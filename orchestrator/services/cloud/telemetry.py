@@ -14,7 +14,7 @@ Two things the decorator does for every method call:
 Applied manually — this file intentionally does not walk every class
 attribute via metaclass magic. Explicit is friendlier to grep.
 
-See §4.11 of ``docs/features/main_cloud_abstraction.md``.
+See §4.11 of ``knowledge-base/knowledge/features/main_cloud_abstraction.md``.
 """
 
 from __future__ import annotations

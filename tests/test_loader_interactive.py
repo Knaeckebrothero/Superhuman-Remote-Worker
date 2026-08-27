@@ -14,6 +14,7 @@ from src.core.loader import (
     load_agent_config_from_dict,
     get_phase_system_prompt,
 )
+from src.core.skill_resolution import APP_GUIDE_LOADER_TOOL, APP_GUIDE_SKILL
 
 
 # =============================================================================
@@ -110,6 +111,22 @@ class TestInteractiveConfigParsing:
         data = _minimal_config_data(interactive={"permission_mode": "supervised"})
         config = load_agent_config_from_dict(data)
         assert isinstance(config.interactive, InteractiveConfig)
+
+
+class TestContextManagementParsing:
+    """Context management parse tests for keep-window truncation config."""
+
+    def test_keep_window_cap_defaults(self):
+        cfg = load_agent_config_from_dict(_minimal_config_data())
+        assert cfg.context_management.keep_window_max_tool_result_chars == 16000
+
+    def test_keep_window_cap_override(self):
+        cfg = load_agent_config_from_dict(
+            _minimal_config_data(
+                context_management={"keep_window_max_tool_result_chars": 12345}
+            )
+        )
+        assert cfg.context_management.keep_window_max_tool_result_chars == 12345
 
 
 # =============================================================================
@@ -239,6 +256,91 @@ class TestInteractivePromptResolution:
             tool_names=["read_file"],
         )
         assert "HAS_SEARCH" not in result
+
+    def test_managed_product_guide_floor_does_not_need_skills_placeholder(self):
+        """Every prompt family gets the trusted floor when the reader is live."""
+        digest = "a" * 64
+        template = "SYS {agent_display_name} {expert_identity}"
+        config = self._make_config(
+            resolved_prompts={"systemprompt_interactive": template}
+        )
+        config.extra["_resolved_skills"] = {
+            "menu": [
+                {
+                    "name": APP_GUIDE_SKILL,
+                    "system_managed": True,
+                    "loader_tool": APP_GUIDE_LOADER_TOOL,
+                    "bundle_digest": digest,
+                }
+            ]
+        }
+
+        result = get_phase_system_prompt(
+            config=config,
+            is_strategic=False,
+            prompt_type="interactive",
+            model="gpt-5",
+            tool_names=[APP_GUIDE_LOADER_TOOL],
+        )
+
+        assert "<managed_product_guide" in result
+        assert f'current_bundle_sha256="{digest}"' in result
+        assert "on every relevant turn" in result
+        assert "summaries, memories, prior tool results" in result
+        assert result.endswith("</managed_product_guide>")
+
+    def test_managed_product_guide_floor_requires_live_reader(self):
+        digest = "b" * 64
+        template = "SYS {agent_display_name} {expert_identity}"
+        config = self._make_config(
+            resolved_prompts={"systemprompt_interactive": template}
+        )
+        config.extra["_resolved_skills"] = {
+            "menu": [
+                {
+                    "name": APP_GUIDE_SKILL,
+                    "system_managed": True,
+                    "loader_tool": APP_GUIDE_LOADER_TOOL,
+                    "bundle_digest": digest,
+                }
+            ]
+        }
+
+        result = get_phase_system_prompt(
+            config=config,
+            is_strategic=False,
+            prompt_type="interactive",
+            model="gpt-5",
+            tool_names=["read_file"],
+        )
+
+        assert "<managed_product_guide" not in result
+
+    def test_managed_product_guide_floor_rejects_unmanaged_spoof(self):
+        template = "SYS {agent_display_name} {expert_identity}"
+        config = self._make_config(
+            resolved_prompts={"systemprompt_interactive": template}
+        )
+        config.extra["_resolved_skills"] = {
+            "menu": [
+                {
+                    "name": APP_GUIDE_SKILL,
+                    "system_managed": False,
+                    "loader_tool": APP_GUIDE_LOADER_TOOL,
+                    "bundle_digest": "c" * 64,
+                }
+            ]
+        }
+
+        result = get_phase_system_prompt(
+            config=config,
+            is_strategic=False,
+            prompt_type="interactive",
+            model="gpt-5",
+            tool_names=[APP_GUIDE_LOADER_TOOL],
+        )
+
+        assert "<managed_product_guide" not in result
 
     def test_reasoning_directive_prepended_for_prompt_method(self):
         """OSS models with reasoning_method='prompt' get 'Reasoning: X' prefix."""

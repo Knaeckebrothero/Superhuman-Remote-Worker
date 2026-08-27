@@ -1,0 +1,565 @@
+"""Forge adapter — one pull-request call across GitHub, Gitea and GitLab.
+
+Gitea deliberately mirrors GitHub's REST API, so those two differ only in
+API base and auth scheme. GitLab is the outlier: a URL-encoded project path
+instead of owner/repo segments, different field names, and its own header.
+
+A per-repository token is the universal credential here — every forge
+supports one, unlike GitHub Apps which are GitHub-only.
+"""
+
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+from urllib.parse import quote, urlparse
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_FORGES = frozenset({"github", "gitea", "gitlab"})
+
+# Overridden in tests with an httpx.MockTransport.
+_transport: Optional[httpx.BaseTransport] = None
+
+
+class ForgeError(RuntimeError):
+    """Raised when a forge API call fails or is misconfigured."""
+
+
+def _hostname(value: str) -> str | None:
+    """Return a normalized hostname without ever exposing URL userinfo."""
+
+    raw = str(value or "").strip()
+    prefix, separator, scp_path = raw.partition(":")
+    if "//" not in raw and separator and "/" in scp_path and "/" not in prefix:
+        host = prefix.rsplit("@", 1)[-1]
+    else:
+        host = urlparse(raw).hostname
+    return str(host).casefold().rstrip(".") if host else None
+
+
+def forge_web_url_matches_connector(
+    web_url: str,
+    connection_url: str,
+    forge: str,
+) -> bool:
+    """Whether a forge-returned web URL belongs to the connector's host.
+
+    Most connectors use the same browser and API hostname.  An in-cluster
+    Gitea deployment deliberately does not: agents call ``GITEA_INTERNAL_URL``
+    while Gitea returns links rooted at the browser-facing ``GITEA_URL``.
+    Treat exactly that server-configured pair as aliases.  A connector for any
+    other Gitea instance cannot borrow the deployment-wide public hostname.
+    """
+
+    web_host = _hostname(web_url)
+    connection_host = _hostname(connection_url)
+    if not web_host or not connection_host:
+        return False
+    if web_host == connection_host:
+        return True
+    if str(forge or "").strip().casefold() != "gitea":
+        return False
+
+    internal_host = _hostname(os.environ.get("GITEA_INTERNAL_URL", ""))
+    public_host = _hostname(os.environ.get("GITEA_URL", ""))
+    if not internal_host or not public_host:
+        return False
+    configured_hosts = {internal_host, public_host}
+    return connection_host in configured_hosts and web_host in configured_hosts
+
+
+@dataclass(frozen=True)
+class ForgeRepo:
+    """Everything needed to call one repository's API."""
+
+    forge: str
+    api_base: str
+    owner: str
+    repo: str
+    # repr=False: one uncaught non-ForgeError renders this dataclass into a
+    # traceback, and tracebacks reach logs and the agent transcript.
+    token: str = field(repr=False)
+
+
+class GitHubClient:
+    """KB-sized GitHub API client with the native Gitea client's call shape.
+
+    The KB writer commits exactly one note at a time, so GitHub's single-file
+    Contents API is sufficient. Multi-file writes are rejected explicitly:
+    implementing those atomically would require the Git Data API and is a
+    separate design decision.
+    """
+
+    def __init__(self, target: ForgeRepo) -> None:
+        if target.forge != "github":
+            raise ForgeError("GitHubClient requires a github ForgeRepo")
+        self._target = target
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._target.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+    def _repo_api(self) -> str:
+        return (
+            f"{self._target.api_base}/repos/"
+            f"{quote(self._target.owner, safe='')}/"
+            f"{quote(self._target.repo, safe='')}"
+        )
+
+    def _matches_repo(self, repo_name: str) -> bool:
+        if str(repo_name) == self._target.repo:
+            return True
+        logger.warning("GitHub KB client refused a mismatched repository name")
+        return False
+
+    @staticmethod
+    def _content_path(path: str) -> str | None:
+        candidate = str(path or "")
+        parts = candidate.split("/")
+        if (
+            not candidate
+            or candidate.startswith("/")
+            or "\\" in candidate
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            return None
+        return quote(candidate, safe="/")
+
+    async def list_tree(self, repo_name: str, ref: str) -> list[dict[str, str]] | None:
+        """Return GitHub's recursive tree normalized to path/type/sha."""
+        if not self._matches_repo(repo_name):
+            return None
+        safe_ref = quote(str(ref), safe="")
+        try:
+            async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+                response = await client.get(
+                    f"{self._repo_api()}/git/trees/{safe_ref}",
+                    params={"recursive": "1"},
+                    headers=self._headers(),
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("GitHub KB tree request failed: %s", exc)
+            return None
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            logger.warning(
+                "GitHub KB tree request failed (HTTP %s)", response.status_code
+            )
+            return None
+        try:
+            payload = response.json()
+            if payload.get("truncated"):
+                # An incomplete tree would make the reindexer treat unseen
+                # notes as deleted. Fail honestly instead.
+                logger.warning("GitHub KB recursive tree was truncated")
+                return None
+            entries = payload.get("tree") or []
+            return [
+                {
+                    "path": str(entry["path"]),
+                    "type": str(entry["type"]),
+                    "sha": str(entry["sha"]),
+                }
+                for entry in entries
+                if isinstance(entry, dict)
+                and entry.get("path") is not None
+                and entry.get("type") is not None
+                and entry.get("sha") is not None
+            ]
+        except (TypeError, ValueError, AttributeError, KeyError):
+            logger.warning("GitHub KB tree response was malformed")
+            return None
+
+    async def change_files(
+        self,
+        repo_name: str,
+        branch: str,
+        files: list[dict],
+        message: str,
+    ) -> bool:
+        """Create or update exactly one file through GitHub's Contents API."""
+        if not self._matches_repo(repo_name):
+            return False
+        if not files:
+            return True
+        if len(files) != 1:
+            logger.warning(
+                "GitHub KB writes support exactly one file; refusing %d files",
+                len(files),
+            )
+            return False
+
+        file = files[0]
+        path = self._content_path(str(file.get("path") or ""))
+        operation = str(file.get("operation") or "create").lower()
+        content_b64 = file.get("content_b64")
+        if (
+            path is None
+            or operation not in {"create", "update"}
+            or not isinstance(content_b64, str)
+        ):
+            logger.warning("GitHub KB write payload was invalid")
+            return False
+
+        contents_url = f"{self._repo_api()}/contents/{path}"
+        sha = str(file.get("sha") or "").strip() or None
+        try:
+            async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+                if operation == "update" and sha is None:
+                    lookup = await client.get(
+                        contents_url,
+                        params={"ref": branch},
+                        headers=self._headers(),
+                    )
+                    if lookup.status_code != 200:
+                        logger.warning(
+                            "GitHub KB update SHA lookup failed (HTTP %s)",
+                            lookup.status_code,
+                        )
+                        return False
+                    value = lookup.json().get("sha")
+                    sha = str(value).strip() if value else None
+                    if sha is None:
+                        logger.warning("GitHub KB update SHA lookup returned no SHA")
+                        return False
+
+                payload: dict[str, str] = {
+                    "message": str(message),
+                    "content": content_b64,
+                    "branch": str(branch or "main"),
+                }
+                if operation == "update" and sha is not None:
+                    payload["sha"] = sha
+                response = await client.put(
+                    contents_url,
+                    headers=self._headers(),
+                    json=payload,
+                )
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            logger.warning("GitHub KB write failed: %s", exc)
+            return False
+        if response.status_code in (200, 201):
+            return True
+        logger.warning("GitHub KB write failed (HTTP %s)", response.status_code)
+        return False
+
+    async def get_branch_head_sha(self, repo_name: str, branch: str) -> str | None:
+        """Return the commit SHA at a GitHub branch head."""
+        if not self._matches_repo(repo_name):
+            return None
+        safe_branch = quote(str(branch), safe="")
+        try:
+            async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+                response = await client.get(
+                    f"{self._repo_api()}/branches/{safe_branch}",
+                    headers=self._headers(),
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("GitHub KB branch request failed: %s", exc)
+            return None
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            logger.warning(
+                "GitHub KB branch request failed (HTTP %s)", response.status_code
+            )
+            return None
+        try:
+            value = response.json().get("commit", {}).get("sha")
+            return str(value) if value else None
+        except (TypeError, ValueError, AttributeError):
+            logger.warning("GitHub KB branch response was malformed")
+            return None
+
+    async def download_repo_archive(
+        self, repo_name: str, ref: str, dest_path: str
+    ) -> bool:
+        """Stream a GitHub tarball for ``ref`` to ``dest_path``."""
+        if not self._matches_repo(repo_name):
+            return False
+        safe_ref = quote(str(ref), safe="")
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, read=120.0),
+                transport=_transport,
+                follow_redirects=True,
+            ) as client:
+                async with client.stream(
+                    "GET",
+                    f"{self._repo_api()}/tarball/{safe_ref}",
+                    headers=self._headers(),
+                ) as response:
+                    if response.status_code != 200:
+                        logger.warning(
+                            "GitHub KB archive request failed (HTTP %s)",
+                            response.status_code,
+                        )
+                        return False
+                    with open(dest_path, "wb") as output:
+                        async for chunk in response.aiter_bytes():
+                            output.write(chunk)
+            return True
+        except (httpx.HTTPError, OSError) as exc:
+            logger.warning("GitHub KB archive request failed: %s", exc)
+            return False
+
+
+def parse_owner_repo(url: str) -> tuple[str, str]:
+    """Return ``(owner, repo)`` from a repository URL."""
+    raw = url.strip()
+    prefix, separator, scp_path = raw.partition(":")
+    if "://" not in raw and separator and "/" in scp_path and "/" not in prefix:
+        path = scp_path.strip("/")
+    else:
+        path = urlparse(raw).path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 2:
+        raise ForgeError(f"Cannot parse owner/repo from URL: {url!r}")
+    # Trailing pair handles GitLab subgroups (group/sub/repo → sub, repo);
+    # subgroup projects need the full path, handled in _gitlab_project_path.
+    return parts[-2], parts[-1]
+
+
+def resolve_api_base(url: str, forge: str) -> str:
+    """Return the API root for ``url`` on ``forge``."""
+    if forge not in SUPPORTED_FORGES:
+        raise ForgeError(
+            f"Unsupported forge {forge!r}; expected one of {sorted(SUPPORTED_FORGES)}"
+        )
+    raw = url.strip()
+    prefix, separator, scp_path = raw.partition(":")
+    scp_host = None
+    if "://" not in raw and separator and "/" in scp_path and "/" not in prefix:
+        scp_host = prefix.rsplit("@", 1)[-1]
+
+    parsed = urlparse(raw)
+    hostname = scp_host or parsed.hostname
+    if not hostname:
+        raise ForgeError(f"Cannot parse host from URL: {url!r}")
+    scheme = parsed.scheme if parsed.scheme in {"http", "https"} else "https"
+    host_for_url = f"[{hostname}]" if ":" in hostname else hostname
+    port = f":{parsed.port}" if not scp_host and parsed.port else ""
+    origin = f"{scheme}://{host_for_url}{port}"
+
+    if forge == "github":
+        # github.com routes to the SaaS API host; Enterprise uses /api/v3.
+        if hostname.lower() in ("github.com", "www.github.com"):
+            return "https://api.github.com"
+        return f"{origin}/api/v3"
+    if forge == "gitea":
+        return f"{origin}/api/v1"
+    return f"{origin}/api/v4"
+
+
+def _gitlab_project_path(owner: str, repo: str) -> str:
+    """URL-encode ``owner/repo`` into a single path segment.
+
+    GitLab's project endpoint takes an ID or a fully URL-encoded path. Passing
+    it as two path segments silently 404s.
+    """
+    return quote(f"{owner}/{repo}", safe="")
+
+
+def _request_for(
+    target: ForgeRepo, *, title: str, head: str, base: str, body: str
+) -> tuple[str, dict, dict]:
+    """Return ``(url, headers, json_body)`` for this forge's PR endpoint."""
+    if target.forge == "gitlab":
+        url = (
+            f"{target.api_base}/projects/"
+            f"{_gitlab_project_path(target.owner, target.repo)}/merge_requests"
+        )
+        headers = {"PRIVATE-TOKEN": target.token}
+        payload = {
+            "title": title,
+            "source_branch": head,
+            "target_branch": base,
+            "description": body,
+        }
+        return url, headers, payload
+
+    url = f"{target.api_base}/repos/{target.owner}/{target.repo}/pulls"
+    scheme = "token" if target.forge == "gitea" else "Bearer"
+    headers = {
+        "Authorization": f"{scheme} {target.token}",
+        "Accept": "application/json",
+    }
+    payload = {"title": title, "head": head, "base": base, "body": body}
+    return url, headers, payload
+
+
+def _status_request_for(target: ForgeRepo, number: int) -> tuple[str, dict[str, str]]:
+    """Return the forge-specific URL and headers for one PR status read."""
+    if target.forge == "gitlab":
+        url = (
+            f"{target.api_base}/projects/"
+            f"{_gitlab_project_path(target.owner, target.repo)}/"
+            f"merge_requests/{number}"
+        )
+        headers = {"Accept": "application/json"}
+        if target.token:
+            headers["PRIVATE-TOKEN"] = target.token
+        return url, headers
+
+    url = f"{target.api_base}/repos/{target.owner}/{target.repo}/pulls/{number}"
+    headers = {"Accept": "application/json"}
+    if target.token:
+        scheme = "token" if target.forge == "gitea" else "Bearer"
+        headers["Authorization"] = f"{scheme} {target.token}"
+    return url, headers
+
+
+def _response_error_detail(response: httpx.Response) -> str:
+    """Return a bounded forge error without ever inspecting request headers."""
+    try:
+        data = response.json()
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("message") or data.get("error") or "")[:200]
+
+
+async def get_pull_request_status(target: ForgeRepo, number: int) -> dict:
+    """Read and normalize one pull/merge request across supported forges.
+
+    The stable state vocabulary is ``open | merged | closed``. GitHub and
+    Gitea both report merged PRs as closed, so their explicit ``merged`` flag
+    takes precedence over ``state``. GitLab reports merged directly and calls
+    open merge requests ``opened``.
+    """
+    if target.forge not in SUPPORTED_FORGES:
+        raise ForgeError(f"Unsupported forge {target.forge!r}")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise ForgeError("Pull request number must be a positive integer")
+
+    url, headers = _status_request_for(target, number)
+    try:
+        async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+            response = await client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        raise ForgeError(f"Could not reach {target.forge}: {exc}") from exc
+
+    if response.status_code != 200:
+        detail = _response_error_detail(response)
+        raise ForgeError(
+            f"{target.forge} refused the pull request status read "
+            f"(HTTP {response.status_code}){': ' + detail if detail else ''}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ForgeError(f"{target.forge} returned malformed PR status JSON") from exc
+    if not isinstance(data, dict):
+        raise ForgeError(f"{target.forge} returned malformed PR status data")
+
+    remote_number = data.get("number", data.get("iid"))
+    if remote_number is not None:
+        try:
+            if int(remote_number) != number:
+                raise ForgeError(
+                    f"{target.forge} returned a different pull request number"
+                )
+        except (TypeError, ValueError) as exc:
+            raise ForgeError(
+                f"{target.forge} returned a malformed pull request number"
+            ) from exc
+
+    raw_state = str(data.get("state") or "").strip().lower()
+    if target.forge == "gitlab":
+        state = {
+            "opened": "open",
+            "merged": "merged",
+            "closed": "closed",
+            "locked": "closed",
+        }.get(raw_state)
+        head = data.get("source_branch")
+        base = data.get("target_branch")
+        diff_refs = data.get("diff_refs")
+        diff_refs = diff_refs if isinstance(diff_refs, dict) else {}
+        head_sha = data.get("sha") or diff_refs.get("head_sha")
+    else:
+        if data.get("merged") is True or data.get("merged_at"):
+            state = "merged"
+        else:
+            state = {"open": "open", "closed": "closed"}.get(raw_state)
+        raw_head = data.get("head")
+        raw_base = data.get("base")
+        head = raw_head.get("ref") if isinstance(raw_head, dict) else None
+        base = raw_base.get("ref") if isinstance(raw_base, dict) else None
+        head_sha = raw_head.get("sha") if isinstance(raw_head, dict) else None
+    if state is None:
+        raise ForgeError(
+            f"{target.forge} returned an unknown pull request state {raw_state!r}"
+        )
+
+    link = data.get("html_url") or data.get("web_url") or ""
+    return {
+        "number": number,
+        "url": str(link),
+        "state": state,
+        "head": str(head or ""),
+        "base": str(base or ""),
+        "head_sha": str(head_sha or "").strip().lower(),
+        "draft": bool(data.get("draft") or data.get("work_in_progress")),
+    }
+
+
+async def open_pull_request(
+    target: ForgeRepo, *, title: str, head: str, base: str, body: str = ""
+) -> dict:
+    """Open a pull/merge request. Returns ``{"number": int, "url": str}``."""
+    if target.forge not in SUPPORTED_FORGES:
+        raise ForgeError(f"Unsupported forge {target.forge!r}")
+
+    url, headers, payload = _request_for(
+        target, title=title, head=head, base=base, body=body
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+    except httpx.HTTPError as exc:
+        raise ForgeError(f"Could not reach {target.forge}: {exc}") from exc
+
+    if resp.status_code not in (200, 201):
+        # Include the forge's message but never the request headers/token.
+        detail = ""
+        try:
+            data = resp.json()
+            detail = str(data.get("message") or data.get("error") or "")[:200]
+            # GitHub/Gitea bury the actionable reason one level down: the two
+            # most common PR refusals ("head branch not pushed", "no commits
+            # between X and Y") both arrive as a generic
+            # {"message": "Validation Failed", "errors": [{"message": ...}]}.
+            errors = data.get("errors")
+            if isinstance(errors, list) and errors:
+                first = errors[0]
+                nested = first.get("message") if isinstance(first, dict) else first
+                nested = str(nested or "")[:200]
+                if nested and nested != detail:
+                    detail = f"{detail}: {nested}" if detail else nested
+        except (ValueError, AttributeError):
+            pass
+        raise ForgeError(
+            f"{target.forge} refused the pull request "
+            f"(HTTP {resp.status_code}){': ' + detail if detail else ''}"
+        )
+
+    data = resp.json()
+    # GitHub/Gitea: number + html_url. GitLab: iid + web_url.
+    number = data.get("number", data.get("iid"))
+    link = data.get("html_url") or data.get("web_url") or ""
+    if number is None:
+        raise ForgeError(f"{target.forge} returned no PR number: {list(data)[:5]}")
+    return {"number": int(number), "url": link}

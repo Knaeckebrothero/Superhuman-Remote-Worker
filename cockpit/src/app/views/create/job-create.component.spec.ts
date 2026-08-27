@@ -1,12 +1,24 @@
-import { describe, it, expect } from 'vitest';
-import { JobCreateRequest } from '../../core/models/api.model';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { signal } from '@angular/core';
+import { TestBed } from '@angular/core/testing';
+import { ActivatedRoute, Router, convertToParamMap } from '@angular/router';
+import { of } from 'rxjs';
+import { JobCreateRequest, Project } from '../../core/models/api.model';
+import { ApiService } from '../../core/services/api.service';
+import { CapabilitiesService } from '../../core/services/capabilities.service';
+import { ErrorMessageService } from '../../core/services/error-message.service';
+import { ModelService } from '../../core/services/model.service';
+import { UserService } from '../../core/services/user.service';
+import { JobCreateComponent } from './job-create.component';
 
 /**
- * Unit tests for JobCreateComponent utility functions.
+ * Unit tests for JobCreateComponent.
  *
- * Note: These tests focus on pure utility functions and form validation logic.
- * Full component testing with Angular TestBed is not set up in this project.
- * Integration testing should be done via e2e tests.
+ * The first block covers pure form/validation helpers. The block at the bottom
+ * mounts the real component through TestBed with its template overridden away —
+ * the same shape session-create's spec uses, and the only shape available here,
+ * since this environment's JIT compiler cannot see initializer-based inputs
+ * (`input()`, `model()`) and so cannot render templates that bind them.
  */
 
 // Extract utility functions from component for testing
@@ -220,5 +232,101 @@ describe('JobCreateComponent utilities', () => {
       expect(emptyFormData.context).toBeUndefined();
       expect(emptyFormData.instructions).toBeUndefined();
     });
+  });
+});
+
+/**
+ * Project picker behaviour, mounted with the template overridden away (the
+ * house pattern for this component family — see session-create's spec, and the
+ * note there about JIT and signal inputs).
+ */
+describe('JobCreateComponent project picker', () => {
+  function setup(queryProject: string | null, deepLinked: Project | null = null) {
+    const api = {
+      getProjects: vi
+        .fn()
+        .mockImplementation((_userId?: string, status?: string[]) =>
+          of(status?.[0] === 'archived' ? [] : [ACTIVE_PROJECT]),
+        ),
+      // What `?project=` resolves to when the active list does not have it.
+      getProject: vi.fn().mockReturnValue(of(deepLinked)),
+      getEligibleDatasources: vi.fn().mockReturnValue(of([])),
+      getExpertDefaults: vi.fn().mockReturnValue(of(null)),
+      getExperts: vi.fn().mockReturnValue(of([])),
+      getExpertDetail: vi.fn().mockReturnValue(of(null)),
+      previewToolGroups: vi.fn().mockReturnValue(of(null)),
+      createJob: vi.fn().mockReturnValue(of({id: 'job-1'})),
+    };
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        {provide: ApiService, useValue: api},
+        {
+          provide: ActivatedRoute,
+          useValue: {
+            snapshot: {queryParamMap: convertToParamMap(queryProject ? {project: queryProject} : {})},
+          },
+        },
+        {provide: Router, useValue: {navigate: vi.fn()}},
+        {provide: UserService, useValue: {currentUserId: signal('user-1')}},
+        {provide: ErrorMessageService, useValue: {translate: (_e: unknown, k?: string) => k ?? ''}},
+        {provide: ModelService, useValue: {load: vi.fn()}},
+        {
+          provide: CapabilitiesService,
+          useValue: {
+            datasourceScopeAutoAttachAvailable: () => false,
+            grants: signal(null),
+          },
+        },
+      ],
+    });
+    TestBed.overrideComponent(JobCreateComponent, {set: {imports: [], template: ''}});
+    const fixture = TestBed.createComponent(JobCreateComponent);
+    fixture.detectChanges();
+    return {fixture, component: fixture.componentInstance, api};
+  }
+
+  const ACTIVE_PROJECT = {
+    id: 'proj-1',
+    name: 'Live Project',
+    status: 'active',
+    is_default: true,
+  } as Project;
+
+  const ARCHIVED_PROJECT = {
+    id: 'proj-archived',
+    name: 'Better Resavio (pre-split archive)',
+    status: 'archived',
+    is_default: false,
+  } as Project;
+
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('offers active projects only', () => {
+    const {component, api} = setup(null);
+
+    expect(api.getProjects).toHaveBeenCalledWith('user-1', ['active']);
+    expect(component.projects().map((p) => p.id)).toEqual(['proj-1']);
+    expect(component.selectedProjectId()).toBe('proj-1');
+    expect(component.selectedProjectIsArchived()).toBe(false);
+  });
+
+  it('keeps a deep-linked archived project selected and flagged', () => {
+    // Silently retargeting the job at the personal project is how work ends up
+    // somewhere nobody asked for. The create is refused server-side; the form
+    // says so before the user spends a description on it.
+    const {component, api} = setup('proj-archived', ARCHIVED_PROJECT);
+
+    expect(api.getProject).toHaveBeenCalledWith('proj-archived');
+    expect(component.selectedProjectId()).toBe('proj-archived');
+    expect(component.selectedProjectIsArchived()).toBe(true);
+    expect(component.projects().map((p) => p.id)).toEqual(['proj-1', 'proj-archived']);
+  });
+
+  it('falls back to the default project when the deep link is gone for good', () => {
+    const {component} = setup('proj-deleted');
+
+    expect(component.selectedProjectId()).toBe('proj-1');
+    expect(component.selectedProjectIsArchived()).toBe(false);
   });
 });

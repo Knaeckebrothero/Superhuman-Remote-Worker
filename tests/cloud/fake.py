@@ -45,6 +45,8 @@ class FakeMainCloudBackend:
         fail_mode: Optional[CloudBackendErrorKind] = None,
     ) -> None:
         self._initialized = start_initialized
+        self._backend_instance_id: Optional[str] = None
+        self._installation_proof_sha256: Optional[str] = None
         self._fail_mode = fail_mode
         self._users: dict[str, dict[str, str]] = {}
         self._groups: dict[str, set[str]] = {}
@@ -106,6 +108,23 @@ class FakeMainCloudBackend:
     @property
     def is_initialized(self) -> bool:
         return self._initialized
+
+    @property
+    def backend_instance_id(self) -> Optional[str]:
+        return self._backend_instance_id
+
+    @property
+    def installation_proof_sha256(self) -> Optional[str]:
+        return self._installation_proof_sha256
+
+    def bind_backend_instance(self, backend_instance_id: str) -> None:
+        if self._backend_instance_id not in {None, backend_instance_id}:
+            raise RuntimeError("fake backend instance authority changed")
+        self._backend_instance_id = backend_instance_id
+
+    def prepare_backend_instance_attestation(self, backend_instance_id: str) -> None:
+        if not isinstance(backend_instance_id, str) or not backend_instance_id:
+            raise ValueError("fake attestation instance is missing")
 
     @property
     def webdav_credentials(self) -> dict[str, str]:
@@ -299,6 +318,12 @@ class FakeMainCloudBackend:
             entries.append(ProjectFolderEntry(path=d, is_dir=True))
         entries.sort(key=lambda e: e.path)
         return entries
+
+    async def capture_etag_baseline(
+        self, handle: ProjectFolderHandle
+    ) -> dict[str, str]:
+        entries = await self.list_project_folder(handle)
+        return {e.path: e.etag for e in entries if not e.is_dir}
 
     async def get_project_folder_file_bytes(
         self,

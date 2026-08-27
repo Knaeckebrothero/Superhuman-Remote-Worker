@@ -60,6 +60,38 @@ function formatDate(dateString: string): string {
   });
 }
 
+// Mirror of AgentListComponent.auxTooltip with the translated prefix injected
+// (aux Phase 2 badge tooltip). Builds a human string from the compact
+// metadata.aux summary the agent reports on its heartbeat.
+function auxTooltip(metadata: Record<string, unknown> | undefined, prefix: string): string {
+  const aux = (metadata?.['aux'] ?? null) as {
+    model?: string;
+    consecutive_failures?: number;
+    failing_tasks?: Record<string, {last_error_type?: string}>;
+  } | null;
+  if (!aux) {
+    return prefix;
+  }
+
+  const parts: string[] = [];
+  if (aux.model) {
+    parts.push(aux.model);
+  }
+  if (aux.consecutive_failures) {
+    parts.push(`${aux.consecutive_failures} consecutive failures`);
+  }
+
+  const taskDetail = Object.entries(aux.failing_tasks ?? {})
+    .map(([name, t]) => `${name}: ${t?.last_error_type ?? 'error'}`)
+    .join(', ');
+
+  let detail = parts.join(' — ');
+  if (taskDetail) {
+    detail = detail ? `${detail} (${taskDetail})` : taskDetail;
+  }
+  return detail ? `${prefix}: ${detail}` : prefix;
+}
+
 describe('AgentListComponent utilities', () => {
   describe('getStatusIcon', () => {
     it('should return correct icon for ready status', () => {
@@ -181,6 +213,42 @@ describe('AgentListComponent utilities', () => {
 
       expect(result).toBeTruthy();
       expect(result.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('auxTooltip', () => {
+    const PREFIX = 'Auxiliary model degraded';
+
+    it('returns the bare prefix when no metadata', () => {
+      expect(auxTooltip(undefined, PREFIX)).toBe(PREFIX);
+    });
+
+    it('returns the bare prefix when metadata has no aux block', () => {
+      expect(auxTooltip({memory_mb: 123}, PREFIX)).toBe(PREFIX);
+    });
+
+    it('includes model, failure count and failing task detail', () => {
+      const metadata = {
+        aux: {
+          degraded: true,
+          consecutive_failures: 7,
+          model: 'gemma-4-moe',
+          failing_tasks: {
+            memory_extraction: {last_error_type: 'ConnectionError'},
+          },
+        },
+      };
+
+      const result = auxTooltip(metadata, PREFIX);
+
+      expect(result).toBe(
+        'Auxiliary model degraded: gemma-4-moe — 7 consecutive failures (memory_extraction: ConnectionError)',
+      );
+    });
+
+    it('falls back to the prefix when the aux block carries no detail', () => {
+      // degraded flag present but no model/count/tasks → nothing to append.
+      expect(auxTooltip({aux: {degraded: true}}, PREFIX)).toBe(PREFIX);
     });
   });
 });

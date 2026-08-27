@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Curator - Knowledge extraction specialist for project knowledge base
-$extends: defaults
+$extends: worker_base
 
 agent_id: curator
 display_name: Curator
@@ -8,7 +8,7 @@ description: |
   Knowledge extraction specialist. Runs as a persistent subjob in parallel
   with working agents, extracting structured knowledge notes from job artifacts
   (plan.md, archive/, memories, knowledge base). Writes to the project knowledge
-  base via kb_write/kb_update. See docs/features/project_knowledge_base.md.
+  base via kb_write/kb_update. See knowledge-base/knowledge/features/project_knowledge_base.md.
 icon: menu_book
 color: "#a6e3a1"
 tags:
@@ -36,7 +36,7 @@ tools:
     - next_phase_todos
     - todo_complete
     - todo_list
-    - todo_rewind
+    - request_replan
     - mark_complete
     - job_complete
   knowledge:
@@ -49,6 +49,13 @@ tools:
     - kb_contradictions
     - kb_provenance
     - kb_unanswered
+    # Gardening: the curation prompts (config/prompts/curation_prompt*.txt)
+    # unconditionally call these as step 5. Granted 2026-08-02 per decision D9
+    # in knowledge-base/knowledge/issues/tool_configuration_defects_and_fix_roadmap.md — see
+    # knowledge-base/knowledge/issues/registered_tools_no_config_can_grant.md §3a. kb_export is
+    # deliberately NOT added here; see that doc / the task report for why.
+    - kb_lint
+    - kb_index
   git:
     - git_log
     - git_show

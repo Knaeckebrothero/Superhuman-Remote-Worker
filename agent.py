@@ -20,6 +20,10 @@ Examples:
     # Persistent-only server with a specific thread
     python agent.py --mode persistent --port 8002 --thread-id <uuid>
 
+    # Stateless turn executor: claims session_turn units from the shared
+    # run_queue instead of registering/heartbeating (stateless_agents.md M3).
+    python agent.py --mode stateless --config session_base --port 8001
+
     # Loop mode: after a job/session completes, return to IDLE instead of
     # exiting. Needed for Docker Compose / bare-metal dev where the process
     # is not respawned automatically.
@@ -41,36 +45,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src import create_app  # noqa: E402
+from src.core.logging_config import (  # noqa: E402
+    configure_logging,
+    set_log_context,
+)
 
 
 def setup_logging():
-    """Configure logging from LOG_LEVEL environment variable.
+    """Configure logging from LOG_LEVEL / LOG_FORMAT environment variables.
 
-    Reads LOG_LEVEL env var (default: INFO). Valid values: DEBUG, INFO, WARNING, ERROR.
-
+    LOG_FORMAT=json emits structured JSON (cluster); default text (local/dev).
     When LOG_LEVEL=DEBUG, only app loggers (src.*, orchestrator.*) get DEBUG;
-    the root logger stays at INFO to suppress noisy third-party libraries.
-    Set DEBUG_ALL=1 to also include third-party debug output.
+    the root stays at INFO to suppress noisy third-party libraries. Set
+    DEBUG_ALL=1 to also include third-party debug output.
+    See knowledge-base/knowledge/features/centralized_logging.md.
     """
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-
-    if level <= logging.DEBUG and not os.getenv("DEBUG_ALL"):
-        # Root stays at INFO — silences all third-party DEBUG noise automatically
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        # Only app namespaces get DEBUG
-        for namespace in ("src", "orchestrator"):
-            logging.getLogger(namespace).setLevel(logging.DEBUG)
-    else:
-        logging.basicConfig(
-            level=level,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
+    configure_logging(component="agent", app_namespaces=("src", "orchestrator"))
 
 
 def parse_args():
@@ -85,10 +75,10 @@ def parse_args():
     parser.add_argument(
         "--config",
         "-c",
-        default="defaults",
+        default="worker_base",
         help=(
             "Agent config name or path. Looks in config/{name}/config.yaml first, "
-            "then config/{name}.yaml. (default: defaults)"
+            "then config/{name}.yaml. (default: worker_base)"
         ),
     )
 
@@ -109,9 +99,14 @@ def parse_args():
     # Agent mode
     parser.add_argument(
         "--mode",
-        choices=["worker", "persistent", "dual"],
+        choices=["worker", "persistent", "dual", "stateless"],
         default="dual",
-        help="Agent mode: 'dual' (accepts jobs or sessions, default), 'worker' (jobs only), or 'persistent' (sessions only)",
+        help=(
+            "Agent mode: 'dual' (accepts jobs or sessions, default), 'worker' "
+            "(jobs only), 'persistent' (sessions only), or 'stateless' "
+            "(claims session turns from the run_queue — no registration, no "
+            "heartbeat; stateless_agents.md M3)"
+        ),
     )
     parser.add_argument(
         "--loop",
@@ -140,6 +135,9 @@ def run_server(config_path: str, host: str, port: int):
         host=host,
         port=port,
         log_level="info",
+        # Defer to our root JSON handler so uvicorn's own access/error logs are
+        # JSON too, not plain text (see knowledge-base/knowledge/features/centralized_logging.md).
+        log_config=None,
     )
 
 
@@ -164,6 +162,39 @@ def run_persistent_server(
         host=host,
         port=port,
         log_level="info",
+        # Defer to our root JSON handler so uvicorn's own access/error logs are
+        # JSON too, not plain text (see knowledge-base/knowledge/features/centralized_logging.md).
+        log_config=None,
+    )
+
+
+def run_stateless_server(config_path: str, host: str, port: int):
+    """Run the stateless turn executor (stateless_agents.md M3).
+
+    Boots the persistent app internals with STATELESS_EXECUTOR=1: no
+    orchestrator registration, no heartbeat loop, no boot-WS/status
+    watchdogs. Work arrives exclusively via run_queue claims (the executor
+    background task started by the lifespan); direct WS/input endpoints
+    answer 409. /health and /ready stay live for k8s probes.
+    """
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"Starting Stateless Turn Executor on {host}:{port}")
+    logger.info(f"Config: {config_path}")
+
+    os.environ["STATELESS_EXECUTOR"] = "1"
+
+    from src.api.persistent_app import create_persistent_app
+
+    app = create_persistent_app(config_path, None)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        # Defer to our root JSON handler so uvicorn's own access/error logs are
+        # JSON too, not plain text (see knowledge-base/knowledge/features/centralized_logging.md).
+        log_config=None,
     )
 
 
@@ -187,6 +218,9 @@ def run_dual_server(config_path: str, host: str, port: int):
         host=host,
         port=port,
         log_level="info",
+        # Defer to our root JSON handler so uvicorn's own access/error logs are
+        # JSON too, not plain text (see knowledge-base/knowledge/features/centralized_logging.md).
+        log_config=None,
     )
 
 
@@ -194,6 +228,17 @@ def main():
     """Main entry point."""
     args = parse_args()
     setup_logging()
+    # Tag every log line from this agent process with its identity (correlation).
+    # Pods don't set AGENT_ID; the pod name (POD_NAME / HOSTNAME) is the id the
+    # orchestrator uses in its own logs. SESSION_BOUND_THREAD_ID is present for
+    # dedicated session agents (pool/dual agents bind thread_id per-session at
+    # loop start instead).
+    set_log_context(
+        agent_id=os.getenv("AGENT_ID")
+        or os.getenv("POD_NAME")
+        or os.getenv("HOSTNAME"),
+        thread_id=os.getenv("SESSION_BOUND_THREAD_ID"),
+    )
 
     logger = logging.getLogger(__name__)
 
@@ -213,6 +258,10 @@ def main():
 
     if args.mode == "worker":
         run_server(config_path, args.host, args.port)
+        return
+
+    if args.mode == "stateless":
+        run_stateless_server(config_path, args.host, args.port)
         return
 
     # Dual mode (default) — accepts both jobs and sessions

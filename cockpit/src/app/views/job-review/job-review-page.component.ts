@@ -105,7 +105,7 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
         align-items: center;
         gap: 12px;
         padding: 8px 12px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color);
         flex-shrink: 0;
       }
 
@@ -120,13 +120,13 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
       .header-title {
         font-size: 14px;
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         margin: 0;
       }
 
       .header-count {
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-family: 'JetBrains Mono', monospace;
       }
 
@@ -144,14 +144,14 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
         gap: 2px;
         padding: 8px;
         overflow-y: auto;
-        border-right: 1px solid var(--border-color, #313244);
-        background: var(--panel-bg, #181825);
+        border-right: 1px solid var(--border-color);
+        background: var(--panel-bg);
       }
 
       .detail-panel {
         min-width: 0;
         overflow: hidden;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg);
       }
 
       .state {
@@ -160,7 +160,7 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
         align-items: center;
         gap: 8px;
         padding: 32px 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
         text-align: center;
       }
@@ -183,7 +183,7 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
         background: transparent;
         border: 1px solid transparent;
         border-radius: var(--radius-control);
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         text-align: left;
         cursor: pointer;
         font-family: inherit;
@@ -194,14 +194,14 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
       }
 
       .list-item:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .list-item.selected {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
-        border-color: var(--accent-color, #cba6f7);
+        background: var(--surface-0);
+        color: var(--text-primary);
+        border-color: var(--accent-color);
       }
 
       .item-desc {
@@ -220,7 +220,7 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
         align-items: center;
         gap: 8px;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .item-badge {
@@ -228,7 +228,9 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
         letter-spacing: 0.5px;
         font-weight: 600;
         font-size: 10px;
-        color: var(--warning-color, #f9e2af);
+        /* Theme token (was the non-existent --warning-color → invisible
+           Catppuccin fallback on the light theme). Mixed toward text for WCAG AA at 10px. */
+        color: color-mix(in srgb, var(--warning) 55%, var(--text-primary));
       }
 
       .item-time {
@@ -244,7 +246,7 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
         .list-panel {
           max-height: 200px;
           border-right: none;
-          border-bottom: 1px solid var(--border-color, #313244);
+          border-bottom: 1px solid var(--border-color);
         }
       }
     `,

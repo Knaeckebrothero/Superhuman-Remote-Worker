@@ -1,0 +1,1006 @@
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from fastapi import HTTPException
+
+import orchestrator.main as main
+
+
+THREAD_ID = "11111111-1111-4111-8111-111111111111"
+GENERATION = "22222222-2222-4222-8222-222222222222"
+RUNTIME = "33333333-3333-4333-8333-333333333333"
+FINGERPRINT = "SHA256:" + ("A" * 43)
+
+
+def _settled_thread() -> dict:
+    return {
+        "id": THREAD_ID,
+        "user_id": "user-1",
+        "status": "ended",
+        "execution_lane": "stateless",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": {
+                "status": "deleted",
+                "provisioner": "k8s",
+                "_canvas_workspace_generation": GENERATION,
+                "_runtime_incarnation": None,
+                "_snapshot_restore_required": True,
+            },
+            "_workspace_binding": {
+                "generation": GENERATION,
+                "kind": "remote",
+                "backing_id": "k8s-pod:agent-workspaces:old-pod",
+                "ssh_host_key_fingerprint": FINGERPRINT,
+            },
+            "_stateless_workspace_retirement_settled": {
+                "terminal_token": 8,
+                "cleanup_complete": True,
+                "permanent": False,
+                "backing_id": "k8s-pod:agent-workspaces:old-pod",
+                "runtime_incarnation": RUNTIME,
+                "snapshot_restore_required": True,
+            },
+        },
+    }
+
+
+def _settled_virtual_thread() -> dict:
+    return {
+        "id": THREAD_ID,
+        "user_id": "user-1",
+        "status": "ended",
+        "execution_lane": "stateless",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "virtual"}},
+            "_workspace_binding": {
+                "generation": GENERATION,
+                "kind": "virtual",
+                "backing_id": f"rclone:threads/{THREAD_ID}",
+                "ssh_host_key_fingerprint": None,
+            },
+            "_stateless_workspace_retirement_settled": {
+                "terminal_token": 8,
+                "cleanup_complete": True,
+                "permanent": False,
+                "backing_id": f"rclone:threads/{THREAD_ID}",
+                "runtime_incarnation": None,
+                "snapshot_restore_required": False,
+            },
+        },
+    }
+
+
+def _in_progress_creation_thread(*, ready: bool = False) -> dict:
+    workspace = {
+        "status": "ready" if ready else "created",
+        "provisioner": "k8s",
+        "pod_name": f"ws-thread-{THREAD_ID[:12]}",
+        "namespace": "agent-workspaces",
+        "pod_ip": "10.42.0.8",
+        "port": 30022,
+        "_runtime_incarnation": RUNTIME,
+    }
+    metadata = {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "workspace_container": workspace,
+    }
+    if ready:
+        workspace["_canvas_workspace_generation"] = GENERATION
+        metadata["_workspace_binding"] = {
+            "generation": GENERATION,
+            "kind": "remote",
+            "backing_id": f"k8s-pod:agent-workspaces:{RUNTIME}",
+            "ssh_host_key_fingerprint": FINGERPRINT,
+        }
+    else:
+        workspace["_stateless_runtime_creation"] = {
+            "generation": "44444444-4444-4444-8444-444444444444",
+            "mode": "create",
+            "attempted": True,
+            "replaces_uid": None,
+        }
+    return {
+        "id": THREAD_ID,
+        "user_id": "user-1",
+        "status": "created",
+        "execution_lane": "stateless",
+        "metadata": metadata,
+    }
+
+
+def _release_authorized_live_thread() -> dict:
+    ack = {
+        "kind": "protocol",
+        "terminal_token": 8,
+        "workspace_generation": GENERATION,
+        "endpoint_generation": GENERATION,
+        "runtime_incarnation": RUNTIME,
+        "host_key_fingerprint": FINGERPRINT,
+    }
+    return {
+        "id": THREAD_ID,
+        "user_id": "user-1",
+        "status": "ended",
+        "execution_lane": "stateless",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "_stateless_workspace_retirement_pending": True,
+            "_stateless_claim_retirement": {
+                "terminal_token": 8,
+                "claimant_quiesced": True,
+                "shell_retirement_required": True,
+                "resident_cleanup_required": True,
+                "residents_retired": True,
+                "residents_retired_by": "protocol",
+                "remote_retired": True,
+                "remote_retired_by": "protocol",
+                "permanent": False,
+                "workspace_absence_proven": False,
+                "workspace_generation": GENERATION,
+                "endpoint_generation": GENERATION,
+                "runtime_incarnation": RUNTIME,
+                "host_key_fingerprint": FINGERPRINT,
+            },
+            "_stateless_resident_retirement_ack": dict(ack),
+            "_stateless_shell_retirement_ack": dict(ack),
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_name": f"ws-thread-{THREAD_ID[:12]}",
+                "namespace": "agent-workspaces",
+                "pod_ip": "10.42.0.8",
+                "port": 30022,
+                "_canvas_workspace_generation": GENERATION,
+                "_runtime_incarnation": RUNTIME,
+                "_snapshot_restore_required": False,
+            },
+            "_workspace_binding": {
+                "generation": GENERATION,
+                "kind": "remote",
+                "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+                "ssh_host_key_fingerprint": FINGERPRINT,
+            },
+        },
+    }
+
+
+@asynccontextmanager
+async def _owned_lock(*_args, **_kwargs):
+    yield True
+
+
+def _lifecycle_authority() -> dict:
+    return {
+        "status": "ended",
+        "last_activity": "stable",
+        "ended_at": "stable",
+        "retirement_pending": False,
+        "retirement_token": None,
+        "unit_kind": "session_turn",
+        "queue_state": "done",
+        "lease_token": 8,
+    }
+
+
+def _absence_thread(
+    *,
+    backing_id: str | None,
+    snapshot_captured: bool,
+    pending: bool,
+    permanent: bool,
+) -> dict:
+    metadata = {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "workspace_container": {
+            "status": "deleted" if pending else "created",
+            "provisioner": "k8s",
+            "_runtime_incarnation": None,
+            "_snapshot_restore_required": snapshot_captured,
+        },
+        "_workspace_binding": {
+            "kind": "remote",
+            "backing_id": backing_id,
+        },
+    }
+    if pending:
+        metadata.update(
+            {
+                "_stateless_workspace_retirement_pending": True,
+                "_stateless_claim_retirement": {
+                    "terminal_token": 0,
+                    "claimant_quiesced": True,
+                    "shell_retirement_required": False,
+                    "resident_cleanup_required": False,
+                    "residents_retired": True,
+                    "remote_retired": True,
+                    "permanent": permanent,
+                    "workspace_absence_proven": True,
+                    "workspace_generation": None,
+                    "endpoint_generation": None,
+                    "runtime_incarnation": None,
+                    "host_key_fingerprint": None,
+                },
+            }
+        )
+    return {
+        "id": THREAD_ID,
+        "user_id": "user-1",
+        "status": "ended" if pending else "created",
+        "execution_lane": "stateless",
+        "metadata": metadata,
+    }
+
+
+def _db_for_settled(thread: dict, *, permanent: bool) -> SimpleNamespace:
+    closure = {
+        "state": "settled",
+        "terminal_token": 8,
+        "permanent": permanent,
+        "backing_id": "k8s-pod:agent-workspaces:old-pod",
+        "runtime_incarnation": RUNTIME,
+        "snapshot_restore_required": True,
+        "retry": True,
+    }
+    return SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread),
+        get_stateless_thread_lifecycle_authority=AsyncMock(
+            return_value=_lifecycle_authority()
+        ),
+        stateless_session_workspace_ensure_lock=_owned_lock,
+        begin_stateless_thread_workspace_retirement=AsyncMock(return_value=closure),
+        merge_thread_config_override=AsyncMock(),
+        has_unfinished_session_memory_effects=AsyncMock(return_value=False),
+        delete_thread=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_soft_end_reuses_settled_proof_without_effects() -> None:
+    thread = _settled_thread()
+    db = _db_for_settled(thread, permanent=False)
+    provisioner = SimpleNamespace(release_absent_workspace=AsyncMock())
+    snapshots = SimpleNamespace(is_available=True, delete_snapshot=AsyncMock())
+
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-1"}, thread)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main, "snapshot_service", snapshots),
+        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+    ):
+        result = await main.end_thread(
+            THREAD_ID, SimpleNamespace(), permanent=False, force=True
+        )
+
+    assert result == {"status": "ended"}
+    db.begin_stateless_thread_workspace_retirement.assert_awaited_once()
+    provisioner.release_absent_workspace.assert_not_awaited()
+    snapshots.delete_snapshot.assert_not_awaited()
+    db.delete_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_end_holds_before_begin_when_published_runtime_cannot_reach_ready() -> (
+    None
+):
+    in_progress = _in_progress_creation_thread()
+    db = SimpleNamespace(
+        get_thread=AsyncMock(side_effect=[in_progress, in_progress]),
+        begin_stateless_thread_workspace_retirement=AsyncMock(),
+    )
+    ensure = AsyncMock()
+    provisioner = SimpleNamespace()
+    suspension = SimpleNamespace()
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ensure_session_workspace", ensure),
+        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main, "workspace_suspension_service", suspension),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await main._reconcile_stateless_thread_retirement(
+                THREAD_ID, force=True, permanent=False
+            )
+
+    assert exc.value.status_code == 503
+    ensure.assert_awaited_once_with(
+        THREAD_ID,
+        db=db,
+        provisioner=provisioner,
+        suspension=suspension,
+        _workspace_lifecycle_lock_held=True,
+    )
+    db.begin_stateless_thread_workspace_retirement.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_end_continues_exact_runtime_to_ready_before_begin() -> None:
+    in_progress = _in_progress_creation_thread()
+    ready = _in_progress_creation_thread(ready=True)
+    db = SimpleNamespace(
+        get_thread=AsyncMock(side_effect=[in_progress, ready]),
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            return_value={"state": "busy", "reason": "turn_in_flight"}
+        ),
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ensure_session_workspace", AsyncMock()),
+        patch.object(main, "container_provisioner", SimpleNamespace()),
+        patch.object(main, "workspace_suspension_service", SimpleNamespace()),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await main._reconcile_stateless_thread_retirement(
+                THREAD_ID, force=False, permanent=False
+            )
+
+    assert exc.value.status_code == 409
+    db.begin_stateless_thread_workspace_retirement.assert_awaited_once_with(
+        THREAD_ID,
+        force=False,
+        permanent=False,
+        workspace_absence_proven=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_end_holds_when_creation_continuation_leaves_restore_debt() -> None:
+    in_progress = _in_progress_creation_thread()
+    workspace = in_progress["metadata"]["workspace_container"]
+    workspace["_snapshot_restore_required"] = True
+    workspace["_stateless_runtime_creation"]["mode"] = "restore"
+    ready_with_restore_debt = _in_progress_creation_thread(ready=True)
+    ready_with_restore_debt["metadata"]["workspace_container"][
+        "_snapshot_restore_required"
+    ] = True
+    db = SimpleNamespace(
+        get_thread=AsyncMock(side_effect=[in_progress, ready_with_restore_debt]),
+        begin_stateless_thread_workspace_retirement=AsyncMock(),
+    )
+    ensure = AsyncMock()
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ensure_session_workspace", ensure),
+        patch.object(main, "container_provisioner", SimpleNamespace()),
+        patch.object(main, "workspace_suspension_service", SimpleNamespace()),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await main._reconcile_stateless_thread_retirement(
+                THREAD_ID, force=True, permanent=False
+            )
+
+    assert exc.value.status_code == 503
+    ensure.assert_awaited_once()
+    db.begin_stateless_thread_workspace_retirement.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_end_holds_markerless_ready_workspace_until_restore_clears() -> None:
+    restore_debt = _in_progress_creation_thread(ready=True)
+    restore_debt["metadata"]["workspace_container"]["_snapshot_restore_required"] = True
+    db = SimpleNamespace(
+        get_thread=AsyncMock(side_effect=[restore_debt, restore_debt]),
+        begin_stateless_thread_workspace_retirement=AsyncMock(),
+    )
+    ensure = AsyncMock()
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ensure_session_workspace", ensure),
+        patch.object(main, "container_provisioner", SimpleNamespace()),
+        patch.object(main, "workspace_suspension_service", SimpleNamespace()),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await main._reconcile_stateless_thread_retirement(
+                THREAD_ID, force=True, permanent=False
+            )
+
+    assert exc.value.status_code == 503
+    ensure.assert_awaited_once()
+    db.begin_stateless_thread_workspace_retirement.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_end_begins_only_after_exact_restore_debt_is_cleared() -> None:
+    restore_debt = _in_progress_creation_thread(ready=True)
+    restore_debt["metadata"]["workspace_container"]["_snapshot_restore_required"] = True
+    restored = _in_progress_creation_thread(ready=True)
+    restored["metadata"]["workspace_container"]["_snapshot_restore_required"] = False
+    db = SimpleNamespace(
+        get_thread=AsyncMock(side_effect=[restore_debt, restored]),
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            return_value={"state": "busy", "reason": "turn_in_flight"}
+        ),
+    )
+    ensure = AsyncMock()
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ensure_session_workspace", ensure),
+        patch.object(main, "container_provisioner", SimpleNamespace()),
+        patch.object(main, "workspace_suspension_service", SimpleNamespace()),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await main._reconcile_stateless_thread_retirement(
+                THREAD_ID, force=False, permanent=False
+            )
+
+    assert exc.value.status_code == 409
+    ensure.assert_awaited_once()
+    db.begin_stateless_thread_workspace_retirement.assert_awaited_once_with(
+        THREAD_ID,
+        force=False,
+        permanent=False,
+        workspace_absence_proven=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_acceptance_cannot_finish_until_exact_old_uid_is_404() -> None:
+    thread = _release_authorized_live_thread()
+    closure = {
+        "state": "closed",
+        "terminal_token": 8,
+        "claimant_quiesced": True,
+        "claim_losses": [],
+        "resident_cleanup_required": True,
+        "resident_acknowledged": True,
+        "shell_retirement_required": True,
+        "remote_acknowledged": True,
+        "permanent": False,
+        "workspace_absence_proven": False,
+        "retry": True,
+    }
+    db = SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread),
+        begin_stateless_thread_workspace_retirement=AsyncMock(return_value=closure),
+        finish_stateless_thread_workspace_retirement=AsyncMock(return_value=True),
+    )
+    provisioner = SimpleNamespace(
+        workspace_pod_authority=AsyncMock(side_effect=["exact_live", "exact_absent"]),
+        # First pass models UID-preconditioned DELETE acceptance while the old
+        # object remains Terminating past the bounded exact-absence wait.
+        release_workspace=AsyncMock(return_value=False),
+        release_absent_workspace=AsyncMock(return_value=True),
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await main._reconcile_stateless_thread_retirement(
+                THREAD_ID, force=True, permanent=False
+            )
+        assert exc.value.status_code == 503
+        db.finish_stateless_thread_workspace_retirement.assert_not_awaited()
+
+        result = await main._reconcile_stateless_thread_retirement(
+            THREAD_ID, force=True, permanent=False
+        )
+
+    assert result["state"] == "settled"
+    provisioner.release_workspace.assert_awaited_once()
+    provisioner.release_absent_workspace.assert_awaited_once()
+    absent_owner = provisioner.release_absent_workspace.await_args.args[0]
+    assert (absent_owner.kind, absent_owner.id) == ("session", THREAD_ID)
+    assert provisioner.release_absent_workspace.await_args.kwargs == {
+        "reclaim_volume": False,
+        "expected_runtime_incarnation": RUNTIME,
+        "strict": True,
+    }
+    db.finish_stateless_thread_workspace_retirement.assert_awaited_once_with(THREAD_ID)
+
+
+@pytest.mark.asyncio
+async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> None:
+    thread = _settled_thread()
+    db = _db_for_settled(thread, permanent=True)
+    provisioner = SimpleNamespace(release_absent_workspace=AsyncMock(return_value=True))
+    snapshots = SimpleNamespace(
+        is_available=True,
+        delete_snapshot=AsyncMock(return_value=True),
+    )
+
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-1"}, thread)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main, "snapshot_service", snapshots),
+        patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
+        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+    ):
+        result = await main.end_thread(
+            THREAD_ID, SimpleNamespace(), permanent=True, force=True
+        )
+
+    assert result == {"status": "deleted"}
+    provisioner.release_absent_workspace.assert_awaited_once()
+    owner = provisioner.release_absent_workspace.await_args.args[0]
+    assert (owner.kind, owner.id) == ("session", THREAD_ID)
+    assert provisioner.release_absent_workspace.await_args.kwargs == {
+        "reclaim_volume": True,
+        "expected_runtime_incarnation": RUNTIME,
+        "strict": True,
+    }
+    snapshots.delete_snapshot.assert_awaited_once_with(THREAD_ID, entity_type="threads")
+    db.delete_thread.assert_awaited_once_with(THREAD_ID)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_delete_failure_keeps_settled_thread_retryable() -> None:
+    thread = _settled_thread()
+    db = _db_for_settled(thread, permanent=True)
+    provisioner = SimpleNamespace(release_absent_workspace=AsyncMock(return_value=True))
+    snapshots = SimpleNamespace(
+        is_available=True,
+        delete_snapshot=AsyncMock(return_value=False),
+    )
+
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-1"}, thread)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main, "snapshot_service", snapshots),
+        patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
+        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await main.end_thread(
+                THREAD_ID, SimpleNamespace(), permanent=True, force=True
+            )
+
+    assert exc_info.value.status_code == 503
+    db.delete_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backing_id", "snapshot_captured", "permanent", "succeeds"),
+    [
+        (None, False, False, False),
+        (None, False, True, False),
+        ("k8s-pvc:agent-workspaces:pvc-uid", False, False, False),
+        ("k8s-pvc:agent-workspaces:pvc-uid", False, True, False),
+        ("k8s-pod:agent-workspaces:pod-uid", False, False, False),
+        ("k8s-pod:agent-workspaces:pod-uid", True, False, False),
+        ("k8s-pod:agent-workspaces:pod-uid", False, True, False),
+    ],
+)
+async def test_missing_runtime_absence_matrix(
+    backing_id,
+    snapshot_captured,
+    permanent,
+    succeeds,
+) -> None:
+    preflight = _absence_thread(
+        backing_id=backing_id,
+        snapshot_captured=snapshot_captured,
+        pending=False,
+        permanent=permanent,
+    )
+    current = _absence_thread(
+        backing_id=backing_id,
+        snapshot_captured=snapshot_captured,
+        pending=True,
+        permanent=permanent,
+    )
+    closure = {
+        "state": "closed",
+        "terminal_token": 0,
+        "claimant_quiesced": True,
+        "claim_losses": [],
+        "resident_cleanup_required": False,
+        "resident_acknowledged": True,
+        "shell_retirement_required": False,
+        "remote_acknowledged": True,
+        "permanent": permanent,
+        "workspace_absence_proven": True,
+        "retry": False,
+    }
+    db = SimpleNamespace(
+        get_thread=AsyncMock(side_effect=[preflight, current]),
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            side_effect=[closure, closure]
+        ),
+        finish_stateless_thread_workspace_retirement=AsyncMock(return_value=True),
+    )
+    provisioner = SimpleNamespace(
+        workspace_pod_authority=AsyncMock(return_value="exact_absent"),
+        release_absent_workspace=AsyncMock(return_value=True),
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+    ):
+        if succeeds:
+            result = await main._reconcile_stateless_thread_retirement(
+                THREAD_ID,
+                force=True,
+                permanent=permanent,
+            )
+            assert result["state"] == "settled"
+        else:
+            with pytest.raises(HTTPException) as exc:
+                await main._reconcile_stateless_thread_retirement(
+                    THREAD_ID,
+                    force=True,
+                    permanent=permanent,
+                )
+            assert exc.value.status_code == 503
+
+    assert succeeds is False
+    provisioner.workspace_pod_authority.assert_not_awaited()
+    provisioner.release_absent_workspace.assert_not_awaited()
+    db.begin_stateless_thread_workspace_retirement.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", ["exact_live", "replacement", "unknown"])
+async def test_missing_runtime_nonabsence_refuses_before_queue_close(authority) -> None:
+    thread = _absence_thread(
+        backing_id=None,
+        snapshot_captured=False,
+        pending=False,
+        permanent=False,
+    )
+    db = SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread),
+        begin_stateless_thread_workspace_retirement=AsyncMock(),
+    )
+    provisioner = SimpleNamespace(
+        workspace_pod_authority=AsyncMock(return_value=authority),
+        release_absent_workspace=AsyncMock(),
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await main._reconcile_stateless_thread_retirement(
+            THREAD_ID,
+            force=True,
+            permanent=False,
+        )
+
+    assert exc.value.status_code == 503
+    db.begin_stateless_thread_workspace_retirement.assert_not_awaited()
+    provisioner.release_absent_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_absence_settled_proof_cannot_upgrade_to_permanent() -> None:
+    backing_id = None
+    snapshot_captured = False
+    thread = _absence_thread(
+        backing_id=backing_id,
+        snapshot_captured=snapshot_captured,
+        pending=False,
+        permanent=False,
+    )
+    thread["status"] = "ended"
+    thread["metadata"]["workspace_container"]["status"] = "deleted"
+    thread["metadata"]["_stateless_workspace_retirement_settled"] = {
+        "terminal_token": 0,
+        "cleanup_complete": True,
+        "permanent": True,
+        "backing_id": backing_id,
+        "runtime_incarnation": None,
+        "snapshot_restore_required": snapshot_captured,
+        "workspace_absence_proven": True,
+    }
+    db = SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread),
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            side_effect=RuntimeError("settled workspace absence proof is unsupported")
+        ),
+    )
+    provisioner = SimpleNamespace(
+        release_absent_workspace=AsyncMock(return_value=True),
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await main._reconcile_stateless_thread_retirement(
+                THREAD_ID,
+                force=True,
+                permanent=True,
+            )
+
+    assert exc.value.status_code == 503
+    provisioner.release_absent_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_service_available", [False, True])
+async def test_direct_permanent_end_does_not_require_an_uncaptured_snapshot(
+    snapshot_service_available: bool,
+) -> None:
+    thread = _settled_thread()
+    thread["status"] = "active"
+    thread["metadata"].pop("_stateless_workspace_retirement_settled")
+    thread["metadata"]["workspace_container"]["_snapshot_restore_required"] = False
+    authority = _lifecycle_authority()
+    authority["status"] = "active"
+    db = SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread),
+        get_stateless_thread_lifecycle_authority=AsyncMock(return_value=authority),
+        stateless_session_workspace_ensure_lock=_owned_lock,
+        merge_thread_config_override=AsyncMock(),
+        has_unfinished_session_memory_effects=AsyncMock(return_value=False),
+        delete_thread=AsyncMock(),
+    )
+    snapshots = SimpleNamespace(
+        is_available=snapshot_service_available,
+        delete_snapshot=AsyncMock(return_value=True),
+    )
+    reconcile = AsyncMock(
+        return_value={
+            "state": "settled",
+            "thread": thread,
+            "closure": {
+                "permanent": True,
+                "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+                "snapshot_restore_required": False,
+            },
+        }
+    )
+
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-1"}, thread)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "snapshot_service", snapshots),
+        patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
+        patch.object(main, "_reconcile_stateless_thread_retirement", reconcile),
+        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+    ):
+        result = await main.end_thread(
+            THREAD_ID, SimpleNamespace(), permanent=True, force=True
+        )
+
+    assert result == {"status": "deleted"}
+    if snapshot_service_available:
+        snapshots.delete_snapshot.assert_awaited_once_with(
+            THREAD_ID, entity_type="threads"
+        )
+    else:
+        snapshots.delete_snapshot.assert_not_awaited()
+    db.delete_thread.assert_awaited_once_with(THREAD_ID)
+
+
+@pytest.mark.asyncio
+async def test_emptydir_permanent_requires_snapshot_prefix_cleanup_after_restore() -> (
+    None
+):
+    thread = _settled_thread()
+    thread["metadata"]["workspace_container"]["_snapshot_restore_required"] = False
+    authority = _lifecycle_authority()
+    db = SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread),
+        get_stateless_thread_lifecycle_authority=AsyncMock(return_value=authority),
+        stateless_session_workspace_ensure_lock=_owned_lock,
+        merge_thread_config_override=AsyncMock(),
+        has_unfinished_session_memory_effects=AsyncMock(return_value=False),
+        delete_thread=AsyncMock(),
+    )
+    reconcile = AsyncMock(
+        return_value={
+            "state": "settled",
+            "thread": thread,
+            "closure": {
+                "permanent": True,
+                # A successful Resume clears this marker but deliberately
+                # retains the immutable S3 prefix for later retries.
+                "snapshot_restore_required": False,
+            },
+        }
+    )
+
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-1"}, thread)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(
+            main,
+            "snapshot_service",
+            SimpleNamespace(is_available=False),
+        ),
+        patch.object(main, "_reconcile_stateless_thread_retirement", reconcile),
+        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await main.end_thread(THREAD_ID, SimpleNamespace(), permanent=True, force=True)
+
+    assert exc.value.status_code == 503
+    db.delete_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("purged", [True, False])
+async def test_permanent_virtual_end_purges_exact_workspace_before_row_delete(
+    purged,
+) -> None:
+    from services import thread_uploads
+
+    thread = _settled_virtual_thread()
+    authority = _lifecycle_authority()
+    db = SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread),
+        get_stateless_thread_lifecycle_authority=AsyncMock(return_value=authority),
+        stateless_session_workspace_ensure_lock=_owned_lock,
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            return_value={
+                "state": "settled",
+                "terminal_token": 8,
+                "permanent": True,
+                "backing_id": f"rclone:threads/{THREAD_ID}",
+                "runtime_incarnation": None,
+                "snapshot_restore_required": False,
+                "retry": True,
+            }
+        ),
+        merge_thread_config_override=AsyncMock(),
+        has_unfinished_session_memory_effects=AsyncMock(return_value=False),
+        delete_thread=AsyncMock(),
+    )
+    purge = AsyncMock(return_value=purged)
+
+    with (
+        patch.object(
+            main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"sub": "user-1"}, thread)),
+        ),
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "snapshot_service", SimpleNamespace(is_available=False)),
+        patch.object(
+            thread_uploads, "purge_attested_stateless_virtual_workspace", purge
+        ),
+        patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
+        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+    ):
+        if purged:
+            result = await main.end_thread(
+                THREAD_ID, SimpleNamespace(), permanent=True, force=True
+            )
+            assert result == {"status": "deleted"}
+        else:
+            with pytest.raises(HTTPException) as exc:
+                await main.end_thread(
+                    THREAD_ID, SimpleNamespace(), permanent=True, force=True
+                )
+            assert exc.value.status_code == 503
+
+    purge.assert_awaited_once()
+    if purged:
+        db.delete_thread.assert_awaited_once_with(THREAD_ID)
+    else:
+        db.delete_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stateless_legacy_suspend_caller_never_falls_through_to_pod_delete() -> (
+    None
+):
+    db = SimpleNamespace(
+        get_thread=AsyncMock(
+            return_value={"id": THREAD_ID, "execution_lane": "stateless"}
+        )
+    )
+    suspension = SimpleNamespace(
+        is_enabled=True,
+        suspend_thread_workspace=AsyncMock(return_value=False),
+    )
+    agent = SimpleNamespace(
+        is_available=True,
+        delete_agent_pod_by_thread=AsyncMock(),
+    )
+    persistent = SimpleNamespace(
+        is_available=True,
+        delete_agent_pod=AsyncMock(),
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "workspace_suspension_service", suspension),
+        patch.object(main, "agent_provisioner", agent),
+        patch.object(main, "persistent_provisioner", persistent),
+    ):
+        await main._suspend_thread_resources_inner(THREAD_ID)
+
+    suspension.suspend_thread_workspace.assert_not_awaited()
+    agent.delete_agent_pod_by_thread.assert_not_awaited()
+    persistent.delete_agent_pod.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_release_never_starts_while_resident_proof_is_incomplete() -> None:
+    metadata = {
+        "_stateless_workspace_retirement_pending": True,
+        "_stateless_claim_retirement": {
+            "terminal_token": 8,
+            "claimant_quiesced": True,
+            "shell_retirement_required": False,
+            "resident_cleanup_required": True,
+            "residents_retired": False,
+            "remote_retired": True,
+            "permanent": False,
+            "workspace_generation": None,
+            "endpoint_generation": None,
+            "runtime_incarnation": None,
+            "host_key_fingerprint": None,
+        },
+        "workspace_container": {},
+        "_workspace_binding": {},
+    }
+    current = {
+        "id": THREAD_ID,
+        "status": "ended",
+        "execution_lane": "stateless",
+        "metadata": metadata,
+    }
+    closure = {
+        "state": "closed",
+        "terminal_token": 8,
+        "claimant_quiesced": True,
+        "resident_cleanup_required": False,
+        "resident_acknowledged": True,
+        "shell_retirement_required": False,
+        "remote_acknowledged": True,
+        "permanent": False,
+    }
+    db = SimpleNamespace(
+        begin_stateless_thread_workspace_retirement=AsyncMock(return_value=closure),
+        get_thread=AsyncMock(return_value=current),
+    )
+    provisioner = SimpleNamespace(
+        release_workspace=AsyncMock(),
+        release_absent_workspace=AsyncMock(),
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "container_provisioner", provisioner),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await main._reconcile_stateless_thread_retirement(
+                THREAD_ID,
+                force=True,
+                permanent=False,
+            )
+
+    assert exc_info.value.status_code == 503
+    provisioner.release_workspace.assert_not_awaited()
+    provisioner.release_absent_workspace.assert_not_awaited()

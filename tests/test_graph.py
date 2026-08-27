@@ -4,11 +4,15 @@ Tests the phase alternation graph architecture routing functions and helper util
 LLM-dependent nodes are tested with mocks or integration tests.
 """
 
+import inspect
+
 import pytest
 import tempfile
 import sys
+import yaml
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
+from uuid import UUID
 
 # Add project root src to path for imports
 project_root = Path(__file__).parent.parent
@@ -18,9 +22,11 @@ if str(src_path) not in sys.path:
 
 # Import from src package (requires langgraph in environment)
 from src.core.workspace import WorkspaceManager  # noqa: E402
+from src.core.state import create_initial_state  # noqa: E402
 from src.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 from src.graph import (  # noqa: E402
+    WORKER_BATCH_MIN_WALL_SECONDS,
     route_entry,
     route_after_execute,
     route_after_check_todos,
@@ -31,7 +37,11 @@ from src.graph import (  # noqa: E402
     create_archive_phase_node,
     create_check_goal_node,
     create_handle_transition_node,
+    create_audited_tool_node,
+    build_phase_alternation_graph,
+    checkpoint_completion_report,
     get_managers_from_workspace,
+    worker_batch_boundary_updates,
 )
 from src.core.phase import (  # noqa: E402
     get_initial_strategic_todos,
@@ -261,6 +271,320 @@ class TestCheckTodosNode:
         assert "todos" in result
         assert result["todos"][0]["status"] == "completed"
 
+    def test_due_batch_freezes_only_at_safe_todo_check(self, managers, mock_config):
+        managers["todo"].add("Task still in progress")
+        node = create_check_todos_node(managers["todo"], mock_config)
+        state = {
+            "job_id": "batch-mid-phase",
+            "iteration": 8,
+            "is_strategic_phase": False,
+            "phase_number": 4,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with patch("src.graph.time.time", return_value=1300.0):
+            result = node(state)
+
+        assert result["should_stop"] is True
+        assert result["phase_complete"] is False
+        assert result["freeze_data"]["freeze_type"] == "batch_boundary"
+        assert result["freeze_data"]["boundary"] == "mid_phase"
+        assert result["freeze_data"]["trigger"] == "wall_clock"
+        assert result["todos"][0]["content"] == "Task still in progress"
+        for field in (
+            "worker_batch_started_at",
+            "worker_batch_start_iteration",
+            "worker_batch_target_wall_seconds",
+            "worker_batch_iteration_cap",
+        ):
+            assert result[field] is None
+
+    def test_replan_request_precedes_due_batch(self, managers, mock_config):
+        managers["todo"].add("Task still in progress")
+        tool_context = MagicMock()
+        tool_context.consume_replan_request.return_value = "the plan changed"
+        node = create_check_todos_node(
+            managers["todo"], mock_config, tool_context=tool_context
+        )
+        state = {
+            "job_id": "batch-replan",
+            "iteration": 8,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with patch("src.graph.time.time", return_value=1300.0):
+            result = node(state)
+
+        assert result["phase_complete"] is True
+        assert result["replan_reason"] == "the plan changed"
+        assert "freeze_data" not in result
+
+    def test_completed_phase_precedes_due_batch(self, managers, mock_config):
+        managers["todo"].add("Finished task")
+        managers["todo"].complete("todo_1")
+        node = create_check_todos_node(managers["todo"], mock_config)
+        state = {
+            "job_id": "batch-complete-phase",
+            "iteration": 8,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with patch("src.graph.time.time", return_value=1300.0):
+            result = node(state)
+
+        assert result["phase_complete"] is True
+        assert "freeze_data" not in result
+
+    def test_empty_tactical_recovery_precedes_due_batch(self, managers, mock_config):
+        node = create_check_todos_node(managers["todo"], mock_config)
+        state = {
+            "job_id": "batch-empty-tactical",
+            "iteration": 8,
+            "is_strategic_phase": False,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with patch("src.graph.time.time", return_value=1300.0):
+            result = node(state)
+
+        assert result["phase_complete"] is True
+        assert "freeze_data" not in result
+
+    def test_drain_intent_precedes_due_midphase_batch(self, managers, mock_config):
+        managers["todo"].add("Task still in progress")
+        node = create_check_todos_node(managers["todo"], mock_config)
+        state = {
+            "job_id": "batch-drain",
+            "iteration": 8,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with (
+            patch("src.graph.time.time", return_value=1300.0),
+            patch("src.graph._is_drain_requested", return_value=True),
+        ):
+            result = node(state)
+
+        assert result["phase_complete"] is False
+        assert "freeze_data" not in result
+
+
+class TestWorkerBatchBudget:
+    @staticmethod
+    def _state(**overrides):
+        state = {
+            "job_id": "batch-budget",
+            "iteration": 20,
+            "is_strategic_phase": False,
+            "phase_number": 3,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 10,
+            "worker_batch_target_wall_seconds": 600.0,
+            "worker_batch_iteration_cap": None,
+        }
+        state.update(overrides)
+        return state
+
+    def test_missing_fields_leave_legacy_runs_unarmed(self):
+        assert worker_batch_boundary_updates({"job_id": "legacy"}, now=9999) is None
+
+    def test_initial_state_is_explicitly_unarmed(self):
+        state = create_initial_state("fresh", "/workspace")
+        for field in (
+            "worker_batch_started_at",
+            "worker_batch_start_iteration",
+            "worker_batch_target_wall_seconds",
+            "worker_batch_iteration_cap",
+        ):
+            assert state[field] is None
+        assert worker_batch_boundary_updates(state, now=10_000_000) is None
+
+    def test_budget_check_never_runs_inside_audited_tools(self):
+        assert "worker_batch_boundary_updates(" not in inspect.getsource(
+            create_audited_tool_node
+        )
+        assert 'workflow.add_edge("tools", "check_todos")' in inspect.getsource(
+            build_phase_alternation_graph
+        )
+
+    def test_wall_target_is_not_due_early(self):
+        assert worker_batch_boundary_updates(self._state(), now=1599.999) is None
+        result = worker_batch_boundary_updates(self._state(), now=1600.0)
+        assert result["freeze_data"]["trigger"] == "wall_clock"
+
+    def test_undersized_target_is_clamped_to_five_minutes(self):
+        state = self._state(worker_batch_target_wall_seconds=1.0)
+        assert worker_batch_boundary_updates(state, now=1299.999) is None
+        result = worker_batch_boundary_updates(state, now=1300.0)
+        assert result["freeze_data"]["target_wall_seconds"] == (
+            WORKER_BATCH_MIN_WALL_SECONDS
+        )
+
+    def test_iteration_cap_cannot_fire_before_wall_floor(self):
+        state = self._state(worker_batch_iteration_cap=5)
+        assert worker_batch_boundary_updates(state, now=1299.999) is None
+        result = worker_batch_boundary_updates(state, now=1300.0)
+        assert result["freeze_data"]["trigger"] == "iteration_cap"
+        assert result["freeze_data"]["iteration_delta"] == 10
+
+    def test_wall_clock_wins_when_both_limits_are_due(self):
+        state = self._state(
+            worker_batch_target_wall_seconds=300.0,
+            worker_batch_iteration_cap=5,
+        )
+        result = worker_batch_boundary_updates(state, now=1300.0)
+        assert result["freeze_data"]["trigger"] == "wall_clock"
+
+    @pytest.mark.parametrize(
+        "blocking_state",
+        [
+            {"should_stop": True},
+            {"goal_achieved": True},
+            {"freeze_data": {"freeze_type": "blocking_message"}},
+            {"error": {"message": "existing failure"}},
+        ],
+    )
+    def test_existing_outcome_precedes_batch(self, blocking_state):
+        state = self._state(worker_batch_target_wall_seconds=300.0)
+        state.update(blocking_state)
+        assert worker_batch_boundary_updates(state, now=1300.0) is None
+
+    def test_phase_boundary_can_clear_a_stale_prior_error(self):
+        state = self._state(
+            worker_batch_target_wall_seconds=300.0,
+            error={"message": "stale error from prior node"},
+        )
+        result = worker_batch_boundary_updates(
+            state, now=1300.0, boundary="phase_boundary"
+        )
+        assert result["freeze_data"]["freeze_type"] == "batch_boundary"
+        assert result["error"] is None
+
+
+class TestCheckpointCompletionReport:
+    def test_mints_one_id_with_an_exact_deep_copied_payload(self):
+        state = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"type": "llm_error", "detail": {"attempt": 2}},
+            "freeze_data": {
+                "freeze_type": "blocking_message",
+                "summary": "wait for a reply",
+            },
+        }
+
+        updates = checkpoint_completion_report(state)
+
+        UUID(updates["client_report_id"])
+        assert set(updates["completion_report_payload"]) == {
+            "should_stop",
+            "goal_achieved",
+            "error",
+            "freeze_data",
+        }
+        assert updates["completion_report_payload"] == state
+
+        state["error"]["detail"]["attempt"] = 3
+        state["freeze_data"]["summary"] = "changed after END"
+        assert updates["completion_report_payload"]["error"]["detail"]["attempt"] == 2
+        assert (
+            updates["completion_report_payload"]["freeze_data"]["summary"]
+            == "wait for a reply"
+        )
+
+    def test_retry_keeps_existing_identity_and_payload_verbatim(self):
+        report_id = "11111111-1111-4111-8111-111111111111"
+        payload = {
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": {"freeze_type": "job_complete", "stamp": "first"},
+        }
+        state = {
+            "client_report_id": report_id,
+            "completion_report_payload": payload,
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"message": "later state must not replace the stop"},
+            "freeze_data": None,
+        }
+
+        assert checkpoint_completion_report(state) == {}
+        assert state["client_report_id"] == report_id
+        assert state["completion_report_payload"] is payload
+
+    def test_batch_boundary_does_not_mint_and_clears_stale_envelope(self):
+        result = checkpoint_completion_report(
+            {
+                "client_report_id": "11111111-1111-4111-8111-111111111111",
+                "completion_report_payload": {
+                    "should_stop": True,
+                    "goal_achieved": True,
+                    "error": None,
+                    "freeze_data": None,
+                },
+                "should_stop": True,
+                "freeze_data": {"freeze_type": "batch_boundary"},
+            }
+        )
+
+        assert result == {
+            "client_report_id": None,
+            "completion_report_payload": None,
+        }
+
+    def test_graph_checkpoints_report_before_end(self):
+        source = inspect.getsource(build_phase_alternation_graph)
+        assert '"end": "checkpoint_completion_report"' in source
+        assert 'workflow.add_edge("checkpoint_completion_report", END)' in source
+
+    @pytest.mark.asyncio
+    async def test_report_envelope_is_in_the_terminal_checkpoint(self):
+        from langgraph.checkpoint.memory import InMemorySaver
+        from langgraph.graph import END, StateGraph
+
+        from src.core.state import UniversalAgentState
+
+        workflow = StateGraph(UniversalAgentState)
+        workflow.add_node("checkpoint_completion_report", checkpoint_completion_report)
+        workflow.set_entry_point("checkpoint_completion_report")
+        workflow.add_edge("checkpoint_completion_report", END)
+        graph = workflow.compile(checkpointer=InMemorySaver())
+        config = {"configurable": {"thread_id": "completion-envelope-test"}}
+
+        result = await graph.ainvoke(
+            {
+                "should_stop": True,
+                "goal_achieved": True,
+                "error": None,
+                "freeze_data": {"freeze_type": "job_complete"},
+            },
+            config=config,
+        )
+        terminal = await graph.aget_state(config)
+
+        assert terminal.next == ()
+        assert terminal.values["client_report_id"] == result["client_report_id"]
+        assert (
+            terminal.values["completion_report_payload"]
+            == result["completion_report_payload"]
+        )
+
 
 class TestRestoreTodoStateNode:
     """Tests for restore_todo_state node."""
@@ -293,12 +617,24 @@ class TestRestoreTodoStateNode:
             ],
             "staged_todos": [],
             "todo_next_id": 3,
+            "client_report_id": "11111111-1111-4111-8111-111111111111",
+            "completion_report_payload": {
+                "should_stop": True,
+                "goal_achieved": False,
+                "error": None,
+                "freeze_data": {"freeze_type": "blocking_message"},
+            },
         }
 
         result = node(state)
 
         # Node always clears stop flags on resume
-        assert result == {"should_stop": False, "goal_achieved": False}
+        assert result == {
+            "should_stop": False,
+            "goal_achieved": False,
+            "client_report_id": None,
+            "completion_report_payload": None,
+        }
 
         # But TodoManager should be restored
         todos = managers["todo"].list_all()
@@ -460,13 +796,18 @@ class TestArchivePhaseNode:
         assert len(managers["todo"].list_all()) == 0
 
     @pytest.mark.asyncio
-    async def test_force_summarize_on_strategic_to_tactical_transition(
+    async def test_no_force_summarize_on_strategic_to_tactical_transition(
         self, managers, mock_config
     ):
-        """Test that summarization is forced when transitioning from strategic to tactical.
+        """Boundary compaction is threshold-driven, never forced — both directions.
 
-        This ensures tactical phases get a 'fresh conversation' with just the plan summary,
-        reducing context size and removing irrelevant planning discussions.
+        This used to force a full summarization on the strategic→tactical hop to
+        give tactical a 'fresh conversation with just the plan summary'. That
+        erased what the NEXT strategic phase needed, forcing it to reconstruct
+        state from git, at a cost that grew every phase. Repeated irreversible
+        query-agnostic compaction grows end-task error super-linearly in the
+        number of events (arXiv 2607.08032), and no major harness compacts on a
+        structural boundary. See knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md.
         """
         managers["todo"].add("Task 1")
         managers["todo"].complete("todo_1")
@@ -496,14 +837,14 @@ class TestArchivePhaseNode:
             mock_summarization_prompt,
         )
 
-        # Test strategic phase (is_strategic=True) - should force summarization
+        # Strategic phase completing (is_strategic=True) — the hop that used to force
         state = {"job_id": "test-123", "messages": [], "is_strategic_phase": True}
         await node(state)
 
-        # Verify ensure_within_limits was called with force=True
+        # Verify ensure_within_limits was NOT forced
         call_kwargs = mock_context_mgr.ensure_within_limits.call_args
-        assert call_kwargs.kwargs.get("force") is True, (
-            "Expected force=True for strategic→tactical transition"
+        assert call_kwargs.kwargs.get("force") is False, (
+            "Boundary compaction must be threshold-driven, not forced"
         )
 
     @pytest.mark.asyncio
@@ -727,22 +1068,66 @@ class TestInitStrategicTodosNode:
         todos = managers["todo"].list_all()
         assert len(todos) == 4  # Predefined strategic todos
 
-    def test_handles_missing_instructions(self, managers, mock_config):
-        """Test handling when instructions.md doesn't exist."""
+    def test_missing_instructions_is_fine_when_the_brief_is_there(
+        self, managers, mock_config
+    ):
+        """instructions.md is optional; task_brief.md alone is a real task.
+
+        Only the case where the agent has NO task description at all is fatal
+        (see ``test_taskless_boot_raises``). instructions.md is the optional
+        expert/inline channel, so its absence must stay a normal boot.
+        """
+        managers["workspace"].write_file(
+            "task_brief.md", "# Task Brief\n\n## Description\n\nShip the thing."
+        )
+
         node = create_init_strategic_todos_node(
             managers["workspace"], managers["todo"], mock_config
         )
 
-        state = {"job_id": "test-123"}
-        result = node(state)
+        result = node({"job_id": "test-123"})
 
-        # Should still work with strategic mode message
-        assert "messages" in result
+        assert "Ship the thing" in result["messages"][0].content
         assert "strategic mode" in result["messages"][0].content
+        assert len(managers["todo"].list_all()) == 4
 
-        # Should still load strategic todos
-        todos = managers["todo"].list_all()
-        assert len(todos) == 4
+    def test_taskless_boot_raises(self, managers, mock_config):
+        """No brief and no instructions must abort the boot, not warn.
+
+        Both files are served by in-process virtual providers
+        (knowledge-base/knowledge/features/virtual_directories.md). If the overlay ever fails to
+        serve them — provider raises, registration missed, a backend swap loses
+        the rebind — every read here returns empty and the composed first
+        HumanMessage degrades to the boilerplate "You are starting in strategic
+        mode" with no task in it. The agent then runs a full job against a task
+        it was never told, and the only prior signal was one WARNING line.
+
+        This is the guarantee that replaced VIRTUAL_DIRS_ENABLED: it holds for
+        every cause, where the kill switch covered exactly one.
+        """
+        node = create_init_strategic_todos_node(
+            managers["workspace"], managers["todo"], mock_config
+        )
+
+        with pytest.raises(RuntimeError, match="no task description"):
+            node({"job_id": "test-123"})
+
+    def test_whitespace_only_brief_is_still_taskless(self, managers, mock_config):
+        """A provider that renders blank must not pass the check.
+
+        The realistic overlay failure returns "" or whitespace, not a missing
+        file — an emptiness check that only tested existence would sail past
+        exactly the case it is here to catch.
+        """
+        managers["workspace"].write_file("task_brief.md", "   \n\n\t\n")
+        managers["workspace"].write_file("instructions.md", "")
+
+        node = create_init_strategic_todos_node(
+            managers["workspace"], managers["todo"], mock_config
+        )
+
+        with pytest.raises(RuntimeError, match="no task description"):
+            node({"job_id": "test-123"})
 
 
 class TestPredefinedTodos:
@@ -760,18 +1145,42 @@ class TestPredefinedTodos:
         assert any("next_phase_todos" in c.lower() for c in contents)
 
     def test_transition_strategic_todos(self):
-        """Test get_transition_strategic_todos returns correct todos."""
+        """Test get_transition_strategic_todos returns the slim 2-todo cycle."""
         todos = get_transition_strategic_todos()
-        assert len(todos) == 4
+        # Verification is followed by an explicitly ordered close/continue
+        # decision; technique lives in the capability-aware skill.
+        assert len(todos) == 2
 
-        # Check content patterns
         contents = [t.content for t in todos]
-        assert any("review" in c.lower() for c in contents)
-        assert any("knowledge" in c.lower() or "kb_" in c.lower() for c in contents)
-        assert any("plan.md" in c.lower() for c in contents)
-        assert any(
-            "todos.yaml" in c.lower() or "job_complete" in c.lower() for c in contents
+        assert "skills/verify-before-done/SKILL.md" in contents[0]
+        assert "instructions.md" in contents[0]
+        assert "PASS" in contents[0] and "GAPS" in contents[0]
+        assert "completion_note" in contents[0]
+        assert "begin only after todo 1 is complete" in contents[1]
+        assert "job_complete" in contents[1]
+        assert "next_phase_todos" in contents[1]
+        combined = "\n".join(contents)
+        assert "git_tags" not in combined
+        assert "git_diff" not in combined
+        assert "stop condition comes FIRST" not in combined
+
+    def test_gpt_oss_transition_todos_use_same_ordered_skill_contract(self):
+        template = (
+            project_root / "config/templates/strategic_todos_transition_gpt_oss.yaml"
         )
+        parsed = yaml.safe_load(template.read_text(encoding="utf-8"))
+        contents = [todo["content"] for todo in parsed["todos"]]
+
+        assert len(contents) == 2
+        assert "skills/verify-before-done/SKILL.md" in contents[0]
+        assert "completion_note" in contents[0]
+        assert "Start only after todo 1 is complete" in contents[1]
+        assert "job_complete" in contents[1]
+        assert "next_phase_todos" in contents[1]
+        combined = "\n".join(contents)
+        assert "git_tags" not in combined
+        assert "git_diff" not in combined
+        assert "stop condition" not in combined.lower()
 
 
 class TestTodosYamlValidation:
@@ -970,7 +1379,9 @@ class TestHandleTransitionNode:
 
         # TodoManager should have predefined strategic todos
         todos = managers["todo"].list_all()
-        assert len(todos) == 4  # Transition strategic todos
+        assert (
+            len(todos) == 2
+        )  # Transition strategic todos (review+adapt, plan-or-complete)
 
     @pytest.mark.asyncio
     async def test_drain_intent_freezes_with_version_upgrade(
@@ -1002,6 +1413,14 @@ class TestHandleTransitionNode:
             "is_strategic_phase": True,
             "phase_number": 0,
             "iteration": 10,
+            # A stale error left in state by a mid-phase node must NOT ride out
+            # with the drain freeze (else the orchestrator fails instead of
+            # pauses — version_upgrade_drain_masked_by_coincident_error).
+            "error": {"message": "stale mid-phase error", "type": "job_error"},
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": 5,
         }
         with patch("src.graph._is_drain_requested", return_value=True):
             result = await node(state)
@@ -1012,6 +1431,16 @@ class TestHandleTransitionNode:
         assert freeze["freeze_type"] == "version_upgrade"
         assert freeze["phase_number"] == 0
         assert "drain intent" in freeze["reason"].lower()
+
+        # The drain branch explicitly clears the stale error.
+        assert "error" in result and result["error"] is None
+        for field in (
+            "worker_batch_started_at",
+            "worker_batch_start_iteration",
+            "worker_batch_target_wall_seconds",
+            "worker_batch_iteration_cap",
+        ):
+            assert result[field] is None
 
         # Marker file written for parity with other freeze types.
         marker = managers["workspace"].read_file("output/job_frozen.json")
@@ -1053,6 +1482,91 @@ class TestHandleTransitionNode:
         freeze = result.get("freeze_data")
         if freeze:
             assert freeze.get("freeze_type") != "version_upgrade"
+
+    @pytest.mark.asyncio
+    async def test_due_batch_freezes_at_phase_boundary_without_marker(
+        self, managers, mock_config
+    ):
+        managers["todo"].stage_tactical_todos(
+            [f"Task {i} with enough detail" for i in range(1, 6)],
+            phase_name="Phase 1",
+        )
+        phase_settings = MagicMock()
+        phase_settings.min_todos = 5
+        phase_settings.max_todos = 20
+        mock_config.phase_settings = phase_settings
+        node = create_handle_transition_node(
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
+        )
+        state = {
+            "job_id": "test-batch-boundary",
+            "is_strategic_phase": True,
+            "phase_number": 2,
+            "iteration": 12,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with (
+            patch("src.graph._is_drain_requested", return_value=False),
+            patch("src.graph.time.time", return_value=1300.0),
+        ):
+            result = await node(state)
+
+        assert result["should_stop"] is True
+        assert result["error"] is None
+        assert result["freeze_data"]["freeze_type"] == "batch_boundary"
+        assert result["freeze_data"]["boundary"] == "phase_boundary"
+        assert result["freeze_data"]["phase_number"] == 2
+        assert not managers["workspace"].exists("output/job_frozen.json")
+
+    @pytest.mark.asyncio
+    async def test_replan_lands_before_tactical_phase_batch_handoff(
+        self, managers, mock_config
+    ):
+        managers["todo"].add("Completed tactical task")
+        managers["todo"].complete("todo_1")
+        phase_settings = MagicMock()
+        phase_settings.min_todos = 5
+        phase_settings.max_todos = 20
+        mock_config.phase_settings = phase_settings
+        node = create_handle_transition_node(
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
+        )
+        state = {
+            "job_id": "test-replan-batch-boundary",
+            "is_strategic_phase": False,
+            "phase_number": 3,
+            "iteration": 12,
+            "replan_reason": "new evidence invalidated the old approach",
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with (
+            patch("src.graph._is_drain_requested", return_value=False),
+            patch("src.graph.time.time", return_value=1300.0),
+        ):
+            result = await node(state)
+
+        assert result["freeze_data"]["freeze_type"] == "batch_boundary"
+        assert result["replan_reason"] is None
+        assert any(
+            "[REPLAN REQUESTED]" in getattr(message, "content", "")
+            for message in result.get("messages", [])
+        )
 
 
 # =============================================================================
@@ -1142,8 +1656,8 @@ class TestPhaseAlternationCycle:
             "[PHASE_TRANSITION]" in getattr(m, "content", "")
             for m in state.get("messages", [])
         )
-        # Should have transition strategic todos (4 items)
-        assert len(managers["todo"].list_all()) == 4
+        # Should have transition strategic todos (2 items)
+        assert len(managers["todo"].list_all()) == 2
 
     def test_job_completion_detection(self, managers, mock_config):
         """Test that job_complete creates the completion marker file."""
@@ -1243,6 +1757,9 @@ class TestPhaseAlternationCycle:
         managers["memory"].write(
             "# Project Memory\n\n## Findings\n\n- Important fact 1"
         )
+
+        # Every real job boots with a task; init now refuses without one.
+        managers["workspace"].write_file("instructions.md", "# Task\n\nExtract data.")
 
         # Initialize strategic phase
         init_node = create_init_strategic_todos_node(
@@ -1418,30 +1935,32 @@ class TestEditFileTool:
 
 
 class TestEditCitationTool:
-    """Tests for the edit_citation tool."""
+    """Tests for the edit_citation tool.
+
+    edit_citation now routes through the engine's job-scoped
+    ``edit_citation`` on the vector store (not ``context.db.citations.edit``,
+    which targeted the main app DB where citations don't live).
+    """
 
     @pytest.fixture
-    def mock_db(self):
-        """Create a mock database with citations namespace."""
-        db = MagicMock()
-        db.citations = MagicMock()
-        return db
+    def mock_engine(self):
+        """CitationEngine mock with an async edit_citation."""
+        engine = MagicMock()
+        engine.edit_citation = AsyncMock(return_value=None)
+        return engine
 
     @pytest.fixture
-    def edit_tool(self, workspace_manager, mock_db):
+    def edit_tool(self, workspace_manager, mock_engine):
         """Create citation tools and return the edit_citation tool."""
         from src.tools.citation import create_citation_tools
         from src.tools.context import ToolContext
 
         ctx = ToolContext(
             workspace_manager=workspace_manager,
-            postgres_db=mock_db,
             _job_id="test-job-123",
         )
-        # Pre-set a mock citation engine so get_citation_engine() doesn't
-        # try to connect to a real database via CITATION_DB_URL.
-        mock_engine = MagicMock()
-        mock_engine.get_citation.return_value = {"id": 1}
+        # Pre-set the engine so get_citation_engine() returns it without
+        # needing a real vector pool.
         ctx.citation_engine = mock_engine
         tools = create_citation_tools(ctx)
         for t in tools:
@@ -1450,10 +1969,8 @@ class TestEditCitationTool:
         pytest.fail("edit_citation tool not found in citation tools")
 
     @pytest.mark.asyncio
-    async def test_edit_claim(self, edit_tool, mock_db):
+    async def test_edit_claim(self, edit_tool, mock_engine):
         """Test successful edit of claim field."""
-        mock_db.citations.edit = AsyncMock(return_value=None)
-
         result = await edit_tool.ainvoke(
             {
                 "citation_id": 1,
@@ -1463,13 +1980,15 @@ class TestEditCitationTool:
 
         assert "ok: edited citation [1]" in result
         assert "verification_status reset" in result
-        mock_db.citations.edit.assert_called_once()
-        assert mock_db.citations.edit.call_args.kwargs["claim"] == "Updated claim text"
+        mock_engine.edit_citation.assert_called_once()
+        assert (
+            mock_engine.edit_citation.call_args.kwargs["claim"] == "Updated claim text"
+        )
 
     @pytest.mark.asyncio
-    async def test_edit_not_found(self, edit_tool, mock_db):
-        """Test error when citation is not found."""
-        mock_db.citations.edit = AsyncMock(
+    async def test_edit_not_found(self, edit_tool, mock_engine):
+        """Test error when citation is not found (engine raises ValueError)."""
+        mock_engine.edit_citation = AsyncMock(
             side_effect=ValueError("Citation 999 not found")
         )
 
@@ -1484,10 +2003,8 @@ class TestEditCitationTool:
         assert "not found" in result
 
     @pytest.mark.asyncio
-    async def test_content_edit_resets_verification(self, edit_tool, mock_db):
+    async def test_content_edit_resets_verification(self, edit_tool, mock_engine):
         """Test that editing content fields triggers verification reset message."""
-        mock_db.citations.edit = AsyncMock(return_value=None)
-
         result = await edit_tool.ainvoke(
             {
                 "citation_id": 1,
@@ -1498,10 +2015,10 @@ class TestEditCitationTool:
         assert "verification_status reset to 'pending'" in result
 
     @pytest.mark.asyncio
-    async def test_non_content_edit_preserves_verification(self, edit_tool, mock_db):
+    async def test_non_content_edit_preserves_verification(
+        self, edit_tool, mock_engine
+    ):
         """Test that editing non-content fields does not mention verification reset."""
-        mock_db.citations.edit = AsyncMock(return_value=None)
-
         result = await edit_tool.ainvoke(
             {
                 "citation_id": 1,
@@ -1513,7 +2030,7 @@ class TestEditCitationTool:
         assert "verification_status reset" not in result
 
     @pytest.mark.asyncio
-    async def test_edit_no_fields(self, edit_tool, mock_db):
+    async def test_edit_no_fields(self, edit_tool):
         """Test error when no fields are provided."""
         result = await edit_tool.ainvoke(
             {
@@ -1525,7 +2042,7 @@ class TestEditCitationTool:
         assert "no fields" in result
 
     @pytest.mark.asyncio
-    async def test_edit_invalid_locator_json(self, edit_tool, mock_db):
+    async def test_edit_invalid_locator_json(self, edit_tool):
         """Test error when locator is not valid JSON."""
         result = await edit_tool.ainvoke(
             {

@@ -1,0 +1,415 @@
+:host {
+  display: block;
+
+  /* Query container so the transport can respond to the width of the message
+     column it sits in (which changes when the sidebar collapses), not just the
+     viewport. Drives the phone-width two-row transport below. */
+  container-type: inline-size;
+}
+
+/* ===== Read button (idle) ===== */
+.ra-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* The read-aloud control is a primary affordance — large and fully visible. */
+.ra-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.ra-btn:hover:not(:disabled) {
+  background: var(--surface-1);
+  color: var(--accent-color);
+  border-color: var(--border-color);
+}
+
+.ra-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* ===== Status / player card =====
+   One cohesive surface that morphs through the read-aloud stages. A single
+   vertical rhythm (8px gap) keeps every phase proportionate. */
+.ra-box {
+  margin-top: 8px;
+
+  /* Span the full message-text column (capped upstream by --chat-content-width),
+     not a narrower island. */
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px 11px;
+  background: var(--surface-0);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-surface);
+  box-shadow: var(--shadow-sm);
+  color: var(--text-secondary);
+}
+
+.ra-box[data-phase='error'] {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border-color));
+}
+
+/* Header — an eyebrow label carried by a small accent waveform mark. */
+.ra-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.ra-head-icon {
+  color: var(--accent-color);
+}
+
+.ra-head-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.ra-cancel {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-control);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.ra-cancel:hover {
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+
+/* ===== Status line — one honest indicator per phase ===== */
+.ra-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.ra-status-text {
+  min-width: 0;
+}
+
+.ra-status--error {
+  color: var(--danger);
+}
+
+.ra-status--done app-icon {
+  color: var(--success);
+}
+
+.ra-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* A text-button "Retry part N" / "Try again" / "Skip the rewrite" affordance.
+   Sits inline inside a status row, or standalone (then it shrinks to content
+   instead of stretching to the card width). */
+.ra-link {
+  align-self: flex-start;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--accent-color);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ra-link:hover {
+  color: var(--accent-hover);
+}
+
+.ra-spinner {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--accent-color);
+  border-top-color: transparent;
+  border-radius: var(--radius-full);
+  animation: ra-spin 0.8s linear infinite;
+}
+
+@keyframes ra-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ===== Transport ===== */
+.ra-player {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ra-transport {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.ra-ctrl {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    transform 60ms ease;
+}
+
+.ra-ctrl:hover:not(:disabled) {
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+
+.ra-ctrl:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.ra-ctrl:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* Primary play/pause — the filled accent anchor of the transport row. */
+.ra-ctrl--play {
+  width: 34px;
+  height: 34px;
+  color: var(--on-accent);
+  background: var(--accent-color);
+  box-shadow: var(--shadow-sm);
+}
+
+.ra-ctrl--play:hover:not(:disabled) {
+  color: var(--on-accent);
+  background: var(--accent-hover);
+}
+
+.ra-ctrl--sm {
+  width: 28px;
+  height: 28px;
+}
+
+/* Seek — a pill scrubber with three stacked regions: the faint full-timeline
+   track (estimated tail), the synthesized-but-unplayed region (accent tint),
+   and the played fill (accent), topped by a draggable thumb. */
+.ra-seek {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 80px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-1);
+  cursor: pointer;
+}
+
+.ra-seek-known {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--accent-color) 22%, var(--surface-1));
+}
+
+.ra-seek-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--accent-color);
+}
+
+.ra-seek-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: var(--radius-full);
+  background: var(--accent-color);
+  box-shadow:
+    0 0 0 2px var(--surface-0),
+    var(--shadow-sm);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.ra-time {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ra-speed {
+  flex: none;
+  min-width: 34px;
+  padding: 3px 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.ra-speed:hover {
+  color: var(--text-primary);
+  background: var(--surface-1);
+  border-color: var(--surface-2);
+}
+
+/* Autoplay-blocked prompt. */
+.ra-tap-to-play {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 13px;
+  color: var(--accent-color);
+  background: transparent;
+  border: 1px solid var(--accent-color);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.ra-tap-to-play:hover {
+  background: var(--surface-1);
+}
+
+/* ===== Footer — a quiet transparency caption: either the "reading it as-is"
+   note or the spoken-version disclosure (never both). ===== */
+.ra-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+}
+
+.ra-note {
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.ra-spoken-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  list-style: none;
+}
+
+.ra-spoken-summary::-webkit-details-marker {
+  display: none;
+}
+
+.ra-spoken-summary:hover {
+  color: var(--text-secondary);
+}
+
+.ra-spoken-text {
+  margin-top: 6px;
+  padding-left: 2px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+
+/* ===== Phone-width layout =====
+   When the message column is narrow, the single transport row crams six
+   controls together and the scrubber shrinks to a stub. Instead: lift the
+   scrubber onto its own full-width row (bigger + easier to drag), and let the
+   controls breathe on a second row — play/skip on the left, time + speed on
+   the right — with touch-sized targets. */
+@container (max-width: 400px) {
+  .ra-transport {
+    flex-wrap: wrap;
+    row-gap: 12px;
+    column-gap: 6px;
+  }
+
+  .ra-seek {
+    order: -1;
+    flex-basis: 100%;
+    min-width: 0;
+    height: 8px;
+  }
+
+  .ra-seek-thumb {
+    width: 15px;
+    height: 15px;
+  }
+
+  .ra-ctrl--play {
+    width: 40px;
+    height: 40px;
+  }
+
+  .ra-ctrl--sm {
+    width: 36px;
+    height: 36px;
+  }
+
+  /* Push the time read-out + speed to the right edge of the control row. */
+  .ra-time {
+    margin-left: auto;
+    font-size: 13px;
+  }
+
+  .ra-speed {
+    padding: 5px 9px;
+  }
+}

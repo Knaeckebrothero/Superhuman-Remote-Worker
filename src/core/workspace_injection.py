@@ -8,12 +8,12 @@ making it appear as if the agent already read certain files. This approach:
 
 Handles injection of:
 - Todo lists (as transient HumanMessage)
-- Instruction files triggered by phase transitions (active injection for enforce=false)
+- Instruction files delivered once at a concrete phase start
 - Memory and knowledge injection use their own modules (memory_injection.py, knowledge_injection.py)
 """
 
-import uuid
-from typing import Tuple
+import hashlib
+from typing import List, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
@@ -25,12 +25,55 @@ INSTRUCTION_TOOL_CALL_ID_PREFIX = "instruction_inject_"
 TODOS_INJECTION_CONTENT_PREFIX = "<active_tasks>\n"
 
 
+def content_hash_id(content: str) -> str:
+    """Deterministic 8-hex-char id suffix derived from the injected content.
+
+    Injection tool_call_ids must be deterministic (not uuid4): identical
+    injected content must produce a byte-identical request payload so
+    provider prompt caches can reuse the prefix, and so payloads are
+    reproducible when debugging. Each injection type is injected at most
+    once per request under a distinct prefix, so collisions within one
+    payload are not possible.
+    """
+    return hashlib.sha1(content.encode("utf-8", errors="replace")).hexdigest()[:8]
+
+
+def find_tail_injection_anchor(messages: List[BaseMessage]) -> int:
+    """Index at which to insert the transient injection block, at the tail.
+
+    Transient injections (todos, memory, knowledge, citation feedback,
+    instruction files) are placed AFTER the conversation, not before it:
+    provider prompt caches match on a strict left-to-right prefix, so a
+    block that changes every turn must sit below the stable history or it
+    invalidates the cache for everything after it.
+
+    The anchor is the position just after the last Human/Tool message
+    rather than blindly ``len(messages)``: the injected memory/knowledge
+    pairs are synthetic ``AIMessage(tool_call)`` + ``ToolMessage`` turns,
+    and Gemini rejects a function-call turn that does not immediately
+    follow a user or function-response turn ("Please ensure that function
+    call turn comes immediately after a user turn or after a function
+    response turn."). Every real path into an LLM call ends the history
+    with a HumanMessage (new task/turn, transition, reminder) or the
+    ToolMessages of the previous iteration — so the anchor is normally the
+    end of the list; the walk-back only matters for degenerate histories
+    that end in a bare model turn.
+    """
+    for i in range(len(messages), 0, -1):
+        if isinstance(messages[i - 1], (HumanMessage, ToolMessage)):
+            return i
+    return len(messages)
+
+
 def create_todos_human_message(todos_content: str) -> HumanMessage:
     """Create a transient HumanMessage for todo list injection.
 
-    The message is placed after summary SystemMessages and before other
-    transient injections, giving the agent an up-to-date view of
-    all todos (including completed items) every turn.
+    The message is placed at the very end of the request payload — after
+    the conversation and the other transient injections. The todo list is
+    the agent's current "query", and models weight the end of the prompt
+    highest (see Anthropic's long-context guidance: query at the end).
+    It gives the agent an up-to-date view of all todos (including
+    completed items) every turn.
 
     Args:
         todos_content: Formatted todo list from TodoManager.format_for_injection()
@@ -51,7 +94,7 @@ def create_instruction_tool_messages(
 
     Creates a fake tool call that makes it appear as if the agent already
     called read_file on the instruction file and received the content.
-    Used for active injection (enforce=false) of phase-triggered instruction files.
+    Used for checkpointed, once-per-phase-start instruction delivery.
 
     Args:
         file_path: Workspace-relative path of the instruction file
@@ -60,7 +103,8 @@ def create_instruction_tool_messages(
     Returns:
         Tuple of (AIMessage with tool_call, ToolMessage with instruction content)
     """
-    tool_call_id = f"{INSTRUCTION_TOOL_CALL_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+    id_suffix = content_hash_id(file_path + "\n" + content)
+    tool_call_id = f"{INSTRUCTION_TOOL_CALL_ID_PREFIX}{id_suffix}"
 
     ai_message = AIMessage(
         content="",
@@ -102,12 +146,20 @@ def is_workspace_injection_message(message: BaseMessage) -> bool:
                 return True
 
     from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
-    from src.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
+    from src.core.knowledge_injection import (
+        CHARTER_TOOL_CALL_ID_PREFIX,
+        KNOWLEDGE_TOOL_CALL_ID_PREFIX,
+    )
+    from src.core.citation_feedback_injection import (
+        CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
+    )
 
     prefixes = (
         INSTRUCTION_TOOL_CALL_ID_PREFIX,
         MEMORY_TOOL_CALL_ID_PREFIX,
         KNOWLEDGE_TOOL_CALL_ID_PREFIX,
+        CHARTER_TOOL_CALL_ID_PREFIX,
+        CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
     )
 
     if isinstance(message, ToolMessage):

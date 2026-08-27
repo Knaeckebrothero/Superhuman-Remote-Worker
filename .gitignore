@@ -16,9 +16,6 @@ docker/vpn/config
 docker/vpn/cluster.conf
 docker/vpn/research.conf
 
-# Keycloak realm config is now tracked — all secrets are ${env.VAR}
-# references resolved from .env at import time, not hardcoded in the JSON.
-
 # MCP configuration files
 .mcp.json
 .playwright-mcp/*
@@ -35,6 +32,9 @@ env/
 
 # Local environment
 .env
+
+# Helm local-dev credentials overlay — values-local.yaml.example is tracked; the real one is NOT
+deployment/values-local.yaml
 
 # SQLite database files
 *.db
@@ -171,6 +171,10 @@ docs/_build/
 .settings/
 *.sublime-workspace
 
+# Kate — local project file, kept on disk but untracked (2026-08-17)
+.kateproject
+.kateproject.d/
+
 # IntelliJ
 *.ipr
 *.iml
@@ -190,9 +194,14 @@ docs/_build/
 .history/*
 
 # AI Stuff
+.ai
 CLAUDE.md
+AGENTS.md
 .claude
 .junie
+.codex
+.agents
+.playwright-mcp
 
 # Miscellaneous
 /.angular
@@ -206,3 +215,29 @@ target/
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
+
+# Memory eval harness — datasets are large downloads, runs are local artifacts
+eval/memory/data/
+eval/memory/runs/
+
+# App Guide model-eval artifacts (the held-out corpus and harness are tracked)
+eval/app_guide/runs/
+
+# Superpowers brainstorm companion (local mockups)
+.superpowers/
+bench/runs/
+
+# Extracted Better Resavio client code (Hotel Rheinland) — staged locally for
+# push to a separate GitHub repo. NEVER commit client code to this public repo.
+KurortEngine/
+KurortEngine-salvage/
+KurortEngine-extracted/
+BetterResavio-KB/
+
+# Separate repos checked out inside this working tree. Untracked is not enough —
+# one `git add -A` would publish a private repo into the public one.
+HomeLab/
+# Knowledge vault, cloned in as a plain nested repo (not a submodule).
+knowledge-base/
+knowledge-history/
+srw-cloud/

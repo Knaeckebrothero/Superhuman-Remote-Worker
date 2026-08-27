@@ -1,0 +1,24 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-flex;
+  align-items: center;
+  gap: v.$space-xs;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.app-copy-field__label {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: v.$font-size-xs;
+}
+
+.app-copy-field__value {
+  min-width: 0;
+  font-family: var(--font-mono, monospace);
+  font-size: v.$font-size-xs;
+  color: var(--text-secondary);
+  word-break: break-all;
+  user-select: all;
+}

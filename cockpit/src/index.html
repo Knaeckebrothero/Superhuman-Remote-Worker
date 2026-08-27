@@ -3,8 +3,20 @@
 <head>
   <meta charset="utf-8">
   <title>Cockpit</title>
+  <!-- Bump the app-shell hash when trusted-parent response policy changes. -->
+  <meta name="srw-app-shell-policy" content="anti-framing-v1">
   <base href="/">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- interactive-widget=resizes-content: since Chrome 108 the Android keyboard
+       only shrinks the *visual* viewport by default, so the flex column (100dvh)
+       keeps the composer underneath the keyboard and the browser scroll-hacks the
+       focused textarea alone into view. resizes-content shrinks the layout
+       viewport instead, re-laying the whole column above the keyboard.
+       maximum-scale=1 + user-scalable=no: lock page zoom on mobile — the cockpit
+       is an app shell, not a document. Honored by Android Chrome and installed
+       iOS PWAs; Safari browser tabs ignore the lock for accessibility, but
+       maximum-scale=1 still suppresses iOS auto-zoom on focusing <16px inputs.
+       Double-tap zoom is separately disabled via touch-action in styles.scss. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content">
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#9c2832" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#141418" media="(prefers-color-scheme: dark)">
@@ -32,7 +44,13 @@
     // Without this, the literal text (e.g. "settings") flashes before glyphs
     // arrive — visible as broken `.notdef` boxes in the UI.
     (function () {
-      function markLoaded() { document.body.classList.add('fonts-loaded'); }
+      function markLoaded() {
+        // When the font is already cached, document.fonts.load() resolves in a
+        // microtask that runs before <body> is parsed — document.body is null.
+        // Guard and defer to DOMContentLoaded in that case.
+        if (document.body) { document.body.classList.add('fonts-loaded'); }
+        else { document.addEventListener('DOMContentLoaded', markLoaded, { once: true }); }
+      }
       if (document.fonts && document.fonts.load) {
         document.fonts.load('1em "Material Symbols Outlined"')
           .then(markLoaded)

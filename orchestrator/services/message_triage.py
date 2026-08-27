@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 import httpx
 
@@ -55,6 +56,71 @@ _PROVIDER_FOR_MODEL = {
 }
 
 
+def _strip_think_blocks(text: str) -> str:
+    return re.sub(r"(?is)<think>.*?</think>\s*", "", text)
+
+
+def _strip_code_fence(text: str) -> str:
+    match = re.search(
+        r"(?is)^\s*```(?:json)?\s*\n(.*)\n\s*```\s*$",
+        text,
+        flags=re.DOTALL,
+    )
+    if match:
+        return match.group(1)
+    return text
+
+
+def _first_json_span(text: str) -> str | None:
+    in_string = False
+    escape = False
+    depth = 0
+    start = None
+    for idx, char in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char in "{[":
+            if depth == 0:
+                start = idx
+            depth += 1
+            continue
+        if char in "}]":
+            if depth:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    return text[start : idx + 1].strip()
+    return None
+
+
+def _recover_structured_json(raw_text: str | None) -> dict | None:
+    if not raw_text:
+        return None
+    cleaned = _strip_think_blocks(raw_text)
+    cleaned = _strip_code_fence(cleaned)
+    candidate = _first_json_span(cleaned)
+    if candidate is None:
+        return None
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    action = str(parsed.get("action", "queue")).lower()
+    if action not in {"interrupt", "queue"}:
+        parsed["action"] = "queue"
+    return parsed
+
+
 def _infer_provider(model: str) -> str:
     lowered = model.lower()
     for prefix, provider in _PROVIDER_FOR_MODEL.items():
@@ -82,13 +148,26 @@ async def _resolve_triage_config(db) -> tuple[str, str, str] | None:
 
     base_url: str | None = None
     try:
-        from src.core.model_registry import UnknownModelError, resolve_model
-
-        meta = await resolve_model(model)
-        if meta is not None and meta.base_url:
-            base_url = meta.base_url
-    except (UnknownModelError, ImportError, Exception) as e:  # noqa: BLE001
-        logger.debug("triage registry lookup failed for %s: %s", model, e)
+        if hasattr(db, "list_models") and hasattr(db, "get_system_llm_endpoint"):
+            rows = await db.list_models(capabilities=["chat"], enabled_only=True)
+            for row in rows or []:
+                if not isinstance(row, dict) or row.get("model_id") != model:
+                    continue
+                provider_kind = row.get("provider_kind")
+                provider_ref = row.get("provider_ref")
+                if provider_kind == "endpoint" and provider_ref:
+                    try:
+                        endpoint = await db.get_system_llm_endpoint(provider_ref)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug(
+                            "triage endpoint lookup failed for %s: %s", model, e
+                        )
+                        endpoint = None
+                    if isinstance(endpoint, dict):
+                        base_url = endpoint.get("base_url")
+                break
+    except Exception as e:  # noqa: BLE001
+        logger.debug("triage catalog lookup failed for %s: %s", model, e)
 
     if not base_url:
         base_url = "https://api.openai.com/v1"
@@ -164,7 +243,9 @@ async def triage_message(
 
         data = resp.json()
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        result = json.loads(content)
+        result = _recover_structured_json(content)
+        if not isinstance(result, dict):
+            raise ValueError("triage response not parseable as JSON")
 
         action = result.get("action", "queue")
         if action not in ("interrupt", "queue"):

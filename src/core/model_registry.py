@@ -27,6 +27,7 @@ failure mode is structurally impossible.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -39,8 +40,8 @@ class UnknownModelError(LookupError):
     def __init__(self, model_id: str) -> None:
         super().__init__(
             f"Unknown model '{model_id}'. Configure it via Admin → Models "
-            f"(catalog row anchored to a system API key or system endpoint), "
-            f"or as a per-user endpoint via /api/settings/llm-endpoints."
+            f"(a catalog row anchored to a system API key or a system endpoint "
+            f"registered under Admin → Providers)."
         )
         self.model_id = model_id
 
@@ -56,13 +57,26 @@ class ModelMeta:
     base_url: Optional[str] = None
     api_key_ref: Optional[str] = None
     context_window: Optional[int] = None
+    # Per-model output cap (Admin → Models, stored in models.params_json). Seeded
+    # into dispatch the same way context_window is, then it overrides the family
+    # settings.max_output_tokens before _resolve_max_output_tokens clamps to the
+    # context backstop. See knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md §5.2.
+    max_output_tokens: Optional[int] = None
     reasoning_level: Optional[str] = None
     origin: str = "catalog"
     endpoint_id: Optional[str] = None
     capability: str = "chat"
 
 
-_FACTORY_PROVIDERS = {"openai", "anthropic", "google", "groq", "openrouter", "codex"}
+_FACTORY_PROVIDERS = {
+    "openai",
+    "anthropic",
+    "google",
+    "groq",
+    "openrouter",
+    "mistral",
+    "codex",
+}
 
 
 def _factory_provider(yaml_provider: Optional[str]) -> str:
@@ -78,6 +92,112 @@ def _factory_provider(yaml_provider: Optional[str]) -> str:
     if yaml_provider in _FACTORY_PROVIDERS:
         return yaml_provider
     return "openai"
+
+
+# The system-seeded Codex proxy (CLIProxyAPI) is created under this label by
+# ``ensure_codex_proxy_endpoint`` and its base_url points at the
+# ``*-codex-proxy`` service. It speaks ONLY the OpenAI *Responses* API and
+# surfaces model reasoning via ``reasoning.summary`` — which lives in the codex
+# factory (``_create_codex_llm``). Endpoint-backed rows otherwise resolve to the
+# generic ``openai`` (Chat Completions) factory, which forces
+# ``use_responses_api=False`` and never requests a reasoning summary, so gpt-5.x
+# / o-series / codex models wired to this endpoint silently lose their reasoning.
+CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
+
+
+def _endpoint_factory_provider(
+    base_url: Optional[str], label: Optional[str] = None
+) -> str:
+    """Pick the agent-side LLM factory for an endpoint-backed row.
+
+    Defaults to ``openai`` (the wire protocol is OpenAI-compatible) but returns
+    ``codex`` for the system Codex proxy, whose Responses-API + reasoning-summary
+    path lives in ``_create_codex_llm``. Detected by the well-known endpoint
+    identity (label ``codex-proxy`` or a ``codex-proxy`` host in the base_url).
+    """
+    if label and label.strip().lower() == CODEX_PROXY_ENDPOINT_LABEL:
+        return "codex"
+    if base_url and CODEX_PROXY_ENDPOINT_LABEL in base_url.lower():
+        return "codex"
+    return "openai"
+
+
+# OpenAI's Codex product surface caps context far below the models' true API
+# windows — a deliberate throughput/cost limit, not a capability. gpt-5.x report
+# ~1M on the raw API, but the Codex/ChatGPT-OAuth backend the system codex proxy
+# speaks rejects larger inputs with ``context_too_large``. Measured live against
+# srw-codex-proxy 2026-07-10: 356,590 input -> 200, 380,364 input -> 400. We
+# declare this as the working window so context compaction (threshold = 80% of
+# it) keeps input under the wall instead of dead-ending every turn on an
+# empty/400. Applies to any model resolved onto the ``codex`` factory, regardless
+# of family or catalog window. Override via ``CODEX_CONTEXT_WINDOW_CAP`` (set 0 to
+# disable the day OpenAI ships 1M-for-Codex — see openai/codex#19464).
+CODEX_CONTEXT_WINDOW_CAP_DEFAULT = 400_000
+
+
+def _codex_context_cap() -> int:
+    """Effective context ceiling for codex-proxy-routed models (env-overridable).
+
+    Read from ``CODEX_CONTEXT_WINDOW_CAP``; ``<= 0`` disables the clamp (fall back
+    to the model's own window). A malformed value falls back to the default rather
+    than 0, so a typo can't silently un-cap and re-wedge sessions.
+    """
+    try:
+        return int(
+            os.getenv("CODEX_CONTEXT_WINDOW_CAP", str(CODEX_CONTEXT_WINDOW_CAP_DEFAULT))
+        )
+    except (TypeError, ValueError):
+        return CODEX_CONTEXT_WINDOW_CAP_DEFAULT
+
+
+def _family_context_window(model_id: Optional[str]) -> Optional[int]:
+    """The family matrix's declared true window for ``model_id`` (None if absent).
+
+    Deferred import: ``loader`` imports ``family_of`` from this module, so the
+    dependency can only run in this direction at call time. Any failure degrades
+    to None — the caller then keeps the historical NULL->cap behaviour.
+    """
+    if not model_id:
+        return None
+    try:
+        from src.core.loader import resolve_model_settings
+
+        window = resolve_model_settings(model_id).get("model_max_context_tokens")
+        return int(window) if window else None
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"Family window lookup failed for {model_id}: {e}")
+        return None
+
+
+def _cap_context_window(
+    provider: str, context_window: Optional[int], model_id: Optional[str] = None
+) -> Optional[int]:
+    """Clamp a codex-routed model's working window to the Codex surface cap.
+
+    Non-codex providers pass through untouched (they inherit their family/catalog
+    window as before). For ``codex`` the cap is a **ceiling, never a floor**: the
+    effective window is the admin ``context_window`` when set, else the family
+    matrix's declared true window, and whichever applies is then ``min``'d with
+    the cap. Only when neither is known does the cap itself stand in. Keying on
+    the resolved *provider* (transport), not the family, means gpt-5.x over the
+    real API keeps its full window while the same model over the codex proxy is
+    capped.
+
+    The family fallback matters for models whose true window is *below* the cap.
+    ``gpt-5.3-codex-spark`` is a distilled 128K model: with a NULL catalog row the
+    old ``NULL -> cap`` rule handed back 400K, and because that value is injected
+    at dispatch into ``llm.model_max_context_tokens`` it is truthy, so
+    ``loader._apply_settings_matrix`` never reached the matrix's correct 128000.
+    The 80% compaction threshold landed at 320K, compaction never fired, and the
+    job hard-400'd on ``context_too_large`` (job 9a99f433, 2026-07-23).
+    """
+    if provider != "codex":
+        return context_window
+    cap = _codex_context_cap()
+    if cap <= 0:
+        return context_window
+    effective = context_window or _family_context_window(model_id)
+    return min(effective, cap) if effective else cap
 
 
 # Dependency injection: the orchestrator registers DB-backed lookups at
@@ -162,6 +282,8 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "codex-spark"
     if "codex" in name and name.startswith("gpt-5"):
         return "codex"
+    if name.startswith("gpt-5.6"):
+        return "gpt-5.6"
     if name.startswith("gpt-5"):
         return "gpt-5"
     if name.startswith("gpt-4o"):
@@ -170,6 +292,23 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "o-series"
     if "deepseek" in name:
         return "deepseek"
+    if "glm" in name:
+        return "glm"
+    if name.startswith(
+        (
+            "mistral",
+            "codestral",
+            "magistral",
+            "ministral",
+            "devstral",
+            "pixtral",
+            "voxtral",
+        )
+    ):
+        # Mistral 3 family + specialists. Native api.mistral.ai serves bare ids
+        # (mistral-large-latest, codestral-latest); the openrouter/ prefix is
+        # stripped above. All share the `mistral` matrix family.
+        return "mistral"
     if "qwen" in name or "qwq" in name:
         return "qwen"
     if "llama" in name:
@@ -190,23 +329,48 @@ def family_of(model_id: str, default: str = "default") -> str:
     return default
 
 
+def _params_max_output_tokens(row: dict[str, Any]) -> Optional[int]:
+    """Per-model output cap from a catalog row's ``params_json`` (Admin → Models).
+
+    Seeded into dispatch alongside ``context_window`` so it overrides the family
+    ``settings.max_output_tokens`` (then clamped to the context backstop by
+    ``_resolve_max_output_tokens``). Returns None for a missing, non-int, or
+    non-positive value (→ fall back to the family value). Catalog rows arrive with
+    ``params_json`` already parsed (``postgres._row_to_model``); an endpoint-hook
+    row that left it a raw JSON string is treated as 'no override', not parsed here.
+    """
+    pj = row.get("params_json")
+    if not isinstance(pj, dict):
+        return None
+    try:
+        ival = int(pj.get("max_output_tokens"))
+    except (TypeError, ValueError):
+        return None
+    return ival if ival > 0 else None
+
+
 def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
     """Build a ModelMeta from a user/system endpoint lookup row.
 
-    Endpoint-backed models always route through the openai factory (the
-    wire protocol is OpenAI-compatible). api_key_ref is None because the
-    key travels inline on the endpoint row — the dispatcher fetches it
-    via get_user_llm_endpoint(endpoint_id), not through
-    resolve_api_keys_for_job.
+    Endpoint-backed models route through the openai factory (the wire
+    protocol is OpenAI-compatible) — except the system Codex proxy, which
+    needs the codex factory's Responses-API + reasoning-summary path (see
+    ``_endpoint_factory_provider``). api_key_ref is None because the key
+    travels inline on the endpoint row — the dispatcher fetches it via
+    get_user_llm_endpoint(endpoint_id), not through resolve_api_keys_for_job.
     """
+    provider = _endpoint_factory_provider(row.get("base_url"), row.get("label"))
     return ModelMeta(
         model_id=row["model_id"],
-        provider="openai",
+        provider=provider,
         family=row.get("family") or "default",
         display_name=row.get("display_name") or row["model_id"],
         base_url=row["base_url"],
         api_key_ref=None,
-        context_window=row.get("context_window"),
+        context_window=_cap_context_window(
+            provider, row.get("context_window"), row["model_id"]
+        ),
+        max_output_tokens=_params_max_output_tokens(row),
         reasoning_level=row.get("reasoning_level"),
         origin=origin,
         endpoint_id=str(row["endpoint_id"]),
@@ -235,27 +399,37 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
     provider_ref = row["provider_ref"]
     capability = row.get("capability") or "chat"
     if provider_kind == "endpoint":
+        provider = _endpoint_factory_provider(
+            row.get("endpoint_base_url"), row.get("endpoint_label")
+        )
         return ModelMeta(
             model_id=row["model_id"],
-            provider="openai",
+            provider=provider,
             family=row.get("family") or "default",
             display_name=row.get("display_label") or row["model_id"],
             base_url=row.get("endpoint_base_url"),
             api_key_ref=None,
-            context_window=row.get("context_window"),
+            context_window=_cap_context_window(
+                provider, row.get("context_window"), row["model_id"]
+            ),
+            max_output_tokens=_params_max_output_tokens(row),
             reasoning_level=row.get("reasoning_level"),
             origin="catalog",
             endpoint_id=str(row["endpoint_id"]) if row.get("endpoint_id") else None,
             capability=capability,
         )
+    provider = _factory_provider(provider_ref)
     return ModelMeta(
         model_id=row["model_id"],
-        provider=_factory_provider(provider_ref),
+        provider=provider,
         family=row.get("family") or "default",
         display_name=row.get("display_label") or row["model_id"],
         base_url=None,
         api_key_ref=provider_ref,
-        context_window=row.get("context_window"),
+        context_window=_cap_context_window(
+            provider, row.get("context_window"), row["model_id"]
+        ),
+        max_output_tokens=_params_max_output_tokens(row),
         reasoning_level=row.get("reasoning_level"),
         origin="catalog",
         capability=capability,

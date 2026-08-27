@@ -1,0 +1,30 @@
+# Same-cluster KubeVirt scenario — exercises the vmController templates
+# (Deployment, namespace, RBAC with kubevirt.io verbs, service) plus the
+# transport enum in values.schema.json. Uses chart-created secrets so the file
+# is self-contained. The chart does NOT install KubeVirt/CDI — irrelevant for a
+# static render test.
+license:
+  acceptTerms: true
+
+global:
+  domain: "vm.example.com"
+
+secrets:
+  create: true
+  values: {}
+
+vmController:
+  nodeSelector:
+    srw.io/vm-node: "true"
+
+vm:
+  mode: same-cluster
+  lifecycleAuthSecretName: test-vm-lifecycle
+  preflight:
+    enabled: false
+
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: false

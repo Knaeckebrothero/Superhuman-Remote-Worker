@@ -22,9 +22,16 @@ so the agent-facing output (``{dom, url, title, screenshot, tabs}`` with
 ``[N]`` element refs) is unchanged. URL validation and content-nonce wrapping
 stay on the agent side — this program only executes.
 
+``navigate`` accepts ``file://`` URLs even though browser-use blocks them
+outright: they are rendered through a loopback HTTP listener rooted at the
+workspace, so ``url`` in the reply is the served ``http://127.0.0.1:<port>/...``
+address rather than the ``file://`` one that was requested. Without this an
+agent cannot look at any mockup it writes itself. See ``LocalFileServer``.
+
 Requires browser-use + Playwright Chromium in the workspace image. Chromium
-is resolved via ``PLAYWRIGHT_BROWSERS_PATH`` (set in Dockerfile.workspace),
-the same way the agent's local-mode browser launches.
+is pinned via the explicit ``agent-chromium`` symlink (``BROWSER_EXEC_CHROMIUM``,
+created in Dockerfile.workspace / the VM base provision) rather than
+auto-detected, so browser-use never reaches for its auto-install path.
 """
 
 from __future__ import annotations
@@ -34,19 +41,81 @@ import asyncio
 import base64
 import json
 import os
+import re
+import secrets
+import shutil
 import socket
+import struct
 import subprocess
 import sys
+import threading
+import time
+import uuid
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
 
 SOCKET_PATH = os.environ.get("BROWSER_EXEC_SOCKET", "/tmp/browser-exec.sock")
-DAEMON_LOG = os.environ.get("BROWSER_EXEC_LOG", "/tmp/browser-exec.log")
+# Default under the agent-host home (not /tmp) so the workspace snapshot captures
+# it — snapshots exclude /tmp/*. See knowledge-base/knowledge/features/centralized_logging.md.
+DAEMON_LOG = os.environ.get(
+    "BROWSER_EXEC_LOG", str(Path.home() / ".cache" / "srw" / "browser-exec.log")
+)
 # user_data_dir for the persistent profile (cookies/localStorage survive a
 # Chromium restart). Defaults under the agent-host home so it's workspace-local.
 PROFILE_DIR = os.environ.get(
     "BROWSER_EXEC_PROFILE",
     str(Path.home() / ".browser-profile"),
 )
+# Explicit Chromium binary — the ``agent-chromium`` symlink that
+# Dockerfile.workspace (and the VM base provision) create pointing at the
+# Playwright-installed Chrome. Passing this to BrowserSession makes browser
+# resolution deterministic: browser-use never has to auto-detect the binary and
+# so never falls back to auto-installing one via ``uvx playwright install``
+# (which isn't on the image, and which every browser-use >=0.13 CDP build reaches
+# for when it can't find a browser). See knowledge-base/knowledge/features/browser_workspace_executor.md §5.1.
+CHROMIUM_PATH = os.environ.get("BROWSER_EXEC_CHROMIUM", "/usr/local/bin/agent-chromium")
+# Headful rendering under a virtual X server (see _ensure_display).
+#
+# Headlessness itself is no longer the loud signal it was: Chrome's new headless
+# mode reports honest client-hint brands (``Chromium``, not ``HeadlessChrome``),
+# navigator.webdriver=false under AutomationControlled, and a populated plugin
+# list. What headless *forces* is two things no real browser does, and bot checks
+# read both before a click ever lands:
+#
+#   1. Incoherent geometry. browser-use applies an Emulation device-metrics
+#      override, which resizes the viewport without touching screen/window
+#      metrics. Measured as-shipped: screen 800x600, outer 780x580, inner
+#      1920x1080 — a page larger than the window it lives in, on a monitor
+#      smaller than both. That triple cannot occur on real hardware and is the
+#      cheapest bot test there is.
+#   2. No WebGL at all. With --disable-gpu, getContext('webgl') returns null.
+#      Software rendering (SwiftShader) is a weak signal; *zero* WebGL is a
+#      strong one, because real browsers essentially always have a context.
+#
+# Both close by rendering into an Xvfb display at a plausible desktop size and
+# letting the real window size the viewport. Xvfb is already in the workspace
+# image — Playwright's ``install --with-deps`` pulls it in — so this costs no
+# image surface. Set BROWSER_EXEC_HEADFUL=0 to go back to headless.
+HEADFUL = os.environ.get("BROWSER_EXEC_HEADFUL", "1").lower() not in ("0", "false", "no")
+DISPLAY_NAME = os.environ.get("BROWSER_EXEC_DISPLAY", ":99")
+SCREEN_WIDTH = int(os.environ.get("BROWSER_EXEC_SCREEN_WIDTH", "1920"))
+SCREEN_HEIGHT = int(os.environ.get("BROWSER_EXEC_SCREEN_HEIGHT", "1080"))
+XVFB_START_TIMEOUT_S = float(os.environ.get("BROWSER_EXEC_XVFB_TIMEOUT", "10"))
+# Directory exposed to the browser when rendering a local file (see
+# LocalFileServer). Defaults to the agent's workspace; override only to widen or
+# narrow that root deliberately.
+#
+# WORKSPACE_DEFAULT resolves through $HOME, so it is only right when browser-exec
+# runs as the workspace user — which it does: the agent spawns it over its own
+# SSH session, and the orchestrator connects as ``agent-host`` on every backend
+# (orchestrator/main.py). Verified /home/agent-host/workspace on both the VM and
+# container images. Run as some other user (root, a systemd unit) $HOME/workspace
+# won't exist and each file falls back to its own directory — still renders, but
+# assets referenced above that directory would 404.
+SERVE_ROOT = os.environ.get("BROWSER_EXEC_SERVE_ROOT")
+WORKSPACE_DEFAULT = Path.home() / "workspace"
 
 # Actions that take a positional integer ``ref`` from a prior snapshot.
 VALID_ACTIONS = {
@@ -58,8 +127,545 @@ VALID_ACTIONS = {
     "scroll",
     "screenshot",
     "back",
+    "stream_info",
     "shutdown",
 }
+
+# ─────────────────────────────────────────────────────────────────────
+# Shared-browser streaming (knowledge-base/knowledge/features/shared_browser.md, Piece 1)
+# ─────────────────────────────────────────────────────────────────────
+
+# Loopback-only stream listener. Covered by sshd `PermitOpen 127.0.0.1:*`;
+# never reachable from the pod/VM network — same posture as live-app ports.
+STREAM_PORT = int(os.environ.get("BROWSER_EXEC_STREAM_PORT", "38801"))
+STREAM_QUALITY = int(os.environ.get("BROWSER_EXEC_STREAM_QUALITY", "60"))
+STREAM_MAX_WIDTH = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_WIDTH", "1280"))
+STREAM_MAX_HEIGHT = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_HEIGHT", "720"))
+# Every compositor frame: superseding viewer queues (ViewerQueue.put_frame)
+# handle backpressure by replacement, so skipping frames at the source only
+# adds latency.
+STREAM_EVERY_NTH = int(os.environ.get("BROWSER_EXEC_STREAM_EVERY_NTH", "1"))
+BATON_GRACE_S = float(os.environ.get("BROWSER_EXEC_BATON_GRACE", "30"))
+# Cap for viewer clipboard paste (Input.insertText). The cockpit enforces its
+# own, tighter cap; this one only bounds hand-rolled clients.
+INSERT_TEXT_MAX_CHARS = 16384
+# Where a cold-opened shared browser lands instead of a blank void, so the
+# surface is immediately usable like a normal browser. Only applied when the
+# page is still about:blank — an agent-driven page is never clobbered.
+STREAM_START_URL = os.environ.get(
+    "BROWSER_EXEC_START_URL", "https://www.google.com"
+)
+
+# Framing: [4-byte BE length][1-byte type][payload]; length covers type+payload.
+T_HELLO, T_FRAME, T_STATE, T_INPUT, T_CONTROL, T_ERROR = 1, 2, 3, 4, 5, 6
+MAX_STREAM_FRAME = 8 * 1024 * 1024
+
+
+def encode_stream_frame(ftype: int, payload: bytes) -> bytes:
+    if len(payload) + 1 > MAX_STREAM_FRAME:
+        raise ValueError(f"stream frame too large: {len(payload) + 1}")
+    return struct.pack(">IB", len(payload) + 1, ftype) + payload
+
+
+async def read_stream_frame(reader) -> tuple[int, bytes]:
+    """Read one framed message from an asyncio StreamReader."""
+    head = await reader.readexactly(4)
+    (length,) = struct.unpack(">I", head)
+    if not 1 <= length <= MAX_STREAM_FRAME:
+        raise ValueError(f"bad stream frame length: {length}")
+    body = await reader.readexactly(length)
+    return body[0], body[1:]
+
+
+def encode_frame_payload(header: dict, jpeg: bytes) -> bytes:
+    """FRAME payload: [2-byte BE header length][header JSON][raw JPEG]."""
+    header_json = json.dumps(header).encode()
+    return struct.pack(">H", len(header_json)) + header_json + jpeg
+
+
+def decode_frame_payload(payload: bytes) -> tuple[dict, bytes]:
+    (header_length,) = struct.unpack(">H", payload[:2])
+    return (
+        json.loads(payload[2 : 2 + header_length].decode()),
+        payload[2 + header_length :],
+    )
+
+# Vendored from src/tools/research/browser_security.py (the daemon cannot
+# import agent code): same schemes/hosts policy for viewer-driven navigation.
+_NAV_BLOCKED_HOSTNAMES = {"metadata.google.internal", "metadata.goog"}
+_NAV_K8S_INTERNAL_RE = re.compile(
+    r"\.(cluster\.local|svc|svc\.cluster\.local|pod|pod\.cluster\.local)$",
+    re.IGNORECASE,
+)
+
+
+def validate_user_nav(url: str, files) -> str:
+    """Validate a viewer-typed URL.
+
+    file:// renders via LocalFileServer (agent parity), then the resulting URL
+    passes the same checks as agent navigation.
+    """
+    if not url or not url.strip():
+        raise ValueError("URL cannot be empty")
+    url = url.strip()
+    if urlparse(url).scheme == "file":
+        url = files.url_for(url)
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if not scheme:
+        url = f"https://{url}"
+        parsed = urlparse(url)
+        scheme = "https"
+    if scheme in {"javascript", "data", "file"}:
+        raise ValueError(f"Blocked scheme: {scheme}://")
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported scheme: {scheme}://")
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError("URL has no hostname")
+    if hostname in _NAV_BLOCKED_HOSTNAMES:
+        raise ValueError(f"Blocked hostname: {hostname}")
+    if _NAV_K8S_INTERNAL_RE.search(hostname):
+        raise ValueError(f"Blocked K8s internal hostname: {hostname}")
+    return url
+
+# Agent actions refused while the user holds the baton. Reads (snapshot,
+# screenshot) always pass; stream_info/shutdown are lifecycle, not driving.
+MUTATING_ACTIONS = {"navigate", "click", "type", "select", "scroll", "back"}
+
+
+def _queue_stream_frame(queue, frame) -> None:
+    """Enqueue one outbound frame, dropping the oldest item if necessary."""
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        queue.put_nowait(frame)
+    except asyncio.QueueFull:
+        pass
+
+
+class ViewerQueue(asyncio.Queue):
+    """Bounded per-viewer queue where screencast frames supersede in place.
+
+    A viewer only ever wants the newest frame: replacing a queued unsent
+    FRAME caps stale-frame latency at one frame no matter how far the
+    viewer's TCP/WS path falls behind, while STATE/ERROR messages keep
+    their bounded FIFO ordering. Reaches into asyncio.Queue's backing
+    deque — our own subclass, single consumer, event-loop thread only.
+    """
+
+    def put_frame(self, frame: bytes) -> None:
+        buffer = self._queue
+        for index in range(len(buffer) - 1, -1, -1):
+            item = buffer[index]
+            if item is not None and len(item) > 4 and item[4] == T_FRAME:
+                buffer[index] = frame
+                return
+        _queue_stream_frame(self, frame)
+
+
+class StreamHub:
+    """Shared-browser stream state: viewers, baton, browser generation.
+
+    Owned by the daemon; the single authority for who is driving. See
+    knowledge-base/knowledge/features/shared_browser.md (Piece 1).
+    """
+
+    def __init__(self) -> None:
+        self.baton = "agent"
+        self.generation = None
+        self.token = None
+        self.viewers: dict = {}
+        self.viewer_limit = None
+        self._next_viewer_id = 0
+        self._auto_release = None
+        self.state_extra = {"url": None, "title": None, "loading": False}
+        self.viewport = {
+            "width": STREAM_MAX_WIDTH,
+            "height": STREAM_MAX_HEIGHT,
+        }
+        self.on_state_change = None
+
+    def mint_generation(self, initial_baton=None) -> None:
+        """Mint a new browser identity and hello token."""
+        self.generation = str(uuid.uuid4())
+        self.token = secrets.token_hex(32)
+        if initial_baton in ("agent", "user"):
+            self.baton = initial_baton
+
+    def clear_generation(self) -> None:
+        self.generation = None
+        self.token = None
+
+    def state_payload(self) -> dict:
+        return {
+            "generation": self.generation,
+            "baton": self.baton,
+            "viewport": self.viewport,
+            **self.state_extra,
+        }
+
+    def update_page_state(
+        self,
+        *,
+        url=None,
+        title=None,
+        loading=None,
+    ) -> None:
+        """Update observable page fields and broadcast only real changes."""
+        changed = False
+        for key, value in (
+            ("url", url),
+            ("title", title),
+            ("loading", loading),
+        ):
+            if value is not None and self.state_extra.get(key) != value:
+                self.state_extra[key] = value
+                changed = True
+        if changed:
+            self._notify()
+
+    def take_baton(self) -> None:
+        self._set_baton("user")
+
+    def release_baton(self) -> None:
+        self._set_baton("agent")
+
+    def _set_baton(self, holder: str) -> None:
+        if self.baton != holder:
+            self.baton = holder
+            self._notify()
+
+    def _notify(self) -> None:
+        if self.on_state_change is not None:
+            self.on_state_change()
+
+    def add_viewer(self, queue, max_viewers: int):
+        """Atomically apply the daemon-wide cap and reserve a viewer slot."""
+        if not self.viewers or self.viewer_limit is None:
+            effective_limit = max_viewers
+        else:
+            effective_limit = min(self.viewer_limit, max_viewers)
+        self.viewer_limit = effective_limit
+        if len(self.viewers) >= effective_limit:
+            return None
+        if self._auto_release is not None:
+            self._auto_release.cancel()
+            self._auto_release = None
+        viewer_id = self._next_viewer_id
+        self._next_viewer_id += 1
+        self.viewers[viewer_id] = queue
+        return viewer_id
+
+    def remove_viewer(self, viewer_id) -> None:
+        self.viewers.pop(viewer_id, None)
+        if not self.viewers:
+            self.viewer_limit = None
+        if not self.viewers and self.baton == "user":
+            loop = asyncio.get_running_loop()
+            self._auto_release = loop.call_later(
+                BATON_GRACE_S, self._release_after_grace
+            )
+
+    def _release_after_grace(self) -> None:
+        self._auto_release = None
+        self.release_baton()
+
+    def broadcast(self, frame: bytes) -> None:
+        """Fan an ordered message to viewers; drop oldest for laggards."""
+        for queue in self.viewers.values():
+            _queue_stream_frame(queue, frame)
+
+    def broadcast_frame(self, frame: bytes) -> None:
+        """Fan a screencast frame; a queued unsent frame is superseded."""
+        for queue in self.viewers.values():
+            put_frame = getattr(queue, "put_frame", None)
+            if put_frame is not None:
+                put_frame(frame)
+            else:
+                _queue_stream_frame(queue, frame)
+
+    def shutdown_viewers(self, code: str) -> None:
+        """Tell every viewer the browser is gone and stop its writer."""
+        error_frame = encode_stream_frame(
+            T_ERROR,
+            json.dumps({"code": code, "message": "browser ended"}).encode(),
+        )
+        for queue in list(self.viewers.values()):
+            # Viewer queues are bounded. Reserve room for both the terminal
+            # ERROR and the close sentinel instead of risking a full queue
+            # swallowing the sentinel.
+            while queue.maxsize > 0 and queue.qsize() > queue.maxsize - 2:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            try:
+                queue.put_nowait(error_frame)
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                # The stream server uses maxsize=4, but keep shutdown safe for
+                # any smaller custom queue by prioritising the close sentinel.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+
+
+class ScreencastCdp:
+    """In-process CDP adapter for screencast frames and viewer input.
+
+    Uses browser-use's own attached CDP client; no debugging port and no
+    second connection. The call forms were verified in
+    knowledge-base/knowledge/superpowers/plans/notes-browseruse-cdp-api.md.
+    """
+
+    def __init__(self, session, hub) -> None:
+        self._session = session
+        self._hub = hub
+        self._cdp = None
+        self._main_frame_id = None
+        self._registered_clients = {}
+        self._session_clients = {}
+        self._running = False
+
+    def _is_current_event(self, event_session_id) -> bool:
+        return (
+            self._cdp is not None
+            and (
+                event_session_id is None
+                or event_session_id == self._cdp.session_id
+            )
+        )
+
+    def _register_client(self, client) -> None:
+        """Register this adapter's callbacks once per CDP client wrapper."""
+        identity = id(client)
+        if identity in self._registered_clients:
+            return
+        client.register.Page.screencastFrame(self._on_frame_event)
+        client.register.Page.frameNavigated(self._on_navigated_event)
+        client.register.Page.frameStartedLoading(
+            self._on_frame_started_loading_event
+        )
+        client.register.Page.frameStoppedLoading(
+            self._on_frame_stopped_loading_event
+        )
+        self._registered_clients[identity] = client
+
+    async def start(self, target_id=None) -> None:
+        """Start or move the screencast to the latest focused target."""
+        requested_target = target_id or self._session.agent_focus_target_id
+        if (
+            self._running
+            and self._cdp is not None
+            and self._cdp.target_id == requested_target
+        ):
+            return
+        if self._running:
+            await self.stop()
+
+        cdp = await self._session.get_or_create_cdp_session(
+            target_id=requested_target
+        )
+        client = cdp.cdp_client
+
+        # Resolve the main frame BEFORE publishing this session as current.
+        # _register_client subscribes once per client, so when the screencast
+        # moves to a target that reuses an already-registered client, the
+        # handlers are live the moment _cdp is set — and every one of them
+        # gates on _main_frame_id. Publishing _cdp first and resolving the
+        # frame id a couple of awaits later opened a window where
+        # frameStartedLoading was discarded as "not the main frame", so the
+        # viewer silently lost the loading:true edge for that navigation and
+        # anything waiting on the transition waited forever.
+        main_frame = None
+        try:
+            frame_tree = await client.send.Page.getFrameTree(
+                session_id=cdp.session_id
+            )
+            main_frame = (frame_tree.get("frameTree") or {}).get("frame") or {}
+        except Exception:
+            pass
+
+        # No await between these two: the pair must land atomically for the
+        # handlers, which read them together.
+        self._cdp = cdp
+        self._main_frame_id = (main_frame or {}).get("id")
+        self._register_client(client)
+        self._session_clients[cdp.session_id] = client
+        if main_frame is not None:
+            self._hub.update_page_state(
+                url=main_frame.get("url"),
+                loading=False,
+            )
+
+        try:
+            metrics = await client.send.Page.getLayoutMetrics(
+                session_id=cdp.session_id
+            )
+            css_viewport = (
+                metrics.get("cssVisualViewport")
+                or metrics.get("cssLayoutViewport")
+                or {}
+            )
+            self._hub.viewport = {
+                "width": int(css_viewport.get("clientWidth", STREAM_MAX_WIDTH)),
+                "height": int(css_viewport.get("clientHeight", STREAM_MAX_HEIGHT)),
+            }
+        except Exception:
+            pass
+        try:
+            self._hub.update_page_state(
+                url=await self._session.get_current_page_url(),
+                title=await self._session.get_current_page_title(),
+                loading=False,
+            )
+        except Exception:
+            pass
+
+        # Mark running before the command can yield an initial event. Otherwise
+        # that first frame can be dropped without an ACK and stall CDP.
+        self._running = True
+        try:
+            await client.send.Page.startScreencast(
+                params={
+                    "format": "jpeg",
+                    "quality": STREAM_QUALITY,
+                    "maxWidth": STREAM_MAX_WIDTH,
+                    "maxHeight": STREAM_MAX_HEIGHT,
+                    "everyNthFrame": STREAM_EVERY_NTH,
+                },
+                session_id=cdp.session_id,
+            )
+        except Exception:
+            self._running = False
+            raise
+        self._hub._notify()
+        log("screencast started")
+
+    def _on_frame_event(self, params, session_id=None) -> None:
+        asyncio.create_task(self._handle_frame(params, session_id))
+
+    async def _handle_frame(self, params, event_session_id=None) -> None:
+        current_cdp = self._cdp
+        ack_session_id = event_session_id or (
+            current_cdp.session_id if current_cdp is not None else None
+        )
+        ack_client = self._session_clients.get(event_session_id)
+        if ack_client is None and current_cdp is not None:
+            ack_client = current_cdp.cdp_client
+        try:
+            if not self._is_current_event(event_session_id) or not self._running:
+                return
+            jpeg = base64.b64decode(params["data"])
+            metadata = params.get("metadata") or {}
+            header = {
+                "generation": self._hub.generation,
+                "w": metadata.get("deviceWidth"),
+                "h": metadata.get("deviceHeight"),
+                "ts": time.time(),
+            }
+            self._hub.broadcast_frame(
+                encode_stream_frame(
+                    T_FRAME, encode_frame_payload(header, jpeg)
+                )
+            )
+        finally:
+            # ACK after hand-off to the bounded viewer queues. This preserves
+            # CDP source backpressure while slow viewers drop old frames.
+            try:
+                if ack_client is not None and ack_session_id is not None:
+                    await ack_client.send.Page.screencastFrameAck(
+                        params={"sessionId": params["sessionId"]},
+                        session_id=ack_session_id,
+                    )
+            except Exception:
+                pass
+
+    def _on_navigated_event(self, params, session_id=None) -> None:
+        if not self._is_current_event(session_id):
+            return
+        frame = params.get("frame") or {}
+        if frame.get("parentId"):
+            return
+        self._main_frame_id = frame.get("id")
+        self._hub.update_page_state(url=frame.get("url"))
+
+    def _on_frame_started_loading_event(self, params, session_id=None) -> None:
+        if not self._is_current_event(session_id):
+            return
+        if params.get("frameId") != self._main_frame_id:
+            return
+        self._hub.update_page_state(loading=True)
+
+    def _on_frame_stopped_loading_event(self, params, session_id=None) -> None:
+        if not self._is_current_event(session_id):
+            return
+        if params.get("frameId") != self._main_frame_id:
+            return
+        self._hub.update_page_state(loading=False)
+        asyncio.create_task(self._refresh_page_state(session_id))
+
+    async def _refresh_page_state(self, expected_session_id) -> None:
+        if not self._is_current_event(expected_session_id):
+            return
+        try:
+            url = await self._session.get_current_page_url()
+            title = await self._session.get_current_page_title()
+        except Exception:
+            return
+        if not self._is_current_event(expected_session_id):
+            return
+        self._hub.update_page_state(url=url, title=title)
+
+    async def dispatch_input(self, event: dict) -> None:
+        if self._cdp is None:
+            return
+        client = self._cdp.cdp_client
+        session_id = self._cdp.session_id
+        kind = event.get("kind")
+        params = event.get("params") or {}
+        if kind == "mouse":
+            await client.send.Input.dispatchMouseEvent(
+                params=params, session_id=session_id
+            )
+        elif kind == "key":
+            await client.send.Input.dispatchKeyEvent(
+                params=params, session_id=session_id
+            )
+        elif kind == "insertText":
+            # Viewer clipboard paste. The cockpit caps the text client-side;
+            # this cap is defense in depth against a hand-rolled client.
+            text = str(params.get("text", ""))[:INSERT_TEXT_MAX_CHARS]
+            if text:
+                await client.send.Input.insertText(
+                    params={"text": text}, session_id=session_id
+                )
+        elif kind == "wheel":
+            await client.send.Input.dispatchMouseEvent(
+                params={**params, "type": "mouseWheel"},
+                session_id=session_id,
+            )
+
+    async def stop(self) -> None:
+        was_running = self._running
+        self._running = False
+        if self._cdp is not None and was_running:
+            try:
+                await self._cdp.cdp_client.send.Page.stopScreencast(
+                    session_id=self._cdp.session_id
+                )
+            except Exception:
+                pass
+        log("screencast stopped")
 
 
 def log(msg: str) -> None:
@@ -68,8 +674,260 @@ def log(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Local file rendering (file:// → loopback HTTP)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _QuietHandler(SimpleHTTPRequestHandler):
+    """SimpleHTTPRequestHandler that logs through ``log`` (stderr, prefixed).
+
+    The default handler writes access lines straight to stderr unprefixed. Route
+    them through ``log`` instead so the daemon log stays greppable — the fetches
+    a page makes (missing CSS, 404 assets) are the first thing you want when a
+    mockup renders unstyled.
+    """
+
+    def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+        log("http " + (fmt % args))
+
+
+class LocalFileServer:
+    """Serves local files to the browser over a loopback HTTP listener.
+
+    Why this exists: browser-use's security watchdog rejects any URL without a
+    hostname *before* it consults ``allowed_domains``::
+
+        # browser_use/browser/watchdogs/security_watchdog.py
+        if parsed.scheme in ['data', 'blob']:
+            return True
+        host = parsed.hostname
+        if not host:
+            return False          # ← file:///... lands here, unconditionally
+
+    So ``file://`` is refused on every workspace backend and no setting turns it
+    off. Since every mockup an agent writes is a local file, the practical effect
+    was that agents could not look at their own work — they'd conclude no
+    renderer existed at all. See knowledge-base/knowledge/issues/vm_workspace_missing_browser_exec.md.
+
+    Why serve over HTTP instead of patching the watchdog: patching a vendored
+    library's security control is fragile across upgrades, and browser-use is
+    pinned but not frozen. Navigating to a real ``http://`` URL is the supported
+    path and needs no patching.
+
+    Why the root is bounded: a page served from ``http://127.0.0.1:<port>`` shares
+    an origin with everything else under that port, so the served root is exactly
+    what a rendered page could fetch and exfiltrate. Rooting at ``/`` would let
+    any rendered HTML read the whole disk — strictly worse than ``file://``, which
+    Chrome gives an opaque origin per document. So the root is the agent's own
+    workspace: content the agent already controls, and which by policy holds no
+    internal credentials (docs feedback: creds never in the workspace). Files
+    outside the workspace fall back to their own directory.
+
+    The listener binds 127.0.0.1 inside the workspace, so it stays within the
+    same loopback boundary browser-exec exists to enforce — it is never reachable
+    from the pod/VM network.
+    """
+
+    def __init__(self) -> None:
+        self._servers: dict[str, tuple] = {}
+        self._lock = threading.Lock()
+
+    def _root_for(self, path: Path) -> Path:
+        """Widest sanctioned directory containing ``path``."""
+        for candidate in (SERVE_ROOT, WORKSPACE_DEFAULT):
+            if not candidate:
+                continue
+            try:
+                root = Path(candidate).resolve()
+            except OSError:
+                continue
+            if root.is_dir() and path.is_relative_to(root):
+                return root
+        # Outside the workspace: expose only the file's own directory, so a
+        # stray render can't turn into a filesystem-wide read.
+        return path.parent
+
+    def _port_for(self, root: Path) -> int:
+        key = str(root)
+        with self._lock:
+            existing = self._servers.get(key)
+            if existing is not None:
+                return existing[1]
+            handler = partial(_QuietHandler, directory=key)
+            # Port 0 → kernel picks a free ephemeral port; bound to loopback only.
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            port = httpd.server_address[1]
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            self._servers[key] = (httpd, port)
+            log(f"serving {root} on http://127.0.0.1:{port}/ (local file render)")
+            return port
+
+    def url_for(self, url: str) -> str:
+        """Translate a ``file://`` URL to a served ``http://`` one. Others pass through."""
+        parsed = urlparse(url)
+        if parsed.scheme != "file":
+            return url
+
+        path = Path(unquote(parsed.path)).resolve()
+        if not path.exists():
+            raise ValueError(f"local file not found: {path}")
+        if path.is_dir():
+            raise ValueError(f"refusing to render a directory: {path}")
+
+        root = self._root_for(path)
+        port = self._port_for(root)
+        served = f"http://127.0.0.1:{port}/{quote(path.relative_to(root).as_posix())}"
+        if parsed.query:
+            served += f"?{parsed.query}"
+        if parsed.fragment:
+            served += f"#{parsed.fragment}"
+        log(f"file:// is blocked by browser-use — rendering via {served}")
+        return served
+
+    def close(self) -> None:
+        with self._lock:
+            for httpd, _ in self._servers.values():
+                try:
+                    httpd.shutdown()
+                    httpd.server_close()
+                except Exception:
+                    pass
+            self._servers.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Daemon: holds the persistent browser-use session
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _parse_chromium_version(version_output: str) -> str | None:
+    """Extract the dotted version from ``chromium --version`` output."""
+    match = re.search(r"(\d+\.\d+\.\d+\.\d+)", version_output or "")
+    return match.group(1) if match else None
+
+
+_UA_CACHE: list = []  # memoized [ua_or_None]; the binary never changes mid-run
+
+
+def _clean_user_agent() -> str | None:
+    """Linux Chrome UA matching the real binary version, minus 'Headless'.
+
+    Deriving the version from the actual binary keeps the UA consistent
+    with what the browser otherwise reports; a mismatched hardcoded
+    version would be a stronger bot signal than the one being removed.
+    """
+    if _UA_CACHE:
+        return _UA_CACHE[0]
+    user_agent = None
+    try:
+        result = subprocess.run(
+            [CHROMIUM_PATH, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        version = _parse_chromium_version(result.stdout)
+        if version:
+            user_agent = (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+            )
+    except Exception as exc:
+        log(f"user-agent probe failed: {exc}")
+    _UA_CACHE.append(user_agent)
+    return user_agent
+
+
+_XVFB_PROC: list = []  # daemon-lifetime handle; started at most once
+
+
+def _x_socket_ready(display: str) -> bool:
+    """True once the X server's unix socket for ``display`` exists."""
+    num = display.lstrip(":").split(".")[0]
+    return Path(f"/tmp/.X11-unix/X{num}").exists()
+
+
+async def _ensure_display() -> bool:
+    """Bring up an Xvfb display for headful Chromium. False → stay headless.
+
+    Idempotent and deliberately non-fatal. A workspace without Xvfb, or an Xvfb
+    that refuses to start, degrades to the previous headless behaviour rather
+    than breaking every ``browser_*`` tool — the same posture the daemon takes
+    everywhere else. The cost of degrading is a browser that fails bot checks,
+    not a browser that fails to run.
+    """
+    if not HEADFUL:
+        return False
+    if _XVFB_PROC:
+        return _XVFB_PROC[0].poll() is None
+    # An inherited display wins: a real X server, or an outer `xvfb-run` that
+    # already wrapped us. Never start a second server over a working one.
+    inherited = os.environ.get("DISPLAY")
+    if inherited and _x_socket_ready(inherited):
+        log(f"using inherited DISPLAY={inherited}")
+        return True
+    # Adopt an Xvfb already sitting on our display. A SIGKILLed daemon never
+    # runs _stop_display, so its Xvfb outlives it; without this the replacement
+    # daemon's spawn loses the address-in-use race and degrades to headless for
+    # the rest of the workspace's life — a silent fingerprint regression whose
+    # only symptom is bot checks starting to fail again.
+    if _x_socket_ready(DISPLAY_NAME):
+        os.environ["DISPLAY"] = DISPLAY_NAME
+        log(f"adopting existing display {DISPLAY_NAME}")
+        return True
+    if shutil.which("Xvfb") is None:
+        log("Xvfb not installed; falling back to headless")
+        return False
+    try:
+        proc = subprocess.Popen(
+            [
+                "Xvfb",
+                DISPLAY_NAME,
+                "-screen",
+                "0",
+                f"{SCREEN_WIDTH}x{SCREEN_HEIGHT}x24",
+                "-nolisten",
+                "tcp",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        log(f"Xvfb spawn failed ({exc}); falling back to headless")
+        return False
+
+    deadline = time.monotonic() + XVFB_START_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log(f"Xvfb exited rc={proc.returncode}; falling back to headless")
+            return False
+        if _x_socket_ready(DISPLAY_NAME):
+            os.environ["DISPLAY"] = DISPLAY_NAME
+            _XVFB_PROC.append(proc)
+            log(f"Xvfb up on {DISPLAY_NAME} ({SCREEN_WIDTH}x{SCREEN_HEIGHT})")
+            return True
+        await asyncio.sleep(0.1)
+
+    log("Xvfb did not come up in time; falling back to headless")
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return False
+
+
+def _stop_display() -> None:
+    """Reap Xvfb on daemon shutdown so a restart gets a clean display."""
+    while _XVFB_PROC:
+        proc = _XVFB_PROC.pop()
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 class BrowserDaemon:
@@ -78,7 +936,15 @@ class BrowserDaemon:
     def __init__(self) -> None:
         self._session = None
         self._lock = asyncio.Lock()
+        self._screencast_lock = asyncio.Lock()
+        self._screencast = None
+        self._focus_change_task = None
+        self._focus_change_revision = 0
+        self._focus_handler = None
+        self._start_page_task = None
         self.should_exit = False
+        self._files = LocalFileServer()
+        self.hub = StreamHub()
 
     async def _get_session(self):
         """Return a healthy BrowserSession, (re)starting Chromium if needed."""
@@ -93,28 +959,176 @@ class BrowserDaemon:
                 await self._close_session()
 
         Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
-        # browser-use launches Chromium via Playwright (PLAYWRIGHT_BROWSERS_PATH).
-        # No CDP port, no remote debugging. The workspace pod can't run Chromium's
-        # sandbox (no user namespaces), so disable it and avoid /dev/shm + GPU —
-        # the same flags the old _start_remote_chromium used.
+        # browser-use launches Chromium from the explicit executable_path below
+        # (the agent-chromium symlink → Playwright's Chromium). Pinning the binary
+        # keeps browser-use off its auto-detect/auto-install path. No CDP port, no
+        # remote debugging. The workspace pod can't run Chromium's sandbox (no user
+        # namespaces), so disable it and avoid /dev/shm + GPU — the same flags the
+        # old _start_remote_chromium used.
+        #
+        # Fingerprint hygiene. AutomationControlled clears navigator.webdriver;
+        # the UA override keeps the real binary's version but drops any Headless
+        # marker. The remaining signals — and they are the ones that actually
+        # fail bot checks — are geometry coherence, WebGL presence and the
+        # permission surface; see the HEADFUL block above for the measurements.
+        headful = await _ensure_display()
+        args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        if headful:
+            # Software GL, but *present*. Without a GPU this still reports
+            # SwiftShader, which is a weak signal; having no WebGL context at
+            # all is a strong one. --window-size sizes the real window, which
+            # in turn sizes the viewport (no device-metrics override below).
+            args += [
+                "--use-gl=angle",
+                "--use-angle=swiftshader",
+                "--enable-unsafe-swiftshader",
+                f"--window-size={SCREEN_WIDTH},{SCREEN_HEIGHT}",
+                "--window-position=0,0",
+            ]
+        else:
+            args.append("--disable-gpu")
+        user_agent = _clean_user_agent()
+        if user_agent:
+            args.append(f"--user-agent={user_agent}")
+        # Headful only: let the window drive the viewport instead of overriding
+        # device metrics, so inner ≤ outer ≤ screen holds. Headless has no real
+        # window, so it keeps browser-use's default sizing.
+        sizing = (
+            {
+                "no_viewport": True,
+                "viewport": None,
+                "window_size": {"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT},
+            }
+            if headful
+            else {}
+        )
         session = BrowserSession(
-            headless=True,
+            headless=not headful,
+            executable_path=CHROMIUM_PATH,
             user_data_dir=PROFILE_DIR,
             chromium_sandbox=False,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            # browser-use grants a permission set by default. A profile where
+            # Notification.permission is already "granted" without anyone having
+            # been prompted is a long-standing automation tell; real first-visit
+            # state is "default".
+            permissions=[],
+            args=args,
+            **sizing,
         )
         await session.start()
         self._session = session
-        log("Chromium session started")
+        self._install_focus_handler(session)
+        log(f"Chromium session started (headful={headful})")
         return session
 
+    async def _open_start_page(self) -> None:
+        """Navigate a still-blank cold-opened browser to the start page."""
+        # Decide under the lock, load outside it. Holding the daemon-wide
+        # lock across the load serialises every other action behind a page
+        # nobody asked for — and the victim is ensure_screencast, which
+        # is what SUBSCRIBES to the page events. Attaching late does not just
+        # delay the stream, it loses information: a navigation that starts
+        # before the screencast attaches never delivers its frameStartedLoading,
+        # so the viewer sees a page change with no loading:true edge and
+        # anything waiting on that transition waits forever.
+        try:
+            async with self._lock:
+                session = await self._get_session()
+                url = await session.get_current_page_url()
+                if url and url != "about:blank":
+                    return
+            # Deliberately NOT wrapped in asyncio.wait_for. Cancelling a
+            # navigate_to mid-flight does not abort the navigation, it
+            # abandons a browser-use NavigateToUrlEvent inside its event bus:
+            # the next navigation then queues behind the orphan until bubus
+            # times it out 30s later, with duplicate CDP responses along the
+            # way. A real navigation arriving while this one is still in
+            # flight simply supersedes it, which is the desired outcome —
+            # the start page only ever fires on an otherwise blank page.
+            await session.navigate_to(STREAM_START_URL)
+        except Exception as exc:
+            log(f"start page navigation failed: {exc}")
+
+    def _install_focus_handler(self, session) -> None:
+        """Subscribe once; the event-bus callback itself never awaits locks."""
+        from browser_use.browser.events import AgentFocusChangedEvent
+
+        def on_agent_focus_changed(event) -> None:
+            del event
+            self._focus_change_revision += 1
+            if (
+                self._focus_change_task is None
+                or self._focus_change_task.done()
+            ):
+                self._focus_change_task = asyncio.create_task(
+                    self._follow_agent_focus()
+                )
+
+        session.event_bus.on(AgentFocusChangedEvent, on_agent_focus_changed)
+        self._focus_handler = on_agent_focus_changed
+
+    async def _follow_agent_focus(self) -> None:
+        """Coalesce focus events and switch under screencast→action locks."""
+        task = asyncio.current_task()
+        try:
+            while True:
+                await asyncio.sleep(0)
+                revision = self._focus_change_revision
+                if not self.hub.viewers:
+                    return
+                async with self._screencast_lock:
+                    if not self.hub.viewers:
+                        return
+                    async with self._lock:
+                        session = self._session
+                        if session is None:
+                            return
+                        target_id = session.agent_focus_target_id
+                        if target_id is None:
+                            return
+                        if self._screencast is None:
+                            self._screencast = ScreencastCdp(session, self.hub)
+                        await self._screencast.start(target_id=target_id)
+                if revision == self._focus_change_revision:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log(f"active-target screencast switch failed: {exc}")
+        finally:
+            if self._focus_change_task is task:
+                self._focus_change_task = None
+
     async def _close_session(self) -> None:
+        errors = []
+        focus_task = self._focus_change_task
+        if focus_task is not None and focus_task is not asyncio.current_task():
+            focus_task.cancel()
+            await asyncio.gather(focus_task, return_exceptions=True)
+        self._focus_change_task = None
+        self._focus_handler = None
+        if self._screencast is not None:
+            try:
+                await self._screencast.stop()
+            except Exception as exc:
+                errors.append(exc)
+            self._screencast = None
         if self._session is not None:
             try:
                 await self._session.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(exc)
             self._session = None
+        self.hub.clear_generation()
+        self.hub.shutdown_viewers("browser_gone")
+        if errors:
+            raise RuntimeError(
+                f"browser session shutdown failed ({len(errors)} error(s))"
+            ) from errors[0]
 
     # ── action handlers (mirror browser_direct.py helpers) ──
 
@@ -156,6 +1170,11 @@ class BrowserDaemon:
         except Exception:
             pass
 
+        self.hub.update_page_state(
+            url=result["url"],
+            title=result["title"],
+        )
+        result["baton"] = self.hub.baton
         return result
 
     async def _click(self, session, ref: int) -> None:
@@ -166,9 +1185,43 @@ class BrowserDaemon:
             raise ValueError(
                 f"Element ref={ref} not found. Use snapshot to get current refs."
             )
+        opens_new_tab = (
+            (getattr(node, "attributes", {}) or {}).get("target", "").lower()
+            == "_blank"
+        )
+        existing_targets = (
+            {tab.target_id for tab in await session.get_tabs()}
+            if opens_new_tab
+            else set()
+        )
         event = session.event_bus.dispatch(ClickElementEvent(node=node))
         await event
         await event.event_result(raise_if_any=True)
+        if opens_new_tab:
+            await self._switch_to_new_click_target(session, existing_targets)
+
+    async def _switch_to_new_click_target(self, session, existing_targets) -> None:
+        """Make browser-use's newest `_blank` target the explicit agent focus."""
+        from browser_use.browser.events import SwitchTabEvent
+
+        new_target_id = None
+        for _ in range(40):
+            tabs = await session.get_tabs()
+            new_targets = [
+                tab.target_id
+                for tab in tabs
+                if tab.target_id not in existing_targets
+            ]
+            if new_targets:
+                new_target_id = new_targets[-1]
+                break
+            await asyncio.sleep(0.05)
+        if new_target_id is not None:
+            switch = session.event_bus.dispatch(
+                SwitchTabEvent(target_id=new_target_id)
+            )
+            await switch
+            await switch.event_result(raise_if_any=True)
 
     async def _type(self, session, ref: int, text: str, clear: bool = True) -> None:
         from browser_use.browser.events import TypeTextEvent
@@ -192,8 +1245,11 @@ class BrowserDaemon:
             raise ValueError(
                 f"Element ref={ref} not found. Use snapshot to get current refs."
             )
+        # browser-use's SelectDropdownOptionEvent selects by the option's visible
+        # text; the field is ``text`` (not ``option``). Passing the wrong kwarg
+        # trips a pydantic "text Field required" error and the select never runs.
         event = session.event_bus.dispatch(
-            SelectDropdownOptionEvent(node=node, option=value)
+            SelectDropdownOptionEvent(node=node, text=value)
         )
         await event
         await event.event_result(raise_if_any=True)
@@ -210,13 +1266,102 @@ class BrowserDaemon:
             ScrollEvent(direction=direction, amount=amount, node=node)
         )
         await event
-        await event.event_result(raise_if_any=True)
+        # ScrollEvent's handler returns None (EventResult[NoneType]); the default
+        # raise_if_none=True would reject a perfectly good scroll with "Expected at
+        # least one handler to return a non-None result". Keep raise_if_any so real
+        # handler exceptions still surface.
+        await event.event_result(raise_if_any=True, raise_if_none=False)
 
     async def _back(self, session) -> None:
         page = await session.get_current_page()
         if page is not None:
             await page.evaluate("() => { window.history.back(); }")
             await asyncio.sleep(0.5)
+
+    # ── shared-browser streaming hooks ──
+
+    async def ensure_screencast(self) -> None:
+        """Start (or restart) the screencast while viewers exist."""
+        if not self.hub.viewers:
+            return
+        async with self._screencast_lock:
+            if not self.hub.viewers:
+                return
+            if (
+                self._screencast is not None
+                and self._screencast._running
+            ):
+                return
+            async with self._lock:
+                session = await self._get_session()
+            if self._screencast is None:
+                self._screencast = ScreencastCdp(session, self.hub)
+            await self._screencast.start(
+                target_id=session.agent_focus_target_id
+            )
+
+    async def stop_screencast(self) -> None:
+        async with self._screencast_lock:
+            if self.hub.viewers:
+                return
+            screencast = self._screencast
+            if screencast is not None:
+                await screencast.stop()
+
+    async def dispatch_user_input(self, event: dict) -> None:
+        async with self._lock:
+            if self.hub.baton != "user":
+                return
+            screencast = self._screencast
+            if screencast is not None and screencast._running:
+                await screencast.dispatch_input(event)
+
+    async def take_user_baton(self) -> None:
+        """Transfer control only after any in-flight agent action finishes."""
+        async with self._lock:
+            self.hub.take_baton()
+
+    async def release_user_baton(self) -> None:
+        """Finish any in-flight user mutation before returning control."""
+        async with self._lock:
+            self.hub.release_baton()
+
+    async def user_control_nav(self, op: str, url=None) -> None:
+        """Run one viewer navigation mutation under the daemon action lock."""
+        if self.hub.baton != "user":
+            return
+        async with self._lock:
+            if self.hub.baton != "user":
+                return
+            session = await self._get_session()
+            if op == "navigate":
+                await session.navigate_to(
+                    validate_user_nav(url or "", self._files)
+                )
+            elif op == "back":
+                await self._back(session)
+            elif op == "reload":
+                page = await session.get_current_page()
+                if page is not None:
+                    await page.evaluate("() => { location.reload(); }")
+            try:
+                self.hub.update_page_state(
+                    url=await session.get_current_page_url(),
+                    title=await session.get_current_page_title(),
+                )
+            except Exception:
+                pass
+
+    def _user_driving_refusal(self) -> dict:
+        return {
+            "error": "user_is_driving",
+            "url": self.hub.state_extra.get("url"),
+            "message": (
+                "The user is currently driving the shared browser. "
+                "Read-only actions (snapshot, screenshot) still work; "
+                "ask the user to release control before taking actions."
+            ),
+        }
 
     async def handle(self, req: dict) -> dict:
         """Dispatch one request to the live session. Always returns a dict."""
@@ -225,29 +1370,85 @@ class BrowserDaemon:
 
         if action not in VALID_ACTIONS:
             return {"error": f"unknown action: {action!r}"}
+        if self.should_exit and action != "shutdown":
+            return {"error": "browser daemon is shutting down"}
+
+        # While the user drives, refuse mutating agent actions up front:
+        # never spawn Chromium and never take the action lock.
+        if action in MUTATING_ACTIONS and self.hub.baton == "user":
+            return self._user_driving_refusal()
 
         # Serialize: browser-use sessions are not concurrency-safe, and the
         # agent issues actions one at a time anyway.
         async with self._lock:
             try:
+                # A viewer may have requested the baton while this action was
+                # waiting for the lock. Recheck at the serialization boundary.
+                if action in MUTATING_ACTIONS and self.hub.baton == "user":
+                    return self._user_driving_refusal()
+
                 if action == "shutdown":
-                    await self._close_session()
+                    cleanup_error = None
+                    try:
+                        await self._close_session()
+                    except Exception as exc:
+                        cleanup_error = exc
+                    try:
+                        self._files.close()
+                    except Exception as exc:
+                        cleanup_error = cleanup_error or exc
+                    # Always retire the daemon after a shutdown request. The
+                    # client performs an exact /proc + socket postcondition and
+                    # can TERM/KILL any exact-profile orphan if graceful
+                    # browser-use cleanup failed.
                     self.should_exit = True
-                    return {"ok": True}
+                    if cleanup_error is not None:
+                        return {"error": "browser shutdown required forced cleanup"}
+                    return {"ok": True, "pid": os.getpid()}
 
                 session = await self._get_session()
 
+                if action == "stream_info":
+                    if self.hub.generation is None:
+                        self.hub.mint_generation(args.get("initial_baton"))
+                        # Cold open: land on the start page in the background
+                        # so this response isn't held behind a page load.
+                        # Backgrounding alone does NOT free the viewer path —
+                        # the task holds the daemon-wide lock while it loads,
+                        # so anything that takes that lock (ensure_screencast,
+                        # user navigation) waits behind it. What keeps a slow
+                        # start page from stranding viewers is that viewer
+                        # STATE is delivered without ever taking that lock.
+                        # Lifecycle bootstrap, not agent driving —
+                        # deliberately outside the baton check.
+                        self._start_page_task = asyncio.create_task(
+                            self._open_start_page()
+                        )
+                    return {
+                        "generation": self.hub.generation,
+                        "token": self.hub.token,
+                        "port": STREAM_PORT,
+                        "baton": self.hub.baton,
+                    }
                 if action == "navigate":
-                    await session.navigate_to(args["url"])
+                    # file:// is blocked outright by browser-use's watchdog, so a
+                    # local path is rendered through a loopback HTTP listener
+                    # rooted at the workspace. Non-file URLs pass through
+                    # untouched. See LocalFileServer.
+                    await session.navigate_to(self._files.url_for(args["url"]))
                     return await self._page_state(session, args)
                 if action == "snapshot":
                     return await self._page_state(session, args)
                 if action == "screenshot":
                     shot = await session.take_screenshot()
+                    url = await session.get_current_page_url()
+                    title = await session.get_current_page_title()
+                    self.hub.update_page_state(url=url, title=title)
                     return {
-                        "url": await session.get_current_page_url(),
-                        "title": await session.get_current_page_title(),
+                        "url": url,
+                        "title": title,
                         "screenshot": base64.b64encode(shot).decode(),
+                        "baton": self.hub.baton,
                     }
                 if action == "click":
                     await self._click(session, int(args["ref"]))
@@ -281,6 +1482,188 @@ class BrowserDaemon:
                 return {"error": f"{action} failed: {e}"}
 
         return {"error": f"unhandled action: {action}"}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Stream server (loopback TCP side-channel for the shared browser)
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def _send_stream_error(writer, code: str, message: str) -> None:
+    try:
+        writer.write(
+            encode_stream_frame(
+                T_ERROR,
+                json.dumps({"code": code, "message": message}).encode(),
+            )
+        )
+        await writer.drain()
+    except Exception:
+        pass
+
+
+async def _handle_stream_conn(daemon, reader, writer) -> None:
+    hub = daemon.hub
+    try:
+        frame_type, payload = await asyncio.wait_for(
+            read_stream_frame(reader), timeout=5.0
+        )
+        hello = json.loads(payload.decode()) if frame_type == T_HELLO else {}
+    except Exception:
+        writer.close()
+        return
+
+    if not hub.token or hello.get("token") != hub.token:
+        await _send_stream_error(
+            writer,
+            "unauthorized",
+            "invalid stream hello token",
+        )
+        writer.close()
+        return
+
+    max_viewers = hello.get("max_viewers")
+    if (
+        isinstance(max_viewers, bool)
+        or not isinstance(max_viewers, int)
+        or not 1 <= max_viewers <= 16
+    ):
+        await _send_stream_error(
+            writer,
+            "invalid_hello",
+            "max_viewers must be an integer within [1, 16]",
+        )
+        writer.close()
+        return
+
+    queue = ViewerQueue(maxsize=4)
+    viewer_id = hub.add_viewer(queue, max_viewers)
+    if viewer_id is None:
+        await _send_stream_error(
+            writer,
+            "viewer_limit",
+            "shared browser viewer limit reached",
+        )
+        writer.close()
+        return
+    tasks = []
+    log(
+        f"stream viewer {viewer_id} connected "
+        f"({len(hub.viewers)} total)"
+    )
+    try:
+        queue.put_nowait(
+            encode_stream_frame(
+                T_STATE, json.dumps(hub.state_payload()).encode()
+            )
+        )
+
+        async def pump_out():
+            while True:
+                frame = await queue.get()
+                if frame is None:
+                    break
+                writer.write(frame)
+                await writer.drain()
+
+        async def pump_in():
+            while True:
+                frame_type, payload = await read_stream_frame(reader)
+                if frame_type not in (T_INPUT, T_CONTROL):
+                    continue
+                message = json.loads(payload.decode())
+                if frame_type == T_INPUT:
+                    if hub.baton == "user":
+                        await daemon.dispatch_user_input(message)
+                    continue
+
+                op = message.get("op")
+                if op == "take_baton":
+                    await daemon.take_user_baton()
+                elif op == "release_baton":
+                    await daemon.release_user_baton()
+                elif op in ("navigate", "back", "reload"):
+                    try:
+                        await daemon.user_control_nav(
+                            op, message.get("url")
+                        )
+                    except ValueError as exc:
+                        _queue_stream_frame(
+                            queue,
+                            encode_stream_frame(
+                                T_ERROR,
+                                json.dumps(
+                                    {
+                                        "code": "navigation_rejected",
+                                        "message": str(exc),
+                                    }
+                                ).encode(),
+                            ),
+                        )
+
+        # Pumps first, THEN the screencast. The STATE above is already
+        # queued, and pump_out is the only thing that can put it on the
+        # wire — starting the screencast first makes a viewer's whole
+        # handshake hostage to daemon work it does not depend on. That is
+        # not hypothetical: ensure_screencast waits on the daemon-wide
+        # lock, so a cold-open start-page navigation holding that lock
+        # left viewers with no STATE until the page finished loading.
+        tasks = [
+            asyncio.create_task(pump_out()),
+            asyncio.create_task(pump_in()),
+        ]
+        await daemon.ensure_screencast()
+        done, _ = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            try:
+                task.result()
+            except (asyncio.CancelledError, asyncio.IncompleteReadError):
+                pass
+            except Exception as exc:
+                log(f"stream viewer {viewer_id} pump ended: {exc}")
+    except Exception as exc:
+        log(f"stream viewer {viewer_id} setup ended: {exc}")
+    finally:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        hub.remove_viewer(viewer_id)
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        log(
+            f"stream viewer {viewer_id} disconnected "
+            f"({len(hub.viewers)} total)"
+        )
+        if not hub.viewers:
+            await daemon.stop_screencast()
+
+
+async def start_stream_server(daemon):
+    """Bind the loopback-only listener and wire STATE broadcasting."""
+
+    def broadcast_state():
+        daemon.hub.broadcast(
+            encode_stream_frame(
+                T_STATE, json.dumps(daemon.hub.state_payload()).encode()
+            )
+        )
+
+    daemon.hub.on_state_change = broadcast_state
+    server = await asyncio.start_server(
+        lambda reader, writer: _handle_stream_conn(
+            daemon, reader, writer
+        ),
+        "127.0.0.1",
+        STREAM_PORT,
+    )
+    log(f"stream listener on 127.0.0.1:{STREAM_PORT}")
+    return server
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -335,9 +1718,20 @@ async def _serve() -> int:
         os.chmod(SOCKET_PATH, 0o600)
     except OSError:
         pass
+    try:
+        stream_server = await start_stream_server(daemon)
+    except Exception:
+        server.close()
+        await server.wait_closed()
+        raise
     log(f"listening on {SOCKET_PATH}")
-    async with server:
-        await stop_event.wait()
+    try:
+        async with server:
+            await stop_event.wait()
+    finally:
+        stream_server.close()
+        await stream_server.wait_closed()
+        _stop_display()
     log("shutting down")
     try:
         os.unlink(SOCKET_PATH)
@@ -357,6 +1751,121 @@ def _ping(path: str) -> bool:
         return False
 
 
+def _proc_cmdline(pid: int) -> list[str]:
+    """Read one process argv without trusting a writable pid marker."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return []
+    return [
+        part.decode(errors="surrogateescape")
+        for part in raw.split(b"\0")
+        if part
+    ]
+
+
+def _browser_resident_pids() -> dict[int, str]:
+    """Return exact browser-exec/Chromium residents owned by this profile.
+
+    Local file servers are threads inside the browser-exec daemon, so proving
+    the daemon absent proves those listeners absent too. Xvfb is deliberately
+    not included: it owns only a display socket below ``/tmp`` and cannot write
+    the durable profile/workspace paths. A daemon-spawned Xvfb is reaped by
+    ``_stop_display`` during the graceful path.
+    """
+    residents = {}
+    if not _proc_cmdline(os.getpid()):
+        return {-1: "proc scan unavailable"}
+    script = str(Path(__file__).resolve())
+    profile_flag = f"--user-data-dir={PROFILE_DIR}"
+    try:
+        proc_entries = Path("/proc").iterdir()
+    except OSError:
+        return residents
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        args = _proc_cmdline(pid)
+        if not args:
+            continue
+        is_daemon = (
+            len(args) >= 3
+            and os.path.realpath(args[1]) == script
+            and args[2] == "serve"
+        )
+        has_profile = profile_flag in args or any(
+            arg == "--user-data-dir"
+            and index + 1 < len(args)
+            and args[index + 1] == PROFILE_DIR
+            for index, arg in enumerate(args)
+        )
+        if is_daemon:
+            residents[pid] = "browser-exec"
+        elif has_profile:
+            residents[pid] = "chromium-profile"
+    return residents
+
+
+def _wait_for_browser_shutdown(timeout: float) -> dict[int, str]:
+    deadline = time.monotonic() + timeout
+    while True:
+        residents = _browser_resident_pids()
+        accepting = _ping(SOCKET_PATH)
+        if not residents and not accepting:
+            return {}
+        if time.monotonic() >= deadline:
+            return residents or {-1: "browser-exec socket still accepting"}
+        time.sleep(0.1)
+
+
+def _signal_browser_residents(residents: dict[int, str], sig: int) -> None:
+    for pid in residents:
+        if pid <= 0:
+            continue
+        try:
+            os.kill(pid, sig)
+        except (OSError, ValueError):
+            pass
+
+
+def _complete_shutdown() -> dict:
+    """Gracefully wait, then stop exact residual processes and prove absence."""
+    import signal
+
+    was_running = bool(_browser_resident_pids()) or _ping(SOCKET_PATH)
+    remaining = _wait_for_browser_shutdown(10.0)
+    forced = bool(remaining)
+    if remaining:
+        _signal_browser_residents(remaining, signal.SIGTERM)
+        remaining = _wait_for_browser_shutdown(3.0)
+    if remaining:
+        _signal_browser_residents(remaining, signal.SIGKILL)
+        remaining = _wait_for_browser_shutdown(2.0)
+    if remaining or _ping(SOCKET_PATH):
+        kinds = sorted(set(remaining.values()))
+        return {
+            "error": "browser residents did not stop",
+            "remaining": kinds,
+        }
+    # The server normally unlinks this itself. Remove only a non-accepting
+    # stale socket after process absence has been established.
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return {"error": "browser socket cleanup was not acknowledged"}
+    return {
+        "ok": True,
+        "shutdown_complete": True,
+        "already_stopped": not was_running,
+        "forced": forced,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Client
 # ─────────────────────────────────────────────────────────────────────
@@ -364,6 +1873,7 @@ def _ping(path: str) -> bool:
 
 def _spawn_daemon() -> None:
     """Start the daemon detached, logging to DAEMON_LOG."""
+    Path(DAEMON_LOG).parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(DAEMON_LOG, "a")
     subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "serve"],
@@ -393,14 +1903,33 @@ def run_client(action: str, args: dict, timeout: float) -> int:
     """Send one action; print the JSON reply to stdout. Returns exit code."""
     req = json.dumps({"action": action, "args": args}).encode() + b"\n"
 
+    # Shutdown is idempotent and must never cold-start the daemon it is trying
+    # to retire. It also cleans up an exact-profile Chromium orphan left by a
+    # previously killed daemon.
+    if action == "shutdown" and not _ping(SOCKET_PATH):
+        result = _complete_shutdown()
+        print(json.dumps(result))
+        return 0 if result.get("ok") is True else 1
+
     last_err = None
     for attempt in range(12):  # ~ up to 6s of daemon spin-up
         try:
             resp = _request(req, timeout)
+            if action == "shutdown":
+                # The daemon replies before its server finally block closes
+                # sockets and reaps the display. Do not expose that early reply
+                # as terminal acknowledgement; return only the physical proof.
+                result = _complete_shutdown()
+                print(json.dumps(result))
+                return 0 if result.get("ok") is True else 1
             sys.stdout.write(resp.decode().rstrip("\n") + "\n")
             return 0
         except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
             last_err = e
+            if action == "shutdown":
+                result = _complete_shutdown()
+                print(json.dumps(result))
+                return 0 if result.get("ok") is True else 1
             if attempt == 0:
                 log("daemon not running, spawning")
                 _spawn_daemon()

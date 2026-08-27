@@ -1,0 +1,22 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
+{{- /*
+  The SRW Keycloak theme, rendered from helm/keycloak-theme/srw/.
+
+  ConfigMap keys cannot contain '/', so the nested theme layout is rebuilt at
+  mount time via items[].path in the Deployment (path DOES accept slashes).
+  Keys here are the path with '/' replaced by '_'. .AsConfig cannot be used:
+  it keys by basename, and login/ and email/ both contain theme.properties.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-keycloak-theme
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "keycloak") | nindent 4 }}
+data:
+{{- range $path, $_ := .Files.Glob "keycloak-theme/srw/**" }}
+{{- $key := $path | replace "keycloak-theme/srw/" "" | replace "/" "_" }}
+  {{ $key }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

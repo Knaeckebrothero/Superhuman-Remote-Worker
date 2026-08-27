@@ -737,3 +737,206 @@ class TestCockpitDelegationFields:
         with open("cockpit/src/app/core/models/api.model.ts", "r") as f:
             content = f.read()
         assert "'waiting'" in content
+
+
+# ===========================================================================
+# TestSpawnSubagentScaffolding — Phase 0 of the light-delegation plan
+# (knowledge-base/knowledge/issues/delegation_light_mode_missing.md). One agent-facing tool name
+# with the backend selected by delegation.mode; no behavior yet — both
+# backends return a clear stub.
+# ===========================================================================
+
+
+class TestSpawnSubagentScaffolding:
+    """spawn_subagent registration + config-driven backend dispatch."""
+
+    def _ctx(self, mode):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(config={"delegation": {"mode": mode}})
+
+    def test_registered_in_tool_registry(self):
+        """spawn_subagent is a known delegation tool for both phases."""
+        from src.tools.registry import TOOL_REGISTRY
+
+        meta = TOOL_REGISTRY["spawn_subagent"]
+        assert meta["category"] == "delegation"
+        assert set(meta["phases"]) == {"strategic", "tactical"}
+
+    def test_metadata_merge_includes_all_delegation_tools(self):
+        """get_delegation_metadata exposes heavy tools + spawn_subagent."""
+        from src.tools.delegation import get_delegation_metadata
+
+        names = set(get_delegation_metadata())
+        assert {"delegate_work", "resume_delegation_child", "spawn_subagent"} <= names
+
+    def test_flat_schema(self):
+        """Model-facing schema is flat: one required task + three optional hints."""
+        from src.tools.delegation.spawn_subagent import create_spawn_subagent_tools
+
+        (tool,) = create_spawn_subagent_tools(self._ctx("light"))
+        assert tool.name == "spawn_subagent"
+        assert set(tool.args_schema.model_fields) == {
+            "task_description",
+            "role",
+            "config",
+            "expected_return_format",
+        }
+        assert tool.args_schema.model_fields["task_description"].is_required()
+
+    @pytest.mark.asyncio
+    async def test_light_mode_dispatches_to_light_backend(self):
+        # The light backend is real (Phase 3). With a bare context that carries
+        # no _llm_config it fails closed with a clear message — proving the light
+        # branch (not the heavy stub) was taken, without needing infra.
+        from src.tools.delegation.spawn_subagent import create_spawn_subagent_tools
+
+        (tool,) = create_spawn_subagent_tools(self._ctx("light"))
+        out = await tool.coroutine(task_description="read X")
+        assert "no LLM config" in out
+        assert "heavy backend" not in out
+
+    @pytest.mark.asyncio
+    async def test_light_mode_rejects_empty_task(self):
+        from src.tools.delegation.spawn_subagent import create_spawn_subagent_tools
+
+        (tool,) = create_spawn_subagent_tools(self._ctx("light"))
+        out = await tool.coroutine(task_description="   ")
+        assert "task_description is required" in out
+
+    @pytest.mark.asyncio
+    async def test_heavy_mode_returns_heavy_stub(self):
+        from src.tools.delegation.spawn_subagent import create_spawn_subagent_tools
+
+        (tool,) = create_spawn_subagent_tools(self._ctx("heavy"))
+        out = await tool.coroutine(task_description="read X")
+        assert "heavy backend is not yet available" in out
+
+    @pytest.mark.asyncio
+    async def test_unset_mode_defaults_to_heavy(self):
+        """Missing delegation.mode falls back to the heavy backend."""
+        from types import SimpleNamespace
+
+        from src.tools.delegation.spawn_subagent import create_spawn_subagent_tools
+
+        ctx = SimpleNamespace(config={"delegation": {}})
+        (tool,) = create_spawn_subagent_tools(ctx)
+        out = await tool.coroutine(task_description="read X")
+        assert "heavy backend is not yet available" in out
+
+
+# ===========================================================================
+# TestSubagentModelTier — the `llm.subagent` phase-model tier that lets a
+# top-tier parent spawn a mid-tier reader (opus → sonnet). Parallel to
+# strategic/tactical/summarization; per-job overridable via config_override.
+# ===========================================================================
+
+
+class TestSubagentModelTier:
+    """llm.subagent parses, resolves, and stays out of the main-graph path."""
+
+    def test_subagent_tier_parses_and_resolves(self):
+        from src.core.loader import LLMConfig, _parse_phase_override
+
+        llm = LLMConfig(
+            model="claude-opus-4-8",
+            subagent=_parse_phase_override({"model": "claude-sonnet-5"}),
+        )
+        assert llm.subagent is not None
+        assert llm.get_phase_config("subagent").model == "claude-sonnet-5"
+
+    def test_subagent_inherits_base_when_only_model_set(self):
+        """A model-only subagent override inherits base provider/base_url etc."""
+        from src.core.loader import LLMConfig, _parse_phase_override
+
+        llm = LLMConfig(
+            model="base",
+            provider="anthropic",
+            base_url="https://api.example",
+            subagent=_parse_phase_override({"model": "claude-sonnet-5"}),
+        )
+        resolved = llm.get_phase_config("subagent")
+        assert resolved.model == "claude-sonnet-5"
+        assert resolved.provider == "anthropic"
+        assert resolved.base_url == "https://api.example"
+
+    def test_tactical_fallback_available_when_subagent_unset(self):
+        """Light backend prefers tactical when no subagent tier is configured."""
+        from src.core.loader import LLMConfig, _parse_phase_override
+
+        llm = LLMConfig(model="base", tactical=_parse_phase_override({"model": "tac"}))
+        assert llm.subagent is None
+        # get_phase_config("subagent") returns base (no override) ...
+        assert llm.get_phase_config("subagent").model == "base"
+        # ... so the light backend falls back to the (cheaper) tactical tier.
+        assert llm.get_phase_config("tactical").model == "tac"
+
+    def test_subagent_excluded_from_main_graph_phase_overrides(self):
+        """A subagent-only config must not trigger the main graph's phase LLMs."""
+        from src.core.loader import LLMConfig, _parse_phase_override
+
+        llm = LLMConfig(model="base", subagent=_parse_phase_override({"model": "s"}))
+        assert llm.has_phase_overrides() is False
+
+
+# ===========================================================================
+# TestResumeChildFreezeTimeout — re-suspend freeze must carry the timeout
+# ===========================================================================
+
+
+class TestResumeChildFreezeTimeout:
+    """The re-suspend freeze must carry a ``timeout`` key.
+
+    ``_check_delegation_timeouts`` falls back to ``freeze.get("timeout",
+    7200)`` — omitting the key silently resets a longer delegation deadline
+    to the 2h default after any child resume. Regression for
+    knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md (Gap 2).
+    """
+
+    def _real_context(self):
+        from src.tools.context import ToolContext
+
+        client = MagicMock()
+        client.resume_job = AsyncMock(return_value=True)
+        return ToolContext(
+            orchestrator_client=client,
+            _job_metadata={"job_id": "par-1"},
+            config={"delegation": {"enabled": True, "max_timeout": 14400}},
+        )
+
+    def _resume_tool(self, ctx):
+        from src.tools.delegation.delegate_work import create_delegation_tools
+
+        tools = create_delegation_tools(ctx)
+        return next(t for t in tools if t.name == "resume_delegation_child")
+
+    @pytest.mark.asyncio
+    async def test_resume_freeze_carries_explicit_timeout(self):
+        ctx = self._real_context()
+        tool = self._resume_tool(ctx)
+        msg = tool.func(job_id="child-1", feedback="fix X", timeout=3600)
+        assert "Resumed child" in msg
+        req = ctx.consume_freeze_request()
+        assert req is not None
+        assert req["freeze_type"] == "delegation"
+        assert req["timeout"] == 3600
+
+    @pytest.mark.asyncio
+    async def test_resume_freeze_defaults_to_7200(self):
+        ctx = self._real_context()
+        tool = self._resume_tool(ctx)
+        msg = tool.func(job_id="child-1", feedback="fix X")
+        assert "Resumed child" in msg
+        req = ctx.consume_freeze_request()
+        assert req is not None
+        assert req["timeout"] == 7200
+
+    @pytest.mark.asyncio
+    async def test_resume_timeout_capped_by_max_timeout(self):
+        ctx = self._real_context()
+        tool = self._resume_tool(ctx)
+        msg = tool.func(job_id="child-1", feedback="fix X", timeout=99999)
+        assert msg.startswith("Error")
+        assert "max_timeout" in msg
+        # No freeze requested — the parent must not suspend on bad input.
+        assert ctx.consume_freeze_request() is None

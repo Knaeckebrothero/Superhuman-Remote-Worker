@@ -1,5 +1,6 @@
 @use '../../../styles/variables' as v;
 @use '../../../styles/shape-recipes' as shape;
+@use '../../../styles/mixins' as m;
 
 :host {
   display: contents;
@@ -42,6 +43,16 @@
   &[data-size='md'] { width: 480px; }
   &[data-size='lg'] { width: 720px; }
   &[data-size='xl'] { width: 960px; }
+
+  // Definite height for dialogs whose content is a `height: 100%` surface.
+  // `height` (not `min-height`) so the inner flex chain has something to
+  // resolve against; max-height above still keeps it inside the viewport.
+  &[data-full-height='true'] {
+    height: calc(100vh - #{v.$space-xl});
+
+    &[data-size='xl'] { width: min(1280px, 100%); }
+    &[data-size='lg'] { width: min(960px, 100%); }
+  }
 }
 
 .app-dialog__header {
@@ -108,6 +119,14 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+
+  // Full-bleed content owns its own chrome and its own scrolling.
+  &[data-flush='true'] {
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    overflow: hidden;
+  }
 }
 
 .app-dialog__actions {
@@ -158,9 +177,26 @@
   }
 
   .app-dialog__header,
-  .app-dialog__body,
+  .app-dialog__body:not([data-flush='true']),
   .app-dialog__actions {
     padding-left: v.$space-md;
     padding-right: v.$space-md;
+  }
+
+  // 28px is under the 44px touch minimum, and this is the control someone
+  // reaches for one-handed at the top of a full-height dialog.
+  .app-dialog__close {
+    @include m.touch-target;
+  }
+
+  // Full-height dialogs go edge-to-edge on phones — a 24px inset around a
+  // review surface is wasted width where it is scarcest.
+  .app-dialog__container[data-full-height='true'] {
+    height: 100%;
+    max-height: 100%;
+  }
+
+  .app-dialog__backdrop:has(> [data-full-height='true']) {
+    padding: 0;
   }
 }

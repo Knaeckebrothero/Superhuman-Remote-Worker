@@ -257,7 +257,7 @@
                 <div class="row-meta">
                   <span class="meta-item mono">{{ row.cron_expr }}</span>
                   <span class="meta-item">{{ row.timezone }}</span>
-                  <span class="meta-item">{{ 'automations.list.expert' | transloco }}: {{ row.expert }}</span>
+                  <span class="meta-item">{{ 'automations.list.expert' | transloco }}: {{ expertLabel(row) }}</span>
                   @if (row.next_run_at) {
                     <span class="meta-item">
                       {{ 'automations.list.nextRun' | transloco }}: {{ row.next_run_at | date: 'short' }}

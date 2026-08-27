@@ -8,11 +8,17 @@ Gracefully degrades — if Gitea is unavailable, all methods return safe
 defaults and the system continues without workspace delivery.
 """
 
+import asyncio
 import logging
 import os
 import re
 import secrets
+import shlex
+import tempfile
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
+from uuid import UUID
 
 import httpx
 
@@ -56,6 +62,15 @@ class GiteaClient:
     def is_initialized(self) -> bool:
         """True if admin user and access are verified."""
         return self._initialized
+
+    @property
+    def repository_owner(self) -> str:
+        """Server-owned Gitea namespace for managed repositories."""
+        return self._user
+
+    def clean_repo_url(self, repo_name: str) -> str:
+        """Credential-free canonical URL safe for durable state."""
+        return self._build_clone_url(repo_name)
 
     def _get_client(self) -> httpx.AsyncClient:
         """Get or create the httpx client."""
@@ -162,8 +177,8 @@ class GiteaClient:
                         )
                     else:
                         logger.warning(
-                            f"Failed to create Gitea user (status {resp.status_code}): "
-                            f"{resp.text[:200]}"
+                            "Failed to create Gitea user (status %s)",
+                            resp.status_code,
                         )
                         return False
 
@@ -300,23 +315,66 @@ class GiteaClient:
                     return True
 
             logger.warning(
-                f"Failed to create Gitea OIDC auth source "
-                f"(status {resp.status_code}): {resp.text[:300]}"
+                "Failed to create Gitea OIDC auth source (status %s)",
+                resp.status_code,
             )
             return False
         except (httpx.HTTPError, Exception) as e:
             logger.warning(f"Failed to create Gitea OIDC auth source: {e}")
             return False
 
-    async def create_repo(self, name: str) -> Optional[str]:
-        """Create a repository and return the authenticated clone URL.
+    @staticmethod
+    def _repository_intent_description(intent_marker: str) -> str:
+        marker = str(UUID(str(intent_marker)))
+        return f"SRW managed repository; creation-intent={marker}"
+
+    async def repository_creation_intent_status(
+        self, name: str, *, intent_marker: str
+    ) -> str:
+        """Return ``match``, ``missing``, ``conflict`` or ``unavailable``.
+
+        Only an exact server-generated marker in the exact configured owner
+        namespace can make a committed-but-lost create response adoptable.
+        """
+
+        if not self._initialized:
+            return "unavailable"
+        try:
+            marker_description = self._repository_intent_description(intent_marker)
+        except (TypeError, ValueError):
+            return "conflict"
+        try:
+            response = await self._get_client().get(
+                f"{self._url}/api/v1/repos/{self._user}/{name}"
+            )
+        except httpx.HTTPError:
+            return "unavailable"
+        if response.status_code == 404:
+            return "missing"
+        if response.status_code != 200:
+            return "unavailable"
+        try:
+            repository = response.json()
+            owner = repository.get("owner") or {}
+            owner_name = owner.get("login") or owner.get("username")
+            if (
+                str(repository.get("name") or "") == name
+                and str(owner_name or "") == self._user
+                and str(repository.get("description") or "") == marker_description
+            ):
+                return "match"
+        except (TypeError, ValueError):
+            pass
+        return "conflict"
+
+    async def create_repo(self, name: str, *, intent_marker: str) -> Optional[str]:
+        """Create or exactly re-adopt one durable creation intent.
 
         Args:
             name: Repository name (e.g. "job-abc123")
 
         Returns:
-            Authenticated clone URL (http://user:pass@host/user/repo.git)
-            or None if creation failed.
+            Credential-free clone/display URL or None if creation failed.
         """
         if not self._initialized:
             return None
@@ -330,28 +388,46 @@ class GiteaClient:
                     "name": name,
                     "private": True,
                     "auto_init": True,
-                    "description": f"Workspace for {name}",
+                    "description": self._repository_intent_description(intent_marker),
                 },
             )
 
             if resp.status_code == 409:
-                # Already exists — return the URL anyway
-                logger.debug(f"Gitea repo '{name}' already exists")
+                status = await self.repository_creation_intent_status(
+                    name, intent_marker=intent_marker
+                )
+                if status == "match":
+                    return self._build_clone_url(name)
+                logger.warning("Managed Gitea repository creation collision refused")
+                return None
             elif resp.status_code not in (200, 201):
                 logger.warning(
-                    f"Failed to create Gitea repo '{name}' "
-                    f"(status {resp.status_code}): {resp.text[:200]}"
+                    "Failed to create Gitea repo '%s' (status %s)",
+                    name,
+                    resp.status_code,
                 )
                 return None
 
-            # Build authenticated clone URL
+            status = await self.repository_creation_intent_status(
+                name, intent_marker=intent_marker
+            )
+            if status != "match":
+                logger.warning("Managed Gitea repository intent verification failed")
+                return None
             return self._build_clone_url(name)
 
-        except httpx.HTTPError as e:
-            logger.warning(f"Failed to create Gitea repo '{name}': {e}")
+        except (httpx.HTTPError, TypeError, ValueError):
+            # The POST may have committed even though its response was lost.
+            # Re-read by exact marker; never infer ownership from the name.
+            status = await self.repository_creation_intent_status(
+                name, intent_marker=intent_marker
+            )
+            if status == "match":
+                return self._build_clone_url(name)
+            logger.warning("Managed Gitea repository creation failed")
             return None
 
-    async def delete_repo(self, name: str) -> bool:
+    async def delete_repo(self, name: str, *, intent_marker: str | None = None) -> bool:
         """Delete a repository.
 
         Args:
@@ -364,6 +440,16 @@ class GiteaClient:
             return False
 
         client = self._get_client()
+
+        if intent_marker is not None:
+            intent_status = await self.repository_creation_intent_status(
+                name, intent_marker=intent_marker
+            )
+            if intent_status == "missing":
+                return True
+            if intent_status != "match":
+                logger.warning("Managed Gitea repository cleanup marker refused")
+                return False
 
         try:
             resp = await client.delete(f"{self._url}/api/v1/repos/{self._user}/{name}")
@@ -383,21 +469,222 @@ class GiteaClient:
             return False
 
     def _build_clone_url(self, repo_name: str) -> str:
-        """Build an authenticated clone URL.
-
-        Embeds credentials in the URL for git push from agents.
-        Uses GITEA_INTERNAL_URL when available so that workspace containers
-        (which can't reach the host via localhost) use a routable address.
-        Internal network only — acceptable for this use case.
-        """
-        # Prefer internal URL for container-to-host reachability
-        url = os.environ.get("GITEA_INTERNAL_URL", self._url)
-        if "://" in url:
-            scheme, rest = url.split("://", 1)
-            return f"{scheme}://{self._user}:{self._password}@{rest}/{self._user}/{repo_name}.git"
+        """Build the credential-free canonical URL stored in durable state."""
+        url = (os.environ.get("GITEA_INTERNAL_URL") or self._url).rstrip("/")
+        if "://" not in url:
+            url = f"http://{url}"
+        parsed = urlparse(url)
+        # Explicitly reconstruct netloc from hostname/port: a misconfigured
+        # legacy GITEA_INTERNAL_URL containing userinfo must not perpetuate it.
+        host = parsed.hostname or ""
+        if not host:
+            raise RuntimeError("Gitea URL has no hostname")
+        netloc = host + (f":{parsed.port}" if parsed.port else "")
+        base_path = parsed.path.rstrip("/")
         return (
-            f"http://{self._user}:{self._password}@{url}/{self._user}/{repo_name}.git"
+            f"{parsed.scheme or 'http'}://{netloc}{base_path}/"
+            f"{self._user}/{repo_name}.git"
         )
+
+    def _ssh_internal_endpoint(self) -> tuple[str, int]:
+        """Return the server-to-server SSH endpoint used to prove deploy keys."""
+        configured_host = os.environ.get("GITEA_SSH_INTERNAL_HOST", "").strip()
+        if configured_host:
+            host = configured_host
+        else:
+            parsed = urlparse(os.environ.get("GITEA_INTERNAL_URL") or self._url)
+            host = parsed.hostname or ""
+        if not host:
+            raise RuntimeError("Gitea SSH host is not configured")
+        try:
+            port = int(os.environ.get("GITEA_SSH_INTERNAL_PORT", "2222"))
+        except ValueError as exc:
+            raise RuntimeError("Gitea SSH port is invalid") from exc
+        if not 1 <= port <= 65535:
+            raise RuntimeError("Gitea SSH port is invalid")
+        return host, port
+
+    @staticmethod
+    def _normalized_public_key(value: str) -> str:
+        fields = str(value or "").strip().split()
+        return " ".join(fields[:2]) if len(fields) >= 2 else ""
+
+    async def ensure_repo_deploy_key(
+        self,
+        repo_name: str,
+        *,
+        title: str,
+        public_key: str,
+        access_mode: str,
+    ) -> int | None:
+        """Register one exact-mode deploy key idempotently.
+
+        The public key is safe but still never included in log text.  A replay
+        after an orchestrator crash lists the repository keys and adopts the
+        exact public-key match rather than creating a second authority.
+        """
+        if not self._initialized:
+            return None
+        if access_mode not in {"read", "write"}:
+            return None
+        client = self._get_client()
+        endpoint = f"{self._url}/api/v1/repos/{self._user}/{repo_name}/keys"
+        wanted = self._normalized_public_key(public_key)
+        wanted_read_only = access_mode == "read"
+
+        async def _find_exact_mode_key() -> tuple[int | None, int | None]:
+            """Return (matching id, opposite-mode id) for the exact key."""
+
+            response = await client.get(endpoint)
+            if response.status_code == 404:
+                return None, None
+            if response.status_code != 200:
+                raise httpx.HTTPStatusError(
+                    "deploy-key lookup failed",
+                    request=response.request,
+                    response=response,
+                )
+            for item in response.json():
+                if self._normalized_public_key(item.get("key")) != wanted:
+                    continue
+                key_id = item.get("id")
+                if key_id is None:
+                    return None, None
+                if bool(item.get("read_only")) is wanted_read_only:
+                    return int(key_id), None
+                return None, int(key_id)
+            return None, None
+
+        try:
+            matching_id, opposite_id = await _find_exact_mode_key()
+            if matching_id is not None:
+                return matching_id
+            if opposite_id is not None:
+                # Mode is repository authority. Remove only the exact public
+                # key before recreating it with the required least privilege.
+                removed = await client.delete(f"{endpoint}/{opposite_id}")
+                if removed.status_code not in (204, 404):
+                    return None
+
+            response = await client.post(
+                endpoint,
+                json={
+                    "title": title,
+                    "key": public_key,
+                    "read_only": wanted_read_only,
+                },
+            )
+            if response.status_code not in (200, 201):
+                # Two orchestrator replicas can race after sharing the same
+                # durable reservation. Gitea accepts one POST and may return a
+                # conflict to the other. Re-read the exact public key: adopting
+                # that same writable registration is idempotent; adopting a
+                # merely title-matched or different key is forbidden.
+                matching_id, _opposite_id = await _find_exact_mode_key()
+                if matching_id is not None:
+                    return matching_id
+                logger.warning(
+                    "Managed repository deploy-key registration failed (status %s)",
+                    response.status_code,
+                )
+                return None
+            key_id = response.json().get("id")
+            return int(key_id) if key_id is not None else None
+        except (httpx.HTTPError, ValueError, TypeError):
+            logger.warning("Managed repository deploy-key registration failed")
+            return None
+
+    async def delete_repo_deploy_key(self, repo_name: str, key_id: int) -> bool:
+        """Revoke one exact repository deploy key; 404 is idempotent success."""
+        if not self._initialized:
+            return False
+        try:
+            response = await self._get_client().delete(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/keys/{int(key_id)}"
+            )
+            return response.status_code in (204, 404)
+        except (httpx.HTTPError, TypeError, ValueError):
+            logger.warning("Managed repository deploy-key revocation failed")
+            return False
+
+    async def probe_repo_deploy_key(
+        self,
+        repo_name: str,
+        *,
+        private_key: str,
+        access_mode: str,
+        target_repo_name: str | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> bool:
+        """Prove Git read authority through Gitea SSH without logging secrets.
+
+        ``target_repo_name`` exists for the negative isolation gate: the key
+        minted for ``repo_name`` must fail against a different private repo.
+        The private key is written only to a 0600 temporary file and removed by
+        the temporary-directory context even across timeout/cancellation.
+        """
+        if access_mode not in {"read", "write"}:
+            return False
+        try:
+            host, port = self._ssh_internal_endpoint()
+        except RuntimeError:
+            return False
+        target = target_repo_name or repo_name
+        remote = f"ssh://{host}:{port}/{self._user}/{target}.git"
+        with tempfile.TemporaryDirectory(prefix="srw-repo-authority-") as temp_dir:
+            key_path = Path(temp_dir) / "identity"
+            key_path.write_text(private_key, encoding="utf-8")
+            key_path.chmod(0o600)
+            ssh_command = " ".join(
+                shlex.quote(part)
+                for part in (
+                    "ssh",
+                    "-i",
+                    str(key_path),
+                    "-l",
+                    "git",
+                    "-p",
+                    str(port),
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    f"UserKnownHostsFile={Path(temp_dir) / 'known_hosts'}",
+                )
+            )
+            # Do not copy the orchestrator environment into a Git/SSH child:
+            # it contains the Gitea administrator password and unrelated
+            # service credentials. The probe needs only an executable path,
+            # an isolated HOME for SSH state, and its exact SSH command.
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "HOME": temp_dir,
+                "LANG": os.environ.get("LANG", "C.UTF-8"),
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_SSH_COMMAND": ssh_command,
+            }
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "git",
+                    "ls-remote",
+                    remote,
+                    "HEAD",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=env,
+                )
+                await asyncio.wait_for(
+                    process.communicate(), timeout=max(1.0, timeout_seconds)
+                )
+            except (OSError, asyncio.TimeoutError):
+                if "process" in locals() and process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                return False
+            return process.returncode == 0
 
     @staticmethod
     def mask_credentials(url: str) -> str:
@@ -537,13 +824,19 @@ class GiteaClient:
         files: list[dict],
         message: str,
     ) -> bool:
-        """Create multiple files in a SINGLE commit via Gitea's ChangeFiles API.
+        """Write multiple files in a SINGLE commit via Gitea's ChangeFiles API.
 
         Args:
             repo_name: Repository name.
             branch: Target branch.
-            files: list of ``{"path": str, "content_b64": str}`` — each created
-                (base64 content keeps binary files byte-faithful).
+            files: list of ``{"path": str, "content_b64": str}`` with an
+                optional ``"operation"`` of ``create`` (default) or ``update``
+                (base64 content keeps binary files byte-faithful). ``update``
+                needs no blob SHA: Gitea validates against the branch head
+                commit when none is given — but ``create`` on an existing path
+                is a 422, so callers writing over unknown state must pick the
+                operation per file (see the curated merge in
+                ``services.project_loops``).
             message: Commit message.
 
         Returns:
@@ -559,7 +852,11 @@ class GiteaClient:
             "branch": branch,
             "message": message,
             "files": [
-                {"operation": "create", "path": f["path"], "content": f["content_b64"]}
+                {
+                    "operation": f.get("operation", "create"),
+                    "path": f["path"],
+                    "content": f["content_b64"],
+                }
                 for f in files
             ],
         }
@@ -733,7 +1030,12 @@ class GiteaClient:
             return None
 
     async def get_file_bytes(
-        self, repo_name: str, file_path: str, ref: str | None = None
+        self,
+        repo_name: str,
+        file_path: str,
+        ref: str | None = None,
+        *,
+        redact_coordinates: bool = False,
     ) -> bytes | None:
         """Read raw file content as bytes from a repository.
 
@@ -761,10 +1063,16 @@ class GiteaClient:
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
-                logger.warning(
-                    f"Failed to read {file_path} bytes from {repo_name} "
-                    f"(status {resp.status_code})"
-                )
+                if redact_coordinates:
+                    logger.warning(
+                        "Failed to read private repository object bytes (status %s)",
+                        resp.status_code,
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to read {file_path} bytes from {repo_name} "
+                        f"(status {resp.status_code})"
+                    )
                 return None
             data = resp.json()
             content_b64 = data.get("content", "")
@@ -772,7 +1080,12 @@ class GiteaClient:
                 return b""
             return base64.b64decode(content_b64)
         except Exception as e:
-            logger.warning(f"Failed to read {file_path} bytes from {repo_name}: {e}")
+            if redact_coordinates:
+                logger.warning("Failed to read private repository object bytes")
+            else:
+                logger.warning(
+                    f"Failed to read {file_path} bytes from {repo_name}: {e}"
+                )
             return None
 
     async def get_commits(
@@ -799,9 +1112,20 @@ class GiteaClient:
         client = self._get_client()
 
         try:
+            # NOTE: this must be `/commits`, not `/git/commits` — the latter
+            # only resolves specific commit SHAs and 404s on branch names.
             resp = await client.get(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/git/commits",
-                params={"sha": sha, "page": page, "limit": limit},
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/commits",
+                params={
+                    "sha": sha,
+                    "page": page,
+                    "limit": limit,
+                    # Skip per-commit diff stats / signature checks — callers
+                    # only read sha, message, author, date.
+                    "stat": "false",
+                    "verification": "false",
+                    "files": "false",
+                },
             )
             if resp.status_code == 404:
                 return None
@@ -848,6 +1172,12 @@ class GiteaClient:
         try:
             resp = await client.get(
                 f"{self._url}/api/v1/repos/{self._user}/{repo_name}/compare/{base}...{head}",
+                # Same fast flags as get_commits — we only read sha/message/
+                # author/date below. Gitea 1.22 only honors `files`; `stat`
+                # (the expensive per-commit `git diff` subprocess) is
+                # hardcoded on there and honored from 1.23. Harmless where
+                # ignored, saves ~150ms/commit where not.
+                params={"stat": "false", "verification": "false", "files": "false"},
             )
             if resp.status_code == 404:
                 return None
@@ -876,6 +1206,111 @@ class GiteaClient:
         except Exception as e:
             logger.warning(f"Failed to compare {base}...{head} in {repo_name}: {e}")
             return None
+
+    async def get_commits_between(
+        self,
+        repo_name: str,
+        since_ref: str,
+        head: str = "main",
+        *,
+        max_commits: int = 500,
+    ) -> dict | None:
+        """List commits on ``head`` newer than ``since_ref`` (exclusive).
+
+        Replaces the compare API for the "commits since job start" path.
+        Two reasons: Gitea 1.22's compare endpoint 404s on SHA bases
+        (``BaseNotExist``), and it computes per-commit diff stats server-side
+        (one ``git diff`` subprocess per commit, ~150ms each) regardless of
+        the ``stat`` query flag. The commits endpoint accepts SHA starting
+        points and honors ``stat=false`` (~155x cheaper), so we page it from
+        ``head`` and cut client-side at ``since_ref``.
+
+        Returns the get_compare shape: {"total_commits", "commits"}. When
+        ``since_ref`` isn't found within ``max_commits`` (not an ancestor,
+        or force-pushed away), the collected commits are still returned with
+        ``"truncated": True``. None when ``head`` can't be listed at all.
+        """
+        if not self._initialized:
+            return None
+
+        since_sha = since_ref.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{7,40}", since_sha):
+            # Branch/tag base — resolve to a SHA so the cut below can match.
+            resolved = await self.get_branch_head_sha(repo_name, since_ref)
+            if resolved:
+                since_sha = resolved.lower()
+            else:
+                logger.debug(
+                    f"get_commits_between: could not resolve base ref "
+                    f"'{since_ref}' in {repo_name}; walk will run to the cap"
+                )
+
+        page_limit = 50
+        collected: list[dict] = []
+        for page in range(1, max(1, max_commits // page_limit) + 1):
+            batch = await self.get_commits(
+                repo_name, sha=head, page=page, limit=page_limit
+            )
+            if batch is None:
+                if page == 1:
+                    return None
+                logger.warning(
+                    f"get_commits_between: page {page} failed for {repo_name}; "
+                    f"returning partial result"
+                )
+                break
+            for commit in batch:
+                sha = commit.get("sha", "").lower()
+                if sha.startswith(since_sha):
+                    return {"total_commits": len(collected), "commits": collected}
+                collected.append(commit)
+            if len(batch) < page_limit:
+                # Walked the whole history without meeting since_ref.
+                break
+        return {
+            "total_commits": len(collected),
+            "commits": collected,
+            "truncated": True,
+        }
+
+    async def download_repo_archive(
+        self, repo_name: str, ref: str, dest_path: str
+    ) -> bool:
+        """Stream a repository archive (``<ref>.tar.gz``) to ``dest_path``.
+
+        One request for the whole tree — the bulk-read alternative to N
+        per-file ``contents/`` calls (the measured kb_reindex hot path:
+        ~11k sequential reads/day at ~130ms each). Accepts branch, tag, or
+        commit SHA refs; entries are prefixed with one top-level directory
+        (the repo name).
+
+        Returns True on success. On any failure the file at ``dest_path``
+        must be considered garbage.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+        url = f"{self._url}/api/v1/repos/{self._user}/{repo_name}/archive/{ref}.tar.gz"
+        try:
+            # Generous read timeout: Gitea generates the archive server-side
+            # before the first byte (seconds for large repos, then cached).
+            async with client.stream(
+                "GET", url, timeout=httpx.Timeout(30.0, read=120.0)
+            ) as resp:
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Archive download for {repo_name}@{ref} failed "
+                        f"(status {resp.status_code})"
+                    )
+                    return False
+                with open(dest_path, "wb") as fh:
+                    async for chunk in resp.aiter_bytes():
+                        fh.write(chunk)
+            return True
+        except Exception as e:
+            logger.warning(f"Archive download for {repo_name}@{ref} failed: {e}")
+            return False
 
     async def get_diff(
         self, repo_name: str, base: str, head: str = "HEAD"
@@ -1009,7 +1444,13 @@ class GiteaClient:
             )
             return False
 
-    async def get_branch_head_sha(self, repo_name: str, branch: str) -> str | None:
+    async def get_branch_head_sha(
+        self,
+        repo_name: str,
+        branch: str,
+        *,
+        redact_coordinates: bool = False,
+    ) -> str | None:
         """Return the HEAD commit SHA for a branch.
 
         Uses ``GET /repos/{owner}/{repo}/branches/{branch}``. ``branch``
@@ -1034,15 +1475,24 @@ class GiteaClient:
             if resp.status_code == 404:
                 return None
             if resp.status_code != 200:
-                logger.warning(
-                    f"Failed to read branch '{branch}' on {repo_name} "
-                    f"(status {resp.status_code})"
-                )
+                if redact_coordinates:
+                    logger.warning(
+                        "Failed to resolve private repository revision (status %s)",
+                        resp.status_code,
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to read branch '{branch}' on {repo_name} "
+                        f"(status {resp.status_code})"
+                    )
                 return None
             data = resp.json()
             return data.get("commit", {}).get("id")
         except Exception as e:
-            logger.warning(f"Failed to read branch '{branch}' on {repo_name}: {e}")
+            if redact_coordinates:
+                logger.warning("Failed to resolve private repository revision")
+            else:
+                logger.warning(f"Failed to read branch '{branch}' on {repo_name}: {e}")
             return None
 
     async def list_tree(self, repo_name: str, ref: str) -> list[dict[str, str]] | None:
@@ -1234,6 +1684,56 @@ class GiteaClient:
             logger.warning(f"Failed to create PR in {repo_name}: {e}")
             return None
 
+    async def list_pull_requests(
+        self,
+        repo_name: str,
+        *,
+        state: str = "all",
+        page: int = 1,
+        limit: int = 50,
+    ) -> list[dict] | None:
+        """List pull requests with the identity fields reconciliation needs.
+
+        ``state='all'`` is load-bearing for completion replay: the process may
+        die after a PR was merged or closed, so open-only listing would turn an
+        existing command-keyed PR into a false absence.  ``None`` means the
+        probe was ambiguous; callers must not interpret it as an empty page.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls",
+                params={"state": state, "page": page, "limit": limit},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Failed to list PRs in %s (status %s)",
+                    repo_name,
+                    resp.status_code,
+                )
+                return None
+            pulls: list[dict] = []
+            for raw in resp.json():
+                head = raw.get("head") if isinstance(raw, dict) else None
+                base = raw.get("base") if isinstance(raw, dict) else None
+                pulls.append(
+                    {
+                        "number": raw.get("number"),
+                        "title": raw.get("title") or "",
+                        "body": raw.get("body") or "",
+                        "state": raw.get("state") or "",
+                        "head": head.get("ref") if isinstance(head, dict) else None,
+                        "base": base.get("ref") if isinstance(base, dict) else None,
+                    }
+                )
+            return pulls
+        except Exception as exc:  # noqa: BLE001 - ambiguity must be explicit
+            logger.warning("Failed to list PRs in %s: %s", repo_name, exc)
+            return None
+
     async def merge_pr(
         self,
         repo_name: str,
@@ -1280,6 +1780,121 @@ class GiteaClient:
 
         except httpx.HTTPError as e:
             logger.warning(f"Failed to merge PR #{pr_index} in {repo_name}: {e}")
+            return False
+
+    async def probe_pr_merged(self, repo_name: str, pr_index: int) -> bool | None:
+        """Return Gitea's exact merge state for one pull request.
+
+        Gitea's ``GET .../pulls/{index}/merge`` handler is unusual: the
+        response body can disagree with the HTTP status after the handler has
+        already written a 204.  The status code is therefore the complete
+        protocol here -- 204 means merged, 404 means not merged, and every
+        other response is ambiguous and must be retried rather than guessed.
+
+        ``None`` also covers an uninitialized client and transport failures.
+        In particular, 405 is *not* treated as already merged because Gitea
+        uses it for several unrelated refusal modes.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls/"
+                f"{pr_index}/merge"
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Failed to probe merge state for PR #%s in %s: %s",
+                pr_index,
+                repo_name,
+                exc,
+            )
+            return None
+
+        if resp.status_code == 204:
+            return True
+        if resp.status_code == 404:
+            return False
+        logger.warning(
+            "Ambiguous merge-state response for PR #%s in %s (status %s)",
+            pr_index,
+            repo_name,
+            resp.status_code,
+        )
+        return None
+
+    async def close_pr(self, repo_name: str, pr_index: int) -> bool:
+        """Close a pull request WITHOUT merging it.
+
+        Used by the curated merge (workspace_and_change_records.md §6.4): the
+        contracted deliverables land on ``main`` as their own commit, and the
+        PR stays behind — closed, unmerged — as the branch's audit trail.
+
+        Args:
+            repo_name: Repository name
+            pr_index: PR number/index
+
+        Returns:
+            True if closed, False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.patch(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls/{pr_index}",
+                json={"state": "closed"},
+            )
+            if resp.status_code in (200, 201):
+                logger.info(f"Closed PR #{pr_index} in {repo_name} (unmerged)")
+                return True
+            logger.warning(
+                f"Failed to close PR #{pr_index} in {repo_name} "
+                f"(status {resp.status_code}): {resp.text[:200]}"
+            )
+            return False
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to close PR #{pr_index} in {repo_name}: {e}")
+            return False
+
+    async def comment_on_pr(self, repo_name: str, pr_index: int, body: str) -> bool:
+        """Post a comment on a pull request.
+
+        Gitea serves PR comments through the issues API (a PR is an issue
+        with code attached), hence the ``/issues/`` path.
+
+        Args:
+            repo_name: Repository name
+            pr_index: PR number/index
+            body: Comment body (markdown)
+
+        Returns:
+            True if the comment was created, False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.post(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
+                f"/issues/{pr_index}/comments",
+                json={"body": body},
+            )
+            if resp.status_code in (200, 201):
+                return True
+            logger.warning(
+                f"Failed to comment on PR #{pr_index} in {repo_name} "
+                f"(status {resp.status_code}): {resp.text[:200]}"
+            )
+            return False
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to comment on PR #{pr_index} in {repo_name}: {e}")
             return False
 
     async def rename_repo(self, old_name: str, new_name: str) -> bool:

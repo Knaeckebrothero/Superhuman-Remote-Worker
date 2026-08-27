@@ -36,24 +36,32 @@
   color: var(--text-primary);
   animation: app-toast-in 0.2s ease-out;
 
+  // The `*-tint` tokens are translucent (0.15-0.20 alpha) because their other
+  // ~10 callers are inline banners sitting on an opaque page background. A
+  // toast is the one consumer that FLOATS over arbitrary content — the canvas
+  // pane, chat text — so tinting must be a LAYER over the opaque surface set
+  // above, never a replacement for it. Assigning `background` here dropped the
+  // surface and let whatever was behind bleed through at ~80%, which is how a
+  // sticky danger toast ended up unreadable on top of an artifact.
+  // knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
   &[data-tone='success'] {
-    border-color: var(--success, #a6e3a1);
-    background: var(--success-tint, rgb(166, 227, 161, 0.12));
+    border-color: var(--success);
+    background-image: linear-gradient(var(--success-tint), var(--success-tint));
   }
 
   &[data-tone='warning'] {
-    border-color: var(--warning, #f9e2af);
-    background: var(--warning-tint, rgb(249, 226, 175, 0.12));
+    border-color: var(--warning);
+    background-image: linear-gradient(var(--warning-tint), var(--warning-tint));
   }
 
   &[data-tone='danger'] {
-    border-color: var(--danger, #f38ba8);
-    background: var(--danger-tint, rgb(243, 139, 168, 0.12));
+    border-color: var(--danger);
+    background-image: linear-gradient(var(--danger-tint), var(--danger-tint));
   }
 
   &[data-tone='info'] {
-    border-color: var(--info, #89b4fa);
-    background: var(--info-tint, rgb(137, 180, 250, 0.12));
+    border-color: var(--info);
+    background-image: linear-gradient(var(--info-tint), var(--info-tint));
   }
 }
 

@@ -8,7 +8,7 @@ Provides MongoDB operations:
 - Document updates
 
 These tools are injected automatically when a MongoDB datasource is
-attached to a job. See docs/datasources.md.
+attached to a job. See knowledge-base/knowledge/datasources.md.
 """
 
 import json
@@ -97,17 +97,17 @@ def create_mongo_tools(context: ToolContext) -> List[Any]:
     """Create MongoDB tools with injected context.
 
     Args:
-        context: ToolContext with dependencies (must include mongodb datasource)
+        context: ToolContext with dependencies (must include a MongoDB connector)
 
     Returns:
         List of LangChain tool functions
 
     Raises:
-        ValueError: If MongoDB datasource not available in context
+        ValueError: If a MongoDB connector is not available in context
     """
     db = context.get_datasource("mongodb")
     if not db:
-        raise ValueError("MongoDB datasource not available in context")
+        raise ValueError("MongoDB connector not available in context")
 
     @tool
     def mongo_query(collection: str, filter: str = "{}", limit: int = 50) -> str:

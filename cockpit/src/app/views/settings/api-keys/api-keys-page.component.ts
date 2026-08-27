@@ -22,7 +22,7 @@ import {AppIconComponent} from '../../../ui/icon';
  * Personal Access Token (PAT) management.
  *
  * Distinct from the MCP token UI in `settings.component.ts`. PR 3 of
- * docs/features/auth_bff_and_api_tokens.md: PATs are for n8n /
+ * knowledge-base/knowledge/features/auth_bff_and_api_tokens.md: PATs are for n8n /
  * automation and use the `ak_` prefix; MCP tokens stay on `srw_` and
  * carry their own scope semantics. Both kinds back onto the same
  * `auth_tokens` table — see the design doc §3.6 for the consolidation
@@ -235,8 +235,12 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
     </div>
   `,
   styles: [`
-    :host { display: block; height: 100%; }
-    .api-keys-page { padding: 24px; max-width: 1100px; margin: 0 auto; }
+    /* overflow: auto matches the parent settings page. Without it the host is a
+       600px-tall flex item holding ~850px of content and the shell's
+       .content-area clips the rest: "Create token" and the whole "How to use"
+       section sat below the fold with no scrollbar anywhere on a short viewport. */
+    :host { display: block; height: 100%; overflow: auto; }
+    .api-keys-page { padding: 24px; max-width: var(--content-max-width); margin: 0 auto; }
     .api-keys-container { display: flex; flex-direction: column; gap: 24px; }
     .page-header { display: flex; align-items: center; gap: 12px; }
     .page-title { margin: 0; font-size: 1.5rem; }

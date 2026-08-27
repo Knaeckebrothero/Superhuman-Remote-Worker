@@ -11,8 +11,13 @@ import logging
 from typing import Any, Dict, List
 
 from langchain_core.tools import tool
+from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP, WorkspaceUnavailableError
 
 from ..context import ToolContext
+from ...services.cloud_mount.guardrails import (
+    format_workspace_cloud_search_guard_message,
+    workspace_search_touches_cloud,
+)
 from src.utils.pdf import PDFReader, format_document_info
 
 logger = logging.getLogger(__name__)
@@ -289,6 +294,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"list_files error for {path}: {e}")
             return f"Error listing files: {str(e)}"
@@ -315,12 +322,19 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"delete_file error for {path}: {e}")
             return f"Error deleting: {str(e)}"
 
     @tool
-    def search_files(query: str, path: str = "", case_sensitive: bool = False) -> str:
+    def search_files(
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
+    ) -> str:
         """Search for text content in workspace files.
 
         Searches through all text files and returns matching lines
@@ -330,13 +344,26 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             query: Text or pattern to search for
             path: Directory to search in (empty for entire workspace)
             case_sensitive: Whether to match case exactly
+            exclude_dirs: Optional list of directory names to skip with grep
+                --exclude-dir
 
         Returns:
             Search results with file paths, line numbers, and matching lines
         """
         try:
+            cloud_mount_cfg = context.get_config("cloud_mount", {})
+            if (
+                isinstance(cloud_mount_cfg, dict)
+                and cloud_mount_cfg.get("active")
+                and workspace_search_touches_cloud(path)
+            ):
+                return format_workspace_cloud_search_guard_message(path)
+
             results = workspace.search_files(
-                query, path=path, case_sensitive=case_sensitive
+                query,
+                path=path,
+                case_sensitive=case_sensitive,
+                exclude_dirs=exclude_dirs,
             )
 
             if not results:
@@ -365,7 +392,13 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                     line_text = line_text[:100] + "..."
                 lines.append(f"    L{line_num}: {line_text}")
 
-            if total > max_search_results:
+            if total == SEARCH_RESULT_HARD_CAP:
+                lines.append("")
+                lines.append(
+                    f"[Showing {max_search_results} of {SEARCH_RESULT_HARD_CAP}+ "
+                    f"matches (server-side capped)]"
+                )
+            elif total > max_search_results:
                 lines.append("")
                 lines.append(f"[Showing {max_search_results} of {total} matches]")
 
@@ -373,6 +406,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"search_files error: {e}")
             return f"Error searching: {str(e)}"
@@ -399,6 +434,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"file_exists error for {path}: {e}")
             return f"Error: {str(e)}"
@@ -425,6 +462,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             return f"Error: Source not found: {source}"
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"move_file error for {source} -> {dest}: {e}")
             return f"Error moving file: {str(e)}"
@@ -464,6 +503,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             return f"Error: File not found: {path}"
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"rename_file error for {path} -> {new_name}: {e}")
             return f"Error renaming file: {str(e)}"
@@ -490,6 +531,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             return f"Error: Source not found: {source}"
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"copy_file error for {source} -> {dest}: {e}")
             return f"Error copying file: {str(e)}"
@@ -522,7 +565,15 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                     return "Error: PDF info requires pdfplumber. Install with: pip install pdfplumber"
 
                 try:
-                    info = pdf_reader.get_document_info(full_path)
+                    # Materialize the file on the local filesystem first —
+                    # required for remote workspace backends where get_path()
+                    # returns a remote-only path that local PDF I/O cannot open.
+                    with workspace.local_copy(path) as local_path:
+                        info = pdf_reader.get_document_info(local_path)
+
+                    # local_copy() yields a temp file — restore the
+                    # caller-facing name so the display shows the real path.
+                    info["file_name"] = path.rsplit("/", 1)[-1]
 
                     # Format with reading suggestions
                     lines = [format_document_info(info), ""]
@@ -563,12 +614,14 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
                     return "\n".join(lines)
 
+                except WorkspaceUnavailableError:
+                    raise
                 except Exception as e:
                     logger.error(f"PDF info error for {path}: {e}")
                     return f"Error getting PDF info: {str(e)}"
 
             # For non-PDF files, return basic info
-            file_size = full_path.stat().st_size
+            file_size = workspace.get_size(path)
             estimated_words = int(file_size / BYTES_PER_WORD)
             estimated_tokens = estimated_words  # Roughly 1 word ≈ 1 token
 
@@ -591,6 +644,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"get_document_info error for {path}: {e}")
             return f"Error: {str(e)}"
@@ -613,6 +668,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"create_directory error for {path}: {e}")
             return f"Error creating directory: {str(e)}"
@@ -640,6 +697,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"delete_directory error for {path}: {e}")
             return f"Error deleting directory: {str(e)}"

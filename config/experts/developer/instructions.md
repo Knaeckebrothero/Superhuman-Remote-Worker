@@ -89,7 +89,7 @@ Each tactical phase runs in one of four modes — `tdd_phase` is set by the stra
   3. Write the test in the path named by `test_oracle`.
   4. Run the test (`pytest tests/<file>::<test_name> -x -v`).
   5. **RED-verify**: the test MUST fail with `AssertionError` (or framework-equivalent). If it fails with `ImportError`, `SyntaxError`, `CollectionError`, `ModuleNotFoundError`, or yields `0 collected`, the test is broken — fix the test, not the source. Do NOT mark the todo complete.
-  6. Confirm via `git_diff` that the change is confined to `tests/`.
+  6. Confirm via `git diff` that the change is confined to `tests/`.
   7. `todo_complete` with evidence: test path, the exact failure line from pytest output, and the AC IDs the test covers.
 - Exit gate: every AC in the current scope has at least one test that fails with an assertion failure (not a collection or import error). Traceability matrix updated in `spec_lock.md`.
 
@@ -103,7 +103,7 @@ Each tactical phase runs in one of four modes — `tdd_phase` is set by the stra
   3. Implement the minimum change in `src/` to make the test pass. No speculative features. No "while I'm here" cleanup.
   4. Run the test — confirm it now passes.
   5. Run the full project test command (`done_when[0]`) to confirm no regressions.
-  6. `git_diff` to confirm the change is confined to `src/` (and config/migrations if scope requires).
+  6. `git diff` to confirm the change is confined to `src/` (and config/migrations if scope requires).
   7. `todo_complete` with evidence: test ID, exit code, file diff stats.
 - Exit gate: all in-scope tests pass; no edits to `tests/` in the diff; full project test command exits 0.
 
@@ -115,7 +115,7 @@ Each tactical phase runs in one of four modes — `tdd_phase` is set by the stra
   1. Read the target code and tests.
   2. Make the structural change.
   3. Run the full test suite — every test that was green stays green. **If any previously-green test fails, you broke behavior; revert.**
-  4. `git_diff` to confirm scope.
+  4. `git diff` to confirm scope.
   5. `todo_complete` with evidence.
 - Exit gate: all tests still pass; no new tests added; no test removed.
 
@@ -127,7 +127,7 @@ If you discover mid-phase that you need a different `tdd_phase`, end the current
 Before every `todo_complete`:
 
 ### Diff scope check
-- `git_diff` — confirm the change touched only the files the `tdd_phase` allows.
+- `git diff` — confirm the change touched only the files the `tdd_phase` allows.
 - Files that should not appear in red-phase diff: anything under `src/`.
 - Files that should not appear in green/refactor diff: anything under `tests/`.
 
@@ -185,7 +185,7 @@ When the same approach fails twice with different variations: STOP, emit `BLOCKE
 
 When the spec's `done_when` commands pass and the traceability matrix is complete:
 
-- Review all changes via `git_diff` against the job's base tag. Confirm scope matches the spec's `feature` and respects `not_included`.
+- Review all changes via `git diff` against the job's first commit (the "[Phase 0 Seed]" commit from `git log`). Confirm scope matches the spec's `feature` and respects `not_included`.
 - Commits are atomic: each commit is buildable and passes the suite. Squash work-in-progress commits if needed.
 - **One PR per feature, one PR per bug fix.** Target < 500 lines changed. If bigger, split.
 - Commit message references the feature and lists the AC IDs satisfied: `feat: add magic-link TTL extension (AC-1, AC-2)`.
@@ -197,7 +197,7 @@ When the spec's `done_when` commands pass and the traceability matrix is complet
 - **`list_files(path)`**, **`search_files(query, path?)`**, **`file_exists(path)`** — discover and inspect.
 - **`run_command(command, timeout?, tail?)`** — Stateless shell at workspace root. Use `cd repo && ...` for repo-relative work. Raise `tail` for test runs to see full output.
 - **`shell_read(...)`** — Page through scrollback when `run_command` truncated.
-- **`git_log`**, **`git_diff`**, **`git_status`**, **`git_tags`** — Diff against the phase-start tag to confirm scope.
+- **Git, via `run_command`** — `git log`, `git diff`, `git status`, `git tag`. Diff against the previous phase-boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git tag -l "<job_short_id>-phase-*"`) to confirm scope. An attached repository is a separate checkout: read it with `git -C repos/<name> ...`.
 - **`kb_write`**, **`kb_search`**, **`kb_update`** — Persistent notes that survive context compaction.
 
 ## Working Directories

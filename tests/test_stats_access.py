@@ -13,7 +13,7 @@ approved user. G5:
 The underlying postgres methods (`get_job_statistics`,
 `get_daily_statistics`, `detect_stuck_jobs`) take optional
 ``owner_user_id`` / ``visible_project_ids`` / ``scope_project_id``
-kwargs that compose into the same OR-clause G1's `get_visible_jobs`
+kwargs that compose into the same OR-clause G1's `query_jobs`
 uses.
 """
 
@@ -51,16 +51,39 @@ def _scoped(user: dict, scope: str) -> dict:
 # =============================================================================
 
 
+#: Calling a FastAPI handler directly leaves unpassed parameters as ``Query``
+#: objects rather than their defaults, so tests supply the full signature.
+_STATS_JOBS_DEFAULTS: dict = {
+    "origin": None,
+    "project_id": None,
+    "has_project": None,
+    "include_archived_projects": False,
+    "search": None,
+    "as_of": None,
+}
+
+
+async def _stats_jobs(fake_request, **overrides):
+    from main import get_job_statistics
+
+    return await get_job_statistics(
+        fake_request, **{**_STATS_JOBS_DEFAULTS, **overrides}
+    )
+
+
+#: Visibility narrowing keys. An admin without an MCP scope must carry none of
+#: them; that is what makes it the full-fleet view.
+_VISIBILITY_KEYS = {"owner_user_id", "visible_project_ids", "scope_project_id"}
+
+
 class TestStatsJobs:
     @pytest.mark.asyncio
     async def test_non_admin_passes_visibility_args(
         self, user_a, fake_db, fake_request
     ):
-        from main import get_job_statistics
-
         fake_db.get_job_statistics = AsyncMock(return_value={"total_jobs": 3})
         with _patch_caller_and_db(user_a, fake_db):
-            result = await get_job_statistics(fake_request)
+            result = await _stats_jobs(fake_request)
         kwargs = fake_db.get_job_statistics.call_args.kwargs
         assert kwargs["owner_user_id"] == str(user_a["id"])
         assert len(kwargs["visible_project_ids"]) == 1  # owns project_a
@@ -69,39 +92,85 @@ class TestStatsJobs:
 
     @pytest.mark.asyncio
     async def test_admin_no_visibility_args(self, user_admin, fake_db, fake_request):
-        from main import get_job_statistics
-
         fake_db.get_job_statistics = AsyncMock(return_value={})
         with _patch_caller_and_db(user_admin, fake_db):
-            await get_job_statistics(fake_request)
+            await _stats_jobs(fake_request)
         kwargs = fake_db.get_job_statistics.call_args.kwargs
-        assert kwargs == {}
+        # No narrowing key at all — filters may be present, visibility must not.
+        assert _VISIBILITY_KEYS & kwargs.keys() == set()
 
     @pytest.mark.asyncio
     async def test_admin_with_mcp_project_scope(
         self, user_admin, project_a, fake_db, fake_request
     ):
-        from main import get_job_statistics
-
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
         fake_db.get_job_statistics = AsyncMock(return_value={})
         with _patch_caller_and_db(scoped, fake_db):
-            await get_job_statistics(fake_request)
+            await _stats_jobs(fake_request)
         kwargs = fake_db.get_job_statistics.call_args.kwargs
-        assert kwargs == {"scope_project_id": str(project_a["id"])}
+        assert _VISIBILITY_KEYS & kwargs.keys() == {"scope_project_id"}
+        assert kwargs["scope_project_id"] == str(project_a["id"])
 
     @pytest.mark.asyncio
     async def test_non_admin_with_mcp_scope(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from main import get_job_statistics
-
         scoped = _scoped(user_a, f"project:{project_a['id']}")
         fake_db.get_job_statistics = AsyncMock(return_value={})
         with _patch_caller_and_db(scoped, fake_db):
-            await get_job_statistics(fake_request)
+            await _stats_jobs(fake_request)
         kwargs = fake_db.get_job_statistics.call_args.kwargs
         assert kwargs["scope_project_id"] == str(project_a["id"])
+
+    @pytest.mark.asyncio
+    async def test_status_is_never_a_parameter(self, user_a, fake_db, fake_request):
+        """Disjunctive faceting: the status selection must not narrow the
+        counts, or selecting one status drops every other chip to zero."""
+        import inspect
+
+        from main import get_job_statistics
+
+        assert "status" not in inspect.signature(get_job_statistics).parameters
+        fake_db.get_job_statistics = AsyncMock(return_value={})
+        with _patch_caller_and_db(user_a, fake_db):
+            await _stats_jobs(fake_request)
+        assert "statuses" not in fake_db.get_job_statistics.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_list_filters_reach_the_counts(
+        self, user_a, project_a, fake_db, fake_request
+    ):
+        """Chips must summarise the set the list is paging, so every other
+        filter — including the archived default and the watermark — applies."""
+        from datetime import datetime, timezone
+
+        pinned = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+        fake_db.get_job_statistics = AsyncMock(return_value={})
+        with _patch_caller_and_db(user_a, fake_db):
+            await _stats_jobs(
+                fake_request,
+                project_id=[str(project_a["id"])],
+                search="abc",
+                as_of=pinned,
+            )
+        kwargs = fake_db.get_job_statistics.call_args.kwargs
+        assert kwargs["project_ids"] == [str(project_a["id"])]
+        assert kwargs["search"] == "abc"
+        assert kwargs["as_of"] == pinned
+        assert kwargs["include_archived_projects"] is False
+
+    @pytest.mark.asyncio
+    async def test_invisible_project_filter_is_403(
+        self, user_a, project_b, fake_db, fake_request
+    ):
+        """The counts endpoint must refuse exactly what the list refuses, or
+        the two disagree in a way neither endpoint's own tests would catch."""
+        fake_db.get_job_statistics = AsyncMock(return_value={})
+        with _patch_caller_and_db(user_a, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await _stats_jobs(fake_request, project_id=[str(project_b["id"])])
+        assert exc.value.status_code == 403
+        fake_db.get_job_statistics.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unauthenticated_baseline(self, fake_db, fake_request):
@@ -153,26 +222,58 @@ class TestStatsDaily:
 
 
 class TestStatsStuck:
+    # E3 (officer_supervision_surface §5): the route now lists processing
+    # jobs (get_processing_jobs, no updated_at filter) and derives stuckness
+    # from the shared liveness computation; visibility kwargs are unchanged.
+
     @pytest.mark.asyncio
     async def test_non_admin_passes_visibility(self, user_a, fake_db, fake_request):
         from main import get_stuck_jobs
 
-        fake_db.detect_stuck_jobs = AsyncMock(return_value=[])
+        fake_db.get_processing_jobs = AsyncMock(return_value=[])
         with _patch_caller_and_db(user_a, fake_db):
             await get_stuck_jobs(fake_request, threshold_minutes=60)
-        kwargs = fake_db.detect_stuck_jobs.call_args.kwargs
-        assert kwargs["threshold_minutes"] == 60
+        kwargs = fake_db.get_processing_jobs.call_args.kwargs
         assert kwargs["owner_user_id"] == str(user_a["id"])
 
     @pytest.mark.asyncio
     async def test_admin_no_visibility_args(self, user_admin, fake_db, fake_request):
         from main import get_stuck_jobs
 
-        fake_db.detect_stuck_jobs = AsyncMock(return_value=[])
+        fake_db.get_processing_jobs = AsyncMock(return_value=[])
         with _patch_caller_and_db(user_admin, fake_db):
             await get_stuck_jobs(fake_request, threshold_minutes=60)
-        kwargs = fake_db.detect_stuck_jobs.call_args.kwargs
+        kwargs = fake_db.get_processing_jobs.call_args.kwargs
         assert "owner_user_id" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_default_threshold_is_server_owned_and_reported(
+        self, user_a, fake_db, fake_request, monkeypatch
+    ):
+        from main import get_stuck_jobs
+
+        monkeypatch.setenv("JOB_LIVENESS_STALL_MINUTES", "47")
+        fake_db.get_processing_jobs = AsyncMock(return_value=[])
+        with _patch_caller_and_db(user_a, fake_db):
+            result = await get_stuck_jobs(fake_request, threshold_minutes=None)
+        assert result == {
+            "jobs": [],
+            "threshold_minutes": 47,
+            "threshold_source": "deployment_default",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("threshold", [30, 60])
+    async def test_explicit_override_is_reported(
+        self, threshold, user_a, fake_db, fake_request
+    ):
+        from main import get_stuck_jobs
+
+        fake_db.get_processing_jobs = AsyncMock(return_value=[])
+        with _patch_caller_and_db(user_a, fake_db):
+            result = await get_stuck_jobs(fake_request, threshold_minutes=threshold)
+        assert result["threshold_minutes"] == threshold
+        assert result["threshold_source"] == "request_override"
 
 
 # =============================================================================

@@ -4,6 +4,23 @@ Domain:    {{ .Values.global.domain }}
 Namespace: {{ .Release.Namespace }}
 License:   accepted ({{ include "srw.fullname" . }} will start)
 
+{{- if .Values.orchestrator.runtimeAuthorityMigrationMaintenanceAck }}
+
+PINNED RUNTIME AUTHORITY CUTOVER
+================================
+The one-shot migration 0185 acknowledgement was enabled. This release uses a
+Recreate orchestrator deployment and supplies only the exact
+`pinned-runtime-authority-v1` migration gate.
+
+Before reopening admission, verify that every old mutating orchestrator and
+warm/dedicated agent was drained, migration 0185 is successful in
+`schema_migrations`, and the new orchestrator is ready. Do not use Helm
+`--atomic` for this cutover and never roll back to a pre-0185 image after the
+migration commits. Clear
+`orchestrator.runtimeAuthorityMigrationMaintenanceAck` on a later all-new
+version rollout.
+{{- end }}
+
 Services:
   Cockpit:       {{ include "srw.cockpitUrl" . }}
   API:           {{ include "srw.apiUrl" . }}
@@ -48,6 +65,23 @@ in the Vault path `{{ .Values.externalSecrets.vaultPath }}` — the
 orchestrator will refuse to start without it.
 {{- end }}
 
+{{- if .Values.nextcloud.protectedEffect.enabled }}
+
+Protected Nextcloud effects
+===========================
+The internal bounded effect lane is enabled at:
+
+  http://{{ include "srw.nextcloudProtectedEffectName" . }}
+
+Ensure dedicated Secret `{{ include "srw.nextcloudProtectedEffectSecretName" . }}` contains a stable
+NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY of at least 32 bytes. Do not rotate that
+key while cloud_ro_effect_intents are retained, and never copy it into the
+shared application Secret consumed by agent Pods. The configuration digest is
+derived by the chart and must not be overridden. External Nextcloud endpoints
+are not eligible for protected cloud mode without an equivalent server-side
+deadline and hard FPM handler bound.
+{{- end }}
+
 {{- if .Values.llm.seed.enabled }}
 
 LLM seed
@@ -61,3 +95,49 @@ Inspect the run:
 
   kubectl -n {{ .Release.Namespace }} logs job/{{ include "srw.fullname" . }}-llm-seed
 {{- end }}
+
+{{- if (include "srw.garageEnabled" .) }}
+
+Bundled object store (Garage) — NOT FOR PRODUCTION
+==================================================
+A single-node Garage S3 store is enabled. It has NO replication or erasure
+coding and is bound to one PVC ({{ include "srw.fullname" . }}-garage-data).
+It backs workspace snapshots (bucket "{{ .Values.s3.bucket }}") and the virtual
+workspace tier (bucket "{{ .Values.garage.buckets.workspaces }}").
+
+For production, just point at an external S3 — setting s3.endpoint turns this
+bundled store off on its own (garage.enabled defaults to auto). Set
+garage.enabled=false only to run with NO object store at all, which disables
+durable Canvas presentations, workspace snapshots, and the virtual tier.
+  - s3.endpoint / s3.bucket                 (snapshots)
+  - virtualWorkspace.s3.endpoint            (virtual tier)
+
+Inspect the one-time bootstrap (layout + buckets + keys):
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "srw.fullname" . }}-garage-bootstrap
+{{- end }}
+
+{{- if include "srw.vmSameCluster" . }}
+{{- $legacyVmAliasWithoutSecret := and .Values.vmController.enabled (eq (.Values.vm.mode | default "off") "off") (empty (include "srw.vmLifecycleAuthSecretName" .)) }}
+
+VM workspaces on this cluster
+=============================
+KubeVirt and CDI must already be installed. The preflight hook verifies their
+CRDs before install/upgrade. Confirm the VM node selector and storage class,
+then watch the controller and its first VMI:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "srw.vmControllerName" . }}
+  kubectl -n {{ .Release.Namespace }} get vm,vmi,pod -l srw.io/component=agent-workspace
+
+{{- if $legacyVmAliasWithoutSecret }}
+
+WARNING: vmController.enabled selected legacy unauthenticated provisioning.
+Guest tokens cannot be minted. Set vm.lifecycleAuthSecretName before enabling
+authenticated VM lifecycle requests.
+{{- else }}
+
+The lifecycle Secret is `{{ include "srw.vmLifecycleAuthSecretName" . }}`.
+{{- end }}
+The SSH key Secret is `{{ include "srw.vmSshKeySecretName" . }}`. See
+helm/README.md#vm-workspaces-on-your-cluster for prerequisites and checks.
+{{- end }}
+{{ include "srw.backupNotes" . }}

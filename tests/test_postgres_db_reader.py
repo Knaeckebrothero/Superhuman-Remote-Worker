@@ -1,47 +1,92 @@
-import pytest
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
+
+import pytest
+
 from src.database.postgres_db import PostgresDB
 
 
 @pytest.mark.asyncio
-async def test_history_includes_components_and_tool_link():
+async def test_agent_db_end_thread_closes_control_admission():
+    """The direct-DB fallback must close the same capability as REST end."""
+    db = PostgresDB.__new__(PostgresDB)
+    conn = AsyncMock()
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    db.acquire = acquire
+    await db.end_thread("t1")
+
+    sql = " ".join(conn.execute.await_args.args[0].split())
+    assert "status = 'ended'" in sql
+    assert "control_admission_agent_id = NULL" in sql
+
+
+@pytest.mark.asyncio
+async def test_agent_db_terminal_status_closes_control_admission():
+    db = PostgresDB.__new__(PostgresDB)
+    conn = AsyncMock()
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    db.acquire = acquire
+    await db.update_thread_status("t1", "suspended")
+
+    sql = " ".join(conn.execute.await_args.args[0].split())
+    assert "WHEN $2 IN ('ended', 'suspended') THEN NULL" in sql
+
+
+@pytest.mark.asyncio
+async def test_history_projects_only_resume_fields():
+    """HF-7 thread-read diet: the resume reader returns exactly what the resume
+    consumers use — role/content/tool_calls/tool_call_id/turn_number — and does
+    NOT fetch the resume-unused component columns (thinking/reasoning/
+    tool_results/provider*/response_metadata/additional_kwargs/metrics/id/
+    created_at). Those are never read on resume; the rebuilt AIMessage doesn't
+    carry them."""
     db = PostgresDB.__new__(PostgresDB)  # bypass __init__/connection
     db.fetch = AsyncMock(
         return_value=[
             {
-                "id": "11111111-1111-1111-1111-111111111111",
-                "role": "ai",
-                "content": "hi",
+                "role": "tool",
+                "content": "result",
                 "tool_calls": None,
-                "turn_number": 1,
-                "metrics": None,
-                "tool_call_id": None,
-                "thinking": "legacy reasoning",
-                "reasoning": None,
-                "tool_results": None,
-                "provider": "openai-chat",
-                "provider_raw": None,
-                "additional_kwargs": None,
-                "response_metadata": None,
-                "created_at": None,
+                "tool_call_id": "call_1",
+                "turn_number": 2,
             }
         ]
     )
     rows = await db.get_thread_messages_history("t1")
-    row = rows[0]
-    for key in (
-        "tool_call_id",
-        "thinking",
+    assert rows[0] == {
+        "role": "tool",
+        "content": "result",
+        "tool_calls": None,
+        "tool_call_id": "call_1",
+        "turn_number": 2,
+    }
+    # The tool-result link survives (so _db_rows_to_lc_messages need not fall
+    # back to positional pairing).
+    assert rows[0]["tool_call_id"] == "call_1"
+    # The SELECT projection must not re-introduce the resume-unused over-fetch.
+    # (created_at legitimately stays in the ORDER BY, so scope the check to the
+    # projection clause between SELECT and FROM.)
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    projection = sql.split("FROM")[0]
+    for dropped in (
         "reasoning",
         "tool_results",
-        "provider",
         "provider_raw",
-        "additional_kwargs",
         "response_metadata",
+        "additional_kwargs",
+        "thinking",
+        "metrics",
+        "created_at",
     ):
-        assert key in row, f"reader dropped {key}"
-    assert row["provider"] == "openai-chat"
-    assert row["thinking"] == "legacy reasoning"
+        assert dropped not in projection, f"resume reader must not fetch {dropped}"
 
 
 @pytest.mark.asyncio
@@ -52,7 +97,21 @@ async def test_history_excludes_summary_marker_rows():
     db.fetch = AsyncMock(return_value=[])
     await db.get_thread_messages_history("t1")
     sql = " ".join(db.fetch.call_args[0][0].split())
-    assert "role <> 'summary'" in sql
+    assert "role NOT IN ('summary', 'error')" in sql
+
+
+@pytest.mark.asyncio
+async def test_history_excludes_cancelled_and_other_unadmitted_delivery_rows():
+    """Cockpit keeps the transcript row; the agent restore must not model it."""
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetch = AsyncMock(return_value=[])
+
+    await db.get_thread_messages_history("t1")
+
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    assert "thread_input_deliveries" in sql
+    for state in ("persisted", "owned", "queued", "deferred", "cancelled"):
+        assert f"'{state}'" in sql
 
 
 @pytest.mark.asyncio
@@ -66,7 +125,9 @@ async def test_history_supports_since_turn_for_checkpoint_resume():
     await db.get_thread_messages_history("t1", since_turn=5)
     sql = " ".join(db.fetch.call_args[0][0].split())
     assert "turn_number >" in sql, "since_turn must add a turn_number filter"
-    assert "role <> 'summary'" in sql, "since_turn must preserve summary exclusion"
+    assert "role NOT IN ('summary', 'error')" in sql, (
+        "since_turn must preserve summary exclusion"
+    )
     assert "ORDER BY turn_number ASC" in sql, "ordering must be preserved"
     # The boundary value is bound as a parameter, not interpolated.
     args = db.fetch.call_args[0]
@@ -150,7 +211,7 @@ async def test_history_seq_gt_filters_and_orders_by_seq():
     sql = " ".join(db.fetch.call_args[0][0].split())
     assert "seq >" in sql, "seq_gt must add a seq filter"
     assert "ORDER BY seq ASC" in sql, "seq cursor must order by seq, not turn"
-    assert "role <> 'summary'" in sql, "summary exclusion preserved"
+    assert "role NOT IN ('summary', 'error')" in sql, "summary exclusion preserved"
     assert 42 in db.fetch.call_args[0][1:], "boundary seq must be a bound param"
 
 
@@ -212,7 +273,9 @@ async def test_checkpoint_surfaces_boundary_seq():
 
 
 def _full_row(mid, turn):
-    """A thread_messages row with every column the reader maps."""
+    """A thread_messages row carrying every DB column (the reader now projects
+    only a subset; the extra keys are ignored, and are kept here to prove the
+    reader tolerates a full row)."""
     return {
         "id": mid,
         "role": "ai",
@@ -245,7 +308,11 @@ async def test_newest_first_selects_seq_desc_and_returns_chronological():
     sql = " ".join(db.fetch.call_args[0][0].split())
     assert "ORDER BY seq DESC" in sql, "newest_first must select by seq DESC"
     assert "LIMIT" in sql, "the floor must cap the row count"
-    assert [r["id"] for r in rows] == ["n1", "n2", "n3"], "result must be chronological"
+    # Identify rows by a projected field (id is no longer returned): _full_row
+    # sets content=f"c{mid}", so chronological order is c-n1, c-n2, c-n3.
+    assert [r["content"] for r in rows] == ["cn1", "cn2", "cn3"], (
+        "result must be chronological"
+    )
 
 
 @pytest.mark.asyncio

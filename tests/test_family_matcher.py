@@ -27,6 +27,12 @@ from orchestrator.services.family_matcher import detect_family
         ("gpt-5", "gpt-5"),
         ("gpt-5.2", "gpt-5"),
         ("gpt-5-mini", "gpt-5"),
+        # GPT-5.6 tiers (Luna/Terra/Sol) — dedicated family, must beat gpt-5;
+        # codex variants keep the codex family (rule order).
+        ("gpt-5.6-sol", "gpt-5.6"),
+        ("gpt-5.6-terra", "gpt-5.6"),
+        ("openrouter/openai/gpt-5.6-luna", "gpt-5.6"),
+        ("gpt-5.6-codex", "codex"),
         ("o3", "o-series"),
         ("o3-mini", "o-series"),
         ("o4", "o-series"),
@@ -47,6 +53,12 @@ from orchestrator.services.family_matcher import detect_family
         ("MiniMaxAI/MiniMax-M2.7", "minimax"),
         ("MiniMaxAI/MiniMax-M3", "minimax-m3"),
         ("deepseek-v3", "deepseek"),
+        ("z-ai/glm-5.2", "glm"),
+        ("glm-5.2", "glm"),
+        # Mistral 3 family + specialists (settings-only family)
+        ("mistral-large-latest", "mistral"),
+        ("codestral-latest", "mistral"),
+        ("magistral-medium-latest", "mistral"),
         # Kimi (Moonshot) → default per design (no custom prompts shipped)
         ("moonshotai/kimi-k2-instruct-0905", "default"),
         # Embeddings
@@ -70,6 +82,8 @@ def test_detect_family_matched_rules(model_id: str, expected_family: str) -> Non
         ("openrouter/openai/text-embedding-3-large", "openai-embedding"),
         ("openrouter/google/gemini-2.5-pro", "gemini"),
         ("openrouter/openai/gpt-oss-120b", "gpt-oss"),
+        ("openrouter/z-ai/glm-5.2", "glm"),
+        ("openrouter/mistralai/mistral-large-latest", "mistral"),
     ],
 )
 def test_openrouter_prefix_recurses(model_id: str, expected_family: str) -> None:

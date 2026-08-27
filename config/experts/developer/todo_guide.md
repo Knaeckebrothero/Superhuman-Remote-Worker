@@ -18,12 +18,19 @@ Every developer phase is one of these types. The strategic phase chooses; the ta
 
 **Pick exactly one tdd_phase per tactical phase.** Mixing types in one phase is the failure mode that erases the TDD discipline.
 
-**Target: 5-10 todos per tactical phase.** Adapt based on complexity:
-- Spec phase: 3-5 todos (interview, write spec, lock to spec_lock.md, init matrix)
-- Red phase: 1 todo per behavior under test (target 5-8)
-- Green phase: 1 todo per failing test (target 5-8)
-- Refactor phase: 3-5 focused structural changes
-- Integration phase: 3-5 todos (review diff, commit, push, verify)
+**Phase count here is set by the TDD cycle, not by batch size.** Other experts default
+to a single execution phase; you are the exception, because `spec`/`red`/`green` differ
+in what they are *allowed to write* and collapsing them erases the discipline.
+
+What you should NOT do is split within a type. One `red` phase covering every failing
+test beats three small ones — each extra boundary costs a full planning cycle.
+
+**Target: 8-16 todos per tactical phase.** Adapt based on complexity:
+- Spec phase: 3-6 todos (interview, write spec, lock to spec_lock.md, init matrix)
+- Red phase: 1 todo per behavior under test — all of them, in one phase
+- Green phase: 1 todo per failing test — all of them, in one phase
+- Refactor phase: 3-6 focused structural changes (skip entirely when not needed)
+- Integration phase: 3-6 todos (review diff, commit, push, verify)
 
 ---
 
@@ -104,16 +111,16 @@ Purpose: Improve code quality while keeping all tests green.
 Example todos:
 - "Run full test suite (`pytest tests/ -x -v`) and record baseline — must be all green before refactoring. Save baseline output to archive/phase_N_baseline.txt."
 - "Extract <logic> from repo/src/<file> into repo/src/<new_file>. Update imports in callers. Run `pytest tests/ -x` — every previously-green test stays green."
-- "Verify via git_diff: only structural changes, no behavior changes, no edits under tests/."
+- "Verify via git diff: only structural changes, no behavior changes, no edits under tests/."
 
 ### 5. Integration Phase (PR / commit)
 
 Purpose: Package the work for review.
 
 Example todos:
-- "Review all changes via `git_diff` against the job's base tag. Confirm scope matches spec.yaml feature and respects not_included."
+- "Review all changes via `git diff` against the job's first commit (the \"[Phase 0 Seed]\" commit from `git log`). Confirm scope matches spec.yaml feature and respects not_included."
 - "Stage and commit with message `feat: <feature> (AC-1, AC-2, ...)`. Push to origin <branch>."
-- "Verify via `git_log` and `git_status`: commit landed, branch clean."
+- "Verify via `git log` and `git status`: commit landed, branch clean."
 
 ### 6. Bug Fix Variant (red → green within one feature)
 
@@ -131,14 +138,14 @@ Every change must be independently verified before `todo_complete`.
 **Verification checklist per todo:**
 
 For RED phase:
-1. `git_diff` — only files under `tests/` changed? Anything in `src/`? STOP.
+1. `git diff` — only files under `tests/` changed? Anything in `src/`? STOP.
 2. Pytest output — does the new test ID appear in the failure list?
 3. Failure type — is it `AssertionError`/assertion mismatch? Or is it `ImportError`/`CollectionError`/`SyntaxError`?
 4. Forbidden test pattern check — search the diff for `assert True`, `pytest.skip`, `xfail`, empty bodies, tautologies, etc.
 5. Traceability — is the AC ID updated in `spec_lock.md`?
 
 For GREEN phase:
-1. `git_diff` — only files under `src/` (or config/migration paths) changed? Anything under `tests/`? STOP.
+1. `git diff` — only files under `src/` (or config/migration paths) changed? Anything under `tests/`? STOP.
 2. Pytest output — did the target test go from red to green?
 3. Full suite — did `done_when` commands pass? Any new failures elsewhere?
 4. Traceability — AC ID updated to `green`?
@@ -186,4 +193,8 @@ For GREEN phase:
 | `refactor` | 3-5 | After green; only when structure genuinely needs improvement |
 | `integration` | 3-5 | Final phase — PR/commit prep |
 
-**Default per phase: 7 todos.** Spec/integration phases are smaller (3-5). Red/green phases scale with AC count. If a phase needs > 12 todos, split the spec or split the phase.
+**Default per phase: as many todos as the type needs.** Spec/integration are naturally
+smaller (3-6). Red/green scale with AC count and should cover the whole spec in one
+phase — do not split a red or green phase to keep the list short. If a phase would
+exceed ~25 todos the spec is too big; split the spec, not the phase. If execution shows
+the spec itself is wrong, invoke `request_replan`.

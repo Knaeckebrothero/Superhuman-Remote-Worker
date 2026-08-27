@@ -67,29 +67,6 @@ def _detect_identifier_type(identifier: str) -> str:
     return "doi"  # Default assumption
 
 
-def _is_remote_workspace(context: ToolContext) -> bool:
-    """Check if the workspace lives on a remote host."""
-    if not context.has_workspace():
-        return False
-    return context.workspace_manager.backend.host is not None
-
-
-def _get_local_documents_dir(context: ToolContext) -> Path:
-    """Get a local directory for downloads.
-
-    For local workspaces, returns the workspace documents/ dir directly.
-    For remote workspaces, returns a local temp dir (caller must transfer
-    files to the workspace via the backend).
-    """
-    if not context.has_workspace():
-        return Path("./downloads")
-    if _is_remote_workspace(context):
-        # Remote workspace — download locally first, transfer after
-        d = Path(tempfile.mkdtemp(prefix="paper_dl_"))
-        return d
-    return context.workspace_manager.get_path("documents")
-
-
 def _transfer_to_workspace(
     context: ToolContext, local_path: Path, dest_rel: str
 ) -> str:
@@ -143,17 +120,15 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
     async def download_paper(
         identifier: str,
         identifier_type: str = "auto",
-        use_browser_fallback: bool = True,
     ) -> str:
         """Download paper PDF to workspace documents folder.
 
-        Uses fallback chain: arXiv -> Unpaywall -> Browser automation.
+        Uses fallback chain: arXiv -> Unpaywall (open-access copies).
         Downloaded papers are registered as citation sources when possible.
 
         Args:
             identifier: DOI (e.g., "10.1038/nature12373"), arXiv ID (e.g., "2408.08921"), or URL
             identifier_type: "doi", "arxiv", or "auto" (auto-detect)
-            use_browser_fallback: Try browser automation if API methods fail (default True). Useful for publisher pages with VPN access.
 
         Returns:
             Path to downloaded PDF or error message with suggestions
@@ -161,19 +136,25 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         if identifier_type == "auto":
             identifier_type = _detect_identifier_type(identifier)
 
-        remote = _is_remote_workspace(context)
-        dest_dir = _get_local_documents_dir(context)
+        if not context.has_workspace():
+            return "Could not download paper: no workspace is available."
 
         # Track whether we found a paywalled paper (for messaging)
         paywalled_title = None
 
-        try:
+        # A virtual workspace has ``host is None`` but its paths are object
+        # keys, not agent-local files. Every tier therefore downloads to a
+        # bounded local staging directory and writes the result via the
+        # backend.
+        with tempfile.TemporaryDirectory(prefix="paper_dl_") as temp_dir:
+            dest_dir = Path(temp_dir)
+
             # Try arXiv first (for arXiv IDs, or DOIs that might be arXiv)
             if identifier_type == "arxiv" or "arxiv" in identifier.lower():
                 result = await _try_arxiv_download(identifier, dest_dir)
                 if result.success:
-                    ws_path = _maybe_transfer(context, remote, result.path)
-                    _register_downloaded_paper(context, result, ws_path)
+                    ws_path = _store_download_in_workspace(context, result.path)
+                    await _register_downloaded_paper(context, result, ws_path)
                     return (
                         f"Downloaded: {result.paper.title}\n"
                         f"Path: {ws_path}\n"
@@ -188,8 +169,8 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
                         doi.group(), dest_dir, proxy=proxy
                     )
                     if result.success:
-                        ws_path = _maybe_transfer(context, remote, result.path)
-                        _register_downloaded_paper(context, result, ws_path)
+                        ws_path = _store_download_in_workspace(context, result.path)
+                        await _register_downloaded_paper(context, result, ws_path)
                         return (
                             f"Downloaded: {result.paper.title}\n"
                             f"Path: {ws_path}\n"
@@ -202,25 +183,11 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
                     elif result.error:
                         logger.debug(f"Unpaywall download failed: {result.error}")
 
-            # Try browser automation as final fallback
-            if use_browser_fallback:
-                browser_result = await _try_browser_download(
-                    identifier, identifier_type, dest_dir, context, proxy=proxy
-                )
-                if browser_result:
-                    return browser_result
-        finally:
-            # Clean up temp dir if we created one for remote downloads
-            if remote and dest_dir.exists():
-                import shutil
-
-                shutil.rmtree(dest_dir, ignore_errors=True)
-
         # All methods failed
         if paywalled_title:
             return (
                 f"Paper is paywalled: {paywalled_title}\n"
-                f"No open access version found and browser download failed.\n"
+                f"No open access version found.\n"
                 f"Suggestions:\n"
                 f"  - Check if a preprint exists on arXiv\n"
                 f"  - Connect to institutional VPN and configure proxy\n"
@@ -250,15 +217,32 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         """
         id_type = _detect_identifier_type(identifier)
 
-        # Try Semantic Scholar first (richer metadata)
-        info = await _get_semantic_scholar_info(identifier, proxy=proxy)
-        if info:
-            return info
+        # Try Semantic Scholar first (richer metadata). Provider/auth failures
+        # remain visible while still allowing the arXiv fallback to do useful
+        # work; they must not masquerade as "paper not found".
+        from .utils.semantic_scholar_client import SemanticScholarProviderError
+
+        semantic_error = None
+        try:
+            info = await _get_semantic_scholar_info(identifier, proxy=proxy)
+        except SemanticScholarProviderError as exc:
+            semantic_error = str(exc)
+            logger.warning(semantic_error)
+        else:
+            if info:
+                return info
 
         # Fall back to arXiv for arXiv IDs
         if id_type == "arxiv" or "arxiv" in identifier.lower():
-            return await _get_arxiv_info(identifier)
+            arxiv_info = await _get_arxiv_info(identifier)
+            if semantic_error:
+                return (
+                    f"{semantic_error}\nUsing arXiv metadata fallback.\n\n{arxiv_info}"
+                )
+            return arxiv_info
 
+        if semantic_error:
+            return f"{semantic_error}\nCould not fall back to arXiv for: {identifier}"
         return f"Could not find paper info for: {identifier}"
 
     return [search_papers, download_paper, get_paper_info]
@@ -291,36 +275,23 @@ async def _search_arxiv(query: str, max_results: int) -> str:
 
 async def _search_semantic_scholar(query: str, max_results: int, *, proxy=None) -> str:
     """Search Semantic Scholar and format results."""
-    import os
-
-    import aiohttp
-
-    from .utils.network import research_request
-
-    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
-    headers = {}
-    if api_key:
-        headers["x-api-key"] = api_key
-
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
-    params = {
-        "query": query,
-        "limit": max_results,
-        "fields": "title,authors,year,abstract,citationCount,openAccessPdf,externalIds,venue",
-    }
+    from .utils.semantic_scholar_client import (
+        SemanticScholarProviderError,
+        search_semantic_scholar,
+    )
 
     try:
-        async with research_request(
-            "GET", url, proxy=proxy, timeout=30, params=params, headers=headers
-        ) as resp:
-            if resp.status == 429:
-                return "Semantic Scholar rate limit hit. Try again in a few minutes or set SEMANTIC_SCHOLAR_API_KEY."
-            resp.raise_for_status()
-            data = await resp.json()
-    except ConnectionError as e:
-        return f"Semantic Scholar search error (connection): {e}"
-    except aiohttp.ClientError as e:
-        return f"Semantic Scholar search error: {e}"
+        data = await search_semantic_scholar(
+            query,
+            max_results,
+            fields=(
+                "title,authors,year,abstract,citationCount,openAccessPdf,"
+                "externalIds,venue"
+            ),
+            proxy=proxy,
+        )
+    except SemanticScholarProviderError as exc:
+        return str(exc)
 
     results = data.get("data", [])
     if not results:
@@ -381,168 +352,9 @@ async def _try_unpaywall_download(
     return await client.download(doi, dest_dir)
 
 
-async def _resolve_doi_url(doi: str, *, proxy=None) -> Optional[str]:
-    """Resolve a DOI to its publisher URL by following the redirect.
-
-    Args:
-        doi: DOI string (e.g., "10.1038/nature12373")
-        proxy: Optional ProxyConfig for routing through VPN.
-
-    Returns:
-        Publisher URL or None if resolution fails
-    """
-    from .utils.network import research_request
-
-    doi_url = f"https://doi.org/{doi}"
-    try:
-        async with research_request(
-            "HEAD", doi_url, proxy=proxy, timeout=15, allow_redirects=True
-        ) as resp:
-            return str(resp.url)
-    except Exception as e:
-        logger.debug(f"DOI resolution failed for {doi}: {e}")
-        return doi_url  # Fall back to doi.org URL
-
-
-async def _try_browser_download(
-    identifier: str,
-    identifier_type: str,
-    dest_dir: Path,
-    context: "ToolContext",
-    *,
-    proxy=None,
-) -> Optional[str]:
-    """Try downloading a paper using browser automation.
-
-    Resolves the identifier to a URL and uses browser-use to navigate
-    and download the PDF. Works best with institutional VPN/proxy.
-
-    Args:
-        identifier: Paper identifier (DOI, arXiv ID, or URL)
-        identifier_type: Type of identifier
-        dest_dir: Download destination directory
-        context: ToolContext for browser configuration
-
-    Returns:
-        Success message string, or None if browser download failed/unavailable
-    """
-    try:
-        from .browser import (
-            _get_browser_config,
-            _get_browser_llm,
-            _find_new_files,
-            _find_new_files_remote,
-            _is_remote_browser,
-            _register_downloaded_file,
-            _stop_remote_chromium,
-        )
-        from browser_use import Agent, Browser
-    except ImportError:
-        logger.debug("browser-use not available for fallback download")
-        return None
-
-    # Resolve identifier to a URL
-    if identifier_type == "doi":
-        doi_match = DOI_PATTERN.search(identifier)
-        if doi_match:
-            url = await _resolve_doi_url(doi_match.group(), proxy=proxy)
-        else:
-            return None
-    elif identifier_type == "arxiv":
-        arxiv_match = ARXIV_PATTERN.search(identifier)
-        arxiv_id = arxiv_match.group() if arxiv_match else identifier
-        url = f"https://arxiv.org/abs/{arxiv_id}"
-    elif identifier.startswith("http"):
-        url = identifier
-    else:
-        return None
-
-    logger.info(f"Trying browser download from: {url}")
-
-    remote = _is_remote_browser(context)
-    browser = None
-    try:
-        llm = _get_browser_llm()
-
-        if remote:
-            browser_kwargs = _get_browser_config(context)
-        else:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            browser_kwargs = _get_browser_config(context, downloads_path=dest_dir)
-
-        browser = Browser(**browser_kwargs)
-
-        agent = Agent(
-            task=(
-                f"Go to {url} and download the PDF of this paper. "
-                f"Look for a 'Download PDF' button or link. "
-                f"Accept any cookie banners if needed. "
-                f"Wait for the download to complete."
-            ),
-            llm=llm,
-            browser=browser,
-            use_vision=False,
-            max_actions_per_step=4,
-        )
-
-        await agent.run()
-
-        # Check for downloaded files — remote vs local detection
-        if remote:
-            backend = context.workspace_manager.backend
-            new_files = _find_new_files_remote(backend, "documents")
-            if new_files:
-                rel_path = new_files[0]
-                file_size = backend.stat(rel_path)
-                file_name = Path(rel_path).name
-                _register_downloaded_file(context, rel_path, name=file_name)
-                return (
-                    f"Downloaded via browser: {file_name}\n"
-                    f"Path: {rel_path}\n"
-                    f"Size: {file_size:,} bytes\n"
-                    f"Source: Browser automation ({url})"
-                )
-        else:
-            downloaded_files = _find_new_files(dest_dir)
-            if downloaded_files:
-                downloaded_path = downloaded_files[0]
-                _register_downloaded_file(
-                    context, str(downloaded_path), name=downloaded_path.name
-                )
-                return (
-                    f"Downloaded via browser: {downloaded_path.name}\n"
-                    f"Path: {downloaded_path}\n"
-                    f"Size: {downloaded_path.stat().st_size:,} bytes\n"
-                    f"Source: Browser automation ({url})"
-                )
-
-        return None
-
-    except Exception as e:
-        logger.debug(f"Browser download failed: {e}")
-        return None
-    finally:
-        if browser is not None:
-            try:
-                await browser.stop()
-            except Exception:
-                pass
-        if remote:
-            _stop_remote_chromium(context.workspace_manager.backend)
-
-
 async def _get_semantic_scholar_info(identifier: str, *, proxy=None) -> Optional[str]:
     """Get paper info from Semantic Scholar."""
-    import os
-
-    import aiohttp
-
-    from .utils.network import research_request
-
-    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
-    headers = {}
-    if api_key:
-        headers["x-api-key"] = api_key
+    from .utils.semantic_scholar_client import get_semantic_scholar_paper
 
     # Semantic Scholar accepts DOIs and arXiv IDs directly
     paper_id = identifier
@@ -550,26 +362,17 @@ async def _get_semantic_scholar_info(identifier: str, *, proxy=None) -> Optional
         arxiv_id = ARXIV_PATTERN.search(identifier).group()
         paper_id = f"ArXiv:{arxiv_id}"
     elif DOI_PATTERN.search(identifier):
-        paper_id = DOI_PATTERN.search(identifier).group()
+        paper_id = f"DOI:{DOI_PATTERN.search(identifier).group()}"
 
-    url = f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}"
-    params = {
-        "fields": "title,authors,year,abstract,citationCount,referenceCount,openAccessPdf,externalIds,venue,publicationDate",
-    }
-
-    try:
-        async with research_request(
-            "GET", url, proxy=proxy, timeout=30, params=params, headers=headers
-        ) as resp:
-            if resp.status == 404:
-                return None
-            if resp.status == 429:
-                return "Semantic Scholar rate limit hit. Try again in a few minutes."
-            resp.raise_for_status()
-            data = await resp.json()
-    except ConnectionError:
-        return None
-    except aiohttp.ClientError:
+    data = await get_semantic_scholar_paper(
+        paper_id,
+        fields=(
+            "title,authors,year,abstract,citationCount,referenceCount,"
+            "openAccessPdf,externalIds,venue,publicationDate"
+        ),
+        proxy=proxy,
+    )
+    if data is None:
         return None
 
     ext_ids = data.get("externalIds") or {}
@@ -640,23 +443,18 @@ async def _get_arxiv_info(identifier: str) -> str:
     return "\n".join(lines)
 
 
-def _maybe_transfer(
-    context: ToolContext, remote: bool, local_path: Optional[Path]
+def _store_download_in_workspace(
+    context: ToolContext, local_path: Optional[Path]
 ) -> str:
-    """If remote, transfer a locally downloaded file to the workspace.
-
-    Returns a display path (workspace-relative for remote, absolute for local).
-    """
+    """Write one operation-scoped download through the workspace backend."""
     if local_path is None:
         return ""
-    if not remote:
-        return str(local_path)
     dest_rel = f"documents/{local_path.name}"
     _transfer_to_workspace(context, local_path, dest_rel)
     return dest_rel
 
 
-def _register_downloaded_paper(
+async def _register_downloaded_paper(
     context: ToolContext, result, display_path: Optional[str] = None
 ) -> None:
     """Register a downloaded paper as a citation source."""
@@ -665,7 +463,7 @@ def _register_downloaded_paper(
 
     path_str = display_path or str(result.path)
     try:
-        source_id = context.get_or_register_doc_source(
+        source_id = await context.get_or_register_doc_source(
             path_str, name=result.paper.title
         )
         logger.info(

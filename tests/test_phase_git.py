@@ -3,6 +3,7 @@
 Tests that phase transitions correctly create git tags and commit changes.
 """
 
+import logging
 import pytest
 import shutil
 import tempfile
@@ -109,6 +110,55 @@ class TestCompletePhaseWithGit:
         assert "[Phase 2 Tactical]" in log
         assert "Complete" in log
         assert "8 todos" in log
+
+    def test_tag_points_at_completion_commit(self, workspace_with_git):
+        """The phase tag dereferences to the completion commit (commit-then-tag)."""
+        _complete_phase_with_git(
+            workspace=workspace_with_git,
+            phase_number=3,
+            phase_type="tactical",
+            todos_archived=2,
+            job_id="test-job-1234",
+        )
+
+        gm = workspace_with_git.git_manager
+        tag_commit = gm.resolve_tag_commit("test-job-phase-3-tactical-complete")
+        assert tag_commit is not None
+        assert tag_commit == gm.get_current_commit()
+        log = gm.log(max_count=1, oneline=True)
+        assert "[Phase 3 Tactical]" in log
+
+    def test_double_completion_keeps_first_tag(self, workspace_with_git, caplog):
+        """A repeated completion never moves the audit tag; both commits exist."""
+        gm = workspace_with_git.git_manager
+        tag_name = "test-job-phase-1-tactical-complete"
+
+        _complete_phase_with_git(
+            workspace=workspace_with_git,
+            phase_number=1,
+            phase_type="tactical",
+            todos_archived=1,
+            job_id="test-job-1234",
+        )
+        first_commit = gm.resolve_tag_commit(tag_name)
+        assert first_commit is not None
+
+        with caplog.at_level(logging.ERROR, logger="src.managers.git_manager"):
+            _complete_phase_with_git(
+                workspace=workspace_with_git,
+                phase_number=1,
+                phase_type="tactical",
+                todos_archived=1,
+                job_id="test-job-1234",
+            )
+
+        assert "Phase tag invariant violation" in caplog.text
+        assert gm.list_tags(tag_name) == [tag_name]
+        assert gm.resolve_tag_commit(tag_name) == first_commit
+        # Second completion commit exists; the tag stays on the first
+        assert gm.get_current_commit() != first_commit
+        log = gm.log(max_count=5, oneline=True)
+        assert log.count("[Phase 1 Tactical] Complete") == 2
 
     def test_handles_missing_git_manager(self, workspace_with_git):
         """Test that function handles workspace without git gracefully."""

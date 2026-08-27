@@ -1,16 +1,366 @@
 {
+  "toolCard": {
+    "sections": {
+      "result": "Ergebnis",
+      "error": "Fehler"
+    },
+    "status": {
+      "pending": "ausstehend",
+      "running": "läuft",
+      "ok": "abgeschlossen",
+      "error": "Fehler",
+      "denied": "abgelehnt",
+      "expired": "nicht ausgeführt"
+    },
+    "diff": {
+      "replace": "Diff",
+      "append": "angehängt",
+      "prepend": "vorangestellt",
+      "write": "geschrieben",
+      "truncated": "+{{count}} weitere Zeilen"
+    },
+    "showMore": "{{count}} weitere Zeilen anzeigen",
+    "showLess": "Weniger anzeigen",
+    "previewNote": "Vorschau · {{size}} gesamt",
+    "canvas": {
+      "open": "Canvas öffnen",
+      "current": "aktuell",
+      "currentStage": "öffnet aktuelle Bühne",
+      "replaced": "Präsentation ersetzt",
+      "unavailable": "Canvas nicht verfügbar",
+      "sourceKind": {
+        "file": "Datei",
+        "app": "Live-App",
+        "canvas": "Canvas"
+      }
+    },
+    "titles": {
+      "read_file": "Datei lesen",
+      "write_file": "Datei schreiben",
+      "edit_file": "Datei bearbeiten",
+      "list_files": "Dateien auflisten",
+      "search_files": "Dateien durchsuchen",
+      "file_exists": "Datei prüfen",
+      "delete_file": "Datei löschen",
+      "move_file": "Datei verschieben",
+      "get_document_info": "Dokument prüfen",
+      "run_command": "Befehl ausführen",
+      "shell_execute": "Befehl ausführen",
+      "shell_read": "Ausgabe lesen",
+      "git_log": "Git-Verlauf anzeigen",
+      "git_show": "Commit anzeigen",
+      "git_diff": "Änderungen vergleichen",
+      "git_status": "Git-Status prüfen",
+      "web_search": "Web durchsuchen",
+      "extract_webpage": "Seite extrahieren",
+      "browse_website": "Website öffnen",
+      "search_papers": "Paper suchen",
+      "kb_write": "In Wissensdatenbank schreiben",
+      "kb_read": "Wissen lesen",
+      "kb_search": "Wissen durchsuchen",
+      "next_phase_todos": "Nächste Phase planen",
+      "todo_complete": "Aufgabe abschließen",
+      "cite_document": "Dokument zitieren",
+      "send_message": "Nachricht senden",
+      "delegate_work": "Arbeit delegieren",
+      "job_complete": "Job abschließen",
+      "mark_complete": "Als erledigt markieren",
+      "set_canvas": "In Canvas präsentieren",
+      "get_canvas": "Canvas prüfen",
+      "clear_canvas": "Canvas leeren",
+      "create_job": "Job planen",
+      "notify_user": "Nachricht an den Nutzer"
+    },
+    "notify": {
+      "from": "Offizier → Sie",
+      "sending": "wird gesendet…",
+      "urgency": {
+        "page": "Page",
+        "digest": "Digest",
+        "log": "Log"
+      }
+    },
+    "job": {
+      "approve": "Freigeben",
+      "openDiff": "Änderungen öffnen",
+      "cancel": "Job abbrechen",
+      "resumeWithFeedback": "Mit Feedback fortsetzen",
+      "feedbackPlaceholder": "Was soll anders laufen?",
+      "feedbackSubmit": "Senden & fortsetzen",
+      "feedbackDismiss": "Verwerfen",
+      "diffTitle": "Job {{id}} — Änderungen"
+    },
+    "jobBatch": {
+      "title": "{{count}} Jobs gestartet",
+      "finished": "{{done}}/{{total}} beendet",
+      "failed": "{{count}} fehlgeschlagen",
+      "review": "{{count}} zur Prüfung",
+      "notCreated": "Job wurde nicht erstellt"
+    },
+    "view": {
+      "rendered": "Gerendert",
+      "raw": "Quelltext"
+    },
+    "showAll": "Alles anzeigen"
+  },
+  "canvas": {
+    "paneLabel": "Dynamischer Canvas",
+    "defaultTitle": "Canvas",
+    "noSource": "Keine Quelle ausgewählt",
+    "untrusted": "Vom Agenten bereitgestellter Inhalt",
+    "lastSynced": "Zuletzt synchronisiert",
+    "refresh": "Canvas-Status aktualisieren",
+    "popOut": "Canvas in einem neuen Fenster öffnen",
+    "close": "Canvas schließen",
+    "open": "Canvas öffnen",
+    "hide": "Canvas ausblenden",
+    "skipToCanvas": "Zum Canvas springen",
+    "newContent": "Neuer Canvas-Inhalt verfügbar",
+    "returnToChat": "Zurück zum Chat",
+    "resize": "Chat und Canvas in der Größe ändern",
+    "empty": "Der Agent hat noch nichts präsentiert.",
+    "unsupported": "Diese Canvas-Quelle wird von dieser Cockpit-Version nicht unterstützt.",
+    "contentTooComplex": "Dieses Artefakt ist zu komplex, um es sicher darzustellen. Bitten Sie den Agenten, es zu vereinfachen.",
+    "sourceKind": {
+      "file": "Datei",
+      "app": "Live-App",
+      "browser": "Geteilter Browser",
+      "unknown": "Canvas"
+    },
+    "renderer": {
+      "markdown": "Markdown",
+      "text": "Text",
+      "html": "Statisches HTML",
+      "html-interactive": "Interaktives HTML",
+      "image": "Bild",
+      "office": "Office-Dokument",
+      "app": "Live-App",
+      "browser": "Geteilter Browser",
+      "unsupported": "Nicht unterstützte Quelle"
+    },
+    "status": {
+      "ready": "Canvas ist bereit",
+      "readyRevision": "Canvas ist bereit, Präsentation {{revision}}",
+      "loading": "Canvas-Inhalt wird geladen…",
+      "updating": "Der Agent aktualisiert den Canvas…",
+      "sourceChanged": "Die Quelle im Workspace wurde geändert. Bitten Sie den Agenten, sie erneut zu präsentieren.",
+      "contentError": "Der Canvas-Inhalt konnte nicht geladen werden.",
+      "starting": "Canvas wird gestartet…",
+      "unavailable": "Die Canvas-Quelle ist derzeit nicht verfügbar.",
+      "ended": "Diese Canvas-Quelle wurde beendet.",
+      "error": "Im Canvas ist ein Fehler aufgetreten.",
+      "cleared": "Canvas wurde geleert."
+    },
+    "image": {
+      "zoomIn": "Vergrößern",
+      "zoomOut": "Verkleinern",
+      "missingAlt": "Bild ohne bereitgestellte Beschreibung"
+    },
+    "html": {
+      "frameTitle": "Statische Canvas-Vorschau: {{title}}",
+      "interactiveFrameTitle": "Interaktive Canvas-Vorschau: {{title}}"
+    },
+    "office": {
+      "frameTitle": "Office-Dokument: {{title}}",
+      "connecting": "Office-Dokument wird geöffnet…",
+      "unavailable": "Das Office-Dokument konnte nicht geöffnet werden.",
+      "conflict": {
+        "title": "Office-Änderungen benötigen Aufmerksamkeit",
+        "body": "Der Editor konnte das Speichern oder Aktualisieren für diesen Turn nicht abschließen. Laden Sie vor dem Fortfahren die aktuelle Workspace-Version; während der Übergabe kann sie weiterhin von einem anderen Writer geändert werden.",
+        "reload": "Dokument neu laden"
+      }
+    },
+    "browser": {
+      "source": "Aktueller geteilter Browser",
+      "untitled": "Seite ohne Titel",
+      "noUrl": "Keine Seitenadresse",
+      "loading": "Seite wird geladen…",
+      "surfaceLabel": "Seite im geteilten Browser",
+      "retryConnection": "Verbindung erneut versuchen",
+      "restart": "Browser neu starten",
+      "baton": {
+        "agent": "Der Agent steuert",
+        "user": "Sie steuern",
+        "take": "Steuerung übernehmen",
+        "release": "Steuerung abgeben",
+        "pending": "Warten auf Browser…"
+      },
+      "toolbar": {
+        "label": "Steuerelemente des geteilten Browsers",
+        "back": "Zurück",
+        "reload": "Neu laden",
+        "address": "Adresse",
+        "navigationRejected": "Navigation blockiert:"
+      },
+      "open": {
+        "action": "Browser öffnen",
+        "explanation": "Öffnen Sie einen Browser, den Sie gemeinsam mit dem Agenten verwenden können.",
+        "dirty": "Speichern oder verwerfen Sie Ihre Canvas-Änderungen, bevor Sie den Browser öffnen. Dadurch wird die aktuelle Ansicht ersetzt.",
+        "replace": {
+          "title": "Aktuellen Canvas ersetzen?",
+          "body": "Beim Öffnen des geteilten Browsers wird die aktuelle Canvas-Präsentation ersetzt. Das zugrunde liegende Element wird nicht gelöscht, muss aber vom Agenten erneut präsentiert werden, bevor Sie dorthin zurückkehren können.",
+          "confirm": "Durch Browser ersetzen"
+        },
+        "retry": "Erneut versuchen",
+        "phase": {
+          "workspace": "Workspace wird gestartet…",
+          "browser": "Browser wird gestartet…",
+          "connecting": "Verbindung wird hergestellt…"
+        },
+        "error": {
+          "timeout": "Der Browser hat zu lange zum Starten gebraucht. Sie können es erneut versuchen.",
+          "invalidResponse": "Der Server hat eine ungültige Browser-Antwort zurückgegeben.",
+          "failed": "Der Browser konnte nicht geöffnet werden. Sie können es erneut versuchen."
+        }
+      },
+      "reason": {
+        "feature_disabled": "Der geteilte Browser ist auf diesem Server deaktiviert.",
+        "workspace_required": "Dieser Sitzungstyp stellt keinen Browser-Workspace bereit.",
+        "workspace_unattested": "Dieser Workspace ist für den Zugriff auf den geteilten Browser nicht vertrauenswürdig.",
+        "workspace_unroutable": "Der Server kann diesen Workspace-Browser nicht sicher erreichen.",
+        "transport_unavailable": "Der sichere Browser-Transport ist auf diesem Server nicht konfiguriert."
+      },
+      "status": {
+        "connecting": "Verbindung wird hergestellt…",
+        "ready": "Geteilter Browser verbunden",
+        "reconnecting": "Verbindung zum geteilten Browser wird wiederhergestellt…",
+        "ended": "Diese Browser-Sitzung wurde beendet.",
+        "viewerLimit": "Der geteilte Browser hat sein Anzeigelimit erreicht.",
+        "unauthorized": "Sie haben keinen Zugriff mehr auf diesen geteilten Browser.",
+        "unavailable": "Der geteilte Browser ist derzeit nicht verfügbar.",
+        "disabled": "Der geteilte Browser ist auf diesem Server deaktiviert.",
+        "error": "Bei der Verbindung zum geteilten Browser ist ein Protokollfehler aufgetreten."
+      }
+    },
+    "app": {
+      "source": "Workspace-Anwendung",
+      "frameTitle": "Live-Canvas-Anwendung: {{title}}",
+      "untrustedWarning": "Nicht vertrauenswürdige App — keine Passwörter oder Geheimnisse eingeben.",
+      "connecting": "Verbindung zur isolierten Canvas-Anwendung wird hergestellt…",
+      "renewing": "Die sichere Canvas-Verbindung wird aktualisiert…",
+      "unavailable": "Die isolierte Canvas-Anwendung konnte nicht geöffnet werden.",
+      "retry": "Sichere Vorschau erneut versuchen",
+      "failure": {
+        "disabled": {
+          "title": "Live-Vorschau ist deaktiviert",
+          "body": "In dieser Bereitstellung ist die isolierte Anzeige von Live-Apps nicht aktiviert."
+        },
+        "unsupported": {
+          "title": "Sichere Live-Vorschau wird nicht unterstützt",
+          "body": "Dieser Browser oder seine Datenschutzeinstellungen unterstützt die von Canvas benötigten sicheren Metadaten oder partitionierten Speicher nicht."
+        },
+        "temporary": {
+          "title": "Sichere Live-Vorschau ist nicht verfügbar",
+          "body": "Die eingebettete Vorschau konnte nicht hergestellt werden. Ursache kann ein vorübergehender Dienst-, Authentifizierungs- oder Browser-Datenschutzfehler sein."
+        },
+        "safeFallback": "Zur Sicherheit hat Canvas die App nicht als eigenständige Seite geöffnet. Verwenden Sie stattdessen die authentifizierte IDE oder den manuellen Vorschau-Workflow."
+      },
+      "reset": {
+        "action": "App-Ursprung zurücksetzen",
+        "confirm": "Mit neuem App-Ursprung starten",
+        "confirming": {
+          "title": "Mit einem neuen isolierten App-Ursprung starten?",
+          "body": "Die Ursprungsgeneration der App wird gewechselt, alte Vorschauen werden stillgelegt und ihre Sitzungen widerrufen. Die Bereinigung von Browserdaten des alten Ursprungs erfolgt nach Möglichkeit."
+        },
+        "resetting": {
+          "title": "App-Ursprung wird zurückgesetzt…",
+          "body": "Canvas widerruft alte Ursprungssitzungen und verbindet diese Vorschau neu."
+        },
+        "success": {
+          "title": "App-Ursprung wurde zurückgesetzt",
+          "body": "Canvas verbindet die App mit einer neuen Ursprungsgeneration neu."
+        },
+        "error": {
+          "title": "App-Ursprung konnte nicht zurückgesetzt werden",
+          "body": "Canvas hat den aktuellen Stand neu geladen. Prüfen Sie die Verbindung und versuchen Sie es erneut."
+        }
+      }
+    },
+    "editor": {
+      "label": "Editor für die Canvas-Quelle",
+      "loading": "Editor wird geladen…",
+      "unavailable": "Der Quelltexteditor konnte nicht geladen werden.",
+      "edit": "Quelle bearbeiten",
+      "preview": "Vorschau anzeigen",
+      "save": "Speichern",
+      "saving": "Wird gespeichert…",
+      "saved": "Canvas-Quelle gespeichert",
+      "unsaved": "Sie haben ungespeicherte Canvas-Änderungen",
+      "keepEditing": "Weiter bearbeiten",
+      "loadCurrent": "Verwerfen und aktuelle Version laden",
+      "discardCleared": "Lokale Änderungen verwerfen",
+      "remoteEditing": "Eine andere Ansicht bearbeitet diese Canvas-Quelle.",
+      "sourceRefresh": "Die Workspace-Datei wurde außerhalb des Canvas-Editors geändert.",
+      "loadWorkspace": "Workspace-Version laden",
+      "conflict": {
+        "content_changed": {
+          "title": "Die Workspace-Datei wurde geändert",
+          "body": "Ihre Änderungen bleiben erhalten. Vergleichen Sie sie, bevor Sie die aktuelle Workspace-Version laden."
+        },
+        "presentation_changed": {
+          "title": "Der Canvas wurde erneut präsentiert",
+          "body": "Ihre Änderungen bleiben erhalten. Laden Sie die aktuelle Präsentation, bevor Sie sie überschreiben."
+        },
+        "replaced": {
+          "title": "Die Canvas-Quelle wurde ersetzt",
+          "body": "Ihre Änderungen gehören weiterhin zur vorherigen Quelle und wurden nicht gespeichert."
+        },
+        "cleared": {
+          "title": "Der Canvas wurde geleert",
+          "body": "Ihre lokalen Änderungen bleiben erhalten, bis Sie sie verwerfen oder anderweitig kopieren."
+        },
+        "busy": {
+          "title": "Die Canvas-Quelle ist belegt",
+          "body": "Ein anderer Speichervorgang läuft. Ihre Änderungen sind sicher; versuchen Sie es gleich erneut."
+        },
+        "precondition_required": {
+          "title": "Die Speichervoraussetzung des Editors fehlt",
+          "body": "Ihre Änderungen sind sicher. Laden Sie die aktuelle Version und versuchen Sie es erneut."
+        },
+        "save_failed": {
+          "title": "Die Canvas-Quelle konnte nicht gespeichert werden",
+          "body": "Ihre Änderungen bleiben in diesem Browser erhalten. Prüfen Sie die Verbindung und versuchen Sie es erneut."
+        }
+      }
+    },
+    "offline": {
+      "badge": "Workspace schläft",
+      "body": "Der Workspace schläft — angezeigt wird die am {{date}} präsentierte Version. Sobald die Sitzung fortgesetzt wird, ist sie wieder bearbeitbar.",
+      "bodyUndated": "Der Workspace schläft — angezeigt wird die zuletzt präsentierte Version. Sobald die Sitzung fortgesetzt wird, ist sie wieder bearbeitbar."
+    }
+  },
   "common": {
+    "close": "Schließen",
     "save": "Speichern",
     "saving": "Wird gespeichert...",
     "saved": "Gespeichert",
     "delete": "Löschen",
     "cancel": "Abbrechen",
+    "dismiss": "Schließen",
     "edit": "Bearbeiten",
+    "rename": "Umbenennen",
     "copy": "Kopieren",
     "copied": "Kopiert",
     "never": "Nie",
     "default": "Standard",
     "noKey": "(kein Schlüssel)"
+  },
+  "externalImage": {
+    "title": "Externes Bild blockiert",
+    "host": "Ziel: {{host}}",
+    "unknownHost": "unbekannter Host",
+    "explanation": "Beim Laden kontaktiert der SRW-Server {{host}} und übermittelt diesem Host den unten angezeigten URL-Pfad samt Abfrage. Ihr Browser stellt nur die zurückgegebenen Bilddaten dar.",
+    "parameterWarning": "Diese URL enthält Abfrageparameter. Prüfen Sie diese vor dem Laden auf vertrauliche Informationen.",
+    "unsupported": "Geladen werden können nur öffentliche HTTPS-Bild-URLs auf Port 443 ohne Zugangsdaten oder Fragmente.",
+    "copyUrl": "URL kopieren",
+    "copied": "Kopiert",
+    "blocked": "Blockiert",
+    "idle": "Bild einmal laden",
+    "loading": "Wird geladen…",
+    "loaded": "Bild geladen",
+    "error": "Erneut laden",
+    "loadFailed": "SRW konnte diese URL nicht als sicheres öffentliches Rasterbild laden.",
+    "missingAlt": "Externes Bild"
   },
   "nav": {
     "cockpit": "Cockpit",
@@ -19,15 +369,38 @@
     "jobs": "Aufträge",
     "review": "Auftragsprüfung",
     "projects": "Projekte",
-    "datasources": "Datenquellen",
+    "datasources": "Konnektoren",
+    "contacts": "Kontakte",
+    "experts": "Experten",
+    "skills": "Skills",
     "automations": "Automationen",
     "create": "Erstellen",
-    "debug": "Debug",
+    "workbench": "Workbench",
     "settings": "Einstellungen",
     "logout": "Abmelden",
     "admin": "Admin",
     "collapseSidebar": "Seitenleiste einklappen",
     "openSidebar": "Seitenleiste öffnen"
+  },
+  "grants": {
+    "lockedShort": "Erfordert eine Freigabe",
+    "locked": {
+      "vm_workspace": "VM-Workspaces erfordern die Freigabe „vm_workspace“.",
+      "shell_tools": "Shell-Tools erfordern die Freigabe „shell_tools“.",
+      "delegation": "Delegation erfordert die Freigabe „delegation“.",
+      "datasource_tools": "Konnektor-Tools erfordern die Freigabe „datasource_tools“.",
+      "browser": "Browser-Tools erfordern die Freigabe „browser“.",
+      "model_selection": "Ihr Administrator schränkt ein, welche Modelle Sie auswählen können.",
+      "autonomy_ceiling": "Autonomie über Ihrer Obergrenze erfordert eine Freigabe.",
+      "permission_mode": "Dieser Berechtigungsmodus erfordert eine Freigabe."
+    }
+  },
+  "adminExpertDefaults": {
+    "title": "Standard-Experten der Anwendung",
+    "desc": "Diese globalen Datenbank-Experten werden für Benutzer vorausgewählt, die keinen aktiven persönlichen oder Projektstandard haben.",
+    "worker": "Neue Aufträge",
+    "session": "Neue Sitzungen",
+    "edit": "Ausgewählten Experten bearbeiten"
   },
   "shell": {
     "newSession": "Neue Sitzung",
@@ -47,20 +420,46 @@
     "emptyHint": "Erstellen Sie ein neues Projekt, um zu beginnen",
     "createProject": "Projekt erstellen",
     "creating": "Wird erstellt...",
+    "createFailed": "Projekt konnte nicht erstellt werden. Bitte Angaben prüfen und erneut versuchen.",
     "namePlaceholder": "Projektname (erforderlich)",
     "descriptionPlaceholder": "Beschreibung (optional)",
     "goalPlaceholder": "Ziel (optional)",
     "badgePersonal": "Persönlich",
     "jobsCount": "{{count}} Aufträge",
+    "jobsCountOne": "{{count}} Auftrag",
     "reposCount": "{{count}} Repos",
+    "reposCountOne": "{{count}} Repo",
     "membersCount": "{{count}} Mitglieder",
+    "membersCountOne": "{{count}} Mitglied",
+    "emptyArchived": "Keine archivierten Projekte",
+    "emptyArchivedHint": "Archivieren hält ein abgeschlossenes Projekt aus Listen und Auswahlfeldern heraus, ohne etwas zu löschen",
+    "archivedNotice": "Archivierte Projekte sind in dieser Liste sowie in den Auswahlfeldern für neue Aufträge und Sitzungen ausgeblendet. Heben Sie die Archivierung auf, um wieder Arbeit darin anzulegen.",
     "status": {
       "active": "aktiv",
-      "archived": "archiviert",
-      "deleted": "gelöscht"
+      "archived": "archiviert"
+    },
+    "filter": {
+      "active": "Aktiv ({{count}})",
+      "archived": "Archiviert ({{count}})"
+    },
+    "action": {
+      "unarchive": "Archivierung aufheben",
+      "unarchiving": "Wird aufgehoben..."
+    },
+    "tooltip": {
+      "unarchive": "Dieses Projekt wieder aktivieren, damit neue Aufträge und Sitzungen darauf laufen können"
     },
     "error": {
       "noAccess": "Sie haben keinen Zugriff auf dieses Projekt."
+    },
+    "externalKb": {
+      "toggle": "Externes Wissens-Repository verwenden",
+      "hint": "Die Wissensdatenbank dieses Projekts in einem eigenen privaten GitHub-Repository ablegen, indem Sie einen zuvor angelegten Wissensdatenbank-Konnektor anhängen.",
+      "selectPlaceholder": "Wissensdatenbank-Konnektor auswählen…",
+      "loading": "Konnektoren werden geladen…",
+      "adoptHint": "Der Konnektor wird zur Wissensdatenbank dieses Projekts: Er wird fortan vom Projekt verwaltet und steht anderen nicht mehr zur Verfügung.",
+      "noConnectors": "Sie haben noch keinen Wissensdatenbank-Konnektor. Legen Sie zuerst einen für das Repository an und hängen Sie ihn dann hier an.",
+      "createConnector": "Konnektor anlegen"
     }
   },
   "automations": {
@@ -135,10 +534,13 @@
     "returnToChat": "Zurück zum Chat",
     "loading": "Sitzungen werden geladen...",
     "empty": "Noch keine Sitzungen. Erstellen Sie eine, um zu beginnen.",
+    "emptyCta": "Einfach loschatten",
     "emptyFilterActive": "Keine aktiven Sitzungen.",
     "emptyFilterEnded": "Keine beendeten Sitzungen.",
     "untitledSession": "Unbenannte Sitzung",
     "confirmDelete": "Diese Sitzung dauerhaft löschen?",
+    "confirmForceDelete": "Der Agent arbeitet in dieser Sitzung noch an einem Zug. Trotzdem löschen? Der laufende Zug geht verloren.",
+    "confirmEndMidTurn": "Der Agent arbeitet noch an einem Zug. Sitzung trotzdem beenden? Der laufende Zug und alle eingereihten Eingaben gehen verloren.",
     "turnsOne": "Zug",
     "turnsMany": "Züge",
     "filter": {
@@ -164,33 +566,137 @@
       "modelConfigDefault": "Konfigurations-Standard",
       "projectsLabel": "Projekte",
       "projectsEmpty": "Keine Projekte verfügbar",
+      "projectArchived": "(archiviert)",
+      "projectArchivedWarning": "Ein archiviertes Projekt ist weiterhin ausgewählt — eine Sitzung darauf wird abgelehnt. Wählen Sie es ab oder heben Sie die Archivierung auf.",
       "projectsHint": "Projekte für gemeinsamen Wissenszugriff auswählen",
       "permissionLabel": "Berechtigungsmodus",
       "permissionSupervised": "Beaufsichtigt",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
       "creating": "Wird erstellt...",
+      "failed": "Die Sitzung konnte nicht erstellt werden. Passe die Einstellungen unten an und versuche es erneut.",
       "create": "Erstellen",
       "cancel": "Abbrechen",
       "expertLabel": "Experte",
       "expertLoading": "Experten werden geladen...",
-      "createSession": "Sitzung erstellen"
+      "expertSelectedPrefix": "Ausgewählt:",
+      "createSession": "Sitzung erstellen",
+      "protectedCloud": "Geschützte Cloud — Agenten-Änderungen werden zur Überprüfung bereitgestellt",
+      "protectedCloudHint": "Der Agent erhält schreibgeschützten Cloud-Zugriff; seine Änderungen warten im Prüfbereich auf Ihre Freigabe."
+    },
+    "configDrift": {
+      "title": "Ein Teil der Einrichtung dieser Sitzung ist nicht mehr vorhanden",
+      "intro": "Teile der Konfiguration dieser Sitzung sind nicht mehr verfügbar:",
+      "attentionNeeded": "Die Einrichtung dieser Sitzung erfordert Aufmerksamkeit. Sie wird jetzt geöffnet …",
+      "resumeAnyway": "Trotzdem fortsetzen",
+      "startNew": "Neue Sitzung starten",
+      "connector": {
+        "deleted": "Gelöschter Konnektor — {{label}}",
+        "revoked": "Widerrufener Konnektor — {{label}}",
+        "out_of_scope": "Widerrufener Konnektor — {{label}}"
+      },
+      "project": {
+        "deleted": "Gelöschtes Projekt — {{label}}",
+        "revoked": "Widerrufenes Projekt — {{label}}",
+        "out_of_scope": "Widerrufenes Projekt — {{label}}"
+      },
+      "grant": {
+        "deleted": "Fehlende Freigabe — {{label}}",
+        "revoked": "Fehlende Freigabe — {{label}}",
+        "out_of_scope": "Fehlende Freigabe — {{label}}"
+      },
+      "countSuffix": " (×{{count}})"
     }
   },
   "jobs": {
+    "pagination": {
+      "label": "Seitennavigation",
+      "current": "Seite {{page}}",
+      "goToPage": "Zu Seite {{page}}",
+      "previous": "Vorherige Seite",
+      "next": "Nächste Seite",
+      "pageSize": "Pro Seite",
+      "rangeUnknown": "{{start}}–{{end}}"
+    },
+    "live": {
+      "on": "Live",
+      "paused": "Pausiert",
+      "pause": "Live-Aktualisierung pausieren",
+      "resume": "Live-Aktualisierung fortsetzen",
+      "pausedOnPage": "Live-Aktualisierung pausiert — Seite {{page}}",
+      "backToLive": "Zurück zu Live",
+      "newJobs": "{{count}} neu — anzeigen"
+    },
+    "origin": {
+      "user": "Von einer Person erstellt",
+      "session": "Aus einer Sitzung gestartet",
+      "automation": "Automatisierung",
+      "loop": "Schleife",
+      "officer": "Officer",
+      "subjob": "Teilauftrag",
+      "lifecycle": "System-Lebenszyklus",
+      "bench": "Benchmark"
+    },
     "title": "Aufträge",
+    "confirmDelete": "Diesen Job endgültig löschen? Ein vorhandener Backlog-Ticket-Anspruch bleibt bestehen und wird nicht erneut freigegeben.",
+    "confirmCancel": "Diesen Job abbrechen?",
+    "confirmCancelHint": "Sie können ihn später von einem Checkpoint fortsetzen.",
+    "confirmCancelDismiss": "Weiterlaufen lassen",
+    "confirmCancelConfirm": "Job abbrechen",
     "loading": "Aufträge werden geladen...",
     "refresh": "Aktualisieren",
+    "newJob": "Neuer Auftrag",
+    "reviewQueue": "Prüfen ({{count}})",
     "noJobsFound": "Keine Aufträge gefunden",
     "noJobsHintFilter": "Versuchen Sie einen anderen Filter",
     "noJobsHintEmpty": "Erstellen Sie einen neuen Auftrag, um zu beginnen",
     "snapshotsSummary": "{{count}} Snapshots · {{size}}",
-    "count": "Zeige {{filtered}} von {{total}} Aufträgen",
+    "count": "{{start}}–{{end}} von {{total}} Aufträgen",
     "colJob": "Auftrag",
+    "colProject": "Projekt",
     "colStatus": "Status",
     "colCreated": "Erstellt",
     "colActions": "Aktionen",
+    "projectNone": "Kein Projekt",
+    "projectUnknown": "Unbekanntes Projekt",
+    "failureReason": "Grund",
+    "workspace": {
+      "summary": "Arbeitsbereich: angefordert {{requested}} · zugewiesen {{assigned}} · wirksam {{effective}}",
+      "state": "Arbeitsbereichsstatus: {{state}} · Detail: {{failure}}",
+      "default": "Standard",
+      "unavailable": "nicht verfügbar",
+      "none": "keines"
+    },
     "filter": {
+      "token": {
+        "status": "Status: {{value}}",
+        "origin": "Herkunft: {{value}}",
+        "project": "Projekt: {{name}}",
+        "noProject": "Ohne Projekt",
+        "search": "Suche: {{term}}",
+        "systemHidden": "Systemjobs ausgeblendet",
+        "archived": "Archivierte Projekte ausgeblendet"
+      },
+      "statusGroup": "Nach Status filtern",
+      "appliedGroup": "Aktive Filter",
+      "searchPlaceholder": "Titel oder ID suchen",
+      "searchLabel": "Jobs durchsuchen",
+      "more": "Filter",
+      "clearAll": "Alle zurücksetzen",
+      "removeToken": "Filter entfernen: {{filter}}",
+      "resultAnnouncement": "{{count}} Jobs gefunden",
+      "panelTitle": "Filter",
+      "panelLabel": "Job-Filter",
+      "originLabel": "Herkunft",
+      "originHint": "Woher der Job stammt. Leer lassen, um alle anzuzeigen.",
+      "projectLabel": "Projekt",
+      "projectAll": "Alle Projekte",
+      "projectSearch": "Projekte filtern",
+      "noProject": "Nur Jobs ohne Projekt",
+      "noProjectHint": "Nicht mit einzelnen Projekten kombinierbar.",
+      "archivedLabel": "Archivierte Projekte",
+      "includeArchived": "Jobs aus archivierten Projekten einbeziehen",
+      "includeArchivedHint": "Standardmäßig aus — deren Jobs sind hier ausgeblendet.",
       "all": "Alle",
       "pending_review": "Prüfung",
       "reviewing": "In Prüfung",
@@ -200,9 +706,11 @@
       "completed": "Abgeschlossen",
       "paused": "Pausiert",
       "failed": "Fehlgeschlagen",
-      "cancelled": "Abgebrochen"
+      "cancelled": "Abgebrochen",
+      "blocked_undelivered": "Blockiert / nicht ausgeliefert"
     },
     "status": {
+      "pending": "Ausstehend",
       "pending_review": "Prüfung ausstehend",
       "reviewing": "In Prüfung",
       "waiting": "Wartend",
@@ -211,7 +719,10 @@
       "completed": "Abgeschlossen",
       "paused": "Pausiert",
       "failed": "Fehlgeschlagen",
-      "cancelled": "Abgebrochen"
+      "cancelled": "Abgebrochen",
+      "blocked_undelivered": "Blockiert / nicht ausgeliefert",
+      "waiting_for_reply": "Wartet auf Antwort",
+      "waiting_approval": "Wartet · Freigabe"
     },
     "action": {
       "view": "Ansehen",
@@ -228,32 +739,40 @@
       "confirmDelete": "Bestätigen?",
       "promote": "Heraufstufen",
       "createProject": "Projekt erstellen",
-      "exportToCloud": "In Cloud exportieren",
-      "exported": "Exportiert"
+      "exportToCloud": "In die Cloud exportieren",
+      "openCloudFolder": "Cloud-Ordner öffnen",
+      "exported": "Exportiert",
+      "approveRequest": "Anfrage freigeben"
     },
     "tooltip": {
-      "collapse": "Unteraufträge einklappen",
-      "expand": "Unteraufträge ausklappen",
-      "view": "In Debug-Ansicht öffnen",
-      "workspace": "Arbeitsbereich in Gitea öffnen",
-      "ideSnapshot": "Arbeitsbereich in Web-IDE öffnen (aus Snapshot)",
-      "ideCode": "Arbeitsbereich in Web-IDE öffnen (nur Code)",
-      "ideStarting": "IDE-Sitzung wird gestartet...",
-      "pauseJob": "Auftrag pausieren",
+      "approveRequest": "Dieser Auftrag wartet auf eine Sudo-/VM-Upgrade-Entscheidung — Anfrage im Posteingang öffnen",
       "cancelJob": "Auftrag abbrechen",
       "canceling": "Auftrag wird abgebrochen...",
+      "collapse": "Unteraufträge einklappen",
+      "collapseDetails": "Job-Details ausblenden",
       "confirmCancel": "Erneut klicken, um Abbruch zu bestätigen",
-      "reviewJob": "Prüfen und genehmigen/fortsetzen",
-      "resumeJob": "Vom Checkpoint fortsetzen",
       "confirmDelete": "Erneut klicken, um Löschung zu bestätigen",
-      "deleteJob": "Auftrag löschen",
-      "promoteJob": "Zu Projekt heraufstufen",
-      "exportToCloud": "Output-Ordner dieses Auftrags in einen geteilten Cloud-Ordner kopieren",
-      "alreadyExported": "Bereits exportiert. Cloud-Ordner löschen, um erneut zu exportieren.",
-      "snapshotStats": "S3-Snapshot-Speicher",
-      "snapshotAvailable": "Umgebungs-Snapshot verfügbar",
+      "delegationChild": "Delegations-Unterauftrag (Erstellungsreihenfolge {{order}})",
       "delegationWaiting": "Warte auf Abschluss der Delegations-Unteraufträge",
-      "delegationChild": "Delegations-Unterauftrag (Erstellungsreihenfolge {{order}})"
+      "deleteJob": "Auftrag löschen",
+      "expand": "Unteraufträge ausklappen",
+      "expandDetails": "Job-Details anzeigen",
+      "exportToCloud": "Ergebnisse dieses Auftrags in einen geteilten Cloud-Ordner kopieren",
+      "ideCode": "Arbeitsbereich in Web-IDE öffnen (nur Code)",
+      "ideSnapshot": "Arbeitsbereich in Web-IDE öffnen (aus Snapshot)",
+      "ideStarting": "IDE-Sitzung wird gestartet...",
+      "moreActions": "Weitere Aktionen",
+      "openCloudFolder": "Cloud-Ordner dieses Auftrags in einem neuen Tab öffnen",
+      "pauseJob": "Auftrag pausieren",
+      "promoteJob": "Zu Projekt heraufstufen",
+      "resumeJob": "Vom Checkpoint fortsetzen",
+      "reviewJob": "Prüfen und genehmigen/fortsetzen",
+      "reviewQueue": "Prüfungswarteschlange öffnen",
+      "snapshotAvailable": "Umgebungs-Snapshot verfügbar",
+      "snapshotStats": "S3-Snapshot-Speicher",
+      "subjobCount": "{{count}} Unterauftrag/-aufträge in diesem Baum, unabhängig vom Filter",
+      "view": "In der Workbench öffnen",
+      "workspace": "Arbeitsbereich in Gitea öffnen"
     },
     "delegationChildren": "{{count}} Unteraufträge",
     "promote": {
@@ -263,10 +782,13 @@
     },
     "create": {
       "title": "Neuen Auftrag erstellen",
+      "backToJobs": "Zurück zu Aufträgen",
       "dismiss": "Schließen",
       "projectLabel": "Projekt",
       "projectNone": "Kein Projekt",
       "projectPersonal": "(Persönlich)",
+      "projectArchived": "(archiviert)",
+      "projectArchivedWarning": "Dieses Projekt ist archiviert — ein Auftrag darin wird abgelehnt. Heben Sie die Archivierung auf oder wählen Sie ein anderes Projekt.",
       "projectHint": "Wählen Sie das Projekt, zu dem dieser Auftrag gehört",
       "descriptionLabel": "Beschreibung",
       "descriptionPlaceholder": "Beschreiben Sie, was der Agent erreichen soll...",
@@ -277,7 +799,7 @@
       "expertLabel": "Agent-Experte",
       "expertLoading": "Experten werden geladen...",
       "expertSelectedPrefix": "Ausgewählt:",
-      "expertHintUnselected": "Wählen Sie ein Expertenprofil oder lassen Sie die Auswahl leer für den Standard-Agenten",
+      "expertHintUnselected": "Der wirksame Standard-Experte wird automatisch ausgewählt",
       "documentsLabel": "Dokumente",
       "dropHint": "Dateien hierher ziehen oder klicken, um zu durchsuchen",
       "maxHint": "Max. {{maxFiles}} Dateien, je {{maxSizeMb}} MB",
@@ -297,6 +819,38 @@
       "submit": "Auftrag erstellen",
       "creating": "Wird erstellt...",
       "uploading": "Wird hochgeladen..."
+    },
+    "detail": {
+      "auditSteps": "Audit-Schritte",
+      "cost": "Kosten",
+      "costFloor": "{{priced}} von {{total}} erfassten Ereignissen bepreist — die tatsächlichen Kosten liegen höher.",
+      "costFloorHint": "Teilweise bepreist: die tatsächlichen Kosten liegen höher als angezeigt.",
+      "costMeteringOff": "Die Verbrauchserfassung ist in dieser Installation deaktiviert.",
+      "costNoUsage": "Für diesen Job wurde kein Verbrauch erfasst.",
+      "costPredatesLedger": "Dieser Job lief vor Beginn der Verbrauchserfassung und hat daher keine Werte.",
+      "costUnknown": "Verbrauch konnte nicht geladen werden.",
+      "costUnpriced": "Erfasst, aber für diese Modelle gibt es keine Preisliste — Tokens sind exakt, die Kosten unbekannt.",
+      "duration": "Dauer",
+      "expert": "Experte",
+      "loading": "Details werden geladen…",
+      "model": "Modell",
+      "modelDefault": "Experten-Standard",
+      "origin": "Herkunft",
+      "scopeCovers": "Summiert über {{count}} Jobs — diesen Job und alle darunter liegenden Teil-Jobs, unabhängig vom aktuellen Filter.",
+      "scopeJob": "Dieser Job",
+      "scopeLabel": "Verbrauchsbereich",
+      "scopeNoSubjobs": "Dieser Job hat keine Teil-Jobs, beide Werte sind daher identisch.",
+      "scopeSubtree": "Inkl. Teil-Jobs",
+      "showSubjobRows": "{{count}} ausgeblendete als Zeilen anzeigen",
+      "showSubjobRowsHint": "Fügt Unteraufträge zum Herkunftsfilter hinzu, damit sie in der Liste erscheinen.",
+      "subjobs": "Unteraufträge ({{count}})",
+      "tokens": "Tokens",
+      "unknown": "Unbekannt",
+      "usage": "Verbrauch",
+      "usageLive": "läuft noch — Werte bis zu 3 Min. verzögert",
+      "waitingNoLiveSubjobs": "Wartet auf einen Unterauftrag, aber alle darunter sind fertig.",
+      "waitingOnSubjobs": "Wartet auf {{count}} unfertige(n) Unterauftrag — die Arbeit liegt eine Ebene tiefer.",
+      "workspace": "Workspace"
     }
   },
   "admin": {
@@ -321,6 +875,27 @@
         "noSettingChanges": "Keine Einstellungsänderungen zu speichern.",
         "settingsSaved": "Inferenz-Einstellungen gespeichert.",
         "settingsSaveFailed": "Einstellungen konnten nicht gespeichert werden."
+      }
+    },
+    "usage": {
+      "cacheHit": "Cache-Treffer",
+      "cachedTokens": "Gecachte Tok.",
+      "vcpuHours": "vCPU-Stunden",
+      "memoryGibHours": "Arbeitsspeicher-GiB-Stunden",
+      "claimGibHours": "Claim-GiB-Stunden",
+      "claimHours": "PVC-Claim-Stunden",
+      "volumeGibHours": "Volume-GiB-Stunden",
+      "volumeHours": "Volume-Stunden",
+      "vcpuHoursShort": "vCPU-Std.",
+      "memoryGibHoursShort": "RAM-GiB-Std.",
+      "memoryBreakdownUnavailable": "Arbeitsspeicher ist in dieser älteren Aufschlüsselung nicht verfügbar, da GiB-Stunden nicht nach Kategorie getrennt sind.",
+      "pageDescCloud": "LLM-Token sowie Workspace-CPU- und Arbeitsspeicher-Zuweisungen werden im Nutzungs-Ledger erfasst und auf deine Sichtbarkeit begrenzt. CPU und Arbeitsspeicher bleiben getrennte Größen. Die kanonischen Kosten verwenden die im Ledger gespeicherten Tarife; die Cloud-Karten bewerten Compute zur Planung neu, ohne den Verlauf zu verändern.",
+      "cloudEstimate": {
+        "title": "Cloud-Vergleichsschätzung",
+        "subtitle": "Aktuelle öffentliche Listenpreise für die in diesem Zeitraum angeforderten Workspace-CPU- und RAM-Ressourcen. Diese Werte dienen der Planung und sind keine Rechnungen.",
+        "computeOnly": "Nur Compute",
+        "formulaMax": "Der dominante CPU- oder RAM-Knotenanteil bestimmt die Schätzung.",
+        "formulaSum": "Die Schätzungen der CPU- und RAM-Zähler werden addiert."
       }
     },
     "providers": {
@@ -387,17 +962,10 @@
       }
     },
     "viewMode": {
-      "role": "Admin",
-      "scopeAll": "Alle Daten",
-      "scopeMe": "Eigene Daten",
-      "tooltip": {
-        "switchToMe": "Wechseln, um nur eigene Daten zu sehen",
-        "switchToAll": "Wechseln zur flottenweiten Ansicht"
-      },
-      "pill": {
-        "label": "Nur eigene Daten",
-        "showAll": "Alle anzeigen",
-        "tooltip": "Zurück zur flottenweiten Ansicht"
+      "banner": {
+        "text": "Sie sehen die Daten aller Benutzer.",
+        "showMine": "Nur meine anzeigen",
+        "tooltip": "Zur Ansicht nur eigener Daten wechseln"
       }
     }
   },
@@ -419,48 +987,94 @@
       "desc": "Ihre bevorzugte Oberflächensprache. Änderungen werden sofort angewendet.",
       "label": "Oberflächensprache"
     },
-    "apiKeys": {
-      "title": "API-Schlüssel",
-      "desc": "Legen Sie eigene API-Schlüssel für LLM-Anbieter und Werkzeuge fest. Diese haben bei der Ausführung von Aufträgen Vorrang vor systemweiten Schlüsseln.",
-      "empty": "Keine API-Schlüssel konfiguriert. Fügen Sie einen hinzu, um eigene Anbieterschlüssel zu verwenden.",
-      "colProvider": "Anbieter",
-      "colKey": "Schlüssel",
-      "colLabel": "Bezeichnung",
-      "colUpdated": "Aktualisiert",
-      "addTitle": "Schlüssel hinzufügen / aktualisieren",
-      "labelPlaceholder": "Bezeichnung (optional)",
-      "keyPlaceholder": "API-Schlüssel (z. B. sk-...)",
-      "saveButton": "Schlüssel speichern"
+    "voice": {
+      "title": "Vorlese-Stimme",
+      "desc": "Die Stimme, mit der eine Assistenten-Nachricht vorgelesen wird. Gilt ab sofort für jedes Vorlesen.",
+      "provider": "Sprach-Anbieter",
+      "providerHint": "Welche Sprach-Engine Nachrichten vorliest. Jeder Anbieter bietet eigene Stimmen.",
+      "label": "Stimme",
+      "auto": "Standard (automatisch)",
+      "customPlaceholder": "Stimmen-ID",
+      "sampleLabel": "Beispieltext (optional)",
+      "samplePlaceholder": "Eigenen Text eingeben, um diese Stimme zu hören…",
+      "sampleHint": "Noch {{left}} Zeichen. Leer lassen für einen Standardsatz.",
+      "preview": "Stimme anhören",
+      "hostedPreview": "Hörprobe",
+      "previewFailed": "Vorschau konnte nicht abgespielt werden — bitte TTS-Einrichtung prüfen.",
+      "loadingVoices": "Stimmen werden geladen…",
+      "langNote": "Die Sprache jeder Stimme steht in Klammern (z. B. [EN-US], [ES], [FR]); [multi] bedeutet mehrsprachig.",
+      "kokoroNoGerman": "Dieses Backend hat keine deutsche Stimme — für Deutsch eine (mehrsprachige) OpenAI-Stimme wählen.",
+      "libraryToggle": "Stimmenbibliothek durchsuchen",
+      "libraryAdminFlag": "Hinzufügen von Bibliotheksstimmen erlauben",
+      "librarySearchPlaceholder": "Stimmen suchen (z. B. french english)",
+      "libraryAnyGender": "Beliebiges Geschlecht",
+      "female": "Weiblich",
+      "male": "Männlich",
+      "librarySearch": "Suchen",
+      "libraryAdd": "Hinzufügen",
+      "libraryAdded": "Hinzugefügt",
+      "libraryEmpty": "Keine Stimmen gefunden. Andere Suche versuchen.",
+      "previewCaveat": "„Hörprobe“ ist der Demo-Clip des Anbieters — nutze „Stimme testen“, um die tatsächliche Synthese zu hören, die anders klingen kann.",
+      "libraryPreviewCaveat": "Hörproben sind Demo-Clips des Anbieters und stimmen ggf. nicht mit der synthetisierten Ausgabe überein (Hintergrundrauschen, Klarheit). Füge eine Stimme hinzu und nutze dann „Stimme testen“, um das echte Ergebnis zu hören.",
+      "rewriteTitle": "Wie Nachrichten umformuliert werden",
+      "rewriteReasoningLabel": "Reasoning beim Umformulieren",
+      "rewriteReasoningHint": "Aus ist am schnellsten. Eingeschaltet wird die Umformulierung besser, verzögert aber das erste Audio, während das Modell nachdenkt.",
+      "reasoningOff": "Aus (am schnellsten)",
+      "reasoningLow": "Niedrig",
+      "reasoningMedium": "Mittel",
+      "reasoningHigh": "Hoch",
+      "rewritePromptLabel": "Eigene Umformulierungs-Anweisungen (optional)",
+      "rewritePromptHint": "Deine dauerhaften Vorgaben, wie Nachrichten vorgelesen werden — z. B. „gib mir bei langen Nachrichten eine Kurzfassung“, „Tabellen überspringen“, „Code-Dateinamen weglassen“. Diese haben Vorrang vor den Standardregeln (außer: es werden nie Fakten erfunden oder Zahlen und Namen geändert).",
+      "rewritePromptPlaceholder": "z. B. Lange Nachrichten zusammenfassen und Tabellen überspringen…",
+      "rewritePromptCounter": "{{left}} Zeichen übrig.",
+      "rewriteSave": "Umformulierung speichern"
     },
-    "llmEndpoints": {
-      "title": "LLM-Endpunkte",
-      "desc": "Registrieren Sie eigene OpenAI-kompatible Endpunkte (vLLM, Ollama, privates Gateway). Hier gelistete Modelle erscheinen im Modell-Picker als eigene Gruppe.",
-      "empty": "Keine eigenen Endpunkte. Fügen Sie einen hinzu, um Modelle an Ihren eigenen Server zu routen.",
-      "noKey": "kein Schlüssel",
-      "noModels": "Noch keine Modelle zugeordnet. Fügen Sie unten eines hinzu.",
-      "catalogHint": "Welche Modelle dieses Endpunkts verfügbar sind, kuratiert ein Admin – siehe Admin → Modelle.",
-      "addTitle": "Endpunkt hinzufügen",
-      "createButton": "Endpunkt erstellen",
-      "labelPlaceholder": "Bezeichnung (z. B. Mein vLLM)",
-      "baseUrlPlaceholder": "Basis-URL (z. B. https://vllm.example/v1)",
-      "apiKeyPlaceholder": "API-Schlüssel (optional)",
-      "allowInsecure": "http:// erlauben (außerhalb lokaler Entwicklung nicht empfohlen)",
-      "confirmDelete": "Diesen Endpunkt und alle zugehörigen Modelle löschen?",
-      "testButton": "Testen",
-      "testing": "Teste...",
-      "testOk": "OK ({{status}})",
-      "testFail": "Fehlgeschlagen ({{status}}): {{error}}",
-      "colModelId": "Modell-ID",
-      "colDisplayName": "Anzeigename",
-      "colFamily": "Familie",
-      "colContext": "Kontext",
-      "modelIdPlaceholder": "Modell-ID (z. B. my-org/my-model)",
-      "displayNamePlaceholder": "Anzeigename",
-      "familyPlaceholder": "Familie (optional)",
-      "contextPlaceholder": "Kontextfenster (Tokens)",
-      "addModelButton": "Modell hinzufügen",
-      "errorUrlScheme": "Die Basis-URL muss mit http:// oder https:// beginnen",
-      "errorHttpNeedsOptIn": "http://-URLs erfordern die Option „http:// erlauben“."
+    "dataVisibility": {
+      "title": "Datensichtbarkeit",
+      "desc": "Admins sehen standardmäßig die Daten aller Benutzer. Wechseln Sie zu „Nur eigene Daten“, um wie ein normaler Benutzer zu arbeiten. Die Auswahl wird in Ihrem Konto gespeichert und gilt überall.",
+      "label": "Anzeigen",
+      "optionAll": "Alle Daten",
+      "optionMe": "Nur eigene Daten"
+    },
+    "apiKeys": {
+      "linkTitle": "Personal Access Tokens",
+      "linkDesc": "Bearer-Tokens für n8n, Skripte und andere Automatisierungs-Tools, die die Orchestrator-API aufrufen müssen.",
+      "linkManage": "API-Keys verwalten",
+      "title": "Personal Access Tokens",
+      "desc": "Bearer-Tokens für Automatisierungs-Tools, die direkt mit der Orchestrator-API kommunizieren. Jedes Token hat eigene Action-Scopes und ein eigenes Ablaufdatum. Verlorene Tokens können nicht wiederhergestellt werden — erstelle einfach ein neues.",
+      "existingTitle": "Deine Tokens",
+      "colName": "Name",
+      "colScopes": "Scopes",
+      "colHint": "Token",
+      "colLastUsed": "Zuletzt verwendet",
+      "colExpires": "Läuft ab",
+      "empty": "Noch keine Tokens. Unten kannst du eines erstellen.",
+      "rotate": "Rotieren",
+      "revoke": "Widerrufen",
+      "rotatedBadge": "Wird rotiert",
+      "createTitle": "Neues Token erstellen",
+      "createDesc": "Wähle nur die Scopes, die die Automatisierung tatsächlich benötigt. Der Admin-Scope ist an deine Admin-Rolle gebunden und erlaubt destruktive Operationen.",
+      "namePlaceholder": "Token-Name (z. B. n8n Produktion)",
+      "scopesLegend": "Scopes",
+      "scopes": {
+        "jobsRead": "Jobs, Projekte und Audit-Trail einsehen.",
+        "jobsWrite": "Jobs erstellen, abbrechen, fortsetzen; Nachrichten senden; Dateien anhängen.",
+        "chatRead": "Persistente Threads und Nachrichtenverlauf lesen.",
+        "chatWrite": "Threads erstellen, Nachrichten senden, Slash-Befehle ausführen.",
+        "knowledgeRead": "Wissen durchsuchen, Quellen und Zitate auflisten.",
+        "knowledgeWrite": "Wissensnotizen und Zitate erstellen, ändern, löschen.",
+        "admin": "Sudo-Freigaben, Benutzer-/Projekt-Verwaltung, Konnektor-Verwaltung."
+      },
+      "expiryLabel": "Ablaufdatum",
+      "expiryNever": "Läuft nie ab (mit Warnung)",
+      "create": "Token erstellen",
+      "creating": "Wird erstellt…",
+      "copyWarning": "Kopiere dieses Token jetzt — es wird nicht erneut angezeigt.",
+      "copyDetail": "Speichere es in deinem Passwort-Manager oder in deinen n8n-Credentials. Jeder mit diesem Token kann die Orchestrator-API in deinem Namen innerhalb der gewählten Scopes aufrufen.",
+      "copyAck": "Ich habe das Token sicher kopiert.",
+      "copyDone": "Fertig",
+      "usageTitle": "Verwendung",
+      "usageDesc": "Übergib das Token in einem Authorization-Header. n8n's Header-Auth-Credential funktioniert direkt damit."
     },
     "preferences": {
       "title": "Voreinstellungen",
@@ -491,6 +1105,24 @@
       "providerOpenrouter": "OpenRouter",
       "save": "Voreinstellungen speichern"
     },
+    "expertDefaults": {
+      "title": "Standard-Assistenten",
+      "desc": "Wähle den Datenbank-Experten, der für neue Aufträge und Sitzungen vorausgewählt wird. Die Modell- und Verhaltensvorgaben darunter füllen nur Felder aus, die der ausgewählte Experte offenlässt.",
+      "worker": "Neue Aufträge",
+      "session": "Neue Sitzungen",
+      "useApplication": "Anwendungsstandard verwenden",
+      "customize": "Kopie anpassen",
+      "clear": "Persönlichen Standard entfernen",
+      "manage": "Meine Experten verwalten",
+      "restricted": "Dein Administrator verwaltet die Standard-Assistenten. Eine ältere persönliche Auswahl kannst du weiterhin entfernen.",
+      "effective": "Aktiv: {{name}} ({{source}})",
+      "source": {
+        "application": "Anwendungsstandard",
+        "user": "dein Standard",
+        "project": "Projektstandard",
+        "explicit": "explizite Auswahl"
+      }
+    },
     "persistent": {
       "title": "Persistenter Agent",
       "desc": "Standardwerte für interaktive persistente Agent-Sitzungen. Können pro Sitzung überschrieben werden.",
@@ -507,6 +1139,11 @@
       "permissionSupervised": "Beaufsichtigt",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
+      "workspaceBackend": "Standard-Arbeitsbereich",
+      "workspaceBackendHint": "Wo neue Sitzungen ihre Dateien ablegen. Virtuell startet in Sekunden und kann während der Sitzung auf einen Container aufgerüstet werden; Container bietet von Anfang an Shell und Git, braucht aber länger zum Bereitstellen.",
+      "workspaceVirtual": "Virtuell — sofort, Dateien im Cloud-Speicher",
+      "workspaceSandbox": "Container — volle Shell & Git, langsamerer Start",
+      "workspaceNone": "Ohne — nur Chat, keine Dateien",
       "configDefault": "Standard",
       "configDeveloper": "Entwickler",
       "configScholar": "Forscher",
@@ -564,52 +1201,15 @@
       "webConnectorDesc": "Fügen Sie diese URL als benutzerdefinierten MCP-Konnektor hinzu. OAuth-Anmeldung wird automatisch durchgeführt — kein Token oder Anmeldeinformationen erforderlich.",
       "webConnectorHint": "Funktioniert mit jedem MCP-Client, der OAuth 2.1 (Authorization Code + PKCE) unterstützt. Lassen Sie die Felder Client-ID und Client-Secret leer — der Server übernimmt die Registrierung automatisch."
     },
-    "apiKeys": {
-      "linkTitle": "Personal Access Tokens",
-      "linkDesc": "Bearer-Tokens für n8n, Skripte und andere Automatisierungs-Tools, die die Orchestrator-API aufrufen müssen.",
-      "linkManage": "API-Keys verwalten",
-      "title": "Personal Access Tokens",
-      "desc": "Bearer-Tokens für Automatisierungs-Tools, die direkt mit der Orchestrator-API kommunizieren. Jedes Token hat eigene Action-Scopes und ein eigenes Ablaufdatum. Verlorene Tokens können nicht wiederhergestellt werden — erstelle einfach ein neues.",
-      "existingTitle": "Deine Tokens",
-      "colName": "Name",
-      "colScopes": "Scopes",
-      "colHint": "Token",
-      "colLastUsed": "Zuletzt verwendet",
-      "colExpires": "Läuft ab",
-      "empty": "Noch keine Tokens. Unten kannst du eines erstellen.",
-      "rotate": "Rotieren",
-      "revoke": "Widerrufen",
-      "rotatedBadge": "Wird rotiert",
-      "createTitle": "Neues Token erstellen",
-      "createDesc": "Wähle nur die Scopes, die die Automatisierung tatsächlich benötigt. Der Admin-Scope ist an deine Admin-Rolle gebunden und erlaubt destruktive Operationen.",
-      "namePlaceholder": "Token-Name (z. B. n8n Produktion)",
-      "scopesLegend": "Scopes",
-      "scopes": {
-        "jobsRead": "Jobs, Projekte und Audit-Trail einsehen.",
-        "jobsWrite": "Jobs erstellen, abbrechen, fortsetzen; Nachrichten senden; Dateien anhängen.",
-        "chatRead": "Persistente Threads und Nachrichtenverlauf lesen.",
-        "chatWrite": "Threads erstellen, Nachrichten senden, Slash-Befehle ausführen.",
-        "knowledgeRead": "Wissen durchsuchen, Quellen und Zitate auflisten.",
-        "knowledgeWrite": "Wissensnotizen und Zitate erstellen, ändern, löschen.",
-        "admin": "Sudo-Freigaben, Benutzer-/Projekt-Verwaltung, Datasource-Verwaltung."
-      },
-      "expiryLabel": "Ablaufdatum",
-      "expiryNever": "Läuft nie ab (mit Warnung)",
-      "create": "Token erstellen",
-      "creating": "Wird erstellt…",
-      "copyWarning": "Kopiere dieses Token jetzt — es wird nicht erneut angezeigt.",
-      "copyDetail": "Speichere es in deinem Passwort-Manager oder in deinen n8n-Credentials. Jeder mit diesem Token kann die Orchestrator-API in deinem Namen innerhalb der gewählten Scopes aufrufen.",
-      "copyAck": "Ich habe das Token sicher kopiert.",
-      "copyDone": "Fertig",
-      "usageTitle": "Verwendung",
-      "usageDesc": "Übergib das Token in einem Authorization-Header. n8n's Header-Auth-Credential funktioniert direkt damit."
-    },
     "codex": {
       "title": "Codex-Proxy",
       "desc": "Verwalten Sie den Codex-OAuth-Proxy für ChatGPT-Abo-basierte Modelle",
       "checking": "Proxy wird geprüft…",
       "connected": "Verbunden",
       "notConnected": "Nicht verbunden",
+      "notEnabled": "Proxy nicht aktiviert",
+      "disabledTitle": "Codex-Proxy ist nicht aktiviert",
+      "disabledDesc": "Auf dieser Instanz läuft der Codex-OAuth-Proxy nicht, daher sind ChatGPT-Abo-basierte Modelle nicht verfügbar. Um ihn zu aktivieren, setzen Sie folgenden Wert in Ihrem Helm-Values-Overlay, deployen Sie neu und laden Sie diese Seite neu:",
       "refreshStatus": "Status aktualisieren",
       "disconnect": "Trennen",
       "availableModels": "Verfügbare Modelle",
@@ -624,6 +1224,14 @@
       "submitting": "Wird gesendet…",
       "completeLogin": "Anmeldung abschließen",
       "portForwardHint": "Wenn kubectl port-forward aktiv ist, wird die Anmeldung automatisch abgeschlossen.",
+      "usage": {
+        "title": "Nutzungslimits",
+        "session": "Aktuelle Sitzung",
+        "weekly": "Wochenlimit",
+        "resetsIn": "Zurücksetzung in {{time}}",
+        "limitReached": "Limit erreicht",
+        "disclaimer": "Der Proxy stellt keine Nutzungsdaten bereit: ChatGPT erfasst über den Proxy geleitete Anfragen als 'zusätzliche Nutzung' außerhalb dieser Fenster, daher spiegeln diese Balken die Proxy-Nutzung noch nicht wider."
+      },
       "errors": {
         "urlMissingParams": "Der URL fehlen erforderliche Parameter. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",
         "invalidUrl": "Ungültige URL. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",
@@ -649,7 +1257,7 @@
       "agentUser": "Agent-Benutzer",
       "credentialsRef": "Credentials-Referenz (optional)",
       "secretProvenance": "Secret-Provenienz",
-      "secretSet": "gesetzt ({{chars}} Zeichen)",
+      "secretSet": "gesetzt",
       "secretUnset": "nicht gesetzt",
       "testing": "Wird getestet…",
       "test": "Testen",
@@ -665,7 +1273,7 @@
         "saved": "Gespeichert — aktives Backend ist jetzt {{backend}}",
         "savedReloaded": "Gespeichert — aktives Backend ist jetzt {{backend}} (neu geladen)",
         "saveFailed": "Speichern fehlgeschlagen",
-        "overlayCleared": "Überlagerung entfernt — aktives Backend wurde aus Env-Variablen neu aufgebaut",
+        "overlayCleared": "Umgebungskonfiguration geprüft und aktiviert; der Backend-Verlauf wurde beibehalten",
         "resetFailed": "Zurücksetzen fehlgeschlagen"
       }
     },
@@ -685,11 +1293,13 @@
       "overview": "Übersicht",
       "jobs": "Aufträge",
       "knowledge": "Wissen",
-      "datasources": "Datenquellen",
+      "datasources": "Konnektoren",
       "repos": "Repos",
       "experts": "Experten",
       "members": "Mitglieder",
-      "settings": "Einstellungen"
+      "settings": "Einstellungen",
+      "loop": "Loop",
+      "centurion": "Centurio"
     },
     "overview": {
       "description": "Beschreibung",
@@ -697,12 +1307,13 @@
       "noDescription": "Keine Beschreibung",
       "noGoal": "Kein Ziel festgelegt",
       "statsJobs": "Aufträge",
-      "statsDatasources": "Datenquellen",
+      "statsDatasources": "Konnektoren",
       "statsRepos": "Repos",
       "statsMembers": "Mitglieder",
       "defaultConfig": "Standard-Konfiguration",
       "created": "Erstellt",
       "edit": "Bearbeiten",
+      "archivedReadOnly": "Dieses Projekt ist archiviert. Beschreibung und Ziel sind schreibgeschützt — heben Sie die Archivierung auf, um sie zu bearbeiten.",
       "openFolder": "Projektordner öffnen",
       "manageAutomations": "Automationen verwalten",
       "save": "Speichern",
@@ -714,10 +1325,19 @@
       "colStatus": "Status",
       "colDescription": "Beschreibung",
       "colConfig": "Konfiguration",
-      "colBranch": "Branch",
-      "colMerge": "Merge"
+      "colBranch": "Ausführungs-Repository",
+      "colMerge": "Zustellung"
     },
     "knowledge": {
+      "attachTitle": "Externes Wissens-Repository",
+      "attachHint": "Dieses Projekt hat noch kein Wissens-Repository. Hängen Sie einen Wissensdatenbank-Konnektor an, um die Notizen in Ihrem eigenen privaten GitHub-Repository abzulegen.",
+      "attachSelectPlaceholder": "Wissensdatenbank-Konnektor auswählen…",
+      "attachNoConnectors": "Noch kein Wissensdatenbank-Konnektor vorhanden. Legen Sie zuerst einen für das Repository an und hängen Sie ihn dann hier an.",
+      "attachCreateConnector": "Konnektor anlegen",
+      "attachAdoptHint": "Der Konnektor wird zur Wissensdatenbank dieses Projekts: Er wird fortan vom Projekt verwaltet und steht anderen nicht mehr zur Verfügung.",
+      "attachSubmit": "Anhängen",
+      "attachSubmitting": "Wird angehängt…",
+      "attachFailed": "Der Konnektor konnte nicht angehängt werden.",
       "totalLabel": "Gesamt",
       "searchPlaceholder": "Wissen durchsuchen...",
       "search": "Suchen",
@@ -750,9 +1370,14 @@
       "exportedAlert": "{{count}} Notizen exportiert nach:\n{{path}}"
     },
     "datasources": {
-      "selectPlaceholder": "Datenquelle auswählen...",
+      "selectPlaceholder": "Konnektor auswählen...",
+      "searchPlaceholder": "Verfügbare Konnektoren durchsuchen...",
+      "loadingCandidates": "Verfügbare Konnektoren werden geladen...",
+      "candidatesLoadFailed": "Verfügbare Konnektoren konnten nicht geladen werden.",
+      "retry": "Erneut versuchen",
+      "noCandidates": "Keine verfügbaren Konnektoren passen zu diesem Projekt und der Suche.",
       "link": "Verknüpfen",
-      "empty": "Keine Datenquellen mit diesem Projekt verknüpft",
+      "empty": "Keine Konnektoren mit diesem Projekt verknüpft",
       "colName": "Name",
       "colType": "Typ",
       "colDescription": "Projekt-Beschreibung",
@@ -762,6 +1387,7 @@
       "accessDefault": "Standard (Lesen/Schreiben)",
       "accessReadOnly": "Nur lesen",
       "accessReadWrite": "Lesen/Schreiben",
+      "accessKbReadOnlyHint": "Externe OKF Knowledge Bases sind in dieser Version für Agenten schreibgeschützt.",
       "unlink": "Trennen"
     },
     "repos": {
@@ -782,12 +1408,12 @@
       "colActions": "Aktionen",
       "yes": "Ja",
       "no": "Nein",
-      "remove": "Entfernen"
+      "remove": "Entfernen",
+      "protected": "Geschützt"
     },
     "experts": {
       "loading": "Experten werden geladen...",
-      "emptyPrefix": "Noch keine Projekt-Experten. Fügen Sie Experten-Konfigurationen im",
-      "emptySuffix": "Verzeichnis des Jobs-Repos hinzu."
+      "emptyPrefix": "Diesem Projekt sind im Expertenkatalog noch keine Experten zugeordnet."
     },
     "members": {
       "selectUser": "Benutzer auswählen...",
@@ -827,13 +1453,42 @@
       "dangerZone": "Gefahrenzone",
       "defaultProjectWarning": "Dies ist Ihr persönliches Standardprojekt und kann nicht archiviert oder gelöscht werden.",
       "archiveTitle": "Projekt archivieren",
-      "archiveDesc": "Dieses Projekt als archiviert markieren. Es können keine neuen Aufträge erstellt werden.",
+      "archiveDesc": "Dieses Projekt als archiviert markieren. Es verschwindet aus der Projektliste und aus den Auswahlfeldern für neue Aufträge und Sitzungen, Schleife und Officer werden gestoppt und ausstehende Aufträge werden geparkt. Bereits laufende Arbeit wird zu Ende geführt.",
       "archive": "Archivieren",
+      "archiveConfirmTitle": "Projekt archivieren?",
       "archiveConfirm": "Sind Sie sicher, dass Sie dieses Projekt archivieren möchten?",
+      "archivedReportBase": "Projekt archiviert.",
+      "archivedReportLoop": "Die Projektschleife wurde pausiert.",
+      "archivedReportOfficer": "Der Officer wurde angehalten.",
+      "archivedReportJobs": "{{count}} ausstehende Aufträge wurden geparkt.",
+      "archivedReportJobsOne": "{{count}} ausstehender Auftrag wurde geparkt.",
+      "unarchiveTitle": "Archivierung aufheben",
+      "unarchiveDesc": "Dieses Projekt wieder aktivieren, damit neue Aufträge und Sitzungen darauf laufen können. Was beim Archivieren pausiert wurde, bleibt pausiert, bis Sie es fortsetzen.",
+      "unarchive": "Archivierung aufheben",
+      "unarchiveConfirmTitle": "Archivierung aufheben?",
+      "unarchiveConfirm": "Archivierung dieses Projekts aufheben? Neue Arbeit ist danach wieder möglich; Schleife, Officer und geparkte Aufträge bleiben pausiert.",
+      "archivedReadOnly": "Dieses Projekt ist archiviert, seine Einstellungen sind daher schreibgeschützt. Heben Sie die Archivierung auf, um sie zu bearbeiten — bis dahin bleibt unten alles sichtbar.",
       "deleteTitle": "Projekt löschen",
       "deleteDesc": "Dieses Projekt und seine verwalteten Repositorys dauerhaft löschen.",
       "delete": "Löschen",
       "deleteConfirm": "Sind Sie sicher, dass Sie dieses Projekt dauerhaft löschen möchten? Dies kann nicht rückgängig gemacht werden."
+    }
+  },
+  "projectBacklog": {
+    "title": "Backlog",
+    "refresh": "Aktualisieren",
+    "totalLabel": "Gesamt",
+    "inProgress": "In Bearbeitung",
+    "empty": "Noch keine offenen Tickets – die Scholars des Loops legen hier Ideen ab.",
+    "priority": {
+      "high": "Hoch",
+      "normal": "Normal",
+      "low": "Niedrig"
+    },
+    "type": {
+      "feature": "Feature",
+      "issue": "Problem",
+      "idea": "Idee"
     }
   },
   "chat": {
@@ -855,6 +1510,7 @@
     "jumpToLatest": "Zum Aktuellen · {{count}} neu",
     "header": {
       "settingsTooltip": "Sitzungseinstellungen",
+      "viewMenuTooltip": "Ansichtsoptionen",
       "filesButton": "Dateien",
       "filesTooltip": "Sitzungsdateien in der Cloud öffnen",
       "gitButton": "Git",
@@ -862,18 +1518,90 @@
       "ideButton": "IDE",
       "ideActiveTooltip": "Arbeitsbereich in der IDE öffnen",
       "ideLoadingTooltip": "Arbeitsbereich wird gestartet...",
-      "disconnect": "Trennen"
+      "citationsButton": "Quellen",
+      "citationsTooltip": "Quellen dieser Sitzung anzeigen",
+      "moreActions": "Weitere Aktionen",
+      "disconnect": "Trennen",
+      "projectFilesButton": "Projektdateien",
+      "projectFilesTooltip": "Projektordner {{name}} in Ihrer Cloud öffnen",
+      "sessionFilesButton": "Sitzungsdateien"
+    },
+    "citations": {
+      "title": "Quellen",
+      "empty": "Noch keine Quellen. Bitte den Agenten, zu recherchieren und eine Quelle zu zitieren.",
+      "close": "Schließen",
+      "viewOriginal": "Original anzeigen",
+      "checkSource": "Quelle prüfen",
+      "checking": "Wird geprüft…",
+      "driftUnchanged": "Quelle seit Zitat unverändert",
+      "driftChanged": "Quelle seit Zitat geändert",
+      "driftUnreachable": "Live-Quelle nicht erreichbar",
+      "driftUnknown": "Änderung unbekannt",
+      "statusVerified": "Verifiziert",
+      "statusPending": "Wird verifiziert…",
+      "statusFailed": "Nicht verifiziert",
+      "statusUnknown": "Unbekannt"
     },
     "status": {
       "temp": "Temp. {{value}}",
-      "turn": "Zug {{count}}"
+      "turn": "Zug {{count}}",
+      "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s",
+      "cloudSyncOff": "Cloud-Sync aus",
+      "cloudSyncOffTooltip": "Die Cloud-Synchronisierung konnte für diese Sitzung nicht gestartet werden. Im Arbeitsbereich fehlen möglicherweise Dateien aus der Cloud, und Änderungen werden nicht zurückgespeichert."
+    },
+    "cloudReview": {
+      "regionLabel": "Ausstehende Cloud-Prüfung",
+      "title": "{{count}} Cloud-Änderungen warten auf deine Prüfung",
+      "titleSingular": "{{count}} Cloud-Änderung wartet auf deine Prüfung",
+      "subtitle": "In deine Cloud wurde noch nichts geschrieben",
+      "staged": "bereitgestellt {{at}}",
+      "action": "Änderungen prüfen",
+      "unknownTitle": "Ausstehende Cloud-Änderungen konnten nicht geprüft werden",
+      "unknownBody": "Diese Sitzung verwendet einen geschützten Cloud-Ordner, es könnten also Änderungen warten. Versuchen Sie es erneut oder öffnen Sie die Prüfung, um die Ursache zu sehen.",
+      "recheck": "Erneut prüfen",
+      "openReview": "Prüfung öffnen",
+      "receiptRegionLabel": "Letztes Ergebnis der Cloud-Prüfung",
+      "receiptApplied": "Letzte Cloud-Prüfung: übernommen — {{applied}} geschrieben, {{deleted}} gelöscht",
+      "receiptRejected": "Letzte Cloud-Prüfung: bereitgestellte Änderungen verworfen",
+      "receiptLocal": "nur in diesem Browser",
+      "viewResult": "Ergebnis ansehen"
     },
     "turn": {
       "collapsedEmpty": "Nur Werkzeugaufrufe",
       "thoughtCount": "{{count}} Gedanken",
       "textCount": "{{count}} Textblöcke",
       "toolCount": "{{count}} Werkzeugaufrufe",
-      "toolGroup": "{{count}}× Werkzeugaufrufe"
+      "foldMore": "+{{count}} weitere",
+      "foldFailed": "⚠ {{count}} fehlgeschlagen",
+      "parked": "Dieser Zug wurde nach wiederholten Executor-Fehlern angehalten und erfordert einen Eingriff durch den Administrator."
+    },
+    "queued": {
+      "notSent": "Nicht gesendet",
+      "waiting": "In Warteschlange – wird gesendet",
+      "retry": "Erneut versuchen",
+      "discard": "Verwerfen"
+    },
+    "rewind": {
+      "button": "Bis hierher zurückspulen",
+      "title": "Sitzung zurückspulen",
+      "caveat": "Befehle mit externen Auswirkungen (Netzwerkaufrufe, Deployments) lassen sich nicht rückgängig machen.",
+      "both": "Unterhaltung und Dateien wiederherstellen",
+      "bothDesc": "Spätere Nachrichten ausblenden und Dateien auf diesen Stand zurücksetzen",
+      "conversation": "Nur Unterhaltung wiederherstellen",
+      "conversationDesc": "Dateien behalten ihren aktuellen Stand",
+      "code": "Nur Dateien wiederherstellen",
+      "codeDesc": "Die Unterhaltung bleibt unverändert",
+      "summarize": "Bis hierher zusammenfassen",
+      "summarizeDesc": "Alles bis zu diesem Punkt zu einer Zusammenfassung verdichten",
+      "pickerTitle": "Zurückspulen zu …",
+      "pickerHint": "Nachricht auswählen, zu der zurückgespult werden soll:",
+      "pickerEmpty": "Noch keine früheren Nachrichten zum Zurückspulen.",
+      "pickerFilter": "Tippen, um Nachrichten zu filtern …",
+      "pickerNoMatches": "Keine Nachrichten passen.",
+      "yesterday": "Gestern",
+      "hidesOne": "blendet 1 spätere Nachricht aus",
+      "hidesMany": "blendet {{count}} spätere Nachrichten aus",
+      "refillHint": "Die Nachricht kehrt zum Bearbeiten in das Eingabefeld zurück."
     },
     "diff": {
       "replace": "Diff",
@@ -881,6 +1609,23 @@
       "prepend": "Vorangestellt",
       "write": "Geschrieben",
       "truncated": "+{{count}} weitere Zeilen"
+    },
+    "settingsPane": {
+      "title": "Sitzungseinstellungen",
+      "close": "Einstellungen schließen",
+      "fixedNote": "Experte und Projekte werden beim Erstellen der Sitzung festgelegt und in der Sitzungsliste angezeigt.",
+      "upgradeConfirm": {
+        "sandbox": {
+          "title": "Auf Container upgraden?",
+          "body": "Startet einen Workspace-Container und kopiert deine Dateien hinein. Ergänzt Shell-, Git- und Browser-Tools. Dauert etwa eine Minute."
+        },
+        "vm": {
+          "title": "Auf VM upgraden?",
+          "body": "Stellt eine dedizierte virtuelle Maschine mit root und sudo bereit und kopiert deine Dateien darauf. Ein Kaltstart dauert 6–25 Minuten."
+        },
+        "irreversible": "Das lässt sich nicht rückgängig machen — die Sitzung kann nicht auf eine niedrigere Stufe zurück.",
+        "confirm": "Upgraden"
+      }
     },
     "settings": {
       "mode": "Modus",
@@ -898,7 +1643,15 @@
       "reasoningExpanded": "Ausgeklappt",
       "reasoningCollapsed": "Eingeklappt",
       "toolCallsExpanded": "Ausgeklappt",
-      "toolCallsCollapsed": "Eingeklappt"
+      "toolCallsCollapsed": "Eingeklappt",
+      "readingWidth": "Lesebreite",
+      "widthComfortable": "Komfortabel",
+      "widthWide": "Breit",
+      "widthFull": "Volle Breite",
+      "textSize": "Textgröße",
+      "textSmall": "Klein",
+      "textMedium": "Mittel",
+      "textLarge": "Groß"
     },
     "tasks": {
       "header": "Aufgaben {{done}}/{{total}}",
@@ -914,16 +1667,48 @@
       "banner": "Kontext zusammengefasst",
       "viewSummary": "Zusammenfassung anzeigen"
     },
+    "compactionLive": {
+      "title": "Kontext wird komprimiert",
+      "ctx": "Kontext {{pct}}%",
+      "planning": "Plane Durchläufe…",
+      "pass": "Durchlauf {{current}}/{{total}} · fasse Nachrichten {{first}}–{{last}} zusammen",
+      "retry": "(Versuch {{attempt}}/3)",
+      "footer": "Komprimiere — Durchlauf {{current}} von {{total}} · {{elapsed}}"
+    },
+    "usage": {
+      "input": "Eingabe",
+      "reasoning": "Reasoning",
+      "reasoningEstimatedHint": "Geschätzt aus dem erfassten Reasoning-Text – in der Ausgabe enthalten (dieses Modell meldet keine separate Reasoning-Token-Zahl).",
+      "output": "Ausgabe",
+      "ctx": "Ctx",
+      "ctxHint": "Kontextfüllung bis zum automatischen Verdichtungspunkt – bei 100 % fasst der Agent älteren Kontext zusammen, um Platz zu schaffen."
+    },
     "empty": {
       "title": "Was wollen wir heute erobern?",
       "subtitle": "Der Agent ist verbunden und bereit. Stelle eine Aufgabe oder wähle unten einen Startpunkt."
     },
+    "draft": {
+      "title": "Was wollen wir heute erobern?",
+      "subtitle": "Einfach lostippen — die Sitzung startet beim Absenden.",
+      "advanced": "Erweiterte Optionen",
+      "connectorsLabel": "Standard-Konnektoren",
+      "connectorsLoading": "Standard-Konnektoren werden geladen…",
+      "connectorsFailed": "Standard-Konnektoren konnten nicht geladen werden.",
+      "connectorsRetry": "Erneut versuchen",
+      "connectorsCount": "Standard-Konnektoren ({{count}})",
+      "defaultsFailed": "Standardprojekt und Konnektoren konnten nicht geladen werden. Vor dem Senden erneut versuchen."
+    },
     "ended": {
       "eyebrow": "Wiederaufnehmbar",
       "title": "Sitzung fortsetzen?",
-      "body": "Diese Sitzung ist beendet. Setze sie fort, um den Agenten wieder zu aktivieren und an der Stelle weiterzumachen, an der du aufgehört hast.",
+      "body": "Diese Sitzung ist beendet. Schreibe unten und sende, um den Agenten zurückzuholen und dort weiterzumachen, wo du aufgehört hast — oder nimm sie direkt wieder auf.",
       "endedAt": "Sitzung beendet {{ date }}",
       "resume": "Fortsetzen"
+    },
+    "ending": {
+      "eyebrow": "Sicherer Abschluss",
+      "title": "Sitzung wird beendet…",
+      "body": "Der Agent schließt lokale Arbeit ab und erhält eine mögliche geschützte Cloud-Prüfung. Nach bestätigtem Abschluss kann die Sitzung fortgesetzt werden."
     },
     "startup": {
       "title": "Sitzung wird gestartet",
@@ -932,6 +1717,7 @@
         "creating": "Thread wird erstellt",
         "provisioning": "Agent wird bereitgestellt",
         "booting": "Agent-Laufzeit startet",
+        "bootingVm": "VM startet (dies kann einige Minuten dauern)",
         "connecting": "Verbindung wird hergestellt"
       }
     },
@@ -951,8 +1737,27 @@
     "permission": {
       "title": "Berechtigung erforderlich",
       "approve": "Genehmigen",
+      "singleTitle": "Der Agent möchte ein Werkzeug ausführen",
+      "batchTitle": "Der Agent möchte {{count}} Werkzeugaufruf(e) ausführen",
+      "approveAll": "Alle genehmigen",
       "autoAccept": "Auto-akzeptieren",
       "stop": "Stoppen"
+    },
+    "control": {
+      "backpressure": "Zu viele Änderungen an den Sitzungseinstellungen warten. Versuche es gleich erneut.",
+      "admissionFailed": "Die Sitzungseinstellung konnte nicht geändert werden. Versuche es erneut.",
+      "ownerRejected": "Der ausführende Agent hat diese Sitzungseinstellung abgelehnt. Lade die Seite neu und versuche es erneut."
+    },
+    "workspaceOffer": {
+      "title": "Workspace-Upgrade angefordert",
+      "detail": "Der Agent hat einen {{tier}}-Workspace angefordert.",
+      "upgradeAndContinue": "Upgraden & fortfahren",
+      "upgrade": "Upgraden",
+      "deny": "Ablehnen",
+      "denyStarter": "Kein Workspace-Upgrade — ",
+      "continueMessage": "Der Workspace ist bereit — Shell-, Git- und Datei-Tools sind jetzt verfügbar. Bitte mach dort weiter, wo du aufgehört hast.",
+      "provisioning": "{{tier}} wird bereitgestellt…",
+      "willContinue": "Wird automatisch fortgesetzt, sobald bereit."
     },
     "approval": {
       "pendingTitle": "Bestätigung erforderlich, um dieses Tool auszuführen",
@@ -971,16 +1776,36 @@
       "working": "Agent arbeitet...",
       "reconnecting": "Getrennt — verbinde erneut…",
       "uploading": "Anhänge werden hochgeladen…",
-      "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)"
+      "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)",
+      "defaultMobile": "Nachricht eingeben...",
+      "resuming": "Sitzung wird fortgesetzt…",
+      "ending": "Sitzung wird sicher abgeschlossen…",
+      "endedSendResumes": "Nachricht schreiben — Senden setzt die Sitzung fort",
+      "suspendedSendResumes": "Nachricht schreiben — Senden weckt die Sitzung auf"
+    },
+    "upload": {
+      "stage": "{{done}} von {{total}} werden hochgeladen…",
+      "stagePercent": "{{done}} von {{total}} werden hochgeladen — {{percent}} %",
+      "progressLabel": "Sendefortschritt",
+      "sending": "Wird gesendet…",
+      "waitingOn": "Warte auf {{name}}…",
+      "failed": "{{name}} konnte nicht hochgeladen werden",
+      "removeAndSend": "Datei entfernen und senden",
+      "slashCommandWithAttachments": "Entfernen Sie die angehängten Dateien, bevor Sie einen Befehl ausführen.",
+      "duplicateFile": "{{name}} ist bereits angehängt",
+      "tooLarge": "{{name}} überschreitet das 100-MB-Limit",
+      "tooManyFiles": "Sie können höchstens 20 Dateien gleichzeitig anhängen",
+      "noWorkspace": "Diese Sitzung hat keinen Workspace, daher können keine Dateien angehängt werden."
     },
     "composer": {
       "attach": "Anhängen",
       "chooseFile": "Datei wählen",
       "takePhoto": "Foto aufnehmen",
       "capturePhoto": "Foto aufnehmen",
-      "recordVoice": "Halten zum Aufnehmen",
+      "recordVoice": "Sprachnachricht aufnehmen",
       "recordingStop": "Aufnahme stoppen",
       "recordingCancel": "Aufnahme abbrechen",
+      "recordingCapWarning": "Aufnahme endet bald",
       "remove": "Entfernen",
       "send": "Senden",
       "stop": "Stoppen",
@@ -990,7 +1815,8 @@
       "micDenied": "Mikrofonzugriff verweigert",
       "micError": "Aufnahme konnte nicht gestartet werden",
       "transcribing": "Audio wird transkribiert…",
-      "transcribeError": "Transkription fehlgeschlagen — Audio wurde angehängt"
+      "transcribeError": "Transkription fehlgeschlagen — Audio wurde angehängt",
+      "sttNotConfigured": "Spracheingabe ist noch nicht eingerichtet"
     },
     "tts": {
       "play": "Vorlesen",
@@ -1000,7 +1826,39 @@
       "spokenVersion": "Gesprochene Fassung",
       "part": "Teil {{current}} von {{total}}",
       "preparing": "Audio wird vorbereitet…",
-      "generatingPart": "Teil {{current}} von {{total}} wird erzeugt…"
+      "generatingPart": "Audio wird erzeugt — Teil {{current}} von {{total}}…",
+      "notConfigured": "Vorlesen ist noch nicht eingerichtet",
+      "tapToPlay": "Zum Abspielen tippen",
+      "preparingRead": "Vorlesen wird vorbereitet…",
+      "rewriting": "Text wird für die Sprache umformuliert…",
+      "rewriteSlow": "Umformulierung läuft noch — das Sprachmodell antwortet langsam…",
+      "expectation": "Das Vorlesen beginnt, sobald der erste Teil fertig ist.",
+      "readAsIs": "Umformulierung überspringen — jetzt einfach vorlesen",
+      "playingGenerating": "Wiedergabe · Teil {{current}} von {{total}} wird erzeugt…",
+      "ready": "Fertig · {{parts}} Teile",
+      "cancel": "Vorlesen abbrechen",
+      "cancelled": "Vorlesen abgebrochen — {{parts}} Teile behalten",
+      "rewritingSkipped": "Umformulierung übersprungen — Originaltext wird vorgelesen.",
+      "rewriteFailed": "Der Text konnte nicht für die Sprache vorbereitet werden — das Sprachmodell hat nicht geantwortet.",
+      "tryAgain": "Erneut versuchen",
+      "nothingToRead": "In dieser Nachricht gibt es nichts zum Vorlesen.",
+      "noSession": "Konnte nicht vorgelesen werden — die Sitzungsreferenz fehlt.",
+      "dismiss": "Schließen",
+      "partFailed": "Teil {{part}} von {{total}} konnte nicht erzeugt werden.",
+      "retryPart": "Teil {{part}} erneut",
+      "autoRetry": "Audio-Server hat nicht geantwortet — erneuter Versuch ({{attempt}} von {{max}})…",
+      "hardFail": "Audioerzeugung nach {{part}} von {{total}} Teilen fehlgeschlagen. Fertige Teile bleiben erhalten.",
+      "keepReading": "Du kannst den Text oben weiterlesen.",
+      "pause": "Pause",
+      "prevPart": "Vorheriger Abschnitt",
+      "nextPart": "Nächster Abschnitt",
+      "speed": "Wiedergabegeschwindigkeit",
+      "err": {
+        "paymentRequired": "Diese Stimme erfordert einen kostenpflichtigen ElevenLabs-Plan oder mehr Guthaben. Wähle in den Einstellungen eine andere Stimme.",
+        "auth": "Der Sprachanbieter hat seinen API-Schlüssel abgelehnt. Bitte einen Admin, die Anbieter-Einrichtung zu prüfen.",
+        "rateLimit": "Der Sprachanbieter drosselt gerade die Anfragen. Versuche es gleich noch einmal.",
+        "generic": "Audioerzeugung fehlgeschlagen. Bitte erneut versuchen."
+      }
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",
@@ -1010,6 +1868,7 @@
       "compact": "Unterhaltungsverlauf komprimieren, um Kontext freizugeben",
       "done": "Sitzung beenden — Erinnerungen extrahieren und archivieren",
       "undo": "Dateiänderungen des letzten Zugs rückgängig machen",
+      "rewind": "Zu einer früheren Nachricht zurückspulen",
       "auto": "Zu Auto-Akzeptieren wechseln (alles außer Shell genehmigen)",
       "supervised": "Zu Beaufsichtigt wechseln (alle Schreibvorgänge genehmigen)",
       "autonomous": "Zu Autonom wechseln (nichts genehmigen)",
@@ -1097,45 +1956,187 @@
       "cloud": "Cloud-Speicher",
       "communication": "Kommunikation",
       "delegation": "Arbeit delegieren",
-      "orchestrator": "Orchestrator",
+      "orchestrator": "Flottenverwaltung",
+      "agent_catalog": "Experten und Skills nachschlagen",
+      "catalog_authoring": "Experten und Automatisierungen erstellen",
+      "workflows": "Automatisierungen und Loops verwalten",
       "evaluation": "Auswertung"
     },
     "toolContext": {
       "searchFor": "nach \"{{term}}\"",
       "commandDash": "— {{cmd}}"
+    },
+    "categoryNouns": {
+      "browser_direct": "Browser-Schritte",
+      "citation": "Zitate",
+      "cloud": "Cloud-Aktionen",
+      "communication": "Nachrichten",
+      "core": "Aufgaben",
+      "delegation": "Delegationen",
+      "evaluation": "Evaluationen",
+      "git": "Git-Aktionen",
+      "graph": "Graph-Aktionen",
+      "knowledge": "KB-Aktionen",
+      "mongodb": "Abfragen",
+      "orchestrator": "Flotten-Aktionen",
+      "other": "Schritte",
+      "research": "Suchen",
+      "session_task": "Aufgaben",
+      "shell": "Befehle",
+      "sql": "Abfragen",
+      "thought": "Gedanken",
+      "workspace": "Dateien"
+    },
+    "categoryNounsOne": {
+      "browser_direct": "Browser-Schritt",
+      "citation": "Zitat",
+      "cloud": "Cloud-Aktion",
+      "communication": "Nachricht",
+      "core": "Aufgabe",
+      "delegation": "Delegation",
+      "evaluation": "Evaluation",
+      "git": "Git-Aktion",
+      "graph": "Graph-Aktion",
+      "knowledge": "KB-Aktion",
+      "mongodb": "Abfrage",
+      "orchestrator": "Flotten-Aktion",
+      "other": "Schritt",
+      "research": "Suche",
+      "session_task": "Aufgabe",
+      "shell": "Befehl",
+      "sql": "Abfrage",
+      "thought": "Gedanke",
+      "workspace": "Datei"
     }
   },
+  "experts": {
+    "title": "Experten",
+    "new": "Neuer Experte",
+    "import": "Importieren",
+    "empty": "Noch keine Experten. Erstellen Sie einen oder duplizieren Sie einen integrierten.",
+    "loading": "Experten werden geladen…",
+    "filterAll": "Alle",
+    "filterWorker": "Worker",
+    "filterSession": "Sitzung",
+    "colName": "Name",
+    "colType": "Typ",
+    "colSource": "Quelle",
+    "colActions": "Aktionen",
+    "moreActions": "Weitere Aktionen",
+    "edit": "Bearbeiten",
+    "duplicate": "Duplizieren",
+    "export": "Exportieren",
+    "delete": "Löschen",
+    "cancel": "Abbrechen",
+    "save": "Speichern",
+    "bundledReadonly": "integriert",
+    "confirmDeleteTitle": "Experten löschen?",
+    "confirmDeleteBody": "Dies löscht dauerhaft",
+    "deleted": "Experte gelöscht",
+    "duplicated": "Experte dupliziert",
+    "duplicatedMissingGrants": "Experte dupliziert, aber entfernt, da folgende Berechtigungen fehlen: {{grants}}",
+    "forkedMissingGrants": "Dein neuer Standard wurde erstellt, aber entfernt, da folgende Berechtigungen fehlen: {{grants}}",
+    "imported": "Experte importiert",
+    "inUse": "Experte wird von {{count}} Aufträgen verwendet",
+    "saveFailed": "Speichern fehlgeschlagen",
+    "invalidJson": "Ungültige JSON-Datei"
+  },
+  "skills": {
+    "title": "Skills",
+    "new": "Neuer Skill",
+    "newTitle": "Neuer Skill",
+    "editTitle": "Skill bearbeiten",
+    "import": "Importieren",
+    "empty": "Noch keine Skills. Erstellen Sie einen oder importieren Sie einen Claude-Code-Skill.",
+    "colName": "Name",
+    "colSource": "Quelle",
+    "colActions": "Aktionen",
+    "moreActions": "Weitere Aktionen",
+    "displayName": "Anzeigename",
+    "icon": "Icon (Material Symbol)",
+    "color": "Farbe (Hex)",
+    "tags": "Tags (kommagetrennt)",
+    "filesHint": "Ein Skill ist ein Verzeichnis. SKILL.md ist erforderlich; Name und Beschreibung aus dem Frontmatter werden beim Speichern gelesen.",
+    "addFile": "Datei hinzufügen",
+    "removeFile": "Datei entfernen",
+    "newFilePath": "Neuer Dateipfad (z. B. references/guide.md)",
+    "needSkillMd": "Ein Skill muss eine SKILL.md-Datei enthalten",
+    "edit": "Bearbeiten",
+    "duplicate": "Duplizieren",
+    "export": "Exportieren",
+    "delete": "Löschen",
+    "cancel": "Abbrechen",
+    "save": "Speichern",
+    "confirmDeleteTitle": "Skill löschen?",
+    "confirmDeleteBody": "Dies löscht dauerhaft",
+    "deleted": "Skill gelöscht",
+    "duplicated": "Skill dupliziert",
+    "imported": "Skill importiert",
+    "saveFailed": "Speichern fehlgeschlagen",
+    "invalidZip": "Ungültiges Skill-Archiv"
+  },
   "datasources": {
-    "title": "Datenquellen",
-    "new": "Neu",
+    "title": "Konnektoren",
+    "new": "Neuer Konnektor",
+    "refresh": "Aktualisieren",
     "dismiss": "Schließen",
     "filter": {
       "all": "Alle",
       "generic": "Generisch",
       "repository": "Repository",
+      "kb": "OKF Knowledge Base",
       "postgresql": "PostgreSQL",
       "neo4j": "Neo4j",
       "mongodb": "MongoDB",
       "webdav": "WebDAV",
+      "email": "E-Mail",
+      "mcp": "MCP-Server",
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH-Schlüssel",
       "generic_file": "Datei"
     },
+    "catalog": {
+      "search": "Konnektoren durchsuchen…",
+      "projectSearch": "Projekte durchsuchen…",
+      "anyProject": "Beliebiges Projekt",
+      "moreProjects": "Weitere Projekte",
+      "anyAvailability": "Beliebige Verfügbarkeit",
+      "everywhere": "Überall",
+      "projectScoped": "Projektbezogen",
+      "unavailable": "Nicht verfügbar",
+      "anyDefault": "Automatisch oder manuell",
+      "automatic": "Automatisch",
+      "manual": "Manuell",
+      "mineAndShared": "Eigene und geteilte",
+      "mine": "Eigene",
+      "shared": "Geteilte",
+      "anyVisibility": "Beliebige Sichtbarkeit",
+      "private": "Privat",
+      "public": "Öffentlich",
+      "loadMore": "Mehr laden",
+      "loadFailed": "Der Konnektoren-Katalog konnte nicht geladen werden. Bitte erneut versuchen.",
+      "loadMoreFailed": "Weitere Konnektoren konnten nicht geladen werden."
+    },
     "form": {
-      "editTitle": "Datenquelle bearbeiten",
-      "newTitle": "Neue Datenquelle",
+      "editTitle": "Konnektor bearbeiten",
+      "newTitle": "Neuer Konnektor",
       "nameLabel": "Name",
       "namePlaceholder": "z. B. Production Analytics DB",
-      "typeLabel": "Typ",
+      "typeLabel": "Konnektortyp",
       "typeGroupCli": "CLI-basiert",
+      "typeGroupKnowledge": "Wissen und Repositorys",
       "typeGroupManaged": "Verwaltet",
       "typeGroupCredentialFiles": "Anmeldedaten-Dateien",
+      "typeGroupMcp": "MCP",
       "optGeneric": "Generisch",
       "optRepository": "Repository",
+      "optKb": "OKF Knowledge Base",
       "optPostgresql": "PostgreSQL",
       "optNeo4j": "Neo4j",
       "optMongodb": "MongoDB",
       "optWebdav": "WebDAV",
+      "optEmail": "E-Mail (IMAP/SMTP)",
+      "optMcp": "MCP-Server",
       "optKubeconfig": "Kubeconfig (kubectl)",
       "optSshKey": "SSH-Schlüssel",
       "optGenericFile": "Generische Datei",
@@ -1145,7 +2146,7 @@
       "genericUrlPlaceholder": "z. B. postgresql://host:5432/db oder https://api.example.com",
       "descriptionLabel": "Beschreibung",
       "descriptionPlaceholderGeneric": "Beschreiben Sie diese Ressource für die KI — was sie ist, wie man sie verwendet, welche Daten sie enthält",
-      "descriptionPlaceholderManaged": "Was diese Datenquelle enthält (wird in den Agenten-Kontext aufgenommen)",
+      "descriptionPlaceholderManaged": "Was dieser Konnektor enthält (wird in den Agenten-Kontext aufgenommen)",
       "cliHintLabel": "CLI-Hinweis",
       "cliHintPlaceholder": "z. B. psql $DATABASE_URL",
       "envVarsLabel": "Umgebungsvariablen",
@@ -1154,32 +2155,90 @@
       "envRemoveTooltip": "Entfernen",
       "envAdd": "Variable hinzufügen",
       "envHint": "Anmeldeinformationen werden als Umgebungsvariablen in den Agenten-Arbeitsbereich injiziert. Nur-Lese-Zugriff kann nicht erzwungen werden — verwenden Sie bei Bedarf ein Datenbank-Konto mit eingeschränkten Berechtigungen.",
+      "mcpTransportLabel": "Transport",
+      "mcpTransportHttp": "Remote (HTTP)",
+      "mcpTransportSse": "Remote (SSE)",
+      "mcpTransportStdio": "Lokaler Befehl (stdio)",
+      "mcpTokenLabel": "Bearer-Token",
+      "mcpTokenPlaceholder": "Optional — wird als Authorization: Bearer … gesendet",
+      "mcpHeadersLabel": "Benutzerdefinierte Header",
+      "mcpHeaderKeyPlaceholder": "Header-Name",
+      "mcpHeaderValuePlaceholder": "Wert",
+      "mcpHeaderAdd": "Header hinzufügen",
+      "mcpCommandLabel": "Befehl",
+      "mcpCommandPlaceholder": "npx",
+      "mcpArgsLabel": "Argumente (eines pro Zeile)",
+      "mcpArgsPlaceholder": "-y\n@modelcontextprotocol/server-github",
+      "mcpEnvLabel": "Umgebungsvariablen",
+      "mcpCredentialsRetainHint": "Verbindungsdaten leer lassen, um die gespeicherte MCP-Konfiguration beizubehalten.",
+      "mcpStdioWarning": "Dieser Befehl wird innerhalb der Agent-Umgebung mit den obigen Variablen ausgeführt. Nur vertrauenswürdige Server hinzufügen.",
       "defaultBranchLabel": "Standard-Branch",
       "defaultBranchPlaceholder": "main",
+      "okfRootLabel": "OKF-Stammpfad",
+      "okfRootPlaceholder": "vault (leer für Repository-Stamm)",
+      "okfRootHint": "Relativer Pfad im Repository, der die OKF-Markdown-Notizen enthält.",
+      "forgeLabel": "Forge",
+      "forgePlaceholder": "Forge auswählen...",
+      "forgeGithub": "GitHub",
+      "forgeGitea": "Gitea",
+      "forgeGitlab": "GitLab",
       "authMethodLabel": "Authentifizierungsmethode",
       "authToken": "HTTPS-Token",
       "authSsh": "SSH-Schlüssel",
       "tokenLabel": "Access Token",
       "tokenPlaceholder": "ghp_xxxx oder Personal Access Token",
+      "forgeTokenHintGithub": "Erstellen Sie ein Fine-grained PAT, beschränkt auf dieses eine Repository, mit den Berechtigungen Contents: write und Pull requests: write.",
+      "forgeTokenHintGitlab": "Erstellen Sie ein Project Access Token für dieses Projekt mit dem Scope `api`.",
+      "forgeTokenHintGitea": "⚠️ Gitea-Tokens gelten pro Berechtigung, nicht pro Repository — ein Token aus Ihrem eigenen Konto kann auf jedes Repository zugreifen, auf das Sie Zugriff haben. Erstellen Sie ein eigenes Bot-Konto, fügen Sie es nur als Mitarbeiter dieses einen Repositorys hinzu, und verwenden Sie dessen Token.",
       "sshKeyLabel": "Privater SSH-Schlüssel",
       "sshGenerate": "SSH-Schlüssel generieren",
       "sshGenerateBusy": "Wird generiert...",
       "sshGenerateConfirm": "Aktuellen SSH-Schlüssel ersetzen?",
       "sshGenerateReplace": "Ersetzen",
       "repoHint": "Das Repository wird in den Arbeitsbereich geklont und Git-Anmeldeinformationen werden automatisch konfiguriert. Der Agent verwendet standardmäßige Git-Befehle — keine Einrichtung der Anmeldeinformationen erforderlich.",
+      "patScopesRepo": "Token-Berechtigungen: Contents (Inhalte) lesen und schreiben, zusätzlich Pull requests schreiben, wenn der Agent PRs öffnen soll. Beschränken Sie das Token nach Möglichkeit auf dieses eine Repository.",
+      "patScopesKb": "Token-Berechtigungen: Contents (Inhalte) lesen genügt zum Indexieren. Wird der Konnektor als Wissensdatenbank eines Projekts angehängt, wird zusätzlich Contents schreiben benötigt, da Agenten Notizen zurück ins Repository committen.",
+      "kbHint": "Markdown-/OKF-Repository; zentral indiziert; in dieser Version für Agenten schreibgeschützt.",
+      "credentialsRetainHint": "Token oder SSH-Schlüssel leer lassen, um die gespeicherten Anmeldedaten beizubehalten.",
+      "visibilityLabel": "Sichtbarkeit",
+      "visibilityPublic": "Öffentlich — für alle Benutzer sichtbar",
+      "accessReadOnly": "Nur Lesen",
+      "accessReadWrite": "Lesen & Schreiben",
+      "visibilityCredentialHint": "Nur-Lesen ist deklariert, nicht erzwungen — verwenden Sie Nur-Lese-Zugangsdaten (Deploy-Token / eingeschränktes DB-Konto).",
+      "visibilityKbHint": "Wissensdatenbank-Konnektoren sind immer schreibgeschützt; Zugangsdaten erreichen die Agenten nie.",
+      "availabilityTitle": "Verfügbarkeit",
+      "scopeEverywhere": "Überall in meiner Arbeit",
+      "scopeEverywhereHint": "In allen Projekten und eigenständiger Arbeit verfügbar, vorbehaltlich Freigabe- und öffentlicher Zugriffsregeln.",
+      "scopeProjects": "Ausgewählte Projekte",
+      "scopeProjectsHint": "Nur verfügbar, wenn jedes der Arbeit zugeordnete Projekt hier ausgewählt ist.",
+      "projectsSearch": "Projekte suchen und auswählen…",
+      "projectsLoading": "Projekte werden geladen…",
+      "projectsLoadFailed": "Die Projektverfügbarkeit konnte nicht geladen werden. Speichern ist deaktiviert.",
+      "projectsEmpty": "Keine verknüpfbaren Projekte gefunden.",
+      "projectsSelected": "{{count}} Projekte ausgewählt",
+      "projectRetainedOnly": "Nur beibehalten",
+      "removeSelectedProject": "{{name}} aus den ausgewählten Projekten entfernen",
+      "removeProjectWarning": "{{name}} entfernen? Die projektspezifischen Zugriffseinstellungen und der Wissenseintrag werden ebenfalls entfernt.",
+      "retry": "Erneut versuchen",
+      "nativeProjectPolicy": "Im Projekt enthalten",
+      "nativeProjectPolicyHint": "Projektumfang und automatische Einbindung dieses Konnektors werden vom Projekt verwaltet.",
+      "autoAttach": "Standardmäßig an meine neue Arbeit anhängen",
+      "autoAttachHint": "In Erstellformularen vorausgewählt und an systemerstellte Arbeit angehängt, wenn keine Konnektoren angegeben sind. Bestehende Arbeit und andere Benutzer bleiben unverändert.",
+      "autoImpactAll": "Automatisch in all meiner Arbeit, in der dieser Konnektor verfügbar ist.",
+      "autoImpactProjects": "Automatisch in meiner Arbeit für {{count}} ausgewählte Projekte.",
       "usernameLabel": "Benutzername",
       "usernamePlaceholder": "neo4j",
       "passwordLabel": "Passwort",
       "passwordPlaceholder": "Passwort",
       "testing": "Wird getestet...",
-      "test": "Testen",
+      "test": "Verbindung testen",
       "cancel": "Abbrechen",
       "saving": "Wird gespeichert...",
       "update": "Aktualisieren",
       "create": "Erstellen",
       "kubeconfigLabel": "Kubeconfig-YAML",
       "kubeconfigPlaceholder": "apiVersion: v1\nkind: Config\nclusters:\n  - name: prod\n    cluster:\n      server: https://...",
-      "kubeconfigHint": "Cluster-, Benutzer- und Kontext-Namen werden zur Laufzeit mit dem Slug der Datenquelle präfixiert, damit mehrere Kubeconfigs ohne Kollisionen zusammengeführt werden können. Mit `kubectl config get-contexts` im Agenten lässt sich die zusammengeführte Sicht prüfen.",
+      "kubeconfigHint": "Cluster-, Benutzer- und Kontext-Namen werden zur Laufzeit mit dem Slug des Konnektors präfixiert, damit mehrere Kubeconfigs ohne Kollisionen zusammengeführt werden können. Mit `kubectl config get-contexts` im Agenten lässt sich die zusammengeführte Sicht prüfen.",
       "sshKeyContentLabel": "Privater SSH-Schlüssel",
       "sshKeyContentPlaceholder": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
       "sshKeyHint": "Der Schlüssel wird unter ~/.ssh/<slug> mit Modus 0600 materialisiert. Konfigurieren Sie im Agenten einen Host-Block in ~/.ssh/config, um ihn für bestimmte Hosts zu verwenden.",
@@ -1199,48 +2258,170 @@
       "credFileEnvVarLabel": "Env-Variable",
       "credFileEnvVarPlaceholder": "MY_TOKEN_FILE",
       "credFileRemoveTooltip": "Datei entfernen",
-      "credFileGenericHint": "Jede Datei wird unter dem Zielpfad mit dem angegebenen Modus geschrieben. Ist eine \"Env-Variable\" gesetzt, erhält der Agent-Prozess diese Variable mit dem absoluten Pfad. Pfade müssen unter /home/srw, /tmp, /run oder /workspace liegen."
+      "credFileGenericHint": "Jede Datei wird unter dem Zielpfad mit dem angegebenen Modus geschrieben. Ist eine \"Env-Variable\" gesetzt, erhält der Agent-Prozess diese Variable mit dem absoluten Pfad. Pfade müssen unter /home/srw, /tmp, /run oder /workspace liegen.",
+      "emailProviderLabel": "Anbieter",
+      "emailProviderCustom": "Eigener / selbst gehostet",
+      "emailProviderGmail": "Gmail (privates @gmail.com-Konto)",
+      "emailProviderFastmail": "Fastmail",
+      "emailProviderIcloud": "iCloud Mail",
+      "emailProviderYahoo": "Yahoo Mail",
+      "emailProviderMailbox": "mailbox.org",
+      "emailProviderGmx": "GMX",
+      "emailProviderFastmailHint": "App-Passwörter gibt es bei Fastmail nur in den Bezahl-Tarifen — der Basic-Tarif enthält kein IMAP/SMTP.",
+      "emailProviderIcloudHint": "iCloud: Der IMAP-Benutzername ist nur der Teil vor dem @; der SMTP-Benutzername ist die vollständige Adresse.",
+      "emailOauthNotice": "Google Workspace (Gmail mit eigener Domain), Microsoft 365 / Outlook.com und Proton benötigen OAuth bzw. eine Bridge und werden noch nicht unterstützt.",
+      "emailUsernamePlaceholder": "user@example.com",
+      "emailPasswordLabel": "App-Passwort",
+      "emailAppPasswordHint": "Die meisten Anbieter verlangen ein app-spezifisches Passwort (mit aktivierter Zwei-Faktor-Authentifizierung) — das normale Konto-Passwort funktioniert nicht.",
+      "emailImapHostLabel": "IMAP-Host",
+      "emailImapPortLabel": "IMAP-Port",
+      "emailSmtpHostLabel": "SMTP-Host",
+      "emailSmtpPortLabel": "SMTP-Port",
+      "emailSecurityLabel": "Sicherheit",
+      "emailSecuritySsl": "SSL/TLS",
+      "emailSecurityStarttls": "STARTTLS",
+      "emailAccessLabel": "Zugriffsstufe",
+      "emailAccessRead": "Lesen — Nachrichten auflisten, lesen und durchsuchen",
+      "emailAccessReadWrite": "Lesen/Schreiben — zusätzlich Nachrichten verschieben und markieren",
+      "emailAccessDraft": "Entwurf (Standard) — zusätzlich Entwürfe verfassen, die Sie selbst senden",
+      "emailAccessSend": "Senden — zusätzlich Mails in Ihrem Namen senden (Berechtigung für Direktversand erforderlich)",
+      "emailAccessHintRead": "Der Agent kann Nachrichten in den erlaubten Ordnern auflisten, lesen und durchsuchen. Es wird nichts verändert.",
+      "emailAccessHintReadWrite": "Zusätzlich kann der Agent Nachrichten in den erlaubten Ordnern verschieben und markieren (gelesen/ungelesen, Stern).",
+      "emailAccessHintDraft": "Zusätzlich legt der Agent Entwürfe in Ihrem Entwürfe-Ordner ab — Sie prüfen und senden sie aus Ihrem eigenen Programm.",
+      "emailAccessHintSend": "Fügt direkten SMTP-Versand hinzu. In der aktuellen Laufzeit funktioniert dies nur, wenn „Ohne menschliche Freigabe senden“ aktiviert ist; andernfalls muss der Agent stattdessen einen Entwurf erstellen.",
+      "emailFoldersLabel": "Ordner-Allowlist",
+      "emailFoldersPlaceholder": "AI, AI/Processed",
+      "emailFoldersHint": "Kommagetrennte Ordner, auf die der Agent zugreifen darf. Leer lassen für das gesamte Postfach. Tipp: Ein eigener \"AI\"-Ordner, in den Sie Mails verschieben, macht Sie zur Vorsortier-Instanz.",
+      "emailSendFoldersWarning": "Senden erfordert eine Ordner-Allowlist — der Server lehnt Senden mit leerer Ordnerliste ab.",
+      "emailDraftsFolderLabel": "Entwürfe-Ordner",
+      "emailFromAddressLabel": "Absenderadresse",
+      "emailRecipientsLabel": "Empfänger-Allowlist",
+      "emailRecipientsPlaceholder": "alice@example.com, @example.org",
+      "emailRecipientsHint": "Kommagetrennte Adressen oder @Domains, an die neue Nachrichten gerichtet werden dürfen. Antworten auf den ursprünglichen Thread sind immer erlaubt.",
+      "emailUnattendedSendLabel": "Versand-Freigabe",
+      "emailUnattendedSendToggle": "Ohne menschliche Freigabe senden",
+      "emailUnattendedSendHint": "Erfordert die vom Admin vergebene Berechtigung email_autonomous_send — andernfalls lehnt der Server dies ab. Ist die Option aus, wird der Direktversand abgelehnt; die geplante Freigabe-Warteschlange ist noch nicht verfügbar, daher sollte ein Entwurf verwendet werden.",
+      "emailNotPublishableHint": "E-Mail-Konnektoren können nicht veröffentlicht werden — Postfächer bleiben privat."
+    },
+    "publishDialog": {
+      "title": "Konnektor veröffentlichen?",
+      "message": "Dieser Konnektor wird für alle Benutzer sichtbar. Deren Agenten arbeiten mit den hinterlegten Zugangsdaten.",
+      "rwMessage": "Dieser Konnektor wird für alle Benutzer MIT SCHREIBZUGRIFF sichtbar — deren Agenten können das dahinterliegende System mit den hinterlegten Zugangsdaten verändern.",
+      "namePrompt": "Geben Sie zur Bestätigung den Namen des Konnektors ein:",
+      "confirm": "Veröffentlichen",
+      "cancel": "Abbrechen"
     },
     "sshKeyDialog": {
       "title": "Fügen Sie diesen SSH-Schlüssel zu Ihrem Repository hinzu",
       "intro": "Fügen Sie den folgenden öffentlichen Schlüssel als Deploy-Key bei Ihrem Repository-Anbieter hinzu (GitHub: Einstellungen → Deploy keys; Gitea: Einstellungen → Deploy-Schlüssel; GitLab: Einstellungen → Repository → Deploy keys).",
-      "privateNote": "Der passende private Schlüssel wurde in das Formular eingetragen. Speichern Sie die Datenquelle, um ihn zu hinterlegen.",
+      "privateNote": "Der passende private Schlüssel wurde in das Formular eingetragen. Speichern Sie den Konnektor, um ihn zu hinterlegen.",
       "copy": "Öffentlichen Schlüssel kopieren",
       "copied": "Kopiert!",
       "done": "Fertig",
       "generateFailed": "SSH-Schlüssel konnte nicht generiert werden. Bitte erneut versuchen."
     },
     "table": {
-      "loading": "Datenquellen werden geladen...",
-      "empty": "Keine Datenquellen gefunden",
-      "emptyHint": "Erstellen Sie eine Datenquelle, um Agenten mit externen Datenbanken zu verbinden",
+      "loading": "Konnektoren werden geladen...",
+      "empty": "Keine Konnektoren gefunden",
+      "emptyHint": "Erstellen Sie einen Konnektor, um Agenten mit externen Systemen und Daten zu verbinden",
       "colType": "Typ",
       "colName": "Name",
       "colUrl": "URL",
-      "colScope": "Geltungsbereich",
+      "colScope": "Sichtbarkeit",
+      "colVisibility": "Sichtbarkeit",
+      "colAvailability": "Verfügbarkeit",
       "colActions": "Aktionen",
       "scopeJob": "Auftrag",
-      "scopeGlobal": "Global",
+      "scopeGlobal": "Öffentlich",
+      "scopePrivate": "Privat",
+      "availabilityAll": "Alle Projekte",
+      "availabilityScoped": "Projektbezogen",
+      "availabilityProjects": "{{count}} Projekte",
+      "availabilityNone": "Nicht verfügbar",
+      "badgeAuto": "Auto",
+      "badgeRo": "RO",
+      "badgeRw": "RW",
       "testTooltip": "Verbindung testen",
+      "indexPending": "Ausstehend",
+      "indexIndexing": "Wird indiziert",
+      "indexReady": "Bereit @ {{sha}}",
+      "indexPartial": "Teilweise",
+      "indexFailed": "Fehlgeschlagen",
+      "indexProgressTitle": "{{done}} von {{total}} Notizen indiziert",
+      "lastSuccess": "Letzter Erfolg",
+      "reindexTooltip": "Neu indizieren",
+      "fullReindexTooltip": "Vollständiger Neuaufbau",
+      "fullReindexConfirm": "Vollständigen Neuaufbau der OKF Knowledge Base starten? Dabei werden alle Notizen neu eingebettet, wodurch Einbettungskosten entstehen können.",
       "editTooltip": "Bearbeiten",
-      "deleteTooltip": "Löschen"
+      "deleteTooltip": "Löschen",
+      "moreActions": "Weitere Aktionen"
     },
     "messages": {
       "repoNoAuthConfirm": "Keine Anmeldeinformationen angegeben.\n\nDieses Repository wird nur lesend geklont — der Agent kann den Code durchsuchen und lesen, aber keine Änderungen pushen.\n\nFortfahren?",
-      "updated": "Datenquelle aktualisiert",
-      "updateFailed": "Aktualisierung der Datenquelle fehlgeschlagen",
-      "updateError": "Fehler beim Aktualisieren der Datenquelle",
-      "created": "Datenquelle „{{name}}“ erstellt",
-      "createFailed": "Erstellung der Datenquelle fehlgeschlagen",
-      "createError": "Fehler beim Erstellen der Datenquelle",
-      "createForTestFailed": "Erstellung der Datenquelle zum Testen fehlgeschlagen",
-      "deleted": "Datenquelle „{{name}}“ gelöscht",
-      "deleteFailed": "Löschen der Datenquelle fehlgeschlagen",
-      "deleteError": "Fehler beim Löschen der Datenquelle",
+      "updated": "Konnektor aktualisiert",
+      "updateFailed": "Aktualisierung des Konnektors fehlgeschlagen",
+      "updateError": "Fehler beim Aktualisieren des Konnektors",
+      "created": "Konnektor „{{name}}“ erstellt",
+      "createFailed": "Erstellung des Konnektors fehlgeschlagen",
+      "createError": "Fehler beim Erstellen des Konnektors",
+      "createForTestFailed": "Erstellung des Konnektors zum Testen fehlgeschlagen",
+      "deleted": "Konnektor „{{name}}“ gelöscht",
+      "deleteFailed": "Löschen des Konnektors fehlgeschlagen",
+      "deleteError": "Fehler beim Löschen des Konnektors",
       "testFailed": "Anfrage fehlgeschlagen",
       "testRequestFailed": "Testanfrage fehlgeschlagen",
+      "reindexed": "Neuindizierung der OKF Knowledge Base „{{name}}“ abgeschlossen ({{status}})",
+      "reindexFailed": "Neuindizierung der OKF Knowledge Base fehlgeschlagen",
       "fileTooLarge": "Datei überschreitet 64 KB — Anmeldedaten-Dateien sind auf 64 KB begrenzt."
     }
+  },
+  "contacts": {
+    "title": "Kontakte",
+    "new": "Neuer Kontakt",
+    "search": "Kontakte durchsuchen…",
+    "empty": "Noch keine Kontakte. Kontakte sind Personen, die deine Agenten erreichen dürfen — lege einen an und verknüpfe ihn mit einem Projekt.",
+    "projectsShort": "Proj.",
+    "primary": "primär",
+    "noAddresses": "Keine Adressen",
+    "optIn": {
+      "pending": "Opt-in ausstehend",
+      "opted_out": "abgemeldet"
+    },
+    "filter": {
+      "allChannels": "Alle Kanäle",
+      "allProjects": "Alle Projekte",
+      "channelAria": "Nach Kanal filtern",
+      "projectAria": "Nach Projekt filtern"
+    },
+    "form": {
+      "newTitle": "Neuer Kontakt",
+      "editTitle": "Kontakt bearbeiten",
+      "name": "Anzeigename",
+      "notes": "Notizen (für Agenten sichtbar — Briefings, Präferenzen, Kontext)",
+      "addresses": "Adressen",
+      "addAddress": "Adresse hinzufügen",
+      "projects": "Projekte",
+      "channelLocked": "Der Kanal kann nach dem Speichern nicht mehr geändert werden — entferne diese Adresse und füge stattdessen eine neue hinzu.",
+      "namePlaceholder": "Anna Weber",
+      "notesLabel": "Notizen",
+      "addressesHint": "Wo Agenten diese Person erreichen dürfen. Die erste Adresse eines Kanals wird zur primären.",
+      "removeAddress": "Adresse entfernen",
+      "channelAria": "Kanal",
+      "addressAria": "Adresse",
+      "projectsHint": "Agenten in einem verknüpften Projekt können diesen Kontakt anschreiben.",
+      "noProjects": "Noch keine Projekte. Lege eines an, um den Kontakt zu verknüpfen."
+    },
+    "delete": {
+      "title": "Kontakt löschen",
+      "message": "Der Kontakt wird aus diesen Projekten entfernt: {{projects}}. Agenten können diese Person danach nicht mehr erreichen.",
+      "namePrompt": "Geben Sie zur Bestätigung den Namen des Kontakts ein:"
+    },
+    "saveError": "Speichern fehlgeschlagen. Einige Änderungen wurden möglicherweise nicht übernommen — Kontakt prüfen und erneut versuchen.",
+    "deleteError": "Löschen fehlgeschlagen. Möglicherweise fehlt die Berechtigung, oder der Kontakt hat sich bereits geändert — aktualisieren und erneut versuchen.",
+    "subtitle": "Personen, die deine Agenten erreichen dürfen. Verknüpfe einen Kontakt mit einem Projekt, damit Agenten darin ihn anschreiben können.",
+    "emptyTitle": "Noch keine Kontakte",
+    "noAddressesHint": "Dieser Kontakt hat keine Adressen und ist daher für keinen Agenten erreichbar. Füge eine hinzu.",
+    "loadError": "Kontakte konnten nicht geladen werden. Prüfe die Verbindung und versuche es erneut."
   },
   "inbox": {
     "title": "Aktionszentrum",
@@ -1275,7 +2456,12 @@
       "emptyText": "Wählen Sie einen Eintrag, um Details anzuzeigen",
       "hintUse": "Mit",
       "hintToNavigate": "navigieren,",
-      "hintToSelect": "zum Auswählen"
+      "hintToSelect": "zum Auswählen",
+      "jobId": "Job-ID",
+      "requestId": "Anfrage-ID",
+      "threadId": "Thread-ID",
+      "sessionId": "Sitzungs-ID",
+      "eventId": "Ereignis-ID"
     },
     "sudoDetail": {
       "vmUpgradeRequest": "VM-Upgrade-Anfrage",
@@ -1301,8 +2487,9 @@
       "messageLabel": "Nachricht",
       "modeBlocking": "blockierend",
       "modeAsync": "asynchron",
+      "sessionPage": "Sitzungsmeldung",
+      "openSessionLog": "Sitzungsprotokoll öffnen",
       "defaultAgent": "Agent",
-      "jobPrefix": "Job",
       "threadLoading": "Thread wird geladen …",
       "noMessagesLoaded": "Keine Nachrichten geladen",
       "senderAgent": "Agent",
@@ -1317,7 +2504,6 @@
       "freezeUpgrade": "Sudo erforderlich",
       "freezeComplete": "Job abgeschlossen",
       "defaultAgent": "Agent",
-      "idPrefix": "ID:",
       "phase": "Phase {{number}}",
       "loadingFrozen": "Eingefrorene Daten werden geladen …",
       "summary": "Zusammenfassung",
@@ -1434,7 +2620,6 @@
       "compactOnArchive": "Beim Archivieren komprimieren",
       "keepRecentToolResults": "Letzte Tool-Ergebnisse behalten",
       "keepRecentMessages": "Letzte Nachrichten behalten",
-      "backend": "Backend",
       "vmCpuCores": "VM-CPU-Kerne",
       "vmMemory": "VM-Arbeitsspeicher",
       "maxReadWords": "Max. Lese-Wörter",
@@ -1455,6 +2640,8 @@
     "options": {
       "container": "Container",
       "vmQemu": "VM (QEMU)",
+      "virtual": "Virtuell (Cloud-Dateien)",
+      "none": "Keiner (kein Workspace)",
       "stateless": "Zustandslos",
       "persistent": "Persistent",
       "sudoFreeze": "Einfrieren (Benutzer fragen)",
@@ -1463,7 +2650,10 @@
     },
     "hints": {
       "idleDisabled": "0 = deaktiviert",
-      "autoPlaceholder": "auto"
+      "autoPlaceholder": "auto",
+      "parallelToolCalls": "Die Modellunterstützung variiert — manche Modelle führen unabhängig von dieser Einstellung möglicherweise parallele Tool-Aufrufe aus, während andere sie gar nicht unterstützen.",
+      "virtualBackend": "Virtuelle Workspaces laufen ohne Container — Shell-, Browser- und Git-Tools sind deaktiviert. Datei-, Web-, Datenbank- und Wissens-Tools bleiben verfügbar.",
+      "noneBackend": "Keiner läuft komplett ohne Workspace — Shell-, Browser-, Git- und Datei-Tools sind deaktiviert. Web-, Datenbank- und Wissens-Tools bleiben verfügbar."
     }
   },
   "jobReviewPage": {
@@ -1488,19 +2678,32 @@
       "summary": "Zusammenfassung",
       "confidence": "Konfidenz",
       "deliverables": "Ergebnisse",
-      "agentNotes": "Agent-Notizen"
+      "agentNotes": "Agent-Notizen",
+      "delivery": "Bereitstellung"
     },
     "meta": {
-      "id": "ID: {{id}} …",
+      "jobId": "Job-ID",
       "created": "Erstellt: {{date}}"
     },
     "summaryEmpty": "Keine Zusammenfassung vorhanden",
     "noFrozenData": "Keine eingefrorenen Job-Daten verfügbar",
     "links": {
-      "browseWorkspace": "Arbeitsbereich in Gitea öffnen",
+      "sourceRepository": "Quell-Repository",
+      "branch": "Branch {{branch}}",
+      "pullRequest": "Pull Request #{{number}}",
+      "pullRequestState": {
+        "open": "Offen",
+        "merged": "Zusammengeführt",
+        "closed": "Geschlossen",
+        "unavailable": "Status nicht verfügbar"
+      },
+      "jobWorkspace": "Job-Arbeitsbereich",
       "startingIde": "IDE wird gestartet …",
-      "openIde": "Im Web-IDE öffnen"
+      "openIde": "Im Web-IDE öffnen",
+      "openCloudFolder": "Cloud-Ordner öffnen"
     },
+    "cloudFolderDisclaimer": "Vorschau – die Ergebnisse werden in einen geteilten Cloud-Ordner kopiert, den du durchsuchen kannst. Nutze das Feedback-Feld unten, um Änderungen anzufordern; direkte Änderungen an diesem Ordner erreichen den Agenten nicht und werden überschrieben, wenn der Job fortgesetzt wird.",
+    "reviewSessionHint": "Startet eine beaufsichtigte Sitzung in einem frischen Sandbox-Checkout des bereitgestellten Branches mit Modell, Projekt und Konnektoren dieses Jobs. Job-spezifische Arbeitsbereichs- und Tool-Einstellungen werden nicht kopiert.",
     "vmUpgrade": {
       "title": "Sudo erforderlich",
       "reason": "Der Agent hat einen privilegierten Befehl in einem gehärteten Container versucht:",
@@ -1519,7 +2722,12 @@
       "orContinueFeedback": "oder mit Feedback fortsetzen",
       "feedbackPlaceholder": "Feedback oder zusätzliche Anweisungen für den Agenten eingeben …",
       "resuming": "Wird fortgesetzt …",
-      "continueWithFeedback": "Mit Feedback fortsetzen"
+      "continueWithFeedback": "Mit Feedback fortsetzen",
+      "exportingToCloud": "Wird exportiert …",
+      "exportToCloud": "In die Cloud exportieren",
+      "resyncCloudFolder": "Cloud-Ordner neu synchronisieren",
+      "reviewInSession": "In einer Sitzung prüfen",
+      "preparingReviewSession": "Prüfsitzung wird vorbereitet …"
     },
     "messages": {
       "approved": "Job erfolgreich genehmigt.",
@@ -1529,54 +2737,177 @@
       "continuing": "Job wird fortgesetzt. Der Agent nimmt die Ausführung wieder auf.",
       "continueFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole.",
       "resumedWithFeedback": "Job mit Feedback fortgesetzt. Der Agent arbeitet weiter.",
-      "resumeFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole."
+      "resumeFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole.",
+      "openCloudFolderFailed": "Cloud-Ordner konnte nicht geöffnet werden. Details in der Konsole.",
+      "reviewSessionFailed": "Prüfsitzung konnte nicht erstellt werden. Details in der Konsole."
     }
   },
   "jobDiffReview": {
-    "title": "Cloud-Diff prüfen",
-    "subtitle": "{{count}} Datei(en) wurden in diesem Job geändert. Prüfen und entscheiden.",
-    "subtitleSingular": "{{count}} Datei wurde in diesem Job geändert. Prüfen und entscheiden.",
-    "loading": "Diff wird geladen…",
-    "empty": "Keine Änderungen zu prüfen — der Agent hat den Projektordner nicht angefasst.",
+    "loading": "Änderungen werden geladen…",
+    "staleNotice": "Die bereitgestellten Änderungen haben sich geändert, seit du sie geladen hast — die neueste Version wurde nachgeladen.",
+    "meta": {
+      "staged": "Bereitgestellt",
+      "mount": "Mount",
+      "epoch": "Epoche",
+      "baseline": "Basis",
+      "talliesLabel": "Summen der Änderungen",
+      "openFolder": "Projektdateien öffnen",
+      "openFolderFor": "Projektdateien von {{name}} in einem neuen Tab öffnen",
+      "detailsLabel": "Details"
+    },
+    "forbidden": {
+      "title": "Du kannst diese Änderungen nicht prüfen"
+    },
+    "loadFailed": {
+      "title": "Änderungen konnten nicht geladen werden",
+      "retry": "Erneut versuchen"
+    },
     "fileTree": {
       "header": "Dateien",
       "statusAdded": "Hinzugefügt",
       "statusModified": "Geändert",
-      "statusDeleted": "Gelöscht"
+      "statusDeleted": "Gelöscht",
+      "chooser": "Datei {{index}} von {{total}}",
+      "chooserEmpty": "{{total}} geänderte Dateien"
     },
     "viewer": {
-      "selectPrompt": "Wähle eine Datei aus der Liste, um den Diff anzuzeigen.",
+      "regionLabel": "Ausgewählte Datei",
+      "selectPrompt": "Wähle eine Datei aus der Liste, um ihre Änderungen zu sehen.",
       "loadingFile": "Datei wird geladen…",
-      "loadFailed": "Diff dieser Datei konnte nicht geladen werden. Details in der Konsole.",
-      "labelOriginal": "Cloud-Version",
-      "labelChanged": "Agent-Änderung",
-      "deletedNote": "Diese Datei wird beim Annehmen aus dem Cloud-Ordner gelöscht.",
-      "addedNote": "Diese Datei wird beim Annehmen im Cloud-Ordner angelegt.",
-      "monacoUnavailable": "Der Diff-Editor konnte nicht geladen werden. Inhalt wird als Text angezeigt."
+      "loadFailed": "Diese Datei konnte nicht geladen werden",
+      "missingTitle": "Diese Datei ist nicht mehr bereitgestellt",
+      "monacoUnavailable": "Der Diff-Editor konnte nicht geladen werden. Inhalt wird als Text angezeigt.",
+      "binaryTitle": "Binärdatei — keine Vorschau",
+      "binaryType": "Typ",
+      "binaryStatus": "Änderung",
+      "binaryNoDownload": "Die bereitgestellte Kopie dieser Datei kann hier nicht geöffnet oder heruntergeladen werden.",
+      "binaryKind": {
+        "pdf": "PDF-Dokument",
+        "document": "Textdokument",
+        "spreadsheet": "Tabelle",
+        "presentation": "Präsentation",
+        "image": "Bild",
+        "audio": "Audio",
+        "video": "Video",
+        "archive": "Archiv",
+        "unknown": "Binärdatei"
+      },
+      "reloadReview": "Prüfung neu laden"
     },
     "conflict": {
-      "title": "Cloud-Ordner wurde extern geändert",
-      "body": "Während dieses Jobs wurden Dateien im Cloud-Ordner verändert. Annehmen ist deaktiviert, bis der Konflikt manuell aufgelöst wird (extern geänderte Dateien herunterladen, zusammenführen, dann erneut versuchen).",
+      "title": "Der Cloud-Ordner hat sich während dieser Prüfung geändert",
       "etagMismatch": "Extern geändert",
       "missingAtCloud": "Extern gelöscht",
       "unexpectedAtCloud": "Extern angelegt",
-      "dismiss": "Schließen"
+      "recheck": "Erneut prüfen"
     },
     "partial": {
-      "title": "Schreiben teilweise fehlgeschlagen",
-      "body": "{{applied}} Änderung(en) und {{deleted}} Löschung(en) angewandt, aber {{count}} Datei(en) sind fehlgeschlagen. Der Job bleibt zur Prüfung; Ursache beheben und erneut versuchen."
+      "title": "Einige Schreibvorgänge sind fehlgeschlagen"
+    },
+    "receipt": {
+      "at": "Entschieden",
+      "overlayReset": "Arbeitskopie geleert",
+      "overlayResetYes": "Ja",
+      "overlayResetNo": "Nein",
+      "overlayWarning": "Die Arbeitskopie der Session konnte nicht geleert werden, weil ihr Workspace nicht mehr läuft. Wenn du diese Session fortsetzt, stellt sie dieselben Änderungen möglicherweise erneut bereit — verwirf das Duplikat, falls es auftaucht.",
+      "localOnly": "Dieses Ergebnis ist nur in diesem Browser gespeichert. Der Server führt noch keinen dauerhaften Nachweis über Prüfentscheidungen.",
+      "doneHint": "Für diesen Ordner steht nichts weiter aus."
+    },
+    "a11y": {
+      "loaded": "{{count}} geänderte Dateien geladen.",
+      "loadedEmpty": "Keine Änderungen zu prüfen.",
+      "fileLoaded": "Änderungen für {{path}} werden angezeigt.",
+      "applying": "Änderungen werden in die Cloud übernommen…",
+      "rejecting": "Bereitgestellte Änderungen werden verworfen…",
+      "applied": "Fertig. {{applied}} geschrieben, {{deleted}} gelöscht.",
+      "rejected": "Bereitgestellte Änderungen verworfen. In die Cloud wurde nichts geschrieben.",
+      "loadedSingular": "1 geänderte Datei geladen."
     },
     "actions": {
-      "accept": "Alle Änderungen annehmen",
-      "accepting": "Wird angewandt…",
-      "reject": "Alle verwerfen",
-      "rejecting": "Wird verworfen…",
-      "confirmAcceptTitle": "Diese Änderungen in deinen Cloud-Ordner schreiben?",
-      "confirmAcceptBody": "{{count}} Datei(en) werden in den Projektordner geschrieben. Diese Aktion ist aus dem Cockpit nicht reversibel.",
-      "confirmRejectTitle": "Alle Änderungen verwerfen?",
-      "confirmRejectBody": "Die Bearbeitungen des Agents werden verworfen. Die Gitea-Commits bleiben als Audit-Trail erhalten.",
       "cancel": "Abbrechen",
-      "confirm": "Fortfahren"
+      "done": "Fertig",
+      "close": "Prüfung schließen"
+    },
+    "session": {
+      "addedNote": "Diese Datei wird beim Übernehmen im Cloud-Ordner angelegt.",
+      "applyConfirmBody": "Damit werden alle {{count}} geprüften Änderungen nach {{mount}} geschrieben. Aus dem Cockpit lässt sich das nicht rückgängig machen — nur die Versionshistorie oder der Papierkorb deines Cloud-Anbieters können den vorherigen Stand wiederherstellen.",
+      "applyConfirmBodySingular": "Damit wird die eine geprüfte Änderung nach {{mount}} geschrieben. Das lässt sich in Cockpit nicht rückgängig machen — nur der Versionsverlauf oder Papierkorb Ihres Cloud-Anbieters kann den vorherigen Stand wiederherstellen.",
+      "applyConfirmLabel": "Ja, in die Cloud übernehmen",
+      "applyLabel": "In die Cloud übernehmen",
+      "applyingLabel": "Änderungen werden in die Cloud übertragen…",
+      "binaryBody": "Die Bytes werden exakt so übernommen, wie sie bereitgestellt wurden. Es gibt keine Textvorschau — prüfe sie anhand von Pfad und Änderungsart.",
+      "conflictBody": "Dateien im geschützten Ordner wurden außerhalb dieser Session geändert, seit ihre Änderungen bereitgestellt wurden. Das Übernehmen ist blockiert, bis du sie zusammengeführt hast — eine Erzwingen-Option gibt es bewusst nicht.",
+      "decisionHint": "Übernehmen schreibt jede geprüfte Änderung in den Cloud-Ordner. Verwerfen löscht sie alle und lässt die Cloud unberührt.",
+      "deletedNote": "Diese Datei wird beim Übernehmen aus dem Cloud-Ordner gelöscht.",
+      "dialogLabel": "Cloud-Änderungen prüfen",
+      "directionNew": "Nach dem Übernehmen",
+      "directionOld": "Cloud jetzt",
+      "emptyBody": "Diese Session hat keine Änderungen am geschützten Ordner bereitgestellt. Wenn der Agent gerade einen Zug beendet hat, werden seine Änderungen möglicherweise noch erfasst.",
+      "emptyTitle": "Nichts zur Prüfung bereitgestellt",
+      "eyebrow": "Geschützte Cloud · Prüfung erforderlich",
+      "eyebrowResolved": "Geschützte Cloud · erledigt",
+      "forbiddenBody": "Nur die Eigentümerin oder der Eigentümer dieser Session kann ihre bereitgestellten Cloud-Änderungen prüfen.",
+      "missingBody": "Sie war beim Laden dieser Prüfung Teil der bereitgestellten Änderungen, aber die Session hat seitdem neu bereitgestellt. Lade neu, um die aktuellen Änderungen zu sehen.",
+      "missingBodyGone": "Beim Laden dieser Prüfung war sie noch bereitgestellt, jetzt nicht mehr — die Sitzung hat neu bereitgestellt, oder die Änderungen wurden anderswo entschieden. Laden Sie neu, um den aktuellen Stand zu sehen.",
+      "missingBodyUnreadable": "Sie ist weiterhin bereitgestellt, aber ihre gespeicherte Kopie lässt sich nicht lesen — es gibt also nichts, was sicher angezeigt oder übernommen werden könnte. Lassen Sie die Sitzung die Änderungen erneut bereitstellen.",
+      "partialBody": "{{applied}} Änderungen und {{deleted}} Löschungen übernommen, aber {{count}} Dateien sind fehlgeschlagen. Die restlichen Änderungen sind weiterhin bereitgestellt, du kannst es also erneut versuchen.",
+      "partialBodySingular": "{{applied}} Änderungen und {{deleted}} Löschungen angewendet, aber eine Datei ist fehlgeschlagen. Die übrigen Änderungen bleiben bereitgestellt, Sie können es erneut versuchen.",
+      "receiptAppliedBody": "{{applied}} geschrieben, {{deleted}} gelöscht im geschützten Ordner.",
+      "receiptAppliedTitle": "In deine Cloud übernommen",
+      "receiptRejectedBody": "In deine Cloud wurde nichts geschrieben und nichts daraus entfernt.",
+      "receiptRejectedTitle": "Bereitgestellte Änderungen verworfen",
+      "rejectConfirmBody": "Damit werden alle {{count}} bereitgestellten Änderungen endgültig verworfen. In deine Cloud wird nichts geschrieben und nichts daraus entfernt — danach gibt es aber auch keine Historie, aus der sie sich wiederherstellen ließen.",
+      "rejectConfirmBodySingular": "Damit wird die eine bereitgestellte Änderung endgültig verworfen. Es wird nichts in Ihre Cloud geschrieben oder daraus entfernt, und es gibt danach keinen Verlauf, aus dem sie wiederhergestellt werden könnte.",
+      "rejectConfirmLabel": "Ja, verwerfen",
+      "rejectLabel": "Änderungen verwerfen",
+      "rejectingLabel": "Bereitgestellte Änderungen werden verworfen…",
+      "subtitle": "{{count}} Dateien wurden in dieser Session geändert. In deine Cloud wurde noch nichts geschrieben.",
+      "subtitleSingular": "{{count}} Datei wurde in dieser Session geändert. In deine Cloud wurde noch nichts geschrieben.",
+      "titleFallback": "Geschützter Cloud-Ordner",
+      "unavailableBody": "Diese Session läuft nicht im geschützten Cloud-Modus oder existiert nicht mehr. Nur Sessions, die mit geschützter Cloud angelegt wurden, stellen ihre Änderungen zur Prüfung bereit.",
+      "unavailableTitle": "Keine geschützte Prüfung für diese Session"
+    },
+    "job": {
+      "addedNote": "Diese Datei wird beim Annehmen im Cloud-Ordner angelegt.",
+      "applyConfirmBody": "{{count}} Dateien werden in den Cloud-Ordner des Projekts geschrieben. Diese Aktion ist aus dem Cockpit nicht reversibel.",
+      "applyConfirmBodySingular": "Eine Datei wird in den Cloud-Ordner des Projekts geschrieben. Diese Aktion lässt sich in Cockpit nicht rückgängig machen.",
+      "applyConfirmLabel": "Ja, annehmen",
+      "applyLabel": "Alle Änderungen annehmen",
+      "applyingLabel": "Änderungen werden in den Cloud-Ordner geschrieben…",
+      "binaryBody": "Die Bytes werden exakt so übernommen, wie sie erzeugt wurden. Es gibt keine Textvorschau — prüfe sie anhand von Pfad und Änderungsart.",
+      "conflictBody": "Während dieses Jobs wurden Dateien im Cloud-Ordner geändert. Annehmen ist blockiert, bis du sie manuell zusammengeführt hast — extern geänderte Dateien herunterladen, zusammenführen, dann erneut versuchen.",
+      "decisionHint": "Annehmen schreibt jede Änderung in den Cloud-Ordner des Projekts. Verwerfen löscht sie und schließt den Job ab.",
+      "deletedNote": "Diese Datei wird beim Annehmen aus dem Cloud-Ordner gelöscht.",
+      "dialogLabel": "Projekt-Cloud prüfen",
+      "directionNew": "Nach diesem Job",
+      "directionOld": "Basis",
+      "emptyBody": "Der Agent hat in diesem Job nichts unterhalb des Projektordners geändert.",
+      "emptyTitle": "Keine Änderungen zu prüfen",
+      "eyebrow": "Projekt-Cloud-Prüfung",
+      "eyebrowResolved": "Projekt-Cloud-Prüfung · erledigt",
+      "forbiddenBody": "Du hast keinen Zugriff auf die Projekt-Cloud-Änderungen dieses Jobs.",
+      "missingBody": "Sie war beim Laden dieser Prüfung Teil des Diffs, aber der Diff des Jobs hat sich seitdem geändert. Lade neu, um die aktuellen Änderungen zu sehen.",
+      "missingBodyGone": "Beim Laden dieser Prüfung war sie noch im Diff, jetzt nicht mehr — das Diff des Auftrags hat sich seitdem geändert. Laden Sie neu, um den aktuellen Stand zu sehen.",
+      "missingBodyUnreadable": "Sie ist weiterhin im Diff, aber ihre gespeicherte Kopie lässt sich nicht lesen — es gibt also nichts, was sicher angezeigt oder übernommen werden könnte.",
+      "partialBody": "{{applied}} Änderungen und {{deleted}} Löschungen übernommen, aber {{count}} Dateien sind fehlgeschlagen. Der Job bleibt zur Prüfung; Ursache beheben und erneut versuchen.",
+      "partialBodySingular": "{{applied}} Änderungen und {{deleted}} Löschungen angewendet, aber eine Datei ist fehlgeschlagen. Der Auftrag bleibt in der Prüfung; beheben Sie die Ursache und versuchen Sie es erneut.",
+      "receiptAppliedBody": "{{applied}} geschrieben, {{deleted}} gelöscht im Cloud-Ordner des Projekts.",
+      "receiptAppliedTitle": "Änderungen angenommen",
+      "receiptRejectedBody": "In den Cloud-Ordner wurde nichts geschrieben. Die Gitea-Commits bleiben als Audit-Trail erhalten.",
+      "receiptRejectedTitle": "Änderungen verworfen",
+      "rejectConfirmBody": "Alle {{count}} Änderungen des Agents werden verworfen. Die Gitea-Commits bleiben als Audit-Trail erhalten.",
+      "rejectConfirmBodySingular": "Die eine Änderung des Agenten wird verworfen. Die Gitea-Commits bleiben als Prüfspur erhalten.",
+      "rejectConfirmLabel": "Ja, verwerfen",
+      "rejectLabel": "Alle Änderungen verwerfen",
+      "rejectingLabel": "Änderungen werden verworfen…",
+      "subtitle": "{{count}} Dateien wurden in diesem Job geändert. Prüfen und entscheiden.",
+      "subtitleSingular": "{{count}} Datei wurde in diesem Job geändert. Prüfen und entscheiden.",
+      "titleFallback": "Projekt-Cloud-Ordner",
+      "unavailableBody": "Dieser Job hat keine Projekt-Cloud-Basis zum Vergleichen, oder er existiert nicht mehr.",
+      "unavailableTitle": "Keine Cloud-Prüfung für diesen Job"
+    },
+    "progress": {
+      "keepOpen": "Bitte offen lassen — das Ergebnis erscheint hier, sobald der Vorgang abgeschlossen ist."
     }
   },
   "chatHistory": {
@@ -1594,15 +2925,18 @@
     "human": "Benutzer",
     "assistant": "Assistent",
     "reasoning": "Reasoning",
-    "shellState": "Shell-Status",
-    "paneSingle": "{{n}} Bereich",
-    "panePlural": "{{n}} Bereiche",
-    "emptyPane": "(leer)",
-    "resultPending": "Ergebnis ausstehend oder nicht verfügbar",
+    "context": "Injizierter Kontext",
+    "contextHint": "Transienter Kontext, der bei jeder Anfrage neu injiziert wird (Todos, Memory, Wissen, Instruktionen) — kein Teil der dauerhaften Konversation. Die exakte Payload über den Request-Link öffnen.",
+    "updated": "aktualisiert",
+    "showFull": "Vollständig anzeigen ({{size}})",
+    "showFullNoSize": "Vollständig anzeigen",
+    "collapse": "Einklappen",
+    "resultNotRecorded": "Für diesen Aufruf wurde kein Ergebnis gespeichert",
+    "resultInLaterTurn": "Das Ergebnis steht in der nächsten Runde, die noch nicht geladen ist.",
+    "resultLoadNext": "Laden",
+    "resultLoading": "Nächste Runde wird geladen…",
     "viewRequest": "Vollständige Anfrage anzeigen",
     "showingTurns": "{{n}} Chat-Runden angezeigt",
-    "newOutput": "NEU",
-    "idle": "leerlaufend",
     "turnsCount": "{{n}} Runden"
   },
   "configEditor": {
@@ -1625,11 +2959,20 @@
   "agentSettings": {
     "common": {
       "resetToDefault": "Auf Standard zurücksetzen",
-      "noApiKey": "kein API-Schlüssel"
+      "noApiKey": "kein API-Schlüssel",
+      "selectAll": "Alle auswählen",
+      "deselectAll": "Alle abwählen"
     },
     "datasources": {
-      "group": "Datenquellen",
-      "loading": "Datenquellen werden geladen…"
+      "group": "Konnektoren",
+      "loading": "Konnektoren werden geladen…",
+      "loadFailed": "Konnektoren konnten für diesen Projektkontext nicht geladen werden. Die Erstellung ist deaktiviert.",
+      "retry": "Erneut versuchen",
+      "unavailableName": "Nicht verfügbarer Konnektor",
+      "unavailableLive": "Dieser angehängte Konnektor ist nicht mehr autorisiert oder im Geltungsbereich. Entfernen Sie ihn, bevor Sie fortfahren.",
+      "unavailableBadge": "Nicht verfügbar",
+      "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse.",
+      "lockedLive": "Wissensdatenbanken können während einer Session nicht geändert werden"
     },
     "execution": {
       "group": "Ausführung",
@@ -1638,7 +2981,18 @@
       "scholar": "Scholar (Vorrecherche)",
       "critic": "Critic (Verifikation)",
       "projectMemory": "Projektgedächtnis",
-      "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert"
+      "imageQuality": "Bildqualität",
+      "workspaceBackend": "Arbeitsbereich",
+      "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert",
+      "narration": "Erzählmodus",
+      "tierCurrent": "aktuell",
+      "tierHint": "Beim Upgrade werden deine Dateien übernommen; innerhalb der Sitzung ist es nicht umkehrbar.",
+      "tierUpgrading": "{{tier}} wird bereitgestellt…",
+      "tierUnreachable": {
+        "downgrade": "Herunterstufen nicht möglich",
+        "needsApproval": "Freigabe erforderlich",
+        "unsupported": "von dieser Stufe aus nicht verfügbar"
+      }
     },
     "autonomy": {
       "full": {
@@ -1676,6 +3030,20 @@
         "description": "Agent führt Aktionen ohne Rückfrage aus"
       }
     },
+    "imageQuality": {
+      "economy": {
+        "label": "Sparsam",
+        "description": "Niedrigste Auflösung (~768px) — günstig, grobe Details"
+      },
+      "standard": {
+        "label": "Standard",
+        "description": "Ausgewogen (~1568px) — gute Details für die meisten Aufgaben"
+      },
+      "high": {
+        "label": "Hoch",
+        "description": "Modellfamilien-Maximum — ideal für OCR, Diagramme, UI-Screenshots"
+      }
+    },
     "criticRounds": {
       "1": "1 Runde",
       "3": "3 Runden",
@@ -1684,42 +3052,138 @@
       "0": "Unbegrenzt"
     },
     "tools": {
+      "addAction": "Hinzufügen ({{n}})",
+      "addRequested": "Hinzufügen angefordert",
+      "addable": "Dauerhaft aktiv — die Konfiguration kann zusätzlich hinzufügen: {{names}}",
+      "countBound": "{{n}} gebunden",
+      "countPredicted": "{{n}} vorhergesagt",
       "group": "Werkzeuge",
       "maxDepth": "Max. Tiefe",
-      "timeout": "Timeout (Sek.)"
+      "provenance": {
+        "measured": "Live vom laufenden Agenten",
+        "measured_partial": "Live vom laufenden Agenten — unvollständige Antwort",
+        "predicted": "Vorhergesagt, nicht gemessen",
+        "unknown": "Der aufgelöste Werkzeugsatz konnte nicht gelesen werden"
+      },
+      "timeout": "Timeout (Sek.)",
+      "unknownCategory": "Dieser Cockpit-Build hat keine Beschreibung für diese Kategorie."
     },
     "toolCategories": {
-      "research": {
-        "label": "Recherche",
-        "description": "Kann das Web durchsuchen, wissenschaftliche Quellen finden und Websites besuchen"
+      "agent_catalog": {
+        "label": "Experten & Skills",
+        "description": "Kann Experten und Skills nachschlagen. Nur lesend — angelegt werden sie in der Zeile darunter"
+      },
+      "catalog_authoring": {
+        "label": "Experten & Automatisierungen erstellen",
+        "description": "Kann eigene Experten, Skills und Automatisierungen in Ihrem Namen anlegen und ändern. Neue Automatisierungen werden deaktiviert angelegt, damit Sie sie prüfen können"
       },
       "browser_direct": {
         "label": "Browser",
         "description": "Direkte Browser-Steuerung — navigieren, klicken, tippen, Screenshots erstellen und Seiten visuell verifizieren"
       },
+      "canvas": {
+        "label": "Canvas",
+        "description": "Kann Workspace-Dateien im gemeinsamen Sitzungs-Canvas präsentieren"
+      },
       "citation": {
         "label": "Zitation",
         "description": "Kann Quellen verfolgen, Zitate verwalten und Literaturverzeichnisse erstellen"
-      },
-      "shell": {
-        "label": "Shell",
-        "description": "Kann Shell-Befehle in einem isolierten Terminal ausführen"
       },
       "communication": {
         "label": "Kommunikation",
         "description": "Kann E-Mails an Sie oder Ihr Team versenden"
       },
+      "core": {
+        "label": "Kern",
+        "description": "Planung, Fortschritt und Abschluss — Aufgabenliste, Neuplanung, Benachrichtigungen, Schlafen"
+      },
       "delegation": {
         "label": "Delegation",
         "description": "Kann Subagenten starten, die parallel arbeiten"
+      },
+      "email": {
+        "label": "E-Mail",
+        "description": "Über eine angebundene E-Mail-Datenquelle lesen und senden"
+      },
+      "evaluation": {
+        "label": "Bewertung",
+        "description": "Worker-Jobs freigeben oder mit Feedback zurückgeben"
+      },
+      "git": {
+        "label": "Git",
+        "description": "Kann den Versionsverlauf des Workspaces einsehen"
+      },
+      "graph": {
+        "label": "Graph",
+        "description": "Angebundene Neo4j-Datenquellen abfragen"
       },
       "knowledge": {
         "label": "Wissen",
         "description": "Kann die Projekt-Wissensbasis lesen und beschreiben"
       },
-      "git": {
-        "label": "Git",
-        "description": "Kann den Versionsverlauf des Workspaces einsehen"
+      "loop": {
+        "label": "Projektschleife",
+        "description": "Eine autonome Projektschleife planen"
+      },
+      "mcp": {
+        "label": "MCP-Server",
+        "description": "Werkzeuge, die beim Sitzungsstart von angebundenen MCP-Servern erkannt werden"
+      },
+      "mongodb": {
+        "label": "MongoDB",
+        "description": "Angebundene MongoDB-Datenquellen abfragen"
+      },
+      "job_control": {
+        "label": "Job-Steuerung",
+        "description": "SRW-Jobs erstellen, steuern, pausieren, fortsetzen, freigeben und abbrechen"
+      },
+      "job_inspection": {
+        "label": "Job-Inspektion",
+        "description": "Status und aktuell freigegebene Überwachungsdaten von SRW-Jobs einsehen"
+      },
+      "orchestrator": {
+        "label": "SRW-Projekte",
+        "description": "SRW-Projekte, Repositories, Sitzungskontext und Workspace-Upgrades einsehen"
+      },
+      "product_help": {
+        "label": "Produkthilfe",
+        "description": "SRW-Produkthandbuch und Funktionsübersicht lesen"
+      },
+      "repo": {
+        "label": "Repositories",
+        "description": "Angebundene Repository-Datenquellen lesen und schreiben"
+      },
+      "research": {
+        "label": "Recherche",
+        "description": "Kann das Web durchsuchen, wissenschaftliche Quellen finden und Websites besuchen"
+      },
+      "session_task": {
+        "label": "Sitzungsaufgaben",
+        "description": "Die eigene Aufgabenliste der Sitzung"
+      },
+      "shell": {
+        "label": "Shell",
+        "description": "Kann Shell-Befehle in einem isolierten Terminal ausführen"
+      },
+      "sql": {
+        "label": "SQL",
+        "description": "Angebundene PostgreSQL-Datenquellen abfragen"
+      },
+      "unclassified": {
+        "label": "Sonstige",
+        "description": "Werkzeuge, die dieser Cockpit-Build nicht kennt — meist zur Laufzeit erkannt"
+      },
+      "webdav": {
+        "label": "Cloud-Speicher",
+        "description": "Dateien in angebundenen WebDAV-/Cloud-Datenquellen lesen und schreiben"
+      },
+      "workflows": {
+        "label": "Automatisierungen & Loops",
+        "description": "Kann Automatisierungen und Projekt-Loops einsehen und deaktivierte Automatisierungen entwerfen"
+      },
+      "workspace": {
+        "label": "Arbeitsbereich-Dateien",
+        "description": "Dateien im Arbeitsbereich der Sitzung lesen, schreiben, verschieben und durchsuchen"
       }
     },
     "model": {
@@ -1727,10 +3191,34 @@
       "preset": "Voreinstellung",
       "strategic": "Strategisch",
       "tactical": "Taktisch",
+      "subagent": "Subagent",
       "single": "Modell",
+      "reasoning": "Reasoning",
+      "reasoningDefaultOption": "{{label}} (Standard)",
+      "reasoningResetNotice": "Auf Standard zurückgesetzt — deine Reasoning-Auswahl wurde nicht übernommen.",
       "default": "Standard",
+      "defaultResolved": "{{model}} ({{source}})",
+      "defaultResolvedNoSource": "Standard · {{model}}",
+      "source": {
+        "expert": "vom Experten",
+        "account_default": "dein Standard",
+        "system_default": "System-Standard",
+        "project": "Projekt-Standard"
+      },
       "presetUnconfigured": "Mindestens einem Modell fehlt ein API-Schlüssel",
-      "providerNoKey": "{{provider}} (kein API-Schlüssel)"
+      "providerNoKey": "{{provider}} (kein API-Schlüssel)",
+      "mismatchWindow": "Diese Modelle haben unterschiedliche Kontextfenster — sie teilen sich einen Verlauf und werden auf das kleinere begrenzt (~{{min}}).",
+      "mismatchMultimodal": "Eines dieser Modelle kann keine Bilder lesen — die Bildeingabe wird für beide Phasen deaktiviert.",
+      "temperature": "Temperatur"
+    },
+    "narrationModes": {
+      "auto": "Auto",
+      "verbose": "Ausführlich",
+      "silent": "Still"
+    },
+    "live": {
+      "cacheNote": "Änderungen gelten ab der nächsten Antwort. Das Ändern von Tools, Konnektoren oder des Modells setzt den Prompt-Cache der Unterhaltung zurück — die nächste Antwort verarbeitet den gesamten Verlauf neu, was langsamer ist und für diesen Zug spürbar mehr kosten kann.",
+      "datasourcesLive": "Konnektor-Änderungen gelten ab der nächsten Antwort; entfernte Verbindungen werden nach Abschluss des laufenden Zugs geschlossen. Bereits gelesene Inhalte bleiben im Kontext des Agenten."
     }
   },
   "agentList": {
@@ -1783,6 +3271,8 @@
       "assignFailed": "Zuweisung fehlgeschlagen",
       "assignError": "Fehler bei der Zuweisung"
     },
+    "auxDegraded": "Hilfsmodell gestört",
+    "auxDegradedTip": "Hilfsmodell gestört",
     "time": {
       "secondsAgo": "vor {{n}}s",
       "minutesAgo": "vor {{n}} Min.",
@@ -1896,7 +3386,19 @@
       "agent.unavailable": "Derzeit sind keine Agenten verfügbar.",
       "agent.offline": "Der zugewiesene Agent ist offline.",
       "project.not_found": "Dieses Projekt existiert nicht mehr.",
-      "permission.denied": "Dafür fehlt dir die Berechtigung."
+      "project_archived": "Dieses Projekt ist archiviert. Heben Sie die Archivierung auf, bevor Sie neue Arbeit anlegen.",
+      "permission.denied": "Dafür fehlt dir die Berechtigung.",
+      "nothing_staged": "Es sind keine bereitgestellten Änderungen mehr vorhanden — sie wurden anderswo übernommen oder verworfen.",
+      "no_protected_mount": "Diese Session hat keinen geschützten Cloud-Mount mehr, ihre bereitgestellten Änderungen können also nicht übernommen werden.",
+      "staging_missing": "Der bereitgestellte Inhalt ist im Speicher nicht mehr vorhanden und kann daher nicht übernommen werden. Stelle die Änderungen erneut bereit und prüfe sie noch einmal.",
+      "invalid_epoch": "Diese Prüfung ist veraltet. Lade sie neu und entscheide erneut."
+    },
+    "projects": {
+      "loadFailed": "Projekte konnten nicht geladen werden.",
+      "archiveFailed": "Projekt konnte nicht archiviert werden.",
+      "unarchiveFailed": "Archivierung des Projekts konnte nicht aufgehoben werden.",
+      "updateFailed": "Projekt konnte nicht gespeichert werden.",
+      "renameFailed": "Projekt konnte nicht umbenannt werden."
     },
     "jobs": {
       "createFailed": "Job konnte nicht erstellt werden.",
@@ -1909,7 +3411,9 @@
       "replyFailed": "Antwort konnte nicht gesendet werden.",
       "exportFailed": "Auftrag konnte nicht in deine Cloud exportiert werden.",
       "acceptFailed": "Diff konnte nicht angenommen werden.",
-      "rejectFailed": "Diff konnte nicht verworfen werden."
+      "rejectFailed": "Diff konnte nicht verworfen werden.",
+      "diffLoadFailed": "Die Änderungen des Jobs konnten nicht geladen werden.",
+      "diffFileLoadFailed": "Die Änderungen dieser Datei konnten nicht geladen werden."
     },
     "ide": {
       "startFailed": "IDE-Sitzung konnte nicht gestartet werden.",
@@ -1917,12 +3421,29 @@
     },
     "sessions": {
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden.",
+      "stillEnding": "Diese Sitzung wird noch beendet. Lass diese Seite geöffnet und versuche Fortsetzen danach erneut.",
       "endFailed": "Sitzung konnte nicht beendet werden.",
       "deleteFailed": "Sitzung konnte nicht gelöscht werden.",
-      "createFailed": "Sitzung konnte nicht erstellt werden."
-    }
+      "createFailed": "Sitzung konnte nicht erstellt werden.",
+      "renameFailed": "Sitzung konnte nicht umbenannt werden.",
+      "bindingInvalid": "Diese Sitzungsverbindung ist nicht mehr autoritativ. Warte auf die Wiederherstellung der Sitzung oder wende dich an einen Administrator."
+    },
+    "cloudDiff": {
+      "applyFailed": "Änderungen konnten nicht übernommen werden.",
+      "rejectFailed": "Änderungen konnten nicht verworfen werden.",
+      "restageFailed": "Diff konnte nicht aktualisiert werden.",
+      "loadFailed": "Die bereitgestellten Änderungen konnten nicht geladen werden.",
+      "fileLoadFailed": "Diese bereitgestellte Datei konnte nicht geladen werden."
+    },
+    "network": "Der Server ist nicht erreichbar. Prüfe deine Verbindung und versuche es erneut."
   },
   "toasts": {
+    "admin": {
+      "userRegistered": "Neuer Benutzer wartet auf Freigabe: {{name}}"
+    },
+    "automations": {
+      "autoDisabled": "Automation '{{name}}' wurde automatisch pausiert"
+    },
     "jobs": {
       "created": "Job erstellt",
       "deleted": "Job gelöscht",
@@ -1932,13 +3453,323 @@
       "approved": "Job freigegeben",
       "vmUpgradeStarted": "VM-Upgrade gestartet",
       "replySent": "Antwort gesendet",
-      "exportedToCloud": "{{count}} Datei(en) in deine Cloud exportiert",
+      "exportedToCloud": "{{count}} Datei(en) nach {{folder}} exportiert",
+      "exportedNotShared": "{{count}} Datei(en) nach {{folder}} exportiert, aber der Ordner ist noch nicht für dich freigegeben — einmal in der Cloud anmelden, dann neu synchronisieren.",
       "diffAccepted": "{{applied}} Änderung(en) und {{deleted}} Löschung(en) in den Cloud-Ordner geschrieben.",
       "diffRejected": "Diff verworfen; keine Änderungen in der Cloud."
     },
     "ide": {
       "stopped": "IDE-Sitzung beendet"
+    },
+    "sessions": {
+      "cloudSyncRecovered": "Die Cloud-Synchronisierung läuft jetzt für diese Sitzung."
     }
+  },
+  "officerCorrectness": {
+    "provisioningLabel": "Bereitstellung",
+    "provisioningProblem": "{{count}} Job-Vorabprüfung(en) ausstehend oder fehlgeschlagen — sie belegen Anspruch und Kapazität, sind aber nicht ausführbar.",
+    "knowledgeLabel": "Wissensabgleich",
+    "knowledgeProblem": "{{count}} kanonische/Projektionsmutation(en) ungelöst — betroffene Tickets sind nicht zulässig.",
+    "floorWakeLabel": "Mindestbestand-Weckruf",
+    "poolFallback": "Pool",
+    "delivered": "zugestellt",
+    "durablyQueued": "dauerhaft eingereiht",
+    "deliveryFailed": "Zustellung fehlgeschlagen; Wiederholungsstatus beibehalten",
+    "notQueued": "nicht eingereiht"
+  },
+  "officerCard": {
+    "title": "Centurio",
+    "intro": "Ein ständiger Offizier für dieses Projekt: Er führt den Auftrag, überwacht Jobs und Flotte, entsendet Arbeiter aus seiner Ausrüstung und meldet sich nur, wenn du wirklich gebraucht wirst. In einer Konferenz sprichst du mit ihm; sein Hintergrundprotokoll ist das Sitzungsprotokoll. Der Posten überdauert ihn — Ausrüstung, Budgets und Gedächtnis bleiben zwischen Inkarnationen erhalten.",
+    "readOnly": "Du kannst diesen Offiziersposten ansehen, aber nur ein Projekteigentümer oder Systemadministrator darf ihn verwalten.",
+    "runtimeAuthorization": {
+      "label": "Laufzeitautorisierung",
+      "unavailable": "Nicht verfügbar — die autonome Planung ist pausiert, während der Server erneut versucht und den Projekteigentümer benachrichtigt.",
+      "a11y": "Laufzeitautorisierung des Offiziers nicht verfügbar; autonome Planung ist pausiert"
+    },
+    "a11y": {
+      "loading": "Offiziersposten wird geladen",
+      "region": "Offiziersposten",
+      "brainModel": "Offiziersmodell",
+      "reasoning": "Denkaufwand des Offiziers",
+      "actionsPerWake": "Maximale Aktionen pro Weckruf",
+      "slotName": "Name von Platz {{index}}",
+      "slotCount": "Anzahl von Platz {{index}}",
+      "slotModel": "Modell von Platz {{index}}",
+      "slotWorkspace": "Arbeitsbereich von Platz {{index}}",
+      "slotPool": "Pool von Platz {{index}}",
+      "removeSlot": "Platz {{name}} entfernen",
+      "maxWorkers": "Maximale Arbeiterzahl",
+      "tokenCeiling": "Tägliche Token-Obergrenze",
+      "pagesPerDay": "Maximale Meldungen pro Tag",
+      "sleepMin": "Minimale Schlafdauer in Minuten",
+      "sleepMax": "Maximale Schlafdauer in Minuten",
+      "holdNote": "Notiz zur Aussetzung des Offiziers",
+      "recycle": "Offizierslaufzeit neu starten",
+      "routingPolicy": "Weiterleitung von Arbeiterfragen"
+    },
+    "actions": {
+      "addSlot": "Platz hinzufügen",
+      "cancel": "Abbrechen",
+      "commission": "Centurio einsetzen",
+      "conference": "Konferenz",
+      "confirmDecommission": "Abberufung bestätigen",
+      "confirmHold": "Aussetzung bestätigen",
+      "decommission": "Abberufen",
+      "decommissionKeepRunning": "Abberufen — Jobs weiterlaufen lassen",
+      "hold": "Aussetzen",
+      "keepOfficer": "Im Amt lassen",
+      "openLog": "Protokoll öffnen",
+      "rejoinConference": "Konferenz wieder betreten",
+      "release": "Freigeben",
+      "recycle": "Laufzeit neu starten",
+      "save": "Änderungen speichern"
+    },
+    "backlog": {
+      "autoPull": "Auto-Pull",
+      "on": "an — bereite Tickets werden freien Pool-Plätzen zugeteilt",
+      "off": "aus — Pools bleiben untätig, bis er manuell entsendet",
+      "stalled": "Festgefahren",
+      "stalledDetail": "{{count}} beanspruchte(s) Ticket(s) seit mehr als {{threshold}} Std. ohne Fortschritt ({{source}}) — sie werden nie automatisch freigegeben; Job fortsetzen oder abbrechen, dann Ticket schließen oder erneut bereitstellen.",
+      "thresholdSource": {
+        "deployment_default": "Deployment-Standard",
+        "request_override": "Anfrage-Überschreibung",
+        "unavailable": "Richtlinie nicht verfügbar"
+      }
+    },
+    "brain": {
+      "actionsHint": "Harte Obergrenze für Werkzeugaufrufe pro Weckruf.",
+      "actionsLabel": "Aktionen pro Weckruf",
+      "modelHint": "Das Modell, auf dem sein Urteil beruht — wähle ein starkes; seine Weckrufe sind günstig, aber seine Entscheidungen lenken alles. Leer verwendet deinen Sitzungsstandard.",
+      "modelLabel": "Eigenes Modell des Offiziers",
+      "reasoningHint": "Aufwand pro Weckruf. Wird auf die Modellfähigkeiten begrenzt.",
+      "reasoningLabel": "Denkaufwand"
+    },
+    "budgets": {
+      "pages": "Meldungen pro Tag",
+      "pagesHint": "Wie oft er dich benachrichtigen darf (Standard 3).",
+      "tokenCeiling": "Tägliche Token-Obergrenze",
+      "tokenCeilingHint": "Für sein gesamtes Kommando. Leer bedeutet ohne Obergrenze."
+    },
+    "category": {
+      "none": "Kein Pool — der Offizier entsendet manuell",
+      "researcher": "Recherche — Ergebnis ist eine Antwort",
+      "tester": "Test — Ergebnis sind Issue-Tickets",
+      "executor": "Ausführung — Ergebnis sind ausgelieferte Dateien"
+    },
+    "decommission": {
+      "hint": "Ausrüstung, Budgets, Digest und SITREP-Fingerabdrücke bleiben am Posten; eine erneute Einsetzung stellt sie mit einer Kontinuitätsnotiz wieder her.",
+      "inFlightWarning": "Er hat {{count}} laufende(n) Job(s). Die Abberufung lässt sie weiterlaufen — ihre Abschlüsse landen im Posten-Ledger für seinen Nachfolger."
+    },
+    "defaults": {
+      "default": "Standard",
+      "project": "Projekt",
+      "session": "Sitzungsstandard",
+      "unlimited": "unbegrenzt",
+      "worker": "Arbeiterstandard"
+    },
+    "digest": {
+      "title": "Digest — was er für dich vorgemerkt hat"
+    },
+    "errors": {
+      "commission": "Einsetzung fehlgeschlagen",
+      "conference": "Konferenz konnte nicht geöffnet werden",
+      "decommission": "Abberufung fehlgeschlagen",
+      "hold": "Aussetzung fehlgeschlagen",
+      "policy": "Weiterleitung der Arbeiterfragen konnte nicht geändert werden",
+      "release": "Freigabe fehlgeschlagen",
+      "recycle": "Neustart der Laufzeit fehlgeschlagen",
+      "update": "Aktualisierung fehlgeschlagen",
+      "withDetail": "{{fallback}}: {{detail}}"
+    },
+    "hold": {
+      "noteHint": "Wird auf dem Abzeichen gezeigt — warum er zurücktritt. Anweisungen des Legaten erreichen ihn weiterhin.",
+      "noteLabel": "Notiz zur Aussetzung",
+      "placeholder": "Wartung"
+    },
+    "holdKind": {
+      "maintenance": "Wartung",
+      "conference": "Konferenz"
+    },
+    "immediacy": {
+      "nextDelivery": "gilt ab der nächsten Zustellung",
+      "nextDispatch": "gilt ab der nächsten Entsendung",
+      "nextRespawn": "gilt nach dem nächsten Neustart",
+      "nextSleep": "gilt ab der nächsten Schlafmeldung"
+    },
+    "kit": {
+      "breakerOpen": "SCHUTZSCHALTER OFFEN",
+      "ready": "bereit {{count}}",
+      "readyBelowFloor": "bereit {{count}} — UNTER MINDESTBESTAND"
+    },
+    "machineState": {
+      "not-attempted": "nicht versucht",
+      "in-progress": "in Arbeit",
+      "retryable-failed": "wiederholbarer Fehler",
+      "permanent-failed": "dauerhafter Fehler",
+      "activated": "aktiviert",
+      "pending-sync": "Abgleich ausstehend",
+      "canonical": "kanonisch",
+      "failed": "fehlgeschlagen",
+      "superseded": "ersetzt",
+      "pending": "ausstehend",
+      "synced": "synchronisiert",
+      "projection-only": "nur Projektion",
+      "retryable": "wiederholbar",
+      "queued": "eingereiht",
+      "delivered": "zugestellt",
+      "unknown": "unbekannt"
+    },
+    "messages": {
+      "commissioned": "Eingesetzt.",
+      "commissionedWithBrief": "Eingesetzt — sein erster Weckruf enthält die Kontinuitätsnotiz. Öffne das Protokoll, um die Übernahme zu verfolgen.",
+      "decommissioned": "Posten abberufen — Ausrüstung, Budgets und Fingerabdrücke bleiben für den Nachfolger erhalten.",
+      "held": "Ausgesetzt — Entsendungen pausieren und der Wächter tritt zurück; deine Anweisungen erreichen ihn weiterhin.",
+      "released": "Freigegeben — wartende Ereignisse werden innerhalb eines Takts verarbeitet.",
+      "recycleStarted": "Neustart der Laufzeit begonnen — die Wartungsaussetzung bleibt bis zur gesunden Ablösung bestehen.",
+      "updated": "Posten aktualisiert — die Kapazitätszeile des nächsten SITREP zeigt den neuen Stand."
+    },
+    "runtimeLifecycle": {
+      "label": "Laufzeit-Lebenszyklus",
+      "missing": "fehlt",
+      "unpinned": "nicht angeheftet",
+      "automatic": {
+        "enabled": "automatische Reparatur aktiviert",
+        "disabled": "automatische Reparatur deaktiviert"
+      },
+      "drift": {
+        "current": "aktuell",
+        "drifted": "Image-Abweichung",
+        "missing": "Pod fehlt",
+        "unknown": "unbekannt"
+      },
+      "phase": {
+        "idle": "inaktiv",
+        "awaiting-old-pod-exit": "wartet auf das Beenden der alten Laufzeit",
+        "fencing-old-authority": "alte Laufzeitberechtigung wird beendet",
+        "provisioning": "Ersatz wird bereitgestellt",
+        "provisioning-claimed": "Ersatzbereitstellung läuft",
+        "awaiting-replacement": "wartet auf die Berechtigung des Ersatzes",
+        "failed-retryable": "wiederholbarer Fehler",
+        "complete": "aktuell",
+        "blocked": "blockiert",
+        "cancelled": "abgebrochen",
+        "unknown": "unbekannt"
+      }
+    },
+    "policy": {
+      "title": "Arbeiterfragen",
+      "label": "Wenn ein Arbeiter eine Frage stellt",
+      "userDirect": "Direkt an mich",
+      "officerAndUser": "Offizier und ich",
+      "officerFirst": "Zuerst der Offizier",
+      "officerFirstRecommended": "Zuerst der Offizier (empfohlen)",
+      "hint": "Zuerst der Offizier fällt auf dich zurück, wenn er nicht verfügbar ist, und eskaliert nach {{minutes}} Min. ohne Antwort an dich.",
+      "hintVacant": "Zuerst der Offizier fällt auf dich zurück, wenn er nicht verfügbar ist, und eskaliert nach {{minutes}} Min. ohne Antwort an dich. Bei vakantem Posten gehen Fragen immer direkt an dich.",
+      "value": {
+        "user_direct": "Direkt an mich",
+        "officer_and_user": "Offizier und ich",
+        "officer_first": "Zuerst der Offizier"
+      }
+    },
+    "reasoning": {
+      "defaultHigh": "Standard (hoch)",
+      "low": "niedrig",
+      "medium": "mittel",
+      "high": "hoch",
+      "xhigh": "sehr hoch",
+      "max": "maximal"
+    },
+    "roster": {
+      "count": "Anzahl",
+      "countHint": "Null sperrt neue Aufnahmen, ohne laufende Arbeit abzubrechen; zulässig sind 0 bis 20.",
+      "drainHint": "{{inFlight}} laufend — wird auf {{count}} abgebaut",
+      "hint": "Ordne einen Platz einem Pool zu, damit der Offizier ihn automatisch mit bereiten Tickets dieser Art füllt; ohne Pool entsendet er die Kapazität manuell.",
+      "maxWorkers": "Max. Arbeiter",
+      "maxWorkersHint": "Flache Parallelitätsgrenze. Ohne Ausrüstung ist sie die einzige Schranke (Standard 3).",
+      "model": "Modell",
+      "pool": "Pool",
+      "slot": "Platz",
+      "slotPlaceholder": "Linie",
+      "workspace": "Arbeitsbereich"
+    },
+    "sections": {
+      "brain": "Sein Modell",
+      "budgets": "Budgets",
+      "kit": "Ausrüstung",
+      "sleep": "Schlaf"
+    },
+    "sleep": {
+      "hint": "Er meldet seine Schlafzeit zwischen Weckrufen selbst; der Server begrenzt sie auf diese Werte.",
+      "min": "Min. (Minuten)",
+      "max": "Max. (Minuten)"
+    },
+    "status": {
+      "active": "aktiv",
+      "suspended": "ausgesetzt",
+      "ended": "beendet",
+      "created": "erstellt",
+      "processing": "in Bearbeitung",
+      "waiting_for_reply": "wartet auf Antwort",
+      "paused": "pausiert",
+      "pending_review": "Prüfung ausstehend",
+      "completed": "abgeschlossen",
+      "failed": "fehlgeschlagen",
+      "cancelled": "abgebrochen",
+      "held": "ausgesetzt",
+      "heldKind": "ausgesetzt — {{kind}}",
+      "unknown": "unbekannt"
+    },
+    "summary": {
+      "ceilingReached": "— Obergrenze erreicht; schläft bis zum Zurücksetzen",
+      "model": "Sein Modell",
+      "nextWake": "Nächster Weckruf",
+      "pagesToday": "Meldungen heute",
+      "queuedEvents": "Wartende Ereignisse",
+      "spendToday": "Verbrauch heute",
+      "tokens": "Token"
+    },
+    "vacant": {
+      "dropped": "… {{count}} ältere Einträge verworfen",
+      "flatCapHint": "Keine Plätze bedeutet eine flache Grenze von 3 parallelen Arbeitern. Der Offizier läuft kopflos; sein erster Weckruf enthält die Kontinuitätsnotiz und gegebenenfalls das Ledger der vakanten Zeit.",
+      "hint": "Der Posten ist vakant — kein Centurio hält diese Centurie. Ein Projekteigentümer oder Systemadministrator kann Ausrüstung zuweisen und ihn einsetzen.",
+      "ledgerTitle": "Während der Posten vakant war",
+      "pastIncarnations": "Frühere Inkarnationen"
+    },
+    "validation": {
+      "blankSlot": "Jede Zeile der Aufstellung benötigt einen Platznamen.",
+      "duplicateSlot": "Der Platzname '{{name}}' kommt mehrfach vor. Benenne den doppelten Eintrag um oder entferne ihn."
+    },
+    "wake": {
+      "dueNow": "jetzt fällig",
+      "eventDriven": "nicht geplant (ereignisgesteuert)",
+      "inMinutes": "in {{count}} Min.",
+      "overdueMinutes": "seit {{count}} Min. überfällig"
+    },
+    "workspace": {
+      "sandbox": "Sandbox",
+      "virtual": "virtuell",
+      "none": "keiner",
+      "vmRoot": "VM (Root)"
+    }
+  },
+  "statistics": {
+    "stuckPolicy": "{{threshold}} Min. · {{source}}",
+    "policyUnavailable": "Liveness-Richtlinie nicht verfügbar",
+    "thresholdSource": {
+      "deployment_default": "Deployment-Standard",
+      "request_override": "Anfrage-Überschreibung",
+      "unavailable": "nicht verfügbar"
+    },
+    "livenessState": {
+      "active": "aktiv",
+      "waiting": "wartend",
+      "paused": "pausiert",
+      "suspected_stuck": "vermutlich festgefahren",
+      "unavailable": "Liveness nicht verfügbar",
+      "terminal": "beendet"
+    },
+    "lastActivity": "letzte maßgebliche Aktivität {{time}}",
+    "activityUnavailable": "kein maßgeblicher Aktivitätszeitpunkt"
   },
   "pwa": {
     "splash": "Legion wird formiert…",
@@ -1968,5 +3799,15 @@
     "checkpoint": "Meilenstein · prüfen und fortfahren",
     "syncComplete": "Berichte eingereicht.",
     "errorGeneric": "Das Signal kam nicht durch. Erneut versuchen."
+  },
+  "ui": {
+    "multiSelect": {
+      "placeholder": "Optionen auswählen",
+      "filterPlaceholder": "Optionen filtern",
+      "filterLabel": "Optionen filtern",
+      "empty": "Keine passenden Optionen",
+      "selectedCount": "{{count}} ausgewählt",
+      "clear": "Zurücksetzen"
+    }
   }
 }

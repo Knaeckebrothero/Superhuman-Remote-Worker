@@ -1,0 +1,283 @@
+{{- if and .Values.infrastructureMetering.collectorEnabled (eq (.Values.infrastructureMetering.deploymentMode | default "dedicated") "dedicated") }}
+{{- $fullName := include "srw.fullname" . -}}
+{{- $collectorName := printf "%s-infra-collector" $fullName -}}
+{{- $pvReaderName := printf "%s-pv-reader" $collectorName | trunc 63 | trimSuffix "-" -}}
+{{- $defaultIngestionSecretName := printf "%s-infra-ingestion" $fullName | trunc 63 | trimSuffix "-" -}}
+{{- $defaultVolumeIdentitySecretName := printf "%s-infra-volume-identity" $fullName | trunc 63 | trimSuffix "-" -}}
+{{- $namespaces := concat (list .Release.Namespace) (.Values.infrastructureMetering.namespaceAllowlist | default list) | uniq -}}
+{{- if and .Values.infrastructureMetering.networkPolicy.enabled (not .Values.infrastructureMetering.networkPolicy.apiServerCidrs) }}
+{{- fail "infrastructureMetering.networkPolicy.enabled requires apiServerCidrs" }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "infra-collector") | nindent 4 }}
+automountServiceAccountToken: true
+{{- range $namespace := $namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" $ "component" "infra-collector") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  {{- if $.Values.infrastructureMetering.pvcInventoryEnabled }}
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" $ "component" "infra-collector") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $collectorName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $collectorName }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvInventoryEnabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $pvReaderName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "infra-collector") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $pvReaderName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "infra-collector") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $pvReaderName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $collectorName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "infra-collector") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "infra-collector") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "infra-collector") | nindent 8 }}
+      annotations:
+        checksum/infrastructure-metering-settings: {{ toJson .Values.infrastructureMetering | sha256sum | quote }}
+    spec:
+      serviceAccountName: {{ $collectorName }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
+          imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
+          command: ["python", "-m", "services.infrastructure_metering.collector_runtime"]
+          env:
+            - name: INFRASTRUCTURE_METERING_COLLECTOR_ENABLED
+              value: "true"
+            - name: INFRASTRUCTURE_METERING_DEPLOYMENT_MODE
+              value: "dedicated"
+            - name: INFRASTRUCTURE_METERING_SHADOW_ENABLED
+              value: {{ .Values.infrastructureMetering.shadowEnabled | quote }}
+            - name: INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION
+            - name: INFRASTRUCTURE_METERING_COLLECTOR_ID
+              value: kubernetes-pods
+            - name: INFRASTRUCTURE_METERING_ORCHESTRATOR_URL
+              value: {{ printf "http://%s-orchestrator:8085" $fullName | quote }}
+            - name: INFRASTRUCTURE_METERING_INGESTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infrastructureMetering.ingestionSecretName | default $defaultIngestionSecretName }}
+                  key: {{ .Values.infrastructureMetering.ingestionSecretKey | default "INFRASTRUCTURE_METERING_INGESTION_KEY" }}
+            {{- if .Values.infrastructureMetering.pvInventoryEnabled }}
+            - name: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infrastructureMetering.volumeIdentitySecretName | default $defaultVolumeIdentitySecretName }}
+                  key: {{ .Values.infrastructureMetering.volumeIdentitySecretKey | default "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY" }}
+            {{- end }}
+            - name: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
+            - name: INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST
+            - name: INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS
+            - name: INFRASTRUCTURE_METERING_LIST_PAGE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_LIST_PAGE_SIZE
+            - name: INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY
+            - name: INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE
+            - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS
+            - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES
+          resources:
+            {{- toYaml .Values.infrastructureMetering.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- if .Values.infrastructureMetering.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $collectorName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "infra-collector") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "infra-collector") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.infrastructureMetering.networkPolicy.dnsNamespace | default "kube-system" | quote }}
+          podSelector:
+            matchLabels:
+              {{- toYaml (.Values.infrastructureMetering.networkPolicy.dnsPodSelector | default (dict "k8s-app" "kube-dns")) | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8085
+    {{- range .Values.infrastructureMetering.networkPolicy.apiServerCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    {{- end }}
+{{- end }}
+{{- end }}

@@ -11,11 +11,20 @@ systems and file-based artifacts (plan.md, notes/), while state fields
 control loop flow.
 """
 
-from typing import Any, Dict, List, Optional, Annotated
+from typing import Annotated, Any, Dict, List, Optional
 
 from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+
+
+class CompletionReportPayload(TypedDict):
+    """Exact operation payload persisted for one completion-report retry set."""
+
+    should_stop: bool
+    goal_achieved: bool
+    error: Optional[Dict[str, Any]]
+    freeze_data: Optional[Dict[str, Any]]
 
 
 class UniversalAgentState(TypedDict):
@@ -48,7 +57,16 @@ class UniversalAgentState(TypedDict):
         phase_number: Increments at each phase transition (for tracking/logging)
         is_final_phase: True when job_complete was called, job completes when todos done
         turn_count: LLM call counter, used by memory extraction to trigger every N turns
+        phase_instruction_injections: Checkpointed once-per-phase instruction keys
         last_observed_turn: Last turn when memory extraction ran (for interval tracking)
+        delivered_reply_keys: Durable identities of queued replies already
+            appended to message history (worker handoff dedup)
+        delivered_guidance_ids: Guidance entries absorbed by an execute-node
+            response checkpoint
+        delivered_feedback_keys: Queued-feedback generations absorbed on resume
+        delivered_delegation_keys: Delegation-result generations absorbed on resume
+        instruction_read_receipts: Checkpointed instruction-file read receipts
+            used to preserve phase/freshness enforcement across worker claims
 
         # File-based context
         workspace_memory: Legacy; unused (workspace.md removed), always ""
@@ -57,6 +75,17 @@ class UniversalAgentState(TypedDict):
         error: Error information if something went wrong
         should_stop: Flag to signal workflow termination
         consecutive_llm_errors: Count of consecutive LLM failures
+        client_report_id: Random idempotency key minted once for a genuine stop
+        completion_report_payload: Exact four-field completion operation payload
+
+        # Stateless worker batch budget (missing/None means unarmed)
+        worker_batch_started_at: Epoch timestamp when this claim began
+        worker_batch_start_iteration: Execute-iteration value at claim start
+        worker_batch_target_wall_seconds: Preferred wall-clock batch duration
+        worker_batch_min_wall_seconds: Effective floor for this claim's target
+        worker_batch_iteration_cap: Optional execute-iteration delta cap
+        worker_resume_id: Durable explicit-resume generation applied to this
+            checkpoint, preventing an ambiguous paused report from resuming
 
         # Job metadata
         metadata: Job-specific data (document_path, prompt, etc.)
@@ -86,9 +115,29 @@ class UniversalAgentState(TypedDict):
     is_strategic_phase: bool  # True = strategic mode, False = tactical mode
     phase_number: int  # Increments at each phase transition
     is_final_phase: bool  # True when job_complete called, awaiting todo completion
+
+    # Finalization-decision mirrors (journal-before-observe). Written by the
+    # audited tool node AFTER the decision was durably journaled through the
+    # orchestrator, so any checkpoint containing the tool result also carries
+    # the decision. Mirrors of the durable record, never the source of truth:
+    # jobs.context.completion_decision / the target's verification ledger are.
+    # Nulled on feedback resume — a new round voids the old decision.
+    completion_decision: Optional[Dict[str, Any]]  # journaled job_complete payload
+    verdict_decision: Optional[Dict[str, Any]]  # journaled critic verdict (cache)
+
+    # Exactly-once guard for archive_phase: "<phase_number>:<strategic|tactical>"
+    # of the last archived phase instance. A transition rejection retries the
+    # completion; this stops the retry re-archiving the same boundary.
+    last_archived_phase: Optional[str]
     turn_count: int  # LLM call counter (for memory extraction interval)
+    phase_instruction_injections: List[str]  # Once-per-phase instruction keys
     last_observed_turn: int  # Last turn when memory extraction ran
     last_assembled_turn: int  # Last turn when memory assembler ran
+    delivered_reply_keys: List[str]  # Checkpoint-coupled queued-reply dedup
+    delivered_guidance_ids: List[str]  # Checkpoint-coupled urgent guidance
+    delivered_feedback_keys: List[str]  # Checkpoint-coupled resume feedback
+    delivered_delegation_keys: List[str]  # Checkpoint-coupled child results
+    instruction_read_receipts: Dict[str, Dict[str, Any]]
 
     # File-based context (read from workspace into state)
     workspace_memory: str  # Legacy; unused (workspace.md removed), always ""
@@ -97,6 +146,23 @@ class UniversalAgentState(TypedDict):
     error: Optional[Dict[str, Any]]
     should_stop: bool
     consecutive_llm_errors: int
+
+    # Completion report retry envelope. A graph node writes both immediately
+    # before END, so a successor re-reporting the durable checkpoint reuses the
+    # same random identity and exact operation payload. Genuine resume nodes
+    # clear both before any new work can produce another stop.
+    client_report_id: Optional[str]
+    completion_report_payload: Optional[CompletionReportPayload]
+
+    # Stateless worker batches are armed explicitly by their claim driver.
+    # Keeping these fields in the checkpoint makes the boundary decision
+    # restart-safe; None preserves legacy/session behavior and old checkpoints.
+    worker_batch_started_at: Optional[float]
+    worker_batch_start_iteration: Optional[int]
+    worker_batch_target_wall_seconds: Optional[float]
+    worker_batch_min_wall_seconds: Optional[float]
+    worker_batch_iteration_cap: Optional[int]
+    worker_resume_id: Optional[str]
 
     # Job metadata (flexible, agent-type specific)
     # For Creator: document_path, prompt, etc.
@@ -112,9 +178,15 @@ class UniversalAgentState(TypedDict):
     tool_retry_state: Optional[Dict[str, Any]]
 
     # Phase transition state (legacy, for backwards compatibility)
-    # Set when a phase transition is triggered by todo_complete or todo_rewind
+    # Set when a phase transition is triggered by todo_complete or request_replan
     # Contains: transition_type, trigger_summarization, metadata
     phase_transition: Optional[Dict[str, Any]]
+
+    # Why the tactical phase asked to end early (request_replan tool).
+    # Set by check_todos when it consumes the request, read by handle_transition
+    # so the incoming strategic phase is told what changed. Cleared at the
+    # transition — a stale reason must not steer a later phase.
+    replan_reason: Optional[str]
 
     # Todo persistence (for checkpoint/resume)
     # These fields sync TodoManager state to LangGraph checkpoints
@@ -131,6 +203,12 @@ class UniversalAgentState(TypedDict):
     # Set via aupdate_state when resuming a frozen job with --feedback
     # Consumed by restore_from_feedback node, then cleared
     resume_feedback: Optional[str]
+
+    # Why the job was resumed with feedback (critic return, supervisor
+    # escalation, reviewer feedback, ...). Free-form; rendered verbatim in
+    # the [FEEDBACK_RESUME] banner. Set alongside resume_feedback, consumed
+    # by restore_from_feedback, then cleared.
+    resume_reason: Optional[str]
 
 
 def create_initial_state(
@@ -178,15 +256,33 @@ def create_initial_state(
         is_strategic_phase=True,
         phase_number=1,
         is_final_phase=False,
+        completion_decision=None,
+        verdict_decision=None,
+        last_archived_phase=None,
         turn_count=0,
+        phase_instruction_injections=[],
         last_observed_turn=0,
         last_assembled_turn=0,
+        delivered_reply_keys=[],
+        delivered_guidance_ids=[],
+        delivered_feedback_keys=[],
+        delivered_delegation_keys=[],
+        instruction_read_receipts={},
         # File-based context
         workspace_memory="",
         # Execution control
         error=None,
         should_stop=False,
         consecutive_llm_errors=0,
+        client_report_id=None,
+        completion_report_payload=None,
+        # Worker batch budget (default-unarmed)
+        worker_batch_started_at=None,
+        worker_batch_start_iteration=None,
+        worker_batch_target_wall_seconds=None,
+        worker_batch_min_wall_seconds=None,
+        worker_batch_iteration_cap=None,
+        worker_resume_id=None,
         # Metadata
         metadata=metadata or {},
         # Context management
@@ -202,4 +298,5 @@ def create_initial_state(
         freeze_data=None,
         # Resume from feedback
         resume_feedback=None,
+        resume_reason=None,
     )

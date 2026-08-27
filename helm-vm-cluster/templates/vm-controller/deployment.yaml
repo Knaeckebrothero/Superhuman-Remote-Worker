@@ -6,6 +6,9 @@ metadata:
     {{- include "srwvm.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
 spec:
   replicas: {{ .Values.vmController.replicas }}
+  # Lifecycle create/delete locking is process-local; avoid rollout overlap.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "srwvm.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 6 }}
@@ -53,6 +56,32 @@ spec:
               value: {{ .Values.vmController.vmStorageClass | quote }}
             - name: VM_DISK_SIZE
               value: {{ .Values.vmController.vmDiskSize | quote }}
+            {{- if .Values.vmController.lifecycleAuthSecretName }}
+            - name: VM_LIFECYCLE_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vmController.lifecycleAuthSecretName | quote }}
+                  key: {{ .Values.vmController.lifecycleAuthSecretKey | default "VM_LIFECYCLE_HMAC_SECRET" | quote }}
+            {{- end }}
+            # Golden-image boot acceleration
+            # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md)
+            - name: VM_GOLDEN_IMAGE_ENABLED
+              value: {{ .Values.vmController.goldenImage.enabled | default false | quote }}
+            - name: VM_GOLDEN_DISK_SIZE
+              value: {{ .Values.vmController.goldenImage.diskSize | default .Values.vmController.vmDiskSize | quote }}
+            - name: VM_GOLDEN_GC_ENABLED
+              value: {{ .Values.vmController.goldenImage.gc.enabled | default true | quote }}
+            - name: VM_GOLDEN_KEEP
+              value: {{ .Values.vmController.goldenImage.gc.keep | default 3 | quote }}
+            - name: VM_GOLDEN_GC_MIN_AGE_MINUTES
+              value: {{ .Values.vmController.goldenImage.gc.minAgeMinutes | default 30 | quote }}
+            # Persistent rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md)
+            - name: VM_PERSISTENT_ROOTDISK
+              value: {{ .Values.vmController.persistentRootdisk.enabled | default false | quote }}
+            - name: VM_ROOTDISK_GC_ENABLED
+              value: {{ .Values.vmController.persistentRootdisk.gc.enabled | default false | quote }}
+            - name: VM_ROOTDISK_ORPHAN_HOURS
+              value: {{ .Values.vmController.persistentRootdisk.gc.orphanHours | default 72 | quote }}
             - name: HEADSCALE_URL
               value: {{ .Values.headscale.url | quote }}
             - name: HEADSCALE_API_KEY
@@ -62,6 +91,8 @@ spec:
                   key: api-key
             - name: HEADSCALE_USER
               value: {{ .Values.headscale.user | quote }}
+            - name: HEADSCALE_KEY_EXPIRY_MINUTES
+              value: {{ .Values.headscale.keyExpiryMinutes | default 30 | quote }}
             {{- if .Values.ssh.publicKeyVaultPath }}
             # When the public key is synced from Vault, the controller reads
             # it at runtime and substitutes ${SSH_AUTHORIZED_KEY} in the

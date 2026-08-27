@@ -1,0 +1,1091 @@
+"""GET /internal/units/{unit_id}/claim-bundle (stateless_agents.md §5.6, M4).
+
+The pinned executor-facing contract: internal-key transport auth PLUS live
+lease proof ((unit_id, lease_token) must match state='leased' with the exact
+token, one SELECT that also reads the watermarks), then the attach payload
+assembled by the SAME `_assemble_session_attach_payload` the pinned-lane
+sender uses. Error taxonomy: 401 bad internal key; 403 generic on any lease
+mismatch (no enumeration oracle); 404 absent unit row; 409 non-session unit /
+wrong lane / assembly refused.
+"""
+
+import asyncio
+from copy import deepcopy
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from fastapi import HTTPException
+
+UNIT_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+POD_NAME = "stateless-agent-1"
+POD_UID = "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"
+WORKSPACE_GENERATION = "11111111-1111-4111-8111-111111111111"
+WORKSPACE_RUNTIME = "22222222-2222-4222-8222-222222222222"
+WORKSPACE_FINGERPRINT = "SHA256:" + ("A" * 43)
+
+LEASED_ROW = {
+    "unit_kind": "session_turn",
+    "state": "leased",
+    "lease_token": 7,
+    "leased_by": POD_NAME,
+    "input_seq": 41,
+    "consumed_seq": 12,
+    "thread_status": "created",
+    "thread_lane": "stateless",
+    "thread_metadata": {},
+}
+
+
+class _AsyncCM:
+    def __init__(self, value=None):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeDB:
+    def __init__(self, *, run_queue_row, thread, job=None):
+        self._row = run_queue_row
+        self._thread = thread
+        self._job = job
+        self.conn = MagicMock()
+        self.conn.transaction = lambda: _AsyncCM()
+
+        async def _fetchrow(sql, *_args):
+            if "FROM run_queue AS queue LEFT JOIN threads" in sql:
+                return self._row
+            if "SELECT status::text AS status, execution_lane, metadata" in sql:
+                return self._thread
+            if "SELECT state, lease_token, leased_by FROM run_queue" in sql:
+                return self._row
+            raise AssertionError(f"unexpected fetchrow SQL: {sql}")
+
+        self.conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        self.conn.fetchval = AsyncMock(return_value=True)
+        self.datasource_lock_calls = []
+        # Bundle assembly rechecks repository authority the same way it
+        # rechecks the lease: nothing current here, so nothing to invalidate.
+        self.managed_repository_authorities_are_current = AsyncMock(return_value=True)
+
+    def acquire(self):
+        return _AsyncCM(self.conn)
+
+    async def get_thread(self, tid):
+        return self._thread
+
+    async def get_job(self, jid):
+        return self._job
+
+    def thread_datasource_lock(self, tid):
+        self.datasource_lock_calls.append(tid)
+        return _AsyncCM()
+
+
+class MultiJobFakeDB(FakeDB):
+    """Production-shaped parent/child reads for inherited worker bundles."""
+
+    def __init__(self, *, run_queue_row, jobs):
+        super().__init__(run_queue_row=run_queue_row, thread=None, job=None)
+        self.jobs = {str(job["id"]): deepcopy(job) for job in jobs}
+        self.adoption_calls = []
+
+    async def get_job(self, jid):
+        job = self.jobs.get(str(jid))
+        return deepcopy(job) if job is not None else None
+
+    async def adopt_legacy_k8s_job_workspace_runtime(self, job_id, **kwargs):
+        self.adoption_calls.append((str(job_id), deepcopy(kwargs)))
+        current = self.jobs.get(str(job_id))
+        if current is None:
+            return False
+        context = current.get("context") or {}
+        config = current.get("config_override") or {}
+        if not (
+            str(current.get("status") or "") == kwargs["expected_status"]
+            and current.get("execution_lane") == kwargs["expected_execution_lane"]
+            and (
+                str(current["parent_job_id"]) if current.get("parent_job_id") else None
+            )
+            == kwargs["expected_parent_job_id"]
+            and context.get("_workspace_contract") == kwargs["expected_contract"]
+            and context.get("workspace_backend") == kwargs["expected_legacy_backend"]
+            and config.get("workspace") == kwargs["expected_workspace_config"]
+            and context.get("workspace_container") == kwargs["expected_workspace"]
+        ):
+            return False
+        current["context"] = {
+            **context,
+            "workspace_container": deepcopy(kwargs["adopted_workspace"]),
+        }
+        return True
+
+
+def _thread(**over):
+    thread = {
+        "id": UNIT_ID,
+        "user_id": "user-1",
+        "project_id": None,
+        "execution_lane": "stateless",
+        "status": "created",
+        "config_name": "session_base",
+        "metadata": {
+            "config_override": {
+                "llm": {"model": "m"},
+                "workspace": {"backend": "virtual"},
+            }
+        },
+    }
+    thread.update(over)
+    return thread
+
+
+def _patch(monkeypatch, orch_main, db, *, attach="SENTINEL"):
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main, "_thread_project_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        orch_main, "_thread_has_knowledge_scope", AsyncMock(return_value=False)
+    )
+    inject = AsyncMock(side_effect=lambda co, **kw: co)
+    monkeypatch.setattr(orch_main, "_inject_thread_dispatch_credentials", inject)
+    assembly = AsyncMock(
+        return_value=(
+            {
+                "thread_id": UNIT_ID,
+                "config_override": {"llm": {"model": "m"}},
+                "resolved_config": None,
+                "project_ids": [],
+                "datasources": None,
+                "config_name": "session_base",
+            }
+            if attach == "SENTINEL"
+            else attach
+        )
+    )
+    monkeypatch.setattr(orch_main, "_assemble_session_attach_payload", assembly)
+    return inject, assembly
+
+
+def _worker_attestation(orch_main, **overrides):
+    values = {
+        "backing_id": ("k8s-pod:superhuman-remote-worker:" + WORKSPACE_GENERATION),
+        "workspace_generation": WORKSPACE_GENERATION,
+        "runtime_incarnation": WORKSPACE_RUNTIME,
+        "ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+        "host": "10.0.0.9",
+        "pod_ip": "10.0.0.9",
+        "port": 30022,
+    }
+    values.update(overrides)
+    return orch_main.WorkspaceRuntimeAttestation(**values)
+
+
+def _patch_worker_attestation(monkeypatch, orch_main, *attestations):
+    if not attestations:
+        exact = _worker_attestation(orch_main)
+        attestations = (exact, exact)
+    attest = AsyncMock(side_effect=attestations)
+    monkeypatch.setattr(
+        orch_main.container_provisioner,
+        "attest_workspace_runtime",
+        attest,
+    )
+    return attest
+
+
+def _worker_job_context(container, **extra):
+    return {
+        "_workspace_contract": {
+            "version": 1,
+            "requested_backend": "sandbox",
+            "assigned_backend": "sandbox",
+            "assignment_source": "test",
+        },
+        "workspace_container": {
+            **container,
+            "_runtime_incarnation": WORKSPACE_RUNTIME,
+        },
+        **extra,
+    }
+
+
+def _adopted_worker_container(orch_main, **overrides):
+    attestation = _worker_attestation(orch_main, **overrides)
+    return {
+        "status": "ready",
+        "provisioner": "k8s",
+        "host": attestation.host,
+        "pod_ip": attestation.pod_ip,
+        "port": attestation.port,
+        "_runtime_incarnation": attestation.runtime_incarnation,
+        "_legacy_k8s_runtime_adoption": {
+            "version": 1,
+            "runtime_incarnation": attestation.runtime_incarnation,
+            "workspace_generation": attestation.workspace_generation,
+            "ssh_host_key_fingerprint": (attestation.ssh_host_key_fingerprint),
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_happy_path_returns_watermarks_and_shared_assembly(monkeypatch):
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    inject, assembly = _patch(monkeypatch, orch_main, db)
+
+    out = await orch_main.internal_unit_claim_bundle(
+        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    )
+
+    # One SELECT validated the lease AND carried the watermarks.
+    assert db.conn.fetchrow.await_count == 3
+    assert "run_queue" in db.conn.fetchrow.await_args_list[0].args[0]
+    assert out["unit_id"] == UNIT_ID
+    assert out["thread_id"] == UNIT_ID
+    assert out["unit_kind"] == "session_turn"
+    assert out["execution_lane"] == "stateless"
+    assert out["watermarks"] == {"input_seq": 41, "consumed_seq": 12}
+    # attach came from the ONE shared assembly, called under the datasource
+    # lock with the credential-injected override + canonical config name.
+    assembly.assert_awaited_once()
+    assert assembly.await_args.args == (UNIT_ID,)
+    assert assembly.await_args.kwargs["config_name"]  # canonicalized, non-empty
+    inject.assert_awaited_once()
+    assert db.datasource_lock_calls == [UNIT_ID]
+    assert out["attach"]["thread_id"] == UNIT_ID
+    assert set(out["attach"]) == {
+        "thread_id",
+        "config_override",
+        "resolved_config",
+        "project_ids",
+        "datasources",
+        "config_name",
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_bundle_stolen_during_slow_assembly_is_rejected(monkeypatch):
+    """No attach credentials cross the response boundary after a token steal."""
+
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _, assembly = _patch(monkeypatch, orch_main, db)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_assembly(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return {"thread_id": UNIT_ID, "datasources": {"secret": "in-flight"}}
+
+    assembly.side_effect = _slow_assembly
+    request_task = asyncio.create_task(
+        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID)
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    # The reaper/successor owns a newer token by the time assembly returns.
+    db.conn.fetchval.return_value = False
+    release.set()
+
+    with pytest.raises(HTTPException) as exc:
+        await request_task
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Lease validation failed"
+    assert db.conn.fetchval.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_protected_cloud_flip_during_assembly_blocks_final_credentials(
+    monkeypatch,
+):
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _, assembly = _patch(monkeypatch, orch_main, db)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_assembly(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return {"thread_id": UNIT_ID, "datasources": {"secret": "in-flight"}}
+
+    assembly.side_effect = _slow_assembly
+    request_task = asyncio.create_task(
+        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID)
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    db._thread["metadata"] = {
+        **db._thread["metadata"],
+        "protected_cloud": True,
+    }
+    release.set()
+
+    with pytest.raises(HTTPException) as exc:
+        await request_task
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Lease validation failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["enabled", "conference"])
+@pytest.mark.parametrize("value", [None, 0, "", [], {}, "yes", 1, True])
+async def test_malformed_or_pinned_session_class_refuses_claim_credentials(
+    monkeypatch,
+    field,
+    value,
+):
+    from orchestrator import main as orch_main
+
+    thread = _thread()
+    thread["metadata"]["config_override"]["officer"] = {field: value}
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=thread)
+    _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc.value.status_code in {403, 409}
+    db.conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_class_flip_during_assembly_blocks_final_credentials(
+    monkeypatch,
+):
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _, assembly = _patch(monkeypatch, orch_main, db)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_assembly(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return {"thread_id": UNIT_ID, "datasources": {"secret": "in-flight"}}
+
+    assembly.side_effect = _slow_assembly
+    request_task = asyncio.create_task(
+        orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID)
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    db._thread["metadata"]["config_override"]["officer"] = {"enabled": "yes"}
+    release.set()
+
+    with pytest.raises(HTTPException) as exc:
+        await request_task
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Lease validation failed"
+
+
+@pytest.mark.asyncio
+async def test_token_mismatch_and_not_leased_are_one_generic_403(monkeypatch):
+    from orchestrator import main as orch_main
+
+    # Wrong token on a live lease.
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _patch(monkeypatch, orch_main, db)
+    with pytest.raises(HTTPException) as exc_token:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 6, POD_NAME, POD_UID
+        )
+    assert exc_token.value.status_code == 403
+
+    # Right token but the row is no longer leased (stolen/completed).
+    row = dict(LEASED_ROW, state="queued")
+    db2 = FakeDB(run_queue_row=row, thread=_thread())
+    _patch(monkeypatch, orch_main, db2)
+    with pytest.raises(HTTPException) as exc_state:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc_state.value.status_code == 403
+
+    # Single generic detail: the two cases must be indistinguishable.
+    assert exc_token.value.detail == exc_state.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker_key",
+    [
+        "_stateless_workspace_retirement_pending",
+        "_stateless_claim_retirement",
+        "_stateless_claim_loss_hold",
+        "_stateless_claim_losses",
+    ],
+)
+@pytest.mark.parametrize("value", [None, False, 0, "", [], {}])
+async def test_present_falsey_stop_marker_refuses_credentials(
+    monkeypatch, marker_key, value
+):
+    from orchestrator import main as orch_main
+
+    row = dict(
+        LEASED_ROW,
+        thread_metadata={marker_key: value},
+    )
+    db = FakeDB(run_queue_row=row, thread=_thread())
+    _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_absent_unit_row_404(monkeypatch):
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=None, thread=_thread())
+    _patch(monkeypatch, orch_main, db)
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc.value.status_code == 404
+
+    # Malformed unit id short-circuits to the same 404 (no DataError 500).
+    with pytest.raises(HTTPException) as exc2:
+        await orch_main.internal_unit_claim_bundle(
+            "not-a-uuid", MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc2.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_wrong_lane_and_non_session_kind_409(monkeypatch):
+    from orchestrator import main as orch_main
+
+    # Pinned-lane thread behind a leased session unit.
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread(execution_lane="pinned"))
+    _patch(monkeypatch, orch_main, db)
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc.value.status_code == 409
+
+    # Vanished thread → same 409 family.
+    db2 = FakeDB(run_queue_row=dict(LEASED_ROW), thread=None)
+    _patch(monkeypatch, orch_main, db2)
+    with pytest.raises(HTTPException) as exc2:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc2.value.status_code == 409
+
+    # Non-session unit kinds carry no attach bundle.
+    row = dict(LEASED_ROW, unit_kind="bg_task")
+    db3 = FakeDB(run_queue_row=row, thread=_thread())
+    _patch(monkeypatch, orch_main, db3)
+    with pytest.raises(HTTPException) as exc3:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc3.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeypatch):
+    from orchestrator import main as orch_main
+
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.8",
+            },
+            worker_batch_target_wall_seconds=360,
+            worker_batch_iteration_cap=9,
+        ),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    built = orch_main.JobStartRequest(job_id=UNIT_ID, description="work")
+    builder = AsyncMock(return_value=built)
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    inherit = AsyncMock(return_value=("proceed", None))
+    monkeypatch.setattr(orch_main, "_resolve_subjob_inherited_workspace", inherit)
+    attest = _patch_worker_attestation(monkeypatch, orch_main)
+
+    out = await orch_main.internal_unit_claim_bundle(
+        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    )
+
+    inherit.assert_awaited_once_with(job)
+    builder.assert_awaited_once()
+    attested_job = builder.await_args.args[0]
+    assert attested_job is not job
+    assert attested_job["context"]["workspace_container"] == {
+        "status": "ready",
+        "provisioner": "k8s",
+        "pod_ip": "10.0.0.9",
+        "host": "10.0.0.9",
+        "port": 30022,
+        "_runtime_incarnation": WORKSPACE_RUNTIME,
+    }
+    assert attested_job["config_override"]["workspace"]["remote"]["host"] == (
+        "10.0.0.9"
+    )
+    assert builder.await_args.kwargs == {"persist_dispatch_state": False}
+    assert attest.await_count == 2
+    assert attest.await_args_list[0].args[0] == orch_main.WorkspaceOwner.job(UNIT_ID)
+    db.conn.fetchval.assert_awaited_once()
+    assert "state = 'leased'" in db.conn.fetchval.await_args.args[0]
+    assert out == {
+        "unit_id": UNIT_ID,
+        "job_id": UNIT_ID,
+        "unit_kind": "worker_batch",
+        "execution_lane": "stateless",
+        "job": {
+            "job_id": UNIT_ID,
+            "description": "work",
+            "config_name": "worker_base",
+            "workspace_generation": WORKSPACE_GENERATION,
+            "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
+            "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+            "workspace_owner_kind": "job",
+            "workspace_owner_id": UNIT_ID,
+        },
+        "batch": {
+            "target_wall_seconds": 360.0,
+            "iteration_cap": 9,
+            "min_wall_seconds": 300.0,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_bundle_stolen_during_assembly_is_rejected(monkeypatch):
+    from orchestrator import main as orch_main
+
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "host": "workspace.example",
+            }
+        ),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    db.conn.fetchval.return_value = False
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(
+        orch_main,
+        "_build_job_start_request",
+        AsyncMock(
+            return_value=orch_main.JobStartRequest(
+                job_id=UNIT_ID, description="secret-bearing"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    _patch_worker_attestation(monkeypatch, orch_main)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Lease validation failed"
+
+
+@pytest.mark.asyncio
+async def test_worker_bundle_rejects_rotated_repository_authority(monkeypatch):
+    """A repository authority rotated during assembly invalidates the bundle.
+
+    The lease can still be exactly ours while the credentials the builder
+    already baked into the bundle have been revoked underneath it, so this
+    recheck is independent of the lease recheck above.
+    """
+    from orchestrator import main as orch_main
+
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.8",
+            }
+        ),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    db.managed_repository_authorities_are_current.return_value = False
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    credentials = [
+        {
+            "authority_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 3,
+            "repo_name": "job-stateless",
+            "access_mode": "write",
+            "private_key": "hidden-runtime-bearer",
+        }
+    ]
+    monkeypatch.setattr(
+        orch_main,
+        "_build_job_start_request",
+        AsyncMock(
+            return_value=orch_main.JobStartRequest(
+                job_id=UNIT_ID,
+                description="secret-bearing",
+                managed_repository_credentials=credentials,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    _patch_worker_attestation(monkeypatch, orch_main)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Job repository authority changed during bundle assembly"
+    # The lease was still exactly ours; only the authority moved.
+    db.conn.fetchval.assert_awaited_once()
+    db.managed_repository_authorities_are_current.assert_awaited_once_with(credentials)
+
+
+@pytest.mark.asyncio
+async def test_worker_bundle_rejects_workspace_drift_after_slow_assembly(monkeypatch):
+    from orchestrator import main as orch_main
+
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.8",
+            }
+        ),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(
+        orch_main,
+        "_build_job_start_request",
+        AsyncMock(
+            return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="x")
+        ),
+    )
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    initial = _worker_attestation(orch_main)
+    changed = _worker_attestation(
+        orch_main,
+        runtime_incarnation="33333333-3333-4333-8333-333333333333",
+    )
+    _patch_worker_attestation(monkeypatch, orch_main, initial, changed)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Stateless worker workspace authority unavailable"
+    db.conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inherited_worker_attests_parent_but_keeps_child_tmux_owner(monkeypatch):
+    from orchestrator import main as orch_main
+
+    parent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "parent_job_id": parent_id,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "host": "stale.example",
+            },
+            inherits_parent_workspace=True,
+        ),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    builder = AsyncMock(
+        return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="child")
+    )
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    attest = _patch_worker_attestation(monkeypatch, orch_main)
+
+    out = await orch_main.internal_unit_claim_bundle(
+        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    )
+
+    assert attest.await_count == 2
+    assert all(
+        call.args[0] == orch_main.WorkspaceOwner.job(parent_id)
+        for call in attest.await_args_list
+    )
+    assert builder.await_args.args[0]["context"]["workspace_container"]["host"] == (
+        "10.0.0.9"
+    )
+    assert out["job"]["job_id"] == UNIT_ID
+    assert out["job"]["workspace_owner_kind"] == "job"
+    assert out["job"]["workspace_owner_id"] == parent_id
+
+
+@pytest.mark.asyncio
+async def test_pre_0175_inherited_worker_final_reread_converges_parent(monkeypatch):
+    from orchestrator import main as orch_main
+
+    parent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    parent = {
+        "id": parent_id,
+        "status": "waiting",
+        "execution_lane": "pinned",
+        "config_override": {"workspace": {"backend": "container"}},
+        # Exact previous-release parent runtime: neither contract nor UID.
+        "context": {
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "host": "10.0.0.7",
+                "pod_ip": "10.0.0.7",
+                "port": 30022,
+            }
+        },
+    }
+    child = {
+        "id": UNIT_ID,
+        "parent_job_id": parent_id,
+        "status": "created",
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "container"}},
+        # Exact pre-0175 child shape: the inherited snapshot has no contract,
+        # adoption marker or Pod UID. Only the live parent may supply them.
+        "context": {
+            "inherits_parent_workspace": True,
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.7",
+                "port": 30022,
+            },
+        },
+    }
+    db = MultiJobFakeDB(run_queue_row=row, jobs=[parent, child])
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    builder = AsyncMock(
+        return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="child")
+    )
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    exact = _worker_attestation(orch_main)
+    attest = _patch_worker_attestation(
+        monkeypatch, orch_main, exact, exact, exact, exact, exact, exact, exact
+    )
+
+    out = await orch_main.internal_unit_claim_bundle(
+        UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+    )
+
+    builder.assert_awaited_once()
+    db.conn.fetchval.assert_awaited_once()
+    assert out["job"]["workspace_owner_id"] == parent_id
+    assert out["job"]["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME
+    assert attest.await_count == 7
+    assert all(
+        call.args[0] == orch_main.WorkspaceOwner.job(parent_id)
+        for call in attest.await_args_list
+    )
+    # The historical child row remains a snapshot; both the initial and final
+    # contract checks obtained current authority from the parent overlay.
+    stored_child = await db.get_job(UNIT_ID)
+    assert "_runtime_incarnation" not in stored_child["context"]["workspace_container"]
+    stored_parent = await db.get_job(parent_id)
+    assert (
+        stored_parent["context"]["workspace_container"]["_runtime_incarnation"]
+        == WORKSPACE_RUNTIME
+    )
+    assert len(db.adoption_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["replacement", "tier"], ids=["pod", "tier"])
+async def test_inherited_worker_rejects_parent_change_after_assembly(
+    monkeypatch, change
+):
+    from orchestrator import main as orch_main
+
+    parent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    parent = {
+        "id": parent_id,
+        "status": "waiting",
+        "execution_lane": "pinned",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(_adopted_worker_container(orch_main)),
+    }
+    child = {
+        "id": UNIT_ID,
+        "parent_job_id": parent_id,
+        "status": "created",
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": {
+            "inherits_parent_workspace": True,
+            "workspace_container": {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.7",
+                "port": 30022,
+            },
+        },
+    }
+    db = MultiJobFakeDB(run_queue_row=row, jobs=[parent, child])
+    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    builder = AsyncMock(
+        return_value=orch_main.JobStartRequest(job_id=UNIT_ID, description="child")
+    )
+    monkeypatch.setattr(orch_main, "_build_job_start_request", builder)
+    predecessor = _worker_attestation(orch_main)
+    replacement = _worker_attestation(
+        orch_main,
+        runtime_incarnation="33333333-3333-4333-8333-333333333333",
+        workspace_generation="44444444-4444-4444-8444-444444444444",
+        host="10.0.0.10",
+        pod_ip="10.0.0.10",
+    )
+    calls = 0
+
+    async def attest(owner):
+        nonlocal calls
+        assert owner == orch_main.WorkspaceOwner.job(parent_id)
+        calls += 1
+        if calls == 4:
+            if change == "replacement":
+                db.jobs[parent_id]["context"]["workspace_container"] = (
+                    _adopted_worker_container(
+                        orch_main,
+                        runtime_incarnation=replacement.runtime_incarnation,
+                        workspace_generation=replacement.workspace_generation,
+                        host=replacement.host,
+                        pod_ip=replacement.pod_ip,
+                    )
+                )
+            else:
+                db.jobs[parent_id]["config_override"] = {"workspace": {"backend": "vm"}}
+                db.jobs[parent_id]["context"] = {
+                    "_workspace_contract": {
+                        "version": 1,
+                        "requested_backend": "vm",
+                        "assigned_backend": "vm",
+                        "assignment_source": "operator",
+                    },
+                    "vm": {
+                        "status": "ready",
+                        "ssh_host": "vm.internal",
+                        "ssh_port": 22,
+                        "provision_generation": (
+                            "55555555-5555-4555-8555-555555555555"
+                        ),
+                    },
+                }
+            # The replacement/tier transition begins just after the final live
+            # attestation used by assembly, forcing the database reread fence.
+            return predecessor
+        return replacement if change == "replacement" and calls >= 5 else predecessor
+
+    monkeypatch.setattr(
+        orch_main.container_provisioner,
+        "attest_workspace_runtime",
+        AsyncMock(side_effect=attest),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Job workspace contract changed during bundle assembly"
+    builder.assert_awaited_once()
+    db.conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stateless_bundle_refusal_never_mutates_job_status(monkeypatch):
+    from orchestrator import main as orch_main
+
+    db = MagicMock()
+    db.update_job_status = AsyncMock()
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_authorized_job_datasources",
+        AsyncMock(side_effect=HTTPException(status_code=409, detail="revoked")),
+    )
+
+    built = await orch_main._build_job_start_request(
+        {
+            "id": UNIT_ID,
+            "description": "work",
+            "context": {},
+            "config_override": {"workspace": {"backend": "sandbox"}},
+        },
+        persist_dispatch_state=False,
+    )
+
+    assert built is None
+    db.update_job_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["sandbox", "vm", "future-tier", None])
+async def test_non_lite_workspace_refused_before_attach_assembly(monkeypatch, backend):
+    from orchestrator import main as orch_main
+
+    metadata = (
+        {"config_override": {"workspace": {"backend": backend}}}
+        if backend is not None
+        else {}
+    )
+    db = FakeDB(
+        run_queue_row=dict(LEASED_ROW),
+        thread=_thread(metadata=metadata),
+    )
+    inject, assembly = _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert "virtual/none" in str(exc.value.detail)
+    inject.assert_not_awaited()
+    assembly.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "physical_evidence",
+    [
+        {"workspace_container": {"status": "ready", "pod_ip": "10.0.0.8"}},
+        {"vm": {"status": "provisioning", "provision_generation": "g1"}},
+    ],
+    ids=["sandbox-upgrade", "vm-upgrade"],
+)
+async def test_upgraded_lite_claim_refused_before_credentials_or_assembly(
+    monkeypatch, physical_evidence
+):
+    from orchestrator import main as orch_main
+
+    metadata = {
+        "config_override": {"workspace": {"backend": "virtual"}},
+        **physical_evidence,
+    }
+    db = FakeDB(
+        run_queue_row=dict(LEASED_ROW),
+        thread=_thread(metadata=metadata),
+    )
+    inject, assembly = _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+
+    assert exc.value.status_code == 409
+    assert "virtual/none" in str(exc.value.detail)
+    inject.assert_not_awaited()
+    assembly.assert_not_awaited()
+    assert db.datasource_lock_calls == []
+
+
+@pytest.mark.asyncio
+async def test_assembly_refusal_is_generic_409(monkeypatch):
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _patch(monkeypatch, orch_main, db, attach=None)
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, MagicMock(), 7, POD_NAME, POD_UID
+        )
+    assert exc.value.status_code == 409
+    # Generic reason — must not leak which fail-closed rule refused.
+    assert "grant" not in str(exc.value.detail).lower()
+    assert "datasource" not in str(exc.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_internal_auth_failure_is_401_before_any_lookup(monkeypatch):
+    """With the REAL require_internal and no/wrong X-Internal-Key the endpoint
+    401s before touching the queue or the thread."""
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+
+    request = MagicMock()
+    request.headers = {"X-Internal-Key": ""}
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(
+            UNIT_ID, request, 7, POD_NAME, POD_UID
+        )
+    assert exc.value.status_code == 401
+    db.conn.fetchrow.assert_not_awaited()

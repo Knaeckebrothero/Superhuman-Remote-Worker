@@ -24,10 +24,12 @@ from pydantic import SecretStr
 from orchestrator.services.cloud import (
     CloudBackendError,
     CloudBackendErrorKind,
+    CloudMountSubject,
     GroupId,
     OpenCloudBackend,
     OpenCloudSettings,
     ProjectFolderHandle,
+    SessionFolderHandle,
     ShareHandle,
     UserId,
 )
@@ -326,6 +328,22 @@ def _install_fake(backend: OpenCloudBackend, fake: FakeOpenCloud) -> None:
     }
 
 
+class TestRoleId:
+    @pytest.mark.asyncio
+    async def test_resolves_on_cold_cache_refresh_path(self):
+        # Regression: on a cache miss the refresh path indexed the tuple-keyed
+        # _role_cache with a bare display_name string, raising KeyError. Force
+        # the cold path by clearing the pre-warmed cache.
+        backend = OpenCloudBackend(_settings())
+        fake = FakeOpenCloud()
+        _install_fake(backend, fake)
+        backend._role_cache = {}  # force the _load_role_catalog refresh
+
+        role_id = await backend._role_id("Can view", 40)
+
+        assert role_id == "bb22-viewer-role-id"
+
+
 # ----------------------------------------------------------------- Settings tests
 
 
@@ -371,19 +389,65 @@ class TestUrlConstructors:
         # Both '!' and '$' must be percent-encoded (opencloud-eu/web#1795).
         assert "%21" in url
         assert "%24" in url
-        assert "files/spaces/" in url
+        # `/f/<fileId>` is OpenCloud's private-link resolver — routes to the
+        # exact Space for any member. The old `/files/spaces/<drive_id>`
+        # fallback silently resolved to the viewer's *personal* Space.
+        assert f"{OPENCLOUD_BASE}/f/" in url
 
-    def test_project_folder_webdav_url_prefers_persisted(self):
+    def test_project_folder_browser_url_ignores_stale_persisted_domain(self):
+        # Regression: OpenCloud was rebranded (cloud.superhuman-remote-worker.com
+        # -> cloud.srw.works). The webUrl OpenCloud returns at Space creation
+        # bakes in whatever OC_URL was canonical then, and we persisted it in
+        # vendor_meta.web_url. Returning that snapshot verbatim sends the
+        # "Open folder" button to a now-foreign instance. The link must be
+        # derived from the LIVE public_url instead.
+        be = OpenCloudBackend(_settings())  # public_url == OPENCLOUD_BASE
+        handle = ProjectFolderHandle(
+            backend="opencloud",
+            native_id="a03eeabc$f3f282fc",
+            vendor_meta={
+                "web_url": "https://cloud.old-domain.example/f/a03eeabc$f3f282fc",
+                "webdav_url": (
+                    "https://cloud.old-domain.example/dav/spaces/a03eeabc$f3f282fc"
+                ),
+            },
+        )
+        url = be.get_project_folder_browser_url(handle)
+        assert url == f"{OPENCLOUD_BASE}/f/a03eeabc%24f3f282fc"
+        assert "old-domain" not in url
+
+    def test_project_folder_browser_url_legacy_no_native_id_uses_persisted(self):
+        # Handles without a native_id can't be reconstructed; fall back to the
+        # persisted absolute link (best effort).
         be = OpenCloudBackend(_settings())
         handle = ProjectFolderHandle(
             backend="opencloud",
-            native_id="d1",
-            vendor_meta={"webdav_url": "https://override.example/dav/x/"},
+            native_id="",
+            vendor_meta={"web_url": "https://cloud.example.com/f/legacy"},
         )
         assert (
-            be.get_project_folder_webdav_url(handle)
-            == "https://override.example/dav/x/"
+            be.get_project_folder_browser_url(handle)
+            == "https://cloud.example.com/f/legacy"
         )
+
+    def test_project_folder_webdav_url_ignores_stale_persisted_domain(self):
+        # Same rebrand hazard as the browser link: the persisted webdav_url is
+        # the PUBLIC graph-response URL frozen on the old domain. Reconstruct
+        # from the live internal base + drive id, mirroring
+        # build_rclone_mount_spec (which already does this for real mounts).
+        be = OpenCloudBackend(_settings())  # base_url == OPENCLOUD_BASE
+        handle = ProjectFolderHandle(
+            backend="opencloud",
+            native_id="a03eeabc$f3f282fc",
+            vendor_meta={
+                "webdav_url": (
+                    "https://cloud.old-domain.example/dav/spaces/a03eeabc$f3f282fc"
+                )
+            },
+        )
+        url = be.get_project_folder_webdav_url(handle)
+        assert url == f"{OPENCLOUD_BASE}/dav/spaces/a03eeabc%24f3f282fc/"
+        assert "old-domain" not in url
 
     def test_project_folder_webdav_url_falls_back_to_reconstructed(self):
         be = OpenCloudBackend(_settings())
@@ -400,6 +464,207 @@ class TestUrlConstructors:
     def test_webdav_credentials_empty(self):
         be = OpenCloudBackend(_settings())
         assert be.webdav_credentials == {}
+
+
+# ----------------------------------------------------------- rclone mount spec
+
+
+class TestRcloneMountSpec:
+    @pytest.mark.asyncio
+    async def test_session_folder_spec_uses_bearer_command_auth(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = SessionFolderHandle(
+            backend="opencloud",
+            native_id="sessions/thread-1",
+            vendor_meta={"drive_id": "drive-agent-home"},
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="session_folder",
+            target_path="/cloud/home",
+            access="read_write",
+        )
+        assert spec.source_type == "webdav"
+        assert (
+            spec.source_config["url"]
+            == f"{OPENCLOUD_BASE}/dav/spaces/drive-agent-home/sessions/thread-1/"
+        )
+        assert spec.source_config["vendor"] == "infinitescale"
+        # Bearer flow: no static credential in the rclone source config.
+        assert "pass" not in spec.source_config
+        assert spec.auth["type"] == "keycloak_client_credentials"
+        assert spec.auth["issuer"] == KEYCLOAK_BASE
+        assert spec.auth["client_id"] == "opencloud-orchestrator"
+        assert spec.auth["client_secret"] == "test-secret"
+        assert "token_helper" in spec.required_capabilities
+        assert spec.min_rclone_version == "1.70.0"
+        # TLS verification stays on unless explicitly opted out.
+        assert spec.provider_flags == []
+
+    @pytest.mark.asyncio
+    async def test_mount_insecure_tls_adds_no_check_certificate(self):
+        # Local-dev knob (OPENCLOUD_MOUNT_INSECURE_TLS): the tus data-gateway
+        # hop presents the mkcert edge cert on local k3d.
+        settings = _settings().model_copy(update={"mount_insecure_tls": True})
+        be = OpenCloudBackend(settings)
+        _install_fake(be, FakeOpenCloud())
+        handle = SessionFolderHandle(
+            backend="opencloud",
+            native_id="sessions/thread-1",
+            vendor_meta={"drive_id": "drive-agent-home"},
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="session_folder",
+            target_path="/cloud/home",
+            access="read_write",
+        )
+        assert spec.provider_flags == ["--no-check-certificate"]
+        # The flag must survive into the agent payload.
+        assert spec.to_payload()["provider_flags"] == ["--no-check-certificate"]
+
+    @pytest.mark.asyncio
+    async def test_project_folder_spec_reconstructs_space_url(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = ProjectFolderHandle(
+            backend="opencloud", native_id="drive-42", vendor_meta={}
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="project",
+            target_path="/cloud/proj",
+            access="read_write",
+        )
+        assert spec.source_config["url"] == f"{OPENCLOUD_BASE}/dav/spaces/drive-42/"
+        assert spec.auth["type"] == "keycloak_client_credentials"
+
+    @pytest.mark.asyncio
+    async def test_prefer_public_url_swaps_internal_to_public(self):
+        # A cross-cluster VM mount must target the public edge; the internal
+        # service URL isn't reachable from the vm cluster
+        # (knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md). Same-cluster
+        # pods (default, prefer_public_url=False) keep the internal URL.
+        settings = _settings().model_copy(
+            update={
+                "base_url": "http://srw-opencloud:9200",
+                "public_url": "https://cloud.example.com",
+            }
+        )
+        be = OpenCloudBackend(settings)
+        _install_fake(be, FakeOpenCloud())
+        handle = ProjectFolderHandle(
+            backend="opencloud", native_id="drive-42", vendor_meta={}
+        )
+        internal = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="project",
+            target_path="/cloud/proj",
+            access="read_write",
+        )
+        assert (
+            internal.source_config["url"]
+            == "http://srw-opencloud:9200/dav/spaces/drive-42/"
+        )
+        public = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="project",
+            target_path="/cloud/proj",
+            access="read_only",
+            prefer_public_url=True,
+        )
+        assert (
+            public.source_config["url"]
+            == "https://cloud.example.com/dav/spaces/drive-42/"
+        )
+
+    @pytest.mark.asyncio
+    async def test_user_home_with_sub_uses_impersonation_auth(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = ProjectFolderHandle(
+            backend="opencloud",
+            native_id="personal-drive-1",
+            vendor_meta={
+                "kind": "user_home",
+                "username": "user-1",
+                # Graph responses persist the PUBLIC URL — the spec builder
+                # must ignore it and reconstruct from the internal base.
+                "webdav_url": "https://cloud.public.example/dav/spaces/personal-drive-1",
+            },
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="project_default",
+            target_path="/cloud/home",
+            access="read_write",
+            subject=CloudMountSubject(user_sub="kc-sub-1234", username="user-1"),
+        )
+        # Internal base URL reconstruction — NOT the persisted vendor_meta
+        # webdav_url, which is the public URL from the graph response.
+        assert (
+            spec.source_config["url"]
+            == f"{OPENCLOUD_BASE}/dav/spaces/personal-drive-1/"
+        )
+        assert spec.auth["type"] == "keycloak_user_impersonation"
+        assert spec.auth["target_user_sub"] == "kc-sub-1234"
+        assert spec.auth["client_secret"] == "test-secret"
+        assert "token_helper" in spec.required_capabilities
+
+    @pytest.mark.asyncio
+    async def test_user_home_without_sub_raises_not_supported(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = ProjectFolderHandle(
+            backend="opencloud",
+            native_id="personal-drive-1",
+            vendor_meta={"kind": "user_home", "username": "user-1"},
+        )
+        with pytest.raises(CloudBackendError) as exc_info:
+            await be.build_rclone_mount_spec(
+                handle=handle,
+                mount_kind="project_default",
+                target_path="/cloud/home",
+                access="read_write",
+                subject=CloudMountSubject(username="user-1"),
+            )
+        assert exc_info.value.kind == CloudBackendErrorKind.NOT_SUPPORTED
+
+    @pytest.mark.asyncio
+    async def test_uninitialized_backend_raises_unavailable(self):
+        be = OpenCloudBackend(_settings())
+        handle = SessionFolderHandle(
+            backend="opencloud", native_id="sessions/t", vendor_meta={}
+        )
+        with pytest.raises(CloudBackendError) as exc_info:
+            await be.build_rclone_mount_spec(
+                handle=handle,
+                mount_kind="session_folder",
+                target_path="/cloud/home",
+                access="read_write",
+            )
+        assert exc_info.value.kind == CloudBackendErrorKind.UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_payload_carries_min_rclone_version(self):
+        be = OpenCloudBackend(_settings())
+        _install_fake(be, FakeOpenCloud())
+        handle = SessionFolderHandle(
+            backend="opencloud",
+            native_id="sessions/thread-1",
+            vendor_meta={"drive_id": "drive-agent-home"},
+        )
+        spec = await be.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="session_folder",
+            target_path="/cloud/home",
+            access="read_write",
+        )
+        payload = spec.to_payload()
+        assert payload["min_rclone_version"] == "1.70.0"
+        assert payload["source"]["config"]["vendor"] == "infinitescale"
+        assert payload["auth"]["type"] == "keycloak_client_credentials"
 
 
 # -------------------------------------------------------- Token + graph flows

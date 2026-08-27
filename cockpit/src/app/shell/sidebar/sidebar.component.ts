@@ -5,22 +5,20 @@ import {filter, map} from 'rxjs';
 import {UserService} from '../../core/services/user.service';
 import {SidebarService} from '../../core/services/sidebar.service';
 import {ViewportService} from '../../core/services/viewport.service';
-import {LayoutService} from '../../debug/services/layout.service';
-import {LayoutPickerComponent} from '../../debug/components/layout-picker/layout-picker.component';
+import {LayoutService} from '../../workbench/services/layout.service';
+import {LayoutPickerComponent} from '../../workbench/components/layout-picker/layout-picker.component';
 import {NotificationBellComponent} from '../notification-bell/notification-bell.component';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {environment} from '../../core/environment';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {LegionMarkComponent} from '../../ui/legion-mark';
-import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.component';
-
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, ViewModeToggleComponent],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent],
   template: `
-    <nav class="sidebar">
+    <nav class="sidebar" (click)="onSidebarClick($event)">
       <div class="sidebar-header">
         <div class="sidebar-brand">
           <srw-legion-mark [size]="22" />
@@ -38,15 +36,6 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         <div class="sidebar-nav">
           <a
             class="nav-link"
-            routerLink="/"
-            routerLinkActive="active"
-            [routerLinkActiveOptions]="{ exact: true }"
-          >
-            <app-icon size="md" class="nav-icon">construction</app-icon>
-            {{ 'nav.builder' | transloco }}
-          </a>
-          <a
-            class="nav-link"
             [routerLink]="sessionsLink()"
             routerLinkActive="active"
           >
@@ -60,14 +49,6 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
           >
             <app-icon size="md" class="nav-icon">work</app-icon>
             {{ 'nav.jobs' | transloco }}
-          </a>
-          <a
-            class="nav-link"
-            routerLink="/review"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">rate_review</app-icon>
-            {{ 'nav.review' | transloco }}
           </a>
           <a
             class="nav-link"
@@ -87,38 +68,54 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
           </a>
           <a
             class="nav-link"
+            routerLink="/contacts"
+            routerLinkActive="active"
+          >
+            <app-icon size="md" class="nav-icon">group</app-icon>
+            {{ 'nav.contacts' | transloco }}
+          </a>
+          <a
+            class="nav-link"
+            routerLink="/experts"
+            routerLinkActive="active"
+          >
+            <app-icon size="md" class="nav-icon">psychology</app-icon>
+            {{ 'nav.experts' | transloco }}
+          </a>
+          <a
+            class="nav-link"
+            routerLink="/skills"
+            routerLinkActive="active"
+          >
+            <app-icon size="md" class="nav-icon">extension</app-icon>
+            {{ 'nav.skills' | transloco }}
+          </a>
+          <a
+            class="nav-link"
             routerLink="/automations"
             routerLinkActive="active"
           >
             <app-icon size="md" class="nav-icon">schedule</app-icon>
             {{ 'nav.automations' | transloco }}
           </a>
-          <a
-            class="nav-link"
-            routerLink="/create"
-            routerLinkActive="active"
-          >
-            <app-icon size="md" class="nav-icon">add_circle</app-icon>
-            {{ 'nav.create' | transloco }}
-          </a>
           @if (!viewport.isMobile()) {
             <a
               class="nav-link"
-              routerLink="/debug"
+              routerLink="/workbench"
               routerLinkActive="active"
             >
-              <app-icon size="md" class="nav-icon">bug_report</app-icon>
-              {{ 'nav.debug' | transloco }}
+              <app-icon size="md" class="nav-icon">view_quilt</app-icon>
+              {{ 'nav.workbench' | transloco }}
             </a>
           }
           @if (userService.currentUser()?.is_admin) {
             <a
               class="nav-link"
-              routerLink="/admin/llm"
+              routerLink="/admin/models"
               routerLinkActive="active"
             >
               <app-icon size="md" class="nav-icon">smart_toy</app-icon>
-              Admin · LLM
+              Admin · Models
             </a>
             <a
               class="nav-link"
@@ -136,10 +133,26 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
               <app-icon size="md" class="nav-icon">edit_note</app-icon>
               Admin · Config
             </a>
+            <a
+              class="nav-link"
+              routerLink="/admin/grants"
+              routerLinkActive="active"
+            >
+              <app-icon size="md" class="nav-icon">verified_user</app-icon>
+              Admin · Grants
+            </a>
+            <a
+              class="nav-link"
+              routerLink="/admin/usage"
+              routerLinkActive="active"
+            >
+              <app-icon size="md" class="nav-icon">monitoring</app-icon>
+              Admin · Usage
+            </a>
           }
         </div>
 
-        @if (isDebugRoute()) {
+        @if (isWorkbenchRoute()) {
           <div class="section">
             <div class="section-title">Databases</div>
             <a class="section-link" [href]="neo4jUrl" target="_blank" rel="noopener">
@@ -147,9 +160,6 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
             </a>
             <a class="section-link" [href]="pgadminUrl" target="_blank" rel="noopener">
               <span class="link-icon">&#x1F418;</span>PostgreSQL
-            </a>
-            <a class="section-link" [href]="mongoExpressUrl" target="_blank" rel="noopener">
-              <span class="link-icon">&#x1F343;</span>MongoDB
             </a>
           </div>
 
@@ -200,8 +210,6 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
               [style.background]="user.avatar_color"
             >{{ getInitials(user.display_name) }}</span>
             <span class="user-name">{{ user.display_name }}</span>
-            <app-view-mode-toggle />
-
           </div>
           <div class="footer-actions">
             <app-notification-bell />
@@ -233,8 +241,8 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         flex-direction: column;
         width: 200px;
         height: 100%;
-        background: var(--panel-bg, #181825);
-        border-right: 1px solid var(--border-color, #313244);
+        background: var(--panel-bg);
+        border-right: 1px solid var(--border-color);
       }
 
       .sidebar-header {
@@ -242,7 +250,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         align-items: center;
         gap: 8px;
         padding: 16px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color);
         flex-shrink: 0;
       }
 
@@ -250,7 +258,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         display: flex;
         align-items: center;
         gap: 10px;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color);
       }
 
       .sidebar-brand-stack {
@@ -264,7 +272,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         font-family: var(--font-display, inherit);
         font-size: 18px;
         font-weight: 700;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color);
         letter-spacing: 1px;
       }
 
@@ -273,7 +281,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         font-size: 11px;
         letter-spacing: 0.18em;
         text-transform: uppercase;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .collapse-btn {
@@ -286,7 +294,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         background: transparent;
         border: none;
         border-radius: var(--radius-control);
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         cursor: pointer;
         padding: 0;
         transition:
@@ -295,8 +303,8 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
       }
 
       .collapse-btn:hover {
-        color: var(--text-primary, #cdd6f4);
-        background: var(--surface-0, #313244);
+        color: var(--text-primary);
+        background: var(--surface-0);
       }
 
 
@@ -304,7 +312,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         flex: 1;
         overflow-y: auto;
         scrollbar-width: thin;
-        scrollbar-color: var(--border-color, #313244) transparent;
+        scrollbar-color: var(--border-color) transparent;
       }
 
       .sidebar-nav {
@@ -320,7 +328,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         gap: 10px;
         padding: 8px 12px;
         border-radius: var(--radius-control);
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         text-decoration: none;
         font-size: 13px;
         transition:
@@ -329,20 +337,75 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
       }
 
       .nav-link:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .nav-link.active {
-        background: var(--surface-0, #313244);
-        color: var(--accent-color, #cba6f7);
+        background: var(--surface-0);
+        color: var(--accent-color);
       }
 
-      /* Debug sections */
+      /* Mobile drawer sizing: the 200px/13px desktop rail reads cramped as an
+         overlay drawer. Widen it (capped below the viewport so the backdrop
+         stays tappable) and scale the type/targets for thumbs. The width:0
+         collapse still wins via :host(.collapsed) specificity, unchanged. */
+      @media (max-width: 768px) {
+        :host,
+        .sidebar {
+          width: min(300px, 84vw);
+        }
+
+        .sidebar-nav {
+          padding: 14px 10px;
+          gap: 4px;
+        }
+
+        .nav-link {
+          min-height: 44px;
+          padding: 10px 14px;
+          gap: 12px;
+          font-size: 15px;
+        }
+
+        .nav-icon {
+          font-size: 22px;
+        }
+
+        .sidebar-logo {
+          font-size: 20px;
+        }
+
+        .sidebar-label {
+          font-size: 12px;
+        }
+
+        .user-avatar {
+          width: 32px;
+          height: 32px;
+          font-size: 12px;
+        }
+
+        .user-name {
+          font-size: 14px;
+        }
+
+        .footer-link {
+          width: 40px;
+          height: 40px;
+        }
+
+        .logout-button {
+          min-height: 40px;
+          font-size: 14px;
+        }
+      }
+
+      /* Workbench sections */
 
       .section {
         padding: 8px;
-        border-top: 1px solid var(--border-color, #313244);
+        border-top: 1px solid var(--border-color);
       }
 
       .section-title {
@@ -350,7 +413,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 1px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         padding: 4px 8px 6px;
         margin: 0;
       }
@@ -361,7 +424,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         gap: 8px;
         padding: 6px 12px;
         border-radius: var(--radius-control);
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         text-decoration: none;
         font-size: 12px;
         cursor: pointer;
@@ -376,8 +439,8 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
       }
 
       .section-link:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .link-icon {
@@ -391,7 +454,7 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
 
       .sidebar-footer {
         padding: 12px;
-        border-top: 1px solid var(--border-color, #313244);
+        border-top: 1px solid var(--border-color);
         display: flex;
         flex-direction: column;
         gap: 8px;
@@ -413,13 +476,13 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         justify-content: center;
         font-size: 11px;
         font-weight: 600;
-        color: var(--timeline-bg, #11111b);
+        color: var(--timeline-bg);
         flex-shrink: 0;
       }
 
       .user-name {
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -438,15 +501,15 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         width: 30px;
         height: 30px;
         border-radius: var(--radius-control);
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         text-decoration: none;
         transition: color 0.15s ease, background 0.15s ease;
       }
 
       .footer-link:hover,
       .footer-link.active {
-        color: var(--accent-color, #cba6f7);
-        background: var(--surface-0, #313244);
+        color: var(--accent-color);
+        background: var(--surface-0);
       }
 
       .footer-link .nav-icon {
@@ -457,9 +520,9 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
         flex: 1;
         padding: 6px 12px;
         background: transparent;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
         font-family: inherit;
         cursor: pointer;
@@ -469,8 +532,8 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
       }
 
       .logout-button:hover {
-        color: var(--accent-color, #cba6f7);
-        border-color: var(--accent-color, #cba6f7);
+        color: var(--accent-color);
+        border-color: var(--accent-color);
       }
     `,
   ],
@@ -498,6 +561,20 @@ export class SidebarComponent {
     });
   }
 
+  /**
+   * Close the mobile drawer on any link tap, delegated from the nav root.
+   * The NavigationEnd subscription above misses the most intuitive dismiss
+   * gesture: tapping the page you're already on — a same-URL navigation is
+   * skipped by the router and emits nothing, so the drawer just sat there.
+   * Buttons (bell, logout, collapse) are exempt on purpose.
+   */
+  onSidebarClick(event: Event): void {
+    if (!this.viewport.isMobile()) return;
+    if ((event.target as HTMLElement).closest('a[href]')) {
+      this.sidebar.collapse();
+    }
+  }
+
   private readonly currentUrl = toSignal(
     this.router.events.pipe(
       filter((e): e is NavigationEnd => e instanceof NavigationEnd),
@@ -506,15 +583,14 @@ export class SidebarComponent {
     { initialValue: this.router.url },
   );
 
-  readonly isDebugRoute = computed(
-    () => this.currentUrl()?.startsWith('/debug') ?? false,
+  readonly isWorkbenchRoute = computed(
+    () => this.currentUrl()?.startsWith('/workbench') ?? false,
   );
 
   readonly giteaUrl = environment.giteaUrl;
   readonly dozzleUrl = environment.dozzleUrl;
   readonly neo4jUrl = environment.neo4jUrl;
   readonly pgadminUrl = environment.pgadminUrl;
-  readonly mongoExpressUrl = environment.mongoExpressUrl;
   readonly minioConsoleUrl = environment.minioConsoleUrl;
   readonly cloudUrl = environment.cloudUrl;
 

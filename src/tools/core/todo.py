@@ -7,7 +7,7 @@ In the phase alternation architecture:
 - `next_phase_todos` is strategic-only (stages todos for tactical phases)
 - `todo_complete` is shared (marks tasks done, triggers phase transitions)
 - `todo_list` is shared (helps see current state)
-- `todo_rewind` is tactical-only (escape hatch when stuck)
+- `request_replan` is tactical-only (the in-flight adaptation path)
 """
 
 import logging
@@ -18,6 +18,8 @@ from langchain_core.tools import tool
 from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
+
+MAX_COMPLETION_NOTE_CHARS = 1000
 
 # Tool metadata for registry
 # Phase availability:
@@ -46,12 +48,12 @@ TODO_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "core",
         "phases": ["strategic", "tactical"],  # Both: helps see current state
     },
-    "todo_rewind": {
+    "request_replan": {
         "module": "core.todo",
-        "function": "todo_rewind",
-        "description": "Panic button - abandon current approach and re-plan",
+        "function": "request_replan",
+        "description": "End this phase early and return to planning, keeping all work and todo state",
         "category": "core",
-        "phases": ["tactical"],  # Tactical-only: escape hatch when stuck
+        "phases": ["tactical"],  # Tactical-only: the in-flight adaptation path
     },
 }
 
@@ -85,7 +87,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
         - Prepare work items after strategic planning is complete
 
         The tool validates:
-        - Todo count (5-20 items required)
+        - Todo count against the configured bounds (workers: 2-20)
         - Each todo content (minimum 10 characters)
 
         After calling this tool, complete your current strategic todo by
@@ -101,11 +103,12 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             Success message confirming todos were staged, or error if validation fails.
         """
         try:
-            # Enforcement of todo_guide.md read is now config-driven via
-            # instruction_files triggers (apply_instruction_enforcement wrapper).
-            # Fallback check for backward compat when no instruction_files configured:
+            # Enforcement of the todo guide read is now config-driven via
+            # instruction_files triggers (apply_instruction_enforcement wrapper);
+            # the guide is the bundled "todo-guide" skill (Slice 3). Fallback check
+            # for backward compat when no instruction_files are configured:
             if not context._instruction_files and not context.was_recently_read(
-                "todo_guide.md"
+                "skills/todo-guide/SKILL.md"
             ):
                 from src.services.guardrails import format_nudge
 
@@ -117,7 +120,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                 return format_nudge(
                     "read_file_required_error",
                     model=model,
-                    file_path="todo_guide.md",
+                    file_path="skills/todo-guide/SKILL.md",
                     tool_name="next_phase_todos",
                 )
 
@@ -154,7 +157,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             return f"Error staging todos: {str(e)}"
 
     @tool
-    def todo_complete(todo_id: str = "") -> str:
+    def todo_complete(todo_id: str = "", completion_note: str = "") -> str:
         """Mark a single task as complete.
 
         Call this tool AFTER you have finished working on a task.
@@ -165,6 +168,10 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             todo_id: Optional. The ID of the todo to complete (e.g., "todo_1").
                      If not provided, completes the first incomplete task
                      (in_progress first, then highest-priority pending).
+            completion_note: Optional concise outcome that later todos must retain,
+                             such as a verification verdict beginning with
+                             ``PASS:`` or ``GAPS:``. Notes longer than 1000
+                             characters are truncated to fit.
 
         This is the primary rhythm of work:
         1. Work on the current task
@@ -190,6 +197,20 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             This is detected by the graph to trigger phase transitions.
         """
         try:
+            completion_note = completion_note.strip()
+            note_truncated_from = 0
+            if len(completion_note) > MAX_COMPLETION_NOTE_CHARS:
+                note_truncated_from = len(completion_note)
+                marker = f" …[truncated from {note_truncated_from} chars]"
+                keep = MAX_COMPLETION_NOTE_CHARS - len(marker)
+                completion_note = completion_note[:keep].rstrip() + marker
+            completion_notes = [completion_note] if completion_note else None
+
+            # Set by whichever completion path runs below; drives the progress
+            # commit at the end of the tool.
+            completed_id = ""
+            completed_content = ""
+
             if todo_id and todo_id.strip():
                 # Reject comma-separated IDs — complete one todo at a time
                 ids = [id.strip() for id in todo_id.split(",") if id.strip()]
@@ -204,7 +225,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
 
                 if len(ids) == 1:
                     # Single ID - use existing logic
-                    todo = todo_mgr.complete(ids[0])
+                    todo = todo_mgr.complete(ids[0], notes=completion_notes)
                     if not todo:
                         # List available todos to help the agent
                         available = todo_mgr.list_all()
@@ -214,6 +235,9 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                         return (
                             f"Error: Todo '{ids[0]}' not found. No todos in the list."
                         )
+
+                    completed_id = todo.id
+                    completed_content = todo.content
 
                     # Queue memory for completed todo with notes (Memory Light)
                     # Only store if notes contain substantive content (>50 chars)
@@ -249,14 +273,47 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                         )
             else:
                 # Original behavior: complete first pending task
-                result = todo_mgr.complete_first_pending_sync()
+                result = todo_mgr.complete_first_pending_sync(notes=completion_notes)
                 message = result["message"]
                 is_last = result.get("is_last_task", False)
+                completed_id = result.get("completed_id") or ""
+                if completed_id:
+                    _done = next(
+                        (t for t in todo_mgr.list_all() if t.id == completed_id), None
+                    )
+                    completed_content = _done.content if _done else ""
 
             # Add phase transition signal if this was the last task
             if is_last:
                 message += "\n\n[PHASE_COMPLETE] All tasks in this phase are done."
                 logger.info("Last task completed - phase transition signal sent")
+
+            if completion_note and completed_id:
+                message += f"\n\nRecorded completion note: {completion_note}"
+                if note_truncated_from:
+                    message += (
+                        f"\nNote: completion_note was truncated from "
+                        f"{note_truncated_from} chars to fit the "
+                        f"{MAX_COMPLETION_NOTE_CHARS}-char limit. Record only the "
+                        "concise outcome needed by the next todo."
+                    )
+
+            # Make the finished work durable. A completed todo is a real unit of
+            # progress, so it is the honest place to commit — and the commit is
+            # what every external observer (orchestrator, cockpit, MCP tools,
+            # officer) actually reads. Pushing is throttled inside the committer;
+            # git failures are swallowed there and must never fail the tool.
+            committer = getattr(context, "progress_committer", None)
+            if committer is not None and completed_id:
+                committer.on_todo_complete(completed_id, completed_content)
+
+            # Same moment, the other half: a finished todo is also the natural
+            # break at which to deliver queued (non-urgent) replies. Urgent
+            # guidance does not wait for this — it renders every turn.
+            if completed_id:
+                request_drain = getattr(context, "request_reply_drain", None)
+                if callable(request_drain):
+                    request_drain()
 
             return message
 
@@ -308,69 +365,85 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             return f"Error listing todos: {str(e)}"
 
     @tool
-    def todo_rewind(issue: str) -> str:
-        """Panic button: Abandon current approach and re-plan.
+    def request_replan(reason: str) -> str:
+        """End this phase early and go back to planning, keeping all your work.
 
-        Use this tool when you realize the current approach isn't working and
-        you need to reconsider your strategy. This is NOT for normal task
-        completion — use the `todo_complete` tool for that.
+        Use this when you have learned something that changes the approach and
+        it would be wrong to keep working through the remaining todos. This is
+        NOT for normal task completion — use `todo_complete` for that.
 
-        When to use todo_rewind:
-        - You've hit a dead end that makes the current tasks impossible
-        - You discovered the approach is fundamentally flawed
-        - You need to try a completely different strategy
-        - An external constraint makes the current plan invalid
+        When to use request_replan:
+        - You discovered the planned approach will not work
+        - What you found makes some remaining todos pointless or wrong
+        - An external constraint invalidates part of the plan
+        - The work turned out much larger or smaller than the plan assumed
 
-        This tool will:
-        1. Archive your current todos with the failure reason
-        2. Clear the todo list
+        Nothing is lost or undone. Your files, commits and completed todos all
+        stay exactly as they are; todos you finished stay finished and todos
+        you did not start stay pending. The phase simply ends here instead of
+        after the last todo, and the planning phase begins with the full record
+        of what happened plus the reason you give below.
 
-        After calling this, you should:
-        1. Read plan.md to review overall strategy
-        2. Update plan.md if needed
-        3. Create new todos with next_phase_todos()
+        In the planning phase you will review plan.md against what actually
+        happened, adjust it, and stage the next batch with `next_phase_todos`.
 
         Args:
-            issue: Description of WHY the current approach isn't working.
-                   Be specific - this helps when reviewing failed approaches later.
-                   Example: "The API doesn't support batch operations >100 items"
+            reason: What you learned and why it changes the plan. Be specific —
+                    this is what the planning phase reads first.
+                    Example: "The API caps batch operations at 100 items, so
+                    the bulk-import todos need to become paged imports."
 
         Returns:
-            Confirmation message with instructions for re-planning
+            Confirmation that the phase will end after this turn.
         """
-        if not issue or not issue.strip():
-            return "Error: You must provide an 'issue' describing why the rewind is needed."
+        if not reason or not reason.strip():
+            return (
+                "Error: You must provide a 'reason' explaining what changed. "
+                "The planning phase reads it to decide what to adjust."
+            )
 
         try:
-            # Archive with failure note
-            result = todo_mgr.archive_with_failure_note(issue.strip())
+            # Deliberately does NOT archive-as-failed or clear the todo list.
+            # The old behaviour wrote every todo — including the completed ones
+            # — into archive/failed_<time>.md and emptied the list, so the
+            # planning phase inherited no record of what had actually been
+            # achieved and had to reconstruct it. Leaving the todos alone means
+            # archive_phase records them at the boundary with their real
+            # statuses, which is exactly what the planning phase needs to
+            # decide what to keep.
+            done = sum(1 for t in todo_mgr.list_all() if t.status.value == "completed")
+            total = len(todo_mgr.list_all())
 
-            # Clear any staged todos from a prior next_phase_todos call —
-            # the agent is abandoning the current approach, stale staged
-            # todos should not block job_complete or re-planning.
+            note = ""
+            # Staged todos are a bet on the plan that is now being revised —
+            # drop them so the planning phase re-decides rather than inheriting
+            # a stale batch it never sees.
             if todo_mgr.has_staged_todos():
                 todo_mgr.clear_staged_todos()
-                result += "\n(Cleared previously staged todos.)"
+                note = "\nPreviously staged todos were cleared — stage a fresh batch."
 
-            # Return with re-planning instructions
+            context.request_replan(reason.strip())
+
             return (
-                f"{result}\n\n"
-                "To recover, please:\n"
-                "1. Read plan.md to review the overall strategy\n"
-                "2. Update plan.md if the approach needs to change\n"
-                "3. Create new todos with next_phase_todos()"
+                f"Replan requested. This phase ends after the current turn.\n"
+                f"Progress kept: {done}/{total} todos complete; nothing was "
+                f"undone or discarded.\n"
+                f"Reason recorded: {reason.strip()}{note}\n\n"
+                "The planning phase will start with the full record of this "
+                "phase. There, review plan.md against what actually happened, "
+                "update it, then stage the next batch with next_phase_todos()."
             )
 
         except ValueError as e:
             return f"Error: {str(e)}"
         except Exception as e:
-            logger.error(f"todo_rewind error: {e}")
-            return f"Error during rewind: {str(e)}"
+            logger.error(f"request_replan error: {e}")
+            return f"Error requesting replan: {str(e)}"
 
     # Return all todo tools
     return [
         next_phase_todos,
         todo_complete,
         todo_list,
-        todo_rewind,
+        request_replan,
     ]

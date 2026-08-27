@@ -8,7 +8,9 @@ for exploration and idea generation.
 
 ## Core Principle: Breadth Over Depth
 
-**Target: 5-7 todos per tactical phase.** Each todo should explore one question or
+**Target: cover the whole investigation in ONE tactical phase (10-20 todos).** A phase
+boundary costs a full planning cycle, so prefer a larger phase over several small ones.
+Each todo should explore one question or
 produce one artifact. Don't spend more than one phase deep-diving a single topic.
 
 Each tactical phase ends with a strategic review where you assess coverage:
@@ -85,7 +87,7 @@ Example todos:
 - "Map directory structure of src/tools/ — read each __init__.py to understand tool categories"
 - "Search for 'except Exception' across src/ — catalog overly broad exception handling"
 - "Read src/core/context.py and src/core/workspace_injection.py — look for optimization opportunities"
-- "Use the git_log tool (max_count=30) to identify most frequently changed files — check for code churn patterns"
+- "Run `git log -n 30` via run_command to identify most frequently changed files — check for code churn patterns"
 - "Run shell: ruff check src/ 2>&1 | head -50 — catalog lint issues by category"
 - "Write idea artifacts for each finding with specific file:line references"
 
@@ -115,36 +117,42 @@ Example todos:
 - "Document results with actual numbers — include commands.sh for reproducibility"
 - "Write idea artifact if experiment supports the hypothesis, or note dead end if not"
 
-{% if has_tool("delegate_work") -%}
-### 5. Delegated Parallel Research Phase
+{% if has_tool("spawn_subagent") -%}
+### 5. Fan-Out Research Phase (subagents)
 
-Purpose: Fan out independent research threads to subagents, then synthesize their findings.
+Purpose: Fan independent research threads out to subagents; keep your own context for synthesis.
 
-This phase has a different structure: instead of 5-7 exploration todos, you create 1-2 delegation
-todos followed by 3-4 synthesis todos that process the subagent results.
+DEFAULT for separable work: when a phase covers 2+ independent questions, sources, or topics,
+structure it as a fan-out phase. A sequential exploration phase for separable threads is the
+exception and needs a reason (threads depend on each other, or there is only one narrow topic).
 
-Example delegation todo:
-- "Delegate parallel research: (1) web search for Redis caching patterns in Python agent systems — write findings to output/ideas/010_redis_caching.md, (2) web search for in-memory caching with LRU/TTL strategies — write findings to output/ideas/011_inmemory_caching.md, (3) codebase search for existing caching in src/ — write findings to output/ideas/012_current_caching.md"
+Structure: 1-2 fan-out todos followed by 2-3 synthesis todos that process the returned results.
+A fan-out todo means calling `spawn_subagent` several times in a SINGLE turn — one call per
+thread; the calls run in parallel. Subagents return result STRINGS directly to you — they do
+not write files. You author every artifact and knowledge note yourself.
 
-Example synthesis todos (executed after delegation completes):
-- "Review subagent outputs in output/ideas/010-012 — identify overlapping recommendations and contradictions"
-- "Write synthesis artifact output/ideas/013_caching_comparison.md combining subagent findings with tradeoff matrix"
+Example fan-out todo:
+- "Fan out 3 subagents in ONE turn: (1) web research on Redis caching patterns in Python agent systems, (2) web research on in-memory caching with LRU/TTL strategies, (3) codebase search for existing caching in src/. Each task self-contained, each returns 3-5 findings with cited sources"
+
+Example synthesis todos (executed after the results return):
+- "Cross-compare the three subagent result sets — identify overlapping recommendations and contradictions"
+- "Write synthesis artifact output/ideas/013_caching_comparison.md from the returned findings, with tradeoff matrix"
 - "Update knowledge base: consolidated caching learnings (kb_write), record dead ends from subagent results"
 - "Update plan.md with coverage assessment — which caching aspects still need exploration?"
 
-Rules for delegation todos:
-- Each delegated task needs: specific question, exploration mode, output path, quality bar
+Rules for fan-out todos:
+- Each spawned task needs: specific question, where to look (sources + exploration mode), expected return format
 - Tasks must be independent — no task should need another task's results
-- 2-5 tasks per delegation call (never 1 — just do it yourself)
-- Write the delegation todo FIRST in the phase, synthesis todos AFTER
+- 2-5 subagents per fan-out turn (never 1 — just do it yourself)
+- Write the fan-out todo FIRST in the phase, synthesis todos AFTER
 
-When NOT to use a delegated phase:
+When NOT to use a fan-out phase:
 - The research threads depend on each other (use sequential todos instead)
 - You only have one topic to explore (use a normal exploration phase)
-- You need to experiment iteratively (delegation is for parallel exploration, not sequential experimentation)
+- You need to experiment iteratively (fan-out is for parallel reading/research, not sequential experimentation)
 {% endif -%}
 
-### {% if has_tool("delegate_work") %}6{% else %}5{% endif %}. Synthesis Phase
+### {% if has_tool("spawn_subagent") %}6{% else %}5{% endif %}. Synthesis Phase
 
 Purpose: Review accumulated findings and generate remaining idea artifacts.
 
@@ -182,10 +190,12 @@ Every factual claim in an idea artifact must cite a source:
 | Codebase Archaeology | 5-7 | Examining repository for patterns and gaps |
 | Log & Data Analysis | 4-6 | Mining execution data for operational insights |
 | Experiment | 3-5 | Validating a hypothesis with a benchmark or PoC |
-{% if has_tool("delegate_work") -%}
-| Delegated Research | 1-2 delegation + 3-4 synthesis | Multiple independent topics to explore in parallel |
+{% if has_tool("spawn_subagent") -%}
+| Fan-Out Research | 1-2 fan-out + 2-3 synthesis | 2+ independent topics/sources — the DEFAULT for separable research |
 {% endif -%}
 | Synthesis | 4-6 | Reviewing findings, writing remaining ideas |
 
-**Default to 5 todos.** Go higher (6-7) for broad web exploration sweeps. Go lower
-(3-4) for focused experiments. If you need more than 7, split into two phases.
+**Default to one phase covering the investigation.** The counts above are the shape of
+the work inside a phase, not a reason to split: a second phase is worth its planning
+cycle only when the next questions genuinely cannot be written until the first batch
+lands. If findings invalidate the plan mid-phase, invoke `request_replan` instead.

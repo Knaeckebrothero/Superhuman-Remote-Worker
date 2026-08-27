@@ -1,14 +1,17 @@
 import {APP_INITIALIZER, ApplicationConfig, isDevMode, provideBrowserGlobalErrorListeners} from '@angular/core';
 import {provideRouter, withViewTransitions} from '@angular/router';
 import {provideServiceWorker} from '@angular/service-worker';
-import {HttpClient, provideHttpClient, withFetch, withInterceptors} from '@angular/common/http';
+import {HttpClient, provideHttpClient, withInterceptors} from '@angular/common/http';
 import {registerLocaleData} from '@angular/common';
 import localeDe from '@angular/common/locales/de';
 import {firstValueFrom} from 'rxjs';
 import {authInterceptor} from './core/interceptors/auth.interceptor';
 import {viewAsInterceptor} from './core/interceptors/view-as.interceptor';
-import {MARKED_EXTENSIONS, MARKED_OPTIONS, provideMarkdown} from 'ngx-markdown';
+import {MARKED_EXTENSIONS, MARKED_OPTIONS, SANITIZE, provideMarkdown} from 'ngx-markdown';
 import {citationExtension} from './core/markdown/citation-extension';
+import {mathExtension} from './core/markdown/math-extension';
+import {externalImageExtension} from './core/markdown/external-image-extension';
+import {sanitizeMarkdownHtml} from './core/markdown/markdown-sanitizer';
 import {SessionService} from './core/services/session.service';
 import {UserService} from './core/services/user.service';
 import {SettingsService} from './core/services/settings.service';
@@ -68,7 +71,22 @@ export const appConfig: ApplicationConfig = {
     provideBrowserGlobalErrorListeners(),
     provideRouter(routes, withViewTransitions()),
     provideClientHydration(withEventReplay()),
-    provideHttpClient(withFetch(), withInterceptors([authInterceptor, viewAsInterceptor])),
+    // No withFetch(): Angular's FetchBackend emits no UploadProgress events at
+    // all (@angular/common/fesm2022/_module-chunk.mjs — the package's only
+    // HttpEventType.UploadProgress emission lives in HttpXhrBackend), so
+    // attachment upload progress is impossible on it and `reportProgress: true`
+    // is a silent no-op there. withXhr() does not exist in Angular 21, so the
+    // only way to get the XHR backend is to stop asking for fetch.
+    //
+    // Safe here because nothing ever runs this config in Node: angular.json
+    // sets `ssr: false` and declares no `server` entry, so the build emits no
+    // server bundle and prerenders nothing (dist/cockpit/prerendered-routes.json
+    // is `{"routes": {}}`; index.html ships an empty <app-root> with no `ngh`
+    // hydration markers). If SSR is ever switched on, app.config.server.ts's
+    // provideServerRendering() supplies XhrFactory → ServerXhr, which is exactly
+    // what an XHR-backed HttpClient needs off-browser.
+    // knowledge-base/knowledge/features/session_attachment_send_flow.md §9.2
+    provideHttpClient(withInterceptors([authInterceptor, viewAsInterceptor])),
     provideTransloco({
       config: {
         availableLangs: [...SUPPORTED_LANGS],
@@ -101,19 +119,36 @@ export const appConfig: ApplicationConfig = {
       },
       markedExtensions: [
         {
+          // Images are URL-review cards; never emit a live remote <img>.
+          provide: MARKED_EXTENSIONS,
+          multi: true,
+          useValue: externalImageExtension(),
+        },
+        {
           provide: MARKED_EXTENSIONS,
           multi: true,
           useValue: citationExtension(),
         },
+        {
+          // Protect LaTeX math from markdown mangling before the KaTeX pass.
+          provide: MARKED_EXTENSIONS,
+          multi: true,
+          useValue: mathExtension(),
+        },
       ],
+      sanitize: {
+        provide: SANITIZE,
+        useValue: sanitizeMarkdownHtml,
+      },
     }),
     provideServiceWorker('ngsw-worker.js', {
       // Only register in production builds. Dev mode reloads frequently and
       // a stale SW would shadow code changes.
       enabled: !isDevMode(),
-      // Defer registration until the app stabilises so SW install doesn't
-      // contend with hydration / first-paint work.
-      registrationStrategy: 'registerWhenStable:30000',
+      // Register immediately: Chrome decides install-as-app vs. bookmark
+      // shortcut based on whether a SW controls the page at install time, so
+      // a deferred registration loses the standalone-window install.
+      registrationStrategy: 'registerImmediately',
     }),
   ]
 };

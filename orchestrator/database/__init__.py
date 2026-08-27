@@ -2,14 +2,14 @@
 
 Provides core database classes for the orchestrator:
 - PostgresDB: Async PostgreSQL with connection pooling
-- MongoDB: Async MongoDB for audit queries (optional)
+- AuditStore: Async Postgres reader for the audit trail
 
 This is the canonical database layer. All database operations should go
 through these classes rather than creating separate connection pools.
 
 Example:
     ```python
-    from orchestrator.database import PostgresDB, MongoDB, ALLOWED_TABLES, SCHEMA_FILE
+    from orchestrator.database import PostgresDB, ALLOWED_TABLES, SCHEMA_FILE
 
     # PostgreSQL (async)
     db = PostgresDB()
@@ -24,23 +24,34 @@ Example:
     job = await db.create_job(description="Extract requirements")
     await db.register_agent(config_name="creator", pod_ip="10.0.0.1")
 
-    # MongoDB (optional, async)
-    mongo = MongoDB()
-    await mongo.connect()
-    audit = await mongo.get_job_audit("abc-123", page=1, page_size=50)
+    # Audit reads (async)
+    audit = AuditStore(audit_db_url)
+    await audit.connect()
+    trail = await audit.get_job_audit("abc-123", page=1, page_size=50)
     ```
+
+The public exports are loaded lazily.  In particular, invoking
+``python -m database.migrate`` must not import the application database layer
+or its web/cloud dependencies before the standalone migration runner starts.
 """
 
-from .postgres import (
-    PostgresDB,
-    ALLOWED_TABLES,
-    PG_TYPE_MAP,
-    SCHEMA_FILE,
-    MIGRATIONS_APP_DIR,
-    MIGRATIONS_VECTOR_DIR,
-    REQUIRED_TABLES,
-)
-from .mongodb import MongoDB, FILTER_MAPPINGS, FilterCategory
+from __future__ import annotations
+
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .audit_store import AuditStore, FILTER_MAPPINGS, FilterCategory
+    from .postgres import (
+        ALLOWED_TABLES,
+        MIGRATIONS_APP_DIR,
+        MIGRATIONS_AUDIT_DIR,
+        MIGRATIONS_VECTOR_DIR,
+        PG_TYPE_MAP,
+        REQUIRED_TABLES,
+        SCHEMA_FILE,
+        PostgresDB,
+    )
 
 __all__ = [
     # PostgreSQL
@@ -50,9 +61,39 @@ __all__ = [
     "SCHEMA_FILE",
     "MIGRATIONS_APP_DIR",
     "MIGRATIONS_VECTOR_DIR",
+    "MIGRATIONS_AUDIT_DIR",
     "REQUIRED_TABLES",
-    # MongoDB
-    "MongoDB",
+    # Postgres audit store (reader + filter helpers)
+    "AuditStore",
     "FILTER_MAPPINGS",
     "FilterCategory",
 ]
+
+_EXPORT_MODULES = {
+    "PostgresDB": "postgres",
+    "ALLOWED_TABLES": "postgres",
+    "PG_TYPE_MAP": "postgres",
+    "SCHEMA_FILE": "postgres",
+    "MIGRATIONS_APP_DIR": "postgres",
+    "MIGRATIONS_VECTOR_DIR": "postgres",
+    "MIGRATIONS_AUDIT_DIR": "postgres",
+    "REQUIRED_TABLES": "postgres",
+    "AuditStore": "audit_store",
+    "FILTER_MAPPINGS": "audit_store",
+    "FilterCategory": "audit_store",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load a public database export on first access."""
+
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f"{__name__}.{module_name}"), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

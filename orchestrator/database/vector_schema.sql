@@ -149,7 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_tags_job ON source_tags(job_id);
 -- mechanism. That table is owned by orchestrator.database.migrate now —
 -- under a different shape (filename, checksum, ...) — and is created by
 -- the runner itself. Removed here to avoid colliding with the runner's
--- table on existing DBs; see docs/db_migration.md.)
+-- table on existing DBs; see knowledge-base/knowledge/db_migration.md.)
 
 -- Source embeddings
 CREATE TABLE IF NOT EXISTS source_embeddings (
@@ -176,7 +176,7 @@ END $$;
 -- ============================================================================
 -- 2. MEMORIES TABLE (Memory Light — RecallStore)
 -- Agent memory storage with hybrid search (dense vector + sparse keyword + recency).
--- See docs/features/memory_light.md for full architecture.
+-- See knowledge-base/knowledge/features/memory_light.md for full architecture.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS memories (
@@ -463,7 +463,7 @@ $$;
 -- 3. KNOWLEDGE INDEX (Project Knowledge Base — Search Index)
 -- Derived search index for project knowledge notes stored in Neo4j.
 -- Updated via write-through on every kb_write/kb_update.
--- See docs/features/project_knowledge_base.md for full architecture.
+-- See knowledge-base/knowledge/features/project_knowledge_base.md for full architecture.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS knowledge_index (
@@ -473,6 +473,7 @@ CREATE TABLE IF NOT EXISTS knowledge_index (
     title TEXT NOT NULL,
     note_type VARCHAR(50) NOT NULL,           -- goal, plan, decision, learning, code, source, question, state, retrospective
     status VARCHAR(50) DEFAULT 'active',
+    priority SMALLINT NOT NULL DEFAULT 1,
     confidence VARCHAR(20),
     tags TEXT[] DEFAULT '{}',
     keywords TEXT[] DEFAULT '{}',
@@ -490,7 +491,8 @@ CREATE TABLE IF NOT EXISTS knowledge_index (
     CONSTRAINT uq_knowledge_project_note UNIQUE (project_id, note_id),
     CONSTRAINT valid_note_type CHECK (note_type IN (
         'goal', 'plan', 'decision', 'learning', 'code',
-        'source', 'question', 'state', 'retrospective', 'datasource'
+        'source', 'question', 'state', 'retrospective', 'datasource',
+        'feature', 'issue', 'idea'
     )),
     CONSTRAINT valid_note_status CHECK (status IN ('active', 'resolved', 'superseded', 'archived'))
 );
@@ -500,7 +502,8 @@ DO $$ BEGIN
     ALTER TABLE knowledge_index DROP CONSTRAINT IF EXISTS valid_note_type;
     ALTER TABLE knowledge_index ADD CONSTRAINT valid_note_type CHECK (note_type IN (
         'goal', 'plan', 'decision', 'learning', 'code',
-        'source', 'question', 'state', 'retrospective', 'datasource'
+        'source', 'question', 'state', 'retrospective', 'datasource',
+        'feature', 'issue', 'idea'
     ));
 EXCEPTION WHEN others THEN
     RAISE NOTICE 'Could not update valid_note_type constraint: %', SQLERRM;
@@ -511,6 +514,9 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_project_type ON knowledge_index(project
 CREATE INDEX IF NOT EXISTS idx_knowledge_project_status ON knowledge_index(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_knowledge_tags ON knowledge_index USING GIN(tags);
 CREATE INDEX IF NOT EXISTS idx_knowledge_search ON knowledge_index USING GIN(search_doc);
+CREATE INDEX IF NOT EXISTS idx_knowledge_backlog
+    ON knowledge_index (project_id, priority, created_at)
+    WHERE status = 'active' AND note_type IN ('feature', 'issue', 'idea');
 DO $$ BEGIN
     CREATE INDEX IF NOT EXISTS idx_knowledge_embedding ON knowledge_index
         USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);

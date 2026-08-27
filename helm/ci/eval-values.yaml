@@ -1,0 +1,55 @@
+# Eval / single-node profile — chart-created secrets (secrets mode 2).
+# Exercises the `secrets.create=true` path that test-values (ESO) and
+# customer-external (existing Secret) do not cover, with the minimal footprint
+# a mini-PC k3s install would use. The chart auto-generates APP_ENCRYPTION_KEY
+# when it is absent from secrets.values (see templates/secret.yaml), so no
+# secret keys are required just to render. NOT a production config — chart-
+# created secrets are for eval only.
+license:
+  acceptTerms: true
+
+global:
+  domain: "eval.example.com"
+
+# Mode 2: chart creates the runtime Secret from these values (dev/eval only).
+# CI-only non-secret sentinels exercise the generic-value and explicit-Garage
+# paths alongside generated keys. A real eval install supplies real credentials.
+secrets:
+  create: true
+  values:
+    CI_SECRET_RENDER_SENTINEL: "not-a-secret"
+    SNAPSHOT_S3_ACCESS_KEY_ID: "GK000000000000000000000000"
+    SNAPSHOT_S3_SECRET_ACCESS_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Keep the footprint small: optional heavy components off.
+databases:
+  neo4j:
+    enabled: false
+
+opencloud:
+  enabled: false
+nextcloud:
+  enabled: false
+
+mcp:
+  enabled: true
+
+vmController:
+  enabled: false
+
+# No home-cluster admin UIs / mesh on a minimal box.
+pgadmin:
+  enabled: false
+dozzle:
+  enabled: false
+codexProxy:
+  enabled: false
+
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: false
+
+garage:
+  enabled: true

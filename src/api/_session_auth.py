@@ -4,8 +4,10 @@ The pod knows two things from its env:
   - SESSION_JWT_SECRET — shared with the orchestrator (K8s Secret)
   - SESSION_BOUND_THREAD_ID — the thread this pod was provisioned for
 
-A valid handshake: token signature OK, audience=agent, not expired,
-and claim `tid` matches the bound thread.
+A valid handshake: token signature OK, audience=agent, not expired, claim
+`tid` matches the bound thread, and claim `sif` matches the complete local
+thread/generation/agent/attach/Pod identity.  A token minted for G1 therefore
+cannot authorize a successor G2 of the same thread.
 
 For dedicated session pods the bound thread comes straight from the env
 var. For job-pool pods that get a thread attached later via /session/attach
@@ -14,7 +16,7 @@ running pod), so we fall back to the currently-attached thread on the live
 PersistentSession instance. Same JWT, same signature check — only the
 expected `tid` source differs.
 
-See docs/features/direct_session_websockets.md §Component details.
+See knowledge-base/knowledge/features/direct_session_websockets.md §Component details.
 """
 
 from __future__ import annotations
@@ -49,12 +51,24 @@ def _resolve_bound_tid() -> str:
     return str(getattr(session, "thread_id", "") or "")
 
 
+def _resolve_bound_session_identity_fingerprint() -> str | None:
+    """Return the exact local identity advertised by this pod's `/ready`."""
+
+    try:
+        from . import persistent_app as pa
+
+        return pa._current_pinned_session_identity_fingerprint()
+    except Exception:
+        return None
+
+
 async def validate_session_token(ws: WebSocket) -> bool:
     """Validate the WS query param `t`. Closes the WS with an appropriate
     code on failure. Returns True if the connection should proceed."""
     secret = os.environ.get("SESSION_JWT_SECRET", "")
     bound_tid = _resolve_bound_tid()
-    if not secret or not bound_tid:
+    bound_fingerprint = _resolve_bound_session_identity_fingerprint()
+    if not secret or not bound_tid or bound_fingerprint is None:
         # Misconfigured pod — fail closed.
         await ws.accept()
         await ws.close(code=4500, reason="pod missing session auth config")
@@ -74,7 +88,7 @@ async def validate_session_token(ws: WebSocket) -> bool:
             audience="agent",
             leeway=2,
             options={
-                "require": ["exp", "iat", "aud", "sub", "tid"],
+                "require": ["exp", "iat", "aud", "sub", "tid", "sif"],
                 "verify_signature": True,
                 "verify_exp": True,
                 "verify_iat": True,
@@ -96,5 +110,13 @@ async def validate_session_token(ws: WebSocket) -> bool:
         await ws.accept()
         await ws.close(code=4403, reason="session token mismatch")
         return False
+
+    if claims.get("sif") != bound_fingerprint:
+        logger.warning("ws_chat: token session identity does not match local binding")
+        await ws.accept()
+        await ws.close(code=4403, reason="session token identity mismatch")
+        return False
+
+    ws.state.session_identity_fingerprint = bound_fingerprint
 
     return True

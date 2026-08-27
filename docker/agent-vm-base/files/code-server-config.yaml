@@ -1,12 +1,23 @@
-# code-server configuration for agent VMs
-# The management daemon controls auth tokens at runtime.
-# This is the base config baked into the image.
+# code-server configuration for agent VMs — live-VM Web IDE.
+#
+# Reached ONLY through the agent's authenticated SSH direct-tcpip channel to
+# guest loopback (see knowledge-base/knowledge/features/vm_snapshots_and_ide.md, "Live-VM IDE
+# Access via the Agent"). The SSH transport plus the orchestrator's IDE auth
+# gate (require_approved_user + user_can_access_ide_entity) are the trust
+# boundary, so code-server binds loopback with auth disabled — the same model
+# as container workspaces.
+#
+# Do NOT bind 0.0.0.0 or re-enable password auth: the VM firewall drops
+# inbound non-:22 over the mesh, and loopback-only is exactly what keeps
+# `auth: none` safe. The systemd unit (code-server.service) launches this as
+# agent-host and opens /home/agent-host/workspace; the management daemon
+# starts the unit on IDE request.
 
-bind-addr: 0.0.0.0:8080
-auth: password
-password: changeme
+bind-addr: 127.0.0.1:8080
+auth: none
 cert: false
 
-# Open the agent workspace by default
-user-data-dir: /home/agent/.local/share/code-server
-extensions-dir: /home/agent/.local/share/code-server/extensions
+# Kept outside $HOME so the IDE file explorer stays clean (mirrors the
+# container workspace entrypoint). Created + chowned to agent-host in stage2.
+user-data-dir: /var/lib/code-server
+extensions-dir: /var/lib/code-server/extensions

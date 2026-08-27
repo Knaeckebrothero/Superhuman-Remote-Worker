@@ -1,16 +1,366 @@
 {
+  "toolCard": {
+    "sections": {
+      "result": "Result",
+      "error": "Error"
+    },
+    "status": {
+      "pending": "pending",
+      "running": "running",
+      "ok": "completed",
+      "error": "error",
+      "denied": "denied",
+      "expired": "not run"
+    },
+    "diff": {
+      "replace": "diff",
+      "append": "appended",
+      "prepend": "prepended",
+      "write": "written",
+      "truncated": "+{{count}} more lines"
+    },
+    "showMore": "Show {{count}} more lines",
+    "showLess": "Show less",
+    "previewNote": "preview · {{size}} total",
+    "canvas": {
+      "open": "Open Canvas",
+      "current": "current",
+      "currentStage": "opens current stage",
+      "replaced": "presentation replaced",
+      "unavailable": "Canvas unavailable",
+      "sourceKind": {
+        "file": "File",
+        "app": "Live app",
+        "canvas": "Canvas"
+      }
+    },
+    "titles": {
+      "read_file": "Read file",
+      "write_file": "Write file",
+      "edit_file": "Edit file",
+      "list_files": "List files",
+      "search_files": "Search files",
+      "file_exists": "Check file",
+      "delete_file": "Delete file",
+      "move_file": "Move file",
+      "get_document_info": "Inspect document",
+      "run_command": "Execute command",
+      "shell_execute": "Execute command",
+      "shell_read": "Read output",
+      "git_log": "View git history",
+      "git_show": "View commit",
+      "git_diff": "Compare changes",
+      "git_status": "Check git status",
+      "web_search": "Search the web",
+      "extract_webpage": "Extract page",
+      "browse_website": "Browse website",
+      "search_papers": "Search papers",
+      "kb_write": "Write to knowledge base",
+      "kb_read": "Read knowledge",
+      "kb_search": "Search knowledge",
+      "next_phase_todos": "Plan next phase",
+      "todo_complete": "Complete todo",
+      "cite_document": "Cite document",
+      "send_message": "Send message",
+      "delegate_work": "Delegate work",
+      "job_complete": "Complete job",
+      "mark_complete": "Mark complete",
+      "set_canvas": "Present in Canvas",
+      "get_canvas": "Inspect Canvas",
+      "clear_canvas": "Clear Canvas",
+      "create_job": "Schedule job",
+      "notify_user": "Message the user"
+    },
+    "notify": {
+      "from": "Officer → you",
+      "sending": "sending…",
+      "urgency": {
+        "page": "Page",
+        "digest": "Digest",
+        "log": "Log"
+      }
+    },
+    "job": {
+      "approve": "Approve",
+      "openDiff": "Open diff",
+      "cancel": "Cancel job",
+      "resumeWithFeedback": "Continue with feedback",
+      "feedbackPlaceholder": "What should it do differently?",
+      "feedbackSubmit": "Send & continue",
+      "feedbackDismiss": "Dismiss",
+      "diffTitle": "Job {{id}} — changes"
+    },
+    "jobBatch": {
+      "title": "{{count}} jobs dispatched",
+      "finished": "{{done}}/{{total}} finished",
+      "failed": "{{count}} failed",
+      "review": "{{count}} awaiting review",
+      "notCreated": "Job was not created"
+    },
+    "view": {
+      "rendered": "Rendered",
+      "raw": "Raw"
+    },
+    "showAll": "Show all"
+  },
+  "canvas": {
+    "paneLabel": "Dynamic Canvas",
+    "defaultTitle": "Canvas",
+    "noSource": "No source selected",
+    "untrusted": "Agent-provided content",
+    "lastSynced": "Last synced",
+    "refresh": "Refresh Canvas status",
+    "popOut": "Open Canvas in a new window",
+    "close": "Close Canvas",
+    "open": "Open Canvas",
+    "hide": "Hide Canvas",
+    "skipToCanvas": "Skip to Canvas",
+    "newContent": "New Canvas content waiting",
+    "returnToChat": "Return to chat",
+    "resize": "Resize chat and Canvas",
+    "empty": "The agent has not presented anything yet.",
+    "unsupported": "This Canvas source is not supported by this version of Cockpit.",
+    "contentTooComplex": "This artifact is too complex to render safely. Ask the agent to simplify it.",
+    "sourceKind": {
+      "file": "File",
+      "app": "Live app",
+      "browser": "Shared browser",
+      "unknown": "Canvas"
+    },
+    "renderer": {
+      "markdown": "Markdown",
+      "text": "Text",
+      "html": "Static HTML",
+      "html-interactive": "Interactive HTML",
+      "image": "Image",
+      "office": "Office document",
+      "app": "Live app",
+      "browser": "Shared browser",
+      "unsupported": "Unsupported source"
+    },
+    "status": {
+      "ready": "Canvas ready",
+      "readyRevision": "Canvas ready, presentation {{revision}}",
+      "loading": "Loading Canvas content…",
+      "updating": "The agent is updating the Canvas…",
+      "sourceChanged": "The source changed in the workspace. Ask the agent to present it again.",
+      "contentError": "Canvas content could not be loaded.",
+      "starting": "Canvas is starting…",
+      "unavailable": "Canvas source is currently unavailable.",
+      "ended": "This Canvas source has ended.",
+      "error": "Canvas encountered an error.",
+      "cleared": "Canvas was cleared."
+    },
+    "image": {
+      "zoomIn": "Zoom in",
+      "zoomOut": "Zoom out",
+      "missingAlt": "Image with no description provided"
+    },
+    "html": {
+      "frameTitle": "Static Canvas preview: {{title}}",
+      "interactiveFrameTitle": "Interactive Canvas preview: {{title}}"
+    },
+    "office": {
+      "frameTitle": "Office document: {{title}}",
+      "connecting": "Opening the Office document…",
+      "unavailable": "The Office document could not be opened.",
+      "conflict": {
+        "title": "Office changes need attention",
+        "body": "The editor could not complete the save or refresh for this turn. Reload the current workspace version before continuing; another writer may still update it during the handoff.",
+        "reload": "Reload document"
+      }
+    },
+    "browser": {
+      "source": "Current shared browser",
+      "untitled": "Untitled page",
+      "noUrl": "No page URL",
+      "loading": "Page loading…",
+      "surfaceLabel": "Shared browser page",
+      "retryConnection": "Retry connection",
+      "restart": "Restart browser",
+      "baton": {
+        "agent": "Agent is driving",
+        "user": "You're driving",
+        "take": "Take control",
+        "release": "Release control",
+        "pending": "Waiting for browser…"
+      },
+      "toolbar": {
+        "label": "Shared browser controls",
+        "back": "Back",
+        "reload": "Reload",
+        "address": "Address",
+        "navigationRejected": "Navigation blocked:"
+      },
+      "open": {
+        "action": "Open browser",
+        "explanation": "Open a browser that you and the agent can use together.",
+        "dirty": "Save or discard your Canvas edits before opening the browser. Opening it replaces the current stage.",
+        "replace": {
+          "title": "Replace the current Canvas?",
+          "body": "Opening the shared browser replaces the current Canvas presentation. The underlying item is not deleted, but the agent must present it again before you can return to it.",
+          "confirm": "Replace with browser"
+        },
+        "retry": "Retry",
+        "phase": {
+          "workspace": "Starting workspace…",
+          "browser": "Starting browser…",
+          "connecting": "Connecting…"
+        },
+        "error": {
+          "timeout": "The browser took too long to start. You can retry.",
+          "invalidResponse": "The server returned an invalid browser response.",
+          "failed": "The browser could not be opened. You can retry."
+        }
+      },
+      "reason": {
+        "feature_disabled": "Shared browser is disabled on this server.",
+        "workspace_required": "This session type does not provide a browser workspace.",
+        "workspace_unattested": "This workspace is not trusted for shared-browser access.",
+        "workspace_unroutable": "The server cannot securely reach this workspace browser.",
+        "transport_unavailable": "Secure browser transport is not configured on this server."
+      },
+      "status": {
+        "connecting": "Connecting…",
+        "ready": "Shared browser connected",
+        "reconnecting": "Reconnecting to the shared browser…",
+        "ended": "This browser session has ended.",
+        "viewerLimit": "The shared browser has reached its viewer limit.",
+        "unauthorized": "You no longer have access to this shared browser.",
+        "unavailable": "The shared browser is currently unavailable.",
+        "disabled": "Shared browser is disabled on this server.",
+        "error": "The shared-browser connection encountered a protocol error."
+      }
+    },
+    "app": {
+      "source": "Workspace application",
+      "frameTitle": "Live Canvas application: {{title}}",
+      "untrustedWarning": "Untrusted app — do not enter passwords or secrets.",
+      "connecting": "Connecting to the isolated Canvas application…",
+      "renewing": "Refreshing the secure Canvas connection…",
+      "unavailable": "The isolated Canvas application could not be opened.",
+      "retry": "Retry secure preview",
+      "failure": {
+        "disabled": {
+          "title": "Live preview is disabled",
+          "body": "This deployment has not enabled isolated live-app viewing."
+        },
+        "unsupported": {
+          "title": "Secure live preview is not supported",
+          "body": "This browser or its privacy settings does not support the secure metadata or partitioned storage required by Canvas."
+        },
+        "temporary": {
+          "title": "Secure live preview is unavailable",
+          "body": "The embedded preview could not be established. This may be a temporary service, authentication, or browser privacy-policy failure."
+        },
+        "safeFallback": "For safety, Canvas did not open the app as a top-level page. Use the authenticated IDE or manual-preview workflow instead."
+      },
+      "reset": {
+        "action": "Reset app origin",
+        "confirm": "Start with a fresh app origin",
+        "confirming": {
+          "title": "Start with a fresh isolated app origin?",
+          "body": "This rotates the app's origin generation, retires old previews, and revokes their sessions. Browser cleanup of storage left on the retired origin is best-effort."
+        },
+        "resetting": {
+          "title": "Resetting app origin…",
+          "body": "Canvas is revoking old origin sessions and reconnecting this preview."
+        },
+        "success": {
+          "title": "App origin was reset",
+          "body": "Canvas is reconnecting the app with a fresh origin generation."
+        },
+        "error": {
+          "title": "App origin could not be reset",
+          "body": "Canvas reloaded the latest state. Check the connection and try again."
+        }
+      }
+    },
+    "editor": {
+      "label": "Canvas source editor",
+      "loading": "Loading editor…",
+      "unavailable": "The source editor could not be loaded.",
+      "edit": "Edit source",
+      "preview": "Preview source",
+      "save": "Save",
+      "saving": "Saving…",
+      "saved": "Canvas source saved",
+      "unsaved": "You have unsaved Canvas changes",
+      "keepEditing": "Keep editing",
+      "loadCurrent": "Discard and load current",
+      "discardCleared": "Discard local changes",
+      "remoteEditing": "Another view is editing this Canvas source.",
+      "sourceRefresh": "The workspace file changed outside the Canvas editor.",
+      "loadWorkspace": "Load workspace version",
+      "conflict": {
+        "content_changed": {
+          "title": "The workspace file changed",
+          "body": "Your edits are preserved. Compare them before loading the current workspace version."
+        },
+        "presentation_changed": {
+          "title": "The Canvas was republished",
+          "body": "Your edits are preserved. Load the current presentation before saving over it."
+        },
+        "replaced": {
+          "title": "The Canvas source was replaced",
+          "body": "Your edits still belong to the previous source and have not been saved."
+        },
+        "cleared": {
+          "title": "The Canvas was cleared",
+          "body": "Your local edits are preserved until you discard them or copy them elsewhere."
+        },
+        "busy": {
+          "title": "The Canvas source is busy",
+          "body": "Another save is in progress. Your edits are safe; try saving again shortly."
+        },
+        "precondition_required": {
+          "title": "The editor lost its save precondition",
+          "body": "Your edits are safe. Load the current version before trying again."
+        },
+        "save_failed": {
+          "title": "The Canvas source could not be saved",
+          "body": "Your edits remain in this browser. Check the connection and try again."
+        }
+      }
+    },
+    "offline": {
+      "badge": "Workspace asleep",
+      "body": "Workspace is asleep — showing the version presented on {{date}}. It becomes editable again when the session resumes.",
+      "bodyUndated": "Workspace is asleep — showing the last version presented. It becomes editable again when the session resumes."
+    }
+  },
   "common": {
+    "close": "Close",
     "save": "Save",
     "saving": "Saving...",
     "saved": "Saved",
     "delete": "Delete",
     "cancel": "Cancel",
+    "dismiss": "Dismiss",
     "edit": "Edit",
+    "rename": "Rename",
     "copy": "Copy",
     "copied": "Copied",
     "never": "Never",
     "default": "default",
     "noKey": "(no key)"
+  },
+  "externalImage": {
+    "title": "External image blocked",
+    "host": "Destination: {{host}}",
+    "unknownHost": "unknown host",
+    "explanation": "Loading contacts {{host}} through the SRW server and sends that host the URL path and query shown below. Your browser will render only the returned image bytes.",
+    "parameterWarning": "This URL contains query parameters. Review them for private information before loading.",
+    "unsupported": "Only public HTTPS image URLs on port 443, without credentials or fragments, can be loaded.",
+    "copyUrl": "Copy URL",
+    "copied": "Copied",
+    "blocked": "Blocked",
+    "idle": "Load image once",
+    "loading": "Loading…",
+    "loaded": "Image loaded",
+    "error": "Try loading again",
+    "loadFailed": "SRW could not load this URL as a safe public raster image.",
+    "missingAlt": "External image"
   },
   "nav": {
     "cockpit": "Cockpit",
@@ -19,15 +369,38 @@
     "jobs": "Jobs",
     "review": "Job Review",
     "projects": "Projects",
-    "datasources": "Data Sources",
+    "datasources": "Connectors",
+    "contacts": "Contacts",
+    "experts": "Experts",
+    "skills": "Skills",
     "automations": "Automations",
     "create": "Create",
-    "debug": "Debug",
+    "workbench": "Workbench",
     "settings": "Settings",
     "logout": "Logout",
     "admin": "admin",
     "collapseSidebar": "Collapse sidebar",
     "openSidebar": "Open sidebar"
+  },
+  "grants": {
+    "lockedShort": "Requires a capability grant",
+    "locked": {
+      "vm_workspace": "VM workspaces require the vm_workspace grant.",
+      "shell_tools": "Shell tools require the shell_tools grant.",
+      "delegation": "Delegation requires the delegation grant.",
+      "datasource_tools": "Connector tools require the datasource_tools grant.",
+      "browser": "Browser tools require the browser grant.",
+      "model_selection": "Your administrator limits which models you may select.",
+      "autonomy_ceiling": "Autonomy above your ceiling requires a grant.",
+      "permission_mode": "This permission mode requires a grant."
+    }
+  },
+  "adminExpertDefaults": {
+    "title": "Application expert defaults",
+    "desc": "These global database experts are preselected for users who do not have an active personal or project default.",
+    "worker": "New jobs",
+    "session": "New sessions",
+    "edit": "Edit selected expert"
   },
   "shell": {
     "newSession": "New session",
@@ -47,20 +420,46 @@
     "emptyHint": "Create a new project to get started",
     "createProject": "Create Project",
     "creating": "Creating...",
+    "createFailed": "Could not create the project. Check the details and try again.",
     "namePlaceholder": "Project name (required)",
     "descriptionPlaceholder": "Description (optional)",
     "goalPlaceholder": "Goal (optional)",
     "badgePersonal": "Personal",
     "jobsCount": "{{count}} jobs",
+    "jobsCountOne": "{{count}} job",
     "reposCount": "{{count}} repos",
+    "reposCountOne": "{{count}} repo",
     "membersCount": "{{count}} members",
+    "membersCountOne": "{{count}} member",
+    "emptyArchived": "No archived projects",
+    "emptyArchivedHint": "Archiving keeps a finished project out of lists and pickers without deleting anything",
+    "archivedNotice": "Archived projects are hidden from this list and from the New Job and New Session pickers. Unarchive one to create new work in it.",
     "status": {
       "active": "active",
-      "archived": "archived",
-      "deleted": "deleted"
+      "archived": "archived"
+    },
+    "filter": {
+      "active": "Active ({{count}})",
+      "archived": "Archived ({{count}})"
+    },
+    "action": {
+      "unarchive": "Unarchive",
+      "unarchiving": "Unarchiving..."
+    },
+    "tooltip": {
+      "unarchive": "Make this project active again so new jobs and sessions can target it"
     },
     "error": {
       "noAccess": "You don't have access to that project."
+    },
+    "externalKb": {
+      "toggle": "Use an external knowledge repository",
+      "hint": "Keep this project's knowledge base in your own private GitHub repository by attaching a knowledge base connector you created earlier.",
+      "selectPlaceholder": "Choose a knowledge base connector…",
+      "loading": "Loading connectors…",
+      "adoptHint": "The connector becomes this project's knowledge base: it is managed by the project from then on and is no longer available to others.",
+      "noConnectors": "You don't have a knowledge base connector yet. Create one for the repository first, then attach it here.",
+      "createConnector": "Create a connector"
     }
   },
   "automations": {
@@ -135,10 +534,13 @@
     "returnToChat": "Return to chat",
     "loading": "Loading sessions...",
     "empty": "No sessions yet. Create one to get started.",
+    "emptyCta": "Start chatting",
     "emptyFilterActive": "No active sessions.",
     "emptyFilterEnded": "No ended sessions.",
     "untitledSession": "Untitled Session",
     "confirmDelete": "Delete this session permanently?",
+    "confirmForceDelete": "The agent is still working on a turn in this session. Delete anyway? The in-flight turn will be lost.",
+    "confirmEndMidTurn": "The agent is still working on a turn. End the session anyway? The in-flight turn and any queued input will be lost.",
     "turnsOne": "turn",
     "turnsMany": "turns",
     "filter": {
@@ -164,33 +566,137 @@
       "modelConfigDefault": "Config default",
       "projectsLabel": "Projects",
       "projectsEmpty": "No projects available",
+      "projectArchived": "(archived)",
+      "projectArchivedWarning": "An archived project is still selected — creating a session against it will be refused. Deselect it, or unarchive the project.",
       "projectsHint": "Select projects for shared knowledge access",
       "permissionLabel": "Permission Mode",
       "permissionSupervised": "Supervised",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
       "creating": "Creating...",
+      "failed": "The session could not be created. Adjust the settings below and try again.",
       "create": "Create",
       "cancel": "Cancel",
       "expertLabel": "Expert",
       "expertLoading": "Loading experts...",
-      "createSession": "Create Session"
+      "expertSelectedPrefix": "Selected:",
+      "createSession": "Create Session",
+      "protectedCloud": "Protected cloud — agent writes are staged for your review",
+      "protectedCloudHint": "The agent gets read-only cloud access; its changes wait for your approval in the review panel."
+    },
+    "configDrift": {
+      "title": "Some of this session's setup is gone",
+      "intro": "Parts of this session's configuration aren't available anymore:",
+      "attentionNeeded": "This session's setup needs attention. Opening it now…",
+      "resumeAnyway": "Resume without them",
+      "startNew": "Start a new session",
+      "connector": {
+        "deleted": "Deleted connector — {{label}}",
+        "revoked": "Revoked connector — {{label}}",
+        "out_of_scope": "Revoked connector — {{label}}"
+      },
+      "project": {
+        "deleted": "Deleted project — {{label}}",
+        "revoked": "Revoked project — {{label}}",
+        "out_of_scope": "Revoked project — {{label}}"
+      },
+      "grant": {
+        "deleted": "Missing grant — {{label}}",
+        "revoked": "Missing grant — {{label}}",
+        "out_of_scope": "Missing grant — {{label}}"
+      },
+      "countSuffix": " (×{{count}})"
     }
   },
   "jobs": {
+    "pagination": {
+      "label": "Pagination",
+      "current": "Page {{page}}",
+      "goToPage": "Go to page {{page}}",
+      "previous": "Previous page",
+      "next": "Next page",
+      "pageSize": "Per page",
+      "rangeUnknown": "{{start}}–{{end}}"
+    },
+    "live": {
+      "on": "Live",
+      "paused": "Paused",
+      "pause": "Pause live updates",
+      "resume": "Resume live updates",
+      "pausedOnPage": "Live updates paused — viewing page {{page}}",
+      "backToLive": "Back to live",
+      "newJobs": "{{count}} new — show"
+    },
+    "origin": {
+      "user": "Submitted by a person",
+      "session": "Started from a session",
+      "automation": "Automation",
+      "loop": "Loop",
+      "officer": "Officer",
+      "subjob": "Sub-job",
+      "lifecycle": "System lifecycle",
+      "bench": "Benchmark"
+    },
     "title": "Jobs",
+    "confirmDelete": "Delete this job permanently? Any backlog-ticket claim remains and is not re-armed.",
+    "confirmCancel": "Cancel this job?",
+    "confirmCancelHint": "You can resume it later from a checkpoint.",
+    "confirmCancelDismiss": "Keep running",
+    "confirmCancelConfirm": "Cancel job",
     "loading": "Loading jobs...",
     "refresh": "Refresh",
+    "newJob": "New Job",
+    "reviewQueue": "Review ({{count}})",
     "noJobsFound": "No jobs found",
     "noJobsHintFilter": "Try selecting a different filter",
     "noJobsHintEmpty": "Create a new job to get started",
     "snapshotsSummary": "{{count}} snapshots · {{size}}",
-    "count": "Showing {{filtered}} of {{total}} jobs",
+    "count": "{{start}}–{{end}} of {{total}} jobs",
     "colJob": "Job",
+    "colProject": "Project",
     "colStatus": "Status",
     "colCreated": "Created",
     "colActions": "Actions",
+    "projectNone": "No project",
+    "projectUnknown": "Unknown project",
+    "failureReason": "Reason",
+    "workspace": {
+      "summary": "Workspace: requested {{requested}} · assigned {{assigned}} · effective {{effective}}",
+      "state": "Workspace state: {{state}} · detail: {{failure}}",
+      "default": "default",
+      "unavailable": "unavailable",
+      "none": "none"
+    },
     "filter": {
+      "token": {
+        "status": "Status: {{value}}",
+        "origin": "Source: {{value}}",
+        "project": "Project: {{name}}",
+        "noProject": "No project",
+        "search": "Search: {{term}}",
+        "systemHidden": "System jobs hidden",
+        "archived": "Archived projects hidden"
+      },
+      "statusGroup": "Filter by status",
+      "appliedGroup": "Applied filters",
+      "searchPlaceholder": "Search title or ID",
+      "searchLabel": "Search jobs",
+      "more": "Filters",
+      "clearAll": "Clear all",
+      "removeToken": "Remove filter: {{filter}}",
+      "resultAnnouncement": "{{count}} jobs match",
+      "panelTitle": "Filters",
+      "panelLabel": "Job filters",
+      "originLabel": "Source",
+      "originHint": "Where the job came from. Leave empty to show everything.",
+      "projectLabel": "Project",
+      "projectAll": "All projects",
+      "projectSearch": "Filter projects",
+      "noProject": "Only jobs with no project",
+      "noProjectHint": "Cannot be combined with specific projects.",
+      "archivedLabel": "Archived projects",
+      "includeArchived": "Include jobs from archived projects",
+      "includeArchivedHint": "Off by default — their jobs are hidden from this list.",
       "all": "All",
       "pending_review": "Review",
       "reviewing": "Reviewing",
@@ -200,9 +706,11 @@
       "completed": "Completed",
       "paused": "Paused",
       "failed": "Failed",
-      "cancelled": "Cancelled"
+      "cancelled": "Cancelled",
+      "blocked_undelivered": "Blocked / undelivered"
     },
     "status": {
+      "pending": "Pending",
       "pending_review": "Pending Review",
       "reviewing": "Reviewing",
       "waiting": "Waiting",
@@ -211,7 +719,10 @@
       "completed": "Completed",
       "paused": "Paused",
       "failed": "Failed",
-      "cancelled": "Cancelled"
+      "cancelled": "Cancelled",
+      "blocked_undelivered": "Blocked / undelivered",
+      "waiting_for_reply": "Waiting for reply",
+      "waiting_approval": "Waiting · approval"
     },
     "action": {
       "view": "View",
@@ -229,31 +740,39 @@
       "promote": "Promote",
       "createProject": "Create Project",
       "exportToCloud": "Export to cloud",
-      "exported": "Exported"
+      "openCloudFolder": "Open cloud folder",
+      "exported": "Exported",
+      "approveRequest": "Approve request"
     },
     "tooltip": {
-      "collapse": "Collapse sub-jobs",
-      "expand": "Expand sub-jobs",
-      "view": "View in debug panels",
-      "workspace": "Browse workspace in Gitea",
-      "ideSnapshot": "Open workspace in Web IDE (from snapshot)",
-      "ideCode": "Open workspace in Web IDE (code only)",
-      "ideStarting": "Starting IDE session...",
-      "pauseJob": "Pause job",
+      "approveRequest": "This job is waiting on a sudo/VM-upgrade decision — open the request in the inbox",
       "cancelJob": "Cancel job",
       "canceling": "Canceling job...",
+      "collapse": "Collapse sub-jobs",
+      "collapseDetails": "Hide job details",
       "confirmCancel": "Click again to confirm cancellation",
-      "reviewJob": "Review and approve/continue",
-      "resumeJob": "Resume from checkpoint",
       "confirmDelete": "Click again to confirm deletion",
-      "deleteJob": "Delete job",
-      "promoteJob": "Promote to project",
-      "exportToCloud": "Copy this job's output/ folder to a shared cloud folder",
-      "alreadyExported": "Already exported. Delete the cloud folder to re-export.",
-      "snapshotStats": "S3 snapshot storage",
-      "snapshotAvailable": "Environment snapshot available",
+      "delegationChild": "Delegation child (creation order {{order}})",
       "delegationWaiting": "Waiting for delegation children to complete",
-      "delegationChild": "Delegation child (creation order {{order}})"
+      "deleteJob": "Delete job",
+      "expand": "Expand sub-jobs",
+      "expandDetails": "Show job details",
+      "exportToCloud": "Copy this job's deliverables to a shared cloud folder",
+      "ideCode": "Open workspace in Web IDE (code only)",
+      "ideSnapshot": "Open workspace in Web IDE (from snapshot)",
+      "ideStarting": "Starting IDE session...",
+      "moreActions": "More actions",
+      "openCloudFolder": "Open this job's cloud folder in a new tab",
+      "pauseJob": "Pause job",
+      "promoteJob": "Promote to project",
+      "resumeJob": "Resume from checkpoint",
+      "reviewJob": "Review and approve/continue",
+      "reviewQueue": "Open the review queue",
+      "snapshotAvailable": "Environment snapshot available",
+      "snapshotStats": "S3 snapshot storage",
+      "subjobCount": "{{count}} sub-job(s) in this tree, filter or no filter",
+      "view": "Open in Workbench",
+      "workspace": "Browse workspace in Gitea"
     },
     "delegationChildren": "{{count}} children",
     "promote": {
@@ -263,10 +782,13 @@
     },
     "create": {
       "title": "Create New Job",
+      "backToJobs": "Back to Jobs",
       "dismiss": "Dismiss",
       "projectLabel": "Project",
       "projectNone": "No project",
       "projectPersonal": "(Personal)",
+      "projectArchived": "(archived)",
+      "projectArchivedWarning": "This project is archived — creating a job in it will be refused. Unarchive it, or pick another project.",
       "projectHint": "Select which project this job belongs to",
       "descriptionLabel": "Description",
       "descriptionPlaceholder": "Describe what the agent should accomplish...",
@@ -277,7 +799,7 @@
       "expertLabel": "Agent Expert",
       "expertLoading": "Loading experts...",
       "expertSelectedPrefix": "Selected:",
-      "expertHintUnselected": "Select an expert profile or leave unselected for the default agent",
+      "expertHintUnselected": "The effective default expert is selected automatically",
       "documentsLabel": "Documents",
       "dropHint": "Drop files here or click to browse",
       "maxHint": "Max {{maxFiles}} files, {{maxSizeMb}}MB each",
@@ -297,6 +819,38 @@
       "submit": "Create Job",
       "creating": "Creating...",
       "uploading": "Uploading..."
+    },
+    "detail": {
+      "auditSteps": "Audit steps",
+      "cost": "Cost",
+      "costFloor": "Priced {{priced}} of {{total}} metered events — the real cost is higher.",
+      "costFloorHint": "Partially priced: the real cost is higher than shown.",
+      "costMeteringOff": "Usage metering is turned off on this deployment.",
+      "costNoUsage": "No usage was metered for this job.",
+      "costPredatesLedger": "This job ran before usage metering started, so it has no figures.",
+      "costUnknown": "Usage could not be loaded.",
+      "costUnpriced": "Metered, but no rate card covers these models — tokens are exact, cost is unknown.",
+      "duration": "Duration",
+      "expert": "Expert",
+      "loading": "Loading details…",
+      "model": "Model",
+      "modelDefault": "Expert default",
+      "origin": "Origin",
+      "scopeCovers": "Summed across {{count}} jobs — this job and every sub-job beneath it, whether or not the current filter shows them.",
+      "scopeJob": "This job",
+      "scopeLabel": "Usage scope",
+      "scopeNoSubjobs": "This job has no sub-jobs, so both figures are the same.",
+      "scopeSubtree": "Incl. sub-jobs",
+      "showSubjobRows": "Show {{count}} hidden as rows",
+      "showSubjobRowsHint": "Adds sub-jobs to the origin filter, so they appear in the list.",
+      "subjobs": "Sub-jobs ({{count}})",
+      "tokens": "Tokens",
+      "unknown": "Unknown",
+      "usage": "Usage",
+      "usageLive": "still running — figures lag by up to 3 min",
+      "waitingNoLiveSubjobs": "Parked on a sub-job, but every one below has finished.",
+      "waitingOnSubjobs": "Parked on {{count}} unfinished sub-job(s) — the work is one level down.",
+      "workspace": "Workspace"
     }
   },
   "admin": {
@@ -321,6 +875,27 @@
         "noSettingChanges": "No setting changes to save.",
         "settingsSaved": "Inference settings saved.",
         "settingsSaveFailed": "Failed to save settings."
+      }
+    },
+    "usage": {
+      "cacheHit": "Cache hit",
+      "cachedTokens": "Cached tok.",
+      "vcpuHours": "vCPU-hours",
+      "memoryGibHours": "Memory GiB-hours",
+      "claimGibHours": "Claim GiB-hours",
+      "claimHours": "Claim-hours",
+      "volumeGibHours": "Volume GiB-hours",
+      "volumeHours": "Volume-hours",
+      "vcpuHoursShort": "vCPU-h",
+      "memoryGibHoursShort": "Memory GiB-h",
+      "memoryBreakdownUnavailable": "Memory is unavailable in this legacy breakdown because GiB-hours are not separated by category.",
+      "pageDescCloud": "LLM tokens and workspace CPU and memory allocations, metered from the usage ledger and scoped to your visibility. CPU and memory remain separate quantities. Canonical cost uses the rates captured by the ledger; the cloud cards reprice compute for planning without changing that history.",
+      "cloudEstimate": {
+        "title": "Cloud-equivalent estimate",
+        "subtitle": "Current public list prices applied to this window's requested workspace CPU and RAM. These are planning indicators, not invoices.",
+        "computeOnly": "Compute only",
+        "formulaMax": "Dominant CPU or RAM node share sets the estimate.",
+        "formulaSum": "CPU and RAM meter estimates are added."
       }
     },
     "providers": {
@@ -387,17 +962,10 @@
       }
     },
     "viewMode": {
-      "role": "Admin",
-      "scopeAll": "Viewing all",
-      "scopeMe": "Viewing my data",
-      "tooltip": {
-        "switchToMe": "Click to view only your own data",
-        "switchToAll": "Click to view fleet-wide data"
-      },
-      "pill": {
-        "label": "Viewing your data",
-        "showAll": "Show all",
-        "tooltip": "Switch back to fleet-wide view"
+      "banner": {
+        "text": "You're viewing all users' data.",
+        "showMine": "Show only mine",
+        "tooltip": "Switch to viewing only your own data"
       }
     }
   },
@@ -419,48 +987,94 @@
       "desc": "Your preferred interface language. Changes apply immediately.",
       "label": "Interface Language"
     },
-    "apiKeys": {
-      "title": "API Keys",
-      "desc": "Set your own API keys for LLM providers and tools. These take priority over system-wide keys when running jobs.",
-      "empty": "No API keys configured. Add one to use your own provider keys.",
-      "colProvider": "Provider",
-      "colKey": "Key",
-      "colLabel": "Label",
-      "colUpdated": "Updated",
-      "addTitle": "Add / Update Key",
-      "labelPlaceholder": "Label (optional)",
-      "keyPlaceholder": "API key (e.g. sk-...)",
-      "saveButton": "Save Key"
+    "voice": {
+      "title": "Read-aloud voice",
+      "desc": "The voice used when you read an assistant message aloud. Applies to every Read from now on.",
+      "provider": "Voice provider",
+      "providerHint": "Which speech engine reads messages aloud. Each provider offers its own set of voices.",
+      "label": "Voice",
+      "auto": "Default (auto)",
+      "customPlaceholder": "Voice id",
+      "sampleLabel": "Sample text (optional)",
+      "samplePlaceholder": "Type your own words to hear this voice say them…",
+      "sampleHint": "{{left}} characters left. Leave blank for a default phrase.",
+      "preview": "Preview voice",
+      "hostedPreview": "Play sample",
+      "previewFailed": "Couldn't play a preview — check your TTS setup.",
+      "loadingVoices": "Loading voices…",
+      "langNote": "Each voice's language is shown in brackets (e.g. [EN-US], [ES], [FR]); [multi] means multilingual.",
+      "kokoroNoGerman": "This backend has no German voice — for German, use an OpenAI (multilingual) voice.",
+      "libraryToggle": "Browse voice library",
+      "libraryAdminFlag": "Allow adding library voices",
+      "librarySearchPlaceholder": "Search voices (e.g. french english)",
+      "libraryAnyGender": "Any gender",
+      "female": "Female",
+      "male": "Male",
+      "librarySearch": "Search",
+      "libraryAdd": "Add",
+      "libraryAdded": "Added",
+      "libraryEmpty": "No voices found. Try a different search.",
+      "previewCaveat": "\"Play sample\" is the provider's demo clip — use \"Preview voice\" to hear the actual synthesis, which can sound different.",
+      "libraryPreviewCaveat": "Samples are provider demo clips and may not match the synthesized output (background noise, clarity). Add a voice, then use \"Preview voice\" to hear the real thing.",
+      "rewriteTitle": "How messages are rewritten",
+      "rewriteReasoningLabel": "Rewrite reasoning",
+      "rewriteReasoningHint": "Off is fastest. Turning it on makes the rewrite smarter but delays the first audio while the model thinks.",
+      "reasoningOff": "Off (fastest)",
+      "reasoningLow": "Low",
+      "reasoningMedium": "Medium",
+      "reasoningHigh": "High",
+      "rewritePromptLabel": "Custom rewrite instructions (optional)",
+      "rewritePromptHint": "Your standing preferences for how messages are read aloud — e.g. \"give me a TLDR for long messages\", \"skip tables\", \"leave out code file names\". These win over the defaults (except it never invents facts or changes numbers and names).",
+      "rewritePromptPlaceholder": "e.g. Summarize long messages and skip tables…",
+      "rewritePromptCounter": "{{left}} characters left.",
+      "rewriteSave": "Save rewrite settings"
     },
-    "llmEndpoints": {
-      "title": "LLM Endpoints",
-      "desc": "Register your own OpenAI-compatible endpoints (vLLM, Ollama, private gateway). Models on these endpoints are added by an admin via Admin → Models.",
-      "empty": "No custom endpoints. Add one to route models to your own server.",
-      "noKey": "no key",
-      "catalogHint": "An admin curates which models on this endpoint are available — see Admin → Models.",
-      "noModels": "No models attached yet. Add one below.",
-      "addTitle": "Add Endpoint",
-      "createButton": "Create Endpoint",
-      "labelPlaceholder": "Label (e.g. My vLLM)",
-      "baseUrlPlaceholder": "Base URL (e.g. https://vllm.example/v1)",
-      "apiKeyPlaceholder": "API key (optional)",
-      "allowInsecure": "Allow http:// (not recommended outside local dev)",
-      "confirmDelete": "Delete this endpoint and all its model rows?",
-      "testButton": "Test",
-      "testing": "Testing...",
-      "testOk": "OK ({{status}})",
-      "testFail": "Failed ({{status}}): {{error}}",
-      "colModelId": "Model ID",
-      "colDisplayName": "Display name",
-      "colFamily": "Family",
-      "colContext": "Context",
-      "modelIdPlaceholder": "Model ID (e.g. my-org/my-model)",
-      "displayNamePlaceholder": "Display name",
-      "familyPlaceholder": "Family (optional)",
-      "contextPlaceholder": "Context window (tokens)",
-      "addModelButton": "Add Model",
-      "errorUrlScheme": "Base URL must start with http:// or https://",
-      "errorHttpNeedsOptIn": "http:// URLs require the Allow http:// checkbox."
+    "dataVisibility": {
+      "title": "Data visibility",
+      "desc": "Admins see all users' data by default. Switch to \"Only my data\" to work as a regular user would. The choice is saved to your account and applies everywhere.",
+      "label": "Show",
+      "optionAll": "All data",
+      "optionMe": "Only my data"
+    },
+    "apiKeys": {
+      "linkTitle": "Personal Access Tokens",
+      "linkDesc": "Bearer tokens for n8n, scripts, and other automation tools that need to call the orchestrator API.",
+      "linkManage": "Manage API Keys",
+      "title": "Personal Access Tokens",
+      "desc": "Bearer tokens for automation tools that talk to the orchestrator API directly. Each token has its own action scopes and expiry. Lost tokens cannot be recovered — generate a new one.",
+      "existingTitle": "Your tokens",
+      "colName": "Name",
+      "colScopes": "Scopes",
+      "colHint": "Token",
+      "colLastUsed": "Last used",
+      "colExpires": "Expires",
+      "empty": "No tokens yet. Create one below.",
+      "rotate": "Rotate",
+      "revoke": "Revoke",
+      "rotatedBadge": "Rotating",
+      "createTitle": "Create new token",
+      "createDesc": "Pick the scopes the automation actually needs. Admin scope is gated on your admin role and grants destructive operations.",
+      "namePlaceholder": "Token name (e.g. n8n production)",
+      "scopesLegend": "Scopes",
+      "scopes": {
+        "jobsRead": "List and inspect jobs, projects, audit trail.",
+        "jobsWrite": "Create, cancel, resume jobs; send messages; attach files.",
+        "chatRead": "Read persistent threads and message history.",
+        "chatWrite": "Create threads, send messages, run slash commands.",
+        "knowledgeRead": "Search knowledge, list sources and citations.",
+        "knowledgeWrite": "Create, update, delete knowledge notes and citations.",
+        "admin": "Sudo approvals, user/project admin, connector admin."
+      },
+      "expiryLabel": "Expiry",
+      "expiryNever": "Never expires (with warning)",
+      "create": "Create token",
+      "creating": "Creating…",
+      "copyWarning": "Copy this token now — it won't be shown again.",
+      "copyDetail": "Store it in your password manager or n8n credential. Anyone with this token can call the orchestrator API as you, within the chosen scopes.",
+      "copyAck": "I have safely copied this token.",
+      "copyDone": "Done",
+      "usageTitle": "How to use",
+      "usageDesc": "Pass the token in an Authorization header. n8n's Header Auth credential type works out of the box."
     },
     "preferences": {
       "title": "Preferences",
@@ -491,6 +1105,24 @@
       "providerOpenrouter": "OpenRouter",
       "save": "Save Preferences"
     },
+    "expertDefaults": {
+      "title": "Default assistants",
+      "desc": "Choose the database expert preselected for new jobs and sessions. Your model and behavior preferences below only fill fields that the selected expert leaves unspecified.",
+      "worker": "New jobs",
+      "session": "New sessions",
+      "useApplication": "Use the application default",
+      "customize": "Customize a copy",
+      "clear": "Clear personal default",
+      "manage": "Manage my experts",
+      "restricted": "Your administrator controls default assistants. You can still clear an older personal selection.",
+      "effective": "Effective: {{name}} ({{source}})",
+      "source": {
+        "application": "application default",
+        "user": "your default",
+        "project": "project default",
+        "explicit": "explicit selection"
+      }
+    },
     "persistent": {
       "title": "Persistent Agent",
       "desc": "Default settings for interactive persistent agent sessions. Can be overridden per-session.",
@@ -507,6 +1139,11 @@
       "permissionSupervised": "Supervised",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
+      "workspaceBackend": "Default Workspace",
+      "workspaceBackendHint": "Where new sessions keep their files. Virtual starts in seconds and can be upgraded to a container mid-session; Container has full shell and git from the start but takes longer to provision.",
+      "workspaceVirtual": "Virtual — instant, cloud file storage",
+      "workspaceSandbox": "Container — full shell & git, slower start",
+      "workspaceNone": "None — chat only, no files",
       "configDefault": "Default",
       "configDeveloper": "Developer",
       "configScholar": "Scholar",
@@ -564,52 +1201,15 @@
       "webConnectorDesc": "Add this URL as a custom MCP connector. OAuth login is handled automatically — no token or credentials needed.",
       "webConnectorHint": "Works with any MCP client that supports OAuth 2.1 (Authorization Code + PKCE). Leave the Client ID and Client Secret fields empty — the server handles registration automatically."
     },
-    "apiKeys": {
-      "linkTitle": "Personal Access Tokens",
-      "linkDesc": "Bearer tokens for n8n, scripts, and other automation tools that need to call the orchestrator API.",
-      "linkManage": "Manage API Keys",
-      "title": "Personal Access Tokens",
-      "desc": "Bearer tokens for automation tools that talk to the orchestrator API directly. Each token has its own action scopes and expiry. Lost tokens cannot be recovered — generate a new one.",
-      "existingTitle": "Your tokens",
-      "colName": "Name",
-      "colScopes": "Scopes",
-      "colHint": "Token",
-      "colLastUsed": "Last used",
-      "colExpires": "Expires",
-      "empty": "No tokens yet. Create one below.",
-      "rotate": "Rotate",
-      "revoke": "Revoke",
-      "rotatedBadge": "Rotating",
-      "createTitle": "Create new token",
-      "createDesc": "Pick the scopes the automation actually needs. Admin scope is gated on your admin role and grants destructive operations.",
-      "namePlaceholder": "Token name (e.g. n8n production)",
-      "scopesLegend": "Scopes",
-      "scopes": {
-        "jobsRead": "List and inspect jobs, projects, audit trail.",
-        "jobsWrite": "Create, cancel, resume jobs; send messages; attach files.",
-        "chatRead": "Read persistent threads and message history.",
-        "chatWrite": "Create threads, send messages, run slash commands.",
-        "knowledgeRead": "Search knowledge, list sources and citations.",
-        "knowledgeWrite": "Create, update, delete knowledge notes and citations.",
-        "admin": "Sudo approvals, user/project admin, datasource admin."
-      },
-      "expiryLabel": "Expiry",
-      "expiryNever": "Never expires (with warning)",
-      "create": "Create token",
-      "creating": "Creating…",
-      "copyWarning": "Copy this token now — it won't be shown again.",
-      "copyDetail": "Store it in your password manager or n8n credential. Anyone with this token can call the orchestrator API as you, within the chosen scopes.",
-      "copyAck": "I have safely copied this token.",
-      "copyDone": "Done",
-      "usageTitle": "How to use",
-      "usageDesc": "Pass the token in an Authorization header. n8n's Header Auth credential type works out of the box."
-    },
     "codex": {
       "title": "Codex Proxy",
       "desc": "Manage the Codex OAuth proxy for ChatGPT subscription-backed models",
       "checking": "Checking proxy...",
       "connected": "Connected",
       "notConnected": "Not connected",
+      "notEnabled": "Proxy not enabled",
+      "disabledTitle": "Codex proxy isn't enabled",
+      "disabledDesc": "This deployment isn't running the Codex OAuth proxy, so ChatGPT subscription-backed models aren't available. To enable it, set the following in your Helm values overlay, redeploy, then reload this page:",
       "refreshStatus": "Refresh status",
       "disconnect": "Disconnect",
       "availableModels": "Available Models",
@@ -624,6 +1224,14 @@
       "submitting": "Submitting...",
       "completeLogin": "Complete Login",
       "portForwardHint": "If you have kubectl port-forward active, login will complete automatically.",
+      "usage": {
+        "title": "Usage limits",
+        "session": "Current session",
+        "weekly": "Weekly limit",
+        "resetsIn": "Resets in {{time}}",
+        "limitReached": "Limit reached",
+        "disclaimer": "The proxy doesn't expose usage: ChatGPT meters proxy-routed requests as 'extra usage' outside these windows, so these bars don't reflect usage through the proxy yet."
+      },
       "errors": {
         "urlMissingParams": "URL is missing required parameters. Please paste the complete URL from your browser address bar.",
         "invalidUrl": "Invalid URL. Please paste the complete URL from your browser address bar.",
@@ -649,7 +1257,7 @@
       "agentUser": "Agent user",
       "credentialsRef": "Credentials ref (optional)",
       "secretProvenance": "Secret provenance",
-      "secretSet": "set ({{chars}} chars)",
+      "secretSet": "set",
       "secretUnset": "unset",
       "testing": "Testing…",
       "test": "Test",
@@ -665,7 +1273,7 @@
         "saved": "Saved — active backend is now {{backend}}",
         "savedReloaded": "Saved — active backend is now {{backend}} (reloaded)",
         "saveFailed": "Save failed",
-        "overlayCleared": "Overlay cleared — active backend rebuilt from env vars",
+        "overlayCleared": "Environment configuration attested and activated; backend history was retained",
         "resetFailed": "Reset failed"
       }
     },
@@ -685,11 +1293,13 @@
       "overview": "Overview",
       "jobs": "Jobs",
       "knowledge": "Knowledge",
-      "datasources": "Data Sources",
+      "datasources": "Connectors",
       "repos": "Repos",
       "experts": "Experts",
       "members": "Members",
-      "settings": "Settings"
+      "settings": "Settings",
+      "loop": "Loop",
+      "centurion": "Centurion"
     },
     "overview": {
       "description": "Description",
@@ -697,12 +1307,13 @@
       "noDescription": "No description",
       "noGoal": "No goal set",
       "statsJobs": "Jobs",
-      "statsDatasources": "Data Sources",
+      "statsDatasources": "Connectors",
       "statsRepos": "Repos",
       "statsMembers": "Members",
       "defaultConfig": "Default Config",
       "created": "Created",
       "edit": "Edit",
+      "archivedReadOnly": "This project is archived. Its description and goal are read-only — unarchive it to edit them.",
       "openFolder": "Open Project Folder",
       "manageAutomations": "Manage automations",
       "save": "Save",
@@ -714,10 +1325,19 @@
       "colStatus": "Status",
       "colDescription": "Description",
       "colConfig": "Config",
-      "colBranch": "Branch",
-      "colMerge": "Merge"
+      "colBranch": "Execution repository",
+      "colMerge": "Delivery"
     },
     "knowledge": {
+      "attachTitle": "External knowledge repository",
+      "attachHint": "This project has no knowledge repository yet. Attach a knowledge base connector to keep its notes in your own private GitHub repository.",
+      "attachSelectPlaceholder": "Choose a knowledge base connector…",
+      "attachNoConnectors": "No knowledge base connector yet. Create one for the repository first, then attach it here.",
+      "attachCreateConnector": "Create a connector",
+      "attachAdoptHint": "The connector becomes this project's knowledge base: it is managed by the project from then on and is no longer available to others.",
+      "attachSubmit": "Attach",
+      "attachSubmitting": "Attaching…",
+      "attachFailed": "Could not attach that connector.",
       "totalLabel": "Total",
       "searchPlaceholder": "Search knowledge...",
       "search": "Search",
@@ -750,9 +1370,14 @@
       "exportedAlert": "Exported {{count}} notes to:\n{{path}}"
     },
     "datasources": {
-      "selectPlaceholder": "Select a datasource...",
+      "selectPlaceholder": "Select a connector...",
+      "searchPlaceholder": "Search available connectors...",
+      "loadingCandidates": "Loading available connectors...",
+      "candidatesLoadFailed": "Available connectors could not be loaded.",
+      "retry": "Retry",
+      "noCandidates": "No available connectors match this project and search.",
       "link": "Link",
-      "empty": "No datasources linked to this project",
+      "empty": "No connectors linked to this project",
       "colName": "Name",
       "colType": "Type",
       "colDescription": "Project Description",
@@ -762,6 +1387,7 @@
       "accessDefault": "Default (Read-write)",
       "accessReadOnly": "Read-only",
       "accessReadWrite": "Read-write",
+      "accessKbReadOnlyHint": "External OKF Knowledge Bases are read-only to agents in this release.",
       "unlink": "Unlink"
     },
     "repos": {
@@ -782,12 +1408,12 @@
       "colActions": "Actions",
       "yes": "Yes",
       "no": "No",
-      "remove": "Remove"
+      "remove": "Remove",
+      "protected": "Protected"
     },
     "experts": {
       "loading": "Loading experts...",
-      "emptyPrefix": "No project experts yet. Add expert configs to the",
-      "emptySuffix": "directory in the jobs repo."
+      "emptyPrefix": "No experts are linked to this project in the expert catalog."
     },
     "members": {
       "selectUser": "Select user...",
@@ -827,13 +1453,42 @@
       "dangerZone": "Danger Zone",
       "defaultProjectWarning": "This is your default personal project and cannot be archived or deleted.",
       "archiveTitle": "Archive Project",
-      "archiveDesc": "Mark this project as archived. Jobs will no longer be created.",
+      "archiveDesc": "Mark this project as archived. It leaves the project list and the New Job and New Session pickers, its loop and officer stop, and pending jobs are parked. Work already running finishes.",
       "archive": "Archive",
+      "archiveConfirmTitle": "Archive project?",
       "archiveConfirm": "Are you sure you want to archive this project?",
+      "archivedReportBase": "Project archived.",
+      "archivedReportLoop": "The project loop was paused.",
+      "archivedReportOfficer": "The officer was put on hold.",
+      "archivedReportJobs": "{{count}} pending jobs were parked.",
+      "archivedReportJobsOne": "{{count}} pending job was parked.",
+      "unarchiveTitle": "Unarchive Project",
+      "unarchiveDesc": "Make this project active again so new jobs and sessions can target it. Anything archiving paused stays paused until you resume it.",
+      "unarchive": "Unarchive",
+      "unarchiveConfirmTitle": "Unarchive project?",
+      "unarchiveConfirm": "Unarchive this project? New work will be allowed against it again; the loop, officer and parked jobs stay paused.",
+      "archivedReadOnly": "This project is archived, so its settings are read-only. Unarchive it to edit them — everything below stays visible in the meantime.",
       "deleteTitle": "Delete Project",
       "deleteDesc": "Permanently delete this project and its managed repositories.",
       "delete": "Delete",
       "deleteConfirm": "Are you sure you want to permanently delete this project? This cannot be undone."
+    }
+  },
+  "projectBacklog": {
+    "title": "Backlog",
+    "refresh": "Refresh",
+    "totalLabel": "Total",
+    "inProgress": "In progress",
+    "empty": "No open tickets yet — the loop's scholars will file ideas here.",
+    "priority": {
+      "high": "High",
+      "normal": "Normal",
+      "low": "Low"
+    },
+    "type": {
+      "feature": "Feature",
+      "issue": "Issue",
+      "idea": "Idea"
     }
   },
   "chat": {
@@ -855,6 +1510,7 @@
     "jumpToLatest": "Jump to latest · {{count}} new",
     "header": {
       "settingsTooltip": "Session settings",
+      "viewMenuTooltip": "View options",
       "filesButton": "Files",
       "filesTooltip": "Open session files in Cloud",
       "gitButton": "Git",
@@ -862,18 +1518,90 @@
       "ideButton": "IDE",
       "ideActiveTooltip": "Open workspace in IDE",
       "ideLoadingTooltip": "Workspace starting...",
-      "disconnect": "Disconnect"
+      "citationsButton": "Citations",
+      "citationsTooltip": "Show this session's citations",
+      "moreActions": "More actions",
+      "disconnect": "Disconnect",
+      "projectFilesButton": "Project files",
+      "projectFilesTooltip": "Open the {{name}} project folder in your cloud",
+      "sessionFilesButton": "Session files"
+    },
+    "citations": {
+      "title": "Citations",
+      "empty": "No citations yet. Ask the agent to research and cite a source.",
+      "close": "Close",
+      "viewOriginal": "View original",
+      "checkSource": "Check source",
+      "checking": "Checking…",
+      "driftUnchanged": "Source unchanged since cited",
+      "driftChanged": "Source changed since cited",
+      "driftUnreachable": "Live source not reachable",
+      "driftUnknown": "Drift unknown",
+      "statusVerified": "Verified",
+      "statusPending": "Verifying…",
+      "statusFailed": "Unverified",
+      "statusUnknown": "Unknown"
     },
     "status": {
       "temp": "temp {{value}}",
-      "turn": "Turn {{count}}"
+      "turn": "Turn {{count}}",
+      "agentQuiet": "Working — no output for {{seconds}}s",
+      "cloudSyncOff": "Cloud sync off",
+      "cloudSyncOffTooltip": "Cloud sync could not start for this session. The workspace may be missing files from the cloud, and changes won't be saved back to it."
+    },
+    "cloudReview": {
+      "regionLabel": "Pending cloud review",
+      "title": "{{count}} cloud changes are waiting for your review",
+      "titleSingular": "{{count}} cloud change is waiting for your review",
+      "subtitle": "Nothing has been written to your cloud yet",
+      "staged": "staged {{at}}",
+      "action": "Review changes",
+      "unknownTitle": "Couldn't check for pending cloud changes",
+      "unknownBody": "This session uses a protected cloud folder, so there may be changes waiting. Try again, or open the review to see what went wrong.",
+      "recheck": "Check again",
+      "openReview": "Open review",
+      "receiptRegionLabel": "Last cloud review result",
+      "receiptApplied": "Last cloud review: applied — {{applied}} written, {{deleted}} deleted",
+      "receiptRejected": "Last cloud review: staged changes discarded",
+      "receiptLocal": "this browser only",
+      "viewResult": "View result"
     },
     "turn": {
       "collapsedEmpty": "Tool calls only",
       "thoughtCount": "{{count}} thoughts",
       "textCount": "{{count}} text blocks",
       "toolCount": "{{count}} tool calls",
-      "toolGroup": "{{count}}× tool calls"
+      "foldMore": "+{{count}} more",
+      "foldFailed": "⚠ {{count}} failed",
+      "parked": "This turn stopped after repeated executor failures and needs operator intervention."
+    },
+    "queued": {
+      "notSent": "Not sent",
+      "waiting": "Queued — waiting to send",
+      "retry": "Retry",
+      "discard": "Discard"
+    },
+    "rewind": {
+      "button": "Rewind to here",
+      "title": "Rewind session",
+      "caveat": "Commands with external effects (network calls, deployments) can't be undone.",
+      "both": "Restore conversation and files",
+      "bothDesc": "Hide later messages and revert files to this point",
+      "conversation": "Restore conversation only",
+      "conversationDesc": "Files keep their current state",
+      "code": "Restore files only",
+      "codeDesc": "The conversation stays intact",
+      "summarize": "Summarize up to here",
+      "summarizeDesc": "Compact everything up to this point into a summary",
+      "pickerTitle": "Rewind to…",
+      "pickerHint": "Pick a message to rewind to:",
+      "pickerEmpty": "No previous messages to rewind to yet.",
+      "pickerFilter": "Type to filter messages…",
+      "pickerNoMatches": "No messages match.",
+      "yesterday": "Yesterday",
+      "hidesOne": "hides 1 later message",
+      "hidesMany": "hides {{count}} later messages",
+      "refillHint": "Your message returns to the composer so you can edit and resend it."
     },
     "diff": {
       "replace": "Diff",
@@ -881,6 +1609,23 @@
       "prepend": "Prepended",
       "write": "Written",
       "truncated": "+{{count}} more lines"
+    },
+    "settingsPane": {
+      "title": "Session settings",
+      "close": "Close settings",
+      "fixedNote": "Expert and projects are set at session creation and shown in the session list.",
+      "upgradeConfirm": {
+        "sandbox": {
+          "title": "Upgrade to a container?",
+          "body": "Starts a workspace container and copies your files into it. Adds shell, git and browser tools. Takes about a minute."
+        },
+        "vm": {
+          "title": "Upgrade to a VM?",
+          "body": "Provisions a dedicated virtual machine with root and sudo, and copies your files onto it. A cold start takes 6–25 minutes."
+        },
+        "irreversible": "This can't be undone — the session can't move back down a tier.",
+        "confirm": "Upgrade"
+      }
     },
     "settings": {
       "mode": "Mode",
@@ -898,7 +1643,15 @@
       "reasoningExpanded": "Expanded",
       "reasoningCollapsed": "Collapsed",
       "toolCallsExpanded": "Expanded",
-      "toolCallsCollapsed": "Collapsed"
+      "toolCallsCollapsed": "Collapsed",
+      "readingWidth": "Reading width",
+      "widthComfortable": "Comfortable",
+      "widthWide": "Wide",
+      "widthFull": "Full width",
+      "textSize": "Text size",
+      "textSmall": "Small",
+      "textMedium": "Medium",
+      "textLarge": "Large"
     },
     "tasks": {
       "header": "Tasks {{done}}/{{total}}",
@@ -914,16 +1667,48 @@
       "banner": "Context summarized",
       "viewSummary": "View summary"
     },
+    "compactionLive": {
+      "title": "Compacting context",
+      "ctx": "context {{pct}}%",
+      "planning": "Planning passes…",
+      "pass": "Pass {{current}}/{{total}} · summarizing messages {{first}}–{{last}}",
+      "retry": "(retry {{attempt}}/3)",
+      "footer": "Compacting — pass {{current}} of {{total}} · {{elapsed}}"
+    },
+    "usage": {
+      "input": "Input",
+      "reasoning": "Reasoning",
+      "reasoningEstimatedHint": "Estimated from the captured reasoning text — counted within Output (this model reports no separate reasoning-token count).",
+      "output": "Output",
+      "ctx": "Ctx",
+      "ctxHint": "Context fill toward the auto-compaction point — at 100% the agent summarizes older context to free room."
+    },
     "empty": {
       "title": "What shall we conquer today?",
       "subtitle": "The agent is connected and listening. Issue a brief, or pick a starting point below."
     },
+    "draft": {
+      "title": "What shall we conquer today?",
+      "subtitle": "Just start typing — your session spins up when you send.",
+      "advanced": "Advanced options",
+      "connectorsLabel": "Default connectors",
+      "connectorsLoading": "Loading default connectors…",
+      "connectorsFailed": "Default connectors could not be loaded.",
+      "connectorsRetry": "Retry",
+      "connectorsCount": "Default connectors ({{count}})",
+      "defaultsFailed": "Your default project and connectors could not be loaded. Retry before sending."
+    },
     "ended": {
       "eyebrow": "Resumable",
       "title": "Resume this session?",
-      "body": "This session is currently ended. Resume to bring the agent back online and continue where you left off.",
+      "body": "This session is ended. Type below and send to bring the agent back and continue where you left off — or resume now without typing.",
       "endedAt": "Session ended {{ date }}",
       "resume": "Resume"
+    },
+    "ending": {
+      "eyebrow": "Finishing safely",
+      "title": "Ending this session…",
+      "body": "The agent is finishing local work and preserving any protected-cloud review. You can resume after completion is confirmed."
     },
     "startup": {
       "title": "Starting session",
@@ -932,6 +1717,7 @@
         "creating": "Creating thread",
         "provisioning": "Provisioning agent",
         "booting": "Booting agent runtime",
+        "bootingVm": "Booting VM (this can take a few minutes)",
         "connecting": "Establishing connection"
       }
     },
@@ -951,8 +1737,27 @@
     "permission": {
       "title": "Permission required",
       "approve": "Approve",
+      "singleTitle": "The agent wants to run a tool",
+      "batchTitle": "The agent wants to run {{count}} tool(s)",
+      "approveAll": "Approve all",
       "autoAccept": "Auto-accept",
       "stop": "Stop"
+    },
+    "control": {
+      "backpressure": "Too many session setting changes are waiting. Try again shortly.",
+      "admissionFailed": "The session setting could not be changed. Try again.",
+      "ownerRejected": "The serving agent rejected this session setting. Reload and try again."
+    },
+    "workspaceOffer": {
+      "title": "Workspace upgrade requested",
+      "detail": "The agent asked for a {{tier}} workspace.",
+      "upgradeAndContinue": "Upgrade & continue",
+      "upgrade": "Upgrade",
+      "deny": "Deny",
+      "denyStarter": "Don't upgrade the workspace — ",
+      "continueMessage": "The workspace is ready — shell, git, and file tools are now available. Please continue where you left off.",
+      "provisioning": "Provisioning {{tier}}…",
+      "willContinue": "Will continue automatically when ready."
     },
     "approval": {
       "pendingTitle": "Approval needed to run this tool",
@@ -971,16 +1776,36 @@
       "working": "Agent is working...",
       "reconnecting": "Disconnected — reconnecting…",
       "uploading": "Uploading attachments…",
-      "default": "Type a message... (Enter to send, Shift+Enter for newline)"
+      "default": "Type a message... (Enter to send, Shift+Enter for newline)",
+      "defaultMobile": "Type a message...",
+      "resuming": "Resuming session…",
+      "ending": "Session is finishing safely…",
+      "endedSendResumes": "Type a message — sending resumes the session",
+      "suspendedSendResumes": "Type a message — sending wakes the session"
+    },
+    "upload": {
+      "stage": "Uploading {{done}} of {{total}}…",
+      "stagePercent": "Uploading {{done}} of {{total}} — {{percent}}%",
+      "progressLabel": "Send progress",
+      "sending": "Sending…",
+      "waitingOn": "Waiting for {{name}}…",
+      "failed": "{{name}} could not be uploaded",
+      "removeAndSend": "Remove file and send",
+      "slashCommandWithAttachments": "Remove the attached files before running a command.",
+      "duplicateFile": "{{name}} is already attached",
+      "tooLarge": "{{name}} is larger than the 100 MB limit",
+      "tooManyFiles": "You can attach at most 20 files at once",
+      "noWorkspace": "This session has no workspace, so files cannot be attached."
     },
     "composer": {
       "attach": "Attach",
       "chooseFile": "Choose file",
       "takePhoto": "Take photo",
       "capturePhoto": "Capture photo",
-      "recordVoice": "Hold to record voice message",
+      "recordVoice": "Record voice message",
       "recordingStop": "Stop recording",
       "recordingCancel": "Cancel recording",
+      "recordingCapWarning": "Recording stops soon",
       "remove": "Remove",
       "send": "Send",
       "stop": "Stop",
@@ -990,7 +1815,8 @@
       "micDenied": "Microphone permission denied",
       "micError": "Could not start recording",
       "transcribing": "Transcribing audio…",
-      "transcribeError": "Couldn't transcribe — audio attached as-is"
+      "transcribeError": "Couldn't transcribe — audio attached as-is",
+      "sttNotConfigured": "Voice input isn't set up yet"
     },
     "tts": {
       "play": "Read aloud",
@@ -1000,7 +1826,39 @@
       "spokenVersion": "Spoken version",
       "part": "Part {{current}} of {{total}}",
       "preparing": "Preparing audio…",
-      "generatingPart": "Generating part {{current}} of {{total}}…"
+      "generatingPart": "Generating audio — part {{current}} of {{total}}…",
+      "notConfigured": "Read aloud isn't set up yet",
+      "tapToPlay": "Tap to play",
+      "preparingRead": "Preparing to read aloud…",
+      "rewriting": "Rewriting text for speech…",
+      "rewriteSlow": "Still rewriting — the language model is responding slowly…",
+      "expectation": "Reading starts as soon as the first part is ready.",
+      "readAsIs": "Skip the rewrite — read it plainly now",
+      "playingGenerating": "Playing · generating part {{current}} of {{total}}…",
+      "ready": "Ready · {{parts}} parts",
+      "cancel": "Cancel read-aloud",
+      "cancelled": "Read-aloud cancelled — {{parts}} parts kept",
+      "rewritingSkipped": "Rewriting skipped — reading the original text.",
+      "rewriteFailed": "Couldn't prepare the text for speech — the language model didn't respond.",
+      "tryAgain": "Try again",
+      "nothingToRead": "There's nothing to read aloud in this message.",
+      "noSession": "Couldn't read this aloud — the session reference is missing.",
+      "dismiss": "Dismiss",
+      "partFailed": "Part {{part}} of {{total}} failed to generate.",
+      "retryPart": "Retry part {{part}}",
+      "autoRetry": "Audio server didn't respond — retrying (attempt {{attempt}} of {{max}})…",
+      "hardFail": "Audio generation failed after {{part}} of {{total}} parts. Your finished parts are kept.",
+      "keepReading": "You can keep reading the text above.",
+      "pause": "Pause",
+      "prevPart": "Previous section",
+      "nextPart": "Next section",
+      "speed": "Playback speed",
+      "err": {
+        "paymentRequired": "This voice needs a paid ElevenLabs plan or more credit. Try a different voice in Settings.",
+        "auth": "The speech provider rejected its API key. Ask an admin to check the provider setup.",
+        "rateLimit": "The speech provider is rate-limiting right now. Try again in a moment.",
+        "generic": "Audio generation failed. Try again."
+      }
     },
     "code": {
       "expandHint": "Click to expand",
@@ -1010,6 +1868,7 @@
       "compact": "Compress conversation history to free up context",
       "done": "End session — extract memories and archive",
       "undo": "Undo file changes from the last turn",
+      "rewind": "Rewind to an earlier message",
       "auto": "Switch to auto-accept mode (approve all except shell)",
       "supervised": "Switch to supervised mode (approve all writes)",
       "autonomous": "Switch to autonomous mode (approve nothing)",
@@ -1097,45 +1956,187 @@
       "cloud": "Cloud storage",
       "communication": "Communication",
       "delegation": "Delegating work",
-      "orchestrator": "Orchestrator",
+      "orchestrator": "Fleet management",
+      "agent_catalog": "Looking up experts and skills",
+      "catalog_authoring": "Authoring experts and automations",
+      "workflows": "Managing automations and loops",
       "evaluation": "Evaluation"
     },
     "toolContext": {
       "searchFor": "for \"{{term}}\"",
       "commandDash": "— {{cmd}}"
+    },
+    "categoryNouns": {
+      "browser_direct": "browser steps",
+      "citation": "citations",
+      "cloud": "cloud ops",
+      "communication": "messages",
+      "core": "tasks",
+      "delegation": "delegations",
+      "evaluation": "evals",
+      "git": "git ops",
+      "graph": "graph ops",
+      "knowledge": "KB ops",
+      "mongodb": "queries",
+      "orchestrator": "fleet ops",
+      "other": "steps",
+      "research": "searches",
+      "session_task": "tasks",
+      "shell": "commands",
+      "sql": "queries",
+      "thought": "thoughts",
+      "workspace": "files"
+    },
+    "categoryNounsOne": {
+      "browser_direct": "browser step",
+      "citation": "citation",
+      "cloud": "cloud op",
+      "communication": "message",
+      "core": "task",
+      "delegation": "delegation",
+      "evaluation": "eval",
+      "git": "git op",
+      "graph": "graph op",
+      "knowledge": "KB op",
+      "mongodb": "query",
+      "orchestrator": "fleet op",
+      "other": "step",
+      "research": "search",
+      "session_task": "task",
+      "shell": "command",
+      "sql": "query",
+      "thought": "thought",
+      "workspace": "file"
     }
   },
+  "experts": {
+    "title": "Experts",
+    "new": "New Expert",
+    "import": "Import",
+    "empty": "No experts yet. Create one or duplicate a built-in.",
+    "loading": "Loading experts…",
+    "filterAll": "All",
+    "filterWorker": "Worker",
+    "filterSession": "Session",
+    "colName": "Name",
+    "colType": "Type",
+    "colSource": "Source",
+    "colActions": "Actions",
+    "moreActions": "More actions",
+    "edit": "Edit",
+    "duplicate": "Duplicate",
+    "export": "Export",
+    "delete": "Delete",
+    "cancel": "Cancel",
+    "save": "Save",
+    "bundledReadonly": "built-in",
+    "confirmDeleteTitle": "Delete expert?",
+    "confirmDeleteBody": "This permanently deletes",
+    "deleted": "Expert deleted",
+    "duplicated": "Expert duplicated",
+    "duplicatedMissingGrants": "Expert duplicated, but removed because you lack these grants: {{grants}}",
+    "forkedMissingGrants": "Your new default was created, but removed because you lack these grants: {{grants}}",
+    "imported": "Expert imported",
+    "inUse": "Expert is in use by {{count}} job(s)",
+    "saveFailed": "Save failed",
+    "invalidJson": "Invalid JSON file"
+  },
+  "skills": {
+    "title": "Skills",
+    "new": "New Skill",
+    "newTitle": "New Skill",
+    "editTitle": "Edit Skill",
+    "import": "Import",
+    "empty": "No skills yet. Create one or import a Claude Code skill.",
+    "colName": "Name",
+    "colSource": "Source",
+    "colActions": "Actions",
+    "moreActions": "More actions",
+    "displayName": "Display name",
+    "icon": "Icon (Material Symbol)",
+    "color": "Color (hex)",
+    "tags": "Tags (comma separated)",
+    "filesHint": "A skill is a directory. SKILL.md is required; its frontmatter name + description are read on save.",
+    "addFile": "Add file",
+    "removeFile": "Remove file",
+    "newFilePath": "New file path (e.g. references/guide.md)",
+    "needSkillMd": "A skill must contain a SKILL.md file",
+    "edit": "Edit",
+    "duplicate": "Duplicate",
+    "export": "Export",
+    "delete": "Delete",
+    "cancel": "Cancel",
+    "save": "Save",
+    "confirmDeleteTitle": "Delete skill?",
+    "confirmDeleteBody": "This permanently deletes",
+    "deleted": "Skill deleted",
+    "duplicated": "Skill duplicated",
+    "imported": "Skill imported",
+    "saveFailed": "Save failed",
+    "invalidZip": "Invalid skill archive"
+  },
   "datasources": {
-    "title": "Datasources",
-    "new": "New",
+    "title": "Connectors",
+    "new": "New Connector",
+    "refresh": "Refresh",
     "dismiss": "Dismiss",
     "filter": {
       "all": "All",
       "generic": "Generic",
       "repository": "Repository",
+      "kb": "OKF Knowledge Base",
       "postgresql": "PostgreSQL",
       "neo4j": "Neo4j",
       "mongodb": "MongoDB",
       "webdav": "WebDAV",
+      "email": "Email",
+      "mcp": "MCP Server",
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH Key",
       "generic_file": "File"
     },
+    "catalog": {
+      "search": "Search connectors…",
+      "projectSearch": "Search projects…",
+      "anyProject": "Any project",
+      "moreProjects": "More projects",
+      "anyAvailability": "Any availability",
+      "everywhere": "Everywhere",
+      "projectScoped": "Project scoped",
+      "unavailable": "Unavailable",
+      "anyDefault": "Automatic or manual",
+      "automatic": "Automatic",
+      "manual": "Manual",
+      "mineAndShared": "Mine and shared",
+      "mine": "Mine",
+      "shared": "Shared",
+      "anyVisibility": "Any visibility",
+      "private": "Private",
+      "public": "Public",
+      "loadMore": "Load more",
+      "loadFailed": "Could not load the connector catalog. Try again.",
+      "loadMoreFailed": "Could not load more connectors."
+    },
     "form": {
-      "editTitle": "Edit Datasource",
-      "newTitle": "New Datasource",
+      "editTitle": "Edit Connector",
+      "newTitle": "New Connector",
       "nameLabel": "Name",
       "namePlaceholder": "e.g. Production Analytics DB",
-      "typeLabel": "Type",
+      "typeLabel": "Connector Type",
       "typeGroupCli": "CLI-based",
+      "typeGroupKnowledge": "Knowledge and repositories",
       "typeGroupManaged": "Managed",
       "typeGroupCredentialFiles": "Credential files",
+      "typeGroupMcp": "MCP",
       "optGeneric": "Generic",
       "optRepository": "Repository",
+      "optKb": "OKF Knowledge Base",
       "optPostgresql": "PostgreSQL",
       "optNeo4j": "Neo4j",
       "optMongodb": "MongoDB",
       "optWebdav": "WebDAV",
+      "optEmail": "Email (IMAP/SMTP)",
+      "optMcp": "MCP Server",
       "optKubeconfig": "Kubeconfig (kubectl)",
       "optSshKey": "SSH Key",
       "optGenericFile": "Generic file",
@@ -1145,7 +2146,7 @@
       "genericUrlPlaceholder": "e.g. postgresql://host:5432/db or https://api.example.com",
       "descriptionLabel": "Description",
       "descriptionPlaceholderGeneric": "Describe this resource for the AI — what it is, how to use it, what data it contains",
-      "descriptionPlaceholderManaged": "What this datasource contains (included in agent context)",
+      "descriptionPlaceholderManaged": "What this connector contains (included in agent context)",
       "cliHintLabel": "CLI Hint",
       "cliHintPlaceholder": "e.g. psql $DATABASE_URL",
       "envVarsLabel": "Environment Variables",
@@ -1154,32 +2155,90 @@
       "envRemoveTooltip": "Remove",
       "envAdd": "Add variable",
       "envHint": "Credentials are injected as environment variables into the agent workspace. Read-only access cannot be enforced — use a database account with restricted permissions if needed.",
+      "mcpTransportLabel": "Transport",
+      "mcpTransportHttp": "Remote (HTTP)",
+      "mcpTransportSse": "Remote (SSE)",
+      "mcpTransportStdio": "Local command (stdio)",
+      "mcpTokenLabel": "Bearer Token",
+      "mcpTokenPlaceholder": "Optional — sent as Authorization: Bearer …",
+      "mcpHeadersLabel": "Custom Headers",
+      "mcpHeaderKeyPlaceholder": "Header-Name",
+      "mcpHeaderValuePlaceholder": "value",
+      "mcpHeaderAdd": "Add header",
+      "mcpCommandLabel": "Command",
+      "mcpCommandPlaceholder": "npx",
+      "mcpArgsLabel": "Arguments (one per line)",
+      "mcpArgsPlaceholder": "-y\n@modelcontextprotocol/server-github",
+      "mcpEnvLabel": "Environment Variables",
+      "mcpCredentialsRetainHint": "Leave connection credentials blank to retain the stored MCP configuration.",
+      "mcpStdioWarning": "This command runs inside the agent environment with the variables above. Only add servers you trust.",
       "defaultBranchLabel": "Default Branch",
       "defaultBranchPlaceholder": "main",
+      "okfRootLabel": "OKF Root Path",
+      "okfRootPlaceholder": "vault (blank for repository root)",
+      "okfRootHint": "Relative path inside the repository that contains the OKF Markdown notes.",
+      "forgeLabel": "Forge",
+      "forgePlaceholder": "Select a forge...",
+      "forgeGithub": "GitHub",
+      "forgeGitea": "Gitea",
+      "forgeGitlab": "GitLab",
       "authMethodLabel": "Auth Method",
       "authToken": "HTTPS Token",
       "authSsh": "SSH Key",
       "tokenLabel": "Access Token",
       "tokenPlaceholder": "ghp_xxxx or personal access token",
+      "forgeTokenHintGithub": "Create a fine-grained PAT limited to this one repository, with Contents: write and Pull requests: write.",
+      "forgeTokenHintGitlab": "Create a project access token on this project with the `api` scope.",
+      "forgeTokenHintGitea": "⚠️ Gitea tokens are scoped by permission, not by repository — a token from your own account can reach every repository you can access. Create a dedicated bot account, add it as a collaborator on just this repository, and use its token.",
       "sshKeyLabel": "SSH Private Key",
       "sshGenerate": "Generate SSH key",
       "sshGenerateBusy": "Generating...",
       "sshGenerateConfirm": "Replace the current SSH key?",
       "sshGenerateReplace": "Replace",
       "repoHint": "The repository will be cloned into the workspace and git credentials configured automatically. The agent uses standard git commands — no credential setup required.",
+      "patScopesRepo": "Token permissions: Contents read and write, plus Pull requests write if the agent should open PRs. Scope the token to this repository alone wherever your forge allows it.",
+      "patScopesKb": "Token permissions: Contents read is enough to index the notes. Attaching this connector as a project's knowledge base also needs Contents write, because agents commit notes back to the repository.",
+      "kbHint": "Markdown/OKF repository; centrally indexed; read-only to agents in this release.",
+      "credentialsRetainHint": "Leave the token or SSH key blank to retain the stored credential.",
+      "visibilityLabel": "Visibility",
+      "visibilityPublic": "Public — visible to all users",
+      "accessReadOnly": "Read-only",
+      "accessReadWrite": "Read-write",
+      "visibilityCredentialHint": "Read-only is declared, not enforced — use read-only credentials (deploy token / restricted DB account).",
+      "visibilityKbHint": "Knowledge-base connectors are always read-only; credentials never reach agents.",
+      "availabilityTitle": "Availability",
+      "scopeEverywhere": "Everywhere in my work",
+      "scopeEverywhereHint": "Available in all projects and standalone work, subject to sharing and public-access rules.",
+      "scopeProjects": "Selected projects",
+      "scopeProjectsHint": "Available only when every project carried by the work is selected here.",
+      "projectsSearch": "Search and select projects…",
+      "projectsLoading": "Loading projects…",
+      "projectsLoadFailed": "Project availability could not be loaded. Saving is disabled.",
+      "projectsEmpty": "No linkable projects found.",
+      "projectsSelected": "{{count}} projects selected",
+      "projectRetainedOnly": "Retained only",
+      "removeSelectedProject": "Remove {{name}} from selected projects",
+      "removeProjectWarning": "Remove {{name}}? Its project access settings and knowledge entry will also be removed.",
+      "retry": "Retry",
+      "nativeProjectPolicy": "Included with project",
+      "nativeProjectPolicyHint": "This connector's project scope and automatic inclusion are managed by its project.",
+      "autoAttach": "Attach by default to my new work",
+      "autoAttachHint": "Preselected in create forms and attached to system-created work when no connector list is supplied. Existing work and other users are unchanged.",
+      "autoImpactAll": "Automatic in all of my work where this connector is available.",
+      "autoImpactProjects": "Automatic in my work for {{count}} selected projects.",
       "usernameLabel": "Username",
       "usernamePlaceholder": "neo4j",
       "passwordLabel": "Password",
       "passwordPlaceholder": "password",
       "testing": "Testing...",
-      "test": "Test",
+      "test": "Test Connection",
       "cancel": "Cancel",
       "saving": "Saving...",
       "update": "Update",
       "create": "Create",
       "kubeconfigLabel": "Kubeconfig YAML",
       "kubeconfigPlaceholder": "apiVersion: v1\nkind: Config\nclusters:\n  - name: prod\n    cluster:\n      server: https://...",
-      "kubeconfigHint": "Cluster, user, and context names will be prefixed with the datasource slug at runtime so multiple kubeconfigs can be merged without collisions. Try `kubectl config get-contexts` inside the agent to see the merged view.",
+      "kubeconfigHint": "Cluster, user, and context names will be prefixed with the connector slug at runtime so multiple kubeconfigs can be merged without collisions. Try `kubectl config get-contexts` inside the agent to see the merged view.",
       "sshKeyContentLabel": "SSH Private Key",
       "sshKeyContentPlaceholder": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
       "sshKeyHint": "The key is materialized at ~/.ssh/<slug> with mode 0600. Configure a host block in ~/.ssh/config inside the agent to use it for specific hosts.",
@@ -1199,48 +2258,170 @@
       "credFileEnvVarLabel": "Env var",
       "credFileEnvVarPlaceholder": "MY_TOKEN_FILE",
       "credFileRemoveTooltip": "Remove file",
-      "credFileGenericHint": "Each file is written at the target path with the requested mode. If \"Env var\" is set, the agent's process gets that variable pointing at the absolute path. Paths must resolve under /home/srw, /tmp, /run, or /workspace."
+      "credFileGenericHint": "Each file is written at the target path with the requested mode. If \"Env var\" is set, the agent's process gets that variable pointing at the absolute path. Paths must resolve under /home/srw, /tmp, /run, or /workspace.",
+      "emailProviderLabel": "Provider",
+      "emailProviderCustom": "Custom / self-hosted",
+      "emailProviderGmail": "Gmail (personal @gmail.com)",
+      "emailProviderFastmail": "Fastmail",
+      "emailProviderIcloud": "iCloud Mail",
+      "emailProviderYahoo": "Yahoo Mail",
+      "emailProviderMailbox": "mailbox.org",
+      "emailProviderGmx": "GMX",
+      "emailProviderFastmailHint": "Fastmail app passwords are available on paid plans only — the Basic plan excludes IMAP/SMTP.",
+      "emailProviderIcloudHint": "iCloud: the IMAP username is the local part only (before the @); the SMTP username is the full address.",
+      "emailOauthNotice": "Google Workspace (custom-domain Gmail), Microsoft 365 / Outlook.com, and Proton require OAuth or a bridge and are not yet supported.",
+      "emailUsernamePlaceholder": "user@example.com",
+      "emailPasswordLabel": "App password",
+      "emailAppPasswordHint": "Most providers require an app-specific password (with two-factor authentication enabled) — your normal account password will not work.",
+      "emailImapHostLabel": "IMAP host",
+      "emailImapPortLabel": "IMAP port",
+      "emailSmtpHostLabel": "SMTP host",
+      "emailSmtpPortLabel": "SMTP port",
+      "emailSecurityLabel": "Security",
+      "emailSecuritySsl": "SSL/TLS",
+      "emailSecurityStarttls": "STARTTLS",
+      "emailAccessLabel": "Access tier",
+      "emailAccessRead": "Read — list, read, and search messages",
+      "emailAccessReadWrite": "Read/write — also move and flag messages",
+      "emailAccessDraft": "Draft (default) — also compose drafts you send yourself",
+      "emailAccessSend": "Send — also send mail as you (direct-send permission required)",
+      "emailAccessHintRead": "The agent can list, read, and search messages in the allowed folders. Nothing is modified.",
+      "emailAccessHintReadWrite": "Adds moving and flagging messages (mark read/unread, star) within the allowed folders.",
+      "emailAccessHintDraft": "Adds composing drafts into your Drafts folder — you review and send them from your own client.",
+      "emailAccessHintSend": "Adds direct SMTP sending. In the current runtime this works only when Send without human approval is enabled; otherwise the agent must create a draft instead.",
+      "emailFoldersLabel": "Folder allowlist",
+      "emailFoldersPlaceholder": "AI, AI/Processed",
+      "emailFoldersHint": "Comma-separated folders the agent may access. Leave empty for the whole mailbox. Tip: a dedicated \"AI\" folder you move mails into makes you the triage layer.",
+      "emailSendFoldersWarning": "Send access requires a folder allowlist — the server rejects send with an empty folder list.",
+      "emailDraftsFolderLabel": "Drafts folder",
+      "emailFromAddressLabel": "From address",
+      "emailRecipientsLabel": "Recipient allowlist",
+      "emailRecipientsPlaceholder": "alice@example.com, @example.org",
+      "emailRecipientsHint": "Comma-separated addresses or @domains allowed for new compositions. Replies to the original thread are always allowed.",
+      "emailUnattendedSendLabel": "Send approval",
+      "emailUnattendedSendToggle": "Send without human approval",
+      "emailUnattendedSendHint": "Requires the admin-granted email_autonomous_send permission — the server rejects this otherwise. When off, direct sending is refused; the planned human-approval queue is not available yet, so use Draft.",
+      "emailNotPublishableHint": "Email connectors cannot be published — mailboxes stay private to their owner."
+    },
+    "publishDialog": {
+      "title": "Publish connector?",
+      "message": "This connector becomes visible to all users. Their agents will run with its stored credentials.",
+      "rwMessage": "This connector becomes visible to all users WITH WRITE ACCESS — their agents can modify the underlying system using its stored credentials.",
+      "namePrompt": "Type the connector name to confirm:",
+      "confirm": "Publish",
+      "cancel": "Cancel"
     },
     "sshKeyDialog": {
       "title": "Add this SSH key to your repository",
       "intro": "Add the following public key as a deploy key on your repository provider (GitHub: Settings → Deploy keys; Gitea: Settings → Deploy keys; GitLab: Settings → Repository → Deploy keys).",
-      "privateNote": "The matching private key has been added to the form. Save the datasource to store it.",
+      "privateNote": "The matching private key has been added to the form. Save the connector to store it.",
       "copy": "Copy public key",
       "copied": "Copied!",
       "done": "Done",
       "generateFailed": "Failed to generate SSH key. Please try again."
     },
     "table": {
-      "loading": "Loading datasources...",
-      "empty": "No datasources found",
-      "emptyHint": "Create a datasource to connect agents to external databases",
+      "loading": "Loading connectors...",
+      "empty": "No connectors found",
+      "emptyHint": "Create a connector to give agents access to external systems and data",
       "colType": "Type",
       "colName": "Name",
       "colUrl": "URL",
-      "colScope": "Scope",
+      "colScope": "Visibility",
+      "colVisibility": "Visibility",
+      "colAvailability": "Availability",
       "colActions": "Actions",
       "scopeJob": "Job",
-      "scopeGlobal": "Global",
+      "scopeGlobal": "Public",
+      "scopePrivate": "Private",
+      "availabilityAll": "All projects",
+      "availabilityScoped": "Project scoped",
+      "availabilityProjects": "{{count}} projects",
+      "availabilityNone": "Unavailable",
+      "badgeAuto": "Auto",
+      "badgeRo": "RO",
+      "badgeRw": "RW",
       "testTooltip": "Test connection",
+      "indexPending": "Pending",
+      "indexIndexing": "Indexing",
+      "indexReady": "Ready @ {{sha}}",
+      "indexPartial": "Partial",
+      "indexFailed": "Failed",
+      "indexProgressTitle": "{{done}} of {{total}} notes indexed",
+      "lastSuccess": "Last success",
+      "reindexTooltip": "Reindex",
+      "fullReindexTooltip": "Full rebuild",
+      "fullReindexConfirm": "Run a full OKF Knowledge Base rebuild? This re-embeds every note and may incur embedding cost.",
       "editTooltip": "Edit",
-      "deleteTooltip": "Delete"
+      "deleteTooltip": "Delete",
+      "moreActions": "More actions"
     },
     "messages": {
       "repoNoAuthConfirm": "No authentication credentials provided.\n\nThis repository will be cloned as read-only — the agent can browse and read the code but will not be able to push changes.\n\nContinue?",
-      "updated": "Datasource updated",
-      "updateFailed": "Failed to update datasource",
-      "updateError": "Error updating datasource",
-      "created": "Datasource \"{{name}}\" created",
-      "createFailed": "Failed to create datasource",
-      "createError": "Error creating datasource",
-      "createForTestFailed": "Failed to create datasource for testing",
-      "deleted": "Datasource \"{{name}}\" deleted",
-      "deleteFailed": "Failed to delete datasource",
-      "deleteError": "Error deleting datasource",
+      "updated": "Connector updated",
+      "updateFailed": "Failed to update connector",
+      "updateError": "Error updating connector",
+      "created": "Connector \"{{name}}\" created",
+      "createFailed": "Failed to create connector",
+      "createError": "Error creating connector",
+      "createForTestFailed": "Failed to create connector for testing",
+      "deleted": "Connector \"{{name}}\" deleted",
+      "deleteFailed": "Failed to delete connector",
+      "deleteError": "Error deleting connector",
       "testFailed": "Request failed",
       "testRequestFailed": "Test request failed",
+      "reindexed": "OKF Knowledge Base \"{{name}}\" reindex finished ({{status}})",
+      "reindexFailed": "Failed to reindex the OKF Knowledge Base",
       "fileTooLarge": "File exceeds 64 KB — credential files are capped at 64 KB."
     }
+  },
+  "contacts": {
+    "title": "Contacts",
+    "new": "New contact",
+    "search": "Search contacts…",
+    "empty": "No contacts yet. Contacts are people your agents may reach — add one and link it to a project.",
+    "projectsShort": "proj",
+    "primary": "primary",
+    "noAddresses": "No addresses",
+    "optIn": {
+      "pending": "opt-in pending",
+      "opted_out": "opted out"
+    },
+    "filter": {
+      "allChannels": "All channels",
+      "allProjects": "All projects",
+      "channelAria": "Filter by channel",
+      "projectAria": "Filter by project"
+    },
+    "form": {
+      "newTitle": "New contact",
+      "editTitle": "Edit contact",
+      "name": "Display name",
+      "notes": "Notes (visible to agents — briefings, preferences, context)",
+      "addresses": "Addresses",
+      "addAddress": "Add address",
+      "projects": "Projects",
+      "channelLocked": "Channel can't be changed after saving — remove this address and add a new one instead.",
+      "namePlaceholder": "Anna Weber",
+      "notesLabel": "Notes",
+      "addressesHint": "Where agents may reach this person. The first address on a channel becomes its primary.",
+      "removeAddress": "Remove address",
+      "channelAria": "Channel",
+      "addressAria": "Address",
+      "projectsHint": "Agents on a linked project can message this contact.",
+      "noProjects": "No projects yet. Create one to link this contact."
+    },
+    "delete": {
+      "title": "Delete contact",
+      "message": "This removes the contact from these projects: {{projects}}. Agents will no longer be able to message them.",
+      "namePrompt": "Type the contact's name to confirm:"
+    },
+    "saveError": "Save failed. Some changes may not have been applied — check the contact and retry.",
+    "deleteError": "Delete failed. You may not have permission, or the contact already changed — refresh and retry.",
+    "subtitle": "People your agents may reach. Link a contact to a project and agents on that project can message them.",
+    "emptyTitle": "No contacts yet",
+    "noAddressesHint": "This contact has no addresses, so no agent can reach them. Add one to make them reachable.",
+    "loadError": "Couldn't load contacts. Check your connection and retry."
   },
   "inbox": {
     "title": "Action Center",
@@ -1275,7 +2456,12 @@
       "emptyText": "Select an item to view details",
       "hintUse": "Use",
       "hintToNavigate": "to navigate,",
-      "hintToSelect": "to select"
+      "hintToSelect": "to select",
+      "jobId": "Job ID",
+      "requestId": "Request ID",
+      "threadId": "Thread ID",
+      "sessionId": "Session ID",
+      "eventId": "Event ID"
     },
     "sudoDetail": {
       "vmUpgradeRequest": "VM Upgrade Request",
@@ -1301,8 +2487,9 @@
       "messageLabel": "Message",
       "modeBlocking": "blocking",
       "modeAsync": "async",
+      "sessionPage": "Session page",
+      "openSessionLog": "Open session log",
       "defaultAgent": "agent",
-      "jobPrefix": "job",
       "threadLoading": "Loading thread...",
       "noMessagesLoaded": "No messages loaded",
       "senderAgent": "Agent",
@@ -1317,7 +2504,6 @@
       "freezeUpgrade": "Sudo Required",
       "freezeComplete": "Job Complete",
       "defaultAgent": "agent",
-      "idPrefix": "ID:",
       "phase": "Phase {{number}}",
       "loadingFrozen": "Loading frozen data...",
       "summary": "Summary",
@@ -1434,7 +2620,6 @@
       "compactOnArchive": "Compact on archive",
       "keepRecentToolResults": "Keep recent tool results",
       "keepRecentMessages": "Keep recent messages",
-      "backend": "Backend",
       "vmCpuCores": "VM CPU cores",
       "vmMemory": "VM memory",
       "maxReadWords": "Max read words",
@@ -1455,6 +2640,8 @@
     "options": {
       "container": "Container",
       "vmQemu": "VM (QEMU)",
+      "virtual": "Virtual (cloud files)",
+      "none": "None (no workspace)",
       "stateless": "Stateless",
       "persistent": "Persistent",
       "sudoFreeze": "Freeze (ask user)",
@@ -1463,7 +2650,10 @@
     },
     "hints": {
       "idleDisabled": "0 = disabled",
-      "autoPlaceholder": "auto"
+      "autoPlaceholder": "auto",
+      "parallelToolCalls": "Model support varies — some models may still make parallel tool calls regardless of this setting, while others may not support them at all.",
+      "virtualBackend": "Virtual workspaces run with no container — shell, browser, and git tools are disabled. File, web, database, and knowledge tools remain available.",
+      "noneBackend": "None runs with no workspace at all — shell, browser, git, and file tools are disabled. Web, database, and knowledge tools remain available."
     }
   },
   "jobReviewPage": {
@@ -1488,19 +2678,32 @@
       "summary": "Summary",
       "confidence": "Confidence",
       "deliverables": "Deliverables",
-      "agentNotes": "Agent Notes"
+      "agentNotes": "Agent Notes",
+      "delivery": "Delivery"
     },
     "meta": {
-      "id": "ID: {{id}}...",
+      "jobId": "Job ID",
       "created": "Created: {{date}}"
     },
     "summaryEmpty": "No summary provided",
     "noFrozenData": "No frozen job data available",
     "links": {
-      "browseWorkspace": "Browse workspace in Gitea",
+      "sourceRepository": "Source repository",
+      "branch": "Branch {{branch}}",
+      "pullRequest": "Pull request #{{number}}",
+      "pullRequestState": {
+        "open": "Open",
+        "merged": "Merged",
+        "closed": "Closed",
+        "unavailable": "Status unavailable"
+      },
+      "jobWorkspace": "Job workspace",
       "startingIde": "Starting IDE...",
-      "openIde": "Open in Web IDE"
+      "openIde": "Open in Web IDE",
+      "openCloudFolder": "Open cloud folder"
     },
+    "cloudFolderDisclaimer": "Preview — results are copied to a shared cloud folder you can browse. Use the feedback box below to request changes; edits made directly in this folder won't reach the agent and will be replaced when the job continues.",
+    "reviewSessionHint": "Starts a supervised session in a fresh sandbox checkout of the delivered branch with this job's model, project, and connectors. Job-only workspace and tool settings are not copied.",
     "vmUpgrade": {
       "title": "Sudo Required",
       "reason": "The agent attempted a privileged command in a hardened container:",
@@ -1519,7 +2722,12 @@
       "orContinueFeedback": "or continue with feedback",
       "feedbackPlaceholder": "Write feedback or additional instructions for the agent...",
       "resuming": "Resuming...",
-      "continueWithFeedback": "Continue with Feedback"
+      "continueWithFeedback": "Continue with Feedback",
+      "exportingToCloud": "Exporting...",
+      "exportToCloud": "Export to cloud",
+      "resyncCloudFolder": "Re-sync cloud folder",
+      "reviewInSession": "Review in session",
+      "preparingReviewSession": "Preparing review session..."
     },
     "messages": {
       "approved": "Job approved successfully.",
@@ -1529,54 +2737,177 @@
       "continuing": "Job continuing. Agent will resume execution.",
       "continueFailed": "Failed to continue job. Check console for details.",
       "resumedWithFeedback": "Job resumed with feedback. Agent will continue working.",
-      "resumeFailed": "Failed to resume job. Check console for details."
+      "resumeFailed": "Failed to resume job. Check console for details.",
+      "openCloudFolderFailed": "Failed to open cloud folder. Check console for details.",
+      "reviewSessionFailed": "Failed to create the review session. Check console for details."
     }
   },
   "jobDiffReview": {
-    "title": "Cloud diff review",
-    "subtitle": "{{count}} file(s) changed in this job. Review and decide.",
-    "subtitleSingular": "{{count}} file changed in this job. Review and decide.",
-    "loading": "Loading diff…",
-    "empty": "No changes to review — the agent didn't modify the project folder.",
+    "loading": "Loading changes…",
+    "staleNotice": "The staged changes moved on since you loaded them — reloaded the latest version.",
+    "meta": {
+      "staged": "Staged",
+      "mount": "Mount",
+      "epoch": "Epoch",
+      "baseline": "Baseline",
+      "talliesLabel": "Change totals",
+      "openFolder": "Open project files",
+      "openFolderFor": "Open project files for {{name}} in a new tab",
+      "detailsLabel": "Details"
+    },
+    "forbidden": {
+      "title": "You can't review these changes"
+    },
+    "loadFailed": {
+      "title": "Couldn't load the changes",
+      "retry": "Try again"
+    },
     "fileTree": {
       "header": "Files",
       "statusAdded": "Added",
       "statusModified": "Modified",
-      "statusDeleted": "Deleted"
+      "statusDeleted": "Deleted",
+      "chooser": "File {{index}} of {{total}}",
+      "chooserEmpty": "{{total}} changed files"
     },
     "viewer": {
-      "selectPrompt": "Select a file from the list to view the diff.",
+      "regionLabel": "Selected file",
+      "selectPrompt": "Select a file from the list to view its changes.",
       "loadingFile": "Loading file…",
-      "loadFailed": "Couldn't load this file's diff. Check console for details.",
-      "labelOriginal": "Cloud version",
-      "labelChanged": "Agent edit",
-      "deletedNote": "This file will be deleted from the cloud folder on accept.",
-      "addedNote": "This file will be created in the cloud folder on accept.",
-      "monacoUnavailable": "The diff editor failed to load. Showing plain content instead."
+      "loadFailed": "Couldn't load this file",
+      "missingTitle": "This file is no longer staged",
+      "monacoUnavailable": "The diff editor failed to load. Showing plain content instead.",
+      "binaryTitle": "Binary file — no preview",
+      "binaryType": "Type",
+      "binaryStatus": "Change",
+      "binaryNoDownload": "The staged copy of this file cannot be opened or downloaded from here.",
+      "binaryKind": {
+        "pdf": "PDF document",
+        "document": "Word-processor document",
+        "spreadsheet": "Spreadsheet",
+        "presentation": "Presentation",
+        "image": "Image",
+        "audio": "Audio",
+        "video": "Video",
+        "archive": "Archive",
+        "unknown": "Binary file"
+      },
+      "reloadReview": "Reload the review"
     },
     "conflict": {
-      "title": "Cloud folder was modified externally",
-      "body": "Files in the cloud folder changed during this job run. Accept is disabled until you resolve the conflict manually (download the diverged files, reconcile, then retry).",
+      "title": "The cloud folder changed underneath this review",
       "etagMismatch": "Edited externally",
       "missingAtCloud": "Deleted externally",
       "unexpectedAtCloud": "Created externally",
-      "dismiss": "Dismiss"
+      "recheck": "Re-check"
     },
     "partial": {
-      "title": "Partial write failure",
-      "body": "Applied {{applied}} change(s) and {{deleted}} deletion(s), but {{count}} file(s) failed. The job stays in pending review; fix the cause and retry."
+      "title": "Some writes failed"
+    },
+    "receipt": {
+      "at": "Decided",
+      "overlayReset": "Working copy cleared",
+      "overlayResetYes": "Yes",
+      "overlayResetNo": "No",
+      "overlayWarning": "The session's working copy could not be cleared, because its workspace is no longer running. If you resume this session it may stage the same changes again — reject the duplicate if it appears.",
+      "localOnly": "This result is recorded in this browser only. The server does not yet keep a permanent record of review decisions.",
+      "doneHint": "Nothing further is pending for this folder."
+    },
+    "a11y": {
+      "loaded": "{{count}} changed files loaded.",
+      "loadedEmpty": "No changes to review.",
+      "fileLoaded": "Showing changes for {{path}}.",
+      "applying": "Applying changes to the cloud…",
+      "rejecting": "Discarding staged changes…",
+      "applied": "Done. {{applied}} written, {{deleted}} deleted.",
+      "rejected": "Staged changes discarded. Nothing was written to the cloud.",
+      "loadedSingular": "1 changed file loaded."
     },
     "actions": {
-      "accept": "Accept all changes",
-      "accepting": "Applying changes…",
-      "reject": "Reject all",
-      "rejecting": "Rejecting…",
-      "confirmAcceptTitle": "Apply these changes to your cloud folder?",
-      "confirmAcceptBody": "{{count}} file(s) will be written to the project's cloud folder. This action is not reversible from the cockpit.",
-      "confirmRejectTitle": "Discard all changes?",
-      "confirmRejectBody": "The agent's edits will be discarded. The Gitea commits stay as an audit trail.",
       "cancel": "Cancel",
-      "confirm": "Continue"
+      "done": "Done",
+      "close": "Close review"
+    },
+    "session": {
+      "addedNote": "This file will be created in the cloud folder when you apply.",
+      "applyConfirmBody": "This writes all {{count}} reviewed changes to {{mount}}. It cannot be undone from Cockpit — only your cloud provider's own version history or trash can recover the previous state.",
+      "applyConfirmBodySingular": "This writes the one reviewed change to {{mount}}. It cannot be undone from Cockpit — only your cloud provider’s own version history or trash can recover the previous state.",
+      "applyConfirmLabel": "Yes, apply to cloud",
+      "applyLabel": "Apply to cloud",
+      "applyingLabel": "Applying your changes to the cloud…",
+      "binaryBody": "The bytes are applied exactly as staged. There is no text preview, so review it by the path and change type.",
+      "conflictBody": "Files in the protected folder changed outside this session since its changes were staged. Applying is blocked until you reconcile them — there is no force option, by design.",
+      "decisionHint": "Applying writes every reviewed change to the cloud folder. Rejecting discards them all and leaves the cloud untouched.",
+      "deletedNote": "This file will be deleted from the cloud folder when you apply.",
+      "dialogLabel": "Cloud changes review",
+      "directionNew": "After you apply",
+      "directionOld": "Cloud now",
+      "emptyBody": "This session hasn't staged any changes to the protected folder. If the agent has just finished a turn, its changes may still be being captured.",
+      "emptyTitle": "Nothing staged for review",
+      "eyebrow": "Protected cloud · review required",
+      "eyebrowResolved": "Protected cloud · resolved",
+      "forbiddenBody": "Only the owner of this session can review its staged cloud changes.",
+      "missingBody": "It was in the staged set when this review loaded but the session has re-staged since. Reload to see the current changes.",
+      "missingBodyGone": "It was in the staged set when this review loaded, but it is not any more — the session re-staged, or the changes were resolved somewhere else. Reload to see the current state.",
+      "missingBodyUnreadable": "It is still staged, but its stored copy cannot be read, so there is nothing safe to show or apply. Ask the session to stage its changes again.",
+      "partialBody": "Applied {{applied}} changes and {{deleted}} deletions, but {{count}} files failed. The remaining changes are still staged, so you can retry.",
+      "partialBodySingular": "Applied {{applied}} changes and {{deleted}} deletions, but one file failed. The remaining changes are still staged, so you can retry.",
+      "receiptAppliedBody": "{{applied}} written, {{deleted}} deleted in the protected folder.",
+      "receiptAppliedTitle": "Applied to your cloud",
+      "receiptRejectedBody": "Nothing was written to or removed from your cloud.",
+      "receiptRejectedTitle": "Staged changes discarded",
+      "rejectConfirmBody": "This permanently discards all {{count}} staged changes. Nothing is written to or removed from your cloud, and there is no history to restore them from afterwards.",
+      "rejectConfirmBodySingular": "This permanently discards the one staged change. Nothing is written to or removed from your cloud, and there is no history to restore it from afterwards.",
+      "rejectConfirmLabel": "Yes, discard them",
+      "rejectLabel": "Reject staged changes",
+      "rejectingLabel": "Discarding the staged changes…",
+      "subtitle": "{{count}} files changed in this session. Nothing has been written to your cloud yet.",
+      "subtitleSingular": "{{count}} file changed in this session. Nothing has been written to your cloud yet.",
+      "titleFallback": "Protected cloud folder",
+      "unavailableBody": "This session isn't running in protected cloud mode, or it no longer exists. Only sessions created with protected cloud enabled stage their changes for review.",
+      "unavailableTitle": "No protected review for this session"
+    },
+    "job": {
+      "addedNote": "This file will be created in the cloud folder on accept.",
+      "applyConfirmBody": "{{count}} files will be written to the project's cloud folder. This action is not reversible from Cockpit.",
+      "applyConfirmBodySingular": "One file will be written to the project’s cloud folder. This action is not reversible from Cockpit.",
+      "applyConfirmLabel": "Yes, accept them",
+      "applyLabel": "Accept all changes",
+      "applyingLabel": "Writing the changes to the cloud folder…",
+      "binaryBody": "The bytes are applied exactly as produced. There is no text preview, so review it by the path and change type.",
+      "conflictBody": "Files in the cloud folder changed during this job run. Accepting is blocked until you reconcile them manually — download the diverged files, merge, then retry.",
+      "decisionHint": "Accepting writes every change to the project's cloud folder. Rejecting discards them and completes the job.",
+      "deletedNote": "This file will be deleted from the cloud folder on accept.",
+      "dialogLabel": "Project cloud review",
+      "directionNew": "After this job",
+      "directionOld": "Baseline",
+      "emptyBody": "The agent didn't modify anything under the project folder in this job.",
+      "emptyTitle": "No changes to review",
+      "eyebrow": "Project cloud review",
+      "eyebrowResolved": "Project cloud review · resolved",
+      "forbiddenBody": "You don't have access to this job's project cloud changes.",
+      "missingBody": "It was in the diff when this review loaded but the job's diff has changed since. Reload to see the current changes.",
+      "missingBodyGone": "It was in the diff when this review loaded, but it is not any more — the job’s diff has changed since. Reload to see the current state.",
+      "missingBodyUnreadable": "It is still in the diff, but its stored copy cannot be read, so there is nothing safe to show or accept.",
+      "partialBody": "Applied {{applied}} changes and {{deleted}} deletions, but {{count}} files failed. The job stays in pending review; fix the cause and retry.",
+      "partialBodySingular": "Applied {{applied}} changes and {{deleted}} deletions, but one file failed. The job stays in pending review; fix the cause and retry.",
+      "receiptAppliedBody": "{{applied}} written, {{deleted}} deleted in the project’s cloud folder.",
+      "receiptAppliedTitle": "Changes accepted",
+      "receiptRejectedBody": "Nothing was written to the cloud folder. The Gitea commits remain as an audit trail.",
+      "receiptRejectedTitle": "Changes rejected",
+      "rejectConfirmBody": "All {{count}} of the agent's changes will be discarded. The Gitea commits stay as an audit trail.",
+      "rejectConfirmBodySingular": "The agent’s single change will be discarded. The Gitea commits stay as an audit trail.",
+      "rejectConfirmLabel": "Yes, reject them",
+      "rejectLabel": "Reject all changes",
+      "rejectingLabel": "Discarding the changes…",
+      "subtitle": "{{count}} files changed in this job. Review and decide.",
+      "subtitleSingular": "{{count}} file changed in this job. Review and decide.",
+      "titleFallback": "Project cloud folder",
+      "unavailableBody": "This job has no project-cloud baseline to diff against, or it no longer exists.",
+      "unavailableTitle": "No cloud review for this job"
+    },
+    "progress": {
+      "keepOpen": "Keep this open — the result appears here as soon as it finishes."
     }
   },
   "chatHistory": {
@@ -1594,15 +2925,18 @@
     "human": "Human",
     "assistant": "Assistant",
     "reasoning": "Reasoning",
-    "shellState": "Shell State",
-    "paneSingle": "{{n}} pane",
-    "panePlural": "{{n}} panes",
-    "emptyPane": "(empty)",
-    "resultPending": "Result pending or not available",
+    "context": "Injected context",
+    "contextHint": "Transient context re-injected on every request (todos, memory, knowledge, instructions) — not part of the durable conversation. Open the request link for the exact payload.",
+    "updated": "updated",
+    "showFull": "Show full ({{size}})",
+    "showFullNoSize": "Show full",
+    "collapse": "Collapse",
+    "resultNotRecorded": "No result recorded for this call",
+    "resultInLaterTurn": "Result is stored in the next turn, which isn't loaded yet.",
+    "resultLoadNext": "Load it",
+    "resultLoading": "Loading the next turn…",
     "viewRequest": "View full request",
     "showingTurns": "Showing {{n}} chat turns",
-    "newOutput": "NEW",
-    "idle": "idle",
     "turnsCount": "{{n}} turns"
   },
   "configEditor": {
@@ -1625,20 +2959,49 @@
   "agentSettings": {
     "common": {
       "resetToDefault": "Reset to default",
-      "noApiKey": "no API key"
+      "noApiKey": "no API key",
+      "selectAll": "Select all",
+      "deselectAll": "Deselect all"
     },
     "datasources": {
-      "group": "Data Sources",
-      "loading": "Loading datasources..."
+      "group": "Connectors",
+      "loading": "Loading connectors...",
+      "loadFailed": "Connectors could not be loaded for this project context. Creation is disabled.",
+      "retry": "Retry",
+      "unavailableName": "Unavailable connector",
+      "unavailableLive": "This attached connector is no longer authorized or in scope. Detach it before continuing.",
+      "unavailableBadge": "Unavailable",
+      "notReady": "Not fully indexed yet — the agent may see incomplete results.",
+      "lockedLive": "Knowledge bases can't be changed during a session"
     },
     "execution": {
       "group": "Execution",
       "autonomy": "Autonomy",
       "permissionMode": "Permission Mode",
+      "narration": "Narration",
       "scholar": "Scholar (pre-research)",
       "critic": "Critic (verification)",
       "projectMemory": "Project memory",
-      "autonomyDefaultHint": "Controls when the agent pauses for human review"
+      "imageQuality": "Image Quality",
+      "workspaceBackend": "Workspace",
+      "autonomyDefaultHint": "Controls when the agent pauses for human review",
+      "tierCurrent": "current",
+      "tierHint": "Upgrades carry your files over and cannot be reversed within the session.",
+      "tierUpgrading": "Provisioning {{tier}}…",
+      "tierUnreachable": {
+        "downgrade": "can't move down a tier",
+        "needsApproval": "needs approval",
+        "unsupported": "not available from this tier"
+      }
+    },
+    "narrationModes": {
+      "auto": "Auto",
+      "verbose": "Verbose",
+      "silent": "Silent"
+    },
+    "live": {
+      "cacheNote": "Changes apply starting with the next response. Changing tools, connectors, or the model resets the conversation's prompt cache — the next response re-processes the full history, which is slower and can cost noticeably more for that turn.",
+      "datasourcesLive": "Connector changes apply from the next response; removed connections close after the current turn finishes. Content the agent already read stays in its context."
     },
     "autonomy": {
       "full": {
@@ -1676,6 +3039,20 @@
         "description": "Agent runs without asking for approval"
       }
     },
+    "imageQuality": {
+      "economy": {
+        "label": "Economy",
+        "description": "Lowest resolution (~768px) — cheapest, coarse detail"
+      },
+      "standard": {
+        "label": "Standard",
+        "description": "Balanced (~1568px) — good detail for most tasks"
+      },
+      "high": {
+        "label": "High",
+        "description": "Model-family max — best for OCR, charts, UI screenshots"
+      }
+    },
     "criticRounds": {
       "1": "1 round",
       "3": "3 rounds",
@@ -1684,42 +3061,138 @@
       "0": "Unlimited"
     },
     "tools": {
+      "addAction": "Add ({{n}})",
+      "addRequested": "Add requested",
+      "addable": "Locked on — config can still add: {{names}}",
+      "countBound": "{{n}} bound",
+      "countPredicted": "{{n}} predicted",
       "group": "Tools",
       "maxDepth": "Max depth",
-      "timeout": "Timeout (sec)"
+      "provenance": {
+        "measured": "Live from the running agent",
+        "measured_partial": "Live from the running agent — partial answer",
+        "predicted": "Predicted, not measured",
+        "unknown": "The resolved toolset could not be read"
+      },
+      "timeout": "Timeout (sec)",
+      "unknownCategory": "This cockpit build has no description for this category."
     },
     "toolCategories": {
-      "research": {
-        "label": "Research",
-        "description": "Ability to search the web, find academic papers, and browse websites"
+      "agent_catalog": {
+        "label": "Experts & Skills",
+        "description": "Ability to look up experts and skills. Read-only — the row below is what creates them"
+      },
+      "catalog_authoring": {
+        "label": "Author Experts & Automations",
+        "description": "Ability to create and update your own experts, skills and automations on your behalf. New automations are created switched off for you to review"
       },
       "browser_direct": {
         "label": "Browser",
         "description": "Direct browser control — navigate, click, type, screenshot, and visually verify pages"
       },
+      "canvas": {
+        "label": "Canvas",
+        "description": "Ability to present workspace files in the shared session Canvas"
+      },
       "citation": {
         "label": "Citation",
         "description": "Ability to track sources, manage citations, and generate bibliographies"
-      },
-      "shell": {
-        "label": "Shell",
-        "description": "Ability to run shell commands in a sandboxed terminal"
       },
       "communication": {
         "label": "Communication",
         "description": "Ability to send email messages to you or your team"
       },
+      "core": {
+        "label": "Core",
+        "description": "Planning, progress and completion — todos, replanning, notifications, sleep"
+      },
       "delegation": {
         "label": "Delegation",
         "description": "Ability to spawn subagents that work in parallel"
+      },
+      "email": {
+        "label": "Email",
+        "description": "Read and send through an attached email datasource"
+      },
+      "evaluation": {
+        "label": "Evaluation",
+        "description": "Approve or return worker jobs with feedback"
+      },
+      "git": {
+        "label": "Git",
+        "description": "Ability to inspect workspace version history"
+      },
+      "graph": {
+        "label": "Graph",
+        "description": "Query attached Neo4j datasources"
       },
       "knowledge": {
         "label": "Knowledge",
         "description": "Ability to read and write to the project knowledge base"
       },
-      "git": {
-        "label": "Git",
-        "description": "Ability to inspect workspace version history"
+      "loop": {
+        "label": "Project Loop",
+        "description": "Plan an autonomous project loop"
+      },
+      "mcp": {
+        "label": "MCP Servers",
+        "description": "Tools discovered from attached MCP servers at session start"
+      },
+      "mongodb": {
+        "label": "MongoDB",
+        "description": "Query attached MongoDB datasources"
+      },
+      "job_control": {
+        "label": "Job Control",
+        "description": "Create, steer, pause, resume, approve, and cancel SRW jobs"
+      },
+      "job_inspection": {
+        "label": "Job Inspection",
+        "description": "Inspect SRW job status and the currently granted supervision data"
+      },
+      "orchestrator": {
+        "label": "SRW Projects",
+        "description": "Inspect SRW projects, repositories, session context, and workspace upgrades"
+      },
+      "product_help": {
+        "label": "Product Help",
+        "description": "Read the SRW product guide and capability reference"
+      },
+      "repo": {
+        "label": "Repositories",
+        "description": "Read and write attached repository datasources"
+      },
+      "research": {
+        "label": "Research",
+        "description": "Ability to search the web, find academic papers, and browse websites"
+      },
+      "session_task": {
+        "label": "Session Tasks",
+        "description": "The session's own task list"
+      },
+      "shell": {
+        "label": "Shell",
+        "description": "Ability to run shell commands in a sandboxed terminal"
+      },
+      "sql": {
+        "label": "SQL",
+        "description": "Query attached PostgreSQL datasources"
+      },
+      "unclassified": {
+        "label": "Other",
+        "description": "Tools this cockpit build does not recognise — usually discovered at runtime"
+      },
+      "webdav": {
+        "label": "Cloud Storage",
+        "description": "Read and write files on attached WebDAV / cloud datasources"
+      },
+      "workflows": {
+        "label": "Automations & Loops",
+        "description": "Ability to inspect automations and project loops, and draft disabled automations"
+      },
+      "workspace": {
+        "label": "Workspace Files",
+        "description": "Read, write, move and search files in the session workspace"
       }
     },
     "model": {
@@ -1727,10 +3200,25 @@
       "preset": "Preset",
       "strategic": "Strategic",
       "tactical": "Tactical",
+      "subagent": "Subagent",
       "single": "Model",
+      "temperature": "Temperature",
+      "reasoning": "Reasoning",
+      "reasoningDefaultOption": "{{label}} (default)",
+      "reasoningResetNotice": "Reset to default — your reasoning pick didn't carry over.",
       "default": "Default",
+      "defaultResolved": "{{model}} ({{source}})",
+      "defaultResolvedNoSource": "Default · {{model}}",
+      "source": {
+        "expert": "from expert",
+        "account_default": "your default",
+        "system_default": "system default",
+        "project": "project default"
+      },
       "presetUnconfigured": "One or both models lack an API key",
-      "providerNoKey": "{{provider}} (no API key)"
+      "providerNoKey": "{{provider}} (no API key)",
+      "mismatchWindow": "These models have different context windows — they share one history, so it's capped to the smaller (~{{min}}).",
+      "mismatchMultimodal": "One of these models can't read images — image input will be disabled for both phases."
     }
   },
   "agentList": {
@@ -1783,6 +3271,8 @@
       "assignFailed": "Failed to assign job",
       "assignError": "Error assigning job"
     },
+    "auxDegraded": "Aux degraded",
+    "auxDegradedTip": "Auxiliary model degraded",
     "time": {
       "secondsAgo": "{{n}}s ago",
       "minutesAgo": "{{n}}m ago",
@@ -1896,7 +3386,19 @@
       "agent.unavailable": "No agents are available right now.",
       "agent.offline": "The assigned agent is offline.",
       "project.not_found": "That project no longer exists.",
-      "permission.denied": "You don't have permission to do that."
+      "project_archived": "This project is archived. Unarchive it before creating new work.",
+      "permission.denied": "You don't have permission to do that.",
+      "nothing_staged": "There are no staged changes left to act on — they were applied or rejected somewhere else.",
+      "no_protected_mount": "This session no longer has a protected cloud mount, so its staged changes cannot be applied.",
+      "staging_missing": "The staged content is no longer available in storage, so it cannot be applied. Re-stage the changes and review them again.",
+      "invalid_epoch": "This review is out of date. Reload it and decide again."
+    },
+    "projects": {
+      "loadFailed": "Couldn't load your projects.",
+      "archiveFailed": "Couldn't archive the project.",
+      "unarchiveFailed": "Couldn't unarchive the project.",
+      "updateFailed": "Couldn't save the project.",
+      "renameFailed": "Couldn't rename the project."
     },
     "jobs": {
       "createFailed": "Couldn't create the job.",
@@ -1909,7 +3411,9 @@
       "replyFailed": "Couldn't send the reply.",
       "exportFailed": "Couldn't export the job to your cloud.",
       "acceptFailed": "Couldn't accept the diff.",
-      "rejectFailed": "Couldn't reject the diff."
+      "rejectFailed": "Couldn't reject the diff.",
+      "diffLoadFailed": "Couldn't load the job's changes.",
+      "diffFileLoadFailed": "Couldn't load this file's changes."
     },
     "ide": {
       "startFailed": "Couldn't start the IDE session.",
@@ -1917,12 +3421,29 @@
     },
     "sessions": {
       "resumeFailed": "Couldn't resume the session.",
+      "stillEnding": "This session is still finishing. Keep this page open, then try Resume again.",
       "endFailed": "Couldn't end the session.",
       "deleteFailed": "Couldn't delete the session.",
-      "createFailed": "Couldn't create the session."
-    }
+      "createFailed": "Couldn't create the session.",
+      "renameFailed": "Couldn't rename the session.",
+      "bindingInvalid": "This session connection is no longer authoritative. Wait for the session to recover or contact an administrator."
+    },
+    "cloudDiff": {
+      "applyFailed": "Couldn't apply the staged changes.",
+      "rejectFailed": "Couldn't reject the staged changes.",
+      "restageFailed": "Couldn't refresh the staged diff.",
+      "loadFailed": "Couldn't load the staged changes.",
+      "fileLoadFailed": "Couldn't load this staged file."
+    },
+    "network": "Couldn't reach the server. Check your connection and try again."
   },
   "toasts": {
+    "admin": {
+      "userRegistered": "New user pending approval: {{name}}"
+    },
+    "automations": {
+      "autoDisabled": "Automation '{{name}}' was auto-paused"
+    },
     "jobs": {
       "created": "Job created",
       "deleted": "Job deleted",
@@ -1932,13 +3453,323 @@
       "approved": "Job approved",
       "vmUpgradeStarted": "VM upgrade initiated",
       "replySent": "Reply sent",
-      "exportedToCloud": "Exported {{count}} file(s) to your cloud",
+      "exportedToCloud": "Exported {{count}} file(s) to {{folder}}",
+      "exportedNotShared": "Exported {{count}} file(s) to {{folder}}, but it isn't shared with you yet — sign in to the cloud once, then re-sync.",
       "diffAccepted": "Applied {{applied}} change(s), {{deleted}} deletion(s) to the cloud folder.",
       "diffRejected": "Diff rejected; no cloud changes were made."
     },
     "ide": {
       "stopped": "IDE session stopped"
+    },
+    "sessions": {
+      "cloudSyncRecovered": "Cloud sync is now running for this session."
     }
+  },
+  "officerCorrectness": {
+    "provisioningLabel": "Provisioning",
+    "provisioningProblem": "{{count}} job preflight(s) pending or failed — they hold claim and capacity but are not dispatchable.",
+    "knowledgeLabel": "Knowledge sync",
+    "knowledgeProblem": "{{count}} canonical/projection mutation(s) unresolved — affected tickets are ineligible.",
+    "floorWakeLabel": "Floor wake",
+    "poolFallback": "pool",
+    "delivered": "delivered",
+    "durablyQueued": "durably queued",
+    "deliveryFailed": "delivery failed; retry state retained",
+    "notQueued": "not queued"
+  },
+  "officerCard": {
+    "title": "Centurion",
+    "intro": "A standing officer for this project: he holds the charge, watches jobs and fleet, dispatches workers from his kit, and pages you only when something genuinely needs you. You talk to him in a conference; his background log is the session transcript. The post outlives him — kit, budgets, and memory stay with it between incarnations.",
+    "readOnly": "You can view this Officer Post, but only a project owner or system administrator can manage it.",
+    "runtimeAuthorization": {
+      "label": "Runtime authorization",
+      "unavailable": "Unavailable — autonomous planning is paused while the server retries and alerts the project owner.",
+      "a11y": "Officer runtime authorization unavailable; autonomous planning is paused"
+    },
+    "a11y": {
+      "loading": "Loading Officer Post",
+      "region": "Officer Post",
+      "brainModel": "Officer model",
+      "reasoning": "Officer reasoning effort",
+      "actionsPerWake": "Maximum actions per wake",
+      "slotName": "Slot {{index}} name",
+      "slotCount": "Slot {{index}} count",
+      "slotModel": "Slot {{index}} model",
+      "slotWorkspace": "Slot {{index}} workspace",
+      "slotPool": "Slot {{index}} pool",
+      "removeSlot": "Remove slot {{name}}",
+      "maxWorkers": "Maximum workers",
+      "tokenCeiling": "Daily token ceiling",
+      "pagesPerDay": "Maximum pages per day",
+      "sleepMin": "Minimum sleep in minutes",
+      "sleepMax": "Maximum sleep in minutes",
+      "holdNote": "Officer hold note",
+      "recycle": "Recycle Officer runtime",
+      "routingPolicy": "Worker-question routing policy"
+    },
+    "actions": {
+      "addSlot": "Add slot",
+      "cancel": "Cancel",
+      "commission": "Commission centurion",
+      "conference": "Conference",
+      "confirmDecommission": "Confirm decommission",
+      "confirmHold": "Confirm hold",
+      "decommission": "Decommission",
+      "decommissionKeepRunning": "Decommission — leave them running",
+      "hold": "Hold",
+      "keepOfficer": "Keep him",
+      "openLog": "Open log",
+      "rejoinConference": "Rejoin conference",
+      "release": "Release",
+      "recycle": "Recycle runtime",
+      "save": "Save changes"
+    },
+    "backlog": {
+      "autoPull": "Auto-pull",
+      "on": "on — ready tickets are dispatched into free pool slots",
+      "off": "off — pools stay idle until he dispatches by hand",
+      "stalled": "Stalled",
+      "stalledDetail": "{{count}} claimed ticket(s) not moving beyond {{threshold}} h ({{source}}) — these are never released automatically; resume or cancel the job, then close or re-ready the ticket.",
+      "thresholdSource": {
+        "deployment_default": "deployment default",
+        "request_override": "request override",
+        "unavailable": "policy unavailable"
+      }
+    },
+    "brain": {
+      "actionsHint": "Hard cap on tool calls each wake.",
+      "actionsLabel": "Actions per wake",
+      "modelHint": "The brain his judgment runs on — pick a strong one; his wakes are cheap but his decisions steer everything. Blank uses your session default.",
+      "modelLabel": "Officer's own model",
+      "reasoningHint": "Effort per wake. Clamped to what the model supports.",
+      "reasoningLabel": "Reasoning"
+    },
+    "budgets": {
+      "pages": "Pages per day",
+      "pagesHint": "How often he may page you (default 3).",
+      "tokenCeiling": "Daily token ceiling",
+      "tokenCeilingHint": "Across his whole command. Blank means no ceiling."
+    },
+    "category": {
+      "none": "No pool — officer dispatches by hand",
+      "researcher": "Researcher — deliverable is an answer",
+      "tester": "Tester — deliverable is issue tickets",
+      "executor": "Executor — deliverable is shipped files"
+    },
+    "decommission": {
+      "hint": "His kit, budgets, digest, and sitrep fingerprints stay on the post; recommissioning restores them with a continuity brief.",
+      "inFlightWarning": "He has {{count}} job(s) in flight. Decommissioning leaves them running — their completions land on the post's ledger for his successor."
+    },
+    "defaults": {
+      "default": "default",
+      "project": "project",
+      "session": "session default",
+      "unlimited": "unlimited",
+      "worker": "worker default"
+    },
+    "digest": {
+      "title": "Digest — what he queued for you"
+    },
+    "errors": {
+      "commission": "Commission failed",
+      "conference": "Could not open the conference",
+      "decommission": "Decommission failed",
+      "hold": "Hold failed",
+      "policy": "Could not change worker-question routing",
+      "release": "Release failed",
+      "recycle": "Runtime recycle failed",
+      "update": "Update failed",
+      "withDetail": "{{fallback}}: {{detail}}"
+    },
+    "hold": {
+      "noteHint": "Shown on the badge — why he is standing down. Legate input still reaches him while held.",
+      "noteLabel": "Hold note",
+      "placeholder": "maintenance"
+    },
+    "holdKind": {
+      "maintenance": "maintenance",
+      "conference": "conference"
+    },
+    "immediacy": {
+      "nextDelivery": "applies at next delivery",
+      "nextDispatch": "applies at next dispatch",
+      "nextRespawn": "applies on next respawn",
+      "nextSleep": "applies at next sleep filing"
+    },
+    "kit": {
+      "breakerOpen": "BREAKER OPEN",
+      "ready": "ready {{count}}",
+      "readyBelowFloor": "ready {{count}} — BELOW FLOOR"
+    },
+    "machineState": {
+      "not-attempted": "not attempted",
+      "in-progress": "in progress",
+      "retryable-failed": "retryable failure",
+      "permanent-failed": "permanent failure",
+      "activated": "activated",
+      "pending-sync": "pending sync",
+      "canonical": "canonical",
+      "failed": "failed",
+      "superseded": "superseded",
+      "pending": "pending",
+      "synced": "synced",
+      "projection-only": "projection only",
+      "retryable": "retryable",
+      "queued": "queued",
+      "delivered": "delivered",
+      "unknown": "unknown"
+    },
+    "messages": {
+      "commissioned": "Commissioned.",
+      "commissionedWithBrief": "Commissioned — his first wake carries the continuity brief. Open log to watch him take the post.",
+      "decommissioned": "Post decommissioned — kit, budgets, and fingerprints stay on the post for his successor.",
+      "held": "Held — dispatches pause and the watchdog stands down; your input still reaches him.",
+      "released": "Released — queued events drain within a tick.",
+      "recycleStarted": "Runtime recycle started — the maintenance hold remains until the replacement is healthy.",
+      "updated": "Post updated — the next sitrep's capacity line carries the truth."
+    },
+    "runtimeLifecycle": {
+      "label": "Runtime lifecycle",
+      "missing": "missing",
+      "unpinned": "unpinned",
+      "automatic": {
+        "enabled": "automatic repair enabled",
+        "disabled": "automatic repair disabled"
+      },
+      "drift": {
+        "current": "current",
+        "drifted": "image drift",
+        "missing": "pod missing",
+        "unknown": "unknown"
+      },
+      "phase": {
+        "idle": "idle",
+        "awaiting-old-pod-exit": "waiting for the old runtime to drain",
+        "fencing-old-authority": "retiring old runtime authority",
+        "provisioning": "provisioning replacement",
+        "provisioning-claimed": "replacement provision in progress",
+        "awaiting-replacement": "waiting for replacement authority",
+        "failed-retryable": "retryable failure",
+        "complete": "current",
+        "blocked": "blocked",
+        "cancelled": "cancelled",
+        "unknown": "unknown"
+      }
+    },
+    "policy": {
+      "title": "Worker questions",
+      "label": "When a worker asks a question",
+      "userDirect": "Direct to me",
+      "officerAndUser": "Officer and me",
+      "officerFirst": "Officer first",
+      "officerFirstRecommended": "Officer first (recommended)",
+      "hint": "Officer first falls back to you if the officer is unavailable, and escalates to you if he stays silent past {{minutes}} min.",
+      "hintVacant": "Officer first falls back to you if the officer is unavailable, and escalates to you if he stays silent past {{minutes}} min. While the post is vacant, questions come direct to you regardless.",
+      "value": {
+        "user_direct": "Direct to me",
+        "officer_and_user": "Officer and me",
+        "officer_first": "Officer first"
+      }
+    },
+    "reasoning": {
+      "defaultHigh": "default (high)",
+      "low": "low",
+      "medium": "medium",
+      "high": "high",
+      "xhigh": "extra high",
+      "max": "maximum"
+    },
+    "roster": {
+      "count": "Count",
+      "countHint": "Zero blocks new admission without cancelling work already in flight; counts may range from 0 to 20.",
+      "drainHint": "{{inFlight}} in flight — drains to {{count}}",
+      "hint": "Give a slot a pool and the officer fills it automatically from ready tickets of that kind; leave it unset for capacity he dispatches by hand.",
+      "maxWorkers": "Max workers",
+      "maxWorkersHint": "Flat concurrency cap. Without a kit it is the only gate (default 3).",
+      "model": "Model",
+      "pool": "Pool",
+      "slot": "Slot",
+      "slotPlaceholder": "line",
+      "workspace": "Workspace"
+    },
+    "sections": {
+      "brain": "His brain",
+      "budgets": "Budgets",
+      "kit": "Kit",
+      "sleep": "Sleep"
+    },
+    "sleep": {
+      "hint": "He files his own sleep between wakes; the server clamps to these bounds.",
+      "min": "Min (minutes)",
+      "max": "Max (minutes)"
+    },
+    "status": {
+      "active": "active",
+      "suspended": "suspended",
+      "ended": "ended",
+      "created": "created",
+      "processing": "processing",
+      "waiting_for_reply": "waiting for reply",
+      "paused": "paused",
+      "pending_review": "pending review",
+      "completed": "completed",
+      "failed": "failed",
+      "cancelled": "cancelled",
+      "held": "held",
+      "heldKind": "held — {{kind}}",
+      "unknown": "unknown"
+    },
+    "summary": {
+      "ceilingReached": "— ceiling reached; sleeping until reset",
+      "model": "His model",
+      "nextWake": "Next wake",
+      "pagesToday": "Pages today",
+      "queuedEvents": "Queued events",
+      "spendToday": "Spend today",
+      "tokens": "tokens"
+    },
+    "vacant": {
+      "dropped": "… {{count}} older entry or entries dropped",
+      "flatCapHint": "No slots means a flat cap of 3 concurrent workers. The officer runs headless; his first wake carries the continuity brief — and the while-vacant ledger, if jobs finished without him.",
+      "hint": "The post is vacant — no centurion holds this century. A project owner or system administrator can assign the kit and commission him.",
+      "ledgerTitle": "While the post was vacant",
+      "pastIncarnations": "Past incarnations"
+    },
+    "validation": {
+      "blankSlot": "Every roster row needs a slot name.",
+      "duplicateSlot": "Slot name '{{name}}' appears more than once. Rename or remove the duplicate."
+    },
+    "wake": {
+      "dueNow": "due now",
+      "eventDriven": "not scheduled (event-driven)",
+      "inMinutes": "in {{count}} min",
+      "overdueMinutes": "overdue {{count}} min"
+    },
+    "workspace": {
+      "sandbox": "sandbox",
+      "virtual": "virtual",
+      "none": "none",
+      "vmRoot": "VM (root)"
+    }
+  },
+  "statistics": {
+    "stuckPolicy": "{{threshold}} min · {{source}}",
+    "policyUnavailable": "liveness policy unavailable",
+    "thresholdSource": {
+      "deployment_default": "deployment default",
+      "request_override": "request override",
+      "unavailable": "unavailable"
+    },
+    "livenessState": {
+      "active": "active",
+      "waiting": "waiting",
+      "paused": "paused",
+      "suspected_stuck": "suspected stuck",
+      "unavailable": "liveness unavailable",
+      "terminal": "terminal"
+    },
+    "lastActivity": "last authoritative activity {{time}}",
+    "activityUnavailable": "no authoritative activity timestamp"
   },
   "pwa": {
     "splash": "Assembling legion…",
@@ -1968,5 +3799,15 @@
     "checkpoint": "Mile marker · review and proceed",
     "syncComplete": "Reports filed.",
     "errorGeneric": "The signal didn't reach. Try again."
+  },
+  "ui": {
+    "multiSelect": {
+      "placeholder": "Select options",
+      "filterPlaceholder": "Filter options",
+      "filterLabel": "Filter options",
+      "empty": "No matching options",
+      "selectedCount": "{{count}} selected",
+      "clear": "Clear"
+    }
   }
 }

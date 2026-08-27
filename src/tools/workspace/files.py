@@ -12,15 +12,18 @@ Enhanced with visual content support:
 import base64
 import logging
 import mimetypes
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import zipfile
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.tools import tool
+from src.core.workspace_backend import WorkspaceUnavailableError
 
 from src.services.image_content import (
     IMAGE_DATA_TAG_TEMPLATE,
     PAGE_IMAGE_TAG_TEMPLATE,
 )
+from src.services.cloud_mount.guardrails import workspace_path_touches_cloud
 from src.utils.pdf import PDFReader, format_read_info
 from ..context import ToolContext
 
@@ -46,6 +49,27 @@ AUDIO_EXTENSIONS = {
 
 # Document extensions that support visual rendering
 VISUAL_DOCUMENT_EXTENSIONS = {".pdf", ".pptx", ".docx"}
+
+# Archive extensions read_file lists entries for instead of attempting to
+# decode as text. Scoped to zip for now — the only format the session/worker
+# upload paths extract (knowledge-base/knowledge/issues/session_uploads_never_extract_archives.md).
+ARCHIVE_EXTENSIONS = {".zip"}
+
+# Bound the entry listing for a large archive — read_file's job is to tell
+# the agent what's inside, not to reproduce a multi-thousand-entry manifest.
+MAX_ARCHIVE_LISTING_ENTRIES = 200
+
+# Sidecar suffix the session-upload seam
+# (orchestrator/services/thread_uploads.py::ZIP_REFUSAL_NOTE_SUFFIX) writes
+# next to a zip it fell back to storing verbatim because extraction was
+# refused (corrupt, traversal entry, over a cap). Checked before describing
+# an archive below — otherwise a merely *parseable* but refused zip reads as
+# an ordinary, successfully extracted one: a full entry listing with nothing
+# saying those entries were never separated into readable files. That is
+# the motivating incident's dead end, recreated one layer down. No shared
+# import exists between the orchestrator and agent processes; keep both
+# ends of this string in sync by hand.
+ZIP_REFUSAL_NOTE_SUFFIX = ".extraction-refused.txt"
 
 # Tool metadata for registry
 # Phase availability: file tools are available in both strategic and tactical modes
@@ -74,6 +98,68 @@ FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _cloud_cache_guard_for_path(context: ToolContext, path: str) -> Optional[str]:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    if not workspace_path_touches_cloud(path):
+        return None
+    manager = cloud_mount_cfg.get("_manager")
+    if manager is None or not hasattr(manager, "cache_limit_message"):
+        return None
+    try:
+        return manager.cache_limit_message()
+    except Exception as exc:
+        logger.warning("Cloud cache guard check failed: %s", exc)
+        return None
+
+
+def _cloud_upperdir_guard_for_path(context: ToolContext, path: str) -> Optional[str]:
+    """WRITE-scoped sibling of ``_cloud_cache_guard_for_path``: blocks writes
+
+    that would copy-up into an over-quota overlay upperdir (design §7/§9.9).
+    Reads never copy-up, so this is only wired into write_file/edit_file.
+    """
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    if not workspace_path_touches_cloud(path):
+        return None
+    overlay = cloud_mount_cfg.get("_overlay_manager")
+    if overlay is None or not hasattr(overlay, "quota_guard_message"):
+        return None
+    try:
+        return overlay.quota_guard_message()
+    except Exception as exc:
+        logger.warning("Cloud upperdir guard check failed: %s", exc)
+        return None
+
+
+def _absolute(workspace: Any, path: str) -> str:
+    """Render ``path`` as the absolute path the shell would see.
+
+    The file tools resolve relative paths against the **workspace root**;
+    ``shell_execute`` resolves them against the tab's current directory, which
+    any ``cd`` moves. So the same relative string can denote two different
+    files, and echoing the caller's own string back in a tool result tells the
+    model nothing about which one it got. Job bbce4bed lost a deliverable in
+    exactly that gap: ``Written: output/report.md`` next to a shell that was
+    ``cd``'d into a subdirectory, with nothing anywhere naming the anchor.
+
+    Delegates to the backend's own ``resolve_path`` (via
+    :meth:`WorkspaceManager.get_path`), the same resolution ``_file_not_found``
+    reports, so every backend — remote, subdir, virtual overlay — renders its
+    real root. Falls back to the relative path if resolution fails: a
+    diagnostic aid must never be the reason a write fails.
+
+    See knowledge-base/knowledge/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
+    """
+    try:
+        return str(workspace.get_path(path))
+    except Exception:  # pragma: no cover - defensive; write already succeeded
+        return path
+
+
 def _get_mime_type(file_path: Path) -> str:
     """Get MIME type for a file based on extension."""
     mime_type, _ = mimetypes.guess_type(str(file_path))
@@ -95,6 +181,69 @@ def _is_visual_document(file_path: Path) -> bool:
     return file_path.suffix.lower() in VISUAL_DOCUMENT_EXTENSIONS
 
 
+def _is_archive_file(file_path: Path) -> bool:
+    """Check if file is an archive read_file should list rather than decode."""
+    return file_path.suffix.lower() in ARCHIVE_EXTENSIONS
+
+
+def _read_zip_extraction_note(workspace: Any, path: str) -> Optional[str]:
+    """The session-upload seam's refusal note for ``path``, if one exists.
+
+    Returns None for the overwhelming majority of archives — either the
+    upload extracted cleanly, this zip predates the extraction seam, or it
+    was never a session upload at all (e.g. one living inside a cloned
+    repo). Never raises: a missing or unreadable note must never block the
+    ordinary archive listing that follows it.
+    """
+    note_path = f"{path}{ZIP_REFUSAL_NOTE_SUFFIX}"
+    try:
+        if not workspace.exists(note_path):
+            return None
+        return workspace.read_file(note_path).strip()
+    except Exception as e:
+        logger.debug(f"Could not read zip extraction note for {path}: {e}")
+        return None
+
+
+def _describe_zip_archive(local_path: Path, display_name: str, size: int) -> str:
+    """Build an entry listing for a zip archive instead of its raw bytes.
+
+    Falls back to the generic binary message when ``local_path`` wears a
+    ``.zip`` extension but isn't actually a readable archive — a corrupt
+    upload or a renamed non-zip file fails cleanly either way, never with a
+    stack trace or a raw codec error.
+    """
+    try:
+        with zipfile.ZipFile(local_path) as zf:
+            infos = [
+                info
+                for info in zf.infolist()
+                if not info.is_dir()
+                and "__MACOSX" not in PurePosixPath(info.filename).parts
+                and not any(
+                    part.startswith(".") for part in PurePosixPath(info.filename).parts
+                )
+            ]
+    except Exception as e:
+        logger.debug(f"Could not list zip entries for {display_name}: {e}")
+        return f"[binary file: {display_name}, {size:,} bytes]"
+
+    lines = [f"Archive: {display_name} — {len(infos)} file(s), {size:,} bytes"]
+    lines.append("")
+    shown = infos[:MAX_ARCHIVE_LISTING_ENTRIES]
+    for info in shown:
+        lines.append(f"{info.file_size:>12,}  {info.filename}")
+    remaining = len(infos) - len(shown)
+    if remaining > 0:
+        lines.append(f"… and {remaining} more")
+    lines.append("")
+    lines.append(
+        "This is a zip archive — read_file lists its entries but cannot "
+        "show file contents directly."
+    )
+    return "\n".join(lines)
+
+
 def create_file_tools(context: ToolContext) -> List[Any]:
     """Create file operation tools with injected context.
 
@@ -112,6 +261,14 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
     workspace = context.workspace_manager
 
+    def _file_not_found(path: str) -> str:
+        resolved_path = workspace.get_path(path)
+        return (
+            f"Error: File not found: {resolved_path}\n"
+            f'  (resolved from workspace root; you passed "{path}")\n'
+            "  Use `search_files` to locate it if you expected it elsewhere."
+        )
+
     # Get word limit (with backward compatibility fallback)
     max_read_words = context.get_config("max_read_words")
     if max_read_words is None:
@@ -120,6 +277,17 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             "max_read_size", 137_500
         )  # ~25k words
         max_read_words = int(max_read_size_legacy / 5.5)
+
+    # Token-derived ceiling (session_silent_failure_audit.md #5): one tool
+    # result must not occupy more than ~15% of the main model's context
+    # window (~0.75 words/token). The configured max_read_words still rules
+    # when smaller; this bites only when the window is small relative to it —
+    # four unbounded PDF reads once filled a 128k window to 183%.
+    model_window = context.get_config("model_max_context_tokens")
+    if model_window:
+        derived_cap = int(model_window * 0.15 * 0.75)
+        if derived_cap < max_read_words:
+            max_read_words = max(derived_cap, 1_000)
 
     # Initialize PDF reader with word limit
     pdf_reader = PDFReader(max_words_per_read=max_read_words)
@@ -165,6 +333,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"PDF read error for {relative_path}: {e}")
             return f"Error reading PDF: {str(e)}"
@@ -205,6 +375,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"Size: {len(image_data):,} bytes\n\n"
                     + IMAGE_DATA_TAG_TEMPLATE.format(mime=mime_type, b64=base64_image)
                 )
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 logger.error(f"Error reading image {local_path}: {e}")
                 return f"Error reading image: {str(e)}"
@@ -243,6 +415,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"[IMAGE: {name}]\n"
                     f"(Visual description not available - vision services not configured)"
                 )
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 logger.error(f"Error describing image {local_path}: {e}")
                 return f"[IMAGE: {name}]\n(Error generating description: {str(e)})"
@@ -359,6 +533,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 f"[AUDIO: {name}]\n"
                 f"(Transcription not available - audio services not configured)"
             )
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Error transcribing audio {local_path}: {e}")
             return f"[AUDIO: {name}]\n(Error transcribing: {str(e)})"
@@ -380,9 +556,15 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             renderer = get_document_renderer()
 
-            # Render the page as PNG
+            # Render the page as PNG. Per-family DPI (matrix settings.pdf_render_dpi
+            # via limits) lets patch-model mains render fewer pixels than the
+            # provider downscales away; None -> renderer default (150).
             try:
-                page_image = renderer.render_page(full_path, page_num)
+                page_image = renderer.render_page(
+                    full_path, page_num, dpi=context.get_config("pdf_render_dpi")
+                )
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 logger.warning(
                     f"Could not render page {page_num} of {full_path.name}: {e}"
@@ -427,6 +609,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         except ImportError as e:
             logger.debug(f"Vision services not available: {e}")
             return ""  # Silently skip visual content if services not available
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Error getting visual content for page {page_num}: {e}")
             return ""
@@ -462,17 +646,39 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 start = page_start or 1
                 end = min(page_end or total_pages, total_pages)
 
-                # Add visual content for each page read
+                # Decide which pages actually need rasterizing. Text-rich,
+                # image-free pages are already represented by the extracted
+                # text above, so rendering them only burns image tokens
+                # (context_token_accounting.md S2). Fail-open: an empty map
+                # (inspection failed) renders every page, exactly as before.
+                from src.utils.pdf import compress_ranges, page_render_decisions
+
+                decisions = page_render_decisions(full_path, start, end)
+
                 visual_parts = []
+                skipped = []
                 for page_num in range(start, end + 1):
+                    decision = decisions.get(page_num)
+                    if decision is not None and not decision["render"]:
+                        skipped.append(page_num)
+                        continue
                     visual_content = _get_visual_content(full_path, page_num, describe)
                     if visual_content:
                         visual_parts.append(visual_content)
 
+                parts = [text_result]
                 if visual_parts:
-                    return text_result + "\n" + "\n".join(visual_parts)
-                return text_result
+                    parts.append("\n".join(visual_parts))
+                if skipped:
+                    parts.append(
+                        f"\n[Did not rasterize {len(skipped)} text-only "
+                        f"page(s) — already included as text above: "
+                        f"pages {compress_ranges(skipped)}]"
+                    )
+                return "\n".join(parts)
 
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 logger.debug(f"Could not add visual content: {e}")
                 return text_result
@@ -537,6 +743,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         except ImportError:
             return "Error: python-pptx not installed. Install with: pip install python-pptx"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"PPTX read error for {relative_path}: {e}")
             return f"Error reading PowerPoint: {str(e)}"
@@ -599,6 +807,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
                 return "\n".join(result_parts)
 
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 # If visual rendering fails, just return text
                 logger.debug(f"Could not add visual content for DOCX: {e}")
@@ -606,6 +816,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         except ImportError:
             return "Error: python-docx not installed. Install with: pip install python-docx"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"DOCX read error for {relative_path}: {e}")
             return f"Error reading Word document: {str(e)}"
@@ -638,6 +850,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         - Supports offset/limit paging like text files
         - Large files are automatically chunked for transcription
 
+        For archives (ZIP):
+        - Returns an entry listing (names, sizes, count) instead of contents
+
+        For any other binary file:
+        - Returns a `[binary file: name, N bytes]` message rather than a
+          decode error
+
         Args:
             path: Relative path to the file (e.g., "plan.md")
             offset: For text files: starting line number (1-indexed, default: 1)
@@ -651,11 +870,17 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             For documents: includes text + visual content descriptions.
             For images: includes image data or description.
             For audio: includes text transcription of spoken content.
+            For archives: an entry listing. For other binaries: a short
+            descriptive message.
         """
         try:
+            cache_guard_msg = _cloud_cache_guard_for_path(context, path)
+            if cache_guard_msg:
+                return cache_guard_msg
+
             # Check file exists
             if not workspace.exists(path):
-                return f"Error: File not found: {path}"
+                return _file_not_found(path)
 
             full_path = workspace.get_path(path)
             if full_path.is_dir():
@@ -697,6 +922,29 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     context.record_file_read(path)
                 return result
 
+            # Handle archives (zip): an entry listing beats a raw codec error
+            # and lets the agent ask for a specific member instead of
+            # searching the workspace for an "unzip" capability that isn't
+            # coming (knowledge-base/knowledge/issues/session_uploads_never_extract_archives.md).
+            if _is_archive_file(full_path):
+                # Check BEFORE describing the archive: a zip that the
+                # upload seam refused to extract (cap/traversal) still
+                # parses fine here, so without this it reads as an
+                # ordinary, successfully extracted archive — the entries
+                # below are shown but none of them are actually separately
+                # readable, and nothing else says so.
+                note = _read_zip_extraction_note(workspace, path)
+                with workspace.local_copy(path) as local_path:
+                    archive_size = local_path.stat().st_size
+                    result = _describe_zip_archive(
+                        local_path, full_path.name, archive_size
+                    )
+                if note:
+                    result = f"{note}\n\n{result}"
+                if not result.startswith("Error:"):
+                    context.record_file_read(path)
+                return result
+
             # For non-document files, page parameters are ignored
             if page_start is not None or page_end is not None:
                 logger.warning(
@@ -711,14 +959,22 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if start_line < 1:
                 return "Error: offset must be >= 1 (line numbers are 1-indexed)"
 
-            # Read file content
-            content = workspace.read_file(path)
+            # Read file content. Detect binary content up front: an
+            # undecodable file raises UnicodeDecodeError, a ValueError
+            # subclass, which the generic handler below would otherwise
+            # report as a bare codec message instead of an honest diagnosis.
+            try:
+                content = workspace.read_file(path)
+            except UnicodeDecodeError:
+                size = workspace.get_size(path)
+                context.record_file_read(path)
+                return f"[binary file: {full_path.name}, {size:,} bytes]"
             lines = content.splitlines()
             total_lines = len(lines)
 
             # Handle empty files: record as read and return informative message
             if total_lines == 0:
-                context.record_file_read(path)
+                context.record_file_read(path, content)
                 return f"File '{path}' is empty (0 lines)."
 
             # Validate offset
@@ -765,13 +1021,15 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 result += f"Use offset={end_line + 1} to continue.]"
 
             # Record successful read for read-before-write tracking
-            context.record_file_read(path)
+            context.record_file_read(path, content)
             return result
 
         except FileNotFoundError:
-            return f"Error: File not found: {path}"
+            return _file_not_found(path)
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"read_file error for {path}: {e}")
             return f"Error reading file: {str(e)}"
@@ -793,12 +1051,20 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         - Write intermediate results (candidates/candidates.md)
         - Store processed data (chunks/chunk_001.md)
 
+        Paths are resolved against the **workspace root**, NOT against the
+        working directory of your shell. `write_file("output/x.md")` writes the
+        same file whether or not `shell_execute` has `cd`'d somewhere — so if
+        your shell is in a subdirectory, `cat output/x.md` there will NOT find
+        it. The confirmation returns the absolute path; compare it against the
+        `CWD:` line in shell results when the two seem to disagree.
+
         Args:
-            path: Relative path for the file (e.g., "research.md")
+            path: Path for the file, relative to the workspace root
+                (e.g., "research.md")
             content: Content to write
 
         Returns:
-            Confirmation message with file path and size
+            Confirmation message with the resolved absolute path and size
         """
         # Block binary file extensions — write_file is text-only
         BINARY_EXTENSIONS = {
@@ -838,6 +1104,14 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 f"Use git tools to commit and push your results for delivery."
             )
 
+        cache_guard_msg = _cloud_cache_guard_for_path(context, path)
+        if cache_guard_msg:
+            return cache_guard_msg
+
+        upperdir_guard_msg = _cloud_upperdir_guard_for_path(context, path)
+        if upperdir_guard_msg:
+            return upperdir_guard_msg
+
         # Enforce word limit
         max_write_words = context.get_config("max_write_words", 10_000)
         word_count = len(content.split())
@@ -849,10 +1123,16 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             )
 
         try:
-            # Enforce read-before-write for existing non-empty files
-            if workspace.exists(path) and not context.was_recently_read(path):
+            # Enforce read-before-write for existing non-empty files. A
+            # versioned read must still match the current complete text; this
+            # catches Canvas/user edits even when a best-effort invalidation was
+            # missed while the agent was detached.
+            existed = workspace.exists(path)
+            had_recent_read = context.was_recently_read(path)
+            if existed:
                 existing = workspace.read_file(path)
-                if existing.strip():
+                if existing.strip() and not context.recent_read_matches(path, existing):
+                    context.invalidate_recent_read(path)
                     from src.services.guardrails import format_nudge
 
                     model = (
@@ -872,11 +1152,18 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 context._snapshot_callback(path)
 
             workspace.write_file(path, content)
+            if existed and had_recent_read:
+                context.record_file_read(path, content)
 
-            return f"Written: {path}"
+            # Absolute, not the caller's own string: `output/x.md` here and
+            # `output/x.md` in a shell that has cd'd elsewhere are different
+            # files, and only this line says which one you got.
+            return f"Written: {_absolute(workspace, path)} ({len(content)} chars)"
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"write_file error for {path}: {e}")
             return f"Error writing file: {str(e)}"
@@ -886,7 +1173,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         path: str,
         old_string: str = "",
         new_string: str = "",
-        position: Optional[str] = None,
+        position: Optional[Literal["start", "end"]] = None,
     ) -> str:
         """Edit a file by replacing text or inserting at start/end.
 
@@ -914,30 +1201,40 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             Confirmation message or error with guidance
         """
         try:
+            cache_guard_msg = _cloud_cache_guard_for_path(context, path)
+            if cache_guard_msg:
+                return cache_guard_msg
+
+            upperdir_guard_msg = _cloud_upperdir_guard_for_path(context, path)
+            if upperdir_guard_msg:
+                return upperdir_guard_msg
+
             if not workspace.exists(path):
-                return f"Error: File not found: {path}"
+                return _file_not_found(path)
 
             full_path = workspace.get_path(path)
             if full_path.is_dir():
                 return f"Error: '{path}' is a directory, not a file."
 
-            # Enforce read-before-write discipline (skip for empty files)
-            if not context.was_recently_read(path):
-                existing = workspace.read_file(path)
-                if existing.strip():
-                    from src.services.guardrails import format_nudge
+            # Enforce read-before-write discipline (skip for empty files), and
+            # reject a stale versioned read after an out-of-band edit.
+            content = workspace.read_file(path)
+            had_recent_read = context.was_recently_read(path)
+            if content.strip() and not context.recent_read_matches(path, content):
+                context.invalidate_recent_read(path)
+                from src.services.guardrails import format_nudge
 
-                    model = (
-                        context._llm_config.model
-                        if context._llm_config is not None
-                        else None
-                    )
-                    return format_nudge(
-                        "read_file_required_error",
-                        model=model,
-                        file_path=path,
-                        tool_name="edit_file",
-                    )
+                model = (
+                    context._llm_config.model
+                    if context._llm_config is not None
+                    else None
+                )
+                return format_nudge(
+                    "read_file_required_error",
+                    model=model,
+                    file_path=path,
+                    tool_name="edit_file",
+                )
 
             # Validate position parameter
             if position is not None and position not in ("start", "end"):
@@ -945,8 +1242,6 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"Error: Invalid position '{position}'. "
                     f"Use 'start' to prepend, 'end' to append, or omit for replace mode."
                 )
-
-            content = workspace.read_file(path)
 
             # Snapshot for undo before editing
             if context._snapshot_callback:
@@ -956,11 +1251,15 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if position == "end":
                 new_content = content + new_string
                 workspace.write_file(path, new_content)
+                if had_recent_read:
+                    context.record_file_read(path, new_content)
                 return f"Appended to: {path}"
 
             if position == "start":
                 new_content = new_string + content
                 workspace.write_file(path, new_content)
+                if had_recent_read:
+                    context.record_file_read(path, new_content)
                 return f"Prepended to: {path}"
 
             # Replace mode (default) - requires old_string
@@ -989,11 +1288,15 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             new_content = content.replace(old_string, new_string, 1)
             workspace.write_file(path, new_content)
+            if had_recent_read:
+                context.record_file_read(path, new_content)
 
             return f"Edited: {path}"
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"edit_file error for {path}: {e}")
             return f"Error editing file: {str(e)}"

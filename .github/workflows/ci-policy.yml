@@ -1,0 +1,51 @@
+name: ci-policy
+
+# Hard gate on self-hosted runner routing.
+#
+# This repository is PUBLIC and its CI runs on self-hosted runners in the homelab
+# cluster. For a `pull_request` event GitHub executes the workflow file taken
+# FROM the pull request, so a job routed to a self-hosted label would run a
+# stranger's code on our hardware. scripts/check_ci_runners.py refuses to let
+# such a change merge.
+#
+# This workflow is PINNED to ubuntu-latest and must stay that way: it is the
+# thing that verifies nothing else is misrouted, so it can never be allowed to
+# run on the machines it protects. check_ci_runners.py enforces that about
+# itself via Policy(hosted_only=True).
+#
+# There is deliberately NO `paths:` filter. GitHub treats a required status check
+# that did not run the same as one that failed — see the "status-check footgun"
+# section of knowledge-base/knowledge/branch_protection_setup.md — and this one has to run on every
+# change.
+#
+# This is only the MERGE-TIME half of the defence. The RUN-TIME half is
+# docker/ci-runner/job-started-guard.sh, baked into the runner image, which a
+# pull request cannot edit at all.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  runner-routing:
+    name: runner routing policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install 'pyyaml>=6.0'
+      - name: Check runner-routing policy
+        run: python scripts/check_ci_runners.py

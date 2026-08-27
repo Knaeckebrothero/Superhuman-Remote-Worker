@@ -22,7 +22,36 @@ logger = logging.getLogger(__name__)
 
 
 class KeycloakClientError(Exception):
-    """Raised when the KC token endpoint returns a non-2xx or malformed body."""
+    """Raised when the KC token endpoint returns a non-2xx or malformed body.
+
+    ``status_code`` carries the HTTP status Keycloak answered with, or ``None``
+    when it never answered (connect/timeout/TLS failure). ``oauth_error`` is
+    the OAuth2 ``error`` code from the response body, when one was present.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        oauth_error: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.oauth_error = oauth_error
+
+    @property
+    def definitive_rejection(self) -> bool:
+        """True iff Keycloak itself rejected the grant — the token is dead.
+
+        OAuth2 signals a consumed/expired/revoked refresh token (or an ended
+        SSO session) as 400 ``invalid_grant``. Anything else — unreachable,
+        5xx, malformed body, or client-config errors like ``invalid_client``
+        — says nothing about the user's session and must not be treated as a
+        rejection: ``_refresh_session_in_place`` keeps the session row on
+        non-definitive failures so a KC outage doesn't log everyone out.
+        """
+        return self.status_code == 400 and self.oauth_error == "invalid_grant"
 
 
 class KeycloakBFFClient:
@@ -96,7 +125,9 @@ class KeycloakBFFClient:
         """Use the stored refresh token to get a new access token.
 
         Returns the parsed token response. Raises KeycloakClientError on any
-        non-2xx; the caller should treat that as "session is dead, kill it".
+        non-2xx; the caller must check ``definitive_rejection`` to decide
+        whether the session is actually dead (KC rejected the grant) or KC
+        was merely unreachable/broken (keep the session, fail the request).
         """
         data = {
             "grant_type": "refresh_token",
@@ -156,7 +187,11 @@ class KeycloakBFFClient:
                 err,
                 desc,
             )
-            raise KeycloakClientError(f"KC token endpoint {resp.status_code} ({err})")
+            raise KeycloakClientError(
+                f"KC token endpoint {resp.status_code} ({err})",
+                status_code=resp.status_code,
+                oauth_error=err,
+            )
 
         try:
             return resp.json()

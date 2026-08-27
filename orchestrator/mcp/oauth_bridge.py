@@ -5,7 +5,7 @@ enabling Claude.ai, ChatGPT, and other OAuth-based platforms to connect
 while preserving the existing srw_* token system (scoping, expiry, revocation,
 audit trail).
 
-Design: docs/features/mcp_oauth_bridge.md
+Design: knowledge-base/knowledge/features/mcp_oauth_bridge.md
 """
 
 from __future__ import annotations

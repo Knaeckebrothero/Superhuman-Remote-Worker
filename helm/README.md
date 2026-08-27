@@ -2,7 +2,7 @@
 
 A self-improving AI agent system: Orchestrator (FastAPI) coordinates jobs,
 Agents (LangGraph) execute them in isolated workspaces, Cockpit (Angular)
-provides the web UI. Backed by PostgreSQL, pgvector, MongoDB, and (optionally)
+provides the web UI. Backed by PostgreSQL, pgvector, and (optionally)
 Neo4j.
 
 This chart deploys the full stack to a Kubernetes cluster. Internal databases
@@ -11,8 +11,8 @@ equivalents (managed Postgres, an external OIDC provider, an existing git
 server, etc.) — see [Production install](#production-install-bring-your-own).
 
 - **Chart:** `oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker`
-- **Source:** <https://github.com/knaeckebrothero/Superhuman-Remote-Worker>
-- **License:** see [LICENSE](https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE) — you must accept the terms to install (`license.acceptTerms: true`).
+- **Source:** <https://github.com/Knaeckebrothero/Superhuman-Remote-Worker>
+- **License:** see [LICENSE](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE) — you must accept the terms to install (`license.acceptTerms: true`).
 
 ---
 
@@ -28,12 +28,12 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 | `databases.postgres` | Application database (jobs, users, projects) | internal or external |
 | `databases.vector` | pgvector for embeddings, citations, memories | internal or external |
 | `databases.keycloak` | Dedicated Postgres for the bundled Keycloak (only relevant when `keycloak.internal: true`) | internal or external |
-| `databases.mongodb` | Audit trail (optional but recommended) | internal or external |
+| `databases.audit` | Audit trail — LLM/agent/chat traces (optional but recommended) | internal or external |
 | `databases.neo4j` | Project knowledge graph (optional). `edition: community` (default) or `enterprise` (set `acceptLicense` to `"yes"` for Startup Program / commercial, or `"eval"` for non-production). | internal or external |
 | `keycloak` | OIDC provider | internal or external |
 | `gitea` | Git server for agent code workspaces | internal or external |
 | `opencloud` / `nextcloud` | Cloud storage backend | one or external |
-| `pgadmin`, `mongoExpress`, `dozzle` | Admin UIs (off by default) | `*.enabled` |
+| `pgadmin`, `dozzle` | Admin UIs (off by default) | `*.enabled` |
 | `reloader` | Watches Secret/ConfigMap changes, triggers rolling restarts | `reloader.enabled` |
 | `vmController` | KubeVirt VM lifecycle controller (HTTP or NATS transport) | `vmController.enabled` |
 
@@ -51,14 +51,81 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 Optional but recommended:
 - **External Secrets Operator** + a backing store (Vault, AWS Secrets Manager, etc.) — see `externalSecrets.*`
 - **An OIDC IdP** if you don't want the bundled Keycloak (Azure AD, Google Workspace, Okta, etc.)
-- **Managed databases** for production (any standard Postgres 14+ for app + pgvector, MongoDB 6+, Neo4j 5+)
+- **Managed databases** for production (any standard Postgres 14+ for app + pgvector + audit, Neo4j 5+)
+- **CloudNativePG** + the **Barman Cloud plugin**, only if you run the bundled
+  databases on `databases.<name>.engine: cnpg` and want backups — see
+  [Bundled databases on CloudNativePG](#bundled-databases-on-cloudnativepg) below.
+  Neither is needed for the default StatefulSet engine.
+
+---
+
+## Bundled databases on CloudNativePG
+
+Each bundled database carries its own `databases.<name>.engine`:
+
+| value | renders | host helper points at |
+|---|---|---|
+| `statefulset` | the bundled single-replica StatefulSet | that Service |
+| `migrating` | **both** — the Cluster imports from the legacy Service | the legacy Service |
+| `cnpg` | the CloudNativePG `Cluster` only | `<name>-rw` |
+
+`statefulset` is the default and needs nothing installed. The rest of this
+section applies only if you change it.
+
+### The operator
+
+`databases.operator.install` ships **false**, because one operator serving many
+namespaces is the normal deployment and a second install fights the first over
+cluster-scoped CRDs — which Helm neither upgrades on `helm upgrade` nor removes
+on `helm uninstall`. Set it to `true` only on a cluster that has no
+CloudNativePG operator yet.
+
+### The Barman Cloud plugin — the chart cannot install this
+
+Backups (`databases.backup.method: objectstore`) additionally require the
+[Barman Cloud plugin](https://github.com/cloudnative-pg/plugin-barman-cloud).
+`barmanObjectStore` on the `Cluster` resource was deprecated in CloudNativePG
+1.26 and is slated for removal in 1.30, so the plugin is the supported path.
+
+**This chart cannot install it, and will not try.** The plugin ships as a raw
+manifest with no Helm chart, and every namespaced object in it hardcodes the
+operator's namespace (`cnpg-system`) — a release deployed into its own
+namespace does not own that one. Install it yourself:
+
+```bash
+kubectl apply -f https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/v0.14.0/manifest.yaml
+kubectl -n cnpg-system rollout status deployment barman-cloud
+kubectl -n cnpg-system logs deploy/cnpg-cloudnative-pg | grep "Registered plugin"
+```
+
+That last line is the one that matters. A running plugin pod does not mean the
+operator found it — discovery goes through the plugin's Service and its
+cert-manager-issued mTLS secrets, and a plugin the operator has not registered
+is invisible to every `Cluster`.
+
+It in turn requires **cert-manager** (for that mTLS) and **CloudNativePG
+>= 1.26**. If your operator is not in `cnpg-system`, re-namespace the manifest
+before applying it.
+
+`ObjectStore` itself is namespaced, so the chart does render that one alongside
+your clusters — only the plugin Deployment is confined to the operator's
+namespace.
+
+### Backups are off by default, deliberately
+
+`databases.backup.method` defaults to `none`. Pointing it at the chart's own
+bundled Garage would be **worse than having no backups**, because it would look
+like having them: Garage here is a single node on a single PVC in the same
+cluster as the databases it would be backing up, so one node loss takes both.
+`NOTES.txt` warns on install in both cases — no backups at all, and backups
+aimed at this release's own object store.
 
 ---
 
 ## Quick start (evaluation, single command)
 
 For a self-contained evaluation install with everything in-cluster (Postgres,
-MongoDB, Neo4j, Keycloak, Gitea, OpenCloud all bundled):
+Neo4j, Keycloak, Gitea, OpenCloud all bundled):
 
 ```bash
 helm install srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
@@ -94,7 +161,7 @@ Edit at minimum:
 - `license.acceptTerms` → `true`
 - `global.domain` → your base hostname
 - `secrets.existingSecret` → name of a Secret you create yourself (see below)
-- `databases.*.externalUrl` → connection strings for managed Postgres, vector, MongoDB
+- `databases.*.externalUrl` → connection strings for managed Postgres, vector
 - `keycloak.externalIssuerUrl` → your IdP issuer URL
 - `gitea.internal: false` + `*.externalUrl` → your git server URLs
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
@@ -120,7 +187,7 @@ ConfigMap entry, the cockpit deep-link, and the Keycloak gitea-client
 redirect URI. TLS Secret names stay tied to the release name, so two
 SRW installs in the same cluster never collide on cert storage. See
 `global.hostnames` in `values.yaml` for the full key list (cockpit, api,
-auth, git, cloud, mcp, neo4j, neo4jBolt, pgadmin, mongo, dozzle, headscale,
+auth, git, cloud, mcp, neo4j, neo4jBolt, pgadmin, dozzle, headscale,
 minio).
 
 Pre-create the secret with all required keys (see [Secret schema](#secret-schema)):
@@ -177,9 +244,10 @@ secrets:
 
 ### Mode 3 — Chart-created Secret (evaluation / dev only)
 
-The chart generates `APP_ENCRYPTION_KEY` if absent, preserves it across
-upgrades via `lookup`, and inlines any keys you provide in `secrets.values`.
-**Do not use in production** — values end up in `helm get values` output.
+The chart generates `APP_ENCRYPTION_KEY` and `MCP_INTERNAL_KEY` independently
+when absent, preserves both across upgrades via `lookup`, and inlines any keys
+you provide in `secrets.values`. **Do not use in production** — values end up
+in `helm get values` output.
 
 ```yaml
 secrets:
@@ -202,18 +270,20 @@ deployment — what you need depends on which optional components you enable.
 **Database credentials** — discrete user + password keys only. The chart
 composes the DSN at runtime from these + ConfigMap-provided host/port/db,
 so `/`, `@`, `=`, and `+` in passwords are URL-quoted automatically. Don't
-ship a bundled `DATABASE_URL` / `VECTOR_DB_URL` / `CITATION_DB_URL` Vault
+ship a bundled `DATABASE_URL` / `VECTOR_DB_URL` Vault
 key — both layouts coexist (the app falls back to the URL if user+password
 aren't set), but the URL form is legacy and a footgun under `urlsplit`.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`
 - `VECTOR_POSTGRES_USER`, `VECTOR_POSTGRES_PASSWORD` — pgvector has its
   own superuser password (separate from the main Postgres) so a credential
-  leak on one instance doesn't compromise the other.
-- `CITATION_POSTGRES_USER`, `CITATION_POSTGRES_PASSWORD` — citation
-  engine runs as its own role (`srw_citations`) on the pgvector instance
-  with a dedicated `citation_engine` database.
+  leak on one instance doesn't compromise the other. Citations, embeddings,
+  and memories all live in this instance (`srw_vector`); the citation engine
+  is a native SRW subsystem on the vector pool, **not** a separate role or
+  database (the former `srw_citations` / `citation_engine` DB was retired in
+  the citation-engine native integration — see
+  `knowledge-history/done/citation_engine_integration.md`).
 - `NEO4J_USERNAME`, `NEO4J_PASSWORD` — both live in Vault (mirroring
-  the `POSTGRES_USER` / `VECTOR_POSTGRES_USER` / `CITATION_POSTGRES_USER`
+  the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
   pattern, so all DB credentials sit in one place). Community edition
   expects `NEO4J_USERNAME=neo4j`; enterprise can use a different value.
   The Neo4j server image's `NEO4J_AUTH` is composed at pod-start from
@@ -227,6 +297,22 @@ For external-mode databases (`internal: false`), the host/port/db come
 from `databases.<which>.externalHost/externalPort/externalDb` in values;
 only the credentials live in Vault.
 
+An enabled Dynamic Canvas viewer uses a separate PostgreSQL login and never
+receives the application `POSTGRES_*` credential. Production accepts either a
+pre-created dedicated Secret named by
+`canvas.livePreview.viewer.database.credentials.existingSecret`, or a dedicated
+Vault KV path in `credentials.vaultPath` that the chart maps into such a Secret
+through ESO. The Vault-backed ExternalSecret is rendered only while
+`viewer.enabled=true`; preconfiguring the path while the gateway is disabled
+does not contact the provider or require the properties to exist. Pick exactly
+one source and provision that role with only the documented Canvas viewer
+grants. For development with the bundled database, `credentials.create=true`
+plus `provisionRole=true` generates a dedicated Secret and runs the bounded
+role reconciler. That mode is rejected for a production viewer.
+The secret-safe production workflow, preflight, direct-Secret option, and
+rotation cautions are documented in
+`knowledge-base/knowledge/operations/dynamic_canvas_gateway_database.md`.
+
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
 - `KC_DB_PASSWORD` (internal Keycloak only) — used as the Postgres superuser password on the dedicated `srw-keycloakdb` StatefulSet *and* as the connection password the Keycloak pod presents. When pointing the bundled Keycloak at an external Postgres (`databases.keycloak.internal: false`), the same value is sent over the wire — pre-provision a `keycloak` role with this password on your managed instance.
@@ -237,7 +323,43 @@ only the credentials live in Vault.
 **Git, cloud, admin credentials:**
 - `GITEA_ADMIN_USER`, `GITEA_ADMIN_PASSWORD` (internal Gitea only)
 - `NEXTCLOUD_ADMIN_USER`, `NEXTCLOUD_ADMIN_PASSWORD`, `NEXTCLOUD_AGENT_USER`, `NEXTCLOUD_AGENT_PASSWORD` (internal Nextcloud only)
+- `NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY` when
+  `nextcloud.protectedEffect.enabled=true`. Use at least 32 bytes from a
+  dedicated random source. Chart-created mode generates and preserves it;
+  ExternalSecret mode reads it only from
+  `nextcloud.protectedEffect.hmacVaultPath`, while pre-created Secret mode
+  names a dedicated Secret with `hmacSecretName`.
 - `CLOUD_SERVICE_USER`, `CLOUD_SERVICE_PASSWORD` (the agent's account on whichever cloud backend is active)
+
+### Protected Nextcloud effect lane
+
+`agent.protectedCloudModeEnabled=true` with bundled Nextcloud requires
+`nextcloud.protectedEffect.enabled=true`. The chart then adds an internal-only
+Nginx Service and a dedicated Nextcloud PHP-FPM pool. The pool authenticates an
+exact attempt-scoped request and checks its absolute deadline in an
+`auto_prepend_file` before Nextcloud starts; FPM's
+`request_terminate_timeout` supplies the hard wall-clock handler bound. The
+ordinary Nextcloud Service remains the read and cleanup path.
+
+The chart derives one non-secret configuration digest from all timing values
+and the exact verifier/FPM/Nginx files, and supplies that digest to both the
+server capability and the orchestrator's retained backend authority. Do not
+manually set the URL or digest in Helm. Do not rotate
+`NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY` while any `cloud_ro_effect_intents` row is
+retained; drain/reconcile those attempts first and keep the old key resolvable
+for historical cleanup. Never place this key in the main application Vault
+path or Secret: dynamic agent Pods consume that shared bundle through
+`envFrom`, while only the orchestrator and bounded FPM pool may sign effects.
+The chart-created dedicated Secret is immutable and ESO uses CreatedOnce
+refresh semantics. External Nextcloud is fail-closed for protected mode:
+client or reverse-proxy timeouts are not an equivalent causal fence, so an
+external installation needs the same server-enforced capability/deadline/FPM
+contract before it can be admitted.
+
+The bundled Nextcloud Deployment uses the `Recreate` strategy because every
+container in the Pod shares one data PVC. Upgrades therefore include a brief,
+deliberate Nextcloud restart instead of risking a cross-node ReadWriteOnce
+multi-attach deadlock.
 
 **LLM provider keys** (any combination, depending on which providers you use):
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `TAVILY_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `UNPAYWALL_EMAIL`
@@ -249,70 +371,206 @@ only the credentials live in Vault.
 - `DISCORD_WEBHOOK_URL`, `SLACK_WEBHOOK_URL` (chat notifications)
 - `TAILSCALE_AUTH_KEY` (when `agent.tailscale.enabled`)
 - `CODEX_MANAGEMENT_KEY` (when `codexProxy.enabled`)
-- `MCP_INTERNAL_KEY` (when `mcp.enabled`)
+- `MCP_INTERNAL_KEY` (when `mcp.enabled` or delegated Dynamic Canvas tools are
+  enabled). External-Secret and pre-existing-Secret deployments must provide
+  this independently generated shared secret. If it is absent, the
+  orchestrator remains available, but persistent agents withhold the Canvas
+  tools and the `present-with-canvas` companion skill rather than advertising
+  a broken capability; an enabled MCP pod also requires the key to start.
+  Chart-created mode generates and preserves it automatically.
 - `DEFAULT_DS_WEBDAV_*` (auto-configure a default WebDAV datasource for new users)
 
 A skeleton `srw.env` to feed into `kubectl create secret generic ... --from-env-file=`:
 
 ```env
 APP_ENCRYPTION_KEY=<base64-encoded 32-byte key>
+MCP_INTERNAL_KEY=<independently-generated random shared secret>
 POSTGRES_USER=srw
 POSTGRES_PASSWORD=changeme
 VECTOR_POSTGRES_USER=srw
 VECTOR_POSTGRES_PASSWORD=changeme
-CITATION_POSTGRES_USER=srw_citations
-CITATION_POSTGRES_PASSWORD=changeme
 KC_REALM_ADMIN_PASSWORD=changeme
 OPENAI_API_KEY=sk-...
 CLOUD_SERVICE_USER=agent
 CLOUD_SERVICE_PASSWORD=changeme
 ```
 
-Generate `APP_ENCRYPTION_KEY` with: `openssl rand -base64 32`
+Generate the independent keys with:
+
+```bash
+openssl rand -base64 32  # APP_ENCRYPTION_KEY
+openssl rand -base64 48  # MCP_INTERNAL_KEY
+```
 
 ---
 
-## Same-cluster VMs (optional)
+## VM workspaces on your cluster
 
-By default the chart does not deploy any VM infrastructure — VMs live on a
-separate `vm` cluster managed by the Fleet bundles in `deployment-vms/`,
-and the orchestrator reaches them via NATS. To run KubeVirt VMs in the same
-cluster as the orchestrator, enable the bundled VM controller:
+Agent workspaces run as containers by default. Enabling the VM tier gives an agent a full
+virtual machine instead — its own kernel, `systemd`, `sudo` (gated by a human approval in
+the cockpit) and a root disk that survives a crash or a suspend. In this mode the VMs run on
+**the same cluster as the rest of the stack**, managed by KubeVirt; the chart deploys a
+small controller and the rest of the platform talks to the VMs over the pod network.
 
-```yaml
-vmController:
-  enabled: true
-  transport: http       # http | nats | both
-  namespace: agent-vms
-  vmStorageClass: longhorn
-  vmDiskSize: 30Gi
-  vmSshPublicKey: "ssh-ed25519 AAAA... agent@srw"
+What you get, honestly stated: VMs are isolated from each other and from the control plane by
+a hypervisor boundary, the workspace NetworkPolicy, and a node taint you apply — not by a
+separate Kubernetes control plane. That is a stronger boundary than the container tier, and
+the right trade for a single box or a small cluster. If you run untrusted tenants and need a
+separate control plane for the VMs, that is the cross-cluster topology (`vm.mode: external`,
+NATS + Headscale), which is not covered here.
+
+### Prerequisites
+
+The chart does **not** install KubeVirt or CDI — they are cluster-scoped operators with
+their own lifecycle. Install them first; the chart's pre-install hook refuses to proceed
+while the CRDs are missing and prints a pointer to this section.
+
+**Hardware.** Every node that will run VMs needs hardware virtualization:
+
+```bash
+egrep -c '(vmx|svm)' /proc/cpuinfo     # > 0
+test -c /dev/kvm && echo kvm-ok
+virt-host-validate qemu                # optional, needs libvirt-client
+lsmod | grep -E 'kvm|vhost_net'        # kvm_intel|kvm_amd and vhost_net loaded
 ```
 
-Prerequisites the chart does **not** install (the cluster operator must
-provide these before enabling the toggle):
+If the node is itself a VM, enable nested virtualization on its hypervisor (KVM: `nested=1`
+on `kvm_intel`/`kvm_amd`; Proxmox: `qm set <id> --cpu host`; Hyper-V:
+`Set-VMProcessor -VMName <vm> -ExposeVirtualizationExtensions $true`; vSphere: "Expose
+hardware assisted virtualization to the guest OS"). VirtualBox cannot. Without KVM, KubeVirt
+can fall back to software emulation (`useEmulation: true`), which is fine for a smoke test
+and useless for the real agent image.
 
-- **KubeVirt** operator + `KubeVirt` CR (cluster-scoped)
-- **CDI** operator (the bundled VM template uses `DataVolume`)
-- **Nodes with hardware virtualization** (`vmx`/`svm`) and the relevant
-  KubeVirt feature gates enabled
+**Sizing.** Budget ~2 GiB for KubeVirt's control plane (with `infra.replicas: 1`) plus,
+per VM, the guest memory and about `guest/512 + 240 MiB + 8 MiB × vCPU` of launcher
+overhead — a 4 vCPU / 8 GiB VM requests roughly 8.3 GiB. Disk: one 20 GiB golden image per
+image digest plus 20 GiB per VM (root disks are full copies on `local-path`). The chart's
+defaults (`vmController.defaultCpu: 4`, `defaultMemory: 8Gi`, `maxConcurrentVms: 4`) fit a
+64 GiB node; 16 GiB total is the practical floor for the platform plus one small VM.
 
-The `transport` choice trades off features:
+**Kubernetes version and the KubeVirt line.** KubeVirt supports the three newest Kubernetes
+minors at each release. Pick the line that covers your cluster:
 
-- `http` (default for same-cluster) — orchestrator → controller over a
-  ClusterIP Service. Carries lifecycle only (create / delete / query).
-  Does **not** support in-VM daemon events (register, heartbeat, freeze,
-  resume) because those use NATS subjects. Use this when you only need
-  workspace VMs and your jobs don't pause/resume.
-- `nats` — same path as the cross-cluster bundle, but with the controller
-  co-located. Requires `nats.url` set to a reachable NATS server. Full
-  feature set.
-- `both` — controller listens on both transports. Useful while migrating
-  or when only some clients have been moved to HTTP.
+| Kubernetes | KubeVirt | CDI |
+|---|---|---|
+| 1.34 and newer | v1.9.x | v1.66.0 |
+| 1.33 | v1.8.x (e.g. v1.8.4) | v1.66.0 |
+| 1.31 / 1.32 | v1.6.x (e.g. v1.6.6) | v1.66.0 |
 
-When `vmController.enabled=false`, none of these resources render and the
-orchestrator's behavior is identical to today (NATS / direct K8s / docker
-selection).
+**Install KubeVirt and CDI.**
+
+```bash
+export KUBEVIRT_VERSION=v1.8.4   # see the table
+export CDI_VERSION=v1.66.0
+kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml
+kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml
+# single node: one replica of each control-plane component is enough
+kubectl -n kubevirt patch kubevirt kubevirt --type merge -p '{"spec":{"infra":{"replicas":1}}}'
+kubectl -n kubevirt wait kv kubevirt --for condition=Available --timeout=10m
+
+kubectl apply --server-side -f https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}/cdi-operator.yaml
+kubectl apply --server-side -f https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}/cdi-cr.yaml
+kubectl patch cdi cdi --type merge -p '{"spec":{"config":{"featureGates":["HonorWaitForFirstConsumer"],"scratchSpaceStorageClass":"local-path"}}}'
+kubectl wait cdi cdi --for condition=Available --timeout=5m
+```
+
+No KubeVirt feature gates are needed for importing, cloning and booting DataVolumes. On a
+dedicated VM node, also tolerate your taint in the KubeVirt CR (`spec.workloads.nodePlacement`)
+and the CDI CR (`spec.workload`), or the image import and the first bind of each root disk land
+on another node and the VM never schedules.
+
+`scripts/local-kubevirt-up.sh` does all of the above for the local k3d cluster (version
+selection, KVM detection, the patches below, and a smoke test).
+
+**Storage.** The VM root disks are CDI DataVolumes on `vmController.vmStorageClass`
+(default `local-path`). With `local-path`:
+
+- the StorageProfile has no capabilities entry, so CDI cannot infer access modes — the chart's
+  template sets them explicitly; if you write your own DataVolumes, patch the profile once:
+  `kubectl patch storageprofile local-path --type merge -p '{"spec":{"claimPropertySets":[{"accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem"}]}}'`
+- clones are host-assisted full copies (no snapshots), and volumes are pinned to the node
+  they were created on — set `vmController.nodeSelector` on any multi-node cluster;
+- set CDI's `scratchSpaceStorageClass` to the same class (done above). If your cluster has
+  several default StorageClasses, every VM-related object must name its class.
+
+**Network.** The workspace NetworkPolicy must actually be enforced by your CNI. Calico,
+Cilium, OVN-Kubernetes and Antrea enforce natively; **k3s** enforces through its embedded
+kube-router controller (ingress and egress) unless you started it with
+`--disable-network-policy`; Flannel alone does not.
+
+### Chart values
+
+```yaml
+vm:
+  mode: same-cluster
+  lifecycleAuthSecretName: srw-vm-lifecycle-hmac   # see below
+  preflight:
+    enabled: true          # pre-install/upgrade hook: fails when the CRDs are missing
+
+vmController:
+  image:
+    tag: <release or sha tag>
+  defaultVmImage: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:<tag>
+  defaultCpu: 4
+  defaultMemory: 8Gi
+  maxConcurrentVms: 4
+  vmStorageClass: local-path
+  vmDiskSize: 20Gi
+  nodeSelector: {}         # mandatory on multi-node clusters, e.g. {srw.io/vm-node: "true"}
+  tolerations: []          #   and the matching toleration for your taint
+  goldenImage:
+    enabled: true          # import the base image once, clone per VM
+
+agent:
+  tailscale:
+    enabled: false         # the mesh belongs to the cross-cluster topology
+```
+
+Two Secrets must exist in the release namespace:
+
+- **`<release>-vm-ssh-key`** with `ssh-privatekey` and `ssh-publickey` — the key the
+  platform uses to reach every workspace. The chart mounts the private half into the
+  orchestrator and agents and injects the public half into each VM. `scripts/local-dev-up.sh`
+  mints it locally; in production provide it via `secrets.existingVmSshKeySecret` or
+  `externalSecrets.vmSshKeyVaultPath`.
+- **`vm.lifecycleAuthSecretName`** with key `VM_LIFECYCLE_HMAC_SECRET` (≥ 32 random bytes,
+  e.g. `python3 -c 'import secrets; print(secrets.token_hex(32))'`). The orchestrator and the
+  controller share it to sign lifecycle requests, and the controller derives each VM's guest
+  token from it. Keep it separate from the application Secret.
+
+Pin `vmController.defaultVmImage` to a published tag. The default points at the tag that
+matches the chart's `appVersion`, which exists only for released charts.
+
+### Verify
+
+```bash
+kubectl get nodes -l kubevirt.io/schedulable=true
+kubectl get pods -l app.kubernetes.io/component=vm-controller
+```
+
+Then create a job with the VM backend (Cockpit → Create → workspace: VM, or
+`"workspace": {"backend": "vm"}` in the API call) and watch:
+
+```bash
+kubectl get vm,vmi,dv             # the VM reaches Running, the DataVolume Succeeded
+kubectl get pod -l srw.io/component=agent-workspace -o wide
+```
+
+The job's VM context should show `ssh_ready_source: provisioner_probe` once the orchestrator
+has proven SSH to the VM's pod IP. Inside the job, `sudo apt-get install -y <pkg>` raises an
+approval request in the cockpit; approve it and the command runs.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `helm install` fails in the `vm-preflight` hook | KubeVirt/CDI CRDs not installed; install the operators first |
+| VMI stuck in `Scheduling` | no node with `kubevirt.io/schedulable=true` that matches `nodeSelector`/tolerations, or `devices.kubevirt.io/kvm` missing (no KVM) |
+| DataVolume `Pending` forever | WaitForFirstConsumer with no consumer — normal until the VM starts; for a standalone DataVolume add the `cdi.kubevirt.io/storage.bind.immediate.requested: "true"` annotation |
+| DataVolume stuck in `ImportScheduled` | CDI has no scratch space: set `scratchSpaceStorageClass` |
+| `UnrecognizedProvisioner` on the StorageProfile | normal for `local-path`; the chart sets access modes explicitly |
+| VM `Stopped` after the guest powered off | KubeVirt does not restart a voluntary shutdown; the orchestrator recovers the job with the kept root disk |
+| `sudo` inside the VM is denied with "orchestrator unreachable" | the guest daemon cannot reach the orchestrator Service on 8085 — check the workspace NetworkPolicy and that `vm.mode` is `same-cluster` |
 
 ### Network isolation
 
@@ -343,6 +601,7 @@ that implement the standard policy resource on virt-launcher pods:
 | Cilium             | yes                     |
 | OVN-Kubernetes     | yes                     |
 | Antrea             | yes                     |
+| K3s (Flannel + embedded kube-router) | yes (ingress and egress) |
 | **Flannel**        | **no** (any policy)     |
 | Kube-OVN           | partial (KubeVirt bugs) |
 
@@ -357,7 +616,7 @@ envelope (UDP/41641 + DERP/443), not the in-VM traffic. Egress restriction
 on virt-launcher pods is meaningful for boot-time + tunnel handshake
 traffic and meaningless for everything inside the tunnel — Headscale ACLs
 are the right layer for tailnet-source filtering. See
-`docs/features/workspace_network_policy_unification.md` for details.
+`knowledge-base/knowledge/features/workspace_network_policy_unification.md` for details.
 
 ## Post-install verification
 
@@ -391,6 +650,33 @@ helm upgrade srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
 The chart preserves `APP_ENCRYPTION_KEY` across upgrades when `secrets.create=true`
 via `lookup`. ESO mode reads from Vault on each refresh interval.
 
+### Migration 0185 pinned-runtime cutover
+
+Migration 0185 is not rolling-compatible with pre-0185 pinned-runtime writers.
+An ordinary upgrade leaves
+`orchestrator.runtimeAuthorityMigrationMaintenanceAck=false`: a new pod refuses
+the pending migration while the old ready pod remains available.
+
+For the one-time cutover, first put create, Resume, prepare, and input admission
+into maintenance. End or suspend all pinned sessions, wait for in-flight
+provisioning/engage/stage/terminal work, and remove old warm-pool and dedicated
+agent pods. Then upgrade with:
+
+```bash
+helm upgrade srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+  --version <new-version> \
+  -n srw -f my-values.yaml \
+  --set orchestrator.runtimeAuthorityMigrationMaintenanceAck=true
+```
+
+That value supplies the exact migration acknowledgement and changes only the
+orchestrator Deployment to `Recreate`, preventing old/new orchestrator overlap.
+Do not use `helm upgrade --atomic` for this cutover. After migration 0185
+commits, never roll back to an image with old pinned-runtime writers; roll
+forward instead. Verify the migration ledger and lifecycle smoke tests before
+reopening admission, then clear the acknowledgement on a later all-new-version
+upgrade.
+
 ---
 
 ## Uninstall
@@ -422,5 +708,5 @@ chart tarball.
 
 ## Support
 
-- **Issues:** <https://github.com/knaeckebrothero/Superhuman-Remote-Worker/issues>
-- **License:** [LICENSE](https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE)
+- **Issues:** <https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/issues>
+- **License:** [LICENSE](https://github.com/Knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE)

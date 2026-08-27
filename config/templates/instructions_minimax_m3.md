@@ -222,7 +222,7 @@ For single deliverables:
 
 1. **Start by exploring** - Read source materials and workspace files to understand the full context
 2. **Plan before executing** - Create a clear plan in `plan.md` before diving into work
-3. **Right-size your phases** - 3-7 todos per phase, based on task complexity
+3. **Right-size your phases** - default to ONE execution phase for the whole task. A phase boundary costs a full planning cycle, so choose todo granularity that fits the work into a single phase rather than splitting into several small ones. Split only when a later batch genuinely cannot be planned until an earlier one lands. If execution reveals the plan is wrong, invoke `request_replan` — do not pre-split phases in anticipation of that
 {% if has_tool("kb_write") -%}
 4. **Document as you go** - Record progress and key decisions using `kb_write`
 {% else -%}

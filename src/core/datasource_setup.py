@@ -1,17 +1,26 @@
 """Shared datasource setup logic for both job agents and persistent sessions.
 
 Processes datasource configs received from the orchestrator: connects managed
-connectors, injects env vars for CLI access, clones repositories, materializes
-credential files (kubeconfig, ssh_key, generic_file), and builds a datasource
-index for datasources.md.
+connectors, injects env vars for CLI access, clones repositories onto the
+workspace backend, materializes credential files (kubeconfig, ssh_key,
+generic_file), and builds a datasource index for datasources.md.
+
+Repository datasources are cloned exclusively on the workspace via
+``clone_repository_datasources()`` (GitManager + shell-capable backend).
+There is no agent-local clone path — the former subprocess ``git clone``
+branch wrote credentials and repos onto the agent pod and was removed
+(knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
 """
 
 import logging
 import os
 import re
+import shlex
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+from src.services.knowledge.bindings import native_kb_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -37,35 +46,218 @@ def _ds_slug_hyphen(name: str) -> str:
     return s or "unnamed"
 
 
+# Cumulative email access tiers (``config.access``): each tier includes every
+# tool of the tiers below it (knowledge-base/knowledge/features/email_datasource.md). Order in
+# EMAIL_TIER_ORDER is the escalation order used for clamping/maxing.
+EMAIL_TIER_ORDER: Tuple[str, ...] = ("read", "read_write", "draft", "send")
+EMAIL_TIER_TOOLS: Dict[str, List[str]] = {
+    "read": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+    ],
+    "read_write": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+        "email_move",
+        "email_flag",
+    ],
+    "draft": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+        "email_move",
+        "email_flag",
+        "email_draft",
+    ],
+    "send": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+        "email_move",
+        "email_flag",
+        "email_draft",
+        "email_send",
+    ],
+}
+
+# Datasource type → tool category + read/write tool sets. Single source of
+# truth for BOTH trust boundaries: the orchestrator's
+# _build_datasource_tool_override (job dispatch, thread create/resume) and the
+# agent's session attach path delegate to datasource_tool_categories() below.
+# These were previously two hand-maintained copies that disagreed on
+# read-write managed connectors (agent: write tools; orchestrator: CLI-only).
+DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = {
+    "neo4j": {
+        "category": "graph",
+        "read": ["cypher_query", "get_database_schema"],
+        "write": ["cypher_query", "cypher_execute", "get_database_schema"],
+    },
+    "postgresql": {
+        "category": "sql",
+        "read": ["sql_query", "sql_schema"],
+        "write": ["sql_query", "sql_schema", "sql_execute"],
+    },
+    "mongodb": {
+        "category": "mongodb",
+        "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
+        "write": [
+            "mongo_query",
+            "mongo_aggregate",
+            "mongo_schema",
+            "mongo_insert",
+            "mongo_update",
+        ],
+    },
+    "webdav": {
+        "category": "webdav",
+        "read": ["webdav_list", "webdav_read", "webdav_info"],
+        "write": [
+            "webdav_list",
+            "webdav_read",
+            "webdav_info",
+            "webdav_write",
+            "webdav_delete",
+        ],
+    },
+    "repository": {
+        "category": "repo",
+        "read": ["repo_pull", "repo_pr_status"],
+        "write": [
+            "repo_checkout",
+            "repo_commit",
+            "repo_push",
+            "repo_pull",
+            "repo_open_pr",
+            "repo_pr_status",
+        ],
+    },
+    # Email is tier-keyed (config.access), not binary read/write — see
+    # EMAIL_TIER_TOOLS and knowledge-base/knowledge/features/email_datasource.md.
+    "email": {
+        "category": "email",
+        "tiers": EMAIL_TIER_TOOLS,
+    },
+    # MCP tool names are discovered only after the agent connects. The
+    # wildcard is expanded against the runtime registry before tool loading.
+    "mcp": {
+        "category": "mcp",
+        "dynamic": True,
+    },
+}
+
+
+def email_effective_access(ds: Dict[str, Any]) -> str:
+    """Effective email tier: ``config.access`` (default ``draft``), clamped
+    to ``read`` by a read-only project link.
+
+    Unknown values fail closed to ``read``. The clamp never empties
+    credentials — email needs a live IMAP login at every tier
+    (knowledge-base/knowledge/features/email_datasource.md, Touchpoints).
+    """
+    if ds.get("project_read_only", False):
+        return "read"
+    access = (ds.get("config") or {}).get("access", "draft")
+    return access if access in EMAIL_TIER_TOOLS else "read"
+
+
+def datasource_tool_categories(
+    datasources: List[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """Map attached datasources to tool-category overrides.
+
+    Semantics:
+
+    - type not attached → category stripped (``[]``) so stale tools from a
+      previously attached datasource never survive,
+    - ALL datasources of a type read-only → read tools,
+    - any read-write → write tools, backed by the real connection
+      process_datasources() now creates for read-write connectors too,
+    - tier-keyed types (email): highest effective tier across attached
+      datasources of the type (the "any read-write → write" analog);
+      per-datasource tiers come from ``config.access`` clamped by
+      ``project_read_only`` (email_effective_access), and the tool layer's
+      per-call tier check is the backup gate.
+    - dynamic types (MCP): ``["*"]`` while attached; the agent expands this
+      sentinel after runtime discovery. Project read-only does not alter MCP
+      tools because the server and its credentials are the access boundary.
+
+    History: read-write managed connectors (postgresql/neo4j/mongodb) used
+    to map to ``[]`` — "CLI mode" — which was dead on remote workspace
+    backends and left them with no access path at all
+    (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, fixed via
+    direction 1: connection-backed write tools).
+    """
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for ds in datasources:
+        ds_type = ds.get("type")
+        if ds_type:
+            by_type.setdefault(ds_type, []).append(ds)
+
+    categories: Dict[str, List[str]] = {}
+    for ds_type, tool_info in DATASOURCE_TOOL_MAP.items():
+        category = tool_info["category"]
+        ds_list = by_type.get(ds_type, [])
+        if not ds_list:
+            categories[category] = []
+        elif tool_info.get("dynamic"):
+            categories[category] = ["*"]
+        elif "tiers" in tool_info:
+            tier = max(
+                (email_effective_access(ds) for ds in ds_list),
+                key=EMAIL_TIER_ORDER.index,
+            )
+            categories[category] = list(tool_info["tiers"][tier])
+        elif all(ds.get("project_read_only", False) for ds in ds_list):
+            categories[category] = list(tool_info["read"])
+        else:
+            categories[category] = list(tool_info["write"])
+    return categories
+
+
 def process_datasources(
     ds_configs: List[Dict[str, Any]],
-    workspace_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
     """Process datasource configs and create connections/env vars.
 
-    Supports multiple datasources of the same type by using named
-    connection profiles (pg_service.conf) or per-datasource env vars
-    (MONGO_{SLUG}_URI, NEO4J_{SLUG}_URI).
+    ALL managed connectors (postgresql, neo4j, mongodb, webdav) get a real
+    tool connection now — read-write ones included. The former CLI-mode
+    routing for read-write managed connectors (env vars / pg_service.conf,
+    no connection) was a dead path on remote workspace backends: the env
+    landed in the agent process while the shell runs on the workspace host,
+    leaving read-write datasources with no access at all. See
+    knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md (fix direction 1);
+    the inject_* helpers below are kept for a future real CLI-forwarding
+    feature but are no longer called from here.
+
+    Repository datasources are NOT handled here — callers filter them out
+    and clone via clone_repository_datasources() once the workspace backend
+    is ready. Any repository entry that still reaches this function is
+    skipped with a warning; there is no agent-local clone path.
 
     Args:
         ds_configs: List of datasource config dicts from the orchestrator.
-        workspace_dir: Workspace directory for repository cloning.
 
     Returns:
         Tuple of (datasources_dict, client_registry, cli_ds_types):
         - datasources_dict: Connection objects keyed by type for ToolContext
         - client_registry: Parent clients (e.g. MongoClient) for cleanup
-        - cli_ds_types: List of datasource types configured for CLI access
+        - cli_ds_types: Always empty since the CLI-mode retirement; kept in
+          the signature so callers' prompt-block plumbing (the future CLI
+          feature's seam) stays in place.
     """
     datasources_dict: Dict[str, Any] = {}
     client_registry: Dict[str, Any] = {}
     cli_ds_types: List[str] = []
 
-    # Group datasources by type for multi-source setup
-    by_type: Dict[str, List[Dict[str, Any]]] = {}
     generic_list: List[Dict[str, Any]] = []
-    repo_list: List[Dict[str, Any]] = []
-    read_only_list: List[Dict[str, Any]] = []
+    mcp_list: List[Dict[str, Any]] = []
+    connector_list: List[Dict[str, Any]] = []
 
     for ds in ds_configs:
         ds_type = ds.get("type")
@@ -75,13 +267,24 @@ def process_datasources(
         if ds_type == "generic":
             generic_list.append(ds)
         elif ds_type == "repository":
-            repo_list.append(ds)
+            logger.warning(
+                "Repository datasource %r ignored by process_datasources(); "
+                "repos clone onto the workspace backend via "
+                "clone_repository_datasources().",
+                ds.get("name", "unnamed"),
+            )
+        elif ds_type == "kb":
+            # External OKF KBs are centrally indexed. The agent receives only
+            # datasource id/display/config metadata and never opens a connector
+            # or clones the repository.
+            logger.debug(
+                "OKF Knowledge Base %r handled by KnowledgeStore bindings",
+                ds.get("name", "unnamed"),
+            )
+        elif ds_type == "mcp":
+            mcp_list.append(ds)
         else:
-            is_read_only = ds.get("project_read_only", False)
-            if not is_read_only and ds_type in ("postgresql", "neo4j", "mongodb"):
-                by_type.setdefault(ds_type, []).append(ds)
-            else:
-                read_only_list.append(ds)
+            connector_list.append(ds)
 
     # Generic datasources: inject env vars into process environment
     for ds in generic_list:
@@ -95,28 +298,15 @@ def process_datasources(
             ds.get("name", "unnamed"),
         )
 
-    # Repository datasources: clone repos
-    for ds in repo_list:
-        try:
-            setup_repository_datasource(ds, workspace_dir)
-        except Exception as e:
-            logger.warning("Failed to setup repository datasource: %s", e)
-
-    # CLI-mode managed connectors: set up named connections
-    if "postgresql" in by_type:
-        inject_postgresql_services(by_type["postgresql"])
-        cli_ds_types.append("postgresql")
-
-    if "mongodb" in by_type:
-        inject_mongodb_env_vars(by_type["mongodb"])
-        cli_ds_types.append("mongodb")
-
-    if "neo4j" in by_type:
-        inject_neo4j_env_vars(by_type["neo4j"])
-        cli_ds_types.append("neo4j")
-
-    # Read-only managed connectors: create tool connections
-    for ds in read_only_list:
+    # Managed connectors: create tool connections. The registry is
+    # TYPE-keyed (last-one-wins), and datasource_tool_categories() binds
+    # write tools when ANY datasource of a type is read-write — so process
+    # read-only entries first and read-write last, ensuring the connection
+    # that wins the type slot matches the granted tool surface (write tools
+    # must never end up bound to a read-only-linked connection).
+    for ds in sorted(
+        connector_list, key=lambda d: not d.get("project_read_only", False)
+    ):
         ds_type = ds["type"]
         try:
             conn, client = create_datasource_connection(ds)
@@ -124,12 +314,21 @@ def process_datasources(
             if client:
                 client_registry[ds_type] = client
             logger.info(
-                "Connected to %s datasource: %s",
+                "Connected to %s datasource: %s (%s)",
                 ds_type,
                 ds.get("name", "unnamed"),
+                "read-only" if ds.get("project_read_only", False) else "read-write",
             )
         except Exception as e:
             logger.warning("Failed to connect to %s datasource: %s", ds_type, e)
+
+    # ToolContext's datasource registry is keyed by type, so one manager must
+    # aggregate every attached MCP server. Construction performs validation
+    # only; callers connect it asynchronously once their runtime is ready.
+    if mcp_list:
+        from src.tools.mcp import MCPManager
+
+        datasources_dict["mcp"] = MCPManager(mcp_list)
 
     return datasources_dict, client_registry, cli_ds_types
 
@@ -605,6 +804,18 @@ def create_datasource_connection(
         client.list("/")
         return client, None
 
+    elif ds_type == "email":
+        # Lazy import: the email tool module ships with the email tool
+        # surface — keep this module importable without it.
+        from src.tools.email.connection import EmailConnection
+
+        config = dict(ds.get("config") or {})
+        # Normalize to the effective tier (default 'draft'; a read-only
+        # project link clamps to 'read' but credentials stay intact — email
+        # needs a live IMAP login at every tier).
+        config["access"] = email_effective_access(ds)
+        return EmailConnection(creds, config), None
+
     else:
         raise ValueError(f"Unknown datasource type: {ds_type}")
 
@@ -614,84 +825,304 @@ def create_datasource_connection(
 # ---------------------------------------------------------------------------
 
 
-def setup_repository_datasource(
-    ds: Dict[str, Any],
-    workspace_dir: Optional[str] = None,
-) -> None:
-    """Clone a repository into the workspace and configure git credentials.
+def resolve_repo_clone_names(
+    repo_datasources: List[Dict[str, Any]],
+) -> List[str]:
+    """Return the clone-directory name for each repository datasource, in order.
 
-    Uses per-repo core.sshCommand for SSH auth, which avoids conflicts
-    when multiple repos share a hostname (e.g. two GitHub repos with
-    different deploy keys).
+    The directory under ``repos/`` uses the upstream repo name from the URL
+    (falling back to the datasource-label slug), with a numeric suffix when
+    two datasources resolve to the same name (e.g. forks of one upstream).
+    Shared by clone_repository_datasources() and inject_datasource_index()
+    so the datasources.md index always points at the real clone paths.
     """
-    repo_url = ds.get("connection_url", "")
-    creds = ds.get("credentials") or {}
-    name = re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
-    branch = ds.get("default_branch")
+    from ..utils.git_url import repo_name_from_url
 
-    workspace_dir = workspace_dir or os.getcwd()
-    repos_dir = os.path.join(workspace_dir, "repos")
-    os.makedirs(repos_dir, exist_ok=True)
-    clone_path = os.path.join(repos_dir, name)
+    names: List[str] = []
+    used: set[str] = set()
+    for ds in repo_datasources:
+        ds_slug = (
+            re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+            or "repo"
+        )
+        base = repo_name_from_url(ds.get("connection_url", ""), fallback=ds_slug)
+        name = base
+        suffix = 2
+        while name in used:
+            name = f"{base}-{suffix}"
+            suffix += 1
+        if name != base:
+            logger.info(
+                "Repo name collision for %s; cloning into %s instead", base, name
+            )
+        used.add(name)
+        names.append(name)
+    return names
 
-    if os.path.exists(clone_path):
-        logger.info("Repository already exists at %s, skipping clone", clone_path)
+
+def clone_repository_datasources(
+    repo_datasources: List[Dict[str, Any]],
+    workspace_manager: Any,
+) -> None:
+    """Clone repository datasources onto the workspace backend.
+
+    Every operation runs on the workspace: SSH key material lands in the
+    workspace home via ``backend.write_home_file``, host config via
+    ``backend.shell_run``, and the clone itself is
+    ``GitManager.clone(backend=...)`` (git on the workspace over SSH).
+
+    There is deliberately NO agent-local fallback: without a shell-capable
+    backend the datasources are skipped with an error. Repository
+    datasources require a full workspace — lite tiers reject them at
+    dispatch (knowledge-base/knowledge/features/no_workspace_agent_mode.md §4/§7).
+
+    Args:
+        repo_datasources: Datasource config dicts of type "repository".
+        workspace_manager: WorkspaceManager whose backend hosts the clones;
+            successful clones are registered in its ``source_repos``.
+    """
+    if not repo_datasources:
         return
 
-    auth_method = creds.get("auth_method", "token")
-    clone_env = {**os.environ}
+    backend = getattr(workspace_manager, "backend", None)
+    if backend is None or not getattr(backend, "supports_shell", False):
+        logger.error(
+            "Repository datasources require a workspace backend with shell "
+            "support; skipping %d repository datasource(s), no local clone "
+            "fallback: %s",
+            len(repo_datasources),
+            ", ".join(ds.get("name", "unnamed") for ds in repo_datasources),
+        )
+        return
 
-    if auth_method == "ssh":
-        ssh_dir = os.path.expanduser("~/.ssh")
-        os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-        key_file = os.path.join(ssh_dir, f"repo_{name}")
-        with open(key_file, "w") as f:
-            f.write(creds.get("ssh_key", ""))
-        os.chmod(key_file, 0o600)
+    from ..managers.git_manager import GitManager
+    from ..utils.ssh_key import normalize_private_key
 
-        # Clone with explicit SSH command (avoids ~/.ssh/config conflicts)
-        ssh_cmd = f"ssh -i {key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-        clone_env["GIT_SSH_COMMAND"] = ssh_cmd
-
-    elif auth_method == "token" and creds.get("token"):
-        cred_file = os.path.expanduser("~/.git-credentials")
-        parsed = urlparse(repo_url)
-        host = parsed.hostname or "github.com"
-        scheme = parsed.scheme or "https"
-        cred_line = f"{scheme}://oauth2:{creds['token']}@{host}"
-        with open(cred_file, "a") as f:
-            f.write(cred_line + "\n")
-        os.chmod(cred_file, 0o600)
-        subprocess.run(
-            ["git", "config", "--global", "credential.helper", "store"],
-            check=False,
-            capture_output=True,
+    # The workspace root is itself a durable Git repository. Without this
+    # exclusion, its next checkpoint records each nested checkout as a
+    # contentless gitlink; a fallback restore then recreates only an empty
+    # directory. Keeping the clone root ignored means every attach can either
+    # reuse the PVC copy below or re-clone it from the connector.
+    try:
+        if backend.exists(".gitignore"):
+            content = backend.read_file(".gitignore")
+            ignored = any(
+                line.strip() == "repos/" for line in str(content).splitlines()
+            )
+            if not ignored:
+                separator = "" if str(content).endswith("\n") else "\n"
+                backend.append_file(
+                    ".gitignore",
+                    f"{separator}\n# Cloned repository datasources\nrepos/\n",
+                )
+        else:
+            backend.write_file(
+                ".gitignore", "# Cloned repository datasources\nrepos/\n"
+            )
+    except Exception as exc:
+        logger.warning(
+            "Could not exclude repository datasource clones from workspace "
+            "versioning: %s",
+            exc,
         )
 
-    cmd = ["git", "clone", repo_url, clone_path]
-    if branch:
-        cmd.extend(["--branch", branch])
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=120, env=clone_env
-    )
-    if result.returncode != 0:
-        logger.warning("Git clone failed: %s", result.stderr)
-        raise RuntimeError(f"Failed to clone repository: {result.stderr}")
-    logger.info("Cloned repository to %s", clone_path)
-
-    # Set persistent per-repo SSH command so future git ops use the right key
-    if auth_method == "ssh":
-        subprocess.run(
-            [
-                "git",
-                "config",
-                "core.sshCommand",
-                f"ssh -i {key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
-            ],
-            cwd=clone_path,
-            check=False,
-            capture_output=True,
+    clone_names = resolve_repo_clone_names(repo_datasources)
+    for ds, repo_name in zip(repo_datasources, clone_names):
+        # ds_name is the safe form of the user-supplied datasource label.
+        # It stays the SSH key filename and SSH config alias so that two
+        # datasources with different keys for the same repo don't clobber
+        # each other's auth material.
+        ds_name = (
+            re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+            or "repo"
         )
+        try:
+            repo_url = ds.get("connection_url", "")
+            branch = ds.get("default_branch")
+            creds = ds.get("credentials") or {}
+
+            # Determine auth method: explicit field, or infer from
+            # credentials keys (ssh_key present → ssh).
+            auth_method = creds.get("auth_method")
+            if not auth_method:
+                if creds.get("ssh_key"):
+                    auth_method = "ssh"
+                elif creds.get("token"):
+                    auth_method = "token"
+
+            if auth_method == "ssh" and creds.get("ssh_key"):
+                # Normalize defensively: orchestrator validation already
+                # runs on save, but legacy rows in the datasources table
+                # may predate it. Cheap insurance.
+                ssh_key_text = normalize_private_key(creds["ssh_key"])
+
+                parsed = urlparse(repo_url)
+                host = parsed.hostname or "localhost"
+
+                # Write SSH key and configure on the workspace.
+                # write_home_file lands the key under $HOME without
+                # tripping the workspace-boundary check on write_file;
+                # resolve_home_path gives us the absolute path for the
+                # subsequent chmod and SSH config IdentityFile entry.
+                rel_key = f".ssh/repo_{ds_name}"
+                key_path = backend.resolve_home_path(rel_key)
+                backend.shell_run(
+                    "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
+                    timeout=10,
+                    tab_name="git",
+                )
+                backend.write_home_file(rel_key, ssh_key_text)
+                backend.shell_run(
+                    f"chmod 600 {shlex.quote(key_path)}",
+                    timeout=10,
+                    tab_name="git",
+                )
+                # Append SSH config for this host
+                ssh_config = (
+                    f"\nHost {host}\n"
+                    f"  IdentityFile {key_path}\n"
+                    f"  StrictHostKeyChecking accept-new\n"
+                )
+                backend.shell_run(
+                    f"printf %s {shlex.quote(ssh_config)} >> ~/.ssh/config",
+                    timeout=10,
+                    tab_name="git",
+                )
+
+                # Convert HTTPS URL to SSH URL so git uses the key.
+                # strip("/") handles trailing slashes too — datasource URLs
+                # entered as `.../repo/` would otherwise become `repo/.git`,
+                # which GitHub's SSH server rejects.
+                if parsed.scheme in ("http", "https"):
+                    path = parsed.path.strip("/")
+                    if not path.endswith(".git"):
+                        path += ".git"
+                    repo_url = f"git@{host}:{path}"
+                    logger.info(
+                        "Converted HTTPS URL to SSH for %s: %s",
+                        ds_name,
+                        repo_url,
+                    )
+
+            elif (auth_method == "token" or not auth_method) and creds.get("token"):
+                parsed = urlparse(repo_url)
+                repo_url = parsed._replace(
+                    netloc=f"oauth2:{creds['token']}@{parsed.hostname}"
+                    + (f":{parsed.port}" if parsed.port else "")
+                ).geturl()
+
+            target = workspace_manager.path / "repos" / repo_name
+            remote_cwd = f"repos/{repo_name}"
+            reused = backend.exists(f"{remote_cwd}/.git")
+            if reused:
+                # A session workspace may outlive its agent pod (PVC hot tier)
+                # or be restored from the thread repository. Re-register the
+                # managed checkout instead of attempting a second clone into
+                # the existing directory, which git correctly refuses.
+                git_mgr = GitManager(
+                    target,
+                    backend=backend,
+                    remote_cwd=remote_cwd,
+                )
+                logger.info(
+                    "Reusing repository datasource %r from repos/%s",
+                    ds_name,
+                    repo_name,
+                )
+            else:
+                git_mgr = GitManager.clone(
+                    repo_url,
+                    target,
+                    backend=backend,
+                    remote_cwd=remote_cwd,
+                )
+            if git_mgr:
+                branch_ready = True
+                if branch and (not reused or ds.get("require_default_branch")):
+                    branch_ready = git_mgr.checkout_branch(branch)
+                elif branch:
+                    # Reused checkout without require_default_branch: the
+                    # worker may have moved HEAD (e.g. onto a job branch)
+                    # before this re-attach; re-running checkout here silently
+                    # reverted that on every resume (job 12a0e92c). Only a
+                    # review session pins the branch on reuse — its entire
+                    # point is that this exact delivery is checked out
+                    # (orchestrator/services/job_delivery.py sets
+                    # require_default_branch).
+                    logger.debug(
+                        "Reused repos/%s keeps its checked-out branch %r "
+                        "(pinned default %r not re-applied on re-attach)",
+                        repo_name,
+                        git_mgr.current_branch(),
+                        branch,
+                    )
+                if ds.get("require_default_branch") and not branch_ready:
+                    logger.error(
+                        "Repository datasource %r could not check out required "
+                        "branch %r; refusing to register the review source",
+                        ds_name,
+                        branch,
+                    )
+                    continue
+                workspace_manager.source_repos[repo_name] = git_mgr
+                try:
+                    from ..services.forge import parse_owner_repo, resolve_api_base
+
+                    forge = str((ds.get("config") or {}).get("forge") or "").lower()
+                    raw_url = ds.get("connection_url", "")
+                    owner, repo_slug = parse_owner_repo(raw_url)
+                    repo_meta = {
+                        "forge": forge,
+                        "api_base": resolve_api_base(raw_url, forge),
+                        "owner": owner,
+                        "repo": repo_slug,
+                        "token": (creds or {}).get("token", ""),
+                        # The agent payload carries the project link flag as
+                        # `project_read_only`; `read_only` is the publisher's
+                        # declared flag on public datasources. Either one
+                        # forbids writes, and reading only the latter made
+                        # every read-only repository record read_only=False.
+                        "read_only": bool(
+                            ds.get("project_read_only") or ds.get("read_only")
+                        ),
+                        "default_branch": branch,
+                    }
+                    # Current orchestrators deliberately omit the raw DB
+                    # ``id`` and send the resolved, server-owned identity as
+                    # ``datasource_id``.  The ``id`` fallback is retained only
+                    # for older in-process/internal callers that passed a
+                    # resolved row directly to this shared clone helper.
+                    datasource_id = str(
+                        ds.get("datasource_id") or ds.get("id") or ""
+                    ).strip()
+                    if datasource_id:
+                        repo_meta["datasource_id"] = datasource_id
+                    workspace_manager.source_repo_meta[repo_name] = repo_meta
+                except Exception as e:
+                    # A metadata failure must not fail the clone; the repo is
+                    # still usable through the shell and the read-only git tools.
+                    logger.warning(
+                        "Could not record forge metadata for repos/%s: %s",
+                        repo_name,
+                        e,
+                    )
+                logger.info(
+                    "Cloned repository datasource %r into repos/%s",
+                    ds_name,
+                    repo_name,
+                )
+            else:
+                logger.warning(
+                    "Failed to clone repository datasource %r (target repos/%s)",
+                    ds_name,
+                    repo_name,
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to clone repository datasource %s: %s",
+                ds.get("name", "unnamed"),
+                e,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -699,23 +1130,49 @@ def setup_repository_datasource(
 # ---------------------------------------------------------------------------
 
 
+def _declared_ro_note(ds: Dict[str, Any]) -> str:
+    """Advisory suffix for publisher-declared read-only datasources.
+
+    Declarative only (knowledge-base/knowledge/features/public_datasources.md): credentials are
+    the enforcement boundary; this just tells the agent the intent. Distinct
+    from ``project_read_only`` (per-link connector mode), which switches the
+    tool surface.
+    """
+    return " (declared read-only — treat as no-write)" if ds.get("read_only") else ""
+
+
 def inject_datasource_index(
     ds_configs: List[Dict[str, Any]],
     workspace_manager: Any,
 ) -> None:
-    """Inject a compact datasource index into datasources.md.
+    """Inject a compact connector index into the compatibility file datasources.md.
 
-    Lists every datasource with its specific named access method so the
+    Lists every connector with its specific named access method so the
     agent knows how to connect to each one. The system prompts point the
     agent at datasources.md for connection names.
+
+    Rewrites rather than re-appends: any existing connector section, including
+    the legacy "## Available Datasources" heading, is cut before the new one is
+    written. The section is historically trailing because it is only appended
+    after workspace init. This keeps live connector changes from duplicating
+    the index.
     """
-    lines = ["\n\n## Available Datasources\n"]
+    lines = ["\n\n## Available Connectors\n"]
 
     # Group by category for readable output
     repos = [ds for ds in ds_configs if ds.get("type") == "repository"]
+    # A project's own KB datasource is a management surface, not an external
+    # source: it is bound as the writable native KB. Listing it here would
+    # advertise the agent's own knowledge base as "read-only".
+    knowledge_bases = [
+        ds
+        for ds in ds_configs
+        if ds.get("type") == "kb" and not native_kb_project_id(ds)
+    ]
     databases = [
         ds for ds in ds_configs if ds.get("type") in ("postgresql", "neo4j", "mongodb")
     ]
+    mcps = [ds for ds in ds_configs if ds.get("type") == "mcp"]
     creds = [ds for ds in ds_configs if ds.get("type") in CREDENTIAL_FILE_TYPES]
     others = [
         ds
@@ -723,9 +1180,11 @@ def inject_datasource_index(
         if ds.get("type")
         not in (
             "repository",
+            "kb",
             "postgresql",
             "neo4j",
             "mongodb",
+            "mcp",
             "kubeconfig",
             "ssh_key",
             "generic_file",
@@ -734,10 +1193,24 @@ def inject_datasource_index(
 
     if repos:
         lines.append("### Repositories")
-        for ds in repos:
-            slug = re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+        # Same name resolution as clone_repository_datasources() — the index
+        # must point at the directories the clones actually land in.
+        for ds, clone_name in zip(repos, resolve_repo_clone_names(repos)):
             lines.append(
-                f"- **{ds.get('name')}** — cloned at `./repos/{slug}/`, git pre-authenticated"
+                f"- **{ds.get('name')}** — cloned at `./repos/{clone_name}/`, "
+                f"git pre-authenticated{_declared_ro_note(ds)}"
+            )
+        lines.append("")
+
+    if knowledge_bases:
+        lines.append("### OKF Knowledge Bases")
+        for ds in knowledge_bases:
+            name = ds.get("name", "Unnamed")
+            root = str((ds.get("config") or {}).get("root_path") or "")
+            root_hint = f", root `{root}`" if root else ""
+            lines.append(
+                f"- **{name}** (centrally indexed, read-only{root_hint}) — "
+                "use `kb_search`, `kb_list`, and `kb_read`"
             )
         lines.append("")
 
@@ -751,7 +1224,32 @@ def inject_datasource_index(
             if is_ro:
                 lines.append(f"- **{name}** ({ds_type}, read-only) — query tools")
             else:
-                lines.append(_format_rw_cli_entry(name, ds_type))
+                lines.append(
+                    f"- **{name}** ({ds_type}, read-write) — query + write tools"
+                    + _declared_ro_note(ds)
+                )
+        lines.append("")
+
+    if mcps:
+        lines.append("### MCP Servers")
+        for ds in mcps:
+            name = ds.get("name", "Unnamed")
+            transport = str(
+                (ds.get("credentials") or {}).get("transport") or "http"
+            ).lower()
+            status = ds.get("_mcp_status") or "not connected yet"
+            tools = ds.get("_mcp_tools") or []
+            if status == "connected":
+                shown = ", ".join(f"`{tool_name}`" for tool_name in tools[:40])
+                if not shown:
+                    shown = "_no tools advertised_"
+                more = f" (+{len(tools) - 40} more)" if len(tools) > 40 else ""
+                lines.append(
+                    f"- **{name}** (mcp, {len(tools)} tools) — "
+                    f"{transport}; {shown}{more}"
+                )
+            else:
+                lines.append(f"- **{name}** (mcp, {transport}) — {status}")
         lines.append("")
 
     if creds:
@@ -788,12 +1286,37 @@ def inject_datasource_index(
 
             if ds_type == "generic":
                 cli = ds.get("cli_hint", "CLI via env vars")
-                lines.append(f"- **{name}** (generic) — {cli}")
+                lines.append(f"- **{name}** (generic) — {cli}{_declared_ro_note(ds)}")
             elif ds_type == "webdav":
                 access = "read-only tools" if is_ro else "read-write tools"
-                lines.append(f"- **{name}** (webdav, {access})")
+                lines.append(f"- **{name}** (webdav, {access}){_declared_ro_note(ds)}")
+            elif ds_type == "email":
+                config = ds.get("config") or {}
+                account = (
+                    (ds.get("credentials") or {}).get("username")
+                    or config.get("from_address")
+                    or "unknown account"
+                )
+                folders = config.get("folders") or []
+                scope = (
+                    ", ".join(f"`{f}`" for f in folders)
+                    if folders
+                    else "entire mailbox"
+                )
+                lines.append(
+                    f"- **{name}** (email, {account}, tier "
+                    f"`{email_effective_access(ds)}`) — folders: {scope}"
+                    f"{_declared_ro_note(ds)}"
+                )
             else:
-                lines.append(f"- **{name}** ({ds_type})")
+                lines.append(f"- **{name}** ({ds_type}){_declared_ro_note(ds)}")
+        lines.append("")
+
+    if not ds_configs:
+        # A live remove-all still needs the section rewritten — an agent
+        # re-reading the file must not act on connection names that no
+        # longer resolve.
+        lines.append("_No connectors attached._")
         lines.append("")
 
     try:
@@ -801,35 +1324,24 @@ def inject_datasource_index(
             existing = workspace_manager.read_file("datasources.md")
         except (FileNotFoundError, ValueError, OSError):
             existing = ""
+        markers = (
+            existing.find(heading)
+            for heading in ("## Available Connectors", "## Available Datasources")
+        )
+        marker = min((position for position in markers if position != -1), default=-1)
+        if marker != -1:
+            existing = existing[:marker].rstrip("\n")
         workspace_manager.write_file("datasources.md", existing + "\n".join(lines))
         logger.info(
-            "Injected datasource index (%d entries) into datasources.md",
+            "Injected connector index (%d entries) into datasources.md",
             len(ds_configs),
         )
     except Exception as e:
-        logger.warning("Failed to inject datasource index: %s", e)
+        logger.warning("Failed to inject connector index: %s", e)
 
 
-def _format_rw_cli_entry(name: str, ds_type: str) -> str:
-    """Format a one-line CLI usage entry for a read-write managed datasource."""
-    slug = _slugify(name)
-    slug_upper = slug.upper()
-
-    if ds_type == "postgresql":
-        return (
-            f"- **{name}** (postgresql, read-write): "
-            f"`PGSERVICE={slug} psql` — credentials pre-configured"
-        )
-    elif ds_type == "neo4j":
-        return (
-            f"- **{name}** (neo4j, read-write): "
-            f'`cypher-shell --address "$NEO4J_{slug_upper}_URI" '
-            f'--username "$NEO4J_{slug_upper}_USERNAME" '
-            f'--password "$NEO4J_{slug_upper}_PASSWORD"`'
-        )
-    elif ds_type == "mongodb":
-        return (
-            f'- **{name}** (mongodb, read-write): `mongosh "$MONGO_{slug_upper}_URI"`'
-        )
-    else:
-        return f"- **{name}** ({ds_type}, read-write) — CLI via env vars"
+# NOTE: the former _format_rw_cli_entry (PGSERVICE/cypher-shell/mongosh usage
+# lines for read-write connectors) was removed with the CLI-mode retirement —
+# it advertised commands that cannot work on remote workspace backends. A
+# future real CLI-forwarding feature reintroduces it properly
+# (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, direction 2).

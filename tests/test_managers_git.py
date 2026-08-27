@@ -3,6 +3,7 @@
 Tests git versioning functionality for agent workspaces.
 """
 
+import logging
 import shutil
 import subprocess
 import sys
@@ -17,7 +18,7 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.managers.git_manager import GitManager  # noqa: E402
+from src.managers.git_manager import GitManager, TagInvariantViolation  # noqa: E402
 
 
 @pytest.fixture
@@ -98,6 +99,188 @@ class TestHasUnpushedCommits:
     def test_false_when_inactive(self, git_manager):
         """Uninitialized repo → False (no crash)."""
         assert git_manager.has_unpushed_commits() is False
+
+
+class TestPushSkipLogging:
+    """push() must say why it declined.
+
+    Regression guard for the defect behind job bbce4bed: both early returns
+    used to be silent, and five of the six call sites discard the return
+    value, so a job could fail to push across every phase boundary and leave
+    no trace in any log.
+    """
+
+    def test_inactive_repo_logs_reason(self, git_manager, caplog):
+        """No .git → WARNING naming the path that was checked."""
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert git_manager.push() is False
+        assert any(
+            "git not active" in r.message and ".git" in r.message
+            for r in caplog.records
+        ), caplog.text
+
+    def test_missing_remote_logs_reason(self, initialized_git, caplog):
+        """Active repo but no remote → WARNING naming the remote."""
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert initialized_git.push() is False
+        assert any("no 'origin' remote" in r.message for r in caplog.records), (
+            caplog.text
+        )
+
+    def test_missing_remote_names_the_requested_remote(self, initialized_git, caplog):
+        """A non-default remote name appears verbatim, not hardcoded 'origin'."""
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert initialized_git.push(remote="upstream") is False
+        assert any("no 'upstream' remote" in r.message for r in caplog.records), (
+            caplog.text
+        )
+
+    def test_successful_push_logs_no_skip_warning(
+        self, initialized_git, bare_remote, caplog
+    ):
+        """Happy path stays quiet — the new logging must not become noise."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert initialized_git.push() is True
+        assert not any("push skipped" in r.message for r in caplog.records), caplog.text
+
+    def test_git_unavailable_is_distinguished_from_missing_repo(
+        self, temp_workspace, caplog
+    ):
+        """A missing git binary reports as such, not as a missing .git."""
+        with patch("shutil.which", return_value=None):
+            gm = GitManager(temp_workspace)
+            with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+                assert gm.push() is False
+        assert any("git binary unavailable" in r.message for r in caplog.records), (
+            caplog.text
+        )
+
+
+class TestPushDetachedHead:
+    """push() with no branch must refuse on a detached HEAD.
+
+    The old fallback guessed "main", which pushes a STALE main — reporting
+    success while delivering none of the work at HEAD. Nothing legitimately
+    relied on the guess: the workspace repo is never deliberately detached
+    (rewind restores via ``checkout <sha> -- .`` to keep HEAD on its branch).
+    """
+
+    def _detach(self, temp_workspace):
+        subprocess.run(
+            ["git", "-C", str(temp_workspace), "checkout", "--detach"],
+            check=True,
+            capture_output=True,
+        )
+
+    def test_detached_head_refuses_and_logs(
+        self, initialized_git, temp_workspace, bare_remote, caplog
+    ):
+        initialized_git.add_remote("origin", str(bare_remote))
+        self._detach(temp_workspace)
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert initialized_git.push() is False
+        assert any(
+            "push refused" in r.message and "detached" in r.message
+            for r in caplog.records
+        ), caplog.text
+
+    def test_detached_head_does_not_push_a_stale_branch(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        """The silent-wrong-ref scenario end to end: work committed on a
+        detached HEAD must not become a no-op push of the old branch tip."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        branch = initialized_git.current_branch()
+        assert initialized_git.push() is True
+        before = initialized_git.rev_parse(f"origin/{branch}")
+        self._detach(temp_workspace)
+        (temp_workspace / "detached.txt").write_text("work")
+        assert initialized_git.commit("work while detached") is True
+        assert initialized_git.push() is False
+        assert initialized_git.rev_parse(f"origin/{branch}") == before
+
+    def test_explicit_branch_still_pushes_while_detached(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        initialized_git.add_remote("origin", str(bare_remote))
+        branch = initialized_git.current_branch()
+        self._detach(temp_workspace)
+        assert initialized_git.push(branch=branch) is True
+
+
+class TestGitManagerCheckoutBranch:
+    """checkout_branch backs the repo_checkout tool — the only way a
+    shell-less worker can move HEAD in an attached clone."""
+
+    def test_switches_to_an_existing_branch(self, initialized_git, temp_workspace):
+        subprocess.run(
+            ["git", "-C", str(temp_workspace), "branch", "feature"],
+            check=True,
+            capture_output=True,
+        )
+        assert initialized_git.checkout_branch("feature") is True
+        assert initialized_git.current_branch() == "feature"
+
+    def test_missing_branch_fails_without_create(self, initialized_git):
+        before = initialized_git.current_branch()
+        assert initialized_git.checkout_branch("missing") is False
+        assert initialized_git.current_branch() == before
+
+    def test_create_makes_and_switches_to_a_new_branch(self, initialized_git):
+        assert initialized_git.checkout_branch("job/fix-1", create=True) is True
+        assert initialized_git.current_branch() == "job/fix-1"
+
+    def test_create_tracks_an_existing_remote_branch(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        initialized_git.add_remote("origin", str(bare_remote))
+        base = initialized_git.current_branch()
+        assert initialized_git.checkout_branch("remote-only", create=True) is True
+        (temp_workspace / "r.txt").write_text("r")
+        initialized_git.commit("remote work")
+        assert initialized_git.push() is True
+        # Drop the local branch so only origin/remote-only remains.
+        assert initialized_git.checkout_branch(base) is True
+        subprocess.run(
+            ["git", "-C", str(temp_workspace), "branch", "-D", "remote-only"],
+            check=True,
+            capture_output=True,
+        )
+        assert initialized_git.checkout_branch("remote-only", create=True) is True
+        assert initialized_git.current_branch() == "remote-only"
+        assert initialized_git.rev_parse("remote-only") == initialized_git.rev_parse(
+            "origin/remote-only"
+        )
+
+    def test_inactive_repo_returns_false(self, git_manager):
+        assert git_manager.checkout_branch("anything") is False
+
+
+class TestRevParse:
+    """rev_parse resolves refs so repo_push can verify what actually moved."""
+
+    def test_resolves_head_to_a_full_sha(self, initialized_git):
+        sha = initialized_git.rev_parse("HEAD")
+        assert sha is not None
+        assert len(sha) == 40
+
+    def test_unknown_ref_returns_none(self, initialized_git):
+        assert initialized_git.rev_parse("origin/definitely-missing") is None
+
+    def test_inactive_repo_returns_none(self, git_manager):
+        assert git_manager.rev_parse("HEAD") is None
+
+    def test_push_moves_the_remote_tracking_ref(self, initialized_git, bare_remote):
+        """A successful push updates origin/<branch>, which is how repo_push
+        tells a real update from git's exit-0 'Everything up-to-date'."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        branch = initialized_git.current_branch()
+        assert initialized_git.rev_parse(f"origin/{branch}") is None
+        assert initialized_git.push() is True
+        assert initialized_git.rev_parse(f"origin/{branch}") == (
+            initialized_git.rev_parse("HEAD")
+        )
 
 
 class TestGitManagerInit:
@@ -504,6 +687,118 @@ class TestGitManagerTag:
         assert result is False
 
 
+class TestGitManagerTagIdempotency:
+    """Tests for create-once tag semantics (audit-boundary tags never move)."""
+
+    def test_retag_same_commit_is_noop(self, initialized_git, temp_workspace):
+        """Re-tagging the same name at the same commit succeeds without moving."""
+        (temp_workspace / "work.txt").write_text("work")
+        initialized_git.commit("Phase work")
+        assert initialized_git.tag("phase-tag") is True
+        head = initialized_git.get_current_commit()
+        assert head is not None
+
+        assert initialized_git.tag("phase-tag") is True
+        assert initialized_git.resolve_tag_commit("phase-tag") == head
+
+    def test_retag_at_new_commit_refuses_to_move(
+        self, initialized_git, temp_workspace, caplog
+    ):
+        """An existing tag at a different commit is never moved."""
+        (temp_workspace / "one.txt").write_text("one")
+        initialized_git.commit("First completion")
+        assert initialized_git.tag("phase-tag", message="boundary") is True
+        original = initialized_git.resolve_tag_commit("phase-tag")
+        assert original is not None
+
+        (temp_workspace / "two.txt").write_text("two")
+        initialized_git.commit("Second completion")
+
+        with caplog.at_level(logging.ERROR, logger="src.managers.git_manager"):
+            assert initialized_git.tag("phase-tag") is False
+
+        assert "Phase tag invariant violation" in caplog.text
+        assert initialized_git.resolve_tag_commit("phase-tag") == original
+        assert initialized_git.get_current_commit() != original
+
+    def test_invariant_violation_carries_shas(self):
+        """TagInvariantViolation exposes tag name and both commits."""
+        exc = TagInvariantViolation("t1", "aaa111", "bbb222")
+        assert isinstance(exc, RuntimeError)
+        assert exc.tag_name == "t1"
+        assert exc.existing_sha == "aaa111"
+        assert exc.head_sha == "bbb222"
+        assert "aaa111" in str(exc)
+        assert "bbb222" in str(exc)
+
+    def test_resolve_tag_commit_missing_tag(self, initialized_git):
+        """Resolving a nonexistent tag returns None."""
+        assert initialized_git.resolve_tag_commit("no-such-tag") is None
+
+
+class TestGitManagerPushRef:
+    """Tests for per-ref tag delivery and the tags=False push default."""
+
+    def test_push_ref_delivers_exactly_that_tag(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        """push_ref delivers the named tag and nothing else."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        (temp_workspace / "work.txt").write_text("work")
+        initialized_git.commit("Phase work")
+        assert initialized_git.tag("phase-1-complete") is True
+        assert initialized_git.tag("phase-2-complete") is True
+
+        assert initialized_git.push_ref("refs/tags/phase-1-complete") is True
+
+        result = subprocess.run(
+            ["git", "tag", "-l"], cwd=bare_remote, capture_output=True, text=True
+        )
+        remote_tags = result.stdout.split()
+        assert "phase-1-complete" in remote_tags
+        assert "phase-2-complete" not in remote_tags
+
+    def test_push_ref_without_remote(self, initialized_git):
+        """push_ref returns False when no remote is configured."""
+        assert initialized_git.push_ref("refs/tags/anything") is False
+
+    def test_push_default_omits_tags(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        """push() no longer sprays tags; push_ref delivers them per-ref."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        (temp_workspace / "work.txt").write_text("work")
+        initialized_git.commit("Phase work")
+        assert initialized_git.tag("phase-tag") is True
+
+        assert initialized_git.push() is True
+        result = subprocess.run(
+            ["git", "tag", "-l"], cwd=bare_remote, capture_output=True, text=True
+        )
+        assert "phase-tag" not in result.stdout.split()
+
+        assert initialized_git.push_ref("refs/tags/phase-tag") is True
+        result = subprocess.run(
+            ["git", "tag", "-l"], cwd=bare_remote, capture_output=True, text=True
+        )
+        assert "phase-tag" in result.stdout.split()
+
+    def test_push_tags_true_still_pushes_tags(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        """Explicit tags=True keeps the push-all-tags behavior."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        (temp_workspace / "work.txt").write_text("work")
+        initialized_git.commit("Phase work")
+        assert initialized_git.tag("explicit-tag") is True
+
+        assert initialized_git.push(tags=True) is True
+        result = subprocess.run(
+            ["git", "tag", "-l"], cwd=bare_remote, capture_output=True, text=True
+        )
+        assert "explicit-tag" in result.stdout.split()
+
+
 class TestGitManagerListTags:
     """Tests for list_tags functionality."""
 
@@ -778,6 +1073,60 @@ class TestParseShellRunOutput:
         assert result.returncode == 128
         assert "fatal" in result.stdout
 
+    def test_parse_success_with_cwd_header(self):
+        """The `CWD:` line f41970ae added must not leak into stdout.
+
+        Regression guard for the defect that lost job bbce4bed's deliverable:
+        the parser assumed `--- stdout ---` was the first line after
+        `Exit code:`, fell through to `stdout = rest`, and handed callers the
+        whole banner as command output.
+        """
+        gm = self._make_gm()
+        output = "Exit code: 0\nCWD: /home/agent-host/workspace\n--- stdout ---\nmain"
+        result = gm._parse_shell_run_output(output, ["branch", "--show-current"])
+        assert result.returncode == 0
+        assert result.stdout.strip() == "main"
+        assert "CWD:" not in result.stdout
+
+    def test_parse_no_output_with_cwd_header(self):
+        """The empty sentinel still reads as empty once a header precedes it."""
+        gm = self._make_gm()
+        output = "Exit code: 0\nCWD: /home/agent-host/workspace\n(no output)"
+        result = gm._parse_shell_run_output(output, ["add", "-A"])
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    def test_parse_multiline_stdout_with_cwd_header(self):
+        """Payload after the marker survives intact, newlines included."""
+        gm = self._make_gm()
+        output = (
+            "Exit code: 0\nCWD: /home/agent-host/workspace\n"
+            "--- stdout ---\nline one\nline two"
+        )
+        result = gm._parse_shell_run_output(output, ["log"])
+        assert result.stdout == "line one\nline two"
+
+    def test_failure_surfaces_output_as_stderr(self):
+        """Callers log result.stderr on failure — it must not be empty.
+
+        `git push failed: ` with nothing after the colon is what made this
+        regression invisible for a day.
+        """
+        gm = self._make_gm()
+        output = (
+            "Exit code: 128\nCWD: /home/agent-host/workspace\n"
+            "--- stdout ---\nfatal: invalid refspec ''"
+        )
+        result = gm._parse_shell_run_output(output, ["push"])
+        assert result.returncode == 128
+        assert "invalid refspec" in result.stderr
+
+    def test_success_leaves_stderr_empty(self):
+        """A clean run reports no error text."""
+        gm = self._make_gm()
+        output = "Exit code: 0\nCWD: /ws\n--- stdout ---\nfine"
+        assert gm._parse_shell_run_output(output, ["status"]).stderr == ""
+
     def test_parse_timeout(self):
         """Parse timeout output (no Exit code prefix)."""
         gm = self._make_gm()
@@ -941,7 +1290,8 @@ class TestGitManagerBackendClone:
         cmd = first_call[0][0]
         assert "git clone" in cmd
         assert "/home/agent/workspace" in cmd
-        assert first_call.kwargs["timeout"] == 120
+        # Full single-call wait window (shell hard cap) — see clone-wait fix
+        assert first_call.kwargs["timeout"] == 600
 
     def test_clone_with_remote_cwd(self):
         """clone() with remote_cwd clones into subdirectory."""
@@ -1007,6 +1357,136 @@ class TestGitManagerBackendClone:
         # The actual shell_run call DOES contain the real URL (needed for clone)
         cmd = backend.shell_run.call_args[0][0]
         assert "secret-token" in cmd  # Real URL passed to git
+
+
+_STILL_RUNNING_OUTPUT = (
+    "Exit code: -1\n"
+    "--- still running ---\n"
+    "Command on tab 'git' is still running after 600s — that is the maximum "
+    "wait for one call, not an error, and it may still be producing output.\n"
+    "--- terminal state ---\n"
+    "Cloning into '/home/agent-host/workspace'...\n"
+    "Receiving objects:  33% (9695/29378), 5.89 MiB | 1.03 MiB/s"
+)
+
+_COLLIDING_OUTPUT = (
+    "Tab 'git' has a previous command still running; your new command was "
+    "NOT executed.\n"
+    "Wait for it to finish before sending another command here — read the tab "
+    "to monitor its progress.\n"
+    "--- terminal state ---\n"
+    "Receiving objects:  60% (17866/29378), 22.28 MiB | 2.43 MiB/s"
+)
+
+_PROBE_OK = "Exit code: 0\n--- stdout ---\n/home/agent-host/workspace/.git"
+_CONFIG_OK = "Exit code: 0\n(no output)"
+
+
+class _FakeTime:
+    """Deterministic stand-in for the time module: sleep() advances the clock."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_time(monkeypatch):
+    import src.managers.git_manager as git_manager_module
+
+    fake = _FakeTime()
+    monkeypatch.setattr(git_manager_module, "time", fake, raising=False)
+    return fake
+
+
+class TestGitManagerBackendCloneWaitsForCompletion:
+    """A slow-but-healthy clone must be waited out, never abandoned.
+
+    Repro of job 65ba6be8: the jobs-repo clone outlived the shell_run wait,
+    the shell reported "still running" (explicitly not an error), and clone()
+    treated it as a failure while retries collided with the busy tab.
+    """
+
+    def test_clone_waits_out_still_running_and_attaches(self, fake_time):
+        """still-running result -> poll the tab, attach once the clone lands."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.side_effect = [
+            _STILL_RUNNING_OUTPUT,  # initial clone call hits the wait cap
+            _COLLIDING_OUTPUT,  # probe 1: tab still busy cloning
+            _PROBE_OK,  # probe 2: clone finished, repo present
+            _CONFIG_OK,  # git config user.email
+            _CONFIG_OK,  # git config user.name
+        ]
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git", Path("/tmp/ws"), backend=backend
+        )
+
+        assert mgr is not None
+        assert backend.shell_run.call_count == 5
+        clone_call = backend.shell_run.call_args_list[0]
+        assert "git clone" in clone_call[0][0]
+        for probe_call in backend.shell_run.call_args_list[1:3]:
+            assert "rev-parse" in probe_call[0][0]
+            assert probe_call.kwargs["tab_name"] == "git"
+
+    def test_clone_tab_busy_on_entry_waits_and_attaches(self, fake_time):
+        """Busy tab on entry (a retry landing mid-clone) -> wait, then attach."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.side_effect = [
+            _COLLIDING_OUTPUT,  # clone command NOT executed: tab already cloning
+            _PROBE_OK,  # probe: the in-flight clone finished successfully
+            _CONFIG_OK,
+            _CONFIG_OK,
+        ]
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git", Path("/tmp/ws"), backend=backend
+        )
+
+        assert mgr is not None
+
+    def test_clone_still_running_then_failed_returns_none(self, fake_time):
+        """If the awaited clone dies without leaving a repo, report failure."""
+        backend = _make_mock_backend()
+        backend.shell_run.side_effect = [
+            _STILL_RUNNING_OUTPUT,
+            "Exit code: 128\n--- stdout ---\n"
+            "fatal: not a git repository: '/home/agent-host/workspace/.git'",
+        ]
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git", Path("/tmp/ws"), backend=backend
+        )
+
+        assert mgr is None
+        assert backend.shell_run.call_count == 2
+
+    def test_clone_wait_gives_up_at_deadline(self, fake_time):
+        """A tab that never frees up bounds the wait at the overall deadline."""
+        backend = _make_mock_backend()
+
+        def _never_finishes(*args, **kwargs):
+            if backend.shell_run.call_count == 1:
+                return _STILL_RUNNING_OUTPUT
+            return _COLLIDING_OUTPUT
+
+        backend.shell_run.side_effect = _never_finishes
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git", Path("/tmp/ws"), backend=backend
+        )
+
+        assert mgr is None
+        assert backend.shell_run.call_count > 2
+        assert fake_time.now >= 1800
 
 
 class TestGitManagerBackendCommit:
@@ -1106,8 +1586,6 @@ class TestGitManagerBackendPush:
             # auto-detect branch → git branch --show-current
             "Exit code: 0\n--- stdout ---\nmain",
             # git push -u origin main
-            "Exit code: 0\n(no output)",
-            # git push origin --tags
             "Exit code: 0\n(no output)",
         ]
         gm = GitManager(Path("/tmp/ws"), backend=backend)

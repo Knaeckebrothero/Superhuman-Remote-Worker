@@ -1,34 +1,57 @@
-import {ChangeDetectionStrategy, Component, computed, effect, inject, OnInit, signal} from '@angular/core';
-import {Router} from '@angular/router';
-import {environment} from '../../core/environment';
-import {McpTokenService} from '../../core/services/mcp-token.service';
-import {UserService} from '../../core/services/user.service';
-import {ApiService} from '../../core/services/api.service';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  effect,
+  inject,
+  OnInit,
+  signal,
+} from '@angular/core';
+import { Router } from '@angular/router';
+import { environment } from '../../core/environment';
+import { McpTokenService } from '../../core/services/mcp-token.service';
+import { UserService } from '../../core/services/user.service';
+import { ViewModeService } from '../../core/services/view-mode.service';
+import { ApiService } from '../../core/services/api.service';
 import {
   SettingsService,
   MainCloudSettingsResponse,
   MainCloudFormState,
 } from '../../core/services/settings.service';
-import {ModelService} from '../../core/services/model.service';
-import {I18nService, SupportedLang} from '../../core/services/i18n.service';
+import { ModelService } from '../../core/services/model.service';
+import { CapabilitiesService } from '../../core/services/capabilities.service';
+import { I18nService, SupportedLang } from '../../core/services/i18n.service';
+import type { ExpertEditorNavigationState } from '../experts/expert-editor.component';
 import {
-    ApiKeyProvider,
-    CodexStatus,
-    CommunicationSettings,
-    LlmEndpointTestResult,
-    McpTokenCreateResponse,
-    Project
+  ApiKeyProvider,
+  CodexStatus,
+  CodexUsage,
+  CommunicationSettings,
+  Expert,
+  ExpertDefaultsResponse,
+  McpTokenCreateResponse,
+  Project,
+  ReadAloudReasoningLevel,
 } from '../../core/models/api.model';
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
-import {AppThemeToggleComponent} from '../../ui/theme-toggle';
-import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {AppButtonComponent} from '../../ui/button';
-import {AppInputComponent} from '../../ui/input';
-import {AppSelectComponent} from '../../ui/select';
-import {AppCheckboxComponent} from '../../ui/checkbox';
-import {AppFormFieldComponent} from '../../ui/form-field';
-import {AppBadgeComponent} from '../../ui/badge';
-import {AppIconComponent} from '../../ui/icon';
+import {
+  voicesForModelId,
+  voiceLanguageTag,
+  ttsBackendForModelId,
+  TtsAccountVoice,
+  TtsLibraryVoice,
+} from '../../core/models/tts-voices';
+import { SidebarToggleComponent } from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import { AppThemeToggleComponent } from '../../ui/theme-toggle';
+import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
+import { AppButtonComponent } from '../../ui/button';
+import { AppInputComponent } from '../../ui/input';
+import { AppTextareaComponent } from '../../ui/textarea';
+import { AppSelectComponent } from '../../ui/select';
+import { AppSwitchComponent } from '../../ui/switch';
+import { AppCheckboxComponent } from '../../ui/checkbox';
+import { AppFormFieldComponent } from '../../ui/form-field';
+import { AppBadgeComponent } from '../../ui/badge';
+import { AppIconComponent } from '../../ui/icon';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
@@ -36,6 +59,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'google', label: 'Google' },
   { value: 'groq', label: 'Groq' },
   { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'mistral', label: 'Mistral' },
   { value: 'codex', label: 'Codex' },
   { value: 'vision', label: 'Vision' },
 ];
@@ -57,7 +81,9 @@ const EXPIRY_OPTIONS = [
     TranslocoPipe,
     AppButtonComponent,
     AppInputComponent,
+    AppTextareaComponent,
     AppSelectComponent,
+    AppSwitchComponent,
     AppCheckboxComponent,
     AppFormFieldComponent,
     AppBadgeComponent,
@@ -77,7 +103,10 @@ const EXPIRY_OPTIONS = [
           <p class="section-desc">{{ 'settings.appearance.desc' | transloco }}</p>
           <div class="form-block">
             <app-form-field [label]="'settings.appearance.themeLabel' | transloco">
-              <app-theme-toggle [showLabels]="true" [ariaLabel]="'settings.appearance.themeLabel' | transloco" />
+              <app-theme-toggle
+                [showLabels]="true"
+                [ariaLabel]="'settings.appearance.themeLabel' | transloco"
+              />
             </app-form-field>
           </div>
         </section>
@@ -88,16 +117,313 @@ const EXPIRY_OPTIONS = [
           <p class="section-desc">{{ 'settings.language.desc' | transloco }}</p>
           <div class="form-block">
             <app-form-field [label]="'settings.language.label' | transloco">
-              <app-select
-                [value]="i18n.activeLang()"
-                (changed)="onLanguageChange($any($event))"
-              >
+              <app-select [value]="i18n.activeLang()" (changed)="onLanguageChange($any($event))">
                 <option value="en">English</option>
                 <option value="de-DE">Deutsch</option>
               </app-select>
             </app-form-field>
           </div>
         </section>
+
+        <!-- Read-aloud voice -->
+        @if (ttsConfigured()) {
+          <section class="settings-section">
+            <h2 class="section-title">{{ 'settings.voice.title' | transloco }}</h2>
+            <p class="section-desc">{{ 'settings.voice.desc' | transloco }}</p>
+            <div class="form-block">
+              <app-form-field
+                [label]="'settings.voice.provider' | transloco"
+                [hint]="'settings.voice.providerHint' | transloco"
+              >
+                <app-select [value]="ttsModel()" (changed)="setTtsModel($any($event))">
+                  @for (m of modelService.ttsModels(); track m.id) {
+                    <option [value]="m.id">
+                      {{ m.label
+                      }}{{
+                        !ttsModelOverridden() && m.id === resolved().default_tts_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}
+                    </option>
+                  }
+                </app-select>
+              </app-form-field>
+              <app-form-field [label]="'settings.voice.label' | transloco">
+                @if (ttsBackend() === 'elevenlabs') {
+                  @if (elevenVoicesLoading()) {
+                    <p class="voice-lang-note">{{ 'settings.voice.loadingVoices' | transloco }}</p>
+                  } @else if (elevenVoices().length > 0) {
+                    <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
+                      <option value="">{{ 'settings.voice.auto' | transloco }}</option>
+                      @for (v of elevenVoices(); track v.id) {
+                        <option [value]="v.id">{{ elevenVoiceLabel(v) }}</option>
+                      }
+                    </app-select>
+                  } @else {
+                    <app-input
+                      [value]="ttsVoice()"
+                      [placeholder]="'settings.voice.customPlaceholder' | transloco"
+                      (changed)="setTtsVoice($event)"
+                    />
+                  }
+                } @else if (ttsVoices().length > 0) {
+                  <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
+                    <option value="">{{ 'settings.voice.auto' | transloco }}</option>
+                    @for (v of ttsVoices(); track v) {
+                      <option [value]="v">{{ voiceOptionLabel(v) }}</option>
+                    }
+                  </app-select>
+                } @else {
+                  <app-input
+                    [value]="ttsVoice()"
+                    [placeholder]="'settings.voice.customPlaceholder' | transloco"
+                    (changed)="setTtsVoice($event)"
+                  />
+                }
+              </app-form-field>
+              @if (ttsVoices().length > 0) {
+                <p class="voice-lang-note">
+                  {{ 'settings.voice.langNote' | transloco }}
+                  @if (ttsBackend() === 'kokoro') {
+                    {{ 'settings.voice.kokoroNoGerman' | transloco }}
+                  }
+                </p>
+              }
+              <app-form-field [label]="'settings.voice.sampleLabel' | transloco">
+                <app-textarea
+                  [value]="previewText()"
+                  (valueChange)="onPreviewTextChange($event)"
+                  [rows]="2"
+                  size="sm"
+                  [placeholder]="'settings.voice.samplePlaceholder' | transloco"
+                />
+                <p class="voice-sample-hint">
+                  {{ 'settings.voice.sampleHint' | transloco: { left: previewCharsLeft() } }}
+                </p>
+              </app-form-field>
+              <div class="voice-preview-row">
+                <app-button
+                  variant="secondary"
+                  size="sm"
+                  [loading]="previewingVoice()"
+                  [disabled]="previewingVoice()"
+                  (clicked)="previewVoice()"
+                >
+                  <app-icon size="sm">play_arrow</app-icon>
+                  {{ 'settings.voice.preview' | transloco }}
+                </app-button>
+                @if (ttsBackend() === 'elevenlabs' && selectedElevenVoice()?.preview_url) {
+                  <app-button variant="ghost" size="sm" (clicked)="playHostedPreview()">
+                    <app-icon size="sm">graphic_eq</app-icon>
+                    {{ 'settings.voice.hostedPreview' | transloco }}
+                  </app-button>
+                }
+                @if (previewErrorKey()) {
+                  <span class="voice-preview-error">{{ previewErrorKey()! | transloco }}</span>
+                }
+              </div>
+              @if (ttsBackend() === 'elevenlabs' && selectedElevenVoice()?.preview_url) {
+                <p class="voice-lang-note">{{ 'settings.voice.previewCaveat' | transloco }}</p>
+              }
+
+              <!-- How the message is rewritten for speech (all backends). The
+                   auxiliary LLM cleans markdown + shapes the text; these two
+                   knobs steer it — reasoning (off by default; on = smarter but
+                   slower first audio) and a free-text instruction the user
+                   controls (skip tables, TLDR long messages, omit file names…). -->
+              <div class="voice-rewrite">
+                <h3 class="voice-subhead">{{ 'settings.voice.rewriteTitle' | transloco }}</h3>
+                <app-form-field
+                  [label]="'settings.voice.rewriteReasoningLabel' | transloco"
+                  [hint]="'settings.voice.rewriteReasoningHint' | transloco"
+                >
+                  <app-select
+                    [value]="readAloudReasoning()"
+                    (changed)="readAloudReasoning.set($any($event))"
+                  >
+                    <option value="off">{{ 'settings.voice.reasoningOff' | transloco }}</option>
+                    <option value="low">{{ 'settings.voice.reasoningLow' | transloco }}</option>
+                    <option value="medium">
+                      {{ 'settings.voice.reasoningMedium' | transloco }}
+                    </option>
+                    <option value="high">{{ 'settings.voice.reasoningHigh' | transloco }}</option>
+                  </app-select>
+                </app-form-field>
+                <app-form-field
+                  [label]="'settings.voice.rewritePromptLabel' | transloco"
+                  [hint]="'settings.voice.rewritePromptHint' | transloco"
+                >
+                  <app-textarea
+                    [value]="readAloudPromptDraft()"
+                    (valueChange)="onReadAloudPromptChange($event)"
+                    [rows]="3"
+                    size="sm"
+                    [placeholder]="'settings.voice.rewritePromptPlaceholder' | transloco"
+                  />
+                  <p class="voice-sample-hint">
+                    {{
+                      'settings.voice.rewritePromptCounter'
+                        | transloco: { left: readAloudPromptCharsLeft() }
+                    }}
+                  </p>
+                </app-form-field>
+                <div class="actions-row">
+                  <app-button
+                    variant="primary"
+                    size="sm"
+                    [loading]="savingReadAloud()"
+                    [disabled]="savingReadAloud()"
+                    (clicked)="saveReadAloud()"
+                  >
+                    {{
+                      savingReadAloud()
+                        ? ('common.saving' | transloco)
+                        : ('settings.voice.rewriteSave' | transloco)
+                    }}
+                  </app-button>
+                  @if (readAloudSaved()) {
+                    <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
+                  }
+                </div>
+              </div>
+
+              <!-- ElevenLabs Voice Library browser (Phase 6): search the 10k+
+                   community library, audition via hosted previews, and (when the
+                   admin add-gate is on) copy a voice into the deployment account. -->
+              @if (ttsBackend() === 'elevenlabs') {
+                <div class="voice-library">
+                  <div class="voice-library-head">
+                    <app-button variant="ghost" size="sm" (clicked)="toggleLibrary()">
+                      <app-icon size="sm">{{
+                        libraryOpen() ? 'expand_less' : 'travel_explore'
+                      }}</app-icon>
+                      {{ 'settings.voice.libraryToggle' | transloco }}
+                    </app-button>
+                    @if (userService.currentUser()?.is_admin) {
+                      <label class="voice-library-flag">
+                        <app-switch
+                          size="sm"
+                          [checked]="ttsLibraryFlag()"
+                          [disabled]="ttsLibraryFlagSaving()"
+                          (changed)="setTtsLibraryFlag($event)"
+                        />
+                        <span>{{ 'settings.voice.libraryAdminFlag' | transloco }}</span>
+                      </label>
+                    }
+                  </div>
+
+                  @if (libraryOpen()) {
+                    <div class="voice-library-search">
+                      <app-input
+                        [value]="librarySearch()"
+                        [placeholder]="'settings.voice.librarySearchPlaceholder' | transloco"
+                        (changed)="librarySearch.set($event)"
+                      />
+                      <app-select
+                        [value]="libraryGender()"
+                        (changed)="libraryGender.set($any($event))"
+                      >
+                        <option value="">
+                          {{ 'settings.voice.libraryAnyGender' | transloco }}
+                        </option>
+                        <option value="female">{{ 'settings.voice.female' | transloco }}</option>
+                        <option value="male">{{ 'settings.voice.male' | transloco }}</option>
+                      </app-select>
+                      <app-button
+                        variant="secondary"
+                        size="sm"
+                        [loading]="libraryLoading()"
+                        [disabled]="libraryLoading()"
+                        (clicked)="searchLibrary()"
+                      >
+                        <app-icon size="sm">search</app-icon>
+                        {{ 'settings.voice.librarySearch' | transloco }}
+                      </app-button>
+                    </div>
+
+                    @if (libraryError()) {
+                      <p class="voice-preview-error">{{ libraryError() }}</p>
+                    }
+                    @if (libraryVoices().length > 0) {
+                      <p class="voice-lang-note">
+                        {{ 'settings.voice.libraryPreviewCaveat' | transloco }}
+                      </p>
+                    }
+
+                    <div class="voice-library-results">
+                      @for (v of libraryVoices(); track v.id) {
+                        <div class="voice-library-card" [class.is-added]="libraryAdded() === v.id">
+                          <div class="voice-library-card__info">
+                            <span class="voice-library-card__name">{{ v.name }}</span>
+                            @if (libraryVoiceLabel(v)) {
+                              <span class="voice-library-card__tags">{{
+                                libraryVoiceLabel(v)
+                              }}</span>
+                            }
+                          </div>
+                          <div class="voice-library-card__actions">
+                            @if (v.preview_url) {
+                              <app-button
+                                variant="ghost"
+                                size="sm"
+                                [ariaLabel]="'settings.voice.hostedPreview' | transloco"
+                                (clicked)="playLibrarySample(v)"
+                              >
+                                <app-icon size="sm">graphic_eq</app-icon>
+                              </app-button>
+                            }
+                            @if (libraryAddEnabled()) {
+                              @if (libraryAdded() === v.id) {
+                                <span class="voice-library-card__done">
+                                  <app-icon size="sm">check</app-icon>
+                                  {{ 'settings.voice.libraryAdded' | transloco }}
+                                </span>
+                              } @else {
+                                <app-button
+                                  variant="secondary"
+                                  size="sm"
+                                  [loading]="libraryAddingId() === v.id"
+                                  [disabled]="libraryAddingId() !== null"
+                                  (clicked)="addLibraryVoice(v)"
+                                >
+                                  {{ 'settings.voice.libraryAdd' | transloco }}
+                                </app-button>
+                              }
+                            }
+                          </div>
+                        </div>
+                      }
+                      @if (!libraryLoading() && libraryVoices().length === 0 && !libraryError()) {
+                        <p class="voice-lang-note">
+                          {{ 'settings.voice.libraryEmpty' | transloco }}
+                        </p>
+                      }
+                    </div>
+                  }
+                </div>
+              }
+            </div>
+          </section>
+        }
+
+        <!-- Data Visibility Section (Admin Only) -->
+        @if (userService.currentUser()?.is_admin) {
+          <section class="settings-section">
+            <h2 class="section-title">{{ 'settings.dataVisibility.title' | transloco }}</h2>
+            <p class="section-desc">{{ 'settings.dataVisibility.desc' | transloco }}</p>
+            <div class="form-block">
+              <app-form-field [label]="'settings.dataVisibility.label' | transloco">
+                <app-select
+                  [value]="viewMode.viewMode()"
+                  (changed)="viewMode.setMode($any($event))"
+                >
+                  <option value="all">{{ 'settings.dataVisibility.optionAll' | transloco }}</option>
+                  <option value="me">{{ 'settings.dataVisibility.optionMe' | transloco }}</option>
+                </app-select>
+              </app-form-field>
+            </div>
+          </section>
+        }
 
         <!-- API Keys Section -->
         <section class="settings-section">
@@ -168,119 +494,11 @@ const EXPIRY_OPTIONS = [
               [disabled]="settingKey() || !keyValue().trim()"
               (clicked)="saveApiKey()"
             >
-              {{ settingKey() ? ('common.saving' | transloco) : ('settings.apiKeys.saveButton' | transloco) }}
-            </app-button>
-          </div>
-        </section>
-
-        <!-- LLM Endpoints Section -->
-        <section class="settings-section section-spacer">
-          <h2 class="section-title">{{ 'settings.llmEndpoints.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.llmEndpoints.desc' | transloco }}</p>
-
-          @if (settingsService.llmEndpoints().length > 0) {
-            @for (endpoint of settingsService.llmEndpoints(); track endpoint.id) {
-              <div class="endpoint-card">
-                <div class="endpoint-head">
-                  <div class="endpoint-title">
-                    <strong>{{ endpoint.label }}</strong>
-                    <span class="endpoint-url mono">{{ endpoint.base_url }}</span>
-                    @if (endpoint.key_prefix) {
-                      <span class="endpoint-key mono">key {{ endpoint.key_prefix }}...</span>
-                    } @else {
-                      <span class="endpoint-key muted">{{ 'settings.llmEndpoints.noKey' | transloco }}</span>
-                    }
-                  </div>
-                  <div class="endpoint-actions">
-                    <app-button
-                      variant="secondary"
-                      size="sm"
-                      [loading]="testingEndpointId() === endpoint.id"
-                      [disabled]="testingEndpointId() === endpoint.id"
-                      (clicked)="testLlmEndpoint(endpoint.id)"
-                    >
-                      {{ testingEndpointId() === endpoint.id
-                          ? ('settings.llmEndpoints.testing' | transloco)
-                          : ('settings.llmEndpoints.testButton' | transloco) }}
-                    </app-button>
-                    <app-button variant="danger" size="sm" (clicked)="deleteLlmEndpoint(endpoint.id)">
-                      {{ 'common.delete' | transloco }}
-                    </app-button>
-                  </div>
-                </div>
-
-                @if (testResults()[endpoint.id]; as result) {
-                  <div
-                    class="test-result"
-                    [class.ok]="result.ok"
-                    [class.err]="!result.ok"
-                  >
-                    @if (result.ok) {
-                      {{ 'settings.llmEndpoints.testOk' | transloco: {status: result.status} }}
-                    } @else {
-                      {{ 'settings.llmEndpoints.testFail' | transloco:
-                        {status: result.status ?? '-',
-                         error: result.error ?? ''} }}
-                    }
-                  </div>
-                }
-
-                <p class="catalog-hint">
-                  {{ 'settings.llmEndpoints.catalogHint' | transloco }}
-                </p>
-              </div>
-            }
-          } @else {
-            <p class="empty-state">{{ 'settings.llmEndpoints.empty' | transloco }}</p>
-          }
-
-          <!-- Create endpoint form -->
-          <div class="create-form">
-            <h3 class="form-title">{{ 'settings.llmEndpoints.addTitle' | transloco }}</h3>
-            <div class="form-row two-col">
-              <app-input
-                [value]="newEndpointLabel()"
-                [placeholder]="'settings.llmEndpoints.labelPlaceholder' | transloco"
-                [disabled]="creatingEndpoint()"
-                (changed)="newEndpointLabel.set($event)"
-              />
-              <app-input
-                [value]="newEndpointBaseUrl()"
-                [placeholder]="'settings.llmEndpoints.baseUrlPlaceholder' | transloco"
-                [disabled]="creatingEndpoint()"
-                (changed)="newEndpointBaseUrl.set($event)"
-              />
-            </div>
-            <div class="form-row">
-              <app-input
-                type="password"
-                [value]="newEndpointApiKey()"
-                [placeholder]="'settings.llmEndpoints.apiKeyPlaceholder' | transloco"
-                [disabled]="creatingEndpoint()"
-                (changed)="newEndpointApiKey.set($event)"
-              />
-            </div>
-            <app-checkbox
-              size="sm"
-              [checked]="newEndpointAllowInsecure()"
-              [disabled]="creatingEndpoint()"
-              (changed)="newEndpointAllowInsecure.set($event)"
-            >
-              {{ 'settings.llmEndpoints.allowInsecure' | transloco }}
-            </app-checkbox>
-            @if (endpointFormError()) {
-              <p class="form-error">{{ endpointFormError() }}</p>
-            }
-            <app-button
-              variant="primary"
-              size="md"
-              [loading]="creatingEndpoint()"
-              [disabled]="creatingEndpoint() || !newEndpointLabel().trim() || !newEndpointBaseUrl().trim()"
-              (clicked)="createLlmEndpoint()"
-            >
-              {{ creatingEndpoint()
+              {{
+                settingKey()
                   ? ('common.saving' | transloco)
-                  : ('settings.llmEndpoints.createButton' | transloco) }}
+                  : ('settings.apiKeys.saveButton' | transloco)
+              }}
             </app-button>
           </div>
         </section>
@@ -298,9 +516,22 @@ const EXPIRY_OPTIONS = [
                   (changed)="onPrefChange(prefModel, resolved().default_model, $event)"
                 >
                   @for (group of modelService.models(); track group.group) {
-                    <optgroup [label]="group.configured ? group.group : group.group + ' ' + ('settings.preferences.noApiKey' | transloco)">
+                    <optgroup
+                      [label]="
+                        group.configured
+                          ? group.group
+                          : group.group + ' ' + ('settings.preferences.noApiKey' | transloco)
+                      "
+                    >
                       @for (model of group.models; track model) {
-                        <option [value]="model">{{ model }}{{ !prefModel() && model === resolved().default_model ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                        <option [value]="model">
+                          {{ model
+                          }}{{
+                            !prefModel() && model === resolved().default_model
+                              ? ' (' + ('common.default' | transloco) + ')'
+                              : ''
+                          }}
+                        </option>
                       }
                     </optgroup>
                   }
@@ -312,7 +543,14 @@ const EXPIRY_OPTIONS = [
                   (changed)="onPrefChange(prefAuxModel, resolved().default_auxiliary_model, $event)"
                 >
                   @for (m of modelService.auxiliaryModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !prefAuxModel() && m.id === resolved().default_auxiliary_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
+                    <option [value]="m.id">
+                      {{ m.label
+                      }}{{
+                        !prefAuxModel() && m.id === resolved().default_auxiliary_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                    </option>
                   }
                 </app-select>
               </app-form-field>
@@ -323,66 +561,177 @@ const EXPIRY_OPTIONS = [
                   [value]="prefAutonomy() ?? resolved().default_autonomy ?? ''"
                   (changed)="onPrefChange(prefAutonomy, resolved().default_autonomy, $event)"
                 >
-                  <option value="full">{{ 'settings.preferences.autonomyFull' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'full' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="review">{{ 'settings.preferences.autonomyReview' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'review' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="partial">{{ 'settings.preferences.autonomyPartial' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'partial' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="guided">{{ 'settings.preferences.autonomyGuided' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'guided' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="dependent">{{ 'settings.preferences.autonomyDependent' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'dependent' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="full">
+                    {{ 'settings.preferences.autonomyFull' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'full'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="review">
+                    {{ 'settings.preferences.autonomyReview' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'review'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="partial">
+                    {{ 'settings.preferences.autonomyPartial' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'partial'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="guided">
+                    {{ 'settings.preferences.autonomyGuided' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'guided'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="dependent">
+                    {{ 'settings.preferences.autonomyDependent' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'dependent'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
                 </app-select>
               </app-form-field>
               <app-form-field [label]="'settings.preferences.reasoning' | transloco">
                 <app-select
                   [value]="prefReasoning() ?? resolved().default_reasoning_level ?? ''"
-                  (changed)="onPrefChange(prefReasoning, resolved().default_reasoning_level, $event)"
+                  (changed)="
+                    onPrefChange(prefReasoning, resolved().default_reasoning_level, $event)
+                  "
                 >
-                  <option value="low">{{ 'settings.preferences.reasoningLow' | transloco }}{{ !prefReasoning() && resolved().default_reasoning_level === 'low' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="medium">{{ 'settings.preferences.reasoningMedium' | transloco }}{{ !prefReasoning() && resolved().default_reasoning_level === 'medium' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="high">{{ 'settings.preferences.reasoningHigh' | transloco }}{{ !prefReasoning() && resolved().default_reasoning_level === 'high' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="low">
+                    {{ 'settings.preferences.reasoningLow' | transloco
+                    }}{{
+                      !prefReasoning() && resolved().default_reasoning_level === 'low'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="medium">
+                    {{ 'settings.preferences.reasoningMedium' | transloco
+                    }}{{
+                      !prefReasoning() && resolved().default_reasoning_level === 'medium'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="high">
+                    {{ 'settings.preferences.reasoningHigh' | transloco
+                    }}{{
+                      !prefReasoning() && resolved().default_reasoning_level === 'high'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
                 </app-select>
               </app-form-field>
             </div>
 
             <h3 class="subsection-title">{{ 'settings.preferences.helperModels' | transloco }}</h3>
             <div class="form-row two-col">
-              <app-form-field [label]="'settings.preferences.visionModel' | transloco" [hint]="'settings.preferences.visionHint' | transloco">
+              <app-form-field
+                [label]="'settings.preferences.visionModel' | transloco"
+                [hint]="'settings.preferences.visionHint' | transloco"
+              >
                 <app-select
                   [value]="prefVisionModel() ?? resolved().default_vision_model ?? ''"
                   (changed)="onPrefChange(prefVisionModel, resolved().default_vision_model, $event)"
                 >
                   @for (m of modelService.visionModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !prefVisionModel() && m.id === resolved().default_vision_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
+                    <option [value]="m.id">
+                      {{ m.label
+                      }}{{
+                        !prefVisionModel() && m.id === resolved().default_vision_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                    </option>
                   }
                 </app-select>
               </app-form-field>
-              <app-form-field [label]="'settings.preferences.whisperModel' | transloco" [hint]="'settings.preferences.whisperHint' | transloco">
+              <app-form-field
+                [label]="'settings.preferences.whisperModel' | transloco"
+                [hint]="'settings.preferences.whisperHint' | transloco"
+              >
                 <app-select
                   [value]="prefWhisperModel() ?? resolved().default_whisper_model ?? ''"
-                  (changed)="onPrefChange(prefWhisperModel, resolved().default_whisper_model, $event)"
+                  (changed)="
+                    onPrefChange(prefWhisperModel, resolved().default_whisper_model, $event)
+                  "
                 >
                   @for (m of modelService.whisperModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !prefWhisperModel() && m.id === resolved().default_whisper_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
+                    <option [value]="m.id">
+                      {{ m.label
+                      }}{{
+                        !prefWhisperModel() && m.id === resolved().default_whisper_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                    </option>
                   }
                 </app-select>
               </app-form-field>
             </div>
             <div class="form-row two-col">
-              <app-form-field [label]="'settings.preferences.embeddingModel' | transloco" [hint]="'settings.preferences.embeddingHint' | transloco">
+              <app-form-field
+                [label]="'settings.preferences.embeddingModel' | transloco"
+                [hint]="'settings.preferences.embeddingHint' | transloco"
+              >
                 <app-select
                   [value]="prefEmbeddingModel() ?? resolved().default_embedding_model ?? ''"
-                  (changed)="onPrefChange(prefEmbeddingModel, resolved().default_embedding_model, $event)"
+                  (changed)="
+                    onPrefChange(prefEmbeddingModel, resolved().default_embedding_model, $event)
+                  "
                 >
                   @for (m of modelService.embeddingModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : '' }}{{ !prefEmbeddingModel() && m.id === resolved().default_embedding_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
+                    <option [value]="m.id">
+                      {{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : ''
+                      }}{{
+                        !prefEmbeddingModel() && m.id === resolved().default_embedding_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                    </option>
                   }
                 </app-select>
               </app-form-field>
-              <app-form-field [label]="'settings.preferences.embeddingProvider' | transloco" [hint]="'settings.preferences.embeddingProviderHint' | transloco">
+              <app-form-field
+                [label]="'settings.preferences.embeddingProvider' | transloco"
+                [hint]="'settings.preferences.embeddingProviderHint' | transloco"
+              >
                 <app-select
                   [value]="prefEmbeddingProvider() ?? resolved().embedding_provider ?? ''"
-                  (changed)="onPrefChange(prefEmbeddingProvider, resolved().embedding_provider, $event)"
+                  (changed)="
+                    onPrefChange(prefEmbeddingProvider, resolved().embedding_provider, $event)
+                  "
                 >
-                  <option value="local">{{ 'settings.preferences.providerLocal' | transloco }}{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'local' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="openrouter">{{ 'settings.preferences.providerOpenrouter' | transloco }}{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'openrouter' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="local">
+                    {{ 'settings.preferences.providerLocal' | transloco
+                    }}{{
+                      !prefEmbeddingProvider() && resolved().embedding_provider === 'local'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="openrouter">
+                    {{ 'settings.preferences.providerOpenrouter' | transloco
+                    }}{{
+                      !prefEmbeddingProvider() && resolved().embedding_provider === 'openrouter'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
                 </app-select>
               </app-form-field>
             </div>
@@ -395,13 +744,78 @@ const EXPIRY_OPTIONS = [
                 [disabled]="savingPrefs()"
                 (clicked)="savePreferences()"
               >
-                {{ savingPrefs() ? ('common.saving' | transloco) : ('settings.preferences.save' | transloco) }}
+                {{
+                  savingPrefs()
+                    ? ('common.saving' | transloco)
+                    : ('settings.preferences.save' | transloco)
+                }}
               </app-button>
               @if (prefsSaved()) {
                 <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
               }
             </div>
           </div>
+        </section>
+
+        <!-- DB-backed defaults: these choose the expert; the settings below
+             remain fallback values for fields that expert does not specify. -->
+        <section class="settings-section section-spacer">
+          <h2 class="section-title">{{ 'settings.expertDefaults.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.expertDefaults.desc' | transloco }}</p>
+          @if (expertDefaults(); as defaults) {
+            @if (!defaults.personal_defaults_allowed) {
+              <p class="section-hint">{{ 'settings.expertDefaults.restricted' | transloco }}</p>
+            }
+            <div class="form-block">
+              @for (type of expertDefaultTypes; track type) {
+                <div class="form-row two-col">
+                  <app-form-field
+                    [label]="'settings.expertDefaults.' + type | transloco"
+                    [hint]="defaultExpertHint(type)"
+                  >
+                    <app-select
+                      [value]="defaults.defaults[type].personal?.id ?? ''"
+                      [disabled]="!defaults.personal_defaults_allowed || !!defaultExpertBusy()"
+                      (changed)="setDefaultExpert(type, $event ?? '')"
+                    >
+                      <option value="">
+                        {{ 'settings.expertDefaults.useApplication' | transloco }}
+                      </option>
+                      @for (expert of ownedExperts(type); track expert.id) {
+                        <option [value]="expert.id">{{ expert.display_name }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <div class="actions-row default-expert-actions">
+                    <app-button
+                      variant="secondary"
+                      size="sm"
+                      [disabled]="!defaults.personal_defaults_allowed || !!defaultExpertBusy()"
+                      [loading]="defaultExpertBusy() === type"
+                      (clicked)="customizeDefaultExpert(type)"
+                    >
+                      {{ 'settings.expertDefaults.customize' | transloco }}
+                    </app-button>
+                    @if (defaults.defaults[type].personal && !defaults.personal_defaults_allowed) {
+                      <app-button
+                        variant="ghost"
+                        size="sm"
+                        [disabled]="!!defaultExpertBusy()"
+                        (clicked)="setDefaultExpert(type, '')"
+                      >
+                        {{ 'settings.expertDefaults.clear' | transloco }}
+                      </app-button>
+                    }
+                  </div>
+                </div>
+              }
+              <div class="actions-row">
+                <app-button variant="ghost" size="sm" (clicked)="openExperts()">
+                  {{ 'settings.expertDefaults.manage' | transloco }}
+                </app-button>
+              </div>
+            </div>
+          }
         </section>
 
         <!-- Persistent Agent Section -->
@@ -412,36 +826,123 @@ const EXPIRY_OPTIONS = [
           <div class="form-block">
             <app-form-field
               [label]="'settings.persistent.model' | transloco"
-              [hint]="paModel() ? '' : (resolved().persistent_agent?.model ? ('settings.persistent.defaultPrefix' | transloco) + ' ' + (resolved().persistent_agent?.model || '') : '')"
+              [hint]="
+                paModel()
+                  ? ''
+                  : resolved().persistent_agent?.model
+                    ? ('settings.persistent.defaultPrefix' | transloco) +
+                      ' ' +
+                      (resolved().persistent_agent?.model || '')
+                    : ''
+              "
             >
               <app-input
                 [value]="paModel() ?? ''"
-                [placeholder]="resolved().persistent_agent?.model ?? ('settings.persistent.modelPlaceholder' | transloco)"
+                [placeholder]="
+                  resolved().persistent_agent?.model ??
+                  ('settings.persistent.modelPlaceholder' | transloco)
+                "
                 (changed)="onPaModelChange($event)"
               />
             </app-form-field>
-            <div class="form-row two-col">
-              <app-form-field [label]="'settings.persistent.permissionMode' | transloco">
-                <app-select
-                  [value]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
-                  (changed)="onPrefChange(paPermissionMode, resolved().persistent_agent?.permission_mode, $event)"
+            <app-form-field
+              [label]="'settings.persistent.permissionMode' | transloco"
+              [hint]="
+                capabilities.permissionRestricted()
+                  ? ('grants.locked.permission_mode' | transloco)
+                  : ''
+              "
+            >
+              <app-select
+                [value]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
+                (changed)="
+                  onPrefChange(
+                    paPermissionMode,
+                    resolved().persistent_agent?.permission_mode,
+                    $event
+                  )
+                "
+              >
+                <option value="supervised">
+                  {{ 'settings.persistent.permissionSupervised' | transloco
+                  }}{{
+                    !paPermissionMode() &&
+                    resolved().persistent_agent?.permission_mode === 'supervised'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+                <option
+                  value="auto_accept"
+                  [disabled]="!capabilities.allowsPermissionMode('auto_accept')"
                 >
-                  <option value="supervised">{{ 'settings.persistent.permissionSupervised' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'supervised' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="auto_accept">{{ 'settings.persistent.permissionAutoAccept' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'auto_accept' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="autonomous">{{ 'settings.persistent.permissionAutonomous' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'autonomous' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                </app-select>
-              </app-form-field>
-              <app-form-field [label]="'settings.persistent.config' | transloco">
-                <app-select
-                  [value]="paConfigName()"
-                  (changed)="paConfigName.set($event ?? '')"
+                  {{ 'settings.persistent.permissionAutoAccept' | transloco
+                  }}{{
+                    !paPermissionMode() &&
+                    resolved().persistent_agent?.permission_mode === 'auto_accept'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+                <option
+                  value="autonomous"
+                  [disabled]="!capabilities.allowsPermissionMode('autonomous')"
                 >
-                  <option value="">{{ 'settings.persistent.configDefault' | transloco }}</option>
-                  <option value="developer">{{ 'settings.persistent.configDeveloper' | transloco }}</option>
-                  <option value="scholar">{{ 'settings.persistent.configScholar' | transloco }}</option>
-                </app-select>
-              </app-form-field>
-            </div>
+                  {{ 'settings.persistent.permissionAutonomous' | transloco
+                  }}{{
+                    !paPermissionMode() &&
+                    resolved().persistent_agent?.permission_mode === 'autonomous'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+              </app-select>
+            </app-form-field>
+            <app-form-field
+              [label]="'settings.persistent.workspaceBackend' | transloco"
+              [hint]="'settings.persistent.workspaceBackendHint' | transloco"
+            >
+              <app-select
+                [value]="
+                  paWorkspaceBackend() ?? resolved().persistent_agent?.workspace_backend ?? ''
+                "
+                (changed)="
+                  onPrefChange(
+                    paWorkspaceBackend,
+                    resolved().persistent_agent?.workspace_backend,
+                    $event
+                  )
+                "
+              >
+                <option value="virtual">
+                  {{ 'settings.persistent.workspaceVirtual' | transloco
+                  }}{{
+                    !paWorkspaceBackend() &&
+                    resolved().persistent_agent?.workspace_backend === 'virtual'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+                <option value="sandbox">
+                  {{ 'settings.persistent.workspaceSandbox' | transloco
+                  }}{{
+                    !paWorkspaceBackend() &&
+                    resolved().persistent_agent?.workspace_backend === 'sandbox'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+                <option value="none">
+                  {{ 'settings.persistent.workspaceNone' | transloco
+                  }}{{
+                    !paWorkspaceBackend() &&
+                    resolved().persistent_agent?.workspace_backend === 'none'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+              </app-select>
+            </app-form-field>
             <app-form-field [label]="'settings.persistent.greeting' | transloco">
               <app-input
                 [value]="paGreeting()"
@@ -472,9 +973,15 @@ const EXPIRY_OPTIONS = [
                   [value]="paHeadlessMode() ?? ''"
                   (changed)="paHeadlessMode.set($any($event || null))"
                 >
-                  <option value="">{{ 'settings.persistent.headlessModeDefault' | transloco }}</option>
-                  <option value="eager">{{ 'settings.persistent.headlessModeEager' | transloco }}</option>
-                  <option value="polite">{{ 'settings.persistent.headlessModePolite' | transloco }}</option>
+                  <option value="">
+                    {{ 'settings.persistent.headlessModeDefault' | transloco }}
+                  </option>
+                  <option value="eager">
+                    {{ 'settings.persistent.headlessModeEager' | transloco }}
+                  </option>
+                  <option value="polite">
+                    {{ 'settings.persistent.headlessModePolite' | transloco }}
+                  </option>
                 </app-select>
               </app-form-field>
               <app-form-field
@@ -491,7 +998,11 @@ const EXPIRY_OPTIONS = [
             </div>
             <app-form-field [label]="'settings.persistent.notificationChannels' | transloco">
               <div class="channel-list">
-                <app-checkbox size="sm" [checked]="paNotifEmail()" (changed)="paNotifEmail.set($event)">
+                <app-checkbox
+                  size="sm"
+                  [checked]="paNotifEmail()"
+                  (changed)="paNotifEmail.set($event)"
+                >
                   {{ 'settings.persistent.notificationChannelEmail' | transloco }}
                 </app-checkbox>
               </div>
@@ -504,7 +1015,11 @@ const EXPIRY_OPTIONS = [
                 [disabled]="savingPA()"
                 (clicked)="savePersistentAgent()"
               >
-                {{ savingPA() ? ('common.saving' | transloco) : ('settings.persistent.save' | transloco) }}
+                {{
+                  savingPA()
+                    ? ('common.saving' | transloco)
+                    : ('settings.persistent.save' | transloco)
+                }}
               </app-button>
               @if (paSaved()) {
                 <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
@@ -524,18 +1039,44 @@ const EXPIRY_OPTIONS = [
                 [value]="commDelivery()"
                 (changed)="commDelivery.set($event ?? 'next_strategic_phase')"
               >
-                <option value="next_strategic_phase">{{ 'settings.communication.deliveryNextStrategic' | transloco }}</option>
-                <option value="immediate_interrupt">{{ 'settings.communication.deliveryImmediate' | transloco }}</option>
-                <option value="llm_triage">{{ 'settings.communication.deliveryLlmTriage' | transloco }}</option>
+                <option value="next_strategic_phase">
+                  {{ 'settings.communication.deliveryNextStrategic' | transloco }}
+                </option>
+                <option value="immediate_interrupt">
+                  {{ 'settings.communication.deliveryImmediate' | transloco }}
+                </option>
+                <option value="llm_triage">
+                  {{ 'settings.communication.deliveryLlmTriage' | transloco }}
+                </option>
               </app-select>
             </app-form-field>
 
             <app-form-field [label]="'settings.communication.channels' | transloco">
               <div class="channel-list">
-                <app-checkbox size="sm" [checked]="commChannelEmail()" (changed)="commChannelEmail.set($event)">Email</app-checkbox>
-                <app-checkbox size="sm" [checked]="commChannelNtfy()" (changed)="commChannelNtfy.set($event)">Ntfy</app-checkbox>
-                <app-checkbox size="sm" [checked]="commChannelSlack()" (changed)="commChannelSlack.set($event)">Slack</app-checkbox>
-                <app-checkbox size="sm" [checked]="commChannelDiscord()" (changed)="commChannelDiscord.set($event)">Discord</app-checkbox>
+                <app-checkbox
+                  size="sm"
+                  [checked]="commChannelEmail()"
+                  (changed)="commChannelEmail.set($event)"
+                  >Email</app-checkbox
+                >
+                <app-checkbox
+                  size="sm"
+                  [checked]="commChannelNtfy()"
+                  (changed)="commChannelNtfy.set($event)"
+                  >Ntfy</app-checkbox
+                >
+                <app-checkbox
+                  size="sm"
+                  [checked]="commChannelSlack()"
+                  (changed)="commChannelSlack.set($event)"
+                  >Slack</app-checkbox
+                >
+                <app-checkbox
+                  size="sm"
+                  [checked]="commChannelDiscord()"
+                  (changed)="commChannelDiscord.set($event)"
+                  >Discord</app-checkbox
+                >
               </div>
             </app-form-field>
 
@@ -579,7 +1120,11 @@ const EXPIRY_OPTIONS = [
                 [disabled]="savingComm()"
                 (clicked)="saveCommunication()"
               >
-                {{ savingComm() ? ('common.saving' | transloco) : ('settings.communication.save' | transloco) }}
+                {{
+                  savingComm()
+                    ? ('common.saving' | transloco)
+                    : ('settings.communication.save' | transloco)
+                }}
               </app-button>
               @if (commSaved()) {
                 <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
@@ -611,8 +1156,14 @@ const EXPIRY_OPTIONS = [
                   <span class="col-prefix mono">{{ token.token_prefix }}...</span>
                   <span class="col-scope">{{ formatScope(token.scope) }}</span>
                   <span class="col-origin">{{ formatOrigin(token.origin) }}</span>
-                  <span class="col-used">{{ token.last_used_at ? formatDate(token.last_used_at) : ('common.never' | transloco) }}</span>
-                  <span class="col-expires">{{ token.expires_at ? formatDate(token.expires_at) : ('common.never' | transloco) }}</span>
+                  <span class="col-used">{{
+                    token.last_used_at
+                      ? formatDate(token.last_used_at)
+                      : ('common.never' | transloco)
+                  }}</span>
+                  <span class="col-expires">{{
+                    token.expires_at ? formatDate(token.expires_at) : ('common.never' | transloco)
+                  }}</span>
                   <span class="col-action">
                     <app-button variant="danger" size="sm" (clicked)="revokeToken(token.id)">
                       {{ 'settings.mcp.revoke' | transloco }}
@@ -663,7 +1214,9 @@ const EXPIRY_OPTIONS = [
               >
                 <option value="user">{{ 'settings.mcp.scopeUser' | transloco }}</option>
                 @for (p of projects(); track p.id) {
-                  <option [value]="'project:' + p.id">{{ 'settings.mcp.scopeProjectPrefix' | transloco }} {{ p.name }}</option>
+                  <option [value]="'project:' + p.id">
+                    {{ 'settings.mcp.scopeProjectPrefix' | transloco }} {{ p.name }}
+                  </option>
                 }
                 @if (userService.currentUser()?.is_admin) {
                   <option value="all">{{ 'settings.mcp.scopeAll' | transloco }}</option>
@@ -690,7 +1243,11 @@ const EXPIRY_OPTIONS = [
               [disabled]="creating() || !newName().trim()"
               (clicked)="createToken()"
             >
-              {{ creating() ? ('settings.mcp.creating' | transloco) : ('settings.mcp.create' | transloco) }}
+              {{
+                creating()
+                  ? ('settings.mcp.creating' | transloco)
+                  : ('settings.mcp.create' | transloco)
+              }}
             </app-button>
           </div>
 
@@ -700,9 +1257,16 @@ const EXPIRY_OPTIONS = [
               <h3 class="form-title">{{ 'settings.mcp.claudeCodeTitle' | transloco }}</h3>
               <p class="section-desc" [innerHTML]="'settings.mcp.claudeCodeDesc' | transloco"></p>
               <div class="code-block-wrapper">
-                <pre class="code-block">{{mcpJsonSnippet()}}</pre>
-                <app-button class="code-copy-btn" variant="primary" size="sm" (clicked)="copyText(mcpJsonSnippet())">
-                  {{ snippetCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco) }}
+                <pre class="code-block">{{ mcpJsonSnippet() }}</pre>
+                <app-button
+                  class="code-copy-btn"
+                  variant="primary"
+                  size="sm"
+                  (clicked)="copyText(mcpJsonSnippet())"
+                >
+                  {{
+                    snippetCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco)
+                  }}
                 </app-button>
               </div>
             </div>
@@ -720,8 +1284,14 @@ const EXPIRY_OPTIONS = [
                 readonly
                 #mcpUrlInput
               />
-              <app-button variant="primary" size="md" (clicked)="copyText(mcpUrlInput.value, 'connector')">
-                {{ connectorCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco) }}
+              <app-button
+                variant="primary"
+                size="md"
+                (clicked)="copyText(mcpUrlInput.value, 'connector')"
+              >
+                {{
+                  connectorCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco)
+                }}
               </app-button>
             </div>
             <p class="section-hint">{{ 'settings.mcp.webConnectorHint' | transloco }}</p>
@@ -753,9 +1323,18 @@ const EXPIRY_OPTIONS = [
               } @else {
                 <span class="codex-status-dot" [class.connected]="codexStatus().connected"></span>
                 <span class="codex-status-text">
-                  {{ (codexStatus().connected ? 'settings.codex.connected' : 'settings.codex.notConnected') | transloco }}
-                  @if (codexStatus().model_count > 0) {
-                    &mdash; {{ codexStatus().model_count }} model(s) available
+                  @if (!codexStatus().reachable) {
+                    {{ 'settings.codex.notEnabled' | transloco }}
+                  } @else {
+                    {{
+                      (codexStatus().connected
+                        ? 'settings.codex.connected'
+                        : 'settings.codex.notConnected'
+                      ) | transloco
+                    }}
+                    @if (codexStatus().model_count > 0) {
+                      &mdash; {{ codexStatus().model_count }} model(s) available
+                    }
                   }
                 </span>
                 <app-button
@@ -776,11 +1355,79 @@ const EXPIRY_OPTIONS = [
                   <div class="codex-account-row">
                     <span class="mono">{{ acct.name }}</span>
                     <span class="codex-account-status">{{ acct.status }}</span>
-                    <app-button variant="danger" size="sm" (clicked)="disconnectCodexAccount(acct.name)">
+                    <app-button
+                      variant="danger"
+                      size="sm"
+                      (clicked)="disconnectCodexAccount(acct.name)"
+                    >
                       {{ 'settings.codex.disconnect' | transloco }}
                     </app-button>
                   </div>
                 }
+              </div>
+            }
+
+            <!-- Subscription usage capacity (5-hour session + weekly windows) -->
+            @if (codexUsage().available && (codexUsage().primary || codexUsage().secondary)) {
+              <div class="codex-usage">
+                <h3 class="form-title">
+                  {{ 'settings.codex.usage.title' | transloco }}
+                  @if (codexUsage().plan_type) {
+                    <span class="codex-usage-plan">{{ codexUsage().plan_type }}</span>
+                  }
+                  @if (codexUsage().limit_reached) {
+                    <span class="codex-usage-limit">{{
+                      'settings.codex.usage.limitReached' | transloco
+                    }}</span>
+                  }
+                </h3>
+                @if (codexUsage().primary; as w) {
+                  <div class="codex-usage-row">
+                    <div class="codex-usage-meta">
+                      <span class="codex-usage-name">{{
+                        'settings.codex.usage.session' | transloco
+                      }}</span>
+                      @if (w.reset_after_seconds) {
+                        <span class="codex-usage-reset">{{
+                          'settings.codex.usage.resetsIn'
+                            | transloco: { time: formatReset(w.reset_after_seconds) }
+                        }}</span>
+                      }
+                    </div>
+                    <div class="codex-usage-track">
+                      <div
+                        class="codex-usage-fill"
+                        [class]="usageLevel(w.used_percent)"
+                        [style.width.%]="clampPct(w.used_percent)"
+                      ></div>
+                    </div>
+                    <span class="codex-usage-pct">{{ w.used_percent ?? 0 }}%</span>
+                  </div>
+                }
+                @if (codexUsage().secondary; as w) {
+                  <div class="codex-usage-row">
+                    <div class="codex-usage-meta">
+                      <span class="codex-usage-name">{{
+                        'settings.codex.usage.weekly' | transloco
+                      }}</span>
+                      @if (w.reset_after_seconds) {
+                        <span class="codex-usage-reset">{{
+                          'settings.codex.usage.resetsIn'
+                            | transloco: { time: formatReset(w.reset_after_seconds) }
+                        }}</span>
+                      }
+                    </div>
+                    <div class="codex-usage-track">
+                      <div
+                        class="codex-usage-fill"
+                        [class]="usageLevel(w.used_percent)"
+                        [style.width.%]="clampPct(w.used_percent)"
+                      ></div>
+                    </div>
+                    <span class="codex-usage-pct">{{ w.used_percent ?? 0 }}%</span>
+                  </div>
+                }
+                <p class="codex-usage-note">{{ 'settings.codex.usage.disclaimer' | transloco }}</p>
               </div>
             }
 
@@ -796,51 +1443,71 @@ const EXPIRY_OPTIONS = [
               </div>
             }
 
-            <!-- Connect -->
-            <div class="create-form">
-              <app-button
-                variant="primary"
-                size="md"
-                [loading]="codexConnecting()"
-                [disabled]="codexConnecting()"
-                (clicked)="connectCodexAccount()"
-              >
-                {{ (codexConnecting() ? 'settings.codex.waiting' : 'settings.codex.connectAccount') | transloco }}
-              </app-button>
-              @if (codexConnecting()) {
-                <div class="codex-callback-help">
-                  <p class="codex-callback-title">{{ 'settings.codex.completeSignIn' | transloco }}</p>
-                  <ol class="codex-callback-steps">
-                    <li>{{ 'settings.codex.step1' | transloco }}</li>
-                    <li>{{ 'settings.codex.step2' | transloco }}</li>
-                    <li>{{ 'settings.codex.step3' | transloco }}</li>
-                    <li>{{ 'settings.codex.step4' | transloco }}</li>
-                  </ol>
-                  <div class="codex-callback-input-row">
-                    <app-input
-                      [value]="codexCallbackUrl()"
-                      [placeholder]="'settings.codex.callbackPlaceholder' | transloco"
-                      (changed)="codexCallbackUrl.set($event)"
-                    />
-                    <app-button
-                      variant="primary"
-                      size="md"
-                      [loading]="codexCallbackSubmitting()"
-                      [disabled]="codexCallbackSubmitting()"
-                      (clicked)="submitCodexCallback()"
-                    >
-                      {{ (codexCallbackSubmitting() ? 'settings.codex.submitting' : 'settings.codex.completeLogin') | transloco }}
-                    </app-button>
+            <!-- Connect (only when the proxy is actually reachable) -->
+            @if (codexStatus().reachable) {
+              <div class="create-form">
+                <app-button
+                  variant="primary"
+                  size="md"
+                  [loading]="codexConnecting()"
+                  [disabled]="codexConnecting()"
+                  (clicked)="connectCodexAccount()"
+                >
+                  {{
+                    (codexConnecting() ? 'settings.codex.waiting' : 'settings.codex.connectAccount')
+                      | transloco
+                  }}
+                </app-button>
+                @if (codexConnecting()) {
+                  <div class="codex-callback-help">
+                    <p class="codex-callback-title">
+                      {{ 'settings.codex.completeSignIn' | transloco }}
+                    </p>
+                    <ol class="codex-callback-steps">
+                      <li>{{ 'settings.codex.step1' | transloco }}</li>
+                      <li>{{ 'settings.codex.step2' | transloco }}</li>
+                      <li>{{ 'settings.codex.step3' | transloco }}</li>
+                      <li>{{ 'settings.codex.step4' | transloco }}</li>
+                    </ol>
+                    <div class="codex-callback-input-row">
+                      <app-input
+                        [value]="codexCallbackUrl()"
+                        [placeholder]="'settings.codex.callbackPlaceholder' | transloco"
+                        (changed)="codexCallbackUrl.set($event)"
+                      />
+                      <app-button
+                        variant="primary"
+                        size="md"
+                        [loading]="codexCallbackSubmitting()"
+                        [disabled]="codexCallbackSubmitting()"
+                        (clicked)="submitCodexCallback()"
+                      >
+                        {{
+                          (codexCallbackSubmitting()
+                            ? 'settings.codex.submitting'
+                            : 'settings.codex.completeLogin'
+                          ) | transloco
+                        }}
+                      </app-button>
+                    </div>
+                    @if (codexCallbackError()) {
+                      <p class="codex-callback-error">{{ codexCallbackError() }}</p>
+                    }
+                    <p class="codex-callback-hint">
+                      {{ 'settings.codex.portForwardHint' | transloco }}
+                    </p>
                   </div>
-                  @if (codexCallbackError()) {
-                    <p class="codex-callback-error">{{ codexCallbackError() }}</p>
-                  }
-                  <p class="codex-callback-hint">
-                    {{ 'settings.codex.portForwardHint' | transloco }}
-                  </p>
-                </div>
-              }
-            </div>
+                }
+              </div>
+            } @else if (!codexLoading()) {
+              <!-- Proxy disabled/down: explain how to turn it on instead of
+                   offering a Connect button that 502s on /api/codex/login. -->
+              <div class="codex-disabled-notice">
+                <p class="codex-disabled-title">{{ 'settings.codex.disabledTitle' | transloco }}</p>
+                <p class="codex-disabled-desc">{{ 'settings.codex.disabledDesc' | transloco }}</p>
+                <code class="codex-disabled-code">codexProxy.enabled: true</code>
+              </div>
+            }
           </section>
 
           <!-- Cloud Storage Section (Admin Only, Phase 4) -->
@@ -860,9 +1527,13 @@ const EXPIRY_OPTIONS = [
                   [class.connected]="s.effective.is_initialized"
                 ></span>
                 <span class="codex-status-text">
-                  {{ 'settings.cloud.active' | transloco }} <strong>{{ s.effective.backend_id }}</strong>
-                  @if (s.effective.is_initialized) { &mdash; {{ 'settings.cloud.initialized' | transloco }} }
-                  @else { &mdash; {{ 'settings.cloud.notInitialized' | transloco }} }
+                  {{ 'settings.cloud.active' | transloco }}
+                  <strong>{{ s.effective.backend_id }}</strong>
+                  @if (s.effective.is_initialized) {
+                    &mdash; {{ 'settings.cloud.initialized' | transloco }}
+                  } @else {
+                    &mdash; {{ 'settings.cloud.notInitialized' | transloco }}
+                  }
                 </span>
                 <app-button
                   variant="ghost"
@@ -960,11 +1631,12 @@ const EXPIRY_OPTIONS = [
                     <div class="codex-account-row">
                       <span class="mono">{{ entry.field }}</span>
                       <span class="mono">{{ entry.env_var }}</span>
-                      <span
-                        class="codex-account-status"
-                        [class.connected]="entry.set"
-                      >
-                        {{ entry.set ? ('settings.cloud.secretSet' | transloco: {chars: entry.length}) : ('settings.cloud.secretUnset' | transloco) }}
+                      <span class="codex-account-status" [class.connected]="entry.set">
+                        {{
+                          entry.set
+                            ? ('settings.cloud.secretSet' | transloco)
+                            : ('settings.cloud.secretUnset' | transloco)
+                        }}
                       </span>
                     </div>
                   }
@@ -980,7 +1652,9 @@ const EXPIRY_OPTIONS = [
                   [disabled]="cloudBusy()"
                   (clicked)="testCloudSettings()"
                 >
-                  {{ (cloudTesting() ? 'settings.cloud.testing' : 'settings.cloud.test') | transloco }}
+                  {{
+                    (cloudTesting() ? 'settings.cloud.testing' : 'settings.cloud.test') | transloco
+                  }}
                 </app-button>
                 <app-button
                   variant="primary"
@@ -989,7 +1663,10 @@ const EXPIRY_OPTIONS = [
                   [disabled]="cloudBusy()"
                   (clicked)="saveCloudSettings()"
                 >
-                  {{ (cloudSaving() ? 'settings.cloud.saving' : 'settings.cloud.saveReload') | transloco }}
+                  {{
+                    (cloudSaving() ? 'settings.cloud.saving' : 'settings.cloud.saveReload')
+                      | transloco
+                  }}
                 </app-button>
                 @if (s.overlay.present) {
                   <app-button
@@ -1015,8 +1692,12 @@ const EXPIRY_OPTIONS = [
               @if (s.overlay.present) {
                 <p class="section-desc cloud-overlay-info">
                   {{ 'settings.cloud.persistedOverlayLastSaved' | transloco }}
-                  @if (s.overlay.updated_at) { {{ formatDate(s.overlay.updated_at) }} }
-                  @if (s.overlay.updated_by) { by {{ s.overlay.updated_by }} }
+                  @if (s.overlay.updated_at) {
+                    {{ formatDate(s.overlay.updated_at) }}
+                  }
+                  @if (s.overlay.updated_by) {
+                    by {{ s.overlay.updated_by }}
+                  }
                 </p>
               }
             }
@@ -1025,488 +1706,1125 @@ const EXPIRY_OPTIONS = [
       </div>
     </div>
   `,
-  styles: [`
-    :host { display: block; height: 100%; overflow: auto; }
-
-    .settings-page {
-      padding: 32px;
-      max-width: 800px;
-      margin: 0 auto;
-      color: var(--text-primary);
-    }
-
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 32px;
-    }
-
-    .page-title {
-      font-size: 24px;
-      font-weight: 700;
-      margin: 0;
-      color: var(--text-primary);
-    }
-
-    .settings-section {
-      background: var(--panel-bg);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-lg);
-      padding: 24px;
-    }
-
-    .section-spacer { margin-top: 24px; }
-
-    .section-title {
-      font-size: 18px;
-      font-weight: 600;
-      margin-bottom: 4px;
-      color: var(--text-primary);
-    }
-
-    .section-desc {
-      font-size: 13px;
-      color: var(--text-muted);
-      margin-bottom: 20px;
-    }
-
-    .section-desc code {
-      background: var(--surface-0);
-      padding: 2px 6px;
-      border-radius: var(--radius-tag);
-      font-size: 12px;
-    }
-
-    /* Key + Token tables */
-    .key-table, .token-table {
-      margin-bottom: 20px;
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-surface);
-      overflow: hidden;
-    }
-
-    .key-header, .key-row {
-      display: grid;
-      grid-template-columns: 1.5fr 1.2fr 1.2fr 1fr 90px;
-      padding: 10px 14px;
-      gap: 8px;
-      align-items: center;
-      font-size: 13px;
-    }
-
-    .token-header, .token-row {
-      display: grid;
-      grid-template-columns: 2fr 1.2fr 1fr 0.8fr 1fr 1fr 90px;
-      padding: 10px 14px;
-      gap: 8px;
-      align-items: center;
-      font-size: 13px;
-    }
-
-    .key-header, .token-header {
-      background: var(--surface-0);
-      font-weight: 600;
-      font-size: 12px;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-
-    .key-row, .token-row {
-      border-top: 1px solid var(--border-color);
-    }
-
-    .mono {
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-
-    .empty-state {
-      font-size: 13px;
-      color: var(--text-muted);
-      text-align: center;
-      padding: 24px;
-      margin-bottom: 20px;
-    }
-
-    /* New token banner */
-    .new-token-banner {
-      background: var(--success-tint);
-      border: 1px solid var(--success);
-      border-radius: var(--radius-surface);
-      padding: 14px;
-      margin-bottom: 20px;
-    }
-
-    .new-token-warning {
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--success);
-      margin-bottom: 10px;
-    }
-
-    .new-token-row {
-      display: flex;
-      gap: 8px;
-    }
-
-    .new-token-input,
-    .readonly-input {
-      flex: 1;
-      padding: 8px 12px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-control);
-      color: var(--text-primary);
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      outline: none;
-    }
-
-    /* Form layout */
-    .form-block {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-
-    .create-form {
-      border-top: 1px solid var(--border-color);
-      padding-top: 20px;
-      margin-bottom: 20px;
-    }
-
-    .form-title {
-      font-size: 14px;
-      font-weight: 600;
-      margin-bottom: 12px;
-      color: var(--text-primary);
-    }
-
-    .form-row {
-      margin-bottom: 10px;
-    }
-
-    .two-col {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-
-    .actions-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-top: 12px;
-    }
-
-    .channel-list {
-      display: flex;
-      gap: 16px;
-      flex-wrap: wrap;
-      margin-top: 4px;
-    }
-
-    .quiet-hours-row { margin-top: 12px; }
-
-    .time-input {
-      width: 100%;
-      padding: 8px 12px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-control);
-      color: var(--text-primary);
-      font-family: inherit;
-      font-size: 13px;
-      outline: none;
-    }
-    .time-input:focus { border-color: var(--accent-color); }
-
-    /* LLM Endpoints */
-    .endpoint-card {
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-surface);
-      padding: 12px;
-      margin-bottom: 12px;
-      background: var(--surface-0);
-    }
-
-    .endpoint-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
-      margin-bottom: 10px;
-    }
-
-    .endpoint-title {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-      min-width: 0;
-    }
-
-    .endpoint-url {
-      font-size: 12px;
-      color: var(--text-muted);
-      word-break: break-all;
-    }
-
-    .endpoint-key {
-      font-size: 11px;
-      color: var(--text-muted);
-    }
-
-    .endpoint-key.muted {
-      font-style: italic;
-    }
-
-    .endpoint-actions {
-      display: flex;
-      gap: 8px;
-      flex-shrink: 0;
-    }
-
-    .test-result {
-      font-size: 12px;
-      padding: 6px 10px;
-      border-radius: var(--radius-control);
-      margin-bottom: 10px;
-    }
-
-    .test-result.ok {
-      background: var(--success-tint);
-      color: var(--success);
-    }
-
-    .test-result.err {
-      background: var(--danger-tint);
-      color: var(--danger);
-      word-break: break-word;
-    }
-
-    .form-error {
-      color: var(--danger);
-      font-size: 12px;
-      margin: 0 0 10px;
-    }
-
-    .subsection-title {
-      font-size: 12px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--text-muted);
-      margin: 16px 0 8px;
-      padding-top: 12px;
-      border-top: 1px solid var(--border-color);
-    }
-
-    .catalog-hint {
-      font-size: 12px;
-      color: var(--text-muted);
-      margin: 0;
-    }
-
-    /* Instructions */
-    .instructions {
-      border-top: 1px solid var(--border-color);
-      padding-top: 20px;
-    }
-
-    .code-block-wrapper {
-      position: relative;
-    }
-
-    .code-block {
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-tag);
-      padding: 14px;
-      padding-right: 80px;
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      line-height: 1.5;
-      color: var(--text-primary);
-      overflow-x: auto;
-      white-space: pre;
-    }
-
-    .code-copy-btn {
-      position: absolute;
-      top: 8px;
-      right: 8px;
-    }
-
-    .connector-url-row {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 8px;
-    }
-
-    .section-hint {
-      font-size: 12px;
-      color: var(--text-secondary);
-      line-height: 1.5;
-    }
-
-    /* Codex Proxy */
-    .codex-status-card {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 12px 16px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-surface);
-      margin-bottom: 16px;
-    }
-
-    .codex-status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--danger);
-      flex-shrink: 0;
-    }
-
-    .codex-status-dot.connected {
-      background: var(--success);
-    }
-
-    .codex-status-text {
-      font-size: 13px;
-      color: var(--text-secondary);
-      flex: 1;
-    }
-
-    .codex-accounts {
-      margin-bottom: 16px;
-    }
-
-    .secret-provenance { margin-top: 16px; }
-
-    .codex-account-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 8px 14px;
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-surface);
-      margin-bottom: 6px;
-    }
-
-    .codex-account-row .mono { flex: 1; }
-
-    .codex-account-status {
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    .codex-account-status.connected { color: var(--success); }
-
-    .codex-models {
-      margin-bottom: 16px;
-    }
-
-    .codex-model-chips {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-
-    .codex-model-chip {
-      padding: 4px 10px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-control);
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      color: var(--text-secondary);
-    }
-
-    /* Codex callback paste flow */
-    .codex-callback-help {
-      margin-top: 16px;
-      padding: 16px;
-      background: var(--surface-0);
-      border: 1px solid var(--accent-color);
-      border-radius: var(--radius-surface);
-    }
-
-    .codex-callback-title {
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--accent-color);
-      margin-bottom: 10px;
-    }
-
-    .codex-callback-steps {
-      font-size: 13px;
-      color: var(--text-secondary);
-      line-height: 1.6;
-      margin: 0 0 14px 0;
-      padding-left: 20px;
-    }
-
-    .codex-callback-steps code {
-      background: var(--surface-0);
-      padding: 2px 6px;
-      border-radius: var(--radius-tag);
-      font-size: 12px;
-    }
-
-    .codex-callback-input-row {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 8px;
-      align-items: stretch;
-    }
-    .codex-callback-input-row > app-input { flex: 1; }
-
-    .codex-callback-error {
-      font-size: 13px;
-      color: var(--danger);
-      margin: 6px 0 0 0;
-    }
-
-    .codex-callback-hint {
-      font-size: 12px;
-      color: var(--text-muted);
-      margin: 10px 0 0 0;
-    }
-
-    .codex-callback-hint code {
-      background: var(--surface-0);
-      padding: 2px 6px;
-      border-radius: var(--radius-tag);
-      font-size: 11px;
-    }
-
-    /* Cloud Storage */
-    .cloud-button-row {
-      display: flex;
-      gap: 12px;
-      margin-top: 20px;
-      flex-wrap: wrap;
-    }
-    .cloud-message { margin-top: 12px; }
-    .cloud-overlay-info { margin-top: 8px; }
-  `],
+  styles: [
+    `
+      :host {
+        display: block;
+        height: 100%;
+        overflow: auto;
+      }
+
+      .settings-page {
+        padding: 32px;
+        max-width: var(--content-max-width);
+        margin: 0 auto;
+        color: var(--text-primary);
+      }
+
+      .page-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 32px;
+      }
+
+      .page-title {
+        font-size: 24px;
+        font-weight: 700;
+        margin: 0;
+        color: var(--text-primary);
+      }
+
+      .settings-section {
+        background: var(--panel-bg);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-lg);
+        padding: 24px;
+      }
+
+      .section-spacer {
+        margin-top: 24px;
+      }
+
+      .section-title {
+        font-size: 18px;
+        font-weight: 600;
+        margin-bottom: 4px;
+        color: var(--text-primary);
+      }
+
+      .section-desc {
+        font-size: 13px;
+        color: var(--text-muted);
+        margin-bottom: 20px;
+      }
+
+      .section-desc code {
+        background: var(--surface-0);
+        padding: 2px 6px;
+        border-radius: var(--radius-tag);
+        font-size: 12px;
+      }
+
+      /* Key + Token tables */
+      .key-table,
+      .token-table {
+        margin-bottom: 20px;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        overflow: hidden;
+      }
+
+      .key-header,
+      .key-row {
+        display: grid;
+        grid-template-columns: 1.5fr 1.2fr 1.2fr 1fr 90px;
+        padding: 10px 14px;
+        gap: 8px;
+        align-items: center;
+        font-size: 13px;
+      }
+
+      .token-header,
+      .token-row {
+        display: grid;
+        grid-template-columns: 2fr 1.2fr 1fr 0.8fr 1fr 1fr 90px;
+        padding: 10px 14px;
+        gap: 8px;
+        align-items: center;
+        font-size: 13px;
+      }
+
+      .key-header,
+      .token-header {
+        background: var(--surface-0);
+        font-weight: 600;
+        font-size: 12px;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .key-row,
+      .token-row {
+        border-top: 1px solid var(--border-color);
+      }
+
+      .mono {
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .empty-state {
+        font-size: 13px;
+        color: var(--text-muted);
+        text-align: center;
+        padding: 24px;
+        margin-bottom: 20px;
+      }
+
+      /* New token banner */
+      .new-token-banner {
+        background: var(--success-tint);
+        border: 1px solid var(--success);
+        border-radius: var(--radius-surface);
+        padding: 14px;
+        margin-bottom: 20px;
+      }
+
+      .new-token-warning {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--success);
+        margin-bottom: 10px;
+      }
+
+      .new-token-row {
+        display: flex;
+        gap: 8px;
+      }
+
+      .new-token-input,
+      .readonly-input {
+        flex: 1;
+        padding: 8px 12px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        color: var(--text-primary);
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        outline: none;
+      }
+
+      /* Form layout */
+      .form-block {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .create-form {
+        border-top: 1px solid var(--border-color);
+        padding-top: 20px;
+        margin-bottom: 20px;
+      }
+
+      .form-title {
+        font-size: 14px;
+        font-weight: 600;
+        margin-bottom: 12px;
+        color: var(--text-primary);
+      }
+
+      .form-row {
+        margin-bottom: 10px;
+      }
+
+      .two-col {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+
+      .actions-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-top: 12px;
+      }
+
+      .channel-list {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-top: 4px;
+      }
+
+      .quiet-hours-row {
+        margin-top: 12px;
+      }
+
+      .time-input {
+        width: 100%;
+        padding: 8px 12px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        color: var(--text-primary);
+        font-family: inherit;
+        font-size: 13px;
+        outline: none;
+      }
+      .time-input:focus {
+        border-color: var(--accent-color);
+      }
+
+      .form-error {
+        color: var(--danger);
+        font-size: 12px;
+        margin: 0 0 10px;
+      }
+
+      .subsection-title {
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--text-muted);
+        margin: 16px 0 8px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-color);
+      }
+
+      /* Instructions */
+      .instructions {
+        border-top: 1px solid var(--border-color);
+        padding-top: 20px;
+      }
+
+      .code-block-wrapper {
+        position: relative;
+      }
+
+      .code-block {
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-tag);
+        padding: 14px;
+        padding-right: 80px;
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--text-primary);
+        overflow-x: auto;
+        white-space: pre;
+      }
+
+      .code-copy-btn {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+      }
+
+      .connector-url-row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      .section-hint {
+        font-size: 12px;
+        color: var(--text-secondary);
+        line-height: 1.5;
+      }
+
+      /* Codex Proxy */
+      .codex-status-card {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 16px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        margin-bottom: 16px;
+      }
+
+      .codex-status-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--danger);
+        flex-shrink: 0;
+      }
+
+      .codex-status-dot.connected {
+        background: var(--success);
+      }
+
+      .codex-status-text {
+        font-size: 13px;
+        color: var(--text-secondary);
+        flex: 1;
+      }
+
+      .codex-disabled-notice {
+        padding: 14px 16px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+      }
+
+      .codex-disabled-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--text-primary);
+        margin: 0 0 6px 0;
+      }
+
+      .codex-disabled-desc {
+        font-size: 13px;
+        color: var(--text-secondary);
+        line-height: 1.6;
+        margin: 0 0 10px 0;
+      }
+
+      .codex-disabled-code {
+        display: inline-block;
+        padding: 4px 10px;
+        background: var(--surface-1);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      .codex-accounts {
+        margin-bottom: 16px;
+      }
+
+      .secret-provenance {
+        margin-top: 16px;
+      }
+
+      .codex-account-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 14px;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        margin-bottom: 6px;
+      }
+
+      .codex-account-row .mono {
+        flex: 1;
+      }
+
+      .codex-account-status {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .codex-account-status.connected {
+        color: var(--success);
+      }
+
+      .codex-models {
+        margin-bottom: 16px;
+      }
+
+      .codex-model-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .codex-model-chip {
+        padding: 4px 10px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      .codex-usage {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+
+      .codex-usage-plan {
+        margin-left: 8px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--text-secondary);
+        text-transform: none;
+      }
+
+      .codex-usage-limit {
+        margin-left: 8px;
+        font-size: 12px;
+        color: var(--danger);
+      }
+
+      .codex-usage-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .codex-usage-meta {
+        display: flex;
+        flex-direction: column;
+        min-width: 132px;
+      }
+
+      .codex-usage-name {
+        font-size: 13px;
+        color: var(--text-primary);
+      }
+      .codex-usage-reset {
+        font-size: 11px;
+        color: var(--text-secondary);
+      }
+
+      .codex-usage-track {
+        flex: 1;
+        height: 8px;
+        border-radius: 4px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        overflow: hidden;
+      }
+
+      .codex-usage-fill {
+        height: 100%;
+        border-radius: 4px;
+        transition: width 0.3s ease;
+      }
+
+      .codex-usage-fill.ok {
+        background: var(--accent-color);
+      }
+      .codex-usage-fill.warn {
+        background: #e6a23c;
+      }
+      .codex-usage-fill.crit {
+        background: var(--danger);
+      }
+
+      .codex-usage-pct {
+        min-width: 42px;
+        text-align: right;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        color: var(--text-secondary);
+      }
+
+      .codex-usage-note {
+        margin: 4px 0 0;
+        font-size: 11px;
+        line-height: 1.45;
+        font-style: italic;
+        color: var(--text-secondary);
+      }
+
+      /* Codex callback paste flow */
+      .codex-callback-help {
+        margin-top: 16px;
+        padding: 16px;
+        background: var(--surface-0);
+        border: 1px solid var(--accent-color);
+        border-radius: var(--radius-surface);
+      }
+
+      .codex-callback-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--accent-color);
+        margin-bottom: 10px;
+      }
+
+      .codex-callback-steps {
+        font-size: 13px;
+        color: var(--text-secondary);
+        line-height: 1.6;
+        margin: 0 0 14px 0;
+        padding-left: 20px;
+      }
+
+      .codex-callback-steps code {
+        background: var(--surface-0);
+        padding: 2px 6px;
+        border-radius: var(--radius-tag);
+        font-size: 12px;
+      }
+
+      .codex-callback-input-row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 8px;
+        align-items: stretch;
+      }
+      .codex-callback-input-row > app-input {
+        flex: 1;
+      }
+
+      .codex-callback-error {
+        font-size: 13px;
+        color: var(--danger);
+        margin: 6px 0 0 0;
+      }
+
+      .codex-callback-hint {
+        font-size: 12px;
+        color: var(--text-muted);
+        margin: 10px 0 0 0;
+      }
+
+      .codex-callback-hint code {
+        background: var(--surface-0);
+        padding: 2px 6px;
+        border-radius: var(--radius-tag);
+        font-size: 11px;
+      }
+
+      /* Cloud Storage */
+      .cloud-button-row {
+        display: flex;
+        gap: 12px;
+        margin-top: 20px;
+        flex-wrap: wrap;
+      }
+      .cloud-message {
+        margin-top: 12px;
+      }
+      .cloud-overlay-info {
+        margin-top: 8px;
+      }
+
+      /* ---- Mobile (<=560px): this page's first responsive block ---- */
+      @media (max-width: 560px) {
+        /* Reclaim width — the 32px/24px desktop padding is wasteful on a phone. */
+        .settings-page {
+          padding: 16px;
+        }
+        .settings-section {
+          padding: 16px;
+        }
+
+        /* Paired fields stack to one full-width column (bigger tap targets; the
+         preference/persistent/cloud selects were cramped, not broken). */
+        .two-col {
+          grid-template-columns: 1fr;
+        }
+
+        /* API-key & MCP-token grids -> one card per row. A fixed 5-/7-column grid
+         can't fit a phone, and the table wrapper is overflow:hidden, so the
+         right-most column (the Delete / Revoke button) was clipped and
+         UNREACHABLE. Cards restore every field + a full-width action button. */
+        .key-table,
+        .token-table {
+          border: none;
+          border-radius: 0;
+          overflow: visible;
+        }
+        .key-header,
+        .token-header {
+          display: none;
+        }
+        .key-row,
+        .token-row {
+          display: block;
+          border: 1px solid var(--border-color);
+          border-radius: var(--radius-surface);
+          padding: 12px 14px;
+          margin-bottom: 10px;
+        }
+        .key-row > span,
+        .token-row > span {
+          display: block;
+          padding: 1px 0;
+        }
+        /* First cell = card title. */
+        .key-row .col-provider,
+        .token-row .col-name {
+          font-weight: 600;
+          font-size: 14px;
+          color: var(--text-primary);
+          margin-bottom: 4px;
+        }
+        /* Re-label the now-headerless value cells. CSS content: is not scanned by
+         the i18n hardcoded-string check and matches the admin-users card
+         precedent; it also sidesteps the missing settings.apiKeys.* keys. */
+        .key-row .col-prefix::before {
+          content: 'Key: ';
+        }
+        .key-row .col-label::before {
+          content: 'Label: ';
+        }
+        .key-row .col-updated::before {
+          content: 'Updated: ';
+        }
+        .token-row .col-prefix::before {
+          content: 'Token: ';
+        }
+        .token-row .col-scope::before {
+          content: 'Scope: ';
+        }
+        .token-row .col-origin::before {
+          content: 'Origin: ';
+        }
+        .token-row .col-used::before {
+          content: 'Last used: ';
+        }
+        .token-row .col-expires::before {
+          content: 'Expires: ';
+        }
+        .key-row span::before,
+        .token-row span::before {
+          color: var(--text-muted);
+          font-weight: 600;
+        }
+        /* Action cell -> full-width button at the foot of the card. */
+        .key-row .col-action,
+        .token-row .col-action {
+          margin-top: 12px;
+        }
+        .key-row .col-action app-button,
+        .token-row .col-action app-button {
+          display: block;
+          width: 100%;
+        }
+        .key-row .col-action ::ng-deep .app-button__btn,
+        .token-row .col-action ::ng-deep .app-button__btn {
+          width: 100%;
+        }
+
+        /* Codex accounts & Cloud secret-provenance rows: let the long, unbreakable
+         mono strings (e.g. OPENCLOUD_KEYCLOAK_CLIENT_SECRET) wrap instead of
+         forcing the row -- and the whole page -- to scroll sideways. */
+        .codex-account-row {
+          flex-wrap: wrap;
+        }
+        .codex-account-row > * {
+          min-width: 0;
+        }
+        .codex-account-row .mono {
+          overflow-wrap: anywhere;
+        }
+      }
+      .voice-lang-note {
+        margin: 8px 0 0;
+        font-size: 12px;
+        line-height: 1.45;
+        color: var(--text-muted);
+      }
+      .voice-sample-hint {
+        margin: 4px 0 0;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .voice-preview-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 10px;
+      }
+      .voice-preview-row app-icon {
+        margin-right: 4px;
+      }
+      .voice-preview-error {
+        font-size: 13px;
+        color: var(--danger);
+      }
+      .voice-rewrite {
+        margin-top: 14px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-color);
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .voice-subhead {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text);
+      }
+      .voice-library {
+        margin-top: 14px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-color);
+      }
+      .voice-library-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .voice-library-flag {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .voice-library-search {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 12px;
+        flex-wrap: wrap;
+      }
+      .voice-library-search app-input {
+        flex: 1 1 180px;
+      }
+      .voice-library-results {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 12px;
+      }
+      .voice-library-card {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 8px 10px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--surface-1);
+      }
+      .voice-library-card.is-added {
+        border-color: var(--accent-color);
+      }
+      .voice-library-card__info {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+      .voice-library-card__name {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--text);
+      }
+      .voice-library-card__tags {
+        font-size: 12px;
+        color: var(--text-muted);
+        text-transform: capitalize;
+      }
+      .voice-library-card__actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      .voice-library-card__done {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12px;
+        color: var(--accent-color);
+      }
+    `,
+  ],
 })
 export class SettingsComponent implements OnInit {
   readonly tokenService = inject(McpTokenService);
   readonly userService = inject(UserService);
   readonly settingsService = inject(SettingsService);
   readonly modelService = inject(ModelService);
+  readonly capabilities = inject(CapabilitiesService);
   readonly i18n = inject(I18nService);
+  readonly viewMode = inject(ViewModeService);
   private readonly apiService = inject(ApiService);
   private readonly router = inject(Router);
   private readonly transloco = inject(TranslocoService);
 
   // Provider list for dropdown
   readonly providers = PROVIDERS;
+
+  // ── Read-aloud voice ──────────────────────────────────────────────
+  /** The TTS model in effect (user override or system default). The resolved
+   * default lives on the service's `resolvedDefaults` signal — SettingsService
+   * strips `_resolved` off `preferences` — so read it from there, not from
+   * `preferences()._resolved` (which is always undefined). */
+  readonly ttsModel = computed(() => {
+    const p = this.settingsService.preferences();
+    return p.default_tts_model || this.settingsService.resolvedDefaults().default_tts_model || '';
+  });
+  readonly ttsConfigured = computed(() => !!this.ttsModel());
+  /** True when the user has pinned a TTS model (vs following the system
+   * default) — drives the "(default)" annotation on the provider picker. */
+  readonly ttsModelOverridden = computed(
+    () => !!this.settingsService.preferences().default_tts_model,
+  );
+  /** Voices offered by the configured backend ([] ⇒ show a free-text field). */
+  readonly ttsVoices = computed(() => voicesForModelId(this.ttsModel()));
+  /** The configured TTS backend — drives the backend-specific note. */
+  readonly ttsBackend = computed(() => ttsBackendForModelId(this.ttsModel()));
+  /** The user's chosen voice ('' = follow the admin/per-language default). */
+  readonly ttsVoice = computed(() => this.settingsService.preferences().default_tts_voice ?? '');
+
+  /** Option label for a voice: the raw id plus a language tag when known
+   * (e.g. `af_bella [EN-US]`). The `<option>` value stays the raw id. */
+  voiceOptionLabel(voice: string): string {
+    const tag = voiceLanguageTag(this.ttsModel(), voice);
+    return tag ? `${voice} [${tag}]` : voice;
+  }
+
+  // ── ElevenLabs account voices ─────────────────────────────────────
+  // Unlike Kokoro/OpenAI's static catalogs, ElevenLabs voices come live from
+  // the deployment account (server-proxied `GET /api/settings/tts/voices`), so
+  // they're an async signal loaded lazily when that backend is selected.
+  readonly elevenVoices = signal<TtsAccountVoice[]>([]);
+  readonly elevenVoicesLoading = signal(false);
+  /** Fetched once per session; the orchestrator caches ~5 min so re-selecting
+   * ElevenLabs doesn't re-hit the API. */
+  private _elevenVoicesLoaded = false;
+  private hostedAudio: HTMLAudioElement | null = null;
+
+  /** The account voice matching the current selection (for the hosted-preview
+   * button), or null when on Auto ('') or the voice isn't in the list. */
+  readonly selectedElevenVoice = computed(
+    () => this.elevenVoices().find((v) => v.id === this.ttsVoice()) ?? null,
+  );
+
+  /** Option label for an ElevenLabs voice: name + its own accent/gender labels
+   * (e.g. `Sarah — american · female`) — strictly better than prefix-decoding.
+   * The `<option>` value is the opaque account `voice_id`. */
+  elevenVoiceLabel(v: TtsAccountVoice): string {
+    const tags = [v.labels?.['accent'], v.labels?.['gender']].filter(Boolean).join(' · ');
+    return tags ? `${v.name} — ${tags}` : v.name;
+  }
+
+  /** Play the selected voice's hosted `preview_url` (a public ElevenLabs CDN
+   * mp3) — a zero-cost audition, distinct from the synth preview which spends
+   * characters. No-op when the selected voice has no preview. */
+  playHostedPreview(): void {
+    const url = this.selectedElevenVoice()?.preview_url;
+    if (!url) return;
+    this.hostedAudio?.pause();
+    const audio = new Audio(url);
+    this.hostedAudio = audio;
+    audio.play().catch(() => {
+      /* autoplay/network failure — nothing actionable, stay silent */
+    });
+  }
+
+  // ── Read-aloud rewrite preferences (reasoning + custom prompt) ────
+  // Both feed the aux rewrite in services/tts.py. Draft signals + an explicit
+  // Save (mirrors the persistent-agent / communication sub-object pattern) so
+  // the free-text prompt isn't PATCHed on every keystroke; seeded from
+  // preferences in the sync effect.
+  readonly readAloudReasoning = signal<ReadAloudReasoningLevel>('off');
+  readonly readAloudPromptDraft = signal('');
+  /** Server caps the custom prompt (services/tts.py READ_ALOUD_PROMPT_MAX). */
+  readonly readAloudPromptMax = 1000;
+  readonly readAloudPromptCharsLeft = computed(
+    () => this.readAloudPromptMax - this.readAloudPromptDraft().length,
+  );
+  readonly savingReadAloud = signal(false);
+  readonly readAloudSaved = signal(false);
+
+  /** Clamp typed/pasted instructions to the cap so we never submit a 422. */
+  onReadAloudPromptChange(text: string): void {
+    this.readAloudPromptDraft.set(text.slice(0, this.readAloudPromptMax));
+  }
+
+  /** Persist the read-aloud rewrite preferences as one sub-object. */
+  saveReadAloud(): void {
+    this.savingReadAloud.set(true);
+    this.readAloudSaved.set(false);
+    const settings: Record<string, unknown> = {
+      read_aloud: {
+        reasoning_level: this.readAloudReasoning(),
+        custom_prompt: this.readAloudPromptDraft().trim() || null,
+      },
+    };
+    this.settingsService.updatePreferences(settings).subscribe({
+      next: () => {
+        this.savingReadAloud.set(false);
+        this.readAloudSaved.set(true);
+        setTimeout(() => this.readAloudSaved.set(false), 2000);
+      },
+      error: () => this.savingReadAloud.set(false),
+    });
+  }
+
+  // ── ElevenLabs Voice Library browser (Phase 6) ────────────────────
+  // A thin skin over the server-proxied `/api/settings/tts/library` search.
+  // Browsing/previewing is free; "Add to deployment" copies a voice into the
+  // shared account and is gated by the admin flag (`libraryAddEnabled`).
+  readonly libraryOpen = signal(false);
+  readonly librarySearch = signal('');
+  readonly libraryGender = signal('');
+  readonly libraryLoading = signal(false);
+  readonly libraryVoices = signal<TtsLibraryVoice[]>([]);
+  readonly libraryError = signal<string | null>(null);
+  /** Mirrors the deployment's add-gate; also reflected by the admin switch. */
+  readonly libraryAddEnabled = signal(false);
+  /** id of the library voice whose add is in-flight (drives its button spinner). */
+  readonly libraryAddingId = signal<string | null>(null);
+  /** id of the library voice just added, for a transient "Added ✓" affordance. */
+  readonly libraryAdded = signal<string | null>(null);
+
+  /** Open/close the library panel; first open kicks off an empty-query search
+   * (the library's default "featured" listing). */
+  toggleLibrary(): void {
+    const open = !this.libraryOpen();
+    this.libraryOpen.set(open);
+    if (open && this.libraryVoices().length === 0 && !this.libraryLoading()) {
+      this.searchLibrary();
+    }
+  }
+
+  /** Run a library search with the current query + gender filter. */
+  searchLibrary(): void {
+    if (this.libraryLoading()) return;
+    this.libraryLoading.set(true);
+    this.libraryError.set(null);
+    this.apiService
+      .searchTtsLibrary({
+        search: this.librarySearch(),
+        gender: this.libraryGender(),
+      })
+      .subscribe((resp) => {
+        this.libraryLoading.set(false);
+        this.libraryAddEnabled.set(resp.add_enabled);
+        this.libraryError.set(resp.error);
+        this.libraryVoices.set(resp.voices);
+      });
+  }
+
+  /** `accent · gender · language`, blanks dropped — the card's subtitle. */
+  libraryVoiceLabel(v: TtsLibraryVoice): string {
+    return [v.accent, v.gender, v.language].filter(Boolean).join(' · ');
+  }
+
+  /** Audition a library voice via its public CDN preview (zero characters). */
+  playLibrarySample(v: TtsLibraryVoice): void {
+    if (!v.preview_url) return;
+    this.hostedAudio?.pause();
+    const audio = new Audio(v.preview_url);
+    this.hostedAudio = audio;
+    audio.play().catch(() => {
+      /* autoplay/network failure — stay silent */
+    });
+  }
+
+  /** Copy a library voice into the deployment account, then refresh the account
+   * picker (the server invalidated its cache) and select the new voice so the
+   * user can immediately preview/use it. */
+  addLibraryVoice(v: TtsLibraryVoice): void {
+    if (this.libraryAddingId()) return;
+    this.libraryAddingId.set(v.id);
+    this.libraryError.set(null);
+    this.apiService
+      .addTtsLibraryVoice({
+        public_owner_id: v.public_owner_id,
+        voice_id: v.id,
+        new_name: v.name,
+      })
+      .subscribe({
+        next: (res) => {
+          this.libraryAddingId.set(null);
+          this.libraryAdded.set(v.id);
+          const newId = res.voice_id || v.id;
+          // Optimistically show + select the added voice NOW: the account list
+          // is eventually-consistent, so an immediate bare refetch can miss the
+          // just-added voice (that's the "Add did nothing until I toggled
+          // provider" symptom). Insert a local entry built from the library card.
+          const optimistic: TtsAccountVoice = {
+            id: newId,
+            name: v.name,
+            labels: {
+              ...(v.accent ? { accent: v.accent } : {}),
+              ...(v.gender ? { gender: v.gender } : {}),
+            },
+            preview_url: v.preview_url,
+          };
+          if (!this.elevenVoices().some((x) => x.id === newId)) {
+            this.elevenVoices.set([optimistic, ...this.elevenVoices()]);
+          }
+          this._elevenVoicesLoaded = true;
+          this.setTtsVoice(newId);
+          // Reconcile with the server in the background; if the fresh list still
+          // lacks the voice (propagation lag), keep the optimistic entry.
+          this.apiService.listTtsVoices().subscribe((r) => {
+            if (r.backend !== 'elevenlabs' || r.voices.length === 0) return;
+            this.elevenVoices.set(
+              r.voices.some((x) => x.id === newId) ? r.voices : [optimistic, ...r.voices],
+            );
+          });
+        },
+        error: (err) => {
+          this.libraryAddingId.set(null);
+          this.libraryError.set((err?.error?.detail as string) || 'Could not add this voice.');
+        },
+      });
+  }
+
+  // ── Voice Library admin add-gate (admin-only switch) ──────────────
+  readonly ttsLibraryFlag = signal(false);
+  readonly ttsLibraryFlagSaving = signal(false);
+
+  /** Toggle the deployment-wide "allow adding library voices" flag. */
+  setTtsLibraryFlag(enabled: boolean): void {
+    this.ttsLibraryFlagSaving.set(true);
+    this.apiService.setTtsLibrarySetting(enabled).subscribe({
+      next: (row) => {
+        this.ttsLibraryFlag.set(row.enabled);
+        this.libraryAddEnabled.set(row.enabled);
+        this.ttsLibraryFlagSaving.set(false);
+      },
+      error: () => this.ttsLibraryFlagSaving.set(false),
+    });
+  }
+
+  /** Persist the read-aloud provider/model choice. Selecting the resolved
+   * default clears the override (mirrors the aux-model picker); any real change
+   * also clears the voice override, because voice ids are backend-specific — a
+   * Kokoro `af_*` id is meaningless to OpenAI/ElevenLabs, so carrying it over
+   * would make the new backend reject the voice. */
+  setTtsModel(modelId: string): void {
+    if (modelId === this.ttsModel()) return;
+    const resolvedDefault = this.settingsService.resolvedDefaults().default_tts_model ?? '';
+    const override = !modelId || modelId === resolvedDefault ? null : modelId;
+    this.settingsService
+      .updatePreferences({ default_tts_model: override, default_tts_voice: null })
+      .subscribe();
+    this.previewErrorKey.set(null);
+  }
+
+  /** Persist the read-aloud voice choice (empty ⇒ clear the override). */
+  setTtsVoice(voice: string): void {
+    this.settingsService.updatePreferences({ default_tts_voice: voice || null }).subscribe();
+    // A fresh selection invalidates any earlier preview error.
+    this.previewErrorKey.set(null);
+  }
+
+  /** In-flight + last-error state for the "preview voice" button. Holds the
+   * i18n key of the failure message (null = no error), so an actionable
+   * provider error (paid-plan / auth / rate-limit) reads specifically instead
+   * of a generic "couldn't preview". */
+  readonly previewingVoice = signal(false);
+  readonly previewErrorKey = signal<string | null>(null);
+  private previewAudio: HTMLAudioElement | null = null;
+
+  /** Map an actionable TTS error code to its message key (shared wording with
+   * the read-aloud box). */
+  private ttsErrorKey(code: string): string {
+    switch (code) {
+      case 'payment_required':
+        return 'chat.tts.err.paymentRequired';
+      case 'auth':
+        return 'chat.tts.err.auth';
+      case 'rate_limit':
+        return 'chat.tts.err.rateLimit';
+      default:
+        return 'settings.voice.previewFailed';
+    }
+  }
+
+  /** Optional custom sample text to audition the voice on (blank ⇒ canned
+   * phrase). Mirrors the server's `_PREVIEW_TEXT_MAX`. */
+  readonly previewTextMax = 500;
+  readonly previewText = signal('');
+  readonly previewCharsLeft = computed(() => this.previewTextMax - this.previewText().length);
+
+  /** Clamp typed/pasted preview text to the cap so the UI can't submit
+   * something the server would 422. */
+  onPreviewTextChange(text: string): void {
+    this.previewText.set(text.slice(0, this.previewTextMax));
+  }
+
+  /**
+   * Synthesize and play a short sample of the currently-selected voice so the
+   * user can hear it before committing. Empty voice ('' = Auto) is resolved
+   * server-side exactly like normal read-aloud.
+   */
+  previewVoice(): void {
+    if (this.previewingVoice()) return;
+    // Stop any clip still playing from a previous press.
+    this.previewAudio?.pause();
+    this.previewAudio = null;
+    this.previewErrorKey.set(null);
+    this.previewingVoice.set(true);
+    this.apiService
+      .previewTTSVoice(this.ttsVoice(), this.i18n.activeLang(), this.previewText())
+      .subscribe((result) => {
+        this.previewingVoice.set(false);
+        if (result === 'unavailable' || result === null) {
+          this.previewErrorKey.set('settings.voice.previewFailed');
+          return;
+        }
+        if ('errorCode' in result) {
+          // e.g. a free-tier ElevenLabs Library voice → "needs a paid plan".
+          this.previewErrorKey.set(this.ttsErrorKey(result.errorCode));
+          return;
+        }
+        const url = URL.createObjectURL(result);
+        const audio = new Audio(url);
+        this.previewAudio = audio;
+        audio.addEventListener('ended', () => URL.revokeObjectURL(url));
+        // The click is a user gesture, so autoplay policy permits play();
+        // guard anyway so a rejection surfaces as the error hint, not a throw.
+        audio.play().catch(() => {
+          this.previewErrorKey.set('settings.voice.previewFailed');
+          URL.revokeObjectURL(url);
+        });
+      });
+  }
 
   // MCP token form state
   readonly newName = signal('');
@@ -1530,16 +2848,6 @@ export class SettingsComponent implements OnInit {
   readonly keyLabel = signal('');
   readonly settingKey = signal(false);
 
-  // LLM endpoint form state
-  readonly newEndpointLabel = signal('');
-  readonly newEndpointBaseUrl = signal('');
-  readonly newEndpointApiKey = signal('');
-  readonly newEndpointAllowInsecure = signal(false);
-  readonly creatingEndpoint = signal(false);
-  readonly endpointFormError = signal<string>('');
-  readonly testingEndpointId = signal<string | null>(null);
-  readonly testResults = signal<Record<string, LlmEndpointTestResult>>({});
-
   // Preferences form state — null = user hasn't overridden, use resolved default
   readonly prefModel = signal<string | null>(null);
   readonly prefAuxModel = signal<string | null>(null);
@@ -1552,13 +2860,21 @@ export class SettingsComponent implements OnInit {
   readonly savingPrefs = signal(false);
   readonly prefsSaved = signal(false);
 
+  // The selected DB experts are independent from the preference fallbacks.
+  readonly expertDefaultTypes = ['worker', 'session'] as const;
+  readonly expertDefaults = signal<ExpertDefaultsResponse | null>(null);
+  readonly experts = signal<Expert[]>([]);
+  readonly defaultExpertBusy = signal<'worker' | 'session' | null>(null);
+
   /** Resolved defaults shortcut for template use. */
   readonly resolved = this.settingsService.resolvedDefaults;
 
   // Persistent Agent form state — null = use resolved default
   readonly paModel = signal<string | null>(null);
   readonly paPermissionMode = signal<string | null>(null);
-  readonly paConfigName = signal('');
+  // Default session workspace tier (null = track the resolved system default,
+  // which is "virtual" — see knowledge-base/knowledge/features/instant_landing_session.md).
+  readonly paWorkspaceBackend = signal<string | null>(null);
   readonly paGreeting = signal('');
   readonly paIdleTimeout = signal<number | null>(null);
   readonly paIdleTimeoutText = computed(() => {
@@ -1579,7 +2895,9 @@ export class SettingsComponent implements OnInit {
   readonly paSaved = signal(false);
 
   // Communication form state
-  readonly commDelivery = signal<'next_strategic_phase' | 'immediate_interrupt' | 'llm_triage'>('next_strategic_phase');
+  readonly commDelivery = signal<'next_strategic_phase' | 'immediate_interrupt' | 'llm_triage'>(
+    'next_strategic_phase',
+  );
   readonly commChannelEmail = signal(true);
   readonly commChannelNtfy = signal(false);
   readonly commChannelSlack = signal(false);
@@ -1592,8 +2910,14 @@ export class SettingsComponent implements OnInit {
   readonly commSaved = signal(false);
 
   // Codex proxy state (admin-only)
-  readonly codexStatus = signal<CodexStatus>({ connected: false, accounts: [], model_count: 0 });
+  readonly codexStatus = signal<CodexStatus>({
+    connected: false,
+    reachable: false,
+    accounts: [],
+    model_count: 0,
+  });
   readonly codexModels = signal<string[]>([]);
+  readonly codexUsage = signal<CodexUsage>({ available: false });
   readonly codexLoading = signal(false);
   readonly codexConnecting = signal(false);
   readonly codexCallbackUrl = signal('');
@@ -1633,7 +2957,6 @@ export class SettingsComponent implements OnInit {
       field,
       env_var: prov.env_var,
       set: prov.set,
-      length: prov.length,
     }));
   });
 
@@ -1652,12 +2975,18 @@ export class SettingsComponent implements OnInit {
         this.prefEmbeddingModel.set(prefs.default_embedding_model ?? null);
         this.prefEmbeddingProvider.set(prefs.embedding_provider ?? null);
 
+        // Seed the read-aloud rewrite draft (prefs only change on load/save, so
+        // this never clobbers a mid-edit draft — same as the sub-objects below).
+        const ra = prefs.read_aloud;
+        this.readAloudReasoning.set((ra?.reasoning_level as ReadAloudReasoningLevel) ?? 'off');
+        this.readAloudPromptDraft.set(ra?.custom_prompt ?? '');
+
         // Sync persistent agent preferences
         const pa = prefs.persistent_agent;
         if (pa) {
           this.paModel.set(pa.model ?? null);
           this.paPermissionMode.set(pa.permission_mode ?? null);
-          this.paConfigName.set(pa.config_name || '');
+          this.paWorkspaceBackend.set(pa.workspace_backend ?? null);
           this.paGreeting.set(pa.greeting || '');
           this.paIdleTimeout.set(pa.idle_timeout_minutes ?? null);
           this.paCommandAllowlist.set((pa.command_allowlist || []).join(', '));
@@ -1689,9 +3018,12 @@ export class SettingsComponent implements OnInit {
     effect(() => {
       const userId = this.userService.currentUserId();
       if (userId) {
-        this.apiService
-            .getProjects(userId)
-            .subscribe((p) => this.projects.set(p));
+        this.apiService.getProjects(userId).subscribe({
+          next: (p) => this.projects.set(p),
+          // Settings has many independent panels; the project-scoped ones
+          // degrade to empty rather than failing the whole page.
+          error: () => this.projects.set([]),
+        });
       }
     });
 
@@ -1707,22 +3039,40 @@ export class SettingsComponent implements OnInit {
         this._adminLoadersFired = true;
         this.loadCodexStatus();
         this.loadCloudSettings();
+        // Seed the Voice Library add-gate switch with its persisted state.
+        this.apiService.getTtsLibrarySetting().subscribe((row) => {
+          this.ttsLibraryFlag.set(row.enabled);
+          this.libraryAddEnabled.set(row.enabled);
+        });
       }
+    });
+
+    // Lazily load ElevenLabs account voices the first time that backend is in
+    // effect — the list is server-fed (names + accent labels + hosted
+    // previews), not a static catalog like Kokoro/OpenAI. Depends only on
+    // ttsBackend(); the one-shot flag keeps it from re-firing.
+    effect(() => {
+      if (this.ttsBackend() !== 'elevenlabs' || this._elevenVoicesLoaded) return;
+      this._elevenVoicesLoaded = true;
+      this.elevenVoicesLoading.set(true);
+      this.apiService.listTtsVoices().subscribe((resp) => {
+        this.elevenVoicesLoading.set(false);
+        this.elevenVoices.set(resp.backend === 'elevenlabs' ? resp.voices : []);
+      });
     });
   }
 
   private _adminLoadersFired = false;
 
   /** Only show active (non-revoked) tokens. */
-  activeTokens = () =>
-    this.tokenService.tokens().filter((t) => !t.revoked_at);
+  activeTokens = () => this.tokenService.tokens().filter((t) => !t.revoked_at);
 
   ngOnInit(): void {
     this.modelService.load();
     this.tokenService.loadTokens();
     this.settingsService.loadApiKeys();
-    this.settingsService.loadLlmEndpoints();
     this.settingsService.loadPreferences();
+    this.loadExpertDefaults();
     // Admin-only loaders (codex status + cloud settings) are triggered
     // by the effect in the constructor — that path waits for currentUser()
     // to populate, which is the only thing that works on a hard F5 reload.
@@ -1757,8 +3107,14 @@ export class SettingsComponent implements OnInit {
     const now = new Date();
     const diffMs = now.getTime() - d.getTime();
     if (diffMs < 60_000) return this.transloco.translate('settings.helpers.timeJustNow');
-    if (diffMs < 3600_000) return this.transloco.translate('settings.helpers.timeMinutesAgo', {n: Math.floor(diffMs / 60_000)});
-    if (diffMs < 86400_000) return this.transloco.translate('settings.helpers.timeHoursAgo', {n: Math.floor(diffMs / 3600_000)});
+    if (diffMs < 3600_000)
+      return this.transloco.translate('settings.helpers.timeMinutesAgo', {
+        n: Math.floor(diffMs / 60_000),
+      });
+    if (diffMs < 86400_000)
+      return this.transloco.translate('settings.helpers.timeHoursAgo', {
+        n: Math.floor(diffMs / 3600_000),
+      });
     return d.toLocaleDateString(this.transloco.getActiveLang(), { month: 'short', day: 'numeric' });
   }
 
@@ -1855,86 +3211,6 @@ export class SettingsComponent implements OnInit {
     this.settingsService.deleteApiKey(provider).subscribe();
   }
 
-  // ── LLM Endpoints ─────────────────────────────────────────────────
-
-  createLlmEndpoint(): void {
-    const label = this.newEndpointLabel().trim();
-    const baseUrl = this.newEndpointBaseUrl().trim();
-    if (!label || !baseUrl) return;
-
-    const httpsLike = /^https?:\/\//i.test(baseUrl);
-    if (!httpsLike) {
-      this.endpointFormError.set(
-        this.transloco.translate('settings.llmEndpoints.errorUrlScheme'),
-      );
-      return;
-    }
-    if (baseUrl.startsWith('http://') && !this.newEndpointAllowInsecure()) {
-      this.endpointFormError.set(
-        this.transloco.translate('settings.llmEndpoints.errorHttpNeedsOptIn'),
-      );
-      return;
-    }
-
-    this.endpointFormError.set('');
-    this.creatingEndpoint.set(true);
-    this.settingsService
-      .createLlmEndpoint({
-        label,
-        base_url: baseUrl,
-        api_key: this.newEndpointApiKey().trim() || null,
-        allow_insecure: this.newEndpointAllowInsecure(),
-      })
-      .subscribe({
-        next: () => {
-          this.newEndpointLabel.set('');
-          this.newEndpointBaseUrl.set('');
-          this.newEndpointApiKey.set('');
-          this.newEndpointAllowInsecure.set(false);
-          this.creatingEndpoint.set(false);
-        },
-        error: (err) => {
-          this.creatingEndpoint.set(false);
-          const detail = err?.error?.detail ?? err?.message ?? 'Failed';
-          this.endpointFormError.set(String(detail));
-        },
-      });
-  }
-
-  deleteLlmEndpoint(endpointId: string): void {
-    const msg = this.transloco.translate('settings.llmEndpoints.confirmDelete');
-    if (!window.confirm(msg)) return;
-    this.settingsService.deleteLlmEndpoint(endpointId).subscribe({
-      next: () => {
-        const next = {...this.testResults()};
-        delete next[endpointId];
-        this.testResults.set(next);
-      },
-    });
-  }
-
-  testLlmEndpoint(endpointId: string): void {
-    this.testingEndpointId.set(endpointId);
-    this.settingsService.testLlmEndpoint(endpointId).subscribe({
-      next: (result) => {
-        this.testResults.set({...this.testResults(), [endpointId]: result});
-        this.testingEndpointId.set(null);
-      },
-      error: (err) => {
-        this.testResults.set({
-          ...this.testResults(),
-          [endpointId]: {
-            ok: false,
-            status: null,
-            error: err?.error?.detail ?? err?.message ?? 'Request failed',
-            probe_url: '',
-          },
-        });
-        this.testingEndpointId.set(null);
-      },
-    });
-  }
-
   // ── Preferences ───────────────────────────────────────────────────
 
   savePreferences(): void {
@@ -1967,6 +3243,77 @@ export class SettingsComponent implements OnInit {
 
   // ── Persistent Agent Settings ──────────────────────────────────
 
+  private loadExpertDefaults(): void {
+    this.apiService.getExperts().subscribe((experts) => this.experts.set(experts));
+    this.apiService.getExpertDefaults().subscribe((defaults) => {
+      this.expertDefaults.set(defaults);
+      this.defaultExpertBusy.set(null);
+    });
+  }
+
+  ownedExperts(type: 'worker' | 'session'): Expert[] {
+    const userId = this.userService.currentUserId();
+    return this.experts().filter(
+      (expert) =>
+        expert.expert_type === type &&
+        expert.storage_kind === 'db' &&
+        !!userId &&
+        expert.owner_id === userId,
+    );
+  }
+
+  defaultExpertHint(type: 'worker' | 'session'): string {
+    const slot = this.expertDefaults()?.defaults[type];
+    if (!slot?.effective) return '';
+    return this.transloco.translate('settings.expertDefaults.effective', {
+      name: slot.effective.display_name,
+      source: this.transloco.translate(`settings.expertDefaults.source.${slot.source}`),
+    });
+  }
+
+  setDefaultExpert(type: 'worker' | 'session', expertId: string): void {
+    if (this.defaultExpertBusy()) return;
+    this.defaultExpertBusy.set(type);
+    const request = expertId
+      ? this.apiService.setPersonalExpertDefault(type, expertId)
+      : this.apiService.clearPersonalExpertDefault(type);
+    request.subscribe({
+      next: () => this.loadExpertDefaults(),
+      error: () => this.defaultExpertBusy.set(null),
+    });
+  }
+
+  customizeDefaultExpert(type: 'worker' | 'session'): void {
+    if (this.defaultExpertBusy()) return;
+    const slot = this.expertDefaults()?.defaults[type];
+    if (slot?.personal?.id) {
+      this.router.navigate(['/experts', slot.personal.id, 'edit']);
+      return;
+    }
+    const sourceId = slot?.effective?.id;
+    this.defaultExpertBusy.set(type);
+    this.apiService.forkPersonalExpertDefault(type, sourceId).subscribe({
+      next: (result) => {
+        const id = result.default?.id;
+        this.loadExpertDefaults();
+        // Carry `dropped` through the navigation (router state) rather than
+        // a toast here: this page unmounts immediately on success, so a
+        // banner on IT would flash and be gone before anyone could read it.
+        // The editor the user lands on surfaces it once instead — see
+        // `forkNoticeTranslationArgs` there.
+        if (id) {
+          const state: ExpertEditorNavigationState = { dropped: result.dropped };
+          this.router.navigate(['/experts', id, 'edit'], { state });
+        }
+      },
+      error: () => this.defaultExpertBusy.set(null),
+    });
+  }
+
+  openExperts(): void {
+    this.router.navigate(['/experts']);
+  }
+
   onPaModelChange(text: string): void {
     this.paModel.set(text.trim() || null);
   }
@@ -1995,8 +3342,11 @@ export class SettingsComponent implements OnInit {
 
     const allowlistText = this.paCommandAllowlist().trim();
     const allowlist = allowlistText
-        ? allowlistText.split(',').map(s => s.trim()).filter(Boolean)
-        : null;
+      ? allowlistText
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : null;
 
     // notification_channels: v1 only ships email. We always send an explicit
     // list (never null) so the user's choice round-trips cleanly even when
@@ -2007,7 +3357,7 @@ export class SettingsComponent implements OnInit {
       persistent_agent: {
         model: this.paModel()?.trim() || null,
         permission_mode: this.paPermissionMode() || null,
-        config_name: this.paConfigName() || null,
+        workspace_backend: this.paWorkspaceBackend() || null,
         greeting: this.paGreeting().trim() || null,
         idle_timeout_minutes: this.paIdleTimeout() || null,
         command_allowlist: allowlist,
@@ -2096,8 +3446,7 @@ export class SettingsComponent implements OnInit {
         },
         error: (err) => {
           this.creating.set(false);
-          const detail =
-            (err?.error?.detail as string | undefined) ?? 'Create failed';
+          const detail = (err?.error?.detail as string | undefined) ?? 'Create failed';
           this.createError.set(detail);
         },
       });
@@ -2125,6 +3474,32 @@ export class SettingsComponent implements OnInit {
     this.settingsService.getCodexModels().subscribe((res) => {
       this.codexModels.set(res.models);
     });
+    this.settingsService.getCodexUsage().subscribe((usage) => {
+      this.codexUsage.set(usage);
+    });
+  }
+
+  /** Clamp a used-percent to [0, 100] for the bar width (null → 0). */
+  clampPct(p: number | null | undefined): number {
+    return Math.max(0, Math.min(100, typeof p === 'number' ? p : 0));
+  }
+
+  /** Bar colour band by fill: ok (blue) < 70 ≤ warn (amber) < 90 ≤ crit (red). */
+  usageLevel(p: number | null | undefined): 'ok' | 'warn' | 'crit' {
+    const n = typeof p === 'number' ? p : 0;
+    if (n >= 90) return 'crit';
+    if (n >= 70) return 'warn';
+    return 'ok';
+  }
+
+  /** Human "2h 32m" / "3d 4h" / "12m" for a reset countdown (seconds). */
+  formatReset(seconds: number | null | undefined): string {
+    if (!seconds || seconds <= 0) return '';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
+    if (h >= 1) return `${h}h ${m}m`;
+    return `${m}m`;
   }
 
   connectCodexAccount(): void {
@@ -2153,7 +3528,9 @@ export class SettingsComponent implements OnInit {
     try {
       const parsed = new URL(url);
       if (!parsed.searchParams.get('code') || !parsed.searchParams.get('state')) {
-        this.codexCallbackError.set(this.transloco.translate('settings.codex.errors.urlMissingParams'));
+        this.codexCallbackError.set(
+          this.transloco.translate('settings.codex.errors.urlMissingParams'),
+        );
         return;
       }
     } catch {
@@ -2174,7 +3551,8 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.codexCallbackSubmitting.set(false);
-        const detail = err?.error?.detail || this.transloco.translate('settings.codex.errors.completeFailed');
+        const detail =
+          err?.error?.detail || this.transloco.translate('settings.codex.errors.completeFailed');
         this.codexCallbackError.set(detail);
       },
     });
@@ -2234,16 +3612,15 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.cloudLoading.set(false);
-        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.loadFailed'));
+        this.cloudMessage.set(
+          err?.error?.detail || this.transloco.translate('settings.cloud.messages.loadFailed'),
+        );
         this.cloudMessageIsError.set(true);
       },
     });
   }
 
-  updateCloudForm<K extends keyof MainCloudFormState>(
-    key: K,
-    value: MainCloudFormState[K],
-  ): void {
+  updateCloudForm<K extends keyof MainCloudFormState>(key: K, value: MainCloudFormState[K]): void {
     this.cloudForm.update((form) => ({ ...form, [key]: value }));
   }
 
@@ -2262,6 +3639,7 @@ export class SettingsComponent implements OnInit {
     return {
       value: { ...form },
       credentials_ref: credRef,
+      expected_activation_revision: this.cloudSettings()?.activation_revision ?? 0,
     };
   }
 
@@ -2274,14 +3652,19 @@ export class SettingsComponent implements OnInit {
         this.cloudTesting.set(false);
         this.cloudMessage.set(
           res.ok
-            ? this.transloco.translate('settings.cloud.messages.testOk', {ms: res.latency_ms?.toFixed(0) ?? '?'})
-            : this.transloco.translate('settings.cloud.messages.testFailed', {error: res.detail}),
+            ? this.transloco.translate('settings.cloud.messages.testOk', {
+                ms: res.latency_ms?.toFixed(0) ?? '?',
+              })
+            : this.transloco.translate('settings.cloud.messages.testFailed', { error: res.detail }),
         );
         this.cloudMessageIsError.set(!res.ok);
       },
       error: (err) => {
         this.cloudTesting.set(false);
-        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.testRequestFailed'));
+        this.cloudMessage.set(
+          err?.error?.detail ||
+            this.transloco.translate('settings.cloud.messages.testRequestFailed'),
+        );
         this.cloudMessageIsError.set(true);
       },
     });
@@ -2296,8 +3679,10 @@ export class SettingsComponent implements OnInit {
         this.cloudSaving.set(false);
         this.cloudMessage.set(
           this.transloco.translate(
-            res.reloaded ? 'settings.cloud.messages.savedReloaded' : 'settings.cloud.messages.saved',
-            {backend: res.backend_id},
+            res.reloaded
+              ? 'settings.cloud.messages.savedReloaded'
+              : 'settings.cloud.messages.saved',
+            { backend: res.backend_id },
           ),
         );
         this.cloudMessageIsError.set(false);
@@ -2305,7 +3690,9 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.cloudSaving.set(false);
-        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.saveFailed'));
+        this.cloudMessage.set(
+          err?.error?.detail || this.transloco.translate('settings.cloud.messages.saveFailed'),
+        );
         this.cloudMessageIsError.set(true);
       },
     });
@@ -2324,7 +3711,9 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.cloudSaving.set(false);
-        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.resetFailed'));
+        this.cloudMessage.set(
+          err?.error?.detail || this.transloco.translate('settings.cloud.messages.resetFailed'),
+        );
         this.cloudMessageIsError.set(true);
       },
     });

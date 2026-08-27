@@ -6,9 +6,9 @@ request validation and response serialization.
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 
 class JobStatus(str, Enum):
@@ -160,6 +160,15 @@ class ReadyResponse(BaseModel):
     connections: Dict[str, bool] = Field(
         ..., description="Connection status for dependencies"
     )
+    capabilities: Dict[str, StrictBool | StrictInt] = Field(
+        default_factory=dict,
+        description="Server-owned runtime protocol capabilities",
+    )
+    session_identity_fingerprint: Optional[str] = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        description="Non-secret fingerprint of the exact pinned runtime binding",
+    )
 
 
 class AgentStatusResponse(BaseModel):
@@ -173,6 +182,10 @@ class AgentStatusResponse(BaseModel):
     uptime_seconds: float = Field(..., description="Uptime in seconds")
     connections: Dict[str, bool] = Field(..., description="Connection status")
     config: Dict[str, Any] = Field(..., description="Configuration summary")
+    research_providers: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Secret-free cached health for optional research providers",
+    )
 
 
 class ErrorResponse(BaseModel):
@@ -267,13 +280,26 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Directory containing documents",
     )
+    expert_id: Optional[str] = Field(
+        default=None,
+        description="DB-backed expert UUID for this job",
+    )
     config_name: str = Field(
-        default="default",
+        default="worker_base",
         description="Agent configuration name",
     )
     config_override: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Per-job configuration overrides",
+    )
+    resolved_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Orchestrator-resolved config blob (serialize_resolved_config shape). "
+            "When present the agent hydrates it directly instead of resolving "
+            "config_name + config_override locally — the orchestrator owns "
+            "resolution and the freeze. Absent → today's path (fallback)."
+        ),
     )
     context: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -289,11 +315,16 @@ class JobStartRequest(BaseModel):
     )
     datasources: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        description="Resolved datasource connection details (set by orchestrator)",
+        description="Resolved connector details (set by orchestrator)",
     )
     repositories: Optional[List[Dict[str, Any]]] = Field(
         default=None,
         description="Project repositories (jobs, source, reference)",
+    )
+    managed_repository_credentials: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        repr=False,
+        description="Hidden server-owned repository authority transport",
     )
     branch_name: Optional[str] = Field(
         default=None,
@@ -301,7 +332,35 @@ class JobStartRequest(BaseModel):
     )
     project_id: Optional[str] = Field(
         default=None,
-        description="Project ID for datasource scoping",
+        description="Project ID for connector scoping",
+    )
+    runtime_actor: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Hidden server-derived runtime actor context",
+    )
+    workspace_runtime: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=("Safe server-owned requested/assigned/effective tier observation"),
+    )
+    workspace_generation: Optional[str] = Field(
+        default=None,
+        description="Control-plane-attested Kubernetes backing UID",
+    )
+    workspace_runtime_incarnation: Optional[str] = Field(
+        default=None,
+        description="Control-plane-attested current workspace Pod UID",
+    )
+    workspace_ssh_host_key_fingerprint: Optional[str] = Field(
+        default=None,
+        description="Control-plane-attested SSH host-key fingerprint",
+    )
+    workspace_owner_kind: Optional[Literal["job", "session"]] = Field(
+        default=None,
+        description="Kind used by the workspace entrypoint process tag",
+    )
+    workspace_owner_id: Optional[str] = Field(
+        default=None,
+        description="Owner UUID used by the workspace entrypoint process tag",
     )
 
     model_config = ConfigDict(
@@ -351,22 +410,64 @@ class JobResumeRequest(BaseModel):
         default=None,
         description="Inline config overrides from the original job",
     )
+    resolved_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Orchestrator-resolved config blob for the resumed job. When "
+            "present the agent hydrates this complete, credential-injected "
+            "snapshot instead of retaining its generic boot config. Absent "
+            "keeps the legacy resume fallback."
+        ),
+    )
     feedback: Optional[str] = Field(
         default=None,
         description="Optional feedback to inject before resuming",
     )
+    feedback_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "Why the job was resumed with feedback (e.g. critic return, "
+            "supervisor escalation, reviewer feedback). Rendered verbatim in "
+            "the [FEEDBACK_RESUME] banner; omitted -> honest generic fallback."
+        ),
+    )
     datasources: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        description="Resolved datasource connection details (set by orchestrator)",
+        description="Resolved connector details (set by orchestrator)",
+    )
+    repositories: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Project repositories re-authorized by the orchestrator",
+    )
+    managed_repository_credentials: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        repr=False,
+        description="Hidden server-owned repository authority transport",
     )
     project_id: Optional[str] = Field(
         default=None,
         description="Project ID for knowledge base and memory scoping (set by orchestrator)",
     )
+    runtime_actor: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Hidden server-derived runtime actor context",
+    )
+    workspace_runtime: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=("Safe server-owned requested/assigned/effective tier observation"),
+    )
     previous_status: Optional[str] = Field(
         default=None,
         description="Job status before resume. Graceful stops (cancelled, paused, pending_review, waiting) "
         "skip snapshot recovery; crashes (processing, failed) use snapshot recovery.",
+    )
+    git_remote_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "Job repo remote for the pod-handoff clone fallback: a resume "
+            "onto a fresh workspace with no snapshot clones the job's own "
+            "Gitea repo instead of starting blank (set by orchestrator)."
+        ),
     )
     delegation_results: Optional[Dict[str, Any]] = Field(
         default=None,

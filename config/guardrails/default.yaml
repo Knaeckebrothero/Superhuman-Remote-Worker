@@ -42,6 +42,7 @@ tool_examples:
         git_log()                  # last 10 commits, compact one-line format
         git_log(max_count=5)       # last 5 commits
         git_log(oneline=False)     # full commit details
+        git_log(repo="KurortEngine")  # history of an ATTACHED repository (repos/KurortEngine/)
 
   git_show: |-
     Examples:
@@ -49,6 +50,7 @@ tool_examples:
         git_show(stat_only=True)                                # latest commit, file list only
         git_show(commit_ref="HEAD~3")                           # commit from 3 commits ago
         git_show(commit_ref="phase-1-tactical-complete")        # tagged commit
+        git_show(commit_ref="5e08d4fa", repo="KurortEngine")    # a commit in an ATTACHED repository
 
   git_diff: |-
     Examples:
@@ -56,8 +58,13 @@ tool_examples:
         git_diff(ref1="HEAD~5")                                             # last 5 commits vs working dir
         git_diff(ref1="phase-1-tactical-complete", ref2="HEAD")             # between tag and HEAD
         git_diff(file_path="plan.md")                                  # uncommitted changes in one file
+        git_diff(ref1="main", ref2="HEAD", repo="KurortEngine")        # inside an ATTACHED repository
 
   git_status: |-
+    Examples:
+        git_status()                        # this job's own workspace repo
+        git_status(repo="KurortEngine")     # an ATTACHED repository (repos/KurortEngine/)
+
     Example output (clean):
         Branch: master
         Status: clean (no uncommitted changes)
@@ -79,6 +86,7 @@ tool_examples:
         git_tags(pattern="phase-1-*")       # only phase 1 tags for this job
         git_tags(pattern="*")               # all tags for this job
         git_tags(all_jobs=True)             # phase tags from every job in the repo
+        git_tags(pattern="v*", repo="KurortEngine")   # tags in an ATTACHED repository (never job-scoped)
 
   git_merge_squash: |-
     Examples:
@@ -93,16 +101,16 @@ tool_examples:
   # ----- src/tools/shell/shell_tools.py -----
   run_command: |-
     Examples:
-        run_command(command="pytest tests/ -x")
-        run_command(command="git diff HEAD~1", tail=100)
-        run_command(command="npm run build", timeout=300)
-        run_command(command="sshpass -p 'pass' ssh user@host 'systemctl status nginx'")
+        run_command(command="pytest tests/ -x", working_dir=".")
+        run_command(command="git diff HEAD~1", working_dir=".", tail=100)
+        run_command(command="npm run build", working_dir=".", timeout=300)
+        run_command(command="sshpass -p 'pass' ssh user@host 'systemctl status nginx'", working_dir=".")
 
   shell_execute: |-
     Examples:
-        shell_execute(command="pytest tests/ -x")
-        shell_execute(command="npm run dev", name="dev", is_async=True)
-        shell_execute(command="C-c", name="dev", keys=True)
+        shell_execute(command="pytest tests/ -x", working_dir=".")
+        shell_execute(command="npm run dev", working_dir=".", name="dev", is_async=True)
+        shell_execute(command="C-c", working_dir=".", name="dev", keys=True)
 
   shell_read: |-
     Examples:
@@ -237,16 +245,6 @@ nudges:
     Action required: complete the current todo `{todo_id}` now by invoking the `todo_complete` tool.
     Use the tool-call format defined in your system prompt — do not type the call as plain text.
 
-  # Sites: src/graph.py:2939-2951 (phase-budget hard cap rewind)
-  # Placeholders: {used}, {cap}
-  budget_rewind: |-
-    PHASE BUDGET REACHED: {used}/{cap} tool calls consumed.
-    Before staging new todos with the `next_phase_todos` tool:
-      1. Review what worked and what didn't
-      2. Identify root causes for the failures
-      3. Stage smaller, more focused todos
-    Do not repeat the same sequence of calls.
-
   # Sites: src/graph.py:1193-1208 (degenerate-response recovery)
   degenerate_recovery_assistant: |-
     My previous response was degenerate — it contained repetitive or malformed output. I need to retry with a shorter, well-formed response.
@@ -254,6 +252,11 @@ nudges:
   degenerate_recovery_user: |-
     Your last response was detected as degenerate and has been discarded. Issues found: {pattern_detail}.
     If you were trying to call a tool, retry with smaller arguments or a different approach.
+
+  # Sites: src/graph.py audited_tools (act-ratio tripwire)
+  # Placeholders: {count}
+  act_ratio_nudge: |-
+    You've spent {count} steps on planning artifacts. Stop planning; take the next concrete action toward the current todo.
 
   # Sites: src/graph.py:3020-3023 (loop-warning suffix appended to ToolMessage)
   loop_warning_suffix: |-
@@ -276,10 +279,15 @@ nudges:
 
   # ----- src/managers/todo.py -----
 
-  # Sites: src/managers/todo.py:409 (todo-list footer)
+  # Sites: src/managers/todo.py:416 (todo-list footer)
+  # NEVER enumerate the tool surface here ("Tools available: ..."). Models read
+  # such lists as exhaustive and conclude their other bound tools are gone —
+  # proven rewind-loop root cause (job 1cab4b88, 9 tactical phases burned;
+  # knowledge-base/knowledge/issues/agent_phase_guardrails_burn_legitimate_work.md). Describe how
+  # to advance the task list; the bound tool schema defines what exists.
   todo_list_footer: |-
-    Tools available: `todo_complete` (mark a task finished — pass the todo id), `todo_rewind` (revisit a completed task — pass the todo id), `mark_complete` (signal the current phase is done).
-    Invoke them via the tool-call format defined in your system prompt.
+    Mark each finished task by invoking the `todo_complete` tool with its todo id. This task list is a status reminder, not a tool list — it does not limit which tools you can call; every tool bound in this request stays available.
+    Invoke tools via the tool-call format defined in your system prompt.
 
   # ----- src/services/recall_store.py -----
 

@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Scholar - Continuous R&D exploration and idea generation
-$extends: defaults
+$extends: worker_base
 
 agent_id: scholar
 display_name: Scholar
@@ -20,6 +20,14 @@ llm: {}
 scholar:
   enabled: false
 
+# Light subagent delegation: throwaway in-process readers via spawn_subagent.
+# Research fan-out is the driving use case — the parent delegates the reading
+# and authors the synthesis. The reader MODEL comes from the llm.subagent tier
+# (falls back to llm.tactical; override per job via config_override.llm.subagent).
+delegation:
+  enabled: true
+  mode: light
+
 workspace:
   structure:
     - archive/
@@ -31,14 +39,33 @@ workspace:
     - repo/
   git_versioning: true
 
-# Scholar-specific instruction files (extends defaults' todo_guide.md)
+# Scholar-specific instruction files (the conservative base does not add these)
 instruction_files:
-  - file: todo_guide.md
+  - skill: todo-guide
     trigger: before_tool:next_phase_todos
     enforce: true
-  - file: research_guide.md
-    trigger: phase:tactical
-    enforce: false  # Active: injected automatically at tactical phase start
+  - skill: research-guide
+    trigger: phase_start:tactical
+    enforce: false  # Injected once per concrete tactical phase
+  - skill: verify-before-done
+    trigger: before_tool:todo_complete
+    enforce: true
+    phases: [tactical]
+    read_scope: phase
+    max_read_age_turns: 20
+  - skill: verify-before-done
+    trigger: before_tool:job_complete
+    enforce: true
+    phases: [strategic]
+    read_scope: phase
+    max_read_age_turns: 20
+  # Reference every claim inline as [N] (cite-and-place, not cite-and-forget).
+  - skill: cite-as-you-write
+    trigger: before_tool:cite_web
+    enforce: true
+  - skill: cite-as-you-write
+    trigger: before_tool:cite_document
+    enforce: true
 
 tools:
   workspace:
@@ -57,7 +84,7 @@ tools:
     - next_phase_todos
     - todo_complete
     - todo_list
-    - todo_rewind
+    - request_replan
     - mark_complete
     - job_complete
   research:
@@ -68,24 +95,22 @@ tools:
     - search_papers
     - download_paper
     - get_paper_info
-    - browse_website
     - research_topic
   shell:
     - run_command
-  git:
-    - git_log
-    - git_show
-    - git_diff
-    - git_status
-    - git_tags
+    - cancel_command
+  # git: intentionally absent. This agent has shell tools, and
+  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # whenever shell is present — a shell can run git against ANY repository in
+  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+  # here would advertise tools the pod never binds.
   delegation:
-    - delegate_work
-    - resume_delegation_child
+    - spawn_subagent
   # SQL injected when system datasource attached (for reading job data, test results)
   sql: []
   # Citations: a research agent must back every factual claim with a source.
-  # research_guide.md (tactical phase) instructs cite_web / cite_document, so the
-  # tools must exist. Mirrors defaults.yaml's citation suite.
+  # the research-guide skill (tactical phase) instructs cite_web / cite_document,
+  # so the tools must exist. Mirrors worker_base.yaml's citation suite.
   citation:
     - cite_document
     - cite_web

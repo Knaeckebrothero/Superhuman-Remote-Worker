@@ -9,12 +9,16 @@ data:
     (function(window) {
       window['env'] = window['env'] || {};
       window['env']['apiUrl'] = '{{ ternary (include "srw.cockpitUrl" .) (include "srw.apiUrl" .) .Values.auth.bff.sameOriginApi }}/api';
+      // Null keeps the live-app renderer dark. The suffix is exposed only
+      // after the separate viewer gate is explicitly configured.
+      window['env']['canvasViewerHostSuffix'] = {{ if and .Values.canvas.livePreview.enabled .Values.canvas.livePreview.viewer.enabled .Values.canvas.livePreview.viewer.hostSuffix }}{{ .Values.canvas.livePreview.viewer.hostSuffix | quote }}{{ else }}null{{ end }};
+      // Exact foreign iframe origin; null keeps Office Canvas dark-shipped.
+      window['env']['canvasOfficeOrigin'] = {{ if and .Values.collabora.enabled .Values.collabora.publicUrl }}{{ .Values.collabora.publicUrl | quote }}{{ else }}null{{ end }};
       window['env']['giteaUrl'] = '{{ include "srw.gitUrl" . }}/srw';
       window['env']['dozzleUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.dozzleHost" . }}';
       window['env']['minioConsoleUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.minioHost" . }}';
       window['env']['neo4jUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.neo4jBrowserHost" . }}';
       window['env']['pgadminUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.pgadminHost" . }}';
-      window['env']['mongoExpressUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.mongoHost" . }}';
       window['env']['mcpUrl'] = '{{ include "srw.mcpUrl" . }}/mcp';
       window['env']['cloudUrl'] = '{{ include "srw.cloudUrl" . }}';
 
@@ -55,10 +59,10 @@ spec:
       initContainers:
         - name: wait-for-orchestrator
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-orchestrator 8085; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-orchestrator 8085; do sleep 2; done"]
       containers:
         - name: cockpit
-          image: "{{ .Values.image.cockpit.repository }}:{{ .Values.image.cockpit.tag }}"
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.cockpit) | quote }}
           imagePullPolicy: {{ .Values.image.cockpit.pullPolicy }}
           ports:
             - containerPort: 4000

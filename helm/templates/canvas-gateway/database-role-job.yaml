@@ -1,0 +1,130 @@
+{{- if and .Values.canvas.livePreview.viewer.enabled .Values.canvas.livePreview.viewer.database.provisionRole }}
+{{- $database := .Values.canvas.livePreview.viewer.database -}}
+{{- $credentials := $database.credentials -}}
+{{- $databaseSecretName := include "srw.canvasGatewayDatabaseSecretName" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-canvas-gateway-role
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 4 }}
+data:
+  provision.sql: |
+{{ .Files.Get "files/canvas-viewer-role.sql" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "srw.fullname" . }}-canvas-gateway-role-{{ .Release.Revision }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 4 }}
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: provision-role
+          image: {{ .Values.databases.postgres.image }}
+          command:
+            - sh
+            - -ec
+            - |
+              set +x
+              if [ "${#CANVAS_VIEWER_POSTGRES_PASSWORD}" -lt 16 ]; then
+                echo "Canvas gateway database password must contain at least 16 characters" >&2
+                exit 1
+              fi
+              ready=false
+              for attempt in $(seq 1 120); do
+                if psql --no-psqlrc --quiet --tuples-only --no-align \
+                    --command "SELECT to_regclass('public.canvas_origin_sessions') IS NOT NULL AND COUNT(*) = 5 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'canvas_view_bootstraps' AND column_name IN ('authorized_at', 'browser_binding_hash', 'challenge_hash', 'exchange_token_hash', 'ready_receipt_hash')" \
+                    2>/dev/null | grep -qx t; then
+                  ready=true
+                  break
+                fi
+                sleep 2
+              done
+              if [ "$ready" != true ]; then
+                echo "Canvas viewer schema was not ready before the role-provisioning deadline" >&2
+                exit 1
+              fi
+              exec psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
+                --file /etc/srw-canvas-db/provision.sql
+          env:
+            - name: PGHOST
+              value: {{ include "srw.postgresHost" . | quote }}
+            - name: PGPORT
+              value: {{ include "srw.postgresPort" . | quote }}
+            - name: PGDATABASE
+              value: {{ include "srw.postgresDb" . | quote }}
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            # Role name is chart configuration, not secret material.
+            - name: CANVAS_VIEWER_POSTGRES_USER
+              value: {{ $database.username | quote }}
+            - name: CANVAS_VIEWER_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $databaseSecretName }}
+                  key: {{ $credentials.passwordKey }}
+          volumeMounts:
+            - name: role-sql
+              mountPath: /etc/srw-canvas-db
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: role-sql
+          configMap:
+            name: {{ include "srw.fullname" . }}-canvas-gateway-role
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-canvas-gateway-role
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway-role") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}

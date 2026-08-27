@@ -1,0 +1,178 @@
+"""Unit tests for DB-backed expert write-CRUD (restored Slice-1 surface).
+
+These guard the request models + the save-time hard-deny gate + the bundle
+mapping. Full endpoint integration is verified live on k3d (see the plan's
+Task 10) because the auth dependency + asyncpg store are not hermetically
+mockable here. Local env may be noisy (Py3.14, missing optional deps); CI
+(Py3.12) is the authoritative gate.
+"""
+
+import pytest
+from fastapi import HTTPException
+
+from orchestrator.main import (
+    ExpertCreate,
+    ExpertUpdate,
+    _bundled_expert_bundle,
+    _db_expert_to_bundle_src,
+    _validate_expert_fragment,
+)
+
+# --- T1: request models + save-time hard-deny gate ---
+
+
+def test_expert_create_rejects_bad_slug():
+    with pytest.raises(Exception):
+        ExpertCreate(name="Bad Name", display_name="X", expert_type="worker")
+
+
+def test_expert_create_rejects_bad_type():
+    with pytest.raises(Exception):
+        ExpertCreate(name="ok", display_name="X", expert_type="orchestrator")
+
+
+def test_expert_create_rejects_bad_color():
+    with pytest.raises(Exception):
+        ExpertCreate(name="ok", display_name="X", expert_type="worker", color="red")
+
+
+def test_expert_create_minimal_ok():
+    e = ExpertCreate(name="my-helper", display_name="My Helper", expert_type="session")
+    assert e.config == {} and e.prompts == {} and e.color == "#6B7280"
+    assert e.icon == "smart_toy"
+
+
+def test_validate_fragment_blocks_credentials():
+    with pytest.raises(HTTPException) as ei:
+        _validate_expert_fragment({"llm": {"api_key": "secret"}})
+    assert ei.value.status_code == 422
+
+
+def test_validate_fragment_blocks_connections():
+    with pytest.raises(HTTPException) as ei:
+        _validate_expert_fragment({"connections": {"db": "x"}})
+    assert ei.value.status_code == 422
+
+
+def test_validate_fragment_allows_clean_config_and_canonicalises_tools():
+    """Should not raise, and returns the fragment with `tools` normalised — the
+    caller persists what comes back, so a row never holds a policy value the
+    save-time PDP would read backwards."""
+    assert _validate_expert_fragment(
+        {
+            "llm": {"model": "gemma-4-moe"},
+            "tools": {"shell": ["run_command"], "git": []},
+        }
+    ) == {
+        "llm": {"model": "gemma-4-moe"},
+        "tools": {"shell": ["run_command"], "git": []},
+    }
+
+
+def test_validate_fragment_runs_the_shared_tool_gate():
+    """The fragment gate is now the same one every other write boundary runs
+    (400, not 422): `shell` must enumerate, and a cross-category smuggle is
+    refused. See tests/test_tool_override_boundary.py::TestExpertWriteBoundary."""
+    with pytest.raises(HTTPException) as ei:
+        _validate_expert_fragment({"tools": {"shell": True}})
+    assert ei.value.status_code == 400
+
+    with pytest.raises(HTTPException) as ei:
+        _validate_expert_fragment({"tools": {"canvas": ["run_command"]}})
+    assert ei.value.status_code == 400
+
+
+# --- T2: update contract (immutable name/type; unset fields dropped) ---
+
+
+def test_update_excludes_immutable_fields():
+    assert "name" not in ExpertUpdate.model_fields
+    assert "expert_type" not in ExpertUpdate.model_fields
+
+
+# --- Part 2: prompt-key allow-list + fork fidelity ---
+
+
+def test_expert_create_accepts_known_prompt_keys():
+    e = ExpertCreate(
+        name="coder",
+        display_name="Coder",
+        expert_type="worker",
+        prompts={
+            "persona": "p",
+            "strategic": "s",
+            "tactical": "t",
+            "summarization": "z",
+        },
+    )
+    assert e.prompts["strategic"] == "s"
+
+
+def test_expert_create_rejects_unknown_prompt_key():
+    with pytest.raises(Exception):
+        ExpertCreate(
+            name="coder",
+            display_name="Coder",
+            expert_type="worker",
+            prompts={"bogus": "x"},
+        )
+
+
+def test_expert_update_rejects_unknown_prompt_key():
+    with pytest.raises(Exception):
+        ExpertUpdate(prompts={"systemprompt": "x"})
+
+
+def test_bundled_expert_bundle_captures_all_prompt_segments():
+    """Fork fidelity: bundling a worker captures strategic/tactical/summarization,
+    not just persona+instructions (critic ships all five)."""
+    bundle = _bundled_expert_bundle("critic")
+    if bundle is None:
+        pytest.skip("critic bundled expert not found in this env")
+    prompts = bundle["prompts"]
+    assert prompts.get("strategic", "").strip()
+    assert prompts.get("tactical", "").strip()
+    assert prompts.get("summarization", "").strip()
+    assert "persona" in prompts  # still captured
+
+
+def test_update_payload_drops_unset_fields():
+    body = ExpertUpdate(display_name="New Name")
+    assert body.model_dump(exclude_unset=True) == {"display_name": "New Name"}
+
+
+# --- T3: bundle-source mapping (JSONB str-tolerant) ---
+
+
+def test_db_row_to_bundle_src_shape():
+    row = {
+        "name": "scholar",
+        "display_name": "Scholar",
+        "expert_type": "worker",
+        "description": None,
+        "icon": "school",
+        "color": "#111111",
+        "tags": ["research"],
+        "config": {"llm": {"model": "x"}},
+        "prompts": {"persona": "p"},
+    }
+    src = _db_expert_to_bundle_src(row)
+    assert src["name"] == "scholar"
+    assert src["expert_type"] == "worker"
+    assert src["config"] == {"llm": {"model": "x"}}
+    assert src["prompts"] == {"persona": "p"}
+
+
+def test_db_row_to_bundle_src_parses_json_strings():
+    row = {
+        "name": "x",
+        "display_name": "X",
+        "expert_type": "session",
+        "icon": "smart_toy",
+        "color": "#6B7280",
+        "config": '{"tools": {"shell": false}}',
+        "prompts": '{"persona": "hi"}',
+    }
+    src = _db_expert_to_bundle_src(row)
+    assert src["config"] == {"tools": {"shell": False}}
+    assert src["prompts"] == {"persona": "hi"}

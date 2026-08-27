@@ -1,5 +1,6 @@
 import {
   AfterViewInit,
+  CUSTOM_ELEMENTS_SCHEMA,
   ChangeDetectionStrategy,
   Component,
   ElementRef,
@@ -32,6 +33,11 @@ export type SelectSize = 'sm' | 'md' | 'lg';
       (blur)="blurred.emit($event)"
       (focus)="focused.emit($event)"
     >
+      <!-- Trigger for the customizable <select> (appearance: base-select, Chromium 135+).
+           Ignored by browsers that don't support it, which fall back to the native popup. -->
+      <button type="button" class="app-select__trigger" tabindex="-1">
+        <selectedcontent></selectedcontent>
+      </button>
       <ng-content></ng-content>
     </select>
     <span class="app-select__chevron" aria-hidden="true">▾</span>
@@ -40,6 +46,8 @@ export type SelectSize = 'sm' | 'md' | 'lg';
   host: {
     '[attr.data-full-width]': 'fullWidth() || null',
   },
+  // <selectedcontent> is a native customizable-<select> element, unknown to Angular.
+  schemas: [CUSTOM_ELEMENTS_SCHEMA],
 })
 export class AppSelectComponent<T = string> implements AfterViewInit {
   value = model<T | null>(null);

@@ -1,0 +1,96 @@
+# yaml-language-server: $schema=../../schema.json
+# Product QA Tester - product-level usability, integration, and stability audit
+$extends: worker_base
+
+agent_id: product-qa
+display_name: Product QA Tester
+description: |
+  Product-level QA auditor. Audits an application as a usable product, not just
+  as code. Finds bugs, broken setup, missing glue, absent UI/API/CLI surfaces,
+  integration gaps, demo blockers, documentation gaps, workflow holes, and
+  regression risks. Produces evidence-backed issue candidates with reproductions
+  and acceptance criteria for whoever triages and fixes them. Does not fix.
+icon: fact_check
+color: "#a6e3a1"
+tags:
+  - qa
+  - product
+  - usability
+  - integration
+  - testing
+
+llm:
+  reasoning_level: high
+
+workspace:
+  structure:
+    - archive/
+    - documents/
+    - output/findings/
+    - output/repros/
+    - output/audits/
+    - notes/
+    - repo/
+  git_versioning: true
+
+instruction_files:
+  - skill: todo-guide
+    trigger: before_tool:next_phase_todos
+    enforce: true
+  - skill: verify-before-done
+    trigger: before_tool:todo_complete
+    enforce: true
+    phases: [tactical]
+    read_scope: phase
+    max_read_age_turns: 20
+  - skill: verify-before-done
+    trigger: before_tool:job_complete
+    enforce: true
+    phases: [strategic]
+    read_scope: phase
+    max_read_age_turns: 20
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - edit_file
+    - list_files
+    - search_files
+    - file_exists
+    - get_document_info
+    - create_directory
+  core:
+    - next_phase_todos
+    - todo_complete
+    - todo_list
+    - request_replan
+    - mark_complete
+    - job_complete
+  shell:
+    - run_command
+    - cancel_command
+    - shell_read
+  # git: intentionally absent. This agent has shell tools, and
+  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # whenever shell is present — a shell can run git against ANY repository in
+  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+  # here would advertise tools the pod never binds.
+  browser_direct:
+    - browser_navigate
+    - browser_snapshot
+    - browser_click
+    - browser_type
+    - browser_select
+    - browser_scroll
+    - browser_screenshot
+    - browser_back
+    - browser_close
+  research:
+    - web_search
+    - extract_webpage
+  delegation: []
+  citation: []
+  graph: []
+  sql: []
+  mongodb: []

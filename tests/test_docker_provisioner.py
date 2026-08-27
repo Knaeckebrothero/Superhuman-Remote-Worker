@@ -8,6 +8,32 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+def _configure_atomic_workspace_leases(db: AsyncMock) -> None:
+    async def acquire(*, owner_kind, owner_id, candidates):
+        assert owner_kind == "job"
+        assert owner_id
+        rows = await db.fetch("occupied")
+        occupied = {(row["host"], row["port"]) for row in rows}
+        selected = next(
+            (
+                candidate
+                for candidate in candidates
+                if (candidate["host"], candidate["port"]) not in occupied
+            ),
+            None,
+        )
+        if selected is None:
+            return None
+        return {
+            **selected,
+            "status": "ready",
+            "provisioner": "docker",
+            "_docker_workspace_lease_id": "lease-1",
+        }
+
+    db.acquire_docker_workspace_lease = AsyncMock(side_effect=acquire)
+
+
 class TestDockerProvisionerInit:
     """Tests for DockerProvisioner initialization."""
 
@@ -42,8 +68,8 @@ class TestDockerProvisionerInit:
             provisioner.connect(db=db)
             assert provisioner.is_available is True
             assert provisioner.workspace_hosts == [
-                "workspace-1:22",
-                "workspace-2:22",
+                "workspace-1:30022",
+                "workspace-2:30022",
             ]
             assert provisioner.vm_hosts == []
 
@@ -73,8 +99,8 @@ class TestDockerProvisionerInit:
             provisioner = DockerProvisioner()
             provisioner.connect(db=MagicMock())
             assert provisioner.workspace_hosts == [
-                "workspace-1:22",
-                "workspace-2:22",
+                "workspace-1:30022",
+                "workspace-2:30022",
             ]
 
     def test_host_port_format_parsed(self):
@@ -91,6 +117,64 @@ class TestDockerProvisionerInit:
                 "localhost:2201",
                 "localhost:2202",
             ]
+
+    def test_bootstrap_attestation_requires_same_endpoint_fingerprint(self):
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
+        with patch.dict(
+            os.environ,
+            {
+                "WORKSPACE_HOSTS": "workspace-1,workspace-2",
+                "WORKSPACE_IDE_HOSTS": "",
+                "WORKSPACE_HOST_KEY_FINGERPRINTS": ("workspace-1:30022=SHA256:trusted"),
+                "DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS": (
+                    "workspace-1,workspace-2,unknown"
+                ),
+            },
+        ):
+            provisioner = DockerProvisioner()
+            provisioner.connect(db=MagicMock())
+
+        assert provisioner._lease_candidates() == [
+            {
+                "host": "workspace-1",
+                "port": 30022,
+                "bootstrap_attested": True,
+                "trusted_dev_reuse": False,
+                "host_key_fingerprint": "SHA256:trusted",
+            },
+            {
+                "host": "workspace-2",
+                "port": 30022,
+                "bootstrap_attested": False,
+                "trusted_dev_reuse": False,
+            },
+        ]
+
+    def test_trusted_dev_candidate_stays_distinct_from_bootstrap_attestation(self):
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
+        with patch.dict(
+            os.environ,
+            {
+                "WORKSPACE_HOSTS": "workspace-1",
+                "WORKSPACE_IDE_HOSTS": "",
+                "WORKSPACE_HOST_KEY_FINGERPRINTS": "",
+                "DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS": "",
+                "DOCKER_WORKSPACE_TRUSTED_DEV_REUSE": "true",
+            },
+        ):
+            provisioner = DockerProvisioner()
+            provisioner.connect(db=MagicMock())
+
+        assert provisioner._lease_candidates() == [
+            {
+                "host": "workspace-1",
+                "port": 30022,
+                "bootstrap_attested": False,
+                "trusted_dev_reuse": True,
+            }
+        ]
 
     def test_auto_detect_dev_compose(self, tmp_path):
         """Auto-detects dev compose when .dev/ssh-keys/id_ed25519 exists."""
@@ -125,14 +209,19 @@ class TestAssignWorkspace:
         """Create a provisioner with 3 workspace hosts."""
         with patch.dict(
             os.environ,
-            {"WORKSPACE_HOSTS": "workspace-1,workspace-2,workspace-3"},
+            {
+                "WORKSPACE_HOSTS": "workspace-1,workspace-2,workspace-3",
+                "WORKSPACE_HOST_KEY_FINGERPRINTS": "",
+                "DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS": "",
+                "DOCKER_WORKSPACE_TRUSTED_DEV_REUSE": "false",
+            },
         ):
             from orchestrator.services.docker_provisioner import DockerProvisioner
 
             p = DockerProvisioner()
             db = AsyncMock()
             db.fetch = AsyncMock(return_value=[])
-            db.merge_workspace_container_context = AsyncMock(return_value=True)
+            _configure_atomic_workspace_leases(db)
             p.connect(db=db)
             return p
 
@@ -142,7 +231,7 @@ class TestAssignWorkspace:
         result = await provisioner.assign_workspace("job-1")
         assert result is not None
         assert result["host"] == "workspace-1"
-        assert result["port"] == 22
+        assert result["port"] == 30022
         assert result["status"] == "ready"
         assert result["provisioner"] == "docker"
 
@@ -150,7 +239,7 @@ class TestAssignWorkspace:
     async def test_assign_skips_occupied(self, provisioner):
         """Skips workspaces already assigned to active jobs."""
         provisioner._db.fetch = AsyncMock(
-            return_value=[{"host": "workspace-1", "port": 22}]
+            return_value=[{"host": "workspace-1", "port": 30022}]
         )
         result = await provisioner.assign_workspace("job-2")
         assert result is not None
@@ -161,9 +250,9 @@ class TestAssignWorkspace:
         """Returns None when all workspaces are occupied."""
         provisioner._db.fetch = AsyncMock(
             return_value=[
-                {"host": "workspace-1", "port": 22},
-                {"host": "workspace-2", "port": 22},
-                {"host": "workspace-3", "port": 22},
+                {"host": "workspace-1", "port": 30022},
+                {"host": "workspace-2", "port": 30022},
+                {"host": "workspace-3", "port": 30022},
             ]
         )
         result = await provisioner.assign_workspace("job-4")
@@ -173,14 +262,29 @@ class TestAssignWorkspace:
     async def test_assign_writes_context_to_db(self, provisioner):
         """Assignment writes workspace context to the job in DB."""
         await provisioner.assign_workspace("job-1")
-        provisioner._db.merge_workspace_container_context.assert_called_once_with(
-            "job-1",
-            {
-                "status": "ready",
-                "host": "workspace-1",
-                "port": 22,
-                "provisioner": "docker",
-            },
+        provisioner._db.acquire_docker_workspace_lease.assert_awaited_once_with(
+            owner_kind="job",
+            owner_id="job-1",
+            candidates=[
+                {
+                    "host": "workspace-1",
+                    "port": 30022,
+                    "bootstrap_attested": False,
+                    "trusted_dev_reuse": False,
+                },
+                {
+                    "host": "workspace-2",
+                    "port": 30022,
+                    "bootstrap_attested": False,
+                    "trusted_dev_reuse": False,
+                },
+                {
+                    "host": "workspace-3",
+                    "port": 30022,
+                    "bootstrap_attested": False,
+                    "trusted_dev_reuse": False,
+                },
+            ],
         )
 
     @pytest.mark.asyncio
@@ -210,7 +314,7 @@ class TestAssignWorkspaceWithPorts:
             p = DockerProvisioner()
             db = AsyncMock()
             db.fetch = AsyncMock(return_value=[])
-            db.merge_workspace_container_context = AsyncMock(return_value=True)
+            _configure_atomic_workspace_leases(db)
             p.connect(db=db)
             return p
 
@@ -253,7 +357,10 @@ class TestReleaseWorkspace:
     def provisioner(self):
         with patch.dict(
             os.environ,
-            {"WORKSPACE_HOSTS": "workspace-1,workspace-2"},
+            {
+                "WORKSPACE_HOSTS": "workspace-1,workspace-2",
+                "DOCKER_WORKSPACE_TRUSTED_DEV_REUSE": "true",
+            },
         ):
             from orchestrator.services.docker_provisioner import DockerProvisioner
 
@@ -266,15 +373,27 @@ class TestReleaseWorkspace:
                             "workspace_container": {
                                 "status": "ready",
                                 "host": "workspace-1",
-                                "port": 22,
+                                "port": 30022,
                                 "provisioner": "docker",
+                                "_docker_workspace_lease_id": "lease-1",
                             }
                         }
                     )
                 }
             )
-            db.merge_workspace_container_context = AsyncMock(return_value=True)
+
+            async def transition(**kwargs):
+                return {
+                    "status": kwargs["updates"]["status"],
+                    "host": "workspace-1",
+                    "port": 30022,
+                    "provisioner": "docker",
+                    "_docker_workspace_lease_id": "lease-1",
+                }
+
+            db.transition_docker_workspace_lease = AsyncMock(side_effect=transition)
             p.connect(db=db, snapshot_service=None)
+            p._reset_workspace_via_ssh = AsyncMock(return_value=True)
             return p
 
     @pytest.mark.asyncio
@@ -282,10 +401,14 @@ class TestReleaseWorkspace:
         """Release updates DB status to 'released'."""
         ok = await provisioner.release_workspace("job-1")
         assert ok is True
-        provisioner._db.merge_workspace_container_context.assert_called_once_with(
-            "job-1",
-            {"status": "released", "host": "workspace-1"},
-        )
+        calls = provisioner._db.transition_docker_workspace_lease.await_args_list
+        assert calls[0].kwargs["updates"] == {"status": "releasing"}
+        assert calls[1].kwargs["updates"] == {
+            "status": "released",
+            "quarantine_reason": None,
+            "_docker_workspace_trust_mode": "trusted_dev",
+            "_docker_workspace_attested": False,
+        }
 
     @pytest.mark.asyncio
     async def test_release_with_snapshot(self, provisioner):
@@ -300,8 +423,56 @@ class TestReleaseWorkspace:
         snap.capture_vm_snapshot.assert_called_once_with(
             job_id="job-1",
             ssh_host="workspace-1",
-            ssh_port=22,
+            ssh_port=30022,
             source_type="container",
+        )
+
+    @pytest.mark.asyncio
+    async def test_release_uses_authoritative_cas_endpoint_for_side_effects(self):
+        """Stale owner coordinates never select the snapshot or cleanup target."""
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
+        provisioner = DockerProvisioner()
+        provisioner._trusted_dev_reuse = True
+        db = AsyncMock()
+        db.get_job.return_value = {
+            "context": {
+                "workspace_container": {
+                    "status": "ready",
+                    "host": "stale-owner-host",
+                    "port": 39999,
+                    "provisioner": "docker",
+                    "_docker_workspace_lease_id": "lease-authoritative",
+                }
+            }
+        }
+        authoritative = {
+            "host": "inventory-host",
+            "port": 30022,
+            "provisioner": "docker",
+            "_docker_workspace_lease_id": "lease-authoritative",
+        }
+
+        async def transition(**kwargs):
+            return {**authoritative, **kwargs["updates"]}
+
+        db.transition_docker_workspace_lease.side_effect = transition
+        snapshot = AsyncMock()
+        snapshot.is_available = True
+        snapshot.capture_vm_snapshot = AsyncMock(return_value=True)
+        provisioner._db = db
+        provisioner._snapshot_service = snapshot
+        provisioner._reset_workspace_via_ssh = AsyncMock(return_value=True)
+
+        assert await provisioner.release_workspace("job-1") is True
+        snapshot.capture_vm_snapshot.assert_awaited_once_with(
+            job_id="job-1",
+            ssh_host="inventory-host",
+            ssh_port=30022,
+            source_type="container",
+        )
+        provisioner._reset_workspace_via_ssh.assert_awaited_once_with(
+            "inventory-host", 30022
         )
 
     @pytest.mark.asyncio
@@ -328,6 +499,121 @@ class TestReleaseWorkspace:
             p.connect(db=db)
             ok = await p.release_workspace("job-1")
             assert ok is False
+
+
+class TestReleaseThreadWorkspace:
+    """Tests for persistent-thread workspace release."""
+
+    @pytest.mark.asyncio
+    async def test_release_uses_authoritative_cas_endpoint_for_side_effects(self):
+        """Thread release ignores stale endpoint coordinates in owner metadata."""
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
+        provisioner = DockerProvisioner()
+        provisioner._trusted_dev_reuse = True
+        db = AsyncMock()
+        db.get_thread.return_value = {
+            "metadata": {
+                "workspace_container": {
+                    "status": "ready",
+                    "host": "stale-thread-host",
+                    "port": 39998,
+                    "provisioner": "docker",
+                    "_docker_workspace_lease_id": "lease-thread-authoritative",
+                    "_canvas_workspace_generation": "stale-generation",
+                }
+            }
+        }
+        authoritative = {
+            "host": "thread-inventory-host",
+            "port": 30022,
+            "provisioner": "docker",
+            "_docker_workspace_lease_id": "lease-thread-authoritative",
+        }
+
+        async def transition(**kwargs):
+            return {**authoritative, **kwargs["updates"]}
+
+        db.transition_docker_workspace_lease.side_effect = transition
+        snapshot = AsyncMock()
+        snapshot.is_available = True
+        snapshot.capture_vm_snapshot = AsyncMock(return_value=True)
+        provisioner._db = db
+        provisioner._snapshot_service = snapshot
+        provisioner._reset_workspace_via_ssh = AsyncMock(return_value=True)
+
+        assert await provisioner.release_thread_workspace("thread-1") is True
+        snapshot.capture_vm_snapshot.assert_awaited_once_with(
+            job_id="thread-1",
+            ssh_host="thread-inventory-host",
+            ssh_port=30022,
+            source_type="container",
+            entity_type="threads",
+        )
+        provisioner._reset_workspace_via_ssh.assert_awaited_once_with(
+            "thread-inventory-host", 30022
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("terminal_status", ["released", "quarantined"])
+    async def test_terminal_mirror_is_reattested_against_exact_inventory(
+        self, terminal_status
+    ):
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
+        provisioner = DockerProvisioner()
+        db = AsyncMock()
+        db.get_thread.return_value = {
+            "metadata": {
+                "workspace_container": {
+                    "status": terminal_status,
+                    "host": "workspace-1",
+                    "port": 30022,
+                    "provisioner": "docker",
+                    "_docker_workspace_lease_id": "lease-1",
+                }
+            }
+        }
+        db.transition_docker_workspace_lease.return_value = None
+        provisioner._db = db
+
+        assert await provisioner.release_thread_workspace("thread-1") is False
+        db.transition_docker_workspace_lease.assert_awaited_once_with(
+            owner_kind="thread",
+            owner_id="thread-1",
+            expected_lease_id="lease-1",
+            expected_statuses={terminal_status},
+            updates={"status": terminal_status},
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_quarantine_refuses_released_mirror_without_inventory_effect(
+        self,
+    ):
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
+        provisioner = DockerProvisioner()
+        db = AsyncMock()
+        db.get_thread.return_value = {
+            "metadata": {
+                "workspace_container": {
+                    "status": "released",
+                    "host": "workspace-1",
+                    "port": 30022,
+                    "provisioner": "docker",
+                    "_docker_workspace_lease_id": "lease-1",
+                }
+            }
+        }
+        provisioner._db = db
+
+        assert (
+            await provisioner.release_thread_workspace(
+                "thread-1", force_quarantine=True
+            )
+            is False
+        )
+        db.transition_docker_workspace_lease.assert_not_awaited()
 
 
 class TestVMAssignment:

@@ -80,6 +80,10 @@ class FakeNextcloud:
         self.etags: dict[str, str] = {}
         self.requests: list[httpx.Request] = []
         self._etag_seq = 0
+        # When True, a ``Depth: infinity`` PROPFIND is answered 400 (mimics
+        # sabre/dav with infinity disabled) so the etag baseline falls back to
+        # the Depth:1 BFS. Default False: the fake honors infinity.
+        self.reject_infinity = False
 
     # ---- seeding helper
     def add_file(self, relpath: str, content: bytes) -> None:
@@ -102,7 +106,7 @@ class FakeNextcloud:
             return httpx.Response(404, content=b"outside group folder")
         method = request.method
         if method == "PROPFIND":
-            return self._propfind(rel)
+            return self._propfind(rel, request.headers.get("Depth", "1"))
         if method == "GET":
             return self._get(rel)
         if method == "PUT":
@@ -120,12 +124,18 @@ class FakeNextcloud:
         return path[len(self.decoded_base) :].strip("/")
 
     # ---- WebDAV verbs
-    def _propfind(self, rel: str) -> httpx.Response:
+    def _propfind(self, rel: str, depth: str = "1") -> httpx.Response:
         if rel and rel not in self.dirs:
             return httpx.Response(404, content=self._dav_error())
-        # Depth: 1 → the collection itself + its immediate children.
+        if depth == "infinity":
+            if self.reject_infinity:
+                return httpx.Response(400, content=self._dav_error())
+            members = self._descendants(rel)
+        else:
+            members = self._children(rel)
+        # The collection itself + the selected members (children or all descendants).
         blocks = [self._block(rel, is_dir=True)]
-        for child, is_dir in sorted(self._children(rel).items()):
+        for child, is_dir in sorted(members.items()):
             blocks.append(self._block(child, is_dir=is_dir))
         body = (
             '<?xml version="1.0"?>'
@@ -180,6 +190,19 @@ class FakeNextcloud:
         return httpx.Response(404, content=self._dav_error())
 
     # ---- helpers
+    def _descendants(self, current: str) -> dict[str, bool]:
+        """Every file + dir at any depth under ``current`` → {relpath: is_dir}
+        (for a ``Depth: infinity`` PROPFIND)."""
+        prefix = (current + "/") if current else ""
+        members: dict[str, bool] = {}
+        for f in self.files:
+            if f.startswith(prefix) and f != current:
+                members[f] = False
+        for d in self.dirs:
+            if d.startswith(prefix) and d != current:
+                members[d] = True
+        return members
+
     def _children(self, current: str) -> dict[str, bool]:
         """Immediate children of ``current`` → {relpath: is_dir}."""
         prefix = (current + "/") if current else ""
@@ -244,6 +267,33 @@ class FakeNextcloud:
         )
 
 
+class TestRemoveUserFromGroup:
+    @pytest.mark.asyncio
+    async def test_issues_delete_with_body_without_typeerror(self):
+        # Regression: httpx's AsyncClient.delete() rejects a request body, so
+        # the old `delete(..., data=...)` raised TypeError. It must send the
+        # groupid via a DELETE request body.
+        seen: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["method"] = request.method
+            seen["path"] = request.url.path
+            seen["content"] = request.content
+            return httpx.Response(200, json={"ocs": {"meta": {"statuscode": 100}}})
+
+        be = NextcloudBackend(_nc_test_settings())
+        be._client = httpx.AsyncClient(
+            base_url=NEXTCLOUD_BASE, transport=httpx.MockTransport(handler)
+        )
+        be._initialized = True
+
+        await be.remove_user_from_group("srw-reader-a", "grp1")  # must not raise
+
+        assert seen["method"] == "DELETE"
+        assert seen["path"] == "/ocs/v2.php/cloud/users/srw-reader-a/groups"
+        assert b"grp1" in seen["content"]  # groupid sent in the request body
+
+
 def _install_fake(backend: NextcloudBackend, fake: FakeNextcloud) -> None:
     """Wire a pre-initialized adapter up to the fake server."""
     backend._client = httpx.AsyncClient(
@@ -284,6 +334,28 @@ class TestListProjectFolder:
         assert len(file_paths) == len(set(file_paths))
 
     @pytest.mark.asyncio
+    async def test_does_not_double_count_subdirs(self):
+        # Regression for the double-subdir bug (design §11.5): each Depth:1
+        # PROPFIND of a subdir returns that subdir's own self-entry, which the
+        # walker must drop (its parent already emitted it). Assert directory
+        # entries — not just files — appear exactly once.
+        be = NextcloudBackend(_nc_test_settings())
+        fake = FakeNextcloud()
+        fake.add_file("Documents/a.md", b"a")
+        fake.add_file("Documents/Sub/b.md", b"b")
+        _install_fake(be, fake)
+
+        entries = await be.list_project_folder(_handle())
+        paths = [e.path for e in entries]
+        assert len(paths) == len(set(paths)), f"duplicate paths: {paths}"
+        assert set(paths) == {
+            "Documents",
+            "Documents/a.md",
+            "Documents/Sub",
+            "Documents/Sub/b.md",
+        }
+
+    @pytest.mark.asyncio
     async def test_etag_is_stable_across_calls(self):
         # External-mod detection compares baseline vs. live etags, so a
         # re-list of an unchanged file must yield the same etag.
@@ -304,6 +376,48 @@ class TestListProjectFolder:
         entries = await be.list_project_folder(_handle())
         assert [e for e in entries if not e.is_dir] == []
 
+
+class TestCaptureEtagBaseline:
+    @pytest.mark.asyncio
+    async def test_prefers_infinity_single_request(self):
+        be = NextcloudBackend(_nc_test_settings())
+        fake = FakeNextcloud()
+        fake.add_file("a.md", b"a")
+        fake.add_file("knowledge-base/knowledge/b.md", b"b")
+        _install_fake(be, fake)
+
+        base = await be.capture_etag_baseline(_handle())
+
+        assert set(base) == {
+            "a.md",
+            "knowledge-base/knowledge/b.md",
+        }  # files only, no dirs
+        assert all(v for v in base.values())  # etags populated
+        # Exactly one PROPFIND — the infinity short-circuit, not a per-dir BFS.
+        propfinds = [r for r in fake.requests if r.method == "PROPFIND"]
+        assert len(propfinds) == 1
+        assert propfinds[0].headers.get("Depth") == "infinity"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_bfs_when_infinity_rejected(self):
+        be = NextcloudBackend(_nc_test_settings())
+        fake = FakeNextcloud()
+        fake.reject_infinity = True  # sabre with infinity disabled → 400
+        fake.add_file("a.md", b"a")
+        fake.add_file("knowledge-base/knowledge/b.md", b"b")
+        _install_fake(be, fake)
+
+        base = await be.capture_etag_baseline(_handle())
+
+        assert set(base) == {
+            "a.md",
+            "knowledge-base/knowledge/b.md",
+        }  # same result via BFS
+        methods = [r for r in fake.requests if r.method == "PROPFIND"]
+        # One rejected infinity attempt + at least the root + docs Depth:1 walks.
+        assert any(r.headers.get("Depth") == "infinity" for r in methods)
+        assert any(r.headers.get("Depth") == "1" for r in methods)
+
     @pytest.mark.asyncio
     async def test_missing_mountpoint_raises_invalid_request(self):
         be = NextcloudBackend(_nc_test_settings())
@@ -321,9 +435,11 @@ class TestGetBytes:
     async def test_returns_bytes(self):
         be = NextcloudBackend(_nc_test_settings())
         fake = FakeNextcloud()
-        fake.add_file("docs/readme.md", b"# hi\n")
+        fake.add_file("knowledge-base/knowledge/readme.md", b"# hi\n")
         _install_fake(be, fake)
-        blob = await be.get_project_folder_file_bytes(_handle(), path="docs/readme.md")
+        blob = await be.get_project_folder_file_bytes(
+            _handle(), path="knowledge-base/knowledge/readme.md"
+        )
         assert blob == b"# hi\n"
 
     @pytest.mark.asyncio

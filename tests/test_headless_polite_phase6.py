@@ -232,7 +232,7 @@ class TestSweeperPerThreadTTL:
     it now JOINs users and COALESCEs three TTL sources. Doesn't run real SQL."""
 
     @pytest.mark.asyncio
-    async def test_sweeper_sql_joins_users_and_coalesces(self):
+    async def test_sweeper_sql_joins_users_and_coalesces(self, monkeypatch):
         import orchestrator.main as orch_main
 
         captured: dict = {}
@@ -256,13 +256,22 @@ class TestSweeperPerThreadTTL:
             async def __aexit__(self_inner, exc_type, exc, tb):
                 return None
 
-        orch_main.postgres_db = MagicMock()
-        orch_main.postgres_db.acquire = lambda: _Acquire()
+        # monkeypatch, not bare assignment: these are module globals, and a
+        # leaked MagicMock `postgres_db` breaks every later test in the run
+        # that awaits a real DB method.
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire()
+        monkeypatch.setattr(orch_main, "postgres_db", fake_db)
+        monkeypatch.setattr(
+            orch_main,
+            "promote_expired_stateless_pauses",
+            AsyncMock(return_value=[]),
+        )
 
         suspension = MagicMock()
         suspension.is_enabled = True
         suspension.suspend_thread_workspace = AsyncMock(return_value=False)
-        orch_main.workspace_suspension_service = suspension
+        monkeypatch.setattr(orch_main, "workspace_suspension_service", suspension)
 
         await orch_main.attention_sleep_sweeper(evt)
 

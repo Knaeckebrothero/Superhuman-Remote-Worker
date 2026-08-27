@@ -1,17 +1,15 @@
 """Tests for the user management system.
 
 Covers:
-- PostgresDB user operations (CRUD, is_admin, upsert_default_user)
+- PostgresDB user operations (CRUD, is_admin)
 - PostgresDB MCP token operations (create, list, revoke, verify, cleanup)
-- Auth module (get_current_user, validate_session)
-- Init seeding (_seed_default_users, _seed_admin_mcp_token)
-- Orchestrator API endpoints (auth, MCP tokens, admin restrictions)
-- Password hashing and validation
+- Init seeding (_seed_admin_mcp_token)
+- The _user_dict helper, schema and config-file sanity checks
 """
 
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -21,18 +19,6 @@ import pytest
 _orchestrator_dir = os.path.join(os.path.dirname(__file__), "..", "orchestrator")
 if _orchestrator_dir not in sys.path:
     sys.path.insert(0, os.path.abspath(_orchestrator_dir))
-
-# security.password is not yet implemented — skip tests that depend on it
-_has_password_module = True
-try:
-    import security.password  # noqa: F401
-except ModuleNotFoundError:
-    _has_password_module = False
-
-_skip_not_implemented = pytest.mark.skipif(
-    not _has_password_module,
-    reason="User management auth not yet fully implemented (security.password missing)",
-)
 
 
 # ============================================================================
@@ -48,8 +34,6 @@ def _make_user(
     default_project_id=None,
     is_admin=False,
     created_at=None,
-    password_hash=None,
-    email_verified=False,
 ):
     """Build a fake user dict matching PostgresDB.get_user() output."""
     return {
@@ -60,22 +44,6 @@ def _make_user(
         "default_project_id": default_project_id or uuid4(),
         "is_admin": is_admin,
         "created_at": created_at or datetime.now(timezone.utc),
-        "password_hash": password_hash,
-        "email_verified": email_verified,
-    }
-
-
-def _make_session(user_id=None, email="test@example.com"):
-    """Build a fake session dict matching PostgresDB.get_session() output."""
-    uid = user_id or uuid4()
-    return {
-        "session_key": "test-session-key",
-        "user_id": uid,
-        "email": email,
-        "created_at": datetime.now(timezone.utc),
-        "expires_at": datetime.now(timezone.utc) + timedelta(hours=24),
-        "last_activity": datetime.now(timezone.utc),
-        "csrf_token": "test-csrf-token",
     }
 
 
@@ -92,196 +60,6 @@ def _make_mcp_token(user_id=None, scope="user", name="Test Token", revoked=False
         "last_used_at": None,
         "created_at": datetime.now(timezone.utc),
     }
-
-
-# ============================================================================
-# Password Module Tests
-# ============================================================================
-
-
-@_skip_not_implemented
-class TestPasswordModule:
-    """Tests for orchestrator/security/password.py."""
-
-    def test_hash_password_returns_string(self):
-        from security.password import hash_password
-
-        result = hash_password("test_password_123")
-        assert isinstance(result, str)
-        assert result.startswith("$argon2")
-
-    def test_verify_password_correct(self):
-        from security.password import hash_password, verify_password
-
-        pw = "correct_horse_battery_staple1"
-        hashed = hash_password(pw)
-        assert verify_password(pw, hashed) is True
-
-    def test_verify_password_incorrect(self):
-        from security.password import hash_password, verify_password
-
-        hashed = hash_password("right_password1")
-        assert verify_password("wrong_password1", hashed) is False
-
-    def test_verify_password_invalid_hash(self):
-        from security.password import verify_password
-
-        assert verify_password("anything", "not-a-valid-hash") is False
-
-    def test_validate_password_strength_too_short(self):
-        from security.password import validate_password_strength
-
-        ok, msg = validate_password_strength("Ab1")
-        assert not ok
-        assert "8 characters" in msg
-
-    def test_validate_password_strength_no_letter(self):
-        from security.password import validate_password_strength
-
-        ok, msg = validate_password_strength("12345678")
-        assert not ok
-        assert "letter" in msg
-
-    def test_validate_password_strength_no_digit(self):
-        from security.password import validate_password_strength
-
-        ok, msg = validate_password_strength("abcdefgh")
-        assert not ok
-        assert "digit" in msg
-
-    def test_validate_password_strength_valid(self):
-        from security.password import validate_password_strength
-
-        ok, msg = validate_password_strength("secure_pw1")
-        assert ok
-        assert msg == ""
-
-
-# ============================================================================
-# Auth Module Tests
-# ============================================================================
-
-
-@_skip_not_implemented
-class TestGetCurrentUser:
-    """Tests for security.auth.get_current_user."""
-
-    @pytest.mark.asyncio
-    async def test_no_session_cookie_raises_401(self):
-        from security.auth import get_current_user
-
-        request = MagicMock()
-        request.cookies = {}
-        db = MagicMock()
-
-        with pytest.raises(Exception) as exc_info:
-            await get_current_user(request, db)
-        assert exc_info.value.status_code == 401
-        assert "Not authenticated" in str(exc_info.value.detail)
-
-    @pytest.mark.asyncio
-    async def test_invalid_session_raises_401(self):
-        from security.auth import get_current_user
-
-        request = MagicMock()
-        request.cookies = {"session": "invalid-key"}
-        db = MagicMock()
-        db.get_session = AsyncMock(return_value=None)
-
-        with pytest.raises(Exception) as exc_info:
-            await get_current_user(request, db)
-        assert exc_info.value.status_code == 401
-
-    @pytest.mark.asyncio
-    async def test_valid_session_returns_full_user(self):
-        from security.auth import get_current_user
-
-        user_id = uuid4()
-        session = _make_session(user_id=user_id)
-        user = _make_user(user_id=user_id, is_admin=True)
-
-        request = MagicMock()
-        request.cookies = {"session": "valid-key"}
-        db = MagicMock()
-        db.get_session = AsyncMock(return_value=session)
-        db.update_session_activity = AsyncMock()
-        db.get_user = AsyncMock(return_value=user)
-
-        result = await get_current_user(request, db)
-
-        assert result["id"] == user_id
-        assert result["is_admin"] is True
-        assert result["display_name"] == "Test User"
-        db.get_user.assert_called_once_with(str(user_id))
-
-    @pytest.mark.asyncio
-    async def test_valid_session_but_user_deleted_raises_401(self):
-        from security.auth import get_current_user
-
-        session = _make_session()
-
-        request = MagicMock()
-        request.cookies = {"session": "valid-key"}
-        db = MagicMock()
-        db.get_session = AsyncMock(return_value=session)
-        db.update_session_activity = AsyncMock()
-        db.get_user = AsyncMock(return_value=None)
-
-        with pytest.raises(Exception) as exc_info:
-            await get_current_user(request, db)
-        assert exc_info.value.status_code == 401
-        assert "User not found" in str(exc_info.value.detail)
-
-
-@_skip_not_implemented
-class TestValidateSession:
-    """Tests for security.auth.validate_session."""
-
-    @pytest.mark.asyncio
-    async def test_none_session_key_returns_none(self):
-        from security.auth import validate_session
-
-        db = MagicMock()
-        result = await validate_session(db, None)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_empty_session_key_returns_none(self):
-        from security.auth import validate_session
-
-        db = MagicMock()
-        result = await validate_session(db, "")
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_valid_session_returns_user_info(self):
-        from security.auth import validate_session
-
-        user_id = uuid4()
-        session = _make_session(user_id=user_id, email="valid@test.com")
-
-        db = MagicMock()
-        db.get_session = AsyncMock(return_value=session)
-        db.update_session_activity = AsyncMock()
-
-        result = await validate_session(db, "some-session-key")
-
-        assert result is not None
-        assert result["user_id"] == str(user_id)
-        assert result["email"] == "valid@test.com"
-        assert result["csrf_token"] == "test-csrf-token"
-        assert "expires_in" in result
-        db.update_session_activity.assert_called_once_with("some-session-key")
-
-    @pytest.mark.asyncio
-    async def test_expired_session_returns_none(self):
-        from security.auth import validate_session
-
-        db = MagicMock()
-        db.get_session = AsyncMock(return_value=None)  # DB filters expired
-
-        result = await validate_session(db, "expired-key")
-        assert result is None
 
 
 # ============================================================================
@@ -368,27 +146,6 @@ class TestPostgresDBUserOps:
         assert result["is_admin"] is False
 
     @pytest.mark.asyncio
-    async def test_get_user_by_email_with_auth_includes_is_admin(self):
-        db = self._make_db()
-        row = {
-            "id": uuid4(),
-            "display_name": "Carol",
-            "avatar_color": "#89b4fa",
-            "email": "carol@test.com",
-            "default_project_id": uuid4(),
-            "is_admin": True,
-            "created_at": datetime.now(timezone.utc),
-            "password_hash": "$argon2...",
-            "email_verified": True,
-        }
-        self._mock_conn(db, fetchrow_return=row)
-
-        result = await db.get_user_by_email_with_auth("carol@test.com")
-        assert result is not None
-        assert result["is_admin"] is True
-        assert result["password_hash"] == "$argon2..."
-
-    @pytest.mark.asyncio
     async def test_list_users_includes_is_admin(self):
         db = self._make_db()
         rows = [
@@ -441,161 +198,326 @@ class TestPostgresDBUserOps:
         result = await db.get_admin_user()
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_list_users_includes_approval_columns(self):
+        db = self._make_db()
+        rows = [
+            {
+                "id": uuid4(),
+                "display_name": "Pending",
+                "avatar_color": "#89b4fa",
+                "email": "p@test.com",
+                "default_project_id": uuid4(),
+                "is_admin": False,
+                "can_use_vm": False,
+                "is_approved": False,
+                "approved_at": None,
+                "approved_by": None,
+                "created_at": datetime.now(timezone.utc),
+            },
+        ]
+        self._mock_conn(db, fetch_return=rows)
 
-class TestUpsertDefaultUser:
-    """Tests for PostgresDB.upsert_default_user with is_admin support."""
+        result = await db.list_users()
+        assert result[0]["is_approved"] is False
+        assert "approved_at" in result[0]
+        assert "approved_by" in result[0]
 
-    def _make_db(self):
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
-            from database import PostgresDB
+    @pytest.mark.asyncio
+    async def test_update_user_stamps_approval(self):
+        db = self._make_db()
+        conn = self._mock_conn(db, execute_return="UPDATE 1")
 
-            db = PostgresDB()
-        db._pool = MagicMock()
-        return db
+        ok = await db.update_user(
+            str(uuid4()),
+            is_approved=True,
+            approved_at=datetime.now(timezone.utc),
+            approved_by=str(uuid4()),
+        )
+        assert ok is True
+        sql = conn.execute.call_args[0][0]
+        assert "is_approved = $" in sql
+        assert "approved_at = $" in sql
+        assert "approved_by = $" in sql
 
-    def _mock_conn(self, db):
+    @pytest.mark.asyncio
+    async def test_update_user_suspension_omits_stamp(self):
+        # Suspension (is_approved=False) flips the flag but must NOT touch
+        # approved_at/approved_by — they survive as approval history.
+        db = self._make_db()
+        conn = self._mock_conn(db, execute_return="UPDATE 1")
+
+        ok = await db.update_user(str(uuid4()), is_approved=False)
+        assert ok is True
+        sql = conn.execute.call_args[0][0]
+        assert "is_approved = $" in sql
+        assert "approved_at" not in sql
+        assert "approved_by" not in sql
+
+    @pytest.mark.asyncio
+    async def test_approve_users_returns_matched_ids(self):
+        db = self._make_db()
+        id1, id2 = uuid4(), uuid4()
+        conn = self._mock_conn(db, fetch_return=[{"id": id1}, {"id": id2}])
+
+        result = await db.approve_users([str(id1), str(id2)], approved_by=str(uuid4()))
+        assert result == [str(id1), str(id2)]
+        sql = conn.fetch.call_args[0][0]
+        assert "is_approved = TRUE" in sql
+        assert "RETURNING id" in sql
+        passed_uuids = conn.fetch.call_args[0][1]
+        assert id1 in passed_uuids and id2 in passed_uuids
+
+    @pytest.mark.asyncio
+    async def test_approve_users_filters_invalid_ids(self):
+        db = self._make_db()
+        good = uuid4()
+        conn = self._mock_conn(db, fetch_return=[{"id": good}])
+
+        result = await db.approve_users([str(good), "not-a-uuid", ""])
+        assert result == [str(good)]
+        # Only the valid UUID is passed to the query.
+        assert conn.fetch.call_args[0][1] == [good]
+
+    @pytest.mark.asyncio
+    async def test_approve_users_all_invalid_skips_db(self):
+        db = self._make_db()
+        conn = self._mock_conn(db, fetch_return=[])
+
+        result = await db.approve_users(["nope", ""])
+        assert result == []
+        conn.fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_admin_user_ids(self):
+        db = self._make_db()
+        id1, id2 = uuid4(), uuid4()
+        conn = self._mock_conn(db, fetch_return=[{"id": id1}, {"id": id2}])
+
+        result = await db.list_admin_user_ids()
+        assert result == [str(id1), str(id2)]
+        sql = conn.fetch.call_args[0][0]
+        assert "is_admin = TRUE" in sql
+
+
+class TestAppSideAdmission:
+    """App-side admission seam: the ``users.is_approved`` column owns approval,
+    with a transition-window write-through from the legacy Keycloak ``user``
+    role and PAT/MCP paths that no longer force approval. See
+    knowledge-history/done/app_side_admission.md.
+    """
+
+    def _db_with_user(self, user_row):
+        """Mock db whose get_user_by_keycloak_sub returns user_row and whose
+        acquire() yields a conn with a captured execute()."""
+        db = MagicMock()
+        db.get_user_by_keycloak_sub = AsyncMock(return_value=user_row)
         conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
         cm = AsyncMock()
         cm.__aenter__ = AsyncMock(return_value=conn)
         cm.__aexit__ = AsyncMock(return_value=False)
         db.acquire = MagicMock(return_value=cm)
-        return conn
+        return db, conn
 
-    @pytest.mark.asyncio
-    async def test_creates_new_user_with_is_admin(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
-
-        new_row = {
+    def _user_row(self, **over):
+        row = {
             "id": uuid4(),
-            "display_name": "Admin",
-            "avatar_color": "#f38ba8",
-            "email": "admin@test.com",
-            "is_admin": True,
-            "created_at": datetime.now(timezone.utc),
-        }
-        # First fetchrow (check existing) returns None, second (INSERT) returns new_row
-        conn.fetchrow = AsyncMock(side_effect=[None, new_row])
-
-        result = await db.upsert_default_user(
-            display_name="Admin",
-            avatar_color="#f38ba8",
-            email="admin@test.com",
-            is_admin=True,
-        )
-
-        assert result["is_admin"] is True
-        assert result["display_name"] == "Admin"
-        # Verify INSERT was called (second fetchrow)
-        assert conn.fetchrow.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_creates_new_user_with_password(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
-
-        new_row = {
-            "id": uuid4(),
-            "display_name": "Admin",
-            "avatar_color": "#f38ba8",
-            "email": "admin@test.com",
-            "is_admin": True,
-            "created_at": datetime.now(timezone.utc),
-        }
-        conn.fetchrow = AsyncMock(side_effect=[None, new_row])
-
-        result = await db.upsert_default_user(
-            display_name="Admin",
-            email="admin@test.com",
-            is_admin=True,
-            password_hash="$argon2id$...",
-            email_verified=True,
-        )
-
-        assert result["is_admin"] is True
-        # Verify INSERT query includes password_hash and email_verified
-        insert_call = conn.fetchrow.call_args_list[1]
-        query = insert_call[0][0]
-        assert "password_hash" in query
-        assert "email_verified" in query
-
-    @pytest.mark.asyncio
-    async def test_existing_user_updates_is_admin(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
-
-        existing = {
-            "id": uuid4(),
-            "display_name": "Admin",
-            "avatar_color": "#f38ba8",
-            "email": "admin@test.com",
-            "is_admin": False,
-            "created_at": datetime.now(timezone.utc),
-        }
-        conn.fetchrow = AsyncMock(return_value=existing)
-
-        result = await db.upsert_default_user(
-            display_name="Admin",
-            email="admin@test.com",
-            is_admin=True,  # Changed from False to True
-        )
-
-        assert result["is_admin"] is True
-        # Verify UPDATE was called
-        conn.execute.assert_called_once()
-        update_query = conn.execute.call_args[0][0]
-        assert "is_admin" in update_query
-
-    @pytest.mark.asyncio
-    async def test_existing_user_no_changes_skips_update(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
-
-        existing = {
-            "id": uuid4(),
-            "display_name": "Default",
+            "display_name": "rowuser",
             "avatar_color": "#89b4fa",
-            "email": "default@cockpit.local",
+            "email": "u@test.com",
+            "default_project_id": uuid4(),
             "is_admin": False,
+            "can_use_vm": False,
+            "is_approved": False,
+            "preferred_username": "rowuser",
+            "keycloak_sub": "kc-1",
             "created_at": datetime.now(timezone.utc),
         }
-        conn.fetchrow = AsyncMock(return_value=existing)
+        row.update(over)
+        return row
 
-        result = await db.upsert_default_user(
-            display_name="Default",
-            email="default@cockpit.local",
-            is_admin=False,
-        )
-
-        # No update needed — email already set, is_admin unchanged
-        conn.execute.assert_not_called()
-        assert result["is_admin"] is False
+    def _claims(self, roles):
+        return {
+            "sub": "kc-1",
+            "email": "u@test.com",
+            "preferred_username": "rowuser",
+            "realm_access": {"roles": roles},
+        }
 
     @pytest.mark.asyncio
-    async def test_existing_user_updates_email_when_null(self):
-        db = self._make_db()
-        conn = self._mock_conn(db)
+    async def test_write_through_migrates_legacy_role_holder(self):
+        from security.auth import _resolve_user_from_claims
 
-        existing = {
-            "id": uuid4(),
-            "display_name": "Default",
-            "avatar_color": "#89b4fa",
-            "email": None,
-            "is_admin": False,
-            "created_at": datetime.now(timezone.utc),
-        }
-        conn.fetchrow = AsyncMock(return_value=existing)
+        db, conn = self._db_with_user(self._user_row(is_approved=False))
+        result = await _resolve_user_from_claims(self._claims(["user"]), db)
 
-        result = await db.upsert_default_user(
-            display_name="Default",
-            email="new@test.com",
-            is_admin=False,
+        assert result["is_approved"] is True
+        # The role-holder's DB flag was stamped through on this request.
+        sql = conn.execute.call_args[0][0]
+        assert "is_approved = $" in sql
+
+    @pytest.mark.asyncio
+    async def test_pending_when_no_role_and_db_false(self):
+        from security.auth import _resolve_user_from_claims
+
+        db, _ = self._db_with_user(self._user_row(is_approved=False))
+        result = await _resolve_user_from_claims(self._claims([]), db)
+
+        assert result["is_approved"] is False
+        db.acquire.assert_not_called()  # nothing to write through
+
+    @pytest.mark.asyncio
+    async def test_db_approved_survives_absent_role(self):
+        from security.auth import _resolve_user_from_claims
+
+        db, _ = self._db_with_user(self._user_row(is_approved=True))
+        result = await _resolve_user_from_claims(self._claims([]), db)
+
+        # DB flag wins; an absent role never downgrades an approved user.
+        assert result["is_approved"] is True
+        db.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resolve_pat_no_longer_forces_approval(self):
+        from security.auth import _resolve_pat
+
+        db = MagicMock()
+        db.get_auth_token_by_hash = AsyncMock(
+            return_value={
+                "id": uuid4(),
+                "user_id": uuid4(),
+                "kind": "api",
+                "scopes": [],
+            }
         )
+        db.get_user = AsyncMock(
+            return_value={"id": uuid4(), "display_name": "x", "is_approved": False}
+        )
+        db.touch_auth_token = AsyncMock()
+        request = MagicMock()
+        request.headers = {}
+        request.client = MagicMock(host="127.0.0.1")
 
-        conn.execute.assert_called_once()
-        update_query = conn.execute.call_args[0][0]
-        assert "email" in update_query
-        assert result["email"] == "new@test.com"
+        result = await _resolve_pat("ak_token", request, db)
+        # A suspended owner's PAT now reflects the row → denied downstream.
+        assert result["is_approved"] is False
+
+    @pytest.mark.asyncio
+    async def test_resolve_pat_approved_user_passes(self):
+        from security.auth import _resolve_pat
+
+        db = MagicMock()
+        db.get_auth_token_by_hash = AsyncMock(
+            return_value={
+                "id": uuid4(),
+                "user_id": uuid4(),
+                "kind": "api",
+                "scopes": [],
+            }
+        )
+        db.get_user = AsyncMock(
+            return_value={"id": uuid4(), "display_name": "x", "is_approved": True}
+        )
+        db.touch_auth_token = AsyncMock()
+        request = MagicMock()
+        request.headers = {}
+        request.client = MagicMock(host="127.0.0.1")
+
+        result = await _resolve_pat("ak_token", request, db)
+        assert result["is_approved"] is True
+
+    @pytest.mark.asyncio
+    async def test_ensure_user_provisioned_skips_without_sub(self):
+        # Admin-created / pre-OIDC rows have no keycloak_sub → no provisioning
+        # (they provision on their owner's first real OIDC login).
+        from security import auth
+
+        with (
+            patch.object(auth, "_ensure_cloud_user", new=AsyncMock()) as ec,
+            patch.object(auth, "_ensure_gitea_user", new=AsyncMock()) as eg,
+        ):
+            await auth.ensure_user_provisioned({"id": uuid4(), "email": "x@y.com"})
+        ec.assert_not_called()
+        eg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_user_provisioned_fires_both_ensures(self):
+        import asyncio
+
+        from security import auth
+
+        with (
+            patch.object(auth, "_ensure_cloud_user", new=AsyncMock()) as ec,
+            patch.object(auth, "_ensure_gitea_user", new=AsyncMock()) as eg,
+        ):
+            await auth.ensure_user_provisioned(
+                {
+                    "id": uuid4(),
+                    "keycloak_sub": "kc-1",
+                    "email": "x@y.com",
+                    "display_name": "X",
+                    "preferred_username": "x",
+                }
+            )
+            await asyncio.sleep(0)  # let the scheduled tasks run
+            ec.assert_called_once()
+            eg.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_notify_admins_fans_out_sse_and_email(self):
+        from services.notification_service import NotificationService
+
+        svc = NotificationService()
+        feed = MagicMock()  # broadcast is sync
+        email = MagicMock()
+        email.send_system_notification = AsyncMock(return_value=True)
+        db = MagicMock()
+        admin1, admin2 = str(uuid4()), str(uuid4())
+        db.list_admin_user_ids = AsyncMock(return_value=[admin1, admin2])
+        db.get_user = AsyncMock(
+            side_effect=lambda uid: {
+                "id": uid,
+                "email": f"{uid}@x.com",
+                "display_name": "Admin",
+            }
+        )
+        svc.connect(db, email, feed)
+        svc._get_user_channels = AsyncMock(return_value={"email": True})
+        svc._get_user_settings = AsyncMock(return_value={})
+        svc._is_in_quiet_hours = MagicMock(return_value=False)
+
+        res = await svc.notify_admins_user_registered(
+            "new-user-id", display_name="New", email="new@x.com"
+        )
+        assert res["notified"] == 2
+        assert feed.broadcast.call_count == 2
+        assert email.send_system_notification.call_count == 2
+        assert feed.broadcast.call_args.kwargs["event_type"] == "user_registered"
+
+    @pytest.mark.asyncio
+    async def test_notify_admins_skips_email_in_quiet_hours(self):
+        from services.notification_service import NotificationService
+
+        svc = NotificationService()
+        feed = MagicMock()
+        email = MagicMock()
+        email.send_system_notification = AsyncMock(return_value=True)
+        db = MagicMock()
+        admin1 = str(uuid4())
+        db.list_admin_user_ids = AsyncMock(return_value=[admin1])
+        db.get_user = AsyncMock(
+            return_value={"id": admin1, "email": "a@x.com", "display_name": "A"}
+        )
+        svc.connect(db, email, feed)
+        svc._get_user_channels = AsyncMock(return_value={"email": True})
+        svc._get_user_settings = AsyncMock(return_value={})
+        svc._is_in_quiet_hours = MagicMock(return_value=True)  # in quiet hours
+
+        await svc.notify_admins_user_registered("new-user-id", display_name="New")
+        # SSE still fires (in-app isn't quiet-houred); email is suppressed.
+        assert feed.broadcast.call_count == 1
+        email.send_system_notification.assert_not_called()
 
 
 # ============================================================================
@@ -720,79 +642,6 @@ class TestPostgresDBMcpTokens:
 # ============================================================================
 
 
-@_skip_not_implemented
-class TestSeedDefaultUsers:
-    """Tests for _seed_default_users in orchestrator/init.py."""
-
-    @pytest.mark.asyncio
-    async def test_seeds_admin_and_default_user(self):
-        from orchestrator.init import _seed_default_users
-
-        db = MagicMock()
-        db.upsert_default_user = AsyncMock(return_value=_make_user())
-
-        with patch.dict("os.environ", {}, clear=False):
-            # Remove any ADMIN_* env vars that might exist
-            os.environ.pop("ADMIN_EMAIL", None)
-            os.environ.pop("ADMIN_PASSWORD", None)
-            os.environ.pop("ADMIN_DISPLAY_NAME", None)
-            await _seed_default_users(db)
-
-        # Should be called twice: admin + default
-        assert db.upsert_default_user.call_count == 2
-
-        # First call = admin
-        admin_call = db.upsert_default_user.call_args_list[0]
-        assert admin_call.kwargs["display_name"] == "Admin"
-        assert admin_call.kwargs["is_admin"] is True
-        assert admin_call.kwargs["email"] == "admin@cockpit.local"
-
-        # Second call = default user
-        default_call = db.upsert_default_user.call_args_list[1]
-        assert default_call.kwargs["display_name"] == "Default"
-        assert default_call.kwargs.get("is_admin", False) is False
-
-    @pytest.mark.asyncio
-    async def test_seeds_admin_with_custom_env(self):
-        from orchestrator.init import _seed_default_users
-
-        db = MagicMock()
-        db.upsert_default_user = AsyncMock(return_value=_make_user())
-
-        with patch.dict(
-            "os.environ",
-            {
-                "ADMIN_EMAIL": "boss@company.com",
-                "ADMIN_DISPLAY_NAME": "Boss",
-            },
-        ):
-            await _seed_default_users(db)
-
-        admin_call = db.upsert_default_user.call_args_list[0]
-        assert admin_call.kwargs["email"] == "boss@company.com"
-        assert admin_call.kwargs["display_name"] == "Boss"
-
-    @pytest.mark.asyncio
-    async def test_seeds_admin_with_password_in_production(self):
-        from orchestrator.init import _seed_default_users
-
-        db = MagicMock()
-        db.upsert_default_user = AsyncMock(return_value=_make_user())
-
-        with patch.dict(
-            "os.environ",
-            {
-                "ADMIN_PASSWORD": "secure_password_1",
-            },
-        ):
-            await _seed_default_users(db)
-
-        admin_call = db.upsert_default_user.call_args_list[0]
-        assert admin_call.kwargs.get("password_hash") is not None
-        assert admin_call.kwargs["password_hash"].startswith("$argon2")
-        assert admin_call.kwargs["email_verified"] is True
-
-
 class TestSeedAdminMcpToken:
     """Tests for _seed_admin_mcp_token in orchestrator/init.py."""
 
@@ -863,86 +712,6 @@ class TestSeedAdminMcpToken:
 # ============================================================================
 
 
-@_skip_not_implemented
-class TestMcpTokenEndpoints:
-    """Tests for MCP token API endpoints in orchestrator/main.py."""
-
-    @pytest.fixture
-    def mock_db(self):
-        """Create a mock PostgresDB for API tests."""
-        db = MagicMock()
-        db.create_mcp_token = AsyncMock()
-        db.list_mcp_tokens = AsyncMock(return_value=[])
-        db.revoke_mcp_token = AsyncMock(return_value=True)
-        db.get_mcp_token_by_hash = AsyncMock()
-        db.update_mcp_token_last_used = AsyncMock()
-        db.get_session = AsyncMock()
-        db.update_session_activity = AsyncMock()
-        db.get_user = AsyncMock()
-        return db
-
-    def _setup_auth(self, mock_db, user=None, is_admin=False):
-        """Set up the mock DB to return a valid session and user."""
-        if user is None:
-            user = _make_user(is_admin=is_admin)
-
-        session = _make_session(user_id=user["id"], email=user["email"])
-        mock_db.get_session.return_value = session
-        mock_db.get_user.return_value = user
-        return user
-
-    @pytest.mark.asyncio
-    async def test_admin_can_create_full_access_token(self, mock_db):
-        """Admin user should be able to create scope='all' tokens."""
-        admin = self._setup_auth(mock_db, is_admin=True)
-        token_row = _make_mcp_token(user_id=admin["id"], scope="all")
-        mock_db.create_mcp_token.return_value = token_row
-
-        # Simulate the endpoint logic directly
-        from security.auth import get_current_user
-
-        request = MagicMock()
-        request.cookies = {"session": "valid-key"}
-        user = await get_current_user(request, mock_db)
-
-        scope = "all"
-        # This should NOT raise for admin
-        if scope == "all" and not user.get("is_admin", False):
-            pytest.fail("Admin should be allowed to create full-access tokens")
-
-    @pytest.mark.asyncio
-    async def test_non_admin_cannot_create_full_access_token(self, mock_db):
-        """Non-admin user should get 403 for scope='all'."""
-        self._setup_auth(mock_db, is_admin=False)
-
-        from security.auth import get_current_user
-
-        request = MagicMock()
-        request.cookies = {"session": "valid-key"}
-        user = await get_current_user(request, mock_db)
-
-        scope = "all"
-        assert scope == "all" and not user.get("is_admin", False), (
-            "Non-admin should be blocked from creating full-access tokens"
-        )
-
-    @pytest.mark.asyncio
-    async def test_non_admin_can_create_user_scope_token(self, mock_db):
-        """Non-admin user should be able to create scope='user' tokens."""
-        self._setup_auth(mock_db, is_admin=False)
-
-        from security.auth import get_current_user
-
-        request = MagicMock()
-        request.cookies = {"session": "valid-key"}
-        user = await get_current_user(request, mock_db)
-
-        scope = "user"
-        # Should not be blocked
-        blocked = scope == "all" and not user.get("is_admin", False)
-        assert not blocked, "User-scope tokens should be allowed for everyone"
-
-
 class TestUserDictHelper:
     """Tests for the _user_dict helper in main.py."""
 
@@ -992,142 +761,6 @@ class TestUserDictHelper:
 
 
 # ============================================================================
-# Integration-style Tests (Full Flow)
-# ============================================================================
-
-
-@_skip_not_implemented
-class TestAdminBootstrapFlow:
-    """Integration-style tests for the admin bootstrap flow."""
-
-    @pytest.mark.asyncio
-    async def test_full_admin_bootstrap_without_password(self):
-        """Test the full flow: seed admin → create MCP token (dev mode)."""
-        from orchestrator.init import _seed_default_users, _seed_admin_mcp_token
-
-        admin_id = uuid4()
-        admin_user = _make_user(user_id=admin_id, display_name="Admin", is_admin=True)
-
-        db = MagicMock()
-        db.upsert_default_user = AsyncMock(return_value=admin_user)
-        db.get_admin_user = AsyncMock(return_value=admin_user)
-        db.list_mcp_tokens = AsyncMock(return_value=[])
-        db.create_mcp_token = AsyncMock(return_value=_make_mcp_token(scope="all"))
-
-        # Step 1: Seed users
-        with patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("ADMIN_PASSWORD", None)
-            await _seed_default_users(db)
-
-        # Verify admin was created without password
-        admin_call = db.upsert_default_user.call_args_list[0]
-        assert admin_call.kwargs["is_admin"] is True
-        assert admin_call.kwargs.get("password_hash") is None
-
-        # Step 2: Seed MCP token
-        await _seed_admin_mcp_token(db)
-
-        # Verify token was created with scope="all"
-        db.create_mcp_token.assert_called_once()
-        assert db.create_mcp_token.call_args.kwargs["scope"] == "all"
-
-    @pytest.mark.asyncio
-    async def test_full_admin_bootstrap_with_password(self):
-        """Test the full flow: seed admin with password → create MCP token (production)."""
-        from orchestrator.init import _seed_default_users, _seed_admin_mcp_token
-
-        admin_id = uuid4()
-        admin_user = _make_user(user_id=admin_id, display_name="Admin", is_admin=True)
-
-        db = MagicMock()
-        db.upsert_default_user = AsyncMock(return_value=admin_user)
-        db.get_admin_user = AsyncMock(return_value=admin_user)
-        db.list_mcp_tokens = AsyncMock(return_value=[])
-        db.create_mcp_token = AsyncMock(return_value=_make_mcp_token(scope="all"))
-
-        # Step 1: Seed users with password
-        with patch.dict("os.environ", {"ADMIN_PASSWORD": "prod_password_1"}):
-            await _seed_default_users(db)
-
-        admin_call = db.upsert_default_user.call_args_list[0]
-        assert admin_call.kwargs["is_admin"] is True
-        assert admin_call.kwargs["password_hash"].startswith("$argon2")
-        assert admin_call.kwargs["email_verified"] is True
-
-        # Step 2: Seed MCP token
-        await _seed_admin_mcp_token(db)
-        db.create_mcp_token.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_idempotent_rerun_skips_token(self):
-        """Re-running init should not create a duplicate MCP token."""
-        from orchestrator.init import _seed_admin_mcp_token
-
-        admin = _make_user(is_admin=True)
-        existing_token = _make_mcp_token(scope="all")
-
-        db = MagicMock()
-        db.get_admin_user = AsyncMock(return_value=admin)
-        db.list_mcp_tokens = AsyncMock(return_value=[existing_token])
-
-        await _seed_admin_mcp_token(db)
-
-        db.create_mcp_token.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_admin_login_and_token_creation_flow(self):
-        """Test: admin logs in → session created → can create full-access token."""
-        from security.auth import get_current_user
-
-        admin_id = uuid4()
-        admin = _make_user(user_id=admin_id, is_admin=True, email="admin@test.com")
-        session = _make_session(user_id=admin_id, email="admin@test.com")
-
-        db = MagicMock()
-        db.get_session = AsyncMock(return_value=session)
-        db.update_session_activity = AsyncMock()
-        db.get_user = AsyncMock(return_value=admin)
-
-        request = MagicMock()
-        request.cookies = {"session": "admin-session-key"}
-
-        user = await get_current_user(request, db)
-
-        # User should have is_admin
-        assert user["is_admin"] is True
-        assert user["id"] == admin_id
-
-        # Should be allowed to create full-access token
-        scope = "all"
-        assert not (scope == "all" and not user.get("is_admin", False))
-
-    @pytest.mark.asyncio
-    async def test_regular_user_blocked_from_full_access(self):
-        """Test: regular user cannot create scope='all' tokens."""
-        from security.auth import get_current_user
-
-        user_id = uuid4()
-        regular = _make_user(user_id=user_id, is_admin=False)
-        session = _make_session(user_id=user_id)
-
-        db = MagicMock()
-        db.get_session = AsyncMock(return_value=session)
-        db.update_session_activity = AsyncMock()
-        db.get_user = AsyncMock(return_value=regular)
-
-        request = MagicMock()
-        request.cookies = {"session": "user-session-key"}
-
-        user = await get_current_user(request, db)
-
-        assert user["is_admin"] is False
-
-        # Should be blocked
-        scope = "all"
-        assert scope == "all" and not user.get("is_admin", False)
-
-
-# ============================================================================
 # Schema Tests
 # ============================================================================
 
@@ -1152,18 +785,6 @@ class TestSchemaContainsIsAdmin:
             content = f.read()
 
         assert "CREATE TABLE IF NOT EXISTS mcp_tokens" in content
-
-    def test_is_admin_migration_after_email_verified(self):
-        """is_admin migration should come after email_verified migration."""
-        schema_path = os.path.join(
-            os.path.dirname(__file__), "..", "orchestrator", "database", "schema.sql"
-        )
-        with open(schema_path) as f:
-            content = f.read()
-
-        email_verified_pos = content.index("email_verified BOOLEAN")
-        is_admin_pos = content.index("is_admin BOOLEAN")
-        assert is_admin_pos > email_verified_pos
 
 
 # ============================================================================

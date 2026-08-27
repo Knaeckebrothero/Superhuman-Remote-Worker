@@ -17,6 +17,7 @@ import pytest
 
 from orchestrator.services.persistent_provisioner import (
     PersistentProvisioner,
+    PersistentPodCreateStatus,
     persistent_provisioner,
 )
 
@@ -146,10 +147,11 @@ class TestCreateAgentPod:
     """Tests for create_agent_pod method."""
 
     @pytest.mark.asyncio
-    async def test_returns_false_when_k8s_not_available(self):
+    async def test_reports_failed_when_k8s_not_available(self):
         p = PersistentProvisioner()
         result = await p.create_agent_pod("tid-1")
-        assert result is False
+        assert result.status == PersistentPodCreateStatus.FAILED
+        assert result.failure_class == "kubernetes_unavailable"
 
     @pytest.mark.asyncio
     async def test_log_includes_thread_id_and_config(self):
@@ -172,7 +174,7 @@ class TestCreateAgentPod:
         p = PersistentProvisioner()
         # Just verify the method accepts defaults without error
         result = await p.create_agent_pod("tid-1")
-        assert result is False  # K8s not available
+        assert result.status == PersistentPodCreateStatus.FAILED
 
 
 # =============================================================================
@@ -244,6 +246,44 @@ class TestPodManifest:
         assert labels["srw/thread-id"] == "abc123def456-full-uuid"
         assert labels["srw/component"] == "persistent-agent"
 
+    def test_chart_labels_for_netpol_admission(self, monkeypatch):
+        """The Helm-rendered DB NetworkPolicies select
+        app.kubernetes.io/component=agent; without these labels the pod's
+        Postgres connections are REJECTED — the officer respawn crash-looped
+        on asyncpg ECONNREFUSED (2026-07-30)."""
+        monkeypatch.setenv("AGENT_LABEL_NAME", "srw-dev")
+        monkeypatch.setenv("AGENT_LABEL_INSTANCE", "srw-release")
+        labels = self._build()["metadata"]["labels"]
+        assert labels["app.kubernetes.io/name"] == "srw-dev"
+        assert labels["app.kubernetes.io/instance"] == "srw-release"
+        assert labels["app.kubernetes.io/component"] == "agent"
+
+    def test_chart_labels_absent_outside_chart(self, monkeypatch):
+        monkeypatch.delenv("AGENT_LABEL_NAME", raising=False)
+        monkeypatch.delenv("AGENT_LABEL_INSTANCE", raising=False)
+        labels = self._build()["metadata"]["labels"]
+        assert "app.kubernetes.io/name" not in labels
+        assert "app.kubernetes.io/instance" not in labels
+        assert "app.kubernetes.io/component" not in labels
+
+    def test_build_sha_label_from_image_tag(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE", "ghcr.io/x/agent:sha-18bbcae")
+        labels = self._build()["metadata"]["labels"]
+        assert labels["srw/build-sha"] == "18bbcae"
+
+    def test_no_build_sha_label_for_unpinned_tag(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE", "ghcr.io/x/agent:latest")
+        labels = self._build()["metadata"]["labels"]
+        assert "srw/build-sha" not in labels
+
+    def test_generation_can_freeze_an_exact_target_image(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE", "ghcr.io/x/agent:sha-live")
+        manifest = self._build(image_ref="ghcr.io/x/agent:sha-frozen")
+        assert manifest["metadata"]["labels"]["srw/build-sha"] == "frozen"
+        assert manifest["spec"]["containers"][0]["image"] == (
+            "ghcr.io/x/agent:sha-frozen"
+        )
+
     def test_restart_policy_never(self):
         m = self._build()
         assert m["spec"]["restartPolicy"] == "Never"
@@ -251,6 +291,14 @@ class TestPodManifest:
     def test_termination_grace_period(self):
         m = self._build()
         assert m["spec"]["terminationGracePeriodSeconds"] == 180
+
+    def test_prestop_installs_fence_before_waiting_for_parked_boundary(self):
+        container = self._build()["spec"]["containers"][0]
+        command = container["lifecycle"]["preStop"]["exec"]["command"]
+
+        assert command[:2] == ["sh", "-c"]
+        assert command[2].startswith(": > /tmp/srw-persistent-terminating;")
+        assert command[2].endswith("exec python -m src.api.persistent_termination")
 
     def test_init_container_waits_for_orchestrator(self):
         m = self._build()
@@ -268,6 +316,21 @@ class TestPodManifest:
         assert "--port 8001" in cmd
         assert "--host 0.0.0.0" in cmd
 
+    def test_pod_uid_uses_downward_api(self):
+        manifest = self._build()
+        env = manifest["spec"]["containers"][0]["env"]
+
+        pod_uid = next(item for item in env if item["name"] == "POD_UID")
+        assert pod_uid == {
+            "name": "POD_UID",
+            "valueFrom": {
+                "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": "metadata.uid",
+                }
+            },
+        }
+
     def test_env_from_configmap_and_secret(self):
         m = self._build()
         env_from = m["spec"]["containers"][0]["envFrom"]
@@ -278,11 +341,20 @@ class TestPodManifest:
         assert secret_ref == "srw"
 
     def test_env_overrides(self):
-        m = self._build(config_name="scholar")
+        m = self._build(
+            config_name="scholar", runtime_actor_bootstrap="srb_session_only"
+        )
         env = m["spec"]["containers"][0]["env"]
-        env_dict = {e["name"]: e["value"] for e in env}
+        env_dict = {e["name"]: e.get("value") for e in env}
         assert env_dict["AGENT_CONFIG"] == "scholar"
         assert env_dict["AGENT_PORT"] == "8001"
+        internal = next(e for e in env if e["name"] == "MCP_INTERNAL_KEY")
+        assert internal["valueFrom"]["secretKeyRef"] == {
+            "name": "srw",
+            "key": "MCP_INTERNAL_KEY",
+            "optional": True,
+        }
+        assert env_dict["SRW_RUNTIME_ACTOR_BOOTSTRAP"] == "srb_session_only"
 
     def test_security_context_non_root(self):
         m = self._build()
@@ -343,7 +415,9 @@ class TestPodManifest:
         m = self._build()
         container = m["spec"]["containers"][0]
         assert container["livenessProbe"]["httpGet"]["path"] == "/health"
-        assert container["readinessProbe"]["httpGet"]["path"] == "/ready"
+        # /health, not /ready: /ready means "free to accept a session" and left
+        # dedicated pods 0/1-Ready while serving turns (k3d smoke item 8).
+        assert container["readinessProbe"]["httpGet"]["path"] == "/health"
         assert container["startupProbe"]["httpGet"]["path"] == "/health"
         assert container["startupProbe"]["failureThreshold"] == 10
 
@@ -383,6 +457,21 @@ class TestPodManifest:
         )
         assert m["spec"]["containers"][0]["image"] == "my-registry/agent:v2"
 
+    def test_image_pull_policy_from_env(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE_PULL_POLICY", "IfNotPresent")
+
+        manifest = self._build()
+
+        assert manifest["spec"]["containers"][0]["imagePullPolicy"] == "IfNotPresent"
+
+    def test_invalid_image_pull_policy_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE_PULL_POLICY", "Sometimes")
+
+        with pytest.raises(
+            ValueError, match="PERSISTENT_AGENT_IMAGE_PULL_POLICY must be one of"
+        ):
+            PersistentProvisioner()
+
 
 # =============================================================================
 # 7.8: K8s interaction (mocked API)
@@ -403,6 +492,41 @@ def _make_provisioner_with_k8s():
     mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_ctx.__aexit__ = AsyncMock(return_value=False)
     p._db.acquire.return_value = mock_ctx
+    mock_conn.execute.return_value = "UPDATE 1"
+    thread_id = "11111111-1111-4111-8111-111111111111"
+    generation = "22222222-2222-4222-8222-222222222222"
+    attempt_id = "33333333-3333-4333-8333-333333333333"
+    claim_id = "44444444-4444-4444-8444-444444444444"
+    p._db.get_thread.return_value = {
+        "id": thread_id,
+        "status": "created",
+        "runtime_generation": generation,
+        "runtime_retirement_token": None,
+    }
+    p._db.reserve_pinned_agent_pod_provision_intent.return_value = {
+        "attempt_id": attempt_id,
+        "thread_id": thread_id,
+        "runtime_generation": generation,
+        "provisioner": "persistent",
+        "pod_name": "persistent-thread-abc",
+        "status": "planned",
+        "pod_uid": None,
+        "workspace_claim": {
+            "claim_id": claim_id,
+            "thread_id": thread_id,
+            "created_runtime_generation": generation,
+            "create_attempt": attempt_id,
+            "provisioner": "persistent",
+            "pvc_name": "pvc-persistent-thread-abc",
+            "status": "planned",
+            "pvc_uid": None,
+        },
+    }
+    p._db.publish_pinned_agent_workspace_claim.return_value = True
+    p._db.publish_pinned_agent_pod_provision_intent.return_value = True
+    created_claim = MagicMock()
+    created_claim.metadata.uid = "pvc-uid-created"
+    p._core_api.create_namespaced_persistent_volume_claim.return_value = created_claim
     return p, mock_conn
 
 
@@ -425,8 +549,12 @@ class TestCreateAgentPodK8s:
         cs = MagicMock()
         cs.ready = True
         pod.status.container_statuses = [cs]
-        p._core_api.create_namespaced_pod.return_value = MagicMock()
-        p._core_api.read_namespaced_pod.return_value = pod
+        created = MagicMock()
+        created.metadata.uid = "pod-uid-new"
+        p._core_api.create_namespaced_pod.return_value = created
+        not_found = Exception("Not found")
+        not_found.status = 404
+        p._core_api.read_namespaced_pod.side_effect = [not_found, pod]
 
         with patch(
             "orchestrator.services.persistent_provisioner.asyncio.to_thread",
@@ -434,7 +562,8 @@ class TestCreateAgentPodK8s:
         ):
             result = await p.create_agent_pod("thread-abc123def456")
 
-        assert result is True
+        assert result.status == PersistentPodCreateStatus.CREATED
+        assert result.pod_uid == "pod-uid-new"
         p._core_api.create_namespaced_pod.assert_called_once()
 
     @pytest.mark.asyncio
@@ -444,6 +573,18 @@ class TestCreateAgentPodK8s:
         exc = Exception("Conflict")
         exc.status = 409
         p._core_api.create_namespaced_pod.side_effect = exc
+        not_found = Exception("Not found")
+        not_found.status = 404
+        incumbent = MagicMock()
+        incumbent.metadata.uid = "existing-uid"
+        incumbent.metadata.deletion_timestamp = None
+        incumbent.metadata.labels = {
+            "srw/component": "persistent-agent",
+            "srw/thread-id": "thread-abc",
+            "srw.io/runtime-generation": "22222222-2222-4222-8222-222222222222",
+            "srw.io/provision-attempt": "33333333-3333-4333-8333-333333333333",
+        }
+        p._core_api.read_namespaced_pod.side_effect = [not_found, incumbent]
 
         async def fake_to_thread(fn, *args, **kwargs):
             return fn(*args, **kwargs)
@@ -454,7 +595,66 @@ class TestCreateAgentPodK8s:
         ):
             result = await p.create_agent_pod("thread-abc")
 
-        assert result is True  # 409 is OK (pod already exists)
+        assert result.status == PersistentPodCreateStatus.ALREADY_CURRENT
+        assert result.pod_uid == "existing-uid"
+
+    @pytest.mark.asyncio
+    async def test_retry_adopts_published_attempt_without_new_create(self):
+        p, _ = _make_provisioner_with_k8s()
+        intent = p._db.reserve_pinned_agent_pod_provision_intent.return_value
+        intent["status"] = "published"
+        intent["pod_uid"] = "existing-uid"
+        intent["workspace_claim"]["status"] = "ready"
+        intent["workspace_claim"]["pvc_uid"] = "existing-pvc-uid"
+        incumbent = MagicMock()
+        incumbent.metadata.uid = "existing-uid"
+        incumbent.metadata.deletion_timestamp = None
+        incumbent.metadata.labels = {
+            "srw/component": "persistent-agent",
+            "srw/thread-id": "thread-abc",
+            "srw.io/runtime-generation": intent["runtime_generation"],
+            "srw.io/provision-attempt": str(intent["attempt_id"]),
+        }
+        p._core_api.read_namespaced_pod.return_value = incumbent
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch(
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
+        ):
+            result = await p.create_agent_pod("thread-abc")
+
+        assert result.status == PersistentPodCreateStatus.ALREADY_CURRENT
+        assert result.pod_uid == "existing-uid"
+        p._core_api.create_namespaced_pod.assert_not_called()
+        p._core_api.create_namespaced_persistent_volume_claim.assert_not_called()
+        p._db.publish_pinned_agent_pod_provision_intent.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_terminating_409_is_not_success(self):
+        p, _ = _make_provisioner_with_k8s()
+        incumbent = MagicMock()
+        incumbent.metadata.uid = "old-uid"
+        incumbent.metadata.deletion_timestamp = "now"
+        incumbent.metadata.labels = {
+            "srw/component": "persistent-agent",
+            "srw/thread-id": "thread-abc",
+        }
+        p._core_api.read_namespaced_pod.return_value = incumbent
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch(
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
+        ):
+            result = await p.create_agent_pod("thread-abc")
+
+        assert result.status == PersistentPodCreateStatus.TERMINATING
+        p._core_api.create_namespaced_pod.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_returns_false_on_error(self):
@@ -463,6 +663,9 @@ class TestCreateAgentPodK8s:
         exc = Exception("Forbidden")
         exc.status = 403
         p._core_api.create_namespaced_pod.side_effect = exc
+        not_found = Exception("Not found")
+        not_found.status = 404
+        p._core_api.read_namespaced_pod.side_effect = not_found
 
         async def fake_to_thread(fn, *args, **kwargs):
             return fn(*args, **kwargs)
@@ -473,7 +676,64 @@ class TestCreateAgentPodK8s:
         ):
             result = await p.create_agent_pod("thread-abc")
 
-        assert result is False
+        assert result.status == PersistentPodCreateStatus.FAILED
+        assert result.failure_class == "Exception"
+
+    @pytest.mark.asyncio
+    async def test_pvc_timeout_recovery_and_fence_use_exact_persistent_labels(self):
+        p, _ = _make_provisioner_with_k8s()
+        thread_id = "11111111-1111-4111-8111-111111111111"
+        generation = "22222222-2222-4222-8222-222222222222"
+        claim_id = "44444444-4444-4444-8444-444444444444"
+        attempt_id = "33333333-3333-4333-8333-333333333333"
+        pvc_name = "pvc-persistent-11111111-111"
+        timeout = TimeoutError("accepted response lost")
+        p._core_api.create_namespaced_persistent_volume_claim.side_effect = timeout
+        observed = MagicMock()
+        observed.metadata.uid = "persistent-pvc-uid"
+        observed.metadata.labels = {
+            "srw.io/thread-id": thread_id,
+            "srw.io/runtime-generation": generation,
+            "srw.io/workspace-claim": claim_id,
+            "srw.io/provision-attempt": attempt_id,
+            "srw.io/claim-provisioner": "persistent",
+        }
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = observed
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch(
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
+        ):
+            assert (
+                await p.ensure_agent_workspace_claim(
+                    pvc_name,
+                    expected_thread_id=thread_id,
+                    expected_runtime_generation=generation,
+                    expected_claim_id=claim_id,
+                    expected_create_attempt=attempt_id,
+                )
+                == "persistent-pvc-uid"
+            )
+
+        observed.metadata.labels["srw.io/runtime-generation"] = generation
+        observed.metadata.labels["srw.io/workspace-claim-fence"] = "true"
+        p._core_api.create_namespaced_persistent_volume_claim.side_effect = type(
+            "ApiErr", (Exception,), {"status": 409}
+        )()
+        with patch(
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
+        ):
+            assert await p.fence_agent_workspace_claim(
+                pvc_name,
+                expected_thread_id=thread_id,
+                expected_runtime_generation=generation,
+                expected_claim_id=claim_id,
+                expected_create_attempt=attempt_id,
+            ) == {"state": "exact_fence", "pvc_uid": "persistent-pvc-uid"}
 
 
 class TestDeleteAgentPodK8s:

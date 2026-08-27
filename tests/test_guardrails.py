@@ -10,8 +10,10 @@ Covers:
 from __future__ import annotations
 
 import textwrap
+from pathlib import Path
 
 import pytest
+import yaml
 from langchain_core.tools import tool
 
 from src.core.loader import resolve_guardrails
@@ -65,6 +67,27 @@ class TestResolveGuardrails:
         )
         # Other tools come from default
         assert "git_log()" in g["tool_examples"]["git_log"]
+
+    def test_all_shell_example_overrides_set_working_dir_without_inline_cd(self):
+        guardrail_dir = Path(__file__).parents[1] / "config" / "guardrails"
+        for guardrail_path in guardrail_dir.glob("*.yaml"):
+            config = yaml.safe_load(guardrail_path.read_text(encoding="utf-8"))
+            examples = config.get("tool_examples", {})
+            for tool_name in ("run_command", "shell_execute"):
+                if tool_name not in examples:
+                    continue
+                calls = [
+                    line.strip()
+                    for line in examples[tool_name].splitlines()
+                    if tool_name in line
+                ]
+                assert calls, f"{guardrail_path}: no {tool_name} calls"
+                for call_text in calls:
+                    assert "working_dir" in call_text, (
+                        f"{guardrail_path}: {call_text} omits working_dir"
+                    )
+                    assert 'command="cd ' not in call_text
+                    assert 'command:<|"|>cd ' not in call_text
 
 
 # =============================================================================
@@ -255,3 +278,37 @@ class TestNudgeCoverage:
             f"KNOWN_NUDGES has keys not present in config/guardrails/default.yaml: "
             f"{missing}"
         )
+
+
+# =============================================================================
+# todo_list_footer — must never enumerate the tool surface
+# =============================================================================
+
+
+class TestTodoListFooter:
+    """Regression: the todo-list footer must never enumerate the tool surface.
+
+    The footer is appended to the todo list and injected as the final
+    HumanMessage of every request (end-of-prompt = max attention). A
+    "Tools available: ..." list there reads as exhaustive and convinces the
+    model its other bound tools are gone — proven root cause of the job
+    1cab4b88 rewind loop (nine tactical phases burned to todo_rewind) and
+    the job edd06963 "stale palette" memory spiral. See
+    knowledge-base/knowledge/issues/agent_phase_guardrails_burn_legitimate_work.md.
+    """
+
+    def test_no_family_enumerates_tool_surface(self):
+        from src.core.loader import _load_guardrails_matrix
+
+        matrix = _load_guardrails_matrix(None)
+        assert "default" in matrix
+        for family in sorted(matrix):
+            footer = format_nudge("todo_list_footer", family=family)
+            # The forbidden pattern: presenting a closed tool list.
+            assert "Tools available" not in footer, family
+            assert "request_replan" not in footer, family
+            assert "mark_complete" not in footer, family
+            # It still teaches how to advance the list...
+            assert "todo_complete" in footer, family
+            # ...and explicitly disclaims being a tool list.
+            assert "not a tool list" in footer, family

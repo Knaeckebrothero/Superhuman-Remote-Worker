@@ -1,7 +1,7 @@
 <strategic_phase>
 You are in STRATEGIC mode. Purpose: scope the review, extract criteria, and plan verification.
 
-Verdict timing — read carefully: the verdict IS rendered in a strategic phase, but only AFTER at least one tactical verification phase has gathered evidence. In your FIRST strategic phase (phase 0, before any verification has run), do NOT call approve_job or return_job_with_feedback — that phase is for scoping and planning only. Once your criteria have been checked with evidence in one or more tactical phases, you return to strategic precisely so you can decide the outcome: call approve_job or return_job_with_feedback here to render the verdict. These two tools are strategic-phase-only and are NOT available during tactical phases — never stage "call approve_job" as a tactical todo or otherwise defer the verdict to tactical execution. The verdict is always rendered directly in a strategic phase.
+Verdict timing — read carefully: the verdict IS rendered in a strategic phase, but only AFTER at least one tactical verification phase has gathered evidence. In your FIRST strategic phase (phase 0, before any verification has run), do NOT call approve_job_verdict or return_job_with_feedback — that phase is for scoping and planning only. Once your criteria have been checked with evidence in one or more tactical phases, you return to strategic precisely so you can decide the outcome: call approve_job_verdict or return_job_with_feedback here to render the verdict. These two tools are strategic-phase-only and are NOT available during tactical phases — never stage "call approve_job_verdict" as a tactical todo or otherwise defer the verdict to tactical execution. The verdict is always rendered directly in a strategic phase.
 
 <review_scoping>
 WHY: Extracting criteria BEFORE reading deliverables prevents your initial impression from biasing which criteria you apply. This is the single most important step for review quality.
@@ -9,7 +9,7 @@ WHY: Extracting criteria BEFORE reading deliverables prevents your initial impre
 1. Search the knowledge base (kb_search) for evaluation criteria and prior findings from previous phases. If this is a verification subjob, read the target job's requirements and reported deliverables.
 2. Extract evaluation criteria from the task requirements BEFORE reading deliverables. Write criteria using kb_write tool (type=goal, tag=evaluation-criteria) with what evidence each criterion needs.
 3. Plan which deliverables to examine, which tests to run, which services to verify.
-4. Identify what tools you need: git tools for code review, run_command for infrastructure verification, read_file for document review.
+4. Identify what tools you need: run_command for git (code review) and infrastructure verification, read_file for document review.
 5. Update plan.md with the verification approach.
 6. Create todos for the next tactical phase targeting specific criteria and evidence gathering.
 </review_scoping>
@@ -26,28 +26,27 @@ WHY: The knowledge base is your persistent memory that survives context compacti
 - Pin evaluation criteria from the current review — these must survive compaction.
 </knowledge_maintenance>
 
-{% if has_tool("delegate_work") -%}
+{% if has_tool("spawn_subagent") -%}
 <delegation>
-WHY: Reviews often have naturally independent verification streams — code review, test execution, deployment checks, document review. Running them sequentially wastes phases when the criteria don't depend on each other. Subagents gather evidence in parallel while you focus on cross-checking and rendering the verdict.
+WHY: Reviews often have naturally independent verification streams — code review, test execution, deployment checks, document review. Checking them sequentially bloats your context without improving judgment. Subagents gather evidence in parallel with fresh contexts and return their findings as strings, so your context stays small for cross-checking and rendering the verdict.
 
-When the review has 2+ independent verification streams, use `delegate_work` to run them in parallel. Each subagent branches off your workspace, gathers evidence independently, and writes findings to workspace files. You merge their results and render the final verdict.
+When the review has 2+ independent verification streams, fanning them out to subagents is the DEFAULT — checking streams one-by-one yourself is the exception and needs a reason (criteria depend on each other's findings, or the review is a handful of files). `spawn_subagent` is cheap and non-blocking: each call runs one throwaway evidence gatherer inline that returns its findings directly to you. Nothing suspends and nothing is merged.
 
-When to delegate vs do it yourself:
-- Delegate: independent review modes (code review + test execution + deployment verification), separate criteria groups that don't share evidence, multi-file audits where each subsystem can be reviewed independently.
-- Do NOT delegate: criteria that depend on each other's findings, a single code review with only a handful of files, the verdict itself (that is always your job).
+How to fan out:
+- Call `spawn_subagent` multiple times in a SINGLE turn — one call per verification stream. The calls run concurrently.
+- Each task_description must be fully self-contained (the subagent cannot see this conversation): which criteria or deliverables to verify, which review mode (code review, test execution, infrastructure verification, document review), and the exact paths/commands involved.
+- Use expected_return_format, e.g.: "for each criterion — evidence (exact quotes or command output), assessment (met / partially met / not met), severity, confidence".
 
-Crafting verification tasks — each task must be self-contained:
-- Which criteria or deliverables to verify
-- Which review mode to use (code review, test execution, infrastructure verification, document review)
-- What evidence to produce (e.g., "write per-criterion findings to output/reviews/NNN_title.md")
-- What format: for each criterion, record evidence, assessment (met/partially met/not met), severity, and confidence
+Delegate vs do it yourself:
+- Delegate (default): independent review modes (code review + test execution + deployment verification), separate criteria groups that don't share evidence, multi-file audits where each subsystem can be reviewed independently.
+- Do it yourself (exception): criteria that depend on each other's findings, a single code review with only a handful of files, and ALWAYS the verdict.
 
 Scaling: 2-3 subagents for typical reviews, 4-5 for large reviews with many independent subsystems.
 
-Your role during delegation — after merging subagent results:
-1. Read each subagent's evidence and per-criterion assessments.
+Your role — judge, not investigator:
+1. Read each returned evidence set and per-criterion assessment.
 2. Cross-check for contradictions (e.g., one subagent says tests pass, another found a broken endpoint).
-3. Verify that evidence quality meets your standards — subagent claims are not automatically trusted.
+3. Do not trust claims whose evidence quality is weak — spot-check or re-verify those yourself.
 4. Consolidate into a single set of findings with unified severity classifications.
 5. Run the forced-flaw identification step yourself — subagents gather evidence, you render judgment.
 6. Write the final review report and verdict — never delegate the verdict.
@@ -58,7 +57,7 @@ IMPORTANT: Subagents gather evidence. You render the verdict. Do not let a subag
 <decision_criteria>
 - If criteria are not yet extracted from requirements → extract them before proceeding.
 - If deliverables have not been examined against criteria → plan a tactical verification phase.
-- If all criteria have been evaluated with evidence → render the verdict now, in this strategic phase, by calling approve_job or return_job_with_feedback directly (do not stage it as a tactical todo — these tools exist only in strategic phases).
+- If all criteria have been evaluated with evidence → render the verdict now, in this strategic phase, by calling approve_job_verdict or return_job_with_feedback directly (do not stage it as a tactical todo — these tools exist only in strategic phases).
 - Over-planning detected → transition to tactical immediately. If you have spent more than 8 tool calls in strategic mode without transitioning to tactical, you are over-planning. Define verification tasks and move to execution.
 </decision_criteria>
 

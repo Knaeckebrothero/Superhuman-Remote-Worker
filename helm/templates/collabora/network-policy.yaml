@@ -1,0 +1,92 @@
+{{- if .Values.collabora.enabled }}
+{{- $network := .Values.collabora.networkPolicy -}}
+{{- $namespaceSelector := $network.edgeNamespaceSelector -}}
+{{- $podSelector := $network.edgePodSelector -}}
+{{- $hasNamespaceSelector := or (not (empty (get $namespaceSelector "matchLabels"))) (not (empty (get $namespaceSelector "matchExpressions"))) -}}
+{{- $hasPodSelector := or (not (empty (get $podSelector "matchLabels"))) (not (empty (get $podSelector "matchExpressions"))) -}}
+{{- if not $hasNamespaceSelector -}}
+{{- fail "collabora.enabled requires a non-empty networkPolicy.edgeNamespaceSelector" -}}
+{{- end -}}
+{{- if not $hasPodSelector -}}
+{{- fail "collabora.enabled requires a non-empty networkPolicy.edgePodSelector" -}}
+{{- end -}}
+{{- if ne (int .Values.collabora.replicaCount) 1 -}}
+{{- fail "collabora.enabled requires replicaCount: 1 until document affinity is implemented" -}}
+{{- end -}}
+{{- if .Values.collabora.autoscaling.enabled -}}
+{{- fail "collabora.enabled requires autoscaling.enabled: false to preserve one-document affinity" -}}
+{{- end -}}
+{{- if and (empty .Values.sessionRouter.jwtSecret) (empty .Values.sessionRouter.jwtSecretName) -}}
+{{- fail "collabora.enabled requires a configured sessionRouter JWT secret (jwtSecret or jwtSecretName)" -}}
+{{- end -}}
+{{- $publicUrl := required "collabora.enabled requires collabora.publicUrl" .Values.collabora.publicUrl -}}
+{{- if not (regexMatch "^https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$" $publicUrl) -}}
+{{- fail "collabora.publicUrl must be an exact HTTP(S) origin without a path" -}}
+{{- end -}}
+{{- $publicHost := regexReplaceAll "^https?://" $publicUrl "" -}}
+{{- $serverName := required "collabora.enabled requires collabora.collabora.server_name" .Values.collabora.collabora.server_name -}}
+{{- if ne $serverName $publicHost -}}
+{{- fail "collabora.collabora.server_name must equal the host[:port] in collabora.publicUrl" -}}
+{{- end -}}
+{{- $wopiUrl := include "srw.orchestratorInternalUrl" . -}}
+{{- $aliasgroups := .Values.collabora.collabora.aliasgroups -}}
+{{- if lt (len $aliasgroups) 1 -}}
+{{- fail (printf "collabora.enabled requires aliasgroup1.host=%s" $wopiUrl) -}}
+{{- end -}}
+{{- if ne (get (index $aliasgroups 0) "host") $wopiUrl -}}
+{{- fail (printf "collabora aliasgroup1.host must exactly equal %s" $wopiUrl) -}}
+{{- end -}}
+{{- $extra := .Values.collabora.collabora.extra_params | default "" -}}
+{{- range $required := list "--o:ssl.enable=false" "--o:ssl.termination=true" "--o:per_document.always_save_on_exit=true" "--o:admin_console.enable=false" -}}
+{{- if not (contains $required $extra) -}}
+{{- fail (printf "collabora.collabora.extra_params must contain %s" $required) -}}
+{{- end -}}
+{{- end -}}
+{{- if contains "net.frame_ancestors" $extra -}}
+{{- fail "collabora.collabora.extra_params must use net.content_security_policy, not obsolete net.frame_ancestors" -}}
+{{- end -}}
+{{- $frameAncestors := printf "--o:net.content_security_policy=frame-ancestors %s;" (include "srw.cockpitUrl" .) -}}
+{{- if not (contains $frameAncestors $extra) -}}
+{{- fail (printf "collabora.collabora.extra_params must contain %s" $frameAncestors) -}}
+{{- end -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-collabora
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "collabora") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      srw.io/component: collabora
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only the selected tunnel/ingress edge can reach Collabora's HTTP and
+    # WebSocket surface.
+    - from:
+        - namespaceSelector:
+            {{- toYaml $namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $podSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 9980
+  egress:
+    # Cluster DNS.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Token-authenticated CheckFileInfo/GetFile callbacks only.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8085
+{{- end }}

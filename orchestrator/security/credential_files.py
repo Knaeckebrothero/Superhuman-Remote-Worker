@@ -205,7 +205,7 @@ def normalize_credential_files(
         return credentials
     if not credentials or not isinstance(credentials, dict):
         raise CredentialFileValidationError(
-            "credentials.files[] is required for credential-file datasource types"
+            "credentials.files[] is required for credential-file connector types"
         )
     files = credentials.get("files")
     if not isinstance(files, list) or not files:
@@ -214,7 +214,7 @@ def normalize_credential_files(
         )
     if len(files) > MAX_FILES_PER_DATASOURCE:
         raise CredentialFileValidationError(
-            f"At most {MAX_FILES_PER_DATASOURCE} files per datasource, got {len(files)}"
+            f"At most {MAX_FILES_PER_DATASOURCE} files per connector, got {len(files)}"
         )
 
     slug = slugify_datasource_name(ds_name)
@@ -222,7 +222,7 @@ def normalize_credential_files(
     if ds_type == "kubeconfig":
         if len(files) != 1:
             raise CredentialFileValidationError(
-                "kubeconfig datasource must have exactly one file"
+                "kubeconfig connector must have exactly one file"
             )
         normalized = [
             _normalize_one_file(
@@ -237,7 +237,7 @@ def normalize_credential_files(
     elif ds_type == "ssh_key":
         if len(files) > 2:
             raise CredentialFileValidationError(
-                "ssh_key datasource has at most two files (private + optional public)"
+                "ssh_key connector has at most two files (private + optional public)"
             )
         normalized = [
             _normalize_one_file(

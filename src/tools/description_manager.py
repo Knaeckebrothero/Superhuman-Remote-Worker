@@ -2,13 +2,13 @@
 
 Handles:
 1. Extracting docstrings from tool objects (no hardcoding)
-2. Generating workspace documentation (tools/*.md)
+2. Rendering tool markdown (README index + per-tool docs), served live from
+   ``tools/`` as a virtual directory (knowledge-base/knowledge/features/virtual_directories.md)
 3. Applying runtime description overrides for deferred tools
 """
 
 import logging
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .registry import TOOL_REGISTRY
 
@@ -160,60 +160,6 @@ class DescriptionManager:
 
         return "\n".join(lines)
 
-    def generate_workspace_docs(
-        self,
-        tool_names: List[str],
-        output_dir: Path,
-        write_fn: Optional[Callable[[str, str], Any]] = None,
-    ) -> int:
-        """Generate tool documentation files in workspace directory.
-
-        Creates:
-        - tools/README.md - Index of all tools
-        - tools/<tool_name>.md - Detailed doc for each tool
-
-        Args:
-            tool_names: List of tool names to document
-            output_dir: Path to the tools/ directory in workspace
-            write_fn: Optional callback ``write_fn(relative_path, content)``
-                that writes a file through the workspace backend (local or
-                remote).  When *None*, falls back to direct ``Path.write_text``
-                for backward compatibility.
-
-        Returns:
-            Number of files created
-        """
-        if write_fn is None:
-            # Local fallback — write via pathlib
-            output_dir = Path(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            def _local_write(rel: str, content: str) -> None:
-                path = output_dir / rel
-                path.write_text(content, encoding="utf-8")
-
-            write_fn = _local_write
-
-        files_created = 0
-
-        # Generate index
-        index_content = self.generate_tool_index(tool_names)
-        write_fn("README.md", index_content)
-        files_created += 1
-        logger.debug(f"Generated tool index: {output_dir}/README.md")
-
-        # Generate individual tool docs
-        for tool_name in tool_names:
-            doc_content = self.generate_tool_description(tool_name)
-            write_fn(f"{tool_name}.md", doc_content)
-            files_created += 1
-
-        logger.info(
-            f"Generated {files_created} tool documentation files in {output_dir}"
-        )
-
-        return files_created
-
     def apply_overrides(self, tools: List[Any]) -> List[Any]:
         """Apply short descriptions to deferred tools.
 
@@ -298,35 +244,6 @@ def _get_manager() -> DescriptionManager:
 
 
 # === Backward-compatible module functions ===
-
-
-def generate_workspace_tool_docs(
-    tool_names: List[str],
-    output_dir: Path,
-    tools: Optional[List[Any]] = None,
-    write_fn: Optional[Callable[[str, str], Any]] = None,
-) -> int:
-    """Generate tool documentation files in a workspace directory.
-
-    Creates:
-    - tools/README.md - Index of all tools
-    - tools/<tool_name>.md - Detailed doc for each tool
-
-    Args:
-        tool_names: List of tool names to document
-        output_dir: Path to the tools/ directory in workspace
-        tools: Optional list of loaded tool objects (for extracting docstrings)
-        write_fn: Optional callback ``write_fn(relative_path, content)``
-            for writing files through the workspace backend. When *None*,
-            falls back to local pathlib writes.
-
-    Returns:
-        Number of files created
-    """
-    manager = _get_manager()
-    if tools:
-        manager.extract_docstrings(tools)
-    return manager.generate_workspace_docs(tool_names, output_dir, write_fn=write_fn)
 
 
 def generate_tool_description(tool_name: str) -> str:

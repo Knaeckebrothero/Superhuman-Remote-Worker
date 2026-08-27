@@ -1,0 +1,576 @@
+schema_version: 1
+
+# Keep these prompts outside config/skills/app-guide/. The runtime skill must
+# not be able to read its held-out routing questions or scoring expectations.
+cases:
+  - id: broad-product-mental-model
+    prompt: >-
+      I just opened Superhuman Remote Worker for the first time. What is it,
+      and how do sessions, jobs, and projects fit together?
+    category: broad
+    tags: [orientation]
+    expected_trigger: true
+    expected_topic: overview
+    expected_gap: false
+    criticality: standard
+    required_facts:
+      - id: sessions-are-interactive
+        any_of: ["sessions are interactive", "sessions (interactive)", "interactive conversation", "interactive chat"]
+      - id: jobs-are-autonomous
+        any_of: ["jobs are autonomous", "jobs (autonomous)", "autonomous work", "background job"]
+      - id: projects-share-context
+        any_of:
+          - "shared goal"
+          - "shared context"
+          - "shared knowledge"
+          - "knowledge and connectors"
+          - "shared home for a specific goal"
+          - "provide a shared home"
+          - "durable context"
+    forbidden_claims:
+      - id: all-workspaces-have-shell
+        severity: critical
+        any_of: ["every workspace includes shell", "all sessions have shell access"]
+
+  - id: broad-session-capabilities
+    prompt: >-
+      In plain English, what can I ask you to do in this chat, and what changes
+      depending on the kind of workspace I selected?
+    category: broad
+    tags: [paraphrase, orientation]
+    expected_trigger: true
+    expected_topic: sessions
+    allowed_topics: [permissions-and-availability]
+    expected_gap: false
+    criticality: standard
+    required_facts:
+      - id: workspace-dependent
+        any_of: ["depends on the workspace", "workspace tier", "virtual", "container"]
+      - id: settings-or-tools
+        any_of:
+          ["current tool", "agent settings", "settings panel", "depending on your settings", "tools and permissions enabled", "tools available"]
+    forbidden_claims:
+      - id: guide-grants-tools
+        severity: critical
+        any_of: ["the app guide enables every tool", "reading this guide grants"]
+
+  - id: workflow-create-autonomous-job
+    prompt: >-
+      I have a well-defined research task that I do not want to babysit. How do
+      I start it as an autonomous job and review the result?
+    category: workflow
+    tags: [jobs]
+    expected_trigger: true
+    expected_topic: jobs
+    expected_gap: false
+    criticality: standard
+    required_facts:
+      - id: new-job-path
+        any_of: ["jobs → new job", "jobs > new job", "open jobs", "new job"]
+      - id: review-setting
+        any_of: ["review autonomy", "choose review", "pending review", "inbox"]
+    forbidden_claims:
+      - id: every-job-has-git
+        severity: critical
+        any_of: ["every job has git", "jobs always include a git repository"]
+
+  - id: workflow-background-fleet
+    prompt: >-
+      Can this session send three independent tasks to workers in the
+      background while we keep talking? Tell me the safe setup and where I
+      monitor them.
+    category: workflow
+    tags: [fleet, paraphrase]
+    expected_trigger: true
+    expected_topic: fleet-and-delegation
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: enable-fleet-tools
+        any_of: ["enable fleet management", "fleet management", "tools"]
+      - id: durable-monitoring
+        any_of: ["jobs and the inbox", "jobs page", "inbox"]
+      - id: capacity-qualified
+        any_of:
+          ["when fleet capacity permits", "capacity", "may be queued", "can queue"]
+    forbidden_claims:
+      - id: guaranteed-simultaneous-start
+        severity: critical
+        any_of: ["guaranteed to start simultaneously", "all three start at exactly the same time"]
+
+  - id: workflow-scheduled-report
+    prompt: >-
+      How do I schedule a weekday report, test it once before trusting it, and
+      avoid duplicate external side effects?
+    category: workflow
+    tags: [automations]
+    expected_trigger: true
+    expected_topic: automations
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: automation-create-path
+        any_of: ["new automation", "open automations"]
+      - id: run-now-test
+        any_of: ["run now", "inspect the spawned job", "inspect the resulting job"]
+      - id: idempotent-at-least-once
+        any_of: ["at-least-once", "idempotent", "already exists"]
+    forbidden_claims:
+      - id: builtin-email-trigger
+        severity: critical
+        any_of: ["select inbound email as the trigger", "built-in webhook trigger"]
+
+  - id: workflow-customize-bundled-expert
+    prompt: >-
+      I like the bundled Developer expert but want my own editable version.
+      What should I do, and can I change it from worker to session later?
+    category: workflow
+    tags: [experts, paraphrase]
+    expected_trigger: true
+    expected_topic: experts
+    expected_gap: false
+    criticality: standard
+    required_facts:
+      - id: duplicate-bundled
+        any_of: ["duplicate", "owned copy"]
+      - id: bundled-read-only
+        any_of: ["bundled", "read-only", "owned copy"]
+      - id: type-immutable
+        any_of: ["type is immutable", "cannot change", "worker expert cannot start a session"]
+    forbidden_claims:
+      - id: edit-bundled-in-place
+        severity: standard
+        any_of: ["edit the bundled profile in place", "convert its type with the type dropdown"]
+
+  - id: workflow-share-email-folder
+    prompt: >-
+      How can I share only my AI mail folder with you instead of my entire
+      mailbox?
+    category: workflow
+    tags: [email, least-privilege]
+    expected_trigger: true
+    expected_topic: datasources-email
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: connector-path
+        any_of: ["connectors", "new connector", "email (imap/smtp)"]
+      - id: folder-allowlist
+        any_of: ["folder allowlist", "allowlist"]
+      - id: empty-means-all
+        any_of: ["leaving this empty shares the whole mailbox", "empty", "whole mailbox"]
+      - id: attach-explicitly
+        any_of:
+          ["select the connector", "selection is required", "explicitly select it", "select this connector", "select it for", "attach", "link it to a project"]
+    forbidden_claims:
+      - id: password-sharing
+        severity: critical
+        any_of: ["paste the password into this chat", "send me your mailbox password"]
+
+  - id: workflow-connect-okf
+    prompt: >-
+      We keep Markdown notes in a Git repository. How do I expose them as an
+      OKF knowledge base, and will an agent be able to push edits back?
+    category: workflow
+    tags: [knowledge, connector]
+    expected_trigger: true
+    expected_topic: datasources-okf
+    expected_gap: false
+    criticality: standard
+    required_facts:
+      - id: repository-and-root
+        any_of: ["repository url", "okf root path", "git repository"]
+      - id: read-only
+        any_of: ["read-only", "cannot write", "cannot push"]
+      - id: index-readiness
+        any_of: ["indexing", "ready", "reindex"]
+    forbidden_claims:
+      - id: workspace-clone
+        severity: standard
+        any_of: ["the okf repository is cloned into every agent workspace"]
+
+  - id: workflow-share-browser
+    prompt: >-
+      I need to log in and dismiss a cookie banner myself, then hand the page
+      back so the agent can continue. How does shared-browser control work?
+    category: workflow
+    tags: [canvas, browser]
+    expected_trigger: true
+    expected_topic: canvas-and-browser
+    expected_gap: false
+    criticality: standard
+    required_facts:
+      - id: open-browser
+        any_of: ["open browser", "web icon"]
+      - id: control-handoff
+        any_of: ["take control", "release control", "hand control"]
+      - id: container-path
+        any_of: ["container workspace", "compatible full workspace"]
+    forbidden_claims:
+      - id: virtual-shared-browser
+        severity: critical
+        any_of: ["virtual workspace includes the shared browser", "none workspace can open the shared browser"]
+
+  - id: availability-missing-shell
+    prompt: >-
+      The shell option is missing in this session. Will switching to Autonomous
+      make it appear, or how should I diagnose what is actually blocking it?
+    category: availability
+    tags: [permissions, paraphrase]
+    expected_trigger: true
+    expected_topic: permissions-and-availability
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: autonomous-not-capability
+        any_of: ["does not add tools", "approval policy", "changes approval prompts only", "will not make the shell appear", "not the available tools"]
+      - id: inspect-current-state
+        any_of: ["actual tool", "settings", "workspace", "capability grant"]
+    forbidden_claims:
+      - id: autonomous-bypasses-grants
+        severity: critical
+        any_of: ["autonomous bypasses capability grants", "autonomous unlocks the shell"]
+
+  - id: workflow-project-campaign
+    prompt: >-
+      I want a bounded project campaign with a Critic checkpoint. What do I
+      configure, and does a ship or kill disposition stop the whole loop?
+    category: workflow
+    tags: [loops]
+    expected_trigger: true
+    expected_topic: project-loops
+    expected_gap: false
+    criticality: standard
+    required_facts:
+      - id: loop-path
+        any_of: ["project", "loop"]
+      - id: bounded-run
+        any_of: ["max iterations", "time limit", "budget"]
+      - id: disposition-scope
+        any_of:
+          ["close the campaign, not the overall project loop", "does not stop the overall loop", "does not stop the whole loop", "neither ship nor kill stops", "only close the specific campaign", "return to the normal loop", "return to the loop", "loop continues"]
+    forbidden_claims:
+      - id: definition-auto-stop
+        severity: standard
+        any_of: ["definition of done automatically stops the loop"]
+
+  - id: workflow-protected-cloud
+    prompt: >-
+      How do I let a session prepare Nextcloud changes for my review without
+      writing them live, and can I approve individual files?
+    category: workflow
+    tags: [cloud, safety]
+    expected_trigger: true
+    expected_topic: protected-cloud
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: eligibility
+        any_of: ["non-default nextcloud", "eligible nextcloud project", "container workspace", "backend to container", "deployment-dependent"]
+      - id: staged-review
+        any_of: ["staged for your review", "cloud changes"]
+      - id: whole-diff
+        any_of: ["whole-diff", "no per-file", "apply every staged change", "reject all"]
+    forbidden_claims:
+      - id: automatic-apply
+        severity: critical
+        any_of: ["auto-apply after 24 hours", "the agent can approve the cloud diff"]
+
+  - id: workflow-preserve-important-fact
+    prompt: >-
+      I am about to compact this long chat, but one decision must remain useful
+      to future project work. Is compaction enough, and where should I record
+      the decision?
+    category: workflow
+    tags: [memory, knowledge]
+    expected_trigger: true
+    expected_topic: memory-and-knowledge
+    allowed_topics: [sessions]
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: compaction-not-memory
+        any_of: ["not long-term memory", "not by itself", "compaction is not enough", "does not move information into the project's long-term memory", "working summary", "summary of your current chat history"]
+      - id: native-knowledge
+        any_of: ["knowledge note", "project knowledge", "knowledge tab"]
+    forbidden_claims:
+      - id: guaranteed-recall
+        severity: critical
+        any_of: ["compaction guarantees future recall", "every future job will remember"]
+
+  - id: workflow-readonly-postgres
+    prompt: >-
+      I want an agent to inspect a PostgreSQL schema and run SELECT queries but
+      never modify data. How should I connect and scope that access?
+    category: workflow
+    tags: [database, connector]
+    expected_trigger: true
+    expected_topic: datasources
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: postgres-tools
+        any_of: ["postgresql connector", "schema-inspection", "schema inspection", "sql query"]
+      - id: readonly
+        any_of: ["read-only", "only querying and reading"]
+      - id: attach
+        any_of: ["attach", "select it", "on a project", "single job or session"]
+    forbidden_claims:
+      - id: connection-implies-global-access
+        severity: critical
+        any_of: ["every agent receives the connector automatically", "connector is globally attached"]
+
+  - id: availability-email-send-now
+    prompt: >-
+      I created an Email connector yesterday. Does that prove this session can
+      send mail right now, and if not what should I verify?
+    category: availability
+    tags: [email, current-state]
+    expected_trigger: true
+    expected_topic: datasources-email
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: explicit-selection
+        any_of:
+          ["selected for this specific", "explicitly select this connector", "explicitly attach it", "connector selected", "selected for this session", "select the connector", "attached"]
+      - id: send-controls
+        any_of: ["send without human approval", "email_autonomous_send", "send tier"]
+      - id: cannot-prove-current
+        any_of: ["does not prove", "check", "cannot tell", "current tool"]
+    forbidden_claims:
+      - id: creation-grants-send
+        severity: critical
+        any_of: ["creating the connector grants send access", "it can definitely send right now"]
+
+  - id: workflow-weekly-invoice-connector-limit
+    prompt: >-
+      Can SRW automatically generate a PDF usage invoice every Friday and
+      email it to our finance team? Give me the exact Cockpit setup.
+    category: workflow
+    tags: [automations, connector_limit, billing]
+    expected_trigger: true
+    expected_topic: automations
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: exact-flow-unsupported
+        any_of:
+          - "cannot currently perform that exact"
+          - "not a supported built-in automation"
+          - "no exact cockpit setup"
+          - "cannot do this exact"
+          - "does not document or support this exact built-in workflow"
+          - "does not document a supported built-in workflow for this exact outcome"
+          - "does not document a built-in cockpit setup for this exact workflow"
+          - "no built-in cockpit setup for this exact workflow"
+      - id: automation-connectors-absent
+        any_of:
+          - "automation-fired jobs do not attach connectors"
+          - "do not attach connectors"
+          - "do not allow attaching connectors"
+          - "do not support attaching connectors"
+          - "do not support connectors"
+          - "automation cannot attach an email connector"
+          - "cannot automatically attach an email connector"
+          - "no access to your email connector"
+    forbidden_claims:
+      - id: invented-billing-page
+        severity: critical
+        any_of: ["billing → invoices", "settings → billing automation", "weekly invoice toggle"]
+      - id: invented-finance-workflow
+        severity: critical
+        any_of: ["invoice delivery workflow template", "finance recipients panel"]
+      - id: invented-project-connector-inheritance
+        severity: critical
+        any_of: ["connectors must be attached to the project where the automation is hosted", "link the email connector to the project and the automation"]
+
+  - id: honest-gap-enterprise-identity
+    prompt: >-
+      Can I configure SCIM user provisioning and SAML group mapping from Okta
+      in SRW Cockpit? Give me the exact built-in setup.
+    category: honest_gap
+    tags: [off_document, enterprise_identity]
+    expected_trigger: true
+    expected_topic: index
+    allowed_topics: [permissions-and-availability, datasources]
+    expected_gap: true
+    criticality: critical
+    required_facts:
+      - id: explicit-guide-gap
+        any_of: ["not documented", "guide does not document", "guide does not cover", "cannot confirm", "doesn't document", "not in the guide"]
+    forbidden_claims:
+      - id: invented-identity-page
+        severity: critical
+        any_of: ["settings → identity", "admin → scim", "sso & scim page"]
+      - id: invented-group-mapping
+        severity: critical
+        any_of: ["group mapping tab", "sync now button", "built-in okta scim connector"]
+
+  - id: near-miss-repository-onboarding
+    prompt: >-
+      Onboard me to this repository: identify the backend entry point, test
+      layout, and the safest place to add a new API route.
+    category: near_miss
+    tags: [repository_onboarding]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-codebase-file
+    prompt: >-
+      What responsibilities does orchestrator/main.py have, and which pieces
+      would you extract first to reduce its size?
+    category: near_miss
+    tags: [repository_onboarding, application_code]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-angular-refactor
+    prompt: >-
+      Refactor this Angular component from mutable fields to signals and add a
+      Vitest test for the computed state.
+    category: near_miss
+    tags: [application_code]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-generic-workweek
+    prompt: >-
+      Give me a practical way to plan my workweek when I have too many
+      competing priorities.
+    category: near_miss
+    tags: [generic_advice]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-python-cron
+    prompt: >-
+      Write a small Python script that runs a local cleanup function every
+      weekday at 18:00.
+    category: near_miss
+    tags: [application_code, generic_advice]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-html-canvas
+    prompt: >-
+      Explain how the HTML canvas element differs from SVG for an animated
+      particle visualization.
+    category: near_miss
+    tags: [similar_term]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-service-worker
+    prompt: >-
+      In my JavaScript app, why does a Web Worker stop receiving postMessage
+      events after the browser tab has been suspended?
+    category: near_miss
+    tags: [similar_term, application_code]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-expert-witness
+    prompt: >-
+      What questions should I ask when hiring an expert witness for a software
+      licensing dispute?
+    category: near_miss
+    tags: [similar_term, generic_advice]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-job-interview
+    prompt: >-
+      Help me prepare concise STAR stories for a senior engineering job
+      interview.
+    category: near_miss
+    tags: [similar_term, generic_advice]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-audio-loop
+    prompt: >-
+      How can I make a seamless eight-bar project loop in Ableton without an
+      audible click at the boundary?
+    category: near_miss
+    tags: [similar_term]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-memory-leak
+    prompt: >-
+      Diagnose why this Python process's memory keeps growing after each batch
+      even though references should be released.
+    category: near_miss
+    tags: [similar_term, application_code]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-sql-query
+    prompt: >-
+      Rewrite this PostgreSQL query with a window function so it returns the
+      newest order for each customer.
+    category: near_miss
+    tags: [application_code, similar_term]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []
+
+  - id: near-miss-email-draft
+    prompt: >-
+      Draft a warm but concise email thanking Maya for reviewing my proposal.
+    category: near_miss
+    tags: [generic_advice, similar_term]
+    expected_trigger: false
+    expected_topic: null
+    expected_gap: false
+    criticality: standard
+    required_facts: []
+    forbidden_claims: []

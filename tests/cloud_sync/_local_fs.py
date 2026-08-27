@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from src.services.cloud_sync.base import WorkspaceSyncBase
 
@@ -48,16 +48,43 @@ class LocalFsWorkspaceSync(WorkspaceSyncBase):
     async def _ensure_ready(self) -> None:
         return None
 
-    async def _ensure_remote_dir(self, rel_dir: str) -> None:
+    async def _ensure_remote_dir(
+        self,
+        rel_dir: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        if before_write is not None:
+            await before_write()
         if rel_dir and rel_dir != ".":
             (self._remote_root / rel_dir).mkdir(parents=True, exist_ok=True)
 
-    async def _upload_file(self, rel_path: str, local_path: str) -> None:
+    async def _upload_file(
+        self,
+        rel_path: str,
+        local_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        if before_write is not None:
+            await before_write()
         dst = self._remote_root / rel_path
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_path, dst)
 
-    async def _list_remote_files(self) -> list[dict]:
+    async def _delete_remote_file(
+        self,
+        rel_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        if before_write is not None:
+            await before_write()
+        (self._remote_root / rel_path).unlink(missing_ok=True)
+
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
+        # Deliberately ignores ``rel_dir`` and lists recursively — the base
+        # tree walk dedups, and this double exercises exactly that tolerance.
         out: list[dict] = []
         if not self._remote_root.exists():
             return out
@@ -66,7 +93,9 @@ class LocalFsWorkspaceSync(WorkspaceSyncBase):
                 continue
             rel = str(p.relative_to(self._remote_root))
             etag = hashlib.sha256(p.read_bytes()).hexdigest()
-            out.append({"path": rel, "etag": etag, "isdir": False})
+            out.append(
+                {"path": rel, "etag": etag, "isdir": False, "size": p.stat().st_size}
+            )
         return out
 
     async def _download_file(self, rel_path: str, local_path: str) -> None:
@@ -94,16 +123,22 @@ class FailingLocalFsWorkspaceSync(LocalFsWorkspaceSync):
         self._fail_on = fail_on
         self._message = message or f"forced {fail_on} failure"
 
-    async def _upload_file(self, rel_path: str, local_path: str) -> None:
+    async def _upload_file(
+        self,
+        rel_path: str,
+        local_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
         # ``_ensure_remote_dirs`` deliberately swallows mkdir errors (treats
         # them as "already exists"), so failing on dir creation won't
         # surface to the strict-mode caller. Failing on the actual upload
         # is what the algorithm propagates.
         if self._fail_on == "push":
             raise RuntimeError(self._message)
-        await super()._upload_file(rel_path, local_path)
+        await super()._upload_file(rel_path, local_path, before_write=before_write)
 
-    async def _list_remote_files(self) -> list[dict]:
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         if self._fail_on == "pull":
             raise RuntimeError(self._message)
-        return await super()._list_remote_files()
+        return await super()._list_remote_files(rel_dir)

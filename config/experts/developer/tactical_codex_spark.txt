@@ -4,6 +4,12 @@ You are in TACTICAL mode. Execute the current `tdd_phase` with focused action.
 
 Stay on the current todo. Do not reorganize plans or explore tangents.
 
+{% if has_tool("spawn_subagent") -%}
+# Parallel reading
+
+When "read before you write" spans several independent areas or needs external lookups (docs, APIs, errors), fan those out with spawn_subagent (several calls in one turn, one self-contained "read/research X, report Y" task each). They read/websearch in parallel and return summaries; you write the code. Never delegate the implementation.
+{% endif -%}
+
 # `tdd_phase` Scope (Non-Negotiable)
 
 The strategic phase stamped a `tdd_phase` on this tactical phase. It dictates which directories you may write to:
@@ -47,7 +53,7 @@ EARS templates: `The system shall...` / `When X, the system shall...` / `While X
    - Acceptable failure: `AssertionError`, pytest assertion mismatch.
    - NOT acceptable: `ImportError`, `ModuleNotFoundError`, `SyntaxError`, `CollectionError`, "0 collected", `pytest.skip`.
    - If the failure is not an assertion failure: fix the test (paths, imports, fixtures), not the source.
-6. `git_diff` — only `tests/` should appear. If `src/` shows up, revert and stop.
+6. `git diff` — only `tests/` should appear. If `src/` shows up, revert and stop.
 7. Update traceability matrix — AC-N status → `red`.
 8. `todo_complete` with: test path, test name, exact failure line, AC IDs.
 
@@ -59,7 +65,7 @@ EARS templates: `The system shall...` / `When X, the system shall...` / `While X
 4. `write_file` the minimum change in `src/`. No speculative features. No "while I'm here" cleanup.
 5. Run the test — confirm pass.
 6. Run the full suite (`done_when[0]` from spec.yaml) — confirm no regressions.
-7. `git_diff` — only `src/` (and config/migrations if scope requires). If `tests/` shows up: revert the test edit, investigate. If the test was wrong, end the phase.
+7. `git diff` — only `src/` (and config/migrations if scope requires). If `tests/` shows up: revert the test edit, investigate. If the test was wrong, end the phase.
 8. Update traceability matrix — AC-N → `green`.
 9. `todo_complete` with: AC IDs, test IDs that turned green, exit codes, files changed.
 
@@ -68,15 +74,15 @@ EARS templates: `The system shall...` / `When X, the system shall...` / `While X
 1. Run the full test suite — record baseline (must be all green).
 2. `write_file` the structural change in `src/`.
 3. Run the full suite — every previously-green test must stay green. If anything turned red: revert.
-4. `git_diff` — no new tests, no edits in `tests/`.
+4. `git diff` — no new tests, no edits in `tests/`.
 5. `todo_complete` with: baseline, post-refactor result, files changed.
 
 # Integration Phase Steps
 
-1. `git_diff` against the job's base tag.
+1. `git diff` against the job's first commit (the "[Phase 0 Seed]" commit from `git log`; there is no job base tag).
 2. Confirm scope matches `spec.yaml`'s `feature` and respects `not_included`.
 3. Stage and commit: `feat: <feature> (AC-1, AC-2, ...)`.
-4. Verify with `git_log` and `git_status`.
+4. Verify with `git log` and `git status`.
 
 # Forbidden Test Patterns
 

@@ -1,15 +1,23 @@
-import {Component, effect, inject, signal} from '@angular/core';
+import {Component, computed, effect, inject, signal} from '@angular/core';
+import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
-import {Job} from '../../core/models/api.model';
+import {Datasource, Job, PullRequestStatus, RepositoryForge} from '../../core/models/api.model';
 import {environment} from '../../core/environment';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {AppCopyFieldComponent} from '../../ui/copy-field';
 import {JobDiffReviewComponent} from '../job-diff-review/job-diff-review.component';
+import {
+  asRecord,
+  effectiveJobStatus,
+  jobStatusLabelKey,
+  jobStatusTone as sharedJobStatusTone,
+} from '../../core/util/job-status';
 
 interface FrozenJobData {
   freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
@@ -22,6 +30,130 @@ interface FrozenJobData {
   frozen_at?: string;
   command?: string;        // sudo command that triggered vm_upgrade_required freeze
   reason?: string;         // why the freeze happened
+}
+
+export interface JobPullRequest {
+  forge: RepositoryForge;
+  repo: string;
+  number: number;
+  url: string;
+  head: string;
+  base: string;
+}
+
+const REPOSITORY_FORGES = new Set<RepositoryForge>(['github', 'gitea', 'gitlab']);
+
+function safeHttpUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const parsed = new URL(value.trim());
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** Convert a credential-redacted HTTPS/SSH clone URL into its repository page. */
+export function repositoryWebUrl(connectionUrl: string | null | undefined): string | null {
+  const raw = connectionUrl?.trim();
+  if (!raw) return null;
+
+  // SCP-like Git syntax is not understood by URL, but is common for repository
+  // connectors: git@github.com:owner/repo.git.
+  const scp = raw.match(/^(?:[^@/:\s]+@)?([^/:\s]+):(.+)$/);
+  if (scp && !raw.includes('://')) {
+    return repositoryWebUrl(`https://${scp[1]}/${scp[2]}`);
+  }
+
+  try {
+    const parsed = new URL(raw);
+    if (!['http:', 'https:', 'ssh:', 'git:'].includes(parsed.protocol)) return null;
+    const protocol = parsed.protocol === 'http:' ? 'http:' : 'https:';
+    const path = parsed.pathname.replace(/\/+$/, '').replace(/\.git$/i, '');
+    if (!parsed.hostname || !path || path === '/') return null;
+    const port = parsed.port ? `:${parsed.port}` : '';
+    return `${protocol}//${parsed.hostname}${port}${path}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Build the forge's browser route for a branch in an attached repository. */
+export function repositoryBranchUrl(
+  connectionUrl: string | null | undefined,
+  branch: string | null | undefined,
+  forge: RepositoryForge | null | undefined,
+): string | null {
+  const repoUrl = repositoryWebUrl(connectionUrl);
+  const ref = branch?.trim();
+  if (!repoUrl || !ref || !forge) return null;
+  const encodedRef = ref.split('/').map(encodeURIComponent).join('/');
+  const route = forge === 'github' ? 'tree' : forge === 'gitlab' ? '-/tree' : 'src/branch';
+  return `${repoUrl}/${route}/${encodedRef}`;
+}
+
+/** Read and validate the structured record written by ``repo_open_pr``. */
+export function pullRequestFromJob(job: Job | null): JobPullRequest | null {
+  const raw = asRecord(asRecord(job?.context)?.['pull_request']);
+  const forge = raw?.['forge'];
+  const repo = raw?.['repo'];
+  const number = raw?.['number'];
+  const head = raw?.['head'];
+  const base = raw?.['base'];
+  const url = safeHttpUrl(raw?.['url']);
+  if (
+    typeof forge !== 'string' ||
+    !REPOSITORY_FORGES.has(forge as RepositoryForge) ||
+    typeof repo !== 'string' ||
+    !repo.trim() ||
+    typeof number !== 'number' ||
+    !Number.isInteger(number) ||
+    number < 1 ||
+    typeof head !== 'string' ||
+    !head.trim() ||
+    typeof base !== 'string' ||
+    !base.trim() ||
+    !url
+  ) {
+    return null;
+  }
+  return {
+    forge: forge as RepositoryForge,
+    repo: repo.trim(),
+    number,
+    url,
+    head: head.trim(),
+    base: base.trim(),
+  };
+}
+
+/** Prefer the connector named by the PR when a job attached several repos. */
+export function selectDeliveryRepository(
+  datasources: Datasource[],
+  pullRequest: JobPullRequest | null,
+): Datasource | null {
+  const repositories = datasources.filter((item) => item.type === 'repository');
+  if (!pullRequest) return repositories.length === 1 ? repositories[0] : null;
+  const wanted = pullRequest.repo.replace(/^\/+|\/+$/g, '').toLowerCase();
+  const wantedHost = new URL(pullRequest.url).hostname.toLowerCase();
+  const matched = repositories.find((item) => {
+    const webUrl = repositoryWebUrl(item.connection_url);
+    if (!webUrl) return false;
+    try {
+      const parsed = new URL(webUrl);
+      const path = parsed.pathname.replace(/^\/+|\/+$/g, '').toLowerCase();
+      return (
+        parsed.hostname.toLowerCase() === wantedHost &&
+        (path === wanted || path.endsWith(`/${wanted}`))
+      );
+    } catch {
+      return false;
+    }
+  });
+  return matched ?? null;
 }
 
 /**
@@ -42,6 +174,7 @@ interface FrozenJobData {
     AppBadgeComponent,
     AppTextareaComponent,
     AppSpinnerComponent,
+    AppCopyFieldComponent,
     JobDiffReviewComponent,
   ],
   template: `
@@ -76,8 +209,12 @@ interface FrozenJobData {
       } @else if (job()!.status !== 'pending_review') {
         <div class="not-review-state">
           <div class="status-info">
-            <app-badge [tone]="jobStatusTone(job()!.status)" size="sm">
-              {{ job()!.status }}
+            <app-badge [tone]="jobStatusTone(effectiveJobStatus(job()!))" size="sm">
+              @if (jobStatusLabelKey(effectiveJobStatus(job()!)); as statusKey) {
+                {{ statusKey | transloco }}
+              } @else {
+                {{ effectiveJobStatus(job()!) }}
+              }
             </app-badge>
           </div>
           <span class="status-message">
@@ -86,11 +223,19 @@ interface FrozenJobData {
           <span class="job-desc">{{ job()!.description }}</span>
         </div>
       } @else if (job()!.diff_status === 'pending') {
-        <!-- Mode A diff review (see docs/done/job_cloud_export.md) -->
-        <app-job-diff-review
-          [jobId]="job()!.id"
-          (resolved)="onDiffResolved()"
-        />
+        <!-- Mode A diff review (see knowledge-history/done/job_cloud_export.md).
+             @defer keeps the review surface (and Monaco's loader with it) out
+             of the initial bundle, which sits at 2.70MB against a 2.75MB
+             hard-error budget. It is only lazy if EVERY usage site defers it —
+             the two in persistent-chat.component.ts do too. -->
+        @defer {
+          <app-job-diff-review
+            [jobId]="job()!.id"
+            (resolved)="onDiffResolved()"
+          />
+        } @placeholder {
+          <div class="diff-defer-placeholder"></div>
+        }
       } @else {
         <!-- Pending Review State -->
         <div class="review-content">
@@ -99,8 +244,15 @@ interface FrozenJobData {
             <div class="section-header">{{ 'jobReview.sections.job' | transloco }}</div>
             <div class="job-description">{{ job()!.description }}</div>
             <div class="job-meta">
-              <span class="meta-item">{{ 'jobReview.meta.id' | transloco: {id: job()!.id.slice(0, 8)} }}</span>
+              <app-copy-field class="meta-item" [label]="'jobReview.meta.jobId' | transloco" [value]="job()!.id" />
               <span class="meta-item">{{ 'jobReview.meta.created' | transloco: {date: formatDate(job()!.created_at)} }}</span>
+              @if (job()!.workspace_contract) {
+                <span
+                  class="meta-item workspace-contract"
+                  [class.warning]="job()!.workspace_contract!.state !== 'ready'"
+                  [title]="workspaceContractTitle()"
+                >{{ workspaceContractSummary() }}</span>
+              }
             </div>
           </div>
 
@@ -154,28 +306,119 @@ interface FrozenJobData {
             </div>
           }
 
-          <!-- Workspace Links -->
-          @if (getWorkspaceUrl() || hasSnapshot()) {
-            <div class="section workspace-links">
-              @if (getWorkspaceUrl()) {
-                <app-button variant="secondary" size="sm" (clicked)="openWorkspace()">
-                  {{ 'jobReview.links.browseWorkspace' | transloco }}
-                </app-button>
+          <!-- Delivery Links -->
+          @if (
+            sourceRepositoryUrl() ||
+            deliveryBranchUrl() ||
+            pullRequest() ||
+            getJobWorkspaceUrl() ||
+            hasSnapshot()
+          ) {
+            <div class="section delivery-section">
+              <div class="section-header">{{ 'jobReview.sections.delivery' | transloco }}</div>
+              <div class="delivery-links">
+                @if (sourceRepositoryUrl()) {
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    (clicked)="openExternal(sourceRepositoryUrl()!)"
+                  >
+                    {{ 'jobReview.links.sourceRepository' | transloco }}
+                  </app-button>
+                }
+                @if (deliveryBranchUrl()) {
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    (clicked)="openExternal(deliveryBranchUrl()!)"
+                  >
+                    {{ 'jobReview.links.branch' | transloco: { branch: deliveryBranch() } }}
+                  </app-button>
+                }
+                @if (pullRequest(); as pr) {
+                  <app-button variant="info" size="sm" (clicked)="openExternal(pr.url)">
+                    {{ 'jobReview.links.pullRequest' | transloco: { number: pr.number } }}
+                    @if (pullRequestStatus(); as live) {
+                      · {{ ('jobReview.links.pullRequestState.' + live.state) | transloco }}
+                    } @else if (pullRequestStatusUnavailable()) {
+                      · {{ 'jobReview.links.pullRequestState.unavailable' | transloco }}
+                    }
+                  </app-button>
+                }
+                @if (pullRequest() && sourceRepository()) {
+                  <app-button
+                    variant="primary"
+                    size="sm"
+                    [loading]="reviewSessionLoading()"
+                    (clicked)="reviewInSession()"
+                  >
+                    @if (reviewSessionLoading()) {
+                      {{ 'jobReview.actions.preparingReviewSession' | transloco }}
+                    } @else {
+                      {{ 'jobReview.actions.reviewInSession' | transloco }}
+                    }
+                  </app-button>
+                }
+                @if (getJobWorkspaceUrl()) {
+                  <app-button variant="ghost" size="sm" (clicked)="openJobWorkspace()">
+                    {{ 'jobReview.links.jobWorkspace' | transloco }}
+                  </app-button>
+                }
+                @if (hasSnapshot()) {
+                  <app-button
+                    variant="ghost"
+                    size="sm"
+                    [loading]="ideLoading()"
+                    (clicked)="openIde()"
+                  >
+                    @if (ideLoading()) {
+                      {{ 'jobReview.links.startingIde' | transloco }}
+                    } @else {
+                      {{ 'jobReview.links.openIde' | transloco }}
+                    }
+                  </app-button>
+                }
+              </div>
+              @if (pullRequest() && sourceRepository()) {
+                <div class="review-session-hint">
+                  {{ 'jobReview.reviewSessionHint' | transloco }}
+                </div>
               }
-              @if (hasSnapshot()) {
+            </div>
+          }
+
+          <!-- Cloud folder preview (Mode B "open folder"). Export and open are
+               two separate clicks: the export takes longer than the browser's
+               transient-activation window, so an auto-open after it would be
+               popup-blocked. -->
+          @if (job()!.cloud_review_mode === 'open_folder') {
+            <div class="section cloud-folder">
+              @if (job()!.exported_folder_url) {
                 <app-button
                   variant="info"
                   size="sm"
-                  [loading]="ideLoading()"
-                  (clicked)="openIde()"
+                  (clicked)="openExportedFolder()"
                 >
-                  @if (ideLoading()) {
-                    {{ 'jobReview.links.startingIde' | transloco }}
-                  } @else {
-                    {{ 'jobReview.links.openIde' | transloco }}
-                  }
+                  {{ 'jobReview.links.openCloudFolder' | transloco }}
                 </app-button>
               }
+              <app-button
+                [variant]="job()!.exported_at ? 'secondary' : 'info'"
+                size="sm"
+                [loading]="isExportingToCloud()"
+                (clicked)="exportToCloud()"
+              >
+                @if (isExportingToCloud()) {
+                  {{ 'jobReview.actions.exportingToCloud' | transloco }}
+                } @else if (job()!.exported_at) {
+                  {{ 'jobReview.actions.resyncCloudFolder' | transloco }}
+                } @else {
+                  {{ 'jobReview.actions.exportToCloud' | transloco }}
+                }
+              </app-button>
+              <div class="cloud-folder-hint">
+                {{ 'jobReview.cloudFolderDisclaimer' | transloco }}
+              </div>
             </div>
           }
 
@@ -311,7 +554,7 @@ interface FrozenJobData {
         align-items: center;
         gap: 8px;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -336,7 +579,7 @@ interface FrozenJobData {
         gap: 12px;
         padding: 40px 20px;
         flex: 1;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         text-align: center;
       }
 
@@ -376,7 +619,7 @@ interface FrozenJobData {
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .job-description {
@@ -390,7 +633,11 @@ interface FrozenJobData {
         gap: 12px;
         font-size: 10px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
+      }
+
+      .workspace-contract.warning {
+        color: var(--warning);
       }
 
       .summary-text {
@@ -401,7 +648,7 @@ interface FrozenJobData {
       }
 
       .summary-text.muted {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-style: italic;
       }
 
@@ -452,10 +699,32 @@ interface FrozenJobData {
         font-style: italic;
       }
 
-      .workspace-links {
+      .delivery-section {
+        gap: 8px;
+      }
+
+      .delivery-links {
         display: flex;
         gap: 8px;
         flex-wrap: wrap;
+      }
+
+      .review-session-hint {
+        color: var(--text-secondary, var(--text-secondary));
+        font-size: 0.8em;
+        line-height: 1.4;
+      }
+
+      .cloud-folder {
+        gap: 6px;
+        align-items: flex-start;
+      }
+
+      .cloud-folder-hint {
+        color: var(--text-secondary, var(--text-secondary));
+        font-size: 0.8em;
+        font-style: italic;
+        line-height: 1.4;
       }
 
       /* Actions */
@@ -493,7 +762,7 @@ interface FrozenJobData {
         padding: 0 12px;
         background: var(--panel-bg, var(--panel-bg));
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.5px;
       }
@@ -562,9 +831,53 @@ export class JobReviewComponent {
   private readonly api = inject(ApiService);
   private readonly data = inject(DataService);
   private readonly transloco = inject(TranslocoService);
+  private readonly router = inject(Router);
 
   readonly currentJobId = this.data.currentJobId;
   readonly job = signal<Job | null>(null);
+  readonly repositoryDatasources = signal<Datasource[]>([]);
+  readonly pullRequestStatus = signal<PullRequestStatus | null>(null);
+  readonly pullRequestStatusUnavailable = signal(false);
+  readonly pullRequest = computed(() => pullRequestFromJob(this.job()));
+  readonly sourceRepository = computed(() =>
+    selectDeliveryRepository(this.repositoryDatasources(), this.pullRequest()),
+  );
+  readonly sourceRepositoryUrl = computed(() =>
+    repositoryWebUrl(this.sourceRepository()?.connection_url),
+  );
+  readonly deliveryBranch = computed(() => this.pullRequest()?.head || null);
+  readonly deliveryForge = computed(
+    () => this.pullRequest()?.forge || this.sourceRepository()?.config?.forge || null,
+  );
+  readonly deliveryBranchUrl = computed(() =>
+    repositoryBranchUrl(
+      this.sourceRepository()?.connection_url,
+      this.deliveryBranch(),
+      this.deliveryForge(),
+    ),
+  );
+
+  workspaceContractSummary(): string {
+    const workspace = this.job()?.workspace_contract;
+    if (!workspace) return '';
+    return this.transloco.translate('jobs.workspace.summary', {
+      requested:
+        workspace.requested_backend ?? this.transloco.translate('jobs.workspace.default'),
+      assigned:
+        workspace.assigned_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
+      effective:
+        workspace.effective_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
+    });
+  }
+
+  workspaceContractTitle(): string {
+    const workspace = this.job()?.workspace_contract;
+    if (!workspace) return '';
+    return this.transloco.translate('jobs.workspace.state', {
+      state: workspace.state,
+      failure: workspace.failure ?? this.transloco.translate('jobs.workspace.none'),
+    });
+  }
   readonly frozenData = signal<FrozenJobData | null>(null);
   readonly isLoading = signal(false);
   readonly isApproving = signal(false);
@@ -574,6 +887,10 @@ export class JobReviewComponent {
   readonly resultIsError = signal(false);
   readonly confirmingApprove = signal(false);
   readonly ideLoading = signal(false);
+  readonly isExportingToCloud = signal(false);
+  readonly reviewSessionLoading = signal(false);
+  private readonly maxIdePollAttempts = 100;
+  private idePollAttempts = 0;
   private confirmTimeout: ReturnType<typeof setTimeout> | null = null;
   private idePollingInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -587,6 +904,9 @@ export class JobReviewComponent {
         this.loadJob();
       } else {
         this.job.set(null);
+        this.repositoryDatasources.set([]);
+        this.pullRequestStatus.set(null);
+        this.pullRequestStatusUnavailable.set(false);
         this.frozenData.set(null);
         this.resultMessage.set(null);
       }
@@ -609,10 +929,20 @@ export class JobReviewComponent {
 
     this.isLoading.set(true);
     this.resultMessage.set(null);
+    this.repositoryDatasources.set([]);
+    this.pullRequestStatus.set(null);
+    this.pullRequestStatusUnavailable.set(false);
 
     this.api.getJob(jobId).subscribe((job) => {
       this.job.set(job);
       this.isLoading.set(false);
+
+      if (job) {
+        this.loadRepositoryDatasources(jobId);
+        if (this.pullRequest()) {
+          this.loadPullRequestStatus(jobId);
+        }
+      }
 
       // If pending_review, also fetch workspace to get frozen job data
       if (job?.status === 'pending_review') {
@@ -629,7 +959,22 @@ export class JobReviewComponent {
     });
   }
 
-  getWorkspaceUrl(): string | null {
+  private loadRepositoryDatasources(jobId: string): void {
+    this.api.getJobDatasources(jobId).subscribe((datasources) => {
+      if (this.currentJobId() !== jobId) return;
+      this.repositoryDatasources.set(datasources.filter((item) => item.type === 'repository'));
+    });
+  }
+
+  private loadPullRequestStatus(jobId: string): void {
+    this.api.getJobPullRequestStatus(jobId).subscribe((status) => {
+      if (this.currentJobId() !== jobId) return;
+      this.pullRequestStatus.set(status);
+      this.pullRequestStatusUnavailable.set(status === null);
+    });
+  }
+
+  getJobWorkspaceUrl(): string | null {
     const currentJob = this.job();
     const giteaUrl = environment.giteaUrl;
     if (!giteaUrl || !currentJob) return null;
@@ -640,13 +985,38 @@ export class JobReviewComponent {
     return `${giteaUrl}/${repoName}`;
   }
 
-  openWorkspace(): void {
+  openJobWorkspace(): void {
     const currentJob = this.job();
     if (!currentJob) return;
-    const url = this.getWorkspaceUrl();
+    const url = this.getJobWorkspaceUrl();
     if (!url) return;
     this.api.ensureWorkspaceAccess(currentJob.id).subscribe(() => {
       window.open(url, '_blank');
+    });
+  }
+
+  openExternal(url: string): void {
+    const safeUrl = safeHttpUrl(url);
+    if (safeUrl) window.open(safeUrl, '_blank', 'noopener');
+  }
+
+  reviewInSession(): void {
+    const jobId = this.currentJobId();
+    if (!jobId || this.reviewSessionLoading()) return;
+
+    this.reviewSessionLoading.set(true);
+    this.resultMessage.set(null);
+    this.resultIsError.set(false);
+    this.api.createJobReviewSession(jobId).subscribe((result) => {
+      this.reviewSessionLoading.set(false);
+      if (!result?.thread_id) {
+        this.resultMessage.set(
+          this.transloco.translate('jobReview.messages.reviewSessionFailed'),
+        );
+        this.resultIsError.set(true);
+        return;
+      }
+      void this.router.navigate(['/sessions', result.thread_id]);
     });
   }
 
@@ -657,8 +1027,13 @@ export class JobReviewComponent {
     if (currentJob.parent_job_id) return false;
     // Show IDE button if: live VM, snapshot available, or has Gitea repo
     if (currentJob.status === 'processing') return true;
-    const snapshotStatus = currentJob.context?.['snapshot']?.['status'];
-    if (snapshotStatus === 'available') return true;
+    // context is JSONB and may arrive as a raw JSON string, so it must be
+    // coerced before indexing — a direct index compiles and then silently
+    // yields undefined, which here quietly hid the IDE button for any
+    // snapshot-only job. Surfaced when Job.context's type was corrected
+    // (2026-07-29).
+    const snapshot = asRecord(asRecord(currentJob.context)?.['snapshot']);
+    if (snapshot?.['status'] === 'available') return true;
     return !!currentJob.repo_name;
   }
 
@@ -668,6 +1043,8 @@ export class JobReviewComponent {
     const jobId = currentJob.id;
 
     this.ideLoading.set(true);
+    this.resultMessage.set(null);
+    this.resultIsError.set(false);
 
     this.api.getIdeSession(jobId).subscribe((result) => {
       if (!result) {
@@ -685,7 +1062,17 @@ export class JobReviewComponent {
 
       if (result.status === 'available' || result.status === 'expired' || result.status === 'failed') {
         this.api.startIdeSession(jobId).subscribe((startResult) => {
-          if (!startResult || startResult.status === 'unavailable' || startResult.status === 'failed') {
+          if (!startResult) {
+            this.resultMessage.set('Failed to start IDE session');
+            this.resultIsError.set(true);
+            this.ideLoading.set(false);
+            return;
+          }
+          if (startResult.status === 'unavailable' || startResult.status === 'failed') {
+            this.resultMessage.set(
+              startResult.error || 'Failed to start IDE session',
+            );
+            this.resultIsError.set(true);
             this.ideLoading.set(false);
             return;
           }
@@ -699,14 +1086,29 @@ export class JobReviewComponent {
         return;
       }
 
+      if (result.status === 'unavailable') {
+        this.resultMessage.set('IDE session is currently unavailable');
+        this.resultIsError.set(true);
+      }
       this.ideLoading.set(false);
     });
   }
 
   private pollIdeSession(jobId: string): void {
     if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+    this.idePollAttempts = 0;
 
     this.idePollingInterval = setInterval(() => {
+      this.idePollAttempts += 1;
+      if (this.idePollAttempts > this.maxIdePollAttempts) {
+        if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+        this.idePollingInterval = null;
+        this.ideLoading.set(false);
+        this.resultMessage.set('IDE session still restoring after 5 minutes');
+        this.resultIsError.set(true);
+        return;
+      }
+
       this.api.getIdeSession(jobId).subscribe((result) => {
         if (!result) return;
 
@@ -721,6 +1123,10 @@ export class JobReviewComponent {
           if (this.idePollingInterval) clearInterval(this.idePollingInterval);
           this.idePollingInterval = null;
           this.ideLoading.set(false);
+          this.resultMessage.set(
+            result.error || 'Failed to prepare IDE session',
+          );
+          this.resultIsError.set(true);
         }
       });
     }, 3000);
@@ -821,27 +1227,54 @@ export class JobReviewComponent {
     });
   }
 
-  jobStatusTone(status: string): BadgeTone {
-    switch (status) {
-      case 'completed':
-        return 'success';
-      case 'processing':
-      case 'pending_review':
-        return 'warning';
-      case 'failed':
-        return 'danger';
-      case 'created':
-      case 'waiting':
-        return 'info';
-      case 'reviewing':
-        return 'accent';
-      case 'cancelled':
-      case 'paused':
-        return 'neutral';
-      default:
-        return 'neutral';
+  /**
+   * Copy the job's declared deliverables into its shared cloud folder. The
+   * endpoint is re-syncable, so this doubles as "re-sync" after a
+   * resume-with-feedback. Does not open the folder — that's
+   * {@link openExportedFolder}, a separate click, because the copy regularly
+   * outlives the ~5s of transient user activation a popup needs.
+   * exportJobToSharedFolder toasts success/error.
+   */
+  exportToCloud(): void {
+    const jobId = this.currentJobId();
+    if (!jobId) return;
+
+    this.isExportingToCloud.set(true);
+    this.resultMessage.set(null);
+
+    this.api.exportJobToSharedFolder(jobId).subscribe((result) => {
+      this.isExportingToCloud.set(false);
+      if (result) {
+        this.resultIsError.set(false);
+        // Refresh so exported_at ("last synced at") and exported_folder_url
+        // land — the latter is what reveals the "Open cloud folder" button.
+        this.loadJob();
+      } else {
+        this.resultMessage.set(
+          this.transloco.translate('jobReview.messages.openCloudFolderFailed'),
+        );
+        this.resultIsError.set(true);
+      }
+    });
+  }
+
+  /** Open the already-exported folder. Synchronous inside the click handler so
+   *  the browser keeps user activation and allows the new tab. */
+  openExportedFolder(): void {
+    const url = this.job()?.exported_folder_url;
+    if (url) {
+      window.open(url, '_blank', 'noopener');
     }
   }
+
+  /** Delegates to the shared helper — this was copy-pasted in two
+   *  components before the job tool card became the third consumer. */
+  jobStatusTone(status: string): BadgeTone {
+    return sharedJobStatusTone(status);
+  }
+
+  protected readonly effectiveJobStatus = effectiveJobStatus;
+  protected readonly jobStatusLabelKey = jobStatusLabelKey;
 
   formatDate(dateString: string): string {
     const date = new Date(dateString);

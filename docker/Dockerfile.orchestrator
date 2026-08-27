@@ -31,16 +31,33 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Production image
 FROM python:3.11-slim
 
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+
 LABEL maintainer="SRW Team"
 LABEL description="Orchestrator API for agent management and cockpit backend"
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="orchestrator"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
-    PORT=8085
+    PORT=8085 \
+    SRW_COMPONENT=orchestrator \
+    SRW_SOURCE_REVISION=${SRW_SOURCE_REVISION} \
+    SRW_SOURCE_URL=${SRW_SOURCE_URL} \
+    SRW_RELEASE_VERSION=${SRW_RELEASE_VERSION} \
+    SRW_DOCUMENTATION_URL=${SRW_DOCUMENTATION_URL}
 
 # Create non-root user early so COPY --chown can reference it
-RUN groupadd -r srw && useradd -r -g srw srw
+# Keep the runtime identity numeric and stable: Kubernetes cannot prove that a
+# named image user satisfies runAsNonRoot, and the collector Pod pins this ID.
+RUN groupadd -r -g 999 srw && useradd -r -u 999 -g srw srw
 
 WORKDIR /app
 
@@ -50,7 +67,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
+    git \
+    libmagic1 \
     openssh-client \
+    rclone \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder (system-owned, read-only is fine)
@@ -66,6 +87,19 @@ COPY --chown=srw:srw src/ ./src/
 # Copy agent config directory (expert definitions, defaults, prompts, templates)
 COPY --chown=srw:srw config/ ./config/
 
+# Keep the metering package and the main entrypoint image-atomic. This import
+# catches selective/stale build contexts before an image can be published.
+RUN python -c "import services.infrastructure_metering.compute_activation"
+# Fail the image build if the always-on session-memory drain accidentally
+# regains an agent-only import dependency.
+RUN python -c "import services.session_memory_executor"
+# The COPY above flattens orchestrator/ into /app, so there is no `orchestrator`
+# package at runtime: a `from orchestrator.services.X import ...` inside these
+# modules crash-loops the pod on the very first import. tests/conftest.py puts
+# BOTH the repo root and orchestrator/ on sys.path, so pytest resolves either
+# spelling and cannot see it. This import runs against the real flattened layout.
+RUN python -c "import services.email, services.headless_notifications"
+
 # Marker so get_project_root() finds /app (no .git in container)
 RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml
 
@@ -76,4 +110,10 @@ EXPOSE 8085
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:${PORT}/api/health || exit 1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8085"]
+# --timeout-graceful-shutdown caps uvicorn's wait for in-flight connections to
+# close on SIGTERM. Without it uvicorn waits indefinitely ("Waiting for
+# connections to close"); with long-lived agent/SSE connections present, the
+# lifespan shutdown — and with it the M1 leader-election advisory-unlock — never
+# runs before the 60s SIGKILL, so leadership handoff takes the full grace period
+# instead of a clean step-down. 10s leaves ample headroom under the 60s grace.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8085", "--timeout-graceful-shutdown", "10"]

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.core.loader import InstructionFileEntry
 from src.tools.context import ToolContext
 
 
@@ -36,6 +37,11 @@ class FakeInstructionEntry:
     trigger_type: str
     trigger_target: str
     enforce: bool
+
+    @property
+    def path(self) -> str:
+        """Mirror InstructionFileEntry.path; file-bound entries resolve to file."""
+        return self.file
 
 
 # =============================================================================
@@ -205,6 +211,26 @@ class TestHasMethods:
         ctx = ToolContext(workspace_manager=ws)
         assert ctx.has_git() is False
 
+    def test_has_knowledge_true_with_store_only(self):
+        # PR4c-3 flip: Neo4j is optional. The pgvector store is the sole
+        # requirement — a graph-less deployment must still load KB tools.
+        ctx = ToolContext(knowledge_store=MagicMock(), knowledge_graph=None)
+        assert ctx.has_knowledge() is True
+
+    def test_has_knowledge_true_with_both(self):
+        ctx = ToolContext(knowledge_store=MagicMock(), knowledge_graph=MagicMock())
+        assert ctx.has_knowledge() is True
+
+    def test_has_knowledge_false_without_store(self):
+        # Graph present but store absent: retrieval is impossible, so the KB
+        # is not available regardless of Neo4j.
+        ctx = ToolContext(knowledge_store=None, knowledge_graph=MagicMock())
+        assert ctx.has_knowledge() is False
+
+    def test_has_knowledge_false_when_nothing(self):
+        ctx = ToolContext()
+        assert ctx.has_knowledge() is False
+
 
 # =============================================================================
 # db property and get_config
@@ -268,6 +294,30 @@ class TestReadTracking:
         ctx.record_file_read("  foo.md  ")
         assert ctx.was_recently_read("foo.md") is True
 
+    def test_user_edit_invalidation_requires_a_fresh_read(self):
+        ctx = ToolContext()
+        ctx.record_file_read("/output/report.md", "# Before\n")
+
+        assert ctx.recent_read_matches("output/report.md", "# Before\n") is True
+        assert ctx.invalidate_recent_read("output/report.md") is True
+        assert ctx.was_recently_read("output/report.md") is False
+        assert ctx.recent_read_matches("output/report.md", "# Before\n") is False
+        assert ctx.invalidate_recent_read("output/report.md") is False
+
+    def test_versioned_read_detects_changed_full_text(self):
+        ctx = ToolContext()
+        ctx.record_file_read("output/report.md", "# Before\n")
+
+        assert ctx.recent_read_matches("output/report.md", "# Before\n") is True
+        assert ctx.recent_read_matches("output/report.md", "# User edit\n") is False
+
+    def test_path_only_read_preserves_instruction_enforcement_semantics(self):
+        ctx = ToolContext()
+        ctx.record_file_read("AGENTS.md")
+
+        assert ctx.was_recently_read("AGENTS.md") is True
+        assert ctx.recent_read_matches("AGENTS.md", "content not tracked") is False
+
     def test_deque_eviction(self):
         """Recording 11th file should evict the oldest (maxlen=10)."""
         ctx = ToolContext()
@@ -302,6 +352,173 @@ class TestReadTracking:
     def test_get_read_tracking_limit_from_config(self):
         ctx = ToolContext(config={"read_tracking_limit": 20})
         assert ctx.get_read_tracking_limit() == 20
+
+
+# =============================================================================
+# Instruction-file pinning (FIFO eviction exemption)
+# =============================================================================
+
+
+class TestInstructionPinning:
+    """Instruction-file paths are exempt from FIFO eviction once read.
+
+    Any 10 reads used to evict the todo-guide skill and re-arm the
+    enforce-gate — one forced guide re-read per strategic phase. Pinned
+    paths stay "recently read"; the write-authorization path
+    (recent_read_matches) deliberately ignores the pin.
+    """
+
+    def _ctx_with_guide(self):
+        ctx = ToolContext()
+        ctx._instruction_files = [
+            FakeInstructionEntry(
+                "skills/todo-guide/SKILL.md", "before_tool", "next_phase_todos", True
+            ),
+        ]
+        return ctx
+
+    def test_instruction_file_survives_many_subsequent_reads(self):
+        ctx = self._ctx_with_guide()
+        ctx.record_file_read("skills/todo-guide/SKILL.md")
+        for i in range(25):
+            ctx.record_file_read(f"file_{i}.md")
+
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is True
+        # Enforce-gate stays satisfied — no forced re-read
+        assert ctx.check_tool_enforcement("next_phase_todos") is None
+
+    def test_normal_files_still_evict(self):
+        ctx = self._ctx_with_guide()
+        ctx.record_file_read("skills/todo-guide/SKILL.md")
+        ctx.record_file_read("notes/facts.md")
+        for i in range(10):
+            ctx.record_file_read(f"file_{i}.md")
+
+        assert ctx.was_recently_read("notes/facts.md") is False
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is True
+
+    def test_invalidate_clears_pin(self):
+        ctx = self._ctx_with_guide()
+        ctx.record_file_read("skills/todo-guide/SKILL.md")
+        for i in range(10):
+            ctx.record_file_read(f"file_{i}.md")  # evicted from deque, pin holds
+
+        assert ctx.invalidate_recent_read("skills/todo-guide/SKILL.md") is True
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is False
+
+    def test_pin_does_not_authorize_writes(self):
+        """recent_read_matches (write authorization) ignores the pin."""
+        ctx = self._ctx_with_guide()
+        ctx.record_file_read("skills/todo-guide/SKILL.md", "guide body")
+        for i in range(10):
+            ctx.record_file_read(f"file_{i}.md")
+
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is True
+        assert (
+            ctx.recent_read_matches("skills/todo-guide/SKILL.md", "guide body") is False
+        )
+
+    def test_unconfigured_paths_are_not_pinned(self):
+        ctx = ToolContext()
+        ctx.record_file_read("skills/todo-guide/SKILL.md")
+        for i in range(10):
+            ctx.record_file_read(f"file_{i}.md")
+
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is False
+
+    def test_worker_checkpoint_receipt_restores_enforcement_not_write_authority(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        source_ws = _make_workspace_manager()
+        source = ToolContext(workspace_manager=source_ws)
+        source._instruction_files = [entry]
+        source.set_current_phase("tactical", phase_number=2, turn_count=10)
+        source.record_file_read(entry.path, "guide version one")
+
+        receipts = source.export_instruction_read_receipts()
+
+        successor_ws = _make_workspace_manager()
+        successor_ws.read_file.return_value = "guide version one"
+        successor = ToolContext(workspace_manager=successor_ws)
+        successor._instruction_files = [entry]
+        assert successor.restore_instruction_read_receipts(receipts) == 1
+        successor.set_current_phase("tactical", phase_number=2, turn_count=11)
+        assert successor.check_tool_enforcement("todo_complete") is None
+        # The durable receipt can satisfy instruction enforcement, but cannot
+        # authorize a mutation of that file on a new lease.
+        assert not successor.recent_read_matches(entry.path, "guide version one")
+
+        successor.set_current_phase("tactical", phase_number=4, turn_count=12)
+        assert successor.check_tool_enforcement("todo_complete") is not None
+
+    def test_worker_checkpoint_receipt_fails_closed_when_instruction_changed(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        source = ToolContext(workspace_manager=_make_workspace_manager())
+        source._instruction_files = [entry]
+        source.set_current_phase("tactical", phase_number=2, turn_count=10)
+        source.record_file_read(entry.path, "old guide")
+
+        successor_ws = _make_workspace_manager()
+        successor_ws.read_file.return_value = "new guide"
+        successor = ToolContext(workspace_manager=successor_ws)
+        successor._instruction_files = [entry]
+        assert (
+            successor.restore_instruction_read_receipts(
+                source.export_instruction_read_receipts()
+            )
+            == 0
+        )
+        successor.set_current_phase("tactical", phase_number=2, turn_count=11)
+        assert successor.check_tool_enforcement("todo_complete") is not None
+
+    def test_worker_checkpoint_receipt_keeps_version_across_handoffs_and_fifo(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        source = ToolContext(workspace_manager=_make_workspace_manager())
+        source._instruction_files = [entry]
+        source.set_current_phase("tactical", phase_number=2, turn_count=10)
+        source.record_file_read(entry.path, "guide version one")
+        for index in range(25):
+            source.record_file_read(f"notes/read-{index}.md", str(index))
+
+        first_receipts = source.export_instruction_read_receipts()
+        expected_version = first_receipts[entry.path]["content_version"]
+
+        second_ws = _make_workspace_manager()
+        second_ws.read_file.return_value = "guide version one"
+        second = ToolContext(workspace_manager=second_ws)
+        second._instruction_files = [entry]
+        assert second.restore_instruction_read_receipts(first_receipts) == 1
+        # A restored enforcement receipt must never become write authority.
+        assert entry.path not in second._recent_read_versions
+        assert not second.recent_read_matches(entry.path, "guide version one")
+
+        second_receipts = second.export_instruction_read_receipts()
+        assert second_receipts[entry.path]["content_version"] == expected_version
+
+        third_ws = _make_workspace_manager()
+        third_ws.read_file.return_value = "guide version two"
+        third = ToolContext(workspace_manager=third_ws)
+        third._instruction_files = [entry]
+        assert third.restore_instruction_read_receipts(second_receipts) == 0
+        third.set_current_phase("tactical", phase_number=2, turn_count=11)
+        assert third.check_tool_enforcement("todo_complete") is not None
 
 
 # =============================================================================
@@ -373,9 +590,64 @@ class TestInstructionEnforcement:
         ctx = ToolContext()
         assert ctx.check_tool_enforcement("read_file") is None
 
+    def test_phase_filtered_gate_only_applies_in_selected_phase(self):
+        ctx = ToolContext()
+        ctx._instruction_files = [
+            InstructionFileEntry(
+                trigger="before_tool:todo_complete",
+                skill="verify-before-done",
+                phases=["tactical"],
+                read_scope="phase",
+                max_read_age_turns=20,
+            )
+        ]
+
+        ctx.set_current_phase("strategic", phase_number=1, turn_count=3)
+        assert ctx.check_tool_enforcement("todo_complete") is None
+
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=4)
+        assert ctx.check_tool_enforcement("todo_complete") is not None
+
+    def test_phase_scoped_read_does_not_unlock_a_later_phase(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        ctx = ToolContext()
+        ctx._instruction_files = [entry]
+        path = entry.path
+
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=5)
+        ctx.record_file_read(path)
+        assert ctx.check_tool_enforcement("todo_complete") is None
+
+        ctx.set_current_phase("tactical", phase_number=4, turn_count=9)
+        assert ctx.check_tool_enforcement("todo_complete") is not None
+
+    def test_instruction_read_expires_after_configured_llm_turns(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        ctx = ToolContext()
+        ctx._instruction_files = [entry]
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=10)
+        ctx.record_file_read(entry.path)
+
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=30)
+        assert ctx.check_tool_enforcement("todo_complete") is None
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=31)
+        assert ctx.check_tool_enforcement("todo_complete") is not None
+
     def test_get_phase_instruction_files_strategic(self):
-        """Should return entries matching phase='strategic'."""
-        entry = FakeInstructionEntry("strat.md", "phase", "strategic", False)
+        """Should return phase_start entries and the legacy phase alias."""
+        entry = FakeInstructionEntry("strat.md", "phase_start", "strategic", False)
         ctx = ToolContext()
         ctx._instruction_files = [
             entry,
@@ -540,7 +812,11 @@ class TestCitationEngine:
         ctx.close_citation_engine()  # Should not raise
 
     def test_close_clears_state(self):
-        """close_citation_engine should clear engine and registries."""
+        """close_citation_engine should clear engine and registries.
+
+        It must NOT call engine.close() — the engine borrows the agent's
+        shared vector pool, which the agent closes on shutdown (see c420f066).
+        """
         engine = MagicMock()
         ctx = ToolContext(citation_engine=engine)
         ctx._source_registry = {"a": 1, "b": 2}
@@ -548,4 +824,4 @@ class TestCitationEngine:
 
         assert ctx.citation_engine is None
         assert ctx._source_registry == {}
-        engine.close.assert_called_once()
+        engine.close.assert_not_called()

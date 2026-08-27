@@ -1,7 +1,7 @@
 """Guardrails resolution and injection for model-family-specific surface forms.
 
 This module is the runtime side of the guardrails matrix design
-(``docs/design/guardrails_matrix.md``). It does three things:
+(``knowledge-base/knowledge/design/guardrails_matrix.md``). It does three things:
 
 1. **Tool docstring injection** — ``apply_guardrails_to_tools`` rewrites the
    ``Examples:`` block in each bound tool's description so the model sees
@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 KNOWN_NUDGES: Dict[str, Set[str]] = {
     # src/graph.py recovery + phase nudges
     "todo_action": {"todo_id"},
-    "budget_rewind": {"used", "cap"},
     "degenerate_recovery_assistant": set(),
     "degenerate_recovery_user": {"pattern_detail"},
     "loop_warning_suffix": set(),
@@ -49,6 +48,7 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
         "todo_count",
     },
     "phase_transition_tactical_to_strategic": {"phase_number"},
+    "act_ratio_nudge": {"count"},
     # src/managers/todo.py
     "todo_list_footer": set(),
     # src/services/recall_store.py

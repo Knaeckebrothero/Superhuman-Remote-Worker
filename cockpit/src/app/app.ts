@@ -1,5 +1,7 @@
-import {Component, computed, effect, inject, OnInit} from '@angular/core';
-import {RouterOutlet} from '@angular/router';
+import {Component, DestroyRef, computed, effect, inject, OnInit, signal} from '@angular/core';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {ActivatedRoute, NavigationEnd, Router, RouterOutlet} from '@angular/router';
+import {filter} from 'rxjs';
 import {SidebarComponent} from './shell/sidebar/sidebar.component';
 import {AppToastContainerComponent} from './ui/toast';
 import {ComponentRegistryService} from './core/services/component-registry.service';
@@ -7,14 +9,14 @@ import {ViewportService} from './core/services/viewport.service';
 import {UserService} from './core/services/user.service';
 import {SidebarService} from './core/services/sidebar.service';
 import {ActionCenterService} from './core/services/action-center.service';
-// Debug-only components
-import {PlaceholderAComponent} from './debug/components/placeholders/placeholder-a.component';
-import {PlaceholderBComponent} from './debug/components/placeholders/placeholder-b.component';
-import {PlaceholderCComponent} from './debug/components/placeholders/placeholder-c.component';
-import {DbTableComponent} from './debug/components/db-table/db-table.component';
-import {AgentActivityComponent} from './debug/components/agent-activity/agent-activity.component';
-import {RequestViewerComponent} from './debug/components/request-viewer/request-viewer.component';
-import {GraphTimelineComponent} from './debug/components/graph-timeline/graph-timeline.component';
+// Workbench-only components
+import {PlaceholderAComponent} from './workbench/components/placeholders/placeholder-a.component';
+import {PlaceholderBComponent} from './workbench/components/placeholders/placeholder-b.component';
+import {PlaceholderCComponent} from './workbench/components/placeholders/placeholder-c.component';
+import {DbTableComponent} from './workbench/components/db-table/db-table.component';
+import {AgentActivityComponent} from './workbench/components/agent-activity/agent-activity.component';
+import {RequestViewerComponent} from './workbench/components/request-viewer/request-viewer.component';
+import {GraphTimelineComponent} from './workbench/components/graph-timeline/graph-timeline.component';
 // Shared components
 import {TodoListComponent} from './views/todos/todo-list.component';
 import {ChatHistoryComponent} from './views/chat-history/chat-history.component';
@@ -22,16 +24,17 @@ import {AgentListComponent} from './views/agents/agent-list.component';
 import {JobListComponent} from './views/jobs/job-list.component';
 import {JobCreateComponent} from './views/create/job-create.component';
 import {StatisticsComponent} from './views/statistics/statistics.component';
-import {DatasourceListComponent} from './views/datasources/datasource-list.component';
+import {DatasourceListLoaderComponent} from './views/datasources/datasource-list-loader.component';
+import {ExpertsListComponent} from './views/experts/experts-list.component';
 import {JobReviewComponent} from './views/job-review/job-review.component';
 import {WorkspaceBrowserComponent} from './views/workspace-browser/workspace-browser.component';
-import {InstructionBuilderComponent} from './views/instruction-builder/instruction-builder.component';
 import {ProjectListPageComponent} from './views/projects/project-list.component';
-import {MemoryPanelComponent} from './debug/components/memory-panel/memory-panel.component';
+import {MemoryPanelComponent} from './workbench/components/memory-panel/memory-panel.component';
 import {InboxPageComponent} from './views/inbox/inbox-page.component';
 import {ConfigEditorComponent} from './views/config-editor/config-editor.component';
 import {EmptyCatalogBannerComponent} from './shell/empty-catalog-banner/empty-catalog-banner.component';
 import {ReadinessGateBannerComponent} from './shell/readiness-gate-banner/readiness-gate-banner.component';
+import {ViewModeBannerComponent} from './shell/view-mode-banner/view-mode-banner.component';
 import {AppPwaBannerComponent} from './shell/pwa-banner/pwa-banner.component';
 import {AppIconComponent} from './ui/icon';
 
@@ -43,11 +46,14 @@ import {AppIconComponent} from './ui/icon';
     AppToastContainerComponent,
     EmptyCatalogBannerComponent,
     ReadinessGateBannerComponent,
+    ViewModeBannerComponent,
     AppPwaBannerComponent,
     AppIconComponent,
   ],
   template: `
-    <app-pwa-banner />
+    @if (!canvasPopoutRoute()) {
+      <app-pwa-banner />
+    }
     <div class="app-container">
       @if (showSidebar()) {
         <app-sidebar [class.collapsed]="sidebar.collapsed()" />
@@ -62,13 +68,16 @@ import {AppIconComponent} from './ui/icon';
               <app-icon size="inherit" class="pending-icon">hourglass_empty</app-icon>
               <h2>Account Pending Approval</h2>
               <p>Your account has been created but an administrator needs to approve it before you can access the system.</p>
-              <p class="pending-detail">You'll get full access once an admin assigns you the <strong>user</strong> role in Keycloak.</p>
+              <p class="pending-detail">You'll get full access as soon as an administrator approves your account.</p>
               <button class="pending-logout" (click)="userService.logout()">Logout</button>
             </div>
           </div>
         } @else {
-          <app-readiness-gate-banner />
-          <app-empty-catalog-banner />
+          @if (!canvasPopoutRoute()) {
+            <app-readiness-gate-banner />
+            <app-empty-catalog-banner />
+            <app-view-mode-banner />
+          }
           <router-outlet />
         }
       </div>
@@ -106,7 +115,7 @@ import {AppIconComponent} from './ui/icon';
         justify-content: center;
         height: 100%;
         padding: 2rem;
-        background: var(--bg-primary, #1e1e2e);
+        background: var(--app-bg);
       }
 
       .pending-approval-card {
@@ -114,50 +123,50 @@ import {AppIconComponent} from './ui/icon';
         max-width: 480px;
         padding: 3rem 2.5rem;
         border-radius: var(--radius-surface);
-        background: var(--bg-secondary, #313244);
-        border: 1px solid var(--border-color, #45475a);
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
       }
 
       .pending-icon {
         font-size: 3rem;
-        color: var(--text-tertiary, #a6adc8);
+        color: var(--text-muted);
         display: block;
         margin-bottom: 1rem;
       }
 
       .pending-approval-card h2 {
         margin: 0 0 1rem;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         font-size: 1.5rem;
         font-weight: 600;
       }
 
       .pending-approval-card p {
         margin: 0 0 0.75rem;
-        color: var(--text-secondary, #bac2de);
+        color: var(--text-secondary);
         line-height: 1.6;
       }
 
       .pending-detail {
         font-size: 0.875rem;
-        color: var(--text-tertiary, #a6adc8);
+        color: var(--text-muted);
       }
 
       .pending-logout {
         margin-top: 1.5rem;
         padding: 0.625rem 2rem;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #bac2de);
+        color: var(--text-secondary);
         font-size: 0.875rem;
         cursor: pointer;
         transition: all 0.15s ease;
       }
 
       .pending-logout:hover {
-        background: var(--bg-tertiary, #45475a);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-1);
+        color: var(--text-primary);
       }
 
       .sidebar-backdrop {
@@ -201,9 +210,15 @@ export class App implements OnInit {
   private readonly registry = inject(ComponentRegistryService);
   readonly sidebar = inject(SidebarService);
   private readonly actionCenter = inject(ActionCenterService);
+  private readonly router = inject(Router);
+  private readonly activatedRoute = inject(ActivatedRoute);
+  private readonly destroyRef = inject(DestroyRef);
+  readonly canvasPopoutRoute = signal(false);
 
   readonly showSidebar = computed(
-    () => this.userService.isAuthenticated() && this.userService.isApproved(),
+    () => !this.canvasPopoutRoute() &&
+      this.userService.isAuthenticated() &&
+      this.userService.isApproved(),
   );
 
   readonly showMobileBackdrop = computed(
@@ -216,6 +231,17 @@ export class App implements OnInit {
   );
 
   constructor() {
+    const updateShellMode = () => {
+      let route = this.activatedRoute;
+      while (route.firstChild) route = route.firstChild;
+      this.canvasPopoutRoute.set(route.snapshot.data['canvasPopout'] === true);
+    };
+    updateShellMode();
+    this.router.events.pipe(
+      filter((event): event is NavigationEnd => event instanceof NavigationEnd),
+      takeUntilDestroyed(this.destroyRef),
+    ).subscribe(updateShellMode);
+
     // Lock body scroll when mobile sidebar is open
     effect(() => {
       if (this.viewport.isMobile() && !this.sidebar.collapsed()) {
@@ -324,8 +350,14 @@ export class App implements OnInit {
 
     this.registry.register({
       type: 'datasource-list',
-      displayName: 'Datasources',
-      component: DatasourceListComponent,
+      displayName: 'Connectors',
+      component: DatasourceListLoaderComponent,
+    });
+
+    this.registry.register({
+      type: 'experts-list',
+      displayName: 'Experts',
+      component: ExpertsListComponent,
     });
 
     this.registry.register({
@@ -338,12 +370,6 @@ export class App implements OnInit {
       type: 'workspace-browser',
       displayName: 'Workspace Browser',
       component: WorkspaceBrowserComponent,
-    });
-
-    this.registry.register({
-      type: 'instruction-builder',
-      displayName: 'Instruction Builder',
-      component: InstructionBuilderComponent,
     });
 
     this.registry.register({

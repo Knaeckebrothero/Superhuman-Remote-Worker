@@ -1,11 +1,79 @@
 {{/*
 pgAdmin 4 — optional web UI for PostgreSQL administration.
+
+Pre-registers the three SRW application databases (app / pgvector / audit) in the
+server tree on startup so an operator only needs the pgAdmin login. On every pod
+start pgAdmin imports `servers.json` (ConfigMap below). The DB passwords come from
+a chmod-600 `.pgpass` that the `assemble-pgpass` initContainer materialises from
+the `srw` Secret (no DB password is ever rendered into a manifest); the pgAdmin
+entrypoint copies it (via PGPASS_FILE) into the login user's storage dir, and each
+server references it as PassFile "/.pgpass" — pgAdmin resolves PassFile RELATIVE
+to that storage dir, so an absolute path outside it would be dropped ("no password
+supplied"). pgAdmin has no PVC, so the import re-runs on every restart (operator
+edits to the tree are not persisted — the server list is chart-owned).
+
+Login credentials come from the Secret (keys PGADMIN_EMAIL / PGADMIN_PASSWORD by
+default — override via pgadmin.auth.*). Add them to your Vault bundle (prod: the
+main ExternalSecret uses `dataFrom: extract`, so new properties are picked up
+automatically) or to secrets.values (chart-managed dev secret).
 */}}
 {{- if .Values.pgadmin.enabled }}
+{{- $fullname := include "srw.fullname" . -}}
+{{- $secret := include "srw.secretName" . -}}
+{{- $auth := .Values.pgadmin.auth | default dict -}}
+{{- $emailKey := $auth.emailSecretKey | default "PGADMIN_EMAIL" -}}
+{{- $pwKey := $auth.passwordSecretKey | default "PGADMIN_PASSWORD" -}}
+{{- $dbUser := $auth.dbUsername | default "srw" -}}
+{{- $prereg := .Values.pgadmin.preregisterDatabases -}}
+{{- if $prereg }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-pgadmin-servers
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "pgadmin") | nindent 4 }}
+data:
+  servers.json: |
+    {
+      "Servers": {
+        "1": {
+          "Name": "SRW App DB",
+          "Group": "SRW",
+          "Host": "{{ $fullname }}-postgres",
+          "Port": 5432,
+          "MaintenanceDB": {{ include "srw.postgresDb" . | quote }},
+          "Username": {{ $dbUser | quote }},
+          "SSLMode": "prefer",
+          "PassFile": "/.pgpass"
+        },
+        "2": {
+          "Name": "SRW Vector DB (pgvector)",
+          "Group": "SRW",
+          "Host": "{{ $fullname }}-pgvector",
+          "Port": 5432,
+          "MaintenanceDB": {{ include "srw.vectorPostgresDb" . | quote }},
+          "Username": {{ $dbUser | quote }},
+          "SSLMode": "prefer",
+          "PassFile": "/.pgpass"
+        },
+        "3": {
+          "Name": "SRW Audit DB",
+          "Group": "SRW",
+          "Host": "{{ $fullname }}-auditdb",
+          "Port": 5432,
+          "MaintenanceDB": {{ include "srw.auditPostgresDb" . | quote }},
+          "Username": {{ $dbUser | quote }},
+          "SSLMode": "prefer",
+          "PassFile": "/.pgpass"
+        }
+      }
+    }
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "srw.fullname" . }}-pgadmin
+  name: {{ $fullname }}-pgadmin
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "pgadmin") | nindent 4 }}
 spec:
@@ -28,7 +96,49 @@ spec:
           command:
             - sh
             - -c
-            - "until nc -z {{ include "srw.fullname" . }}-postgres 5432; do sleep 2; done"
+            - "until nc -z -w 2 {{ $fullname }}-postgres 5432; do sleep 2; done"
+        {{- if $prereg }}
+        # Build a libpq passfile (chmod 600, owned by the pgadmin uid 5050) from
+        # the Secret so servers.json's PassFile entries resolve without prompting.
+        # Passwords come from env (secretKeyRef) — never templated into a manifest.
+        - name: assemble-pgpass
+          image: busybox:1.36
+          env:
+            - name: APP_PW
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: POSTGRES_PASSWORD
+            - name: VECTOR_PW
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: VECTOR_POSTGRES_PASSWORD
+            - name: AUDIT_PW
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: AUDIT_POSTGRES_PASSWORD
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              umask 077
+              f=/pgpass/pgpassfile
+              # Escape '\' and ':' per the .pgpass format (db field is '*' so any DB matches).
+              esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/:/\\:/g'; }
+              {
+                printf '%s:5432:*:%s:%s\n' "{{ $fullname }}-postgres" "{{ $dbUser }}" "$(esc "$APP_PW")"
+                printf '%s:5432:*:%s:%s\n' "{{ $fullname }}-pgvector" "{{ $dbUser }}" "$(esc "$VECTOR_PW")"
+                printf '%s:5432:*:%s:%s\n' "{{ $fullname }}-auditdb" "{{ $dbUser }}" "$(esc "$AUDIT_PW")"
+              } > "$f"
+              chmod 600 "$f"
+              chown 5050:5050 "$f"
+          volumeMounts:
+            - name: pgpass
+              mountPath: /pgpass
+        {{- end }}
       containers:
         - name: pgadmin
           image: {{ .Values.pgadmin.image }}
@@ -36,21 +146,62 @@ spec:
             - containerPort: 80
           env:
             - name: PGADMIN_DEFAULT_EMAIL
-              value: "admin@srw.dev"
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ $emailKey }}
             - name: PGADMIN_DEFAULT_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: POSTGRES_PASSWORD
+                  name: {{ $secret }}
+                  key: {{ $pwKey }}
+            # Server (multi-user) mode: PGADMIN_DEFAULT_EMAIL/PASSWORD become the
+            # login, and servers.json imports under that user. Desktop mode would
+            # ignore those creds and auto-login as the internal pgadmin4@pgadmin.org
+            # user instead, so the pre-registered servers wouldn't be visible to the
+            # operator logging in with the Secret credentials.
             - name: PGADMIN_CONFIG_SERVER_MODE
+              value: "True"
+            {{- if $prereg }}
+            # PassFile supplies the DB passwords, so no master password is needed.
+            - name: PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED
               value: "False"
+            - name: PGADMIN_SERVER_JSON_FILE
+              value: "/pgadmin4/servers.json"
+            # pgAdmin resolves a server's PassFile RELATIVE to the logged-in
+            # user's storage dir, so the file must live there (an absolute path
+            # outside it resolves to None → "no password supplied"). The
+            # entrypoint copies PGPASS_FILE into
+            # /var/lib/pgadmin/storage/<email-with-@-as-_>/.pgpass, which is
+            # what servers.json references as "/.pgpass".
+            - name: PGPASS_FILE
+              value: "/pgpass/pgpassfile"
+            {{- end }}
+          {{- if $prereg }}
+          volumeMounts:
+            - name: pgpass
+              mountPath: /pgpass
+              readOnly: true
+            - name: pgadmin-servers
+              mountPath: /pgadmin4/servers.json
+              subPath: servers.json
+              readOnly: true
+          {{- end }}
           resources:
             {{- toYaml .Values.pgadmin.resources | nindent 12 }}
+      {{- if $prereg }}
+      volumes:
+        - name: pgpass
+          emptyDir: {}
+        - name: pgadmin-servers
+          configMap:
+            name: {{ $fullname }}-pgadmin-servers
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "srw.fullname" . }}-pgadmin
+  name: {{ $fullname }}-pgadmin
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "pgadmin") | nindent 4 }}
 spec:

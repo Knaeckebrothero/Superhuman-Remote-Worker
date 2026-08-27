@@ -24,6 +24,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # Read a newly provisioned workspace's public SSH host-key fingerprint via
+  # the authenticated Kubernetes control plane. Canvas never learns it by
+  # trusting the same SFTP socket it is about to use.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
   # Finalizer manipulation for the lifecycle reconciler — guarantees
   # cleanup hooks run before a pod disappears from etcd. Adopted in
   # Phase 1 of the unified instance lifecycle redesign; Phase 1c is the
@@ -45,7 +51,7 @@ rules:
     verbs: ["create", "delete", "get", "list", "patch", "update"]
   # Session router: per-session Service + Ingress lifecycle managed by
   # SessionRouterService when a thread binds to an agent. See
-  # docs/features/direct_session_websockets.md §RBAC changes.
+  # knowledge-base/knowledge/features/direct_session_websockets.md §RBAC changes.
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "create", "delete", "patch"]

@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.core.loader import InstructionFileEntry
 from src.tools.context import ToolContext
 from src.tools.registry import (
     TOOL_REGISTRY,
@@ -65,10 +66,10 @@ class TestRegistryMetadata:
         assert "next_phase_todos" in TOOL_REGISTRY
         assert TOOL_REGISTRY["next_phase_todos"]["phases"] == ["strategic"]
 
-    def test_todo_rewind_is_tactical_only(self):
-        """todo_rewind must be tactical-only."""
-        assert "todo_rewind" in TOOL_REGISTRY
-        assert TOOL_REGISTRY["todo_rewind"]["phases"] == ["tactical"]
+    def test_request_replan_is_tactical_only(self):
+        """request_replan must be tactical-only."""
+        assert "request_replan" in TOOL_REGISTRY
+        assert TOOL_REGISTRY["request_replan"]["phases"] == ["tactical"]
 
     def test_mark_complete_available_both_phases(self):
         """mark_complete must be available in both phases."""
@@ -192,15 +193,15 @@ class TestFilterToolsByPhase:
         result = filter_tools_by_phase(["job_complete", "read_file"], "tactical")
         assert "job_complete" not in result
 
-    def test_strategic_excludes_todo_rewind(self):
-        """Strategic phase should exclude todo_rewind."""
-        result = filter_tools_by_phase(["todo_rewind", "read_file"], "strategic")
-        assert "todo_rewind" not in result
+    def test_strategic_excludes_request_replan(self):
+        """Strategic phase should exclude request_replan."""
+        result = filter_tools_by_phase(["request_replan", "read_file"], "strategic")
+        assert "request_replan" not in result
 
-    def test_tactical_includes_todo_rewind(self):
-        """Tactical phase should include todo_rewind."""
-        result = filter_tools_by_phase(["todo_rewind", "read_file"], "tactical")
-        assert "todo_rewind" in result
+    def test_tactical_includes_request_replan(self):
+        """Tactical phase should include request_replan."""
+        result = filter_tools_by_phase(["request_replan", "read_file"], "tactical")
+        assert "request_replan" in result
 
     def test_both_phases_include_read_file(self):
         """read_file should be available in both phases."""
@@ -248,12 +249,12 @@ class TestGetToolsForPhase:
     def test_tactical_includes_tactical_tools(self):
         """Tactical phase should include tactical-only tools."""
         tools = get_tools_for_phase("tactical")
-        assert "todo_rewind" in tools
+        assert "request_replan" in tools
 
     def test_strategic_excludes_tactical_only(self):
         """Strategic should exclude tactical-only tools."""
         tools = get_tools_for_phase("strategic")
-        assert "todo_rewind" not in tools
+        assert "request_replan" not in tools
 
     def test_tactical_excludes_strategic_only(self):
         """Tactical should exclude strategic-only tools."""
@@ -325,6 +326,44 @@ class TestLoadToolsValidation:
         result = load_tools([], ctx)
         assert result == []
 
+    def test_unloaded_requested_tools_warn_once_aggregated(self, caplog):
+        """A registry-known name a factory did not produce must be visible.
+
+        Post-rename checkpoints/history can request names that pass the
+        registry check but never bind (here: graph tools without a neo4j
+        datasource). load_tools must emit ONE aggregated WARNING listing
+        every such name — not one line per name, and not silence.
+        """
+        ctx = ToolContext()  # no neo4j datasource -> graph tools cannot bind
+        with caplog.at_level("WARNING", logger="src.tools.registry"):
+            result = load_tools(["cypher_query", "cypher_execute"], ctx)
+
+        assert result == []
+        skew_records = [
+            record
+            for record in caplog.records
+            if "requested tool(s) did not load" in record.getMessage()
+        ]
+        assert len(skew_records) == 1
+        message = skew_records[0].getMessage()
+        assert "cypher_query" in message
+        assert "cypher_execute" in message
+
+    def test_fully_loaded_request_emits_no_skew_warning(self, caplog):
+        """The aggregated warning must stay silent when every name binds."""
+        ws = MagicMock()
+        ws.is_initialized = True
+        ctx = ToolContext(workspace_manager=ws)
+        with caplog.at_level("WARNING", logger="src.tools.registry"):
+            result = load_tools(["read_file"], ctx)
+
+        assert [tool.name for tool in result] == ["read_file"]
+        assert not [
+            record
+            for record in caplog.records
+            if "requested tool(s) did not load" in record.getMessage()
+        ]
+
     def test_workspace_tools_require_workspace_manager(self):
         """Requesting workspace tools without workspace_manager raises ValueError."""
         ctx = ToolContext()  # no workspace_manager
@@ -344,6 +383,24 @@ class TestLoadToolsValidation:
         ctx = ToolContext(workspace_manager=ws)  # no todo_manager
         with pytest.raises(ValueError, match="todo_manager"):
             load_tools(["todo_complete"], ctx)
+
+    def test_request_workspace_upgrade_loads_without_todo_manager(self):
+        """The lite control tool (workspace_tier_upgrade.md §4.2 S5) loads on a
+        session-shaped context — workspace_manager present, todo_manager=None —
+        where todo/job core tools would require a TodoManager. It is the lone
+        manager-independent core tool, so the relaxed core gate must let it through.
+        """
+        ws = MagicMock()
+        ws.is_initialized = True
+        ctx = ToolContext(workspace_manager=ws)  # no todo_manager (a session)
+        tools = load_tools(["request_workspace_upgrade"], ctx)
+        assert [t.name for t in tools] == ["request_workspace_upgrade"]
+
+    def test_request_workspace_upgrade_loads_without_any_manager(self):
+        """It needs neither workspace nor todo — a bare context still loads it."""
+        ctx = ToolContext()
+        tools = load_tools(["request_workspace_upgrade"], ctx)
+        assert [t.name for t in tools] == ["request_workspace_upgrade"]
 
 
 class TestLoadToolsForPhase:
@@ -468,6 +525,11 @@ class FakeInstructionEntry:
     trigger_type: str
     trigger_target: str
     enforce: bool
+
+    @property
+    def path(self) -> str:
+        """Mirror InstructionFileEntry.path; this fake only models file: entries."""
+        return self.file
 
 
 class TestApplyInstructionEnforcement:
@@ -596,6 +658,34 @@ class TestApplyInstructionEnforcement:
         ctx.record_file_read("guide_b.md")
         result = tool.func()
         assert result == "my_tool called"
+
+    def test_wrapper_evaluates_phase_and_freshness_at_invocation_time(self):
+        ctx = ToolContext()
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        ctx._instruction_files = [entry]
+        tool = self._make_tool("todo_complete")
+        apply_instruction_enforcement([tool], ctx)
+
+        # Strategic todo completion is deliberately outside this binding.
+        ctx.set_current_phase("strategic", phase_number=1, turn_count=1)
+        assert tool.func() == "todo_complete called"
+
+        # The same wrapped tool closes when execution enters tactical mode.
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=2)
+        assert entry.path in tool.func()
+        ctx.record_file_read(entry.path)
+        assert tool.func() == "todo_complete called"
+
+        # The wrapper consults current state on every invocation, so expiry
+        # closes it without reloading or re-wrapping the tool.
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=23)
+        assert entry.path in tool.func()
 
 
 # =============================================================================

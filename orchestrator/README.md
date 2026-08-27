@@ -21,7 +21,7 @@ orchestrator/
 ├── graph_routes.py      # Neo4j graph visualization endpoints
 ├── services/
 │   ├── postgres.py      # PostgreSQL service (jobs, requirements)
-│   ├── mongodb.py       # MongoDB service (audit trail, LLM logs)
+│   ├── audit_store.py   # Postgres audit store (audit trail, LLM logs)
 │   └── workspace.py     # Workspace file reading (todos, plan)
 ├── mcp/
 │   ├── server.py        # FastMCP 2.0 server
@@ -54,7 +54,7 @@ orchestrator/
 | `GET /api/agents` | List registered agents |
 | `PUT /api/agents/{id}/assign` | Assign job to agent |
 
-See `docs/angular_migration_plan.md` for the full orchestration architecture.
+See `knowledge-base/knowledge/angular_migration_plan.md` for the full orchestration architecture.
 
 ## Environment Variables
 
@@ -62,8 +62,8 @@ See `docs/angular_migration_plan.md` for the full orchestration architecture.
 # PostgreSQL (required)
 DATABASE_URL=postgresql://user:pass@localhost:5432/srw
 
-# MongoDB (optional - for audit trail)
-MONGODB_URL=mongodb://localhost:27017/srw_logs
+# Audit store (optional - Postgres audit trail; AUDIT_POSTGRES_* or AUDIT_DB_URL)
+AUDIT_DB_URL=postgresql://user:pass@localhost:5432/srw_audit
 
 # Neo4j (optional - for graph visualization)
 NEO4J_URI=bolt://localhost:7687

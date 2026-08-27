@@ -60,6 +60,7 @@ def _build_message_content(
     mode: str | None = None,
     status: str = "delivered",
     from_field: str = "agent",
+    purpose: str | None = None,
 ) -> str:
     """Build a message file with YAML frontmatter."""
     frontmatter_lines = [
@@ -74,6 +75,8 @@ def _build_message_content(
     ]
     if mode:
         frontmatter_lines.append(f"mode: {mode}")
+    if purpose:
+        frontmatter_lines.append(f"purpose: {purpose}")
     frontmatter_lines.append(f"status: {status}")
     frontmatter_lines.append("---")
     frontmatter_lines.append("")
@@ -98,12 +101,15 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
         message: str,
         mode: str = "async",
         thread_id: Optional[str] = None,
+        purpose: Optional[str] = None,
     ) -> str:
         """Send a message to a human via email.
 
         Messages are stored as workspace files in messages/<thread_id>/ and
-        delivered as emails through the orchestrator. Use sparingly — the
-        recipient receives this as an email.
+        delivered through the orchestrator. Use sparingly — depending on the
+        project's routing policy the recipient is the owner (email) or the
+        project's officer first, with automatic escalation/fallback to the
+        owner.
 
         Args:
             to: Recipient. Use "user" for the job owner.
@@ -113,6 +119,9 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
             mode: "async" to continue working, or "blocking" to pause
                 execution until the recipient replies.
             thread_id: Reply to an existing thread. Omit to start a new thread.
+            purpose: Optional label improving triage/presentation:
+                "question", "blocker", or "update". Routing never trusts it;
+                mode="blocking" stays the mechanical wait signal.
 
         Returns:
             Confirmation with thread ID, delivery status, and file path.
@@ -128,6 +137,11 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
             return f"Error: message too long ({len(message)} chars, max 5000)."
         if mode not in ("async", "blocking"):
             return f"Error: mode must be 'async' or 'blocking', got '{mode}'."
+        if purpose is not None and purpose not in ("question", "blocker", "update"):
+            return (
+                "Error: purpose must be 'question', 'blocker', or 'update' "
+                f"(got '{purpose}'). Omit it if unsure."
+            )
 
         # Check config restriction on recipients
         if to != "user":
@@ -176,6 +190,7 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
             body=message,
             mode=mode,
             status="pending",
+            purpose=purpose,
         )
 
         if context.has_workspace():
@@ -212,18 +227,42 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
             headers["X-MCP-User-Id"] = context.user_id
 
         try:
+            routing_generation = str(uuid.uuid4())
             async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
-                resp = await client.post(
-                    api_url,
-                    json={
-                        "to": to,
-                        "subject": subject,
-                        "message": message,
-                        "mode": mode,
-                        "thread_id": thread_id,
-                        "project_id": getattr(context, "project_id", None),
-                    },
-                )
+                payload = {
+                    "to": to,
+                    "subject": subject,
+                    "message": message,
+                    "mode": mode,
+                    "thread_id": thread_id,
+                    "purpose": purpose,
+                    "project_id": getattr(context, "project_id", None),
+                    "lease_token": (
+                        context._worker_lease_token
+                        if context._stateless_worker
+                        else None
+                    ),
+                    "agent_id": (
+                        getattr(context.orchestrator_client, "agent_id", None)
+                        if not context._stateless_worker
+                        else None
+                    ),
+                    "routing_generation": routing_generation,
+                }
+                # One bounded transport retry covers response loss while the
+                # same durable generation suppresses a second quota charge,
+                # route, or provider delivery. A fresh model-authored send is
+                # still a fresh generation.
+                for send_attempt in range(2):
+                    try:
+                        resp = await client.post(api_url, json=payload)
+                    except httpx.TransportError:
+                        if send_attempt == 0:
+                            continue
+                        raise
+                    if resp.status_code >= 500 and send_attempt == 0:
+                        continue
+                    break
 
             if resp.status_code == 429:
                 data = resp.json()
@@ -273,22 +312,42 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
                 f"unreachable: {e}. Email delivery skipped."
             )
 
+        # Routing note (officer_message_routing): tell the worker WHO holds
+        # its message so a blocking wait reads honestly in the transcript.
+        routing_info = data.get("routing") or {}
+        routing_note = ""
+        if routing_info.get("applied") == "officer_first":
+            routing_note = (
+                "\nRouting: delivered to the project officer first; if the "
+                "officer does not answer in time it escalates to the user "
+                "automatically."
+            )
+        elif routing_info.get("applied") == "officer_and_user":
+            routing_note = (
+                "\nRouting: delivered to the project officer AND the user; "
+                "the first answer counts."
+            )
+
         # If blocking mode, request job freeze
         if mode == "blocking" and resp.status_code == 200:
-            context.request_freeze(
-                {
-                    "status": "waiting_for_reply",
-                    "freeze_type": "blocking_message",
-                    "thread_id": thread_id,
-                    "subject": subject,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "job_id": job_id,
-                }
-            )
+            freeze_payload = {
+                "status": "waiting_for_reply",
+                "freeze_type": "blocking_message",
+                "thread_id": thread_id,
+                "subject": subject,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "job_id": job_id,
+            }
+            # The orchestrator's freeze (written in the send transaction) is
+            # authoritative and carries the route generation; mirroring the
+            # route_id here keeps the local job_frozen.json in agreement.
+            if routing_info.get("route_id"):
+                freeze_payload["route_id"] = routing_info["route_id"]
+            context.request_freeze(freeze_payload)
 
             return (
                 f"Message sent to {masked_recipient} (thread: {thread_id}).\n"
-                f"File: {file_path}\n\n"
+                f"File: {file_path}{routing_note}\n\n"
                 f"Job execution is now paused. Waiting for reply. "
                 f"Execution will resume automatically when the recipient responds."
             )
@@ -296,7 +355,7 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
         # Async mode confirmation
         return (
             f"Message sent to {masked_recipient} (thread: {thread_id}).\n"
-            f"File: {file_path}\n"
+            f"File: {file_path}{routing_note}\n"
             f"Mode: async — continuing execution."
         )
 

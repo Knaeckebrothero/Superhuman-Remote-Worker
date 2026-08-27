@@ -5,11 +5,12 @@ import {UserService} from '../../core/services/user.service';
 
 /**
  * Persistent top banner that reads ``GET /api/system/readiness`` and shows
- * the three-step onboarding checklist when the LLM stack isn't ready:
+ * the onboarding checklist when the runtime isn't ready:
  *
  *   1. At least one provider key or endpoint configured.
  *   2. At least one chat / embedding / auxiliary catalog row.
  *   3. A default model pinned for each required capability.
+ *   4. A DB-backed application expert selected for workers and sessions.
  *
  * Each step deep-links to the admin page that resolves it. Non-admin users
  * see a "contact your admin" message instead — the underlying readiness
@@ -42,7 +43,7 @@ import {UserService} from '../../core/services/user.service';
               @if (hasProvider()) {
                 ✓
               } @else {
-                <a routerLink="/admin/llm" class="banner-link">Configure a provider key or endpoint</a>
+                <a routerLink="/admin/models" class="banner-link">Configure a provider key or endpoint</a>
               }
               @if (hasProvider()) {
                 <span>Provider configured</span>
@@ -52,7 +53,7 @@ import {UserService} from '../../core/services/user.service';
               @if (hasAllCapabilities()) {
                 ✓ <span>Models added for chat, embedding, auxiliary</span>
               } @else {
-                <a routerLink="/admin/llm" [queryParams]="{tab: 'models'}" class="banner-link">
+                <a routerLink="/admin/models" [queryParams]="{tab: 'catalog'}" class="banner-link">
                   Add models for: {{ missingCapabilitiesText() }}
                 </a>
               }
@@ -61,11 +62,20 @@ import {UserService} from '../../core/services/user.service';
               @if (hasAllDefaults()) {
                 ✓ <span>Required defaults pinned</span>
               } @else if (missingDefaultsText()) {
-                <a routerLink="/admin/llm" [queryParams]="{tab: 'defaults'}" class="banner-link">
+                <a routerLink="/admin/models" [queryParams]="{tab: 'defaults'}" class="banner-link">
                   Pin defaults for required models: {{ missingDefaultsText() }}
                 </a>
               } @else {
                 <span>(Required defaults can be pinned once each capability has a model.)</span>
+              }
+            </li>
+            <li [class.done]="hasAllExpertDefaults()">
+              @if (hasAllExpertDefaults()) {
+                ✓ <span>Application expert defaults selected</span>
+              } @else {
+                <a routerLink="/admin/grants" class="banner-link">
+                  Select application experts for: {{ missingExpertDefaultsText() }}
+                </a>
               }
             </li>
           </ol>
@@ -76,9 +86,9 @@ import {UserService} from '../../core/services/user.service';
   styles: [`
     .readiness-banner {
       padding: 12px 16px;
-      background: rgba(243, 139, 168, 0.12);
-      border-bottom: 1px solid rgba(243, 139, 168, 0.4);
-      color: var(--red, #f38ba8);
+      background: color-mix(in srgb, var(--danger) 12%, transparent);
+      border-bottom: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+      color: var(--danger);
       font-size: 13px;
       line-height: 1.5;
     }
@@ -144,6 +154,14 @@ export class ReadinessGateBannerComponent implements OnInit {
 
   readonly missingDefaultsText = computed(() => {
     return this.readiness.readiness().missing_defaults.join(', ');
+  });
+
+  readonly hasAllExpertDefaults = computed(() => {
+    return (this.readiness.readiness().missing_expert_defaults ?? []).length === 0;
+  });
+
+  readonly missingExpertDefaultsText = computed(() => {
+    return (this.readiness.readiness().missing_expert_defaults ?? []).join(', ');
   });
 
   ngOnInit(): void {

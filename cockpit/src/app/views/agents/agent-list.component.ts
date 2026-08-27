@@ -114,6 +114,13 @@ import {AppSpinnerComponent} from '../../ui/spinner';
                     <app-badge [tone]="agentStatusTone(agent.status)" size="sm">
                       {{ getStatusIcon(agent.status) }} {{ 'agentList.status.' + agent.status | transloco }}
                     </app-badge>
+                    @if (agent.aux_degraded) {
+                      <span class="aux-degraded" [title]="auxTooltip(agent)">
+                        <app-badge tone="danger" size="sm">
+                          &#x26A0; {{ 'agentList.auxDegraded' | transloco }}
+                        </app-badge>
+                      </span>
+                    }
                   </td>
                   <td class="config-name">{{ agent.config_name }}</td>
                   <td class="hostname">{{ agent.hostname || agent.pod_ip || '-' }}</td>
@@ -190,7 +197,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         align-items: center;
         gap: 12px;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -202,14 +209,14 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
       .agent-count {
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         margin-left: auto;
       }
 
       .no-jobs {
         text-align: center;
         padding: 20px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .no-jobs .hint {
@@ -235,7 +242,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       }
 
       .job-option:hover {
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
       }
 
       .job-option.selected {
@@ -254,7 +261,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         display: block;
         font-size: 10px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* Loading State */
@@ -276,7 +283,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex: 1;
       }
 
@@ -307,7 +314,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         text-align: left;
         padding: 8px 10px;
         background: var(--surface-0, var(--surface-0));
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-weight: 500;
         text-transform: uppercase;
         font-size: 10px;
@@ -323,6 +330,11 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
       .agent-table tbody tr:hover {
         background: var(--surface-0, var(--surface-0));
+      }
+
+      .aux-degraded {
+        margin-left: 6px;
+        cursor: help;
       }
 
       .config-name {
@@ -348,13 +360,13 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       }
 
       .no-job {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .heartbeat {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* Action Buttons */
@@ -384,7 +396,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
       .auto-refresh {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .status-message {
@@ -567,6 +579,42 @@ export class AgentListComponent implements OnInit, OnDestroy {
       offline: '\u26AA',
     };
     return icons[status] || '\u2753';
+  }
+
+  /**
+   * Human tooltip for the aux-degraded badge, built from the compact
+   * `metadata.aux` summary the agent reports on its heartbeat (aux Phase 2).
+   * e.g. "Auxiliary model degraded: gemma-4-moe \u2014 7 consecutive failures
+   * (memory_extraction: ConnectionError)".
+   */
+  auxTooltip(agent: Agent): string {
+    const prefix = this.transloco.translate('agentList.auxDegradedTip');
+    const aux = (agent.metadata?.['aux'] ?? null) as {
+      model?: string;
+      consecutive_failures?: number;
+      failing_tasks?: Record<string, {last_error_type?: string}>;
+    } | null;
+    if (!aux) {
+      return prefix;
+    }
+
+    const parts: string[] = [];
+    if (aux.model) {
+      parts.push(aux.model);
+    }
+    if (aux.consecutive_failures) {
+      parts.push(`${aux.consecutive_failures} consecutive failures`);
+    }
+
+    const taskDetail = Object.entries(aux.failing_tasks ?? {})
+      .map(([name, t]) => `${name}: ${t?.last_error_type ?? 'error'}`)
+      .join(', ');
+
+    let detail = parts.join(' \u2014 ');
+    if (taskDetail) {
+      detail = detail ? `${detail} (${taskDetail})` : taskDetail;
+    }
+    return detail ? `${prefix}: ${detail}` : prefix;
   }
 
   formatTimestamp(timestamp: string): string {

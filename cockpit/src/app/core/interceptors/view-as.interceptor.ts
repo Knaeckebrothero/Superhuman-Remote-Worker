@@ -1,4 +1,10 @@
-import {HttpEvent, HttpHandlerFn, HttpInterceptorFn, HttpRequest} from '@angular/common/http';
+import {
+  HttpContextToken,
+  HttpEvent,
+  HttpHandlerFn,
+  HttpInterceptorFn,
+  HttpRequest,
+} from '@angular/common/http';
 import {inject} from '@angular/core';
 import {Observable} from 'rxjs';
 import {environment} from '../environment';
@@ -16,13 +22,23 @@ import {ViewModeService} from '../services/view-mode.service';
  * them the backend already treats it as a no-op, but skipping the header
  * keeps audit logs cleaner.
  *
+ * A request can override the global toggle per-call via `VIEW_AS_OVERRIDE`
+ * in its `HttpContext` (used by the Admin→Usage page's "All data" switch):
+ * `'all'` forces the fleet view (never send the header, even in `'me'` mode),
+ * `'mine'` forces self-scope (send the header for an admin, even in `'all'`
+ * mode), and the default `null` defers to `ViewModeService`. This lets one
+ * page scope itself without touching the account-wide setting or the backend.
+ *
  * Must register AFTER `authInterceptor` in `app.config.ts`: cookies +
  * CSRF first, then the view-mode header.
  *
- * Design: `docs/features/admin_view_as_user.md`.
+ * Design: `knowledge-base/knowledge/features/admin_view_as_user.md`.
  */
 export const VIEW_AS_HEADER = 'X-Admin-View-As';
 export const VIEW_AS_USER = 'user';
+
+/** Per-request scope override; defaults to `null` (defer to the global toggle). */
+export const VIEW_AS_OVERRIDE = new HttpContextToken<'all' | 'mine' | null>(() => null);
 
 export const viewAsInterceptor: HttpInterceptorFn = (
   req: HttpRequest<unknown>,
@@ -32,13 +48,22 @@ export const viewAsInterceptor: HttpInterceptorFn = (
     return next(req);
   }
 
-  const userService = inject(UserService);
-  if (!userService.currentUser()?.is_admin) {
-    return next(req);
+  const override = req.context.get(VIEW_AS_OVERRIDE);
+  const isAdmin = inject(UserService).currentUser()?.is_admin === true;
+
+  let selfScope: boolean;
+  if (override === 'all') {
+    selfScope = false; // force fleet — ignore the global toggle
+  } else if (override === 'mine') {
+    selfScope = isAdmin; // force self for admins; a no-op header for non-admins
+  } else {
+    if (!isAdmin) {
+      return next(req);
+    }
+    selfScope = inject(ViewModeService).viewMode() === 'me';
   }
 
-  const viewMode = inject(ViewModeService);
-  if (viewMode.viewMode() !== 'me') {
+  if (!selfScope) {
     return next(req);
   }
 

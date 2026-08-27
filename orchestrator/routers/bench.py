@@ -1,0 +1,332 @@
+"""Authenticated HTTP surface and lifecycle wiring for Job Bench v1."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from contextlib import asynccontextmanager
+from typing import Any, Literal
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from security.access import mcp_scope_project_id, require_project_member
+from security.auth import require_approved_user
+from services.automations import validate_automation_expert_selection
+from services.bench import (
+    BenchStateError,
+    BenchStore,
+    bench_sweeper_loop,
+    build_bench_job_payload,
+    cancel_bench_run,
+    compute_bench_report,
+    create_bench_run,
+)
+from services.default_experts import ExpertSelectionError
+
+
+class BenchTaskSpec(BaseModel):
+    """One fully inline benchmark task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=200)
+    family: str | None = Field(None, max_length=100)
+    description: str = Field(..., min_length=1)
+    required_deliverables: list[str] = Field(default_factory=list)
+    config_name: str = Field("worker_base", min_length=1, max_length=300)
+    config_override: dict[str, Any] = Field(default_factory=dict)
+    priority: int = Field(5, ge=0, le=10)
+
+
+class BenchArmSpec(BaseModel):
+    """One config/model arm applied to every task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=200)
+    config_name: str | None = Field(None, min_length=1, max_length=300)
+    expert_id: UUID | None = None
+    config_override: dict[str, Any] = Field(default_factory=dict)
+    model: str = Field(..., min_length=1, max_length=300)
+    execution_lane: Literal["pinned", "stateless"] | None = Field(
+        None,
+        description=(
+            "Execution plane for this arm. The lane is a top-level JobCreate "
+            "field rather than config, so it cannot ride in config_override — "
+            "a lane A/B has to name it here. Omitted keeps the JobCreate "
+            "default (roots stay pinned). Requesting 'stateless' does not "
+            "bypass admission: create_job runs the same gate for the bench's "
+            "in-process call as for a user request, so a task whose workspace "
+            "needs a VM is pinned by capability whatever the arm asks for."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def one_expert_source(self) -> "BenchArmSpec":
+        if self.config_name and self.expert_id:
+            raise ValueError("An arm may set config_name or expert_id, not both")
+        return self
+
+
+class BenchRunCreate(BaseModel):
+    """Request body for ``POST /api/bench/runs``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=300)
+    tasks: list[BenchTaskSpec] = Field(..., min_length=1, max_length=500)
+    replicates: int = Field(3, ge=1, le=100)
+    max_in_flight: int = Field(2, ge=1, le=100)
+    arms: list[BenchArmSpec] = Field(..., min_length=1, max_length=50)
+    project_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def unique_names(self) -> "BenchRunCreate":
+        task_ids = [task.id for task in self.tasks]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("Task ids must be unique within a bench run")
+        arm_names = [arm.name for arm in self.arms]
+        if len(arm_names) != len(set(arm_names)):
+            raise ValueError("Arm names must be unique within a bench run")
+        return self
+
+
+def _bench_internal_request(created_by: str) -> Request:
+    """Build the authenticated in-process request used by ``create_job``.
+
+    The shared key authenticates the transport; ``X-MCP-User-Id`` makes the
+    existing handler resolve and re-check the creator from Postgres.  No body
+    identity is trusted, matching normal MCP-forwarded job creation.
+    """
+
+    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+    if not internal_key:
+        raise RuntimeError(
+            "MCP_INTERNAL_KEY is required for server-side bench job creation"
+        )
+    headers = [
+        (b"x-internal-key", internal_key.encode("latin-1")),
+        (b"x-mcp-user-id", created_by.encode("ascii")),
+    ]
+    return Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/jobs",
+            "raw_path": b"/api/jobs",
+            "query_string": b"",
+            "headers": headers,
+            "client": ("127.0.0.1", 0),
+            "server": ("orchestrator", 8085),
+        }
+    )
+
+
+async def _create_job_through_main(
+    run: dict[str, Any],
+    task: dict[str, Any],
+    arm: dict[str, Any],
+    replicate: int,
+) -> dict[str, Any]:
+    """Call the regular job-creation handler directly (never over HTTP)."""
+
+    from main import JobCreate, create_job
+
+    created_by = str(run["created_by"])
+    payload = build_bench_job_payload(run, task, arm, replicate)
+    return await create_job(
+        _bench_internal_request(created_by),
+        JobCreate(**payload),
+    )
+
+
+@asynccontextmanager
+async def _bench_lifespan(_app: Any):
+    """Start after the app DB lifespan and drain before DB shutdown."""
+
+    from main import postgres_db
+
+    shutdown_event = asyncio.Event()
+    task = asyncio.create_task(
+        bench_sweeper_loop(
+            BenchStore(postgres_db),
+            shutdown_event,
+            create_job_fn=_create_job_through_main,
+        )
+    )
+    try:
+        yield
+    finally:
+        shutdown_event.set()
+        await task
+
+
+router = APIRouter(
+    prefix="/api/bench",
+    tags=["Job Bench"],
+    lifespan=_bench_lifespan,
+)
+
+
+async def _visible_run_or_404(
+    store: BenchStore,
+    run_id: str,
+    caller: dict[str, Any],
+) -> dict[str, Any]:
+    run = await store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Bench run not found")
+    if not caller.get("is_admin") and str(run["created_by"]) != str(caller["id"]):
+        # Match neighboring owner-scoped resources: do not disclose existence.
+        raise HTTPException(status_code=404, detail="Bench run not found")
+    return run
+
+
+@router.post("/runs", status_code=status.HTTP_201_CREATED)
+async def create_run(request: Request, body: BenchRunCreate) -> dict[str, Any]:
+    """Freeze and start a creator-owned benchmark run."""
+
+    from main import _with_validated_tool_overrides, postgres_db
+
+    caller = await require_approved_user(request, postgres_db)
+    payload = body.model_dump(mode="python")
+
+    # Match POST /api/jobs' scope rules, but resolve the project now so it is
+    # part of the frozen row instead of following a changed user default later.
+    requested_project = str(body.project_id) if body.project_id else None
+    scoped_project = mcp_scope_project_id(caller)
+    if scoped_project is not None:
+        scoped_project_id = str(scoped_project)
+        if requested_project and requested_project != scoped_project_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Bench run is outside the token's project scope",
+            )
+        requested_project = requested_project or scoped_project_id
+    if not requested_project and caller.get("default_project_id"):
+        requested_project = str(caller["default_project_id"])
+    if requested_project:
+        await require_project_member(
+            request,
+            postgres_db,
+            requested_project,
+            min_role="editor",
+            allow_archived=False,
+        )
+    payload["project_id"] = requested_project
+
+    # Fail invalid tool vocabularies at run creation rather than persisting a
+    # run whose sweeper can never create its first job. The regular handler
+    # validates again at each actual submission.
+    for task in payload["tasks"]:
+        task["config_override"] = (
+            _with_validated_tool_overrides(task.get("config_override")) or {}
+        )
+    for arm in payload["arms"]:
+        arm["config_override"] = (
+            _with_validated_tool_overrides(arm.get("config_override")) or {}
+        )
+        if arm.get("expert_id"):
+            try:
+                await validate_automation_expert_selection(
+                    postgres_db,
+                    owner_id=str(caller["id"]),
+                    project_id=requested_project,
+                    expert="worker_base",
+                    expert_id=str(arm["expert_id"]),
+                )
+            except ExpertSelectionError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return await create_bench_run(
+        BenchStore(postgres_db),
+        name=body.name,
+        created_by=str(caller["id"]),
+        spec=payload,
+    )
+
+
+@router.get("/runs")
+async def list_runs(
+    request: Request,
+    limit: int = Query(100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """List caller-owned runs; admins can inspect the full fleet."""
+
+    from main import postgres_db
+
+    caller = await require_approved_user(request, postgres_db)
+    return await BenchStore(postgres_db).list_runs(
+        created_by=None if caller.get("is_admin") else str(caller["id"]),
+        limit=limit,
+    )
+
+
+@router.get("/runs/{run_id}")
+async def get_run(request: Request, run_id: str) -> dict[str, Any]:
+    """Return one visible run, including its frozen spec and live ledger."""
+
+    from main import postgres_db
+
+    caller = await require_approved_user(request, postgres_db)
+    return await _visible_run_or_404(BenchStore(postgres_db), run_id, caller)
+
+
+@router.get("/runs/{run_id}/report")
+async def get_report(request: Request, run_id: str) -> dict[str, Any]:
+    """Compute the v0 phase/cost report server-side from authoritative data."""
+
+    from main import (
+        audit_reader,
+        gitea_client,
+        postgres_db,
+        resolve_job_repo,
+    )
+
+    caller = await require_approved_user(request, postgres_db)
+    run = await _visible_run_or_404(BenchStore(postgres_db), run_id, caller)
+    if not audit_reader.is_available:
+        raise HTTPException(status_code=503, detail="Audit store not available")
+    return await compute_bench_report(
+        postgres_db,
+        run,
+        audit_reader=audit_reader,
+        gitea_client=gitea_client,
+        resolve_job_repo=resolve_job_repo,
+    )
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(request: Request, run_id: str) -> dict[str, Any]:
+    """Stop future submissions and cancel all currently live member jobs."""
+
+    from main import cancel_job, postgres_db
+
+    caller = await require_approved_user(request, postgres_db)
+    store = BenchStore(postgres_db)
+    run = await _visible_run_or_404(store, run_id, caller)
+
+    async def cancel_member(job_id: str) -> Any:
+        return await cancel_job(request, job_id)
+
+    try:
+        return await cancel_bench_run(
+            store,
+            run,
+            cancel_job_fn=cancel_member,
+        )
+    except BenchStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+__all__ = [
+    "BenchArmSpec",
+    "BenchRunCreate",
+    "BenchTaskSpec",
+    "router",
+]

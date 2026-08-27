@@ -14,13 +14,14 @@ The adapter is fully async, built on raw ``httpx.AsyncClient`` (no
 ``msgraph-sdk``), and hits roughly the same error-mapping and telemetry
 patterns as ``NextcloudBackend``.
 
-See §5.2 of ``docs/features/main_cloud_abstraction.md`` for the full
+See §5.2 of ``knowledge-base/knowledge/features/main_cloud_abstraction.md`` for the full
 design, and §13.2 for the underlying research references.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -30,8 +31,17 @@ from urllib.parse import quote
 import httpx
 
 from ._propfind import parse_propfind_entries
-from .base import HealthStatus, UserHome
+from .base import (
+    CanaryFixture,
+    CloudMountSubject,
+    HealthStatus,
+    RcloneMountSpec,
+    RoReaderGrant,
+    UserHome,
+)
+from .backend_instance_authority import main_cloud_installation_proof_sha256
 from .config import OpenCloudSettings
+from .etag_baseline import PropfindError, capture_etag_baseline
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
     GroupId,
@@ -112,12 +122,16 @@ class OpenCloudBackend:
 
         self._initialized = False
         self._client: Optional[httpx.AsyncClient] = None
+        self._backend_instance_id: Optional[str] = None
+        self._installation_proof_sha256: Optional[str] = None
 
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
 
-        self._role_cache: dict[str, str] = {}
+        # Keyed by (displayName, weight) — OpenCloud has duplicate role display
+        # names distinguished only by @libre.graph.weight.
+        self._role_cache: dict[tuple[str, int], str] = {}
 
         # Populated by ensure_initialized once the agent-home Space exists.
         self._agent_home_drive_id: Optional[str] = None
@@ -140,6 +154,27 @@ class OpenCloudBackend:
         return self._initialized
 
     @property
+    def backend_instance_id(self) -> Optional[str]:
+        return self._backend_instance_id
+
+    @property
+    def installation_proof_sha256(self) -> Optional[str]:
+        return self._installation_proof_sha256
+
+    def bind_backend_instance(self, backend_instance_id: str) -> None:
+        """Bind the DB-adopted installation UUID exactly once."""
+
+        if self._backend_instance_id not in {None, backend_instance_id}:
+            raise RuntimeError("OpenCloud backend instance authority changed")
+        self._backend_instance_id = backend_instance_id
+
+    def prepare_backend_instance_attestation(self, backend_instance_id: str) -> None:
+        """OpenCloud's provider proof does not depend on the proposed UUID."""
+
+        if not isinstance(backend_instance_id, str) or not backend_instance_id:
+            raise ValueError("OpenCloud attestation instance is missing")
+
+    @property
     def webdav_credentials(self) -> dict[str, str]:
         """OpenCloud WebDAV is OAuth bearer-based, not user+password.
 
@@ -150,6 +185,120 @@ class OpenCloudBackend:
         legacy ``username``/``password`` plumbing silently falls back.
         """
         return {}
+
+    async def build_rclone_mount_spec(
+        self,
+        *,
+        handle: ProjectFolderHandle | SessionFolderHandle,
+        mount_kind: str,
+        target_path: str,
+        access: str,
+        subject: CloudMountSubject | None = None,
+        prefer_public_url: bool = False,
+    ) -> RcloneMountSpec:
+        """Build an rclone WebDAV spec for an OpenCloud Space surface.
+
+        OpenCloud WebDAV is OAuth-bearer-only, so the spec carries no static
+        credential. ``auth.type = "keycloak_client_credentials"`` tells the
+        agent-side mount manager to mint service-account tokens through the
+        shared ``KeycloakTokenClient`` and feed them to rclone via a
+        runtime-local ``bearer_token_command`` helper — the workspace host
+        only ever sees the short-lived access token, never the client
+        secret. See knowledge-base/knowledge/features/rclone_cloud_mount.md §11.
+
+        User-home mounts (Personal Spaces) use
+        ``auth.type = "keycloak_user_impersonation"``: the agent exchanges
+        its service token for a user-scoped token via RFC 8693
+        (``requested_subject``), because a Personal Space is owned by
+        exactly one user and the service account has no WebDAV access to
+        it. Requires the realm-management ``impersonation`` role on this
+        client's service account (granted by the bundled Keycloak setup).
+        Without a resolvable target sub they raise ``NOT_SUPPORTED`` so the
+        thread takes the documented session-folder fallback.
+        """
+        self._ensure_ready()
+        auth: dict[str, Any] = {
+            "type": "keycloak_client_credentials",
+            "issuer": self._keycloak_issuer,
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+        }
+        if isinstance(handle, SessionFolderHandle):
+            webdav_url = self.get_session_folder_webdav_url(handle)
+        else:
+            # Always reconstruct from the internal base URL. The persisted
+            # vendor_meta webdav_url comes from the graph create/lookup
+            # response and is the PUBLIC URL — mounting that would hairpin
+            # all rclone traffic through the public edge (and fails on
+            # local k3d, where workspace pods cannot reach it at all).
+            # handle.native_id is the Space drive id for both project and
+            # user-home handles.
+            webdav_url = (
+                f"{self._base_url}/dav/spaces/{quote(handle.native_id, safe='')}/"
+                if handle.native_id
+                else None
+            )
+            if handle.vendor_meta.get("kind") == "user_home":
+                target_user_sub = (subject.user_sub if subject else None) or ""
+                if not target_user_sub:
+                    raise CloudBackendError(
+                        CloudBackendErrorKind.NOT_SUPPORTED,
+                        f"cannot build rclone mount for {mount_kind}: "
+                        "user-home mount has no target user sub for "
+                        "impersonation; session-folder fallback applies",
+                        backend=self.backend_id,
+                    )
+                auth["type"] = "keycloak_user_impersonation"
+                auth["target_user_sub"] = target_user_sub
+
+        # Cross-cluster VM runtimes can't reach the internal service URL
+        # (srw-opencloud:9200) — swap to the public edge, which the VM egress
+        # NetworkPolicy permits (443). Same-cluster pods keep the internal URL
+        # (no hairpin, works on local k3d). See
+        # knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md.
+        if (
+            prefer_public_url
+            and webdav_url
+            and self._public_url
+            and webdav_url.startswith(self._base_url)
+        ):
+            webdav_url = self._public_url + webdav_url[len(self._base_url) :]
+
+        if not webdav_url:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                f"cannot build rclone mount for {mount_kind}: missing WebDAV URL",
+                backend=self.backend_id,
+            )
+
+        return RcloneMountSpec(
+            source_type="webdav",
+            source_config={
+                "url": webdav_url,
+                # OCIS-lineage vendor: tus chunked uploads + OpenCloud
+                # quirks. Exists from rclone 1.70.0 — enforced below.
+                "vendor": "infinitescale",
+            },
+            auth=auth,
+            # Local-dev knob (OPENCLOUD_MOUNT_INSECURE_TLS): the tus PATCH
+            # hop targets the PUBLIC data-gateway URL, which on local k3d
+            # presents an mkcert cert the workspace image doesn't trust.
+            provider_flags=(
+                ["--no-check-certificate"] if self._settings.mount_insecure_tls else []
+            ),
+            cache={
+                "vfs_cache_mode": "full",
+                "vfs_cache_max_size": "10G",
+                "vfs_cache_max_age": "24h",
+                "dir_cache_time": "5m",
+                "poll_interval": "1m",
+                "vfs_read_chunk_size": "16M",
+                "vfs_read_chunk_size_limit": "128M",
+                "hard_cache_limit": "20G",
+            },
+            required_capabilities=["rclone", "fuse", "rc", "token_helper"],
+            min_rclone_version="1.70.0",
+        )
 
     # ---------------------------------------------------------------- Lifecycle
 
@@ -204,6 +353,10 @@ class OpenCloudBackend:
             ) = await self._ensure_agent_home_space()
             self._agent_home_webdav_base = (
                 f"{self._base_url}/dav/spaces/{self._agent_home_drive_id}"
+            )
+            self._installation_proof_sha256 = main_cloud_installation_proof_sha256(
+                backend_id=self.backend_id,
+                remote_identity=str(self._agent_home_drive_id),
             )
 
             self._initialized = True
@@ -612,23 +765,29 @@ class OpenCloudBackend:
     ) -> Optional[str]:
         """Browser deep-link to a Space in the OpenCloud Web UI.
 
-        Prefers the ``webUrl`` captured from the drive-creation response
-        (persisted as ``vendor_meta.web_url``) because OpenCloud Web routes
-        Spaces by drive *alias* (e.g. ``project/<uuid>``), not by the raw
-        composite drive id. Falling back to ``/files/spaces/<drive_id>``
-        silently resolves to the user's personal space on real OpenCloud.
+        Derived from the LIVE ``public_url`` plus the Space's stable fileId
+        (``native_id``) via OpenCloud's ``/f/<fileId>`` private-link
+        resolver — the same form ``get_session_folder_browser_url`` uses.
+        The resolver routes to the exact Space for any member, so we do NOT
+        need the drive *alias*; and we deliberately do NOT return the
+        persisted ``vendor_meta.web_url``. That value is the ``webUrl``
+        OpenCloud emitted at Space-creation time, which bakes in whatever
+        ``OC_URL`` was canonical then — a later domain rebrand
+        (``cloud.superhuman-remote-worker.com`` -> ``cloud.srw.works``)
+        freezes every stored link on the dead host. Reconstructing keeps the
+        link current for old and new projects alike.
         """
-        web_url = handle.vendor_meta.get("web_url")
-        if web_url:
-            return str(web_url)
         drive_id = handle.native_id
-        if not drive_id:
-            return None
-        # Delimiters in the composite drive id must be percent-encoded.
-        # See opencloud-eu/web#1795 — most HTTP clients skip `!` and `$`
-        # by default.
-        safe_id = quote(drive_id, safe="")
-        return f"{self._public_url}/files/spaces/{safe_id}"
+        if drive_id:
+            # Delimiters in the composite fileId must be percent-encoded.
+            # See opencloud-eu/web#1795 — most HTTP clients skip `!` and `$`
+            # by default.
+            safe_id = quote(drive_id, safe="")
+            return f"{self._public_url}/f/{safe_id}"
+        # Legacy handle with no drive id: nothing to reconstruct from, so fall
+        # back to whatever absolute link was captured (may carry a stale host).
+        web_url = handle.vendor_meta.get("web_url")
+        return str(web_url) if web_url else None
 
     @instrument_backend_op("list_project_folder")
     async def list_project_folder(
@@ -671,20 +830,20 @@ class OpenCloudBackend:
             seen.add(current)
             safe_sub = quote(current, safe="/")
             url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
-            entries = await self._propfind_depth_one(url_path, href_prefix)
+            # Pass self_path=current so the subdir's own self-entry is dropped
+            # by the parser (it was already emitted as a child of its parent);
+            # without it, every subdirectory is counted twice (design §11.5).
+            entries = await self._propfind_depth_one(
+                url_path, href_prefix, self_path=current
+            )
             for entry in entries:
-                # Skip entries that fall outside ``subpath`` — Depth=1
-                # only returns immediate children, but defensive guard.
-                if current and not entry.path.startswith(current.rstrip("/") + "/"):
-                    if entry.path != current:
-                        continue
                 all_entries.append(entry)
                 if entry.is_dir and entry.path not in seen:
                     queue.append(entry.path)
         return all_entries
 
     async def _propfind_depth_one(
-        self, url_path: str, href_prefix: str
+        self, url_path: str, href_prefix: str, *, self_path: str = ""
     ) -> list[ProjectFolderEntry]:
         """Single ``Depth: 1`` PROPFIND that returns one folder's children.
 
@@ -720,7 +879,67 @@ class OpenCloudBackend:
                 status_code=resp.status_code,
                 raw={"body": resp.text[:500]},
             )
-        return parse_propfind_entries(resp.text, href_prefix=href_prefix)
+        return parse_propfind_entries(
+            resp.text, href_prefix=href_prefix, self_path=self_path
+        )
+
+    async def _propfind_at_depth(
+        self, url_path: str, href_prefix: str, *, depth: str, self_path: str = ""
+    ) -> list[ProjectFolderEntry]:
+        """PROPFIND at an explicit Depth. OpenCloud (oCIS) rejects
+        ``Depth: infinity`` with 400, which raises ``PropfindError`` so the
+        etag baseline falls straight through to a Depth:1 BFS (design §11.5)."""
+        token = await self._get_service_token()
+        try:
+            resp = await self._client.request(
+                "PROPFIND",
+                url_path,
+                headers={"Authorization": f"Bearer {token}", "Depth": depth},
+            )
+        except httpx.HTTPError as e:
+            raise PropfindError(str(e)) from e
+        if resp.status_code != 207:
+            raise PropfindError(
+                f"PROPFIND Depth:{depth} returned {resp.status_code} for {url_path}"
+            )
+        return parse_propfind_entries(
+            resp.text, href_prefix=href_prefix, self_path=self_path
+        )
+
+    async def capture_etag_baseline(
+        self, handle: ProjectFolderHandle
+    ) -> dict[str, str]:
+        """Mount-time ``{path: etag}`` baseline for the conflict gate. OpenCloud
+        rejects ``Depth: infinity``, so this always walks Depth:1 BFS via the
+        shared helper's fallback path (design §3.4, §11.5)."""
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "capture_etag_baseline: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        base_path = f"/dav/spaces/{safe_drive}"
+        href_prefix = f"{base_path}/"
+
+        async def list_tree() -> list[ProjectFolderEntry]:
+            return await self._propfind_at_depth(
+                base_path, href_prefix, depth="infinity"
+            )
+
+        async def list_children(sub: str) -> list[ProjectFolderEntry]:
+            safe_sub = quote(sub, safe="/")
+            url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
+            return await self._propfind_at_depth(
+                url_path, href_prefix, depth="1", self_path=sub
+            )
+
+        return await capture_etag_baseline(
+            root_subpath="", list_children=list_children, list_tree=list_tree
+        )
 
     @instrument_backend_op("get_project_folder_file_bytes")
     async def get_project_folder_file_bytes(
@@ -893,17 +1112,20 @@ class OpenCloudBackend:
     ) -> Optional[str]:
         """Internal WebDAV URL for a Space.
 
-        Preference order: persisted ``webdav_url`` from the create response
-        → reconstructed ``{base_url}/dav/spaces/{drive_id}/``.
+        Reconstructed from the LIVE internal ``base_url`` plus the Space drive
+        id, mirroring ``build_rclone_mount_spec`` (which already reconstructs
+        rather than trusting ``vendor_meta``). The persisted ``webdav_url`` is
+        the PUBLIC graph-response URL and freezes on the ``OC_URL`` domain at
+        creation time, so trusting it both hairpins traffic through the edge
+        and breaks after a domain rebrand. Only fall back to the persisted
+        value for legacy handles that carry no drive id.
         """
-        persisted = handle.vendor_meta.get("webdav_url")
-        if persisted:
-            return str(persisted)
         drive_id = handle.native_id
-        if not drive_id:
-            return None
-        safe_id = quote(drive_id, safe="")
-        return f"{self._base_url}/dav/spaces/{safe_id}/"
+        if drive_id:
+            safe_id = quote(drive_id, safe="")
+            return f"{self._base_url}/dav/spaces/{safe_id}/"
+        persisted = handle.vendor_meta.get("webdav_url")
+        return str(persisted) if persisted else None
 
     # ------------------------------------------------------------- Session folders
 
@@ -1423,7 +1645,7 @@ class OpenCloudBackend:
                 f"role {display_name!r} not in OpenCloud role catalog",
                 backend=self.backend_id,
             )
-        return self._role_cache[display_name]
+        return self._role_cache[key]
 
     # ---------------------------------------------------------------- Group lookup
 
@@ -1472,6 +1694,146 @@ class OpenCloudBackend:
             },
         )
         resp.raise_for_status()
+
+    # ------------------------------------------------ protected cloud mode: RO reader
+    #
+    # NOTE (design §9.2, §11.4): the reader here is a LibreGraph user. For real
+    # login-based mount auth it must be backed by a dedicated Keycloak user, and
+    # creating that on prod-private's SHARED Keycloak is an open question (§9.2).
+    # The Viewer-role RO guarantee is code-read-only/unverified-live (§11.7); the
+    # live status-code validation is the §11.4 manual gate before protected mode
+    # may engage on OpenCloud. This slice implements the interface + the correct
+    # Space Viewer invite; it does not itself provision the KC user.
+
+    async def _find_ro_reader(self, user_key: str) -> Optional[str]:
+        name = f"srw-reader-{user_key}"
+        resp = await self._graph_get("/graph/v1.0/users")
+        for user in resp.json().get("value", []):
+            if user.get("displayName") == name:
+                return str(user["id"])
+        return None
+
+    async def ensure_ro_reader(self, *, user_key: str) -> str:
+        """Idempotently ensure the ``srw-reader-<user_key>`` LibreGraph user with
+        no standing Space access. Returns its LibreGraph id."""
+        self._ensure_ready()
+        existing = await self._find_ro_reader(user_key)
+        if existing:
+            return existing
+        name = f"srw-reader-{user_key}"
+        body = {
+            "accountEnabled": True,
+            "displayName": name,
+            # oCIS LibreGraph REQUIRES onPremisesSamAccountName on create —
+            # omitting it returns 400 "no value given for required property
+            # onPremisesSamAccountName" (live dev-cluster oCIS validation,
+            # 2026-07-10). It doubles as the reader's login username.
+            "onPremisesSamAccountName": name,
+            "mail": f"{name}@srw.local",
+            "identities": [{"issuer": self._keycloak_issuer, "issuerAssignedId": name}],
+        }
+        try:
+            resp = await self._graph_post("/graph/v1.0/users", json=body)
+            if resp.status_code == 409 or (
+                resp.status_code == 400 and "nameAlreadyExists" in resp.text
+            ):
+                found = await self._find_ro_reader(user_key)
+                if found:
+                    return found
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        return str(resp.json()["id"])
+
+    async def mint_ro_grant(
+        self, handle: ProjectFolderHandle, *, user_key: str, grant_key: str
+    ) -> RoReaderGrant:
+        """Invite the reader user to the Space with the **Viewer** role
+        (read-only), capturing the permission id for later revoke."""
+        self._ensure_ready()
+        drive_id = handle.native_id
+        reader_id = await self._find_ro_reader(user_key)
+        if not reader_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"RO reader for {user_key!r} not provisioned",
+                backend=self.backend_id,
+            )
+        role_id = await self._role_id(
+            _SPACE_VIEWER_ROLE_NAME, _SPACE_VIEWER_ROLE_WEIGHT
+        )
+        safe_drive = quote(drive_id, safe="")
+        try:
+            resp = await self._graph_post(
+                f"/graph/v1beta1/drives/{safe_drive}/root/invite",
+                json={
+                    "recipients": [
+                        {"@libre.graph.recipient.type": "user", "objectId": reader_id}
+                    ],
+                    "roles": [role_id],
+                },
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        value = resp.json().get("value") or []
+        if not value or "id" not in value[0]:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                "Space invite returned no permission id",
+                backend=self.backend_id,
+                raw=resp.json(),
+            )
+        permission_id = str(value[0]["id"])
+        webdav_url = f"{self._base_url}/dav/spaces/{drive_id}/"
+        grant_handle = json.dumps(
+            {
+                "permission_id": permission_id,
+                "drive_id": str(drive_id),
+                "reader_id": reader_id,
+                "user_key": user_key,
+            }
+        )
+        return RoReaderGrant(
+            reader_id=reader_id,
+            grant_handle=grant_handle,
+            webdav_url=webdav_url,
+            credentials=None,  # OC reader authenticates with a short-TTL bearer
+            auth_kind="keycloak_user_impersonation",
+        )
+
+    async def revoke_ro_grant(self, grant_handle: str, *, user_key: str) -> None:
+        """Delete the Space Viewer permission minted by ``mint_ro_grant``.
+        Idempotent — a 404 (already gone) is not an error."""
+        self._ensure_ready()
+        data = json.loads(grant_handle)
+        safe_drive = quote(data["drive_id"], safe="")
+        permission_id = data["permission_id"]
+        try:
+            resp = await self._graph_delete(
+                f"/graph/v1beta1/drives/{safe_drive}/root/permissions/{permission_id}"
+            )
+            if resp.status_code not in (200, 204, 404):
+                resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
+    async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
+        """Write a real canary file with the write identity so the RO probe's
+        CVE side channels can target a real path (design §11.4)."""
+        path = ".srw-ro-canary/probe.txt"
+        await self.put_project_folder_file_bytes(handle, path=path, content=b"canary")
+        return CanaryFixture(path=path, version_ref=None, trash_ref=None)
+
+    async def remove_canary_fixture(
+        self, handle: ProjectFolderHandle, fixture: CanaryFixture
+    ) -> None:
+        try:
+            await self.delete_project_folder_file(
+                handle, path=fixture.path, if_exists=True
+            )
+        except CloudBackendError:
+            pass
 
     # ---------------------------------------------------------------- Agent home
 

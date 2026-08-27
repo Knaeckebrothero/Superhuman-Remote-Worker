@@ -10,105 +10,41 @@ The orchestrator URL is read from the ORCHESTRATOR_URL environment variable
 
 import logging
 import os
+from uuid import UUID
 from typing import Any, Dict, List, Optional
 
 import httpx
 from langchain_core.tools import tool
+
+from src.shared.orch_surface.client import AsyncCockpitClient
+from src.shared.orch_surface.jobs import (
+    CallerCtx,
+    JOB_DESCRIPTORS,
+    JobToolResult,
+    make_bound_handler,
+    registry_metadata,
+)
+from src.services.image_content import IMAGE_DATA_TAG_TEMPLATE
 
 from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
 ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "create_worker_job": {
+    "get_session_context": {
         "module": "orchestrator.jobs",
-        "function": "create_worker_job",
+        "function": "get_session_context",
         "description": (
-            "Create a new worker job on the orchestrator. A worker agent will "
-            "pick it up and execute it autonomously. Returns the job ID for "
-            "monitoring. Use config_name to select an expert (developer, scholar, "
-            "critic) or 'defaults' for general-purpose."
+            "Summarize the current persistent session context: thread ID, user "
+            "ID, project scope, workspace availability, backend capabilities, "
+            "cloud mount status, knowledge/connector availability, the chat "
+            "models this deployment routes, and the caller's effective grants."
         ),
         "category": "orchestrator",
-        "short_description": "Delegate work to a worker agent via the orchestrator.",
+        "short_description": "Show current session/project/workspace context.",
         "phases": ["strategic", "tactical"],
     },
-    "list_worker_jobs": {
-        "module": "orchestrator.jobs",
-        "function": "list_worker_jobs",
-        "description": (
-            "List jobs on the orchestrator. Filter by status to find active, "
-            "completed, or failed jobs. Returns job IDs, descriptions, statuses, "
-            "and assigned agents."
-        ),
-        "category": "orchestrator",
-        "short_description": "List jobs with optional status filter.",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_worker_job": {
-        "module": "orchestrator.jobs",
-        "function": "get_worker_job",
-        "description": (
-            "Get detailed status of a specific job including progress, current "
-            "phase, assigned agent, and any error messages."
-        ),
-        "category": "orchestrator",
-        "short_description": "Get job details and progress.",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_job_workspace_file": {
-        "module": "orchestrator.jobs",
-        "function": "get_job_workspace_file",
-        "description": (
-            "Read a file from a worker job's workspace. Use this to inspect "
-            "the worker's output, plan, or workspace notes. Common files: "
-            "plan.md, notes/, output/*.md"
-        ),
-        "category": "orchestrator",
-        "short_description": "Read a file from a job's workspace.",
-        "phases": ["strategic", "tactical"],
-    },
-    "approve_worker_job": {
-        "module": "orchestrator.jobs",
-        "function": "approve_worker_job",
-        "description": (
-            "Approve a frozen job that is pending review. This marks the job "
-            "as completed. Use after reviewing the job's deliverables."
-        ),
-        "category": "orchestrator",
-        "short_description": "Approve a frozen job.",
-        "phases": ["strategic", "tactical"],
-    },
-    "resume_worker_job": {
-        "module": "orchestrator.jobs",
-        "function": "resume_worker_job",
-        "description": (
-            "Resume a paused or frozen job with optional feedback. The worker "
-            "will incorporate your feedback when it resumes execution."
-        ),
-        "category": "orchestrator",
-        "short_description": "Resume a job with optional feedback.",
-        "phases": ["strategic", "tactical"],
-    },
-    "cancel_worker_job": {
-        "module": "orchestrator.jobs",
-        "function": "cancel_worker_job",
-        "description": "Cancel a running or paused job.",
-        "category": "orchestrator",
-        "short_description": "Cancel a job.",
-        "phases": ["strategic", "tactical"],
-    },
-    "pause_worker_job": {
-        "module": "orchestrator.jobs",
-        "function": "pause_worker_job",
-        "description": (
-            "Pause a running job. The worker will stop at the next safe point. "
-            "Use resume_worker_job to continue."
-        ),
-        "category": "orchestrator",
-        "short_description": "Pause a running job.",
-        "phases": ["strategic", "tactical"],
-    },
+    **registry_metadata(),
 }
 
 
@@ -143,285 +79,209 @@ def _get_client(*, user_id: Optional[str] = None) -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=30.0, headers=headers)
 
 
-def _format_job_summary(job: Dict[str, Any]) -> str:
-    """Format a job dict into a readable summary."""
+_surface_client: AsyncCockpitClient | None = None
+
+
+def _get_surface_client() -> AsyncCockpitClient:
+    """Return the shared pooled client used by descriptor-backed tools."""
+    global _surface_client
+    if _surface_client is None:
+        _surface_client = AsyncCockpitClient(base_url=_get_orchestrator_url())
+    return _surface_client
+
+
+def _caller_ctx(context: ToolContext) -> CallerCtx:
+    """Translate trusted ToolContext lineage without adding public arguments.
+
+    Officer detection comes only from the server-derived runtime actor. Parsed
+    config still controls the tool ceiling, but never grants actor authority.
+    """
+    parent_job_id: str | None = None
+    candidate = context._job_metadata.get("job_id")
+    try:
+        if candidate:
+            parent_job_id = str(UUID(str(candidate)))
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+    project_ids = tuple(str(project_id) for project_id in context.project_ids)
+    runtime_actor = getattr(context, "runtime_actor", None)
+    officer_session = bool(
+        runtime_actor is not None and runtime_actor.caller_kind == "officer"
+    )
+    return CallerCtx(
+        kind="officer" if officer_session else "session",
+        user_id=context.user_id,
+        project_ids=project_ids,
+        lineage_project_id=context.project_id,
+        thread_id=context.thread_id,
+        parent_job_id=parent_job_id,
+        resolve_job_id_prefixes=True,
+        runtime_actor=runtime_actor,
+        supports_multimodal=context.get_phase_multimodal(),
+    )
+
+
+def _agent_tool_result(result: str | JobToolResult) -> str:
+    """Bridge a typed shared result into the existing transient image tag.
+
+    The graph/persistent-graph post-processor strips this tag before the
+    ToolMessage is checkpointed and creates the provider image block. Plain
+    text never contains base64 after that boundary.
+    """
+    if isinstance(result, str):
+        return result
+    if result.image is None:
+        return result.text
+    return (
+        result.text
+        + "\n"
+        + IMAGE_DATA_TAG_TEMPLATE.format(
+            mime=result.image.media_type,
+            b64=result.image.base64_data,
+        )
+    )
+
+
+# F15: the local _short_id/_truncate/_compact_dict_value/_format_freeze_data/
+# _format_job_list_item helpers were re-homed into
+# src/shared/orch_surface/formatters.py (format_jobs/format_job_detail) so
+# every lane renders the same decision-grade output.
+
+
+def _format_grants(capabilities: Dict[str, Any]) -> List[str]:
+    """Render the caller's effective grants for the session-context report.
+
+    Shape comes from ``GET /api/users/me/capabilities``: admins get
+    ``grants: None`` (unrestricted). Only the capabilities that decide whether a
+    ``create_job`` override will be accepted are surfaced — the full
+    catalog would bloat the tool result for no decision value.
+    """
+    if capabilities.get("is_admin"):
+        return ["  Grants: admin (unrestricted)"]
+    grants = capabilities.get("grants")
+    if not isinstance(grants, dict):
+        return []
+    lines = ["  Grants:"]
+    for key in ("vm_workspace", "shell_tools", "delegation", "datasource_tools"):
+        if key in grants:
+            lines.append(f"    {key}: {grants[key]}")
+    allowed_models = grants.get("model_selection")
+    if allowed_models is not None:
+        lines.append(
+            f"    model_selection: {', '.join(str(m) for m in allowed_models)}"
+        )
+    return lines
+
+
+def _format_session_context(
+    context: ToolContext,
+    *,
+    chat_models: Optional[List[str]] = None,
+    capabilities: Optional[Dict[str, Any]] = None,
+) -> str:
+    workspace = context.workspace_manager
+    backend = getattr(workspace, "backend", None) if workspace else None
+    cloud_mount = context.config.get("cloud_mount") or {}
+    datasource_keys = sorted(context.datasources.keys())
+
     lines = [
-        f"Job ID: {job.get('id', 'unknown')}",
-        f"Status: {job.get('status', 'unknown')}",
-        f"Description: {job.get('description', 'N/A')}",
+        "Session context:",
+        f"  Thread ID: {context.thread_id or 'none'}",
+        f"  User ID: {context.user_id or 'none'}",
+        f"  Primary project ID: {context.project_id or 'none'}",
+        f"  Project IDs: {', '.join(context.project_ids) if context.project_ids else 'none'}",
+        f"  Job/context ID: {context.job_id or 'none'}",
+        f"  Workspace available: {bool(workspace)}",
     ]
-    if job.get("config_name"):
-        lines.append(f"Config: {job['config_name']}")
-    if job.get("assigned_agent_id"):
-        lines.append(f"Agent: {job['assigned_agent_id']}")
-    if job.get("created_at"):
-        lines.append(f"Created: {job['created_at']}")
-    if job.get("error_message"):
-        lines.append(f"Error: {job['error_message']}")
+    if workspace:
+        lines.extend(
+            [
+                f"  Workspace path: {workspace.path}",
+                f"  Workspace backend: {type(backend).__name__ if backend else 'unknown'}",
+                f"  Supports shell: {bool(getattr(backend, 'supports_shell', False))}",
+                f"  Git available: {context.has_git()}",
+            ]
+        )
+    lines.extend(
+        [
+            f"  Shell manager available: {context.has_shell()}",
+            f"  Knowledge available: {context.has_knowledge()}",
+            f"  Connectors: {', '.join(datasource_keys) if datasource_keys else 'none'}",
+            f"  Cloud mount active: {bool(cloud_mount.get('active'))}",
+        ]
+    )
+    if cloud_mount.get("active"):
+        lines.append(
+            f"  Cloud workspace entry: {cloud_mount.get('workspace_entry', '/workspace/cloud')}"
+        )
+    # Everything a create_job config_override needs to be written without
+    # guessing: the model IDs this deployment actually routes, and the grants
+    # that decide whether an override is accepted. Both are omitted (not faked)
+    # when the lookup failed — see get_session_context.
+    if chat_models:
+        lines.append(f"  Available chat models: {', '.join(chat_models)}")
+    if capabilities:
+        lines.extend(_format_grants(capabilities))
     return "\n".join(lines)
 
 
 def create_orchestrator_tools(context: ToolContext) -> List[Any]:
-    """Create all orchestrator tools with injected context."""
+    """Create the session-context tool and every descriptor-backed job tool."""
     base_url = _get_orchestrator_url()
 
     @tool
-    async def create_worker_job(
-        description: str,
-        config_name: str = "defaults",
-        instructions: Optional[str] = None,
-        priority: int = 5,
-        project_id: Optional[str] = None,
-    ) -> str:
-        """Create a new worker job on the orchestrator.
+    async def get_session_context() -> str:
+        """Show the current session, project, workspace, and capability context.
 
-        Args:
-            description: What the worker should accomplish
-            config_name: Expert config to use (defaults, developer, scholar, critic)
-            instructions: Additional instructions for the worker
-            priority: Job priority 1-10, higher = more urgent (default: 5)
-            project_id: Optional project to scope the job to
-
-        Returns:
-            Job creation result with job ID
+        Use this before project/job/repository actions when you need to know
+        which thread, user, project, and workspace backend this session is using.
+        Also reports the chat models this deployment routes and your effective
+        grants — read both before pinning a model or workspace backend in a
+        create_job config_override.
         """
-        payload: Dict[str, Any] = {
-            "description": description,
-            "config_name": config_name,
-            "priority": priority,
-        }
-        if instructions:
-            payload["instructions"] = instructions
-        if project_id:
-            payload["project_id"] = project_id
-        # When invoked from a persistent session, carry the thread back so
-        # the orchestrator can derive the owning user (and apply their model
-        # preferences during dispatch). No-op for worker-mode callers.
-        if context.thread_id:
-            payload["thread_id"] = context.thread_id
-        if not project_id and context.project_id:
-            payload["project_id"] = context.project_id
-
-        async with _get_client(user_id=context.user_id) as client:
-            try:
-                resp = await client.post(f"{base_url}/api/jobs", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-                job_id = data.get("id") or data.get("job_id", "unknown")
-                return (
-                    f"Job created successfully.\n"
-                    f"Job ID: {job_id}\n"
-                    f"Config: {config_name}\n"
-                    f"Priority: {priority}\n"
-                    f"Description: {description}\n\n"
-                    f"A worker agent will pick this up from the dispatch queue. "
-                    f"Use get_worker_job('{job_id}') to check progress."
-                )
-            except httpx.HTTPStatusError as e:
-                return f"Failed to create job: HTTP {e.response.status_code} — {e.response.text}"
-            except httpx.RequestError as e:
-                return f"Failed to connect to orchestrator: {e}"
-
-    @tool
-    async def list_worker_jobs(
-        status: Optional[str] = None,
-        limit: int = 20,
-    ) -> str:
-        """List jobs on the orchestrator.
-
-        Args:
-            status: Filter by status (created, processing, completed, failed, cancelled, paused, pending_review)
-            limit: Maximum jobs to return (default: 20)
-
-        Returns:
-            Formatted list of jobs
-        """
-        params: Dict[str, Any] = {"limit": limit}
-        if status:
-            params["status"] = status
-
-        async with _get_client(user_id=context.user_id) as client:
-            try:
-                resp = await client.get(f"{base_url}/api/jobs", params=params)
-                resp.raise_for_status()
-                data = resp.json()
-                jobs = data if isinstance(data, list) else data.get("jobs", [])
-
-                if not jobs:
-                    filter_msg = f" with status='{status}'" if status else ""
-                    return f"No jobs found{filter_msg}."
-
-                lines = [f"Found {len(jobs)} job(s):\n"]
-                for job in jobs:
-                    lines.append(f"--- {job.get('id', '?')[:8]}... ---")
-                    lines.append(f"  Status: {job.get('status', '?')}")
-                    lines.append(
-                        f"  Description: {(job.get('description') or 'N/A')[:100]}"
+        chat_models: Optional[List[str]] = None
+        capabilities: Optional[Dict[str, Any]] = None
+        try:
+            async with _get_client(user_id=context.user_id) as client:
+                try:
+                    resp = await client.get(f"{base_url}/api/models")
+                    resp.raise_for_status()
+                    groups = resp.json().get("groups") or []
+                    models = [
+                        str(model_id)
+                        for group in groups
+                        for model_id in (group.get("models") or [])
+                    ]
+                    chat_models = sorted(dict.fromkeys(models)) or None
+                except Exception as error:
+                    logger.debug("get_session_context: model lookup failed: %s", error)
+                try:
+                    resp = await client.get(f"{base_url}/api/users/me/capabilities")
+                    resp.raise_for_status()
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        capabilities = payload
+                except Exception as error:
+                    logger.debug(
+                        "get_session_context: capability lookup failed: %s", error
                     )
-                    if job.get("config_name"):
-                        lines.append(f"  Config: {job['config_name']}")
-                    lines.append("")
+        except Exception as error:
+            logger.debug("get_session_context: orchestrator unreachable: %s", error)
 
-                return "\n".join(lines)
-            except httpx.HTTPStatusError as e:
-                return f"Failed to list jobs: HTTP {e.response.status_code}"
-            except httpx.RequestError as e:
-                return f"Failed to connect to orchestrator: {e}"
+        return _format_session_context(
+            context, chat_models=chat_models, capabilities=capabilities
+        )
 
-    @tool
-    async def get_worker_job(job_id: str) -> str:
-        """Get detailed status of a worker job.
-
-        Args:
-            job_id: The job UUID
-
-        Returns:
-            Job details including status, progress, and any errors
-        """
-        async with _get_client(user_id=context.user_id) as client:
-            try:
-                resp = await client.get(f"{base_url}/api/jobs/{job_id}")
-                resp.raise_for_status()
-                job = resp.json()
-                return _format_job_summary(job)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    return f"Job '{job_id}' not found."
-                return f"Failed to get job: HTTP {e.response.status_code}"
-            except httpx.RequestError as e:
-                return f"Failed to connect to orchestrator: {e}"
-
-    @tool
-    async def get_job_workspace_file(job_id: str, path: str) -> str:
-        """Read a file from a worker job's workspace.
-
-        Args:
-            job_id: The job UUID
-            path: Relative file path (e.g., plan.md, notes/decisions.md, output/result.md)
-
-        Returns:
-            File contents or error message
-        """
-        async with _get_client(user_id=context.user_id) as client:
-            try:
-                resp = await client.get(
-                    f"{base_url}/api/jobs/{job_id}/workspace/file",
-                    params={"path": path},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                content = data.get("content", "")
-                if not content:
-                    return f"File '{path}' is empty or not found."
-                return f"=== {path} ===\n{content}"
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    return f"File '{path}' not found in job {job_id}."
-                return f"Failed to read file: HTTP {e.response.status_code}"
-            except httpx.RequestError as e:
-                return f"Failed to connect to orchestrator: {e}"
-
-    @tool
-    async def approve_worker_job(job_id: str) -> str:
-        """Approve a frozen job that is pending review.
-
-        Args:
-            job_id: The job UUID to approve
-
-        Returns:
-            Approval result
-        """
-        async with _get_client(user_id=context.user_id) as client:
-            try:
-                resp = await client.post(f"{base_url}/api/jobs/{job_id}/approve")
-                resp.raise_for_status()
-                return f"Job {job_id} approved and marked as completed."
-            except httpx.HTTPStatusError as e:
-                return f"Failed to approve job: HTTP {e.response.status_code} — {e.response.text}"
-            except httpx.RequestError as e:
-                return f"Failed to connect to orchestrator: {e}"
-
-    @tool
-    async def resume_worker_job(
-        job_id: str,
-        feedback: Optional[str] = None,
-    ) -> str:
-        """Resume a paused or frozen job with optional feedback.
-
-        Args:
-            job_id: The job UUID to resume
-            feedback: Optional feedback message for the worker to incorporate
-
-        Returns:
-            Resume result
-        """
-        payload: Dict[str, Any] = {}
-        if feedback:
-            payload["feedback"] = feedback
-
-        async with _get_client(user_id=context.user_id) as client:
-            try:
-                resp = await client.post(
-                    f"{base_url}/api/jobs/{job_id}/resume",
-                    json=payload,
-                )
-                resp.raise_for_status()
-                msg = f"Job {job_id} resumed."
-                if feedback:
-                    msg += f" Feedback sent: {feedback[:100]}"
-                return msg
-            except httpx.HTTPStatusError as e:
-                return f"Failed to resume job: HTTP {e.response.status_code} — {e.response.text}"
-            except httpx.RequestError as e:
-                return f"Failed to connect to orchestrator: {e}"
-
-    @tool
-    async def cancel_worker_job(job_id: str) -> str:
-        """Cancel a running or paused job.
-
-        Args:
-            job_id: The job UUID to cancel
-
-        Returns:
-            Cancellation result
-        """
-        async with _get_client(user_id=context.user_id) as client:
-            try:
-                resp = await client.post(f"{base_url}/api/jobs/{job_id}/cancel")
-                resp.raise_for_status()
-                return f"Job {job_id} cancelled."
-            except httpx.HTTPStatusError as e:
-                return f"Failed to cancel job: HTTP {e.response.status_code} — {e.response.text}"
-            except httpx.RequestError as e:
-                return f"Failed to connect to orchestrator: {e}"
-
-    @tool
-    async def pause_worker_job(job_id: str) -> str:
-        """Pause a running job. The worker stops at the next safe point.
-
-        Args:
-            job_id: The job UUID to pause
-
-        Returns:
-            Pause result
-        """
-        async with _get_client(user_id=context.user_id) as client:
-            try:
-                resp = await client.post(f"{base_url}/api/jobs/{job_id}/pause")
-                resp.raise_for_status()
-                return f"Job {job_id} pause requested. Worker will stop at next safe point."
-            except httpx.HTTPStatusError as e:
-                return f"Failed to pause job: HTTP {e.response.status_code} — {e.response.text}"
-            except httpx.RequestError as e:
-                return f"Failed to connect to orchestrator: {e}"
-
-    return [
-        create_worker_job,
-        list_worker_jobs,
-        get_worker_job,
-        get_job_workspace_file,
-        approve_worker_job,
-        resume_worker_job,
-        cancel_worker_job,
-        pause_worker_job,
+    job_tools = [
+        tool(
+            make_bound_handler(
+                item,
+                client_provider=_get_surface_client,
+                caller_provider=lambda context=context: _caller_ctx(context),
+                result_adapter=_agent_tool_result,
+            )
+        )
+        for item in JOB_DESCRIPTORS
     ]
+    return [get_session_context, *job_tools]

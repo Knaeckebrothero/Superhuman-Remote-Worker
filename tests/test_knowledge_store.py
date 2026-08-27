@@ -354,6 +354,198 @@ class TestUpsertContentChanged:
 
 
 # =============================================================================
+# upsert_note priority sentinel (project-backlog-pipeline task 3, fix round 1,
+# Finding 1): priority=None means "unknown, leave it as-is" -- both branches
+# must COALESCE against the row's existing value, not silently default to 1
+# and clobber a real priority. Mutation-tested: reverting either COALESCE to
+# a bare `priority`/`EXCLUDED.priority` reference fails these.
+# =============================================================================
+
+
+class TestUpsertNotePriorityCoalesceSentinel:
+    @pytest.mark.asyncio
+    async def test_metadata_only_branch_coalesces_none_against_existing_row(self):
+        store, mock_db, _ = _make_store()
+        existing_hash = KnowledgeStore._content_hash("body")
+        mock_db.fetchval.side_effect = [existing_hash, uuid.uuid4()]
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="feature",
+            content="body",
+            priority=None,
+        )
+        update_call = mock_db.fetchval.call_args_list[1]
+        query = update_call[0][0]
+        assert "priority = COALESCE($13, priority)" in query
+        # This layer must never turn None into a concrete int itself -- that
+        # decision belongs entirely to the SQL COALESCE against the live row.
+        assert update_call[0][-1] is None
+
+    @pytest.mark.asyncio
+    async def test_insert_branch_coalesces_none_to_default_for_a_fresh_row(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.side_effect = [None, uuid.uuid4()]  # no existing -> INSERT
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="feature",
+            content="body",
+            priority=None,
+        )
+        insert_call = mock_db.fetchval.call_args_list[1]
+        assert "COALESCE($19, 1)" in insert_call[0][0]
+        # $19 is still bound as None -- the VALUES-list COALESCE (not Python)
+        # is what turns it into 1 for the genuinely-new row.
+        assert insert_call[0][-1] is None
+
+    @pytest.mark.asyncio
+    async def test_insert_branch_on_conflict_preserves_existing_not_excluded(self):
+        """The ON CONFLICT branch must reference the raw bound parameter
+        ($19), never EXCLUDED.priority -- EXCLUDED.priority is already the
+        VALUES-list COALESCE(_, 1) result and would never be NULL, so
+        referencing it here would silently reintroduce the clobber bug on
+        every conflicting upsert with priority=None."""
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.side_effect = [None, uuid.uuid4()]
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="feature",
+            content="body",
+            priority=None,
+        )
+        query = mock_db.fetchval.call_args_list[1][0][0]
+        conflict_clause = query.split("ON CONFLICT")[1]
+        assert "priority = COALESCE($19, knowledge_index.priority)" in conflict_clause
+        assert "EXCLUDED.priority" not in conflict_clause
+
+    @pytest.mark.asyncio
+    async def test_explicit_priority_still_wins_on_metadata_only_branch(self):
+        """Regression guard: the sentinel must not interfere with a real,
+        caller-supplied value (Task 3's original contract, fix round 0)."""
+        store, mock_db, _ = _make_store()
+        existing_hash = KnowledgeStore._content_hash("body")
+        mock_db.fetchval.side_effect = [existing_hash, uuid.uuid4()]
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="feature",
+            content="body",
+            priority=0,
+        )
+        update_call = mock_db.fetchval.call_args_list[1]
+        # Positional, not [-1]: args[0] is the query, so $13 (priority) is
+        # index 13. B2 appended $14 (ready) after it, and a trailing-slot pin
+        # would silently start asserting against whatever lands last next.
+        assert update_call[0][13] == 0
+        assert update_call[0][14] is None  # this write said nothing about ready
+
+
+# =============================================================================
+# upsert_kb_note priority sentinel (project-backlog-pipeline task 3, fix
+# round 2, Finding 3): priority=None means "the file has no priority: line,
+# leave the stored rank as-is" -- the reindex-path counterpart to
+# TestUpsertNotePriorityCoalesceSentinel above (the agent-write path).
+# Mutation-tested: reverting either COALESCE to a bare `$21`/
+# `EXCLUDED.priority` reference fails these.
+# =============================================================================
+
+
+class TestUpsertKbNotePriorityCoalesceSentinel:
+    @pytest.mark.asyncio
+    async def test_coalesces_none_against_existing_row_on_conflict(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="feature",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            priority=None,
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "priority = COALESCE($21, knowledge_index.priority)" in query
+        # This layer must never turn None into a concrete int itself -- that
+        # decision belongs entirely to the SQL COALESCE against the live row.
+        assert params[-1] is None
+
+    @pytest.mark.asyncio
+    async def test_coalesces_none_to_default_for_a_fresh_row(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="feature",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            priority=None,
+        )
+        query = mock_db.fetchval.call_args[0][0]
+        assert "COALESCE($21, 1)" in query
+
+    @pytest.mark.asyncio
+    async def test_on_conflict_preserves_existing_not_excluded(self):
+        """Never EXCLUDED.priority here -- it's already the VALUES-list's
+        COALESCE(_, 1) result and would never be NULL, so referencing it
+        would silently reintroduce the clobber bug on every conflicting
+        upsert with priority=None (i.e. every reindex of an existing note
+        whose file has no priority: line)."""
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="feature",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            priority=None,
+        )
+        query = mock_db.fetchval.call_args[0][0]
+        conflict_clause = query.split("ON CONFLICT")[1]
+        assert "priority = COALESCE($21, knowledge_index.priority)" in conflict_clause
+        assert "EXCLUDED.priority" not in conflict_clause
+
+    @pytest.mark.asyncio
+    async def test_explicit_priority_still_wins(self):
+        """Regression guard: the sentinel must not interfere with a real,
+        caller-supplied value (Task 2's original contract)."""
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="feature",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            priority=0,
+        )
+        params = mock_db.fetchval.call_args[0][1:]
+        # $21 (priority) by position, not [-1]: B2 appended $22 (ready_at)
+        # after it, and a trailing-slot pin would follow whatever lands last.
+        assert params[20] == 0
+        assert params[21] is None  # no ready_at: line in this note's frontmatter
+
+
+# =============================================================================
 # 11.6: delete_note()
 # =============================================================================
 
@@ -459,6 +651,71 @@ class TestHybridSearch:
         assert call_args[5] == 0.6  # dense
         assert call_args[6] == 0.3  # sparse
         assert call_args[7] == 0.1  # recency
+
+
+# =============================================================================
+# find_similar_many() — neighbour fetch for the ingestion verdict (slice 2 PR2)
+# =============================================================================
+
+
+class TestFindSimilarMany:
+    """Tests for find_similar_many() — the KB analog of RecallStore's version."""
+
+    @pytest.mark.asyncio
+    async def test_returns_records_with_similarity(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {"note_id": "n1", "title": "A", "content": "body", "similarity": 0.91},
+        ]
+
+        result = await store.find_similar_many(
+            project_id=uuid.uuid4(), embedding=[0.1, 0.2, 0.3]
+        )
+        assert len(result) == 1
+        assert isinstance(result[0], KnowledgeRecord)
+        assert result[0].note_id == "n1"
+        assert result[0].similarity == 0.91
+
+    @pytest.mark.asyncio
+    async def test_query_scopes_to_project_active_and_floor(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        pid = uuid.uuid4()
+
+        await store.find_similar_many(
+            project_id=pid, embedding=[0.1, 0.2, 0.3], k=7, min_similarity=0.75
+        )
+        sql = mock_db.fetch.call_args[0][0]
+        args = mock_db.fetch.call_args[0][1:]
+        assert "project_id" in sql
+        assert "status = 'active'" in sql
+        assert "embedding <=>" in sql
+        # args: embedding, project_id, min_similarity, k
+        assert args[1] == pid
+        assert args[2] == 0.75
+        assert args[3] == 7
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_neighbours(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+
+        result = await store.find_similar_many(
+            project_id=uuid.uuid4(), embedding=[0.1, 0.2, 0.3]
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_accepts_string_embedding(self):
+        # Legacy string embeddings must be normalized (mirrors _prepare_embedding).
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+
+        await store.find_similar_many(
+            project_id=uuid.uuid4(), embedding="[0.1,0.2,0.3]"
+        )
+        passed = mock_db.fetch.call_args[0][1]
+        assert passed == [0.1, 0.2, 0.3]
 
 
 # =============================================================================
@@ -720,3 +977,368 @@ class TestAssembleKnowledgeBlock:
         result = KnowledgeStore.assemble_knowledge_block(notes)
         assert "[1]" in result
         assert "[2]" in result
+
+
+# =============================================================================
+# find_near_duplicate_pairs() — the kb_lint near-duplicate fetch
+# =============================================================================
+
+
+class TestFindNearDuplicatePairs:
+    @pytest.mark.asyncio
+    async def test_returns_pair_tuples_from_rows(self):
+        store, mock_db, _ = _make_store()
+        pid = uuid.uuid4()
+        mock_db.fetch.return_value = [
+            {"note_a": "n1", "note_b": "n2", "similarity": 0.94},
+            {"note_a": "n3", "note_b": "n4", "similarity": 0.91},
+        ]
+        pairs = await store.find_near_duplicate_pairs(pid)
+        assert pairs == [("n1", "n2", 0.94), ("n3", "n4", 0.91)]
+
+    @pytest.mark.asyncio
+    async def test_query_is_active_only_self_join_with_knobs(self):
+        store, mock_db, _ = _make_store()
+        pid = uuid.uuid4()
+        mock_db.fetch.return_value = []
+        await store.find_near_duplicate_pairs(pid, min_similarity=0.88, limit=25)
+        args = mock_db.fetch.call_args[0]
+        sql = args[0]
+        # Active-only on both sides, each pair once, embeddings required.
+        assert sql.count("status = 'active'") == 2
+        assert "a.note_id < b.note_id" in sql
+        assert "embedding IS NOT NULL" in sql
+        assert pid in args
+        assert 0.88 in args
+        assert 25 in args
+
+    @pytest.mark.asyncio
+    async def test_empty_result(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        assert await store.find_near_duplicate_pairs(uuid.uuid4()) == []
+
+    @pytest.mark.asyncio
+    async def test_self_join_guards_embedding_version(self):
+        # D-2: cosine-comparing vectors from different embedding models is
+        # meaningless (ghost null-version vs qwen3 c1). The self-join must only
+        # pair rows that share an embedding_version.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.find_near_duplicate_pairs(uuid.uuid4())
+        sql = mock_db.fetch.call_args[0][0]
+        assert "a.embedding_version = b.embedding_version" in sql
+
+
+# =============================================================================
+# get_note_by_slug() — the kg-less kb_read backend
+# =============================================================================
+
+
+class TestGetNoteBySlug:
+    @pytest.mark.asyncio
+    async def test_excludes_pathless_ghost_rows(self):
+        # B-1 (symmetry with list_notes): a direct read must not surface a
+        # pathless ghost row either — files-canonical means a file must back it.
+        # Status stays unfiltered (superseded/archived files still read).
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = None
+        await store.get_note_by_slug(uuid.uuid4(), "some-slug")
+        sql = mock_db.fetchrow.call_args[0][0]
+        assert "path IS NOT NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_maps_row_to_note_dict(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = {
+            "note_id": "n1",
+            "title": "N1",
+            "note_type": "decision",
+            "status": "superseded",
+            "content": "body",
+            "confidence": "high",
+            "tags": ["a"],
+            "keywords": ["k"],
+            "job_id": None,
+            "phase": None,
+            "created_at": None,
+            "modified_at": None,
+        }
+        out = await store.get_note_by_slug(uuid.uuid4(), "n1")
+        assert out["id"] == "n1"
+        assert out["type"] == "decision"
+        assert out["status"] == "superseded"
+        assert out["tags"] == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_absent(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = None
+        assert await store.get_note_by_slug(uuid.uuid4(), "nope") is None
+
+
+# =============================================================================
+# list_notes() — the kg-less kb_list backend
+# =============================================================================
+
+
+class TestListNotes:
+    @pytest.mark.asyncio
+    async def test_excludes_pathless_ghost_rows(self):
+        # B-1: files-canonical — the store lists what a file backs. Pathless
+        # ghost rows (the DELETE dual-write gap) must never surface in kb_list.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.list_notes(uuid.uuid4())
+        sql = mock_db.fetch.call_args[0][0]
+        assert "path IS NOT NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_maps_rows_to_summary_dicts(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {
+                "note_id": "n1",
+                "title": "N1",
+                "note_type": "decision",
+                "status": "active",
+                "confidence": "high",
+            }
+        ]
+        out = await store.list_notes(uuid.uuid4())
+        assert out == [
+            {
+                "id": "n1",
+                "title": "N1",
+                "type": "decision",
+                "status": "active",
+                "confidence": "high",
+                "priority": 1,
+            }
+        ]
+
+
+# =============================================================================
+# list_notes_full() — the kb_lint / kb_index gardener backend
+# =============================================================================
+
+
+class TestListNotesFull:
+    @pytest.mark.asyncio
+    async def test_does_not_filter_on_path(self):
+        # The linter's whole job is to see what the read path cannot: a row no
+        # file backs is a defect (invisible to kb_read/kb_search), not an
+        # absence. Gating it like list_notes would let a KB whose
+        # materialisation is broken lint "clean" while reading empty.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.list_notes_full(uuid.uuid4())
+        sql = mock_db.fetch.call_args[0][0]
+        assert "path IS NOT NULL" not in sql
+
+    @pytest.mark.asyncio
+    async def test_matches_unadopted_rows_through_project_id(self):
+        # upsert_note (the agent write-through) sets project_id but never
+        # kb_id, so a kb_id-only filter would miss every just-written note.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.list_notes_full(uuid.uuid4())
+        sql = mock_db.fetch.call_args[0][0]
+        assert "kb_id IS NULL AND project_id = $1" in sql
+
+    @pytest.mark.asyncio
+    async def test_maps_rows_with_path_and_supersede(self):
+        store, mock_db, _ = _make_store()
+        job_id = uuid.uuid4()
+        mock_db.fetch.return_value = [
+            {
+                "note_id": "n1",
+                "path": "knowledge/n1.md",
+                "title": "N1",
+                "note_type": "decision",
+                "status": "superseded",
+                "confidence": "high",
+                "priority": 0,
+                "tags": ["a"],
+                "keywords": None,
+                "job_id": job_id,
+                "phase": 3,
+                "content": "body",
+                "superseded_by": "n2",
+                "created_at": None,
+                "modified_at": None,
+            }
+        ]
+        out = await store.list_notes_full(uuid.uuid4())
+        assert out == [
+            {
+                "id": "n1",
+                "path": "knowledge/n1.md",
+                "title": "N1",
+                "type": "decision",
+                "status": "superseded",
+                "content": "body",
+                "confidence": "high",
+                "priority": 0,
+                "tags": ["a"],
+                "keywords": [],
+                "job_id": job_id,
+                "phase": 3,
+                "superseded_by": "n2",
+                "created": None,
+                "modified": None,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_passes_the_scan_cap_as_a_limit(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.list_notes_full(uuid.uuid4(), limit=7)
+        assert mock_db.fetch.call_args[0][2] == 7
+
+
+# =============================================================================
+# reconcile_orphans() — R-1 ghost reconciliation
+# =============================================================================
+
+
+class TestReconcileOrphans:
+    @pytest.mark.asyncio
+    async def test_archives_pathless_orphans_keyed_on_project_id(self):
+        # R-1: un-adopted ghost rows carry project_id but kb_id IS NULL, so the
+        # reconciliation MUST key on project_id — a kb_id filter matches zero.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [{"id": uuid.uuid4()}, {"id": uuid.uuid4()}]
+        pid = uuid.uuid4()
+        n = await store.reconcile_orphans(pid, ["keep-a", "keep-b"])
+        assert n == 2
+        sql = mock_db.fetch.call_args[0][0]
+        assert "project_id = $1" in sql
+        assert "kb_id" not in sql  # the landmine: ghosts have kb_id NULL
+        assert "path IS NULL" in sql
+        assert "status = 'active'" in sql  # only reap active rows
+        assert "note_id <> ALL" in sql  # slug absent from the tree
+        assert "indexed_at <" in sql  # adoption grace
+        assert "status = 'archived'" in sql  # soft-archive, not delete
+        assert "invalidated_at = now()" in sql
+        args = mock_db.fetch.call_args[0]
+        assert pid in args
+        assert ["keep-a", "keep-b"] in args
+
+    @pytest.mark.asyncio
+    async def test_grace_defaults_to_one_hour(self):
+        import datetime
+
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.reconcile_orphans(uuid.uuid4(), [])
+        assert datetime.timedelta(hours=1) in mock_db.fetch.call_args[0]
+
+
+# =============================================================================
+# search_chunks() — the slice-3 PR4 retrieval cutover (RRF over knowledge_chunks)
+# =============================================================================
+
+
+class TestSearchChunks:
+    """Tests for search_chunks() — hybrid retrieval over the chunk index.
+
+    The chunk-granular successor to hybrid_search: after the PR3 reindexer the
+    dense vector lives on ``knowledge_chunks`` (the note row's ``embedding`` is
+    NULL for reindexed notes), so retrieval must fuse over chunk rows and
+    collapse the best chunk back to its note. Returns note-level
+    ``KnowledgeRecord``s so the ``kb_search`` tool signature is unchanged.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_kb_ids(self):
+        store, mock_db, _ = _make_store()
+        result = await store.search_chunks(kb_ids=[], query="test")
+        assert result == []
+        mock_db.fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_calls_embed_for_query(self):
+        store, mock_db, mock_embed = _make_store()
+        mock_db.fetch.return_value = []
+        await store.search_chunks(kb_ids=[uuid.uuid4()], query="search term")
+        mock_embed.embed.assert_called_once_with("search term")
+
+    @pytest.mark.asyncio
+    async def test_uses_chunk_hybrid_search_function(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.search_chunks(kb_ids=[uuid.uuid4()], query="q")
+        sql = mock_db.fetch.call_args[0][0]
+        assert "knowledge_chunk_hybrid_search" in sql
+
+    @pytest.mark.asyncio
+    async def test_passes_kb_ids_as_array_and_version_filter(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        kb_ids = [uuid.uuid4(), uuid.uuid4()]
+        await store.search_chunks(
+            kb_ids=kb_ids, query="q", embedding_version="m:4096:c1"
+        )
+        args = mock_db.fetch.call_args[0]
+        # kb_ids threaded as a single array param (ANY(...) in the function);
+        # embedding_version threaded so mixed-model vectors can't drift.
+        assert kb_ids in args
+        assert "m:4096:c1" in args
+
+    @pytest.mark.asyncio
+    async def test_default_weights_and_rrf_k(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.search_chunks(kb_ids=[uuid.uuid4()], query="q")
+        args = mock_db.fetch.call_args[0]
+        # RRF weights match §5.1 (0.6/0.3/0.1); rrf_k defaults to 60.
+        assert 0.6 in args
+        assert 0.3 in args
+        assert 0.1 in args
+        assert 60 in args
+
+    @pytest.mark.asyncio
+    async def test_over_fetches_then_truncates_to_match_count(self):
+        store, mock_db, _ = _make_store()
+        # The function over-fetches ~over_fetch fused candidates; the method
+        # reranks (no-op v1) then truncates to match_count.
+        mock_db.fetch.return_value = [
+            {"note_id": f"n{i}", "title": "T", "content": "b"} for i in range(50)
+        ]
+        result = await store.search_chunks(
+            kb_ids=[uuid.uuid4()], query="q", match_count=15
+        )
+        assert len(result) == 15
+        # The SQL LIMIT is the over-fetch, strictly larger than match_count.
+        args = mock_db.fetch.call_args[0]
+        assert any(isinstance(a, int) and a >= 50 for a in args)
+
+    @pytest.mark.asyncio
+    async def test_returns_knowledge_records(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {
+                "note_id": "n1",
+                "title": "A",
+                "note_type": "decision",
+                "status": "active",
+                "content": "body",
+            }
+        ]
+        result = await store.search_chunks(kb_ids=[uuid.uuid4()], query="q")
+        assert len(result) == 1
+        assert isinstance(result[0], KnowledgeRecord)
+        assert result[0].note_id == "n1"
+
+    @pytest.mark.asyncio
+    async def test_reranker_slot_preserves_fusion_order_by_default(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {"note_id": "first", "title": "A", "content": "b"},
+            {"note_id": "second", "title": "B", "content": "b"},
+        ]
+        result = await store.search_chunks(kb_ids=[uuid.uuid4()], query="q")
+        # The no-op reranker slot must not reorder the RRF ranking.
+        assert [r.note_id for r in result] == ["first", "second"]

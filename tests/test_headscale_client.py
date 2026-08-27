@@ -153,8 +153,12 @@ class TestInit:
     @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "test-api-key")
     @patch("vm.controller.headscale_client.HEADSCALE_URL", "http://headscale:8080")
     @patch("vm.controller.headscale_client.HEADSCALE_USER", "nonexistent")
-    async def test_init_marks_unavailable_when_user_not_found(self):
-        """init() sets available=False when the configured user doesn't exist."""
+    async def test_init_stays_available_when_user_not_found(self):
+        """A missing user leaves the client configured (retryable), not latched.
+
+        The user may be created after the controller starts; latching would
+        disable mesh VPN for the process lifetime.
+        """
         from vm.controller.headscale_client import HeadscaleClient
 
         client = HeadscaleClient()
@@ -171,7 +175,8 @@ class TestInit:
             await client.init()
 
         assert client._user_id is None
-        assert client.is_available is False
+        assert client.is_available is True
+        assert client.is_ready is False
 
     @pytest.mark.asyncio
     @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "")
@@ -191,7 +196,7 @@ class TestInit:
     @patch("vm.controller.headscale_client.HEADSCALE_URL", "http://headscale:8080")
     @patch("vm.controller.headscale_client.HEADSCALE_USER", "srw")
     async def test_init_handles_api_error_during_user_resolution(self):
-        """init() sets available=False when user list API call fails."""
+        """An API error during init is transient — the client stays available."""
         from vm.controller.headscale_client import HeadscaleClient
 
         client = HeadscaleClient()
@@ -206,14 +211,20 @@ class TestInit:
             await client.init()
 
         assert client._user_id is None
-        assert client.is_available is False
+        assert client.is_available is True
+        assert client.is_ready is False
+        assert "HTTPStatusError" in (client.last_error or "")
 
     @pytest.mark.asyncio
     @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "test-api-key")
     @patch("vm.controller.headscale_client.HEADSCALE_URL", "http://headscale:8080")
     @patch("vm.controller.headscale_client.HEADSCALE_USER", "srw")
     async def test_init_handles_network_timeout(self):
-        """init() sets available=False when user list times out."""
+        """A timeout during init is transient — the client stays available.
+
+        This is the exact boot race behind the outage: the vm-controller comes
+        up before Headscale after a host reboot.
+        """
         from vm.controller.headscale_client import HeadscaleClient
 
         client = HeadscaleClient()
@@ -229,14 +240,16 @@ class TestInit:
             await client.init()
 
         assert client._user_id is None
-        assert client.is_available is False
+        assert client.is_available is True
+        assert client.is_ready is False
+        assert "TimeoutException" in (client.last_error or "")
 
     @pytest.mark.asyncio
     @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "test-api-key")
     @patch("vm.controller.headscale_client.HEADSCALE_URL", "http://headscale:8080")
     @patch("vm.controller.headscale_client.HEADSCALE_USER", "srw")
     async def test_init_handles_empty_user_list(self):
-        """init() sets available=False when the API returns an empty user list."""
+        """An empty user list leaves the client configured and retryable."""
         from vm.controller.headscale_client import HeadscaleClient
 
         client = HeadscaleClient()
@@ -251,7 +264,8 @@ class TestInit:
             await client.init()
 
         assert client._user_id is None
-        assert client.is_available is False
+        assert client.is_available is True
+        assert client.is_ready is False
 
     @pytest.mark.asyncio
     @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "test-api-key")
@@ -413,12 +427,12 @@ class TestCreateAuthKey:
     @pytest.mark.asyncio
     @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "test-api-key")
     @patch("vm.controller.headscale_client.HEADSCALE_URL", "http://headscale:8080")
-    async def test_create_auth_key_returns_none_when_unavailable(self):
-        """create_auth_key() returns None when client is not available."""
+    async def test_create_auth_key_returns_none_when_unconfigured(self):
+        """create_auth_key() returns None when Headscale is not configured."""
         from vm.controller.headscale_client import HeadscaleClient
 
         client = HeadscaleClient()
-        client._available = False
+        client._configured = False
 
         result = await client.create_auth_key("job-id")
         assert result is None
@@ -644,12 +658,12 @@ class TestDeleteNode:
     @pytest.mark.asyncio
     @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "test-api-key")
     @patch("vm.controller.headscale_client.HEADSCALE_URL", "http://headscale:8080")
-    async def test_delete_node_returns_false_when_unavailable(self):
-        """delete_node() returns False when client is not available."""
+    async def test_delete_node_returns_false_when_unconfigured(self):
+        """delete_node() returns False when Headscale is not configured."""
         from vm.controller.headscale_client import HeadscaleClient
 
         client = HeadscaleClient()
-        client._available = False
+        client._configured = False
 
         result = await client.delete_node("job-id")
         assert result is False
@@ -1098,31 +1112,99 @@ class TestLifecycleIntegration:
     @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "test-api-key")
     @patch("vm.controller.headscale_client.HEADSCALE_URL", "http://headscale:8080")
     @patch("vm.controller.headscale_client.HEADSCALE_USER", "srw")
-    async def test_init_failure_blocks_subsequent_operations(self):
-        """When init() fails to resolve user, create_auth_key and delete_node are no-ops."""
+    @patch("vm.controller.headscale_client.RETRY_BASE_S", 0.0)
+    async def test_create_auth_key_recovers_after_failed_init(self):
+        """A boot-race init failure must not poison the client for its lifetime.
+
+        THE regression test for the outage: the vm-controller starts before
+        Headscale after a host reboot, init() fails, and the old client
+        latched ``_available = False`` forever — so every VM created
+        afterwards booted with no tailnet key, heartbeated from the QEMU-NAT
+        address, and was unreachable until someone manually restarted the
+        controller. See knowledge-base/knowledge/issues/
+        vm_controller_headscale_latch_kills_provisioning.md.
+        """
         from vm.controller.headscale_client import HeadscaleClient
 
         client = HeadscaleClient()
-        assert client.is_available is True
-
-        # init() — user not found
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        user_resp = _mock_response(_make_user_list_response(_make_user("other", 1)))
-        mock_http.get = AsyncMock(return_value=user_resp)
+
+        # init() while Headscale is still down.
+        mock_http.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
+        ):
+            await client.init()
+
+        assert client.is_ready is False
+        assert client.is_available is True  # NOT latched off
+
+        # Headscale comes back; the next create re-resolves and succeeds.
+        mock_http.get = AsyncMock(
+            return_value=_mock_response(_make_user_list_response(_make_user("srw", 7)))
+        )
+        mock_http.post = AsyncMock(
+            return_value=_mock_response({"preAuthKey": {"key": "hskey-auth-recovered"}})
+        )
+
+        key = await client.create_auth_key("job-after-recovery")
+
+        assert key == "hskey-auth-recovered"
+        assert client.is_ready is True
+        assert client._user_id == "7"
+        assert mock_http.post.call_args[1]["json"]["user"] == "7"
+        await client.close()
+
+    @pytest.mark.asyncio
+    @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "test-api-key")
+    @patch("vm.controller.headscale_client.HEADSCALE_URL", "http://headscale:8080")
+    @patch("vm.controller.headscale_client.HEADSCALE_USER", "srw")
+    @patch("vm.controller.headscale_client.RETRY_BASE_S", 300.0)
+    async def test_user_resolution_retry_is_throttled(self):
+        """Re-resolution backs off so dispatcher polling can't hammer Headscale."""
+        from vm.controller.headscale_client import HeadscaleClient
+
+        client = HeadscaleClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
 
         with patch(
             "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
         ):
             await client.init()
 
-        # Now unavailable
-        assert client.is_available is False
+        assert mock_http.get.await_count == 1
 
-        # Subsequent operations should be no-ops
-        key = await client.create_auth_key("job-id")
-        assert key is None
+        # Immediately after a failure, further calls are throttled — no new
+        # HTTP traffic — but the client stays configured and retryable.
+        assert await client.create_auth_key("job-a") is None
+        assert await client.create_auth_key("job-b") is None
+        assert mock_http.get.await_count == 1
+        assert client.is_available is True
 
-        deleted = await client.delete_node("job-id")
-        assert deleted is False
+    @pytest.mark.asyncio
+    @patch("vm.controller.headscale_client.HEADSCALE_API_KEY", "test-api-key")
+    @patch("vm.controller.headscale_client.HEADSCALE_URL", "http://headscale:8080")
+    @patch("vm.controller.headscale_client.HEADSCALE_USER", "srw")
+    @patch("vm.controller.headscale_client.RETRY_BASE_S", 0.0)
+    async def test_delete_node_still_works_after_failed_init(self):
+        """Teardown does not need a resolved user, so it survives a failed init."""
+        from vm.controller.headscale_client import HeadscaleClient
 
-        await client.close()
+        client = HeadscaleClient()
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
+        ):
+            await client.init()
+
+        job_id = "teardown-job"
+        mock_http.get = AsyncMock(
+            return_value=_mock_response({"nodes": [_make_node(31, f"vm-{job_id}")]})
+        )
+        mock_http.delete = AsyncMock(return_value=_mock_response({}))
+
+        assert await client.delete_node(job_id) is True
+        mock_http.delete.assert_awaited_once_with("/api/v1/node/31")

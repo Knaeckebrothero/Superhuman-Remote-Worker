@@ -7,12 +7,273 @@ import asyncio
 import logging
 import os
 import socket
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
+from uuid import UUID
 
 import httpx
 from pydantic import BaseModel
 
+from src.core.product_capabilities import ProductComponent
+from src.core.runtime_provenance import component_provenance_from_environment
+from src.shared.runtime_actor import (
+    RUNTIME_ACTOR_BOOTSTRAP_HEADER,
+    RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER,
+    RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN,
+    RUNTIME_ACTOR_REFRESH_HEADER,
+    RuntimeActorContext,
+)
+
 logger = logging.getLogger(__name__)
+
+_COMPLETION_REPORT_PAYLOAD_FIELDS = (
+    "should_stop",
+    "goal_achieved",
+    "error",
+    "freeze_data",
+)
+
+_AGENT_LOCAL_QUIESCENCE_PROTOCOLS = frozenset(
+    {"workspace_process_zero_v1", "agent_runtime_zero_v1"}
+)
+_ATTACH_RELEASE_QUIESCENCE_PROTOCOLS = frozenset(
+    {*_AGENT_LOCAL_QUIESCENCE_PROTOCOLS, "agent_attach_not_started_v1"}
+)
+
+
+class DuplicateThreadBinding(RuntimeError):
+    """Raised when a thread-bound registration loses the provisioning race.
+
+    The orchestrator returns HTTP 409 ("thread already bound to another live
+    agent") when a second agent pod tries to register for a thread that a
+    different live agent already owns. The losing pod must exit cleanly rather
+    than linger: it still carries the ``srw.io/thread-id`` label, so it stays in
+    the per-session Service's endpoints (which sets ``publishNotReadyAddresses``)
+    and black-holes ~half the cockpit's connection attempts until reaped. See
+    knowledge-history/done/persistent_thread_double_provisioning_race.md.
+    """
+
+
+class SessionGrantDenied(Exception):
+    """The session's resolved config exceeds the runner's capability grants —
+    the agent's workspace endpoint (``GET /api/agents/threads/{id}/workspace``)
+    returned HTTP 403. Permanent: a rebind hits the identical denial, so the
+    attach path must surface the real reason and stop, NOT misreport it as a
+    transient 'workspace not provisioned' (the 5m40s ready-timeout bug). Not a
+    RuntimeError so the pool-mode ``except RuntimeError`` attach handler doesn't
+    swallow it. See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
+    """
+
+
+class SessionEnded(Exception):
+    """Typed terminal response from the workspace credential boundary."""
+
+
+class ThreadConfigUpdateDenied(Exception):
+    """The orchestrator rejected a live thread config update (4xx).
+
+    Carries the response ``detail`` (e.g. the capability-grant denial reason
+    from ``_enforce_session_create_grants``) so the session can surface the
+    actual cause to the user instead of a generic "update rejected". Network
+    failures and 5xx keep returning ``None`` — those are transient and the
+    caller's fallback semantics apply (live_session_settings.md P0.3).
+    """
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Thread config update denied ({status_code}): {detail}")
+
+
+class ClaimBundleError(Exception):
+    """Non-200 from the claim-bundle endpoint (M3 pinned contract).
+
+    Carries the status code so the stateless turn executor can branch:
+    401/403 → treat as lease lost (its token-guarded release no-ops), 404 →
+    the unit vanished (drop the claim), 409 → not leased / wrong lane (drop
+    and re-poll). Network errors are NOT wrapped — they propagate as httpx
+    exceptions and the executor releases with backoff.
+    """
+
+    def __init__(self, status_code: int, detail: str = "") -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"claim-bundle {status_code}: {detail[:200]}")
+
+
+class CompletionNonTerminalReportError(Exception):
+    """The orchestrator definitively refused a continue-shaped completion.
+
+    This exact machine-coded HTTP 422 is a pre-write refusal, not an ambiguous
+    transport failure.  Stateless workers must release through their ordinary
+    retry/parking path without probing for durable completion acceptance.
+    """
+
+    code = "completion_non_terminal_report"
+
+    def __init__(self, message: str = "") -> None:
+        self.message = message
+        super().__init__(message or self.code)
+
+
+class VerdictRecordingError(Exception):
+    """The verdict could not be durably recorded.
+
+    Deliberately loud: a verdict that is not persisted must never be reported
+    to the model as recorded, because every downstream loss path treats a
+    missing verdict as approval. Raised by ``record_verification_round`` on
+    any failure — network error, non-200 response — instead of the house
+    best-effort convention (return None/False) used elsewhere in this client.
+    """
+
+
+class CompletionDecisionError(Exception):
+    """The job_complete decision could not be durably journaled.
+
+    Sibling of ``VerdictRecordingError`` for the worker's own terminating
+    decision (journal-before-observe, knowledge-base/knowledge/issues/
+    job_finalization_decisions_held_only_in_process_memory.md): a decision
+    that is not persisted must never be reported to the model as accepted,
+    because a restart would then convert "I decided" into "no decision was
+    made". Raised by ``record_completion_decision`` on any failure instead of
+    the house best-effort convention (return None/False).
+    """
+
+
+class CanvasClientError(RuntimeError):
+    """A model-safe failure from a delegated Dynamic Canvas request.
+
+    ``httpx.HTTPStatusError`` includes the full request URL in its string form.
+    Persistent tool failures are returned to the model, so propagating that
+    exception would disclose internal service names, routes, and thread IDs.
+    Keep only a fixed public error code/message and the response status.
+    """
+
+    def __init__(
+        self, code: str, message: str, *, status_code: int | None = None
+    ) -> None:
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        status = f", HTTP {status_code}" if status_code is not None else ""
+        super().__init__(f"Canvas request failed [{code}{status}]: {message}")
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasSetResult:
+    """Internal set response plus its non-model-visible mutation signal."""
+
+    state: dict[str, Any]
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasClearResult:
+    """Internal clear response plus its non-model-visible mutation signal."""
+
+    state: dict[str, Any]
+    changed: bool
+
+
+# Server-side Canvas validation has a deliberately bounded but longer envelope
+# than this client's ordinary 30-second control-plane requests: capacity queue
+# waits plus pinned SFTP/rclone materialization and image validation can exceed
+# 30 seconds. Keep the delegated mutation/read request alive beyond that hard
+# path so the tool cannot report a timeout while the handler is still capable
+# of committing the presentation. End-to-end idempotency remains the stronger
+# future answer for an actual connection loss after commit.
+CANVAS_REQUEST_TIMEOUT_SECONDS = 120.0
+
+
+def _canonical_runtime_uuid(value: Any) -> str | None:
+    """Return one canonical UUID string without truthiness coercion."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return str(UUID(value.strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+_CANVAS_PUBLIC_ERROR_MESSAGES = {
+    # This is deliberately a closed vocabulary. Orchestrator response bodies
+    # cross an internal-to-model trust boundary, so neither an arbitrary code
+    # nor an arbitrary detail.message may become a tool exception.
+    "canvas_alt_text_required": "Raster images require meaningful alt text",
+    "canvas_cleared": "Canvas is cleared",
+    "canvas_file_not_found": "Canvas file was not found",
+    "canvas_file_too_large": "Canvas content is too large",
+    "canvas_image_too_large": "Canvas image is too large",
+    "canvas_not_file": "Canvas is not file-backed",
+    "canvas_office_unavailable": (
+        "Office document viewing is not enabled or currently available"
+    ),
+    "canvas_precondition_failed": "Canvas state changed; inspect it and try again",
+    "canvas_precondition_required": "Canvas state must be inspected before changing it",
+    "canvas_presentation_changed": "Canvas presentation changed; inspect it and try again",
+    "canvas_port_reserved": "Canvas application port is reserved",
+    "canvas_regular_file_required": "Canvas sources must be regular files",
+    "canvas_replaced": "Canvas source was replaced; inspect it and try again",
+    "canvas_symlink_rejected": "Canvas paths may not contain symlinks",
+    "invalid_canvas_image": "Canvas image is invalid or unsafe",
+    "invalid_canvas_entry_path": "Canvas application entry path is invalid",
+    "invalid_canvas_path": "File path is invalid",
+    "invalid_canvas_port": "Canvas application port is invalid",
+    "mime_renderer_mismatch": "The requested renderer is incompatible with the file",
+    "source_changed": "Workspace content changed; publish the Canvas again",
+    "unsupported_canvas_file": "File type is not supported by Canvas",
+    "workspace_generation_changed": "The workspace changed; publish the Canvas again",
+    "workspace_unavailable": "The workspace is unavailable",
+}
+
+
+def _canvas_response_error(response: httpx.Response) -> CanvasClientError:
+    """Map an HTTP response to a stable error without retaining its request URL."""
+
+    status_code = response.status_code
+    if status_code >= 500:
+        return CanvasClientError(
+            "canvas_service_unavailable",
+            "Canvas service is temporarily unavailable",
+            status_code=status_code,
+        )
+
+    default_code = {
+        400: "invalid_canvas_request",
+        401: "canvas_not_authorized",
+        403: "canvas_not_authorized",
+        404: "canvas_not_found",
+        409: "canvas_conflict",
+        413: "canvas_file_too_large",
+        422: "invalid_canvas_request",
+        429: "canvas_rate_limited",
+    }.get(status_code, "canvas_request_failed")
+    default_message = {
+        401: "Canvas authorization failed",
+        403: "Canvas authorization failed",
+        404: "Canvas resource was not found",
+        409: "Canvas state changed; inspect it and try again",
+        413: "Canvas content is too large",
+        429: "Canvas is temporarily rate limited",
+    }.get(status_code, "Canvas request was rejected")
+
+    code = default_code
+    message = default_message
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if isinstance(detail, dict):
+        candidate_code = detail.get("code")
+        if isinstance(candidate_code, str) and candidate_code in (
+            _CANVAS_PUBLIC_ERROR_MESSAGES
+        ):
+            code = candidate_code
+            message = _CANVAS_PUBLIC_ERROR_MESSAGES[candidate_code]
+
+    return CanvasClientError(code, message, status_code=status_code)
 
 
 class UploadedFileInfo(BaseModel):
@@ -111,11 +372,23 @@ class OrchestratorClient:
         self.user_id = user_id
 
         self.agent_id: Optional[str] = None
+        self.runtime_actor: RuntimeActorContext | None = None
+        # Exact authority for one pinned session life.  This is deliberately
+        # distinct from the process/agent id: a pool agent can serve the same
+        # thread again after End -> Resume, and the reciprocal pair alone then
+        # has an ABA shape.  Workspace credentials, lifecycle writes, attach
+        # rollback and protected staging all echo this generation.
+        self.session_runtime_generation: str | None = None
+        self.session_runtime_attach_token: str | None = None
+        self.pinned_runtime_generation_contract = False
         self.heartbeat_interval: int = 60  # Default, may be updated by orchestrator
 
         self._client: Optional[httpx.AsyncClient] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._stop_heartbeat = asyncio.Event()
+        self._runtime_actor_maintenance_lock = asyncio.Lock()
+        self._runtime_actor_maintenance_failures = 0
+        self._runtime_actor_retry_at = 0.0
 
     async def connect(self) -> None:
         """Initialize the HTTP client.
@@ -147,6 +420,55 @@ class OrchestratorClient:
             await self._client.aclose()
             self._client = None
 
+    def adopt_session_runtime_identity(
+        self,
+        generation: Any,
+        attach_token: Any = None,
+        *,
+        contract_advertised: bool = True,
+    ) -> bool:
+        """Install one exact pinned-session authority on this client.
+
+        The method validates before mutating so a malformed attach cannot
+        erase or partially replace a still-current identity.
+        """
+
+        canonical_generation = _canonical_runtime_uuid(generation)
+        canonical_token = (
+            _canonical_runtime_uuid(attach_token) if attach_token is not None else None
+        )
+        if canonical_generation is None or (
+            attach_token is not None and canonical_token is None
+        ):
+            return False
+        self.session_runtime_generation = canonical_generation
+        self.session_runtime_attach_token = canonical_token
+        self.pinned_runtime_generation_contract = bool(contract_advertised)
+        return True
+
+    def clear_session_runtime_identity(
+        self,
+        *,
+        expected_generation: str | None = None,
+        expected_attach_token: str | None = None,
+    ) -> bool:
+        """Clear only the exact identity captured by a teardown/rollback."""
+
+        if (
+            expected_generation is not None
+            and self.session_runtime_generation != expected_generation
+        ):
+            return False
+        if (
+            expected_attach_token is not None
+            and self.session_runtime_attach_token != expected_attach_token
+        ):
+            return False
+        self.session_runtime_generation = None
+        self.session_runtime_attach_token = None
+        self.pinned_runtime_generation_contract = False
+        return True
+
     async def register(
         self,
         agent_mode: str = "worker",
@@ -159,12 +481,36 @@ class OrchestratorClient:
             thread_id: Thread UUID for persistent mode
 
         Returns:
-            True if registration succeeded, False otherwise
+            True if registration succeeded, False on a transient/other failure.
+
+        Raises:
+            DuplicateThreadBinding: on a 409 for a thread-bound registration
+                (another live agent already owns the thread).
         """
         if not self._client:
             await self.connect()
 
         url = f"{self.orchestrator_url}/api/agents/register"
+        product_provenance = component_provenance_from_environment(
+            os.environ,
+            ProductComponent.AGENT,
+            include_common=True,
+        )
+        provisioned_generation_raw = os.environ.get(
+            "SESSION_RUNTIME_GENERATION", ""
+        ).strip()
+        provisioned_generation = (
+            _canonical_runtime_uuid(provisioned_generation_raw)
+            if provisioned_generation_raw
+            else None
+        )
+        if provisioned_generation_raw and provisioned_generation is None:
+            logger.error(
+                "Refusing registration: provisioned session runtime generation "
+                "is malformed"
+            )
+            return False
+
         payload = {
             "config_name": self.config_name,
             "pod_ip": self.pod_ip,
@@ -173,7 +519,9 @@ class OrchestratorClient:
             "pid": self.pid,
             "agent_mode": agent_mode,
             "thread_id": thread_id,
+            "session_runtime_generation": provisioned_generation,
             "build_sha": os.environ.get("BUILD_SHA", ""),
+            "product_provenance": product_provenance.model_dump(mode="json"),
             # Injected via Kubernetes downward API by agent_provisioner; empty
             # outside of K8s (local dev). The orchestrator persists this on
             # the agents row so the session router can construct K8s
@@ -182,23 +530,15 @@ class OrchestratorClient:
         }
 
         try:
-            response = await self._client.post(url, json=payload)
-
-            if response.status_code == 200:
-                data = response.json()
-                self.agent_id = data.get("agent_id")
-                self.heartbeat_interval = data.get("heartbeat_interval_seconds", 60)
-                logger.info(
-                    f"Registered with orchestrator as agent {self.agent_id}, "
-                    f"heartbeat interval: {self.heartbeat_interval}s"
-                )
-                return True
-            else:
-                logger.error(
-                    f"Failed to register with orchestrator: {response.status_code} - {response.text}"
-                )
-                return False
-
+            registration_headers: dict[str, str] = {}
+            bootstrap = os.environ.get("SRW_RUNTIME_ACTOR_BOOTSTRAP", "").strip()
+            if thread_id and bootstrap:
+                registration_headers[RUNTIME_ACTOR_BOOTSTRAP_HEADER] = bootstrap
+            response = await self._client.post(
+                url,
+                json=payload,
+                headers=registration_headers or None,
+            )
         except httpx.RequestError as e:
             logger.error(f"Failed to connect to orchestrator for registration: {e}")
             return False
@@ -206,9 +546,100 @@ class OrchestratorClient:
             logger.error(f"Unexpected error during registration: {e}")
             return False
 
+        if response.status_code == 200:
+            data = response.json()
+            contract = bool(
+                type(data.get("pinned_runtime_generation_contract")) is int
+                and data["pinned_runtime_generation_contract"] == 1
+            )
+            delivered_generation_raw = data.get("session_runtime_generation")
+            delivered_generation = (
+                _canonical_runtime_uuid(delivered_generation_raw)
+                if delivered_generation_raw is not None
+                else None
+            )
+            delivered_attach_token_raw = data.get("session_runtime_attach_token")
+            delivered_attach_token = (
+                _canonical_runtime_uuid(delivered_attach_token_raw)
+                if delivered_attach_token_raw is not None
+                else None
+            )
+            if delivered_generation_raw is not None and delivered_generation is None:
+                logger.error(
+                    "Refusing registration: orchestrator returned a malformed "
+                    "session runtime generation"
+                )
+                return False
+            if (
+                delivered_attach_token_raw is not None
+                and delivered_attach_token is None
+            ):
+                logger.error(
+                    "Refusing registration: orchestrator returned a malformed "
+                    "session runtime attach token"
+                )
+                return False
+            if (
+                thread_id is not None
+                and contract
+                and (delivered_generation is None or delivered_attach_token is None)
+            ):
+                logger.error(
+                    "Refusing thread-bound registration: advertised runtime "
+                    "generation contract omitted its exact generation or "
+                    "attach token"
+                )
+                return False
+            if (
+                provisioned_generation is not None
+                and delivered_generation != provisioned_generation
+            ):
+                logger.error(
+                    "Refusing thread-bound registration: runtime generation "
+                    "does not match the provisioned authority"
+                )
+                return False
+            self.agent_id = data.get("agent_id")
+            self.pinned_runtime_generation_contract = contract
+            self.session_runtime_generation = delivered_generation
+            self.session_runtime_attach_token = delivered_attach_token
+            self.adopt_runtime_actor(
+                RuntimeActorContext.from_payload(data.get("runtime_actor"))
+            )
+            self.heartbeat_interval = data.get("heartbeat_interval_seconds", 60)
+            logger.info(
+                f"Registered with orchestrator as agent {self.agent_id}, "
+                f"heartbeat interval: {self.heartbeat_interval}s"
+            )
+            return True
+
+        # A thread-bound registration that loses the provisioning race gets a
+        # 409 ("thread already bound to another live agent"). Surface it as a
+        # typed signal so the dedicated-mode startup path can exit cleanly
+        # instead of lingering as an orphan that pollutes the per-session
+        # Service endpoints. Worker/pool/dual registrations carry no thread_id
+        # and never receive this 409.
+        if response.status_code == 409 and thread_id is not None:
+            try:
+                detail = response.json().get("detail")
+            except Exception:
+                detail = None
+            if isinstance(detail, dict) and detail.get("code") == "session_ended":
+                raise SessionEnded("session ended before agent registration")
+            logger.error(
+                f"Orchestrator refused thread-bound registration for thread "
+                f"{thread_id} (409): {response.text}"
+            )
+            raise DuplicateThreadBinding(response.text)
+
+        logger.error(
+            f"Failed to register with orchestrator: {response.status_code} - {response.text}"
+        )
+        return False
+
     async def create_thread(
         self,
-        config_name: str = "persistent_defaults",
+        config_name: str = "session_base",
         permission_mode: str = "supervised",
         title: str = "Local Session",
     ) -> str | None:
@@ -295,7 +726,7 @@ class OrchestratorClient:
             return False
 
     async def request_thread_vm_upgrade(
-        self, thread_id: str, cpu_cores: int = 2, memory: str = "4Gi"
+        self, thread_id: str, cpu_cores: int = 8, memory: str = "16Gi"
     ) -> bool:
         """Request VM provisioning for a persistent thread (upgrade from container).
 
@@ -322,24 +753,400 @@ class OrchestratorClient:
             logger.error(f"VM upgrade request error: {e}")
             return False
 
-    async def get_thread_workspace(self, thread_id: str) -> dict | None:
+    async def abort_thread_vm_upgrade(self, thread_id: str) -> bool:
+        """Tear down a thread's VM after a failed/timed-out upgrade.
+
+        Called by the live upgrade handler when ``_poll_vm_ready`` gives up, so a
+        half-provisioned VM (+ its DataVolume + CDI importer pod) doesn't leak
+        with nobody attached. Idempotent server-side; clears ``metadata.vm`` so a
+        later retry isn't blocked by the provisioning-in-progress guard
+        (workspace_tier_upgrade.md Q7).
+
+        Returns:
+            True if the teardown request was accepted, False otherwise.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/abort-vm-upgrade"
+        try:
+            response = await self._client.post(url)
+            if response.status_code == 200:
+                logger.info(f"VM upgrade aborted/torn down for thread {thread_id}")
+                return True
+            logger.error(
+                f"VM upgrade abort failed: {response.status_code} - {response.text}"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"VM upgrade abort error: {e}")
+            return False
+
+    async def request_thread_workspace_upgrade(
+        self, thread_id: str, target_tier: str = "sandbox"
+    ) -> bool:
+        """Provision a real workspace container for a lite thread (upgrade from
+        ``virtual``/``none`` to the ``sandbox`` tier).
+
+        The session-side analogue of ``request_thread_vm_upgrade``: kicks off
+        container provisioning, after which the caller polls
+        ``get_thread_workspace`` until ready and hot-swaps the backend in place
+        (workspace_tier_upgrade.md §4.2). The ``vm`` tier keeps its own
+        operator-gated ``request_thread_vm_upgrade`` path.
+
+        Returns:
+            True if accepted (or already in progress), False on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/upgrade-to-workspace"
+        )
+        payload = {"target_tier": target_tier}
+
+        try:
+            response = await self._client.post(url, json=payload)
+            if response.status_code == 200:
+                logger.info(
+                    f"Workspace upgrade ({target_tier}) requested for thread "
+                    f"{thread_id}"
+                )
+                return True
+            else:
+                logger.error(
+                    f"Workspace upgrade request failed: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Workspace upgrade request error: {e}")
+            return False
+
+    async def get_thread_workspace(
+        self, thread_id: str, *, raise_on_denied: bool = False
+    ) -> dict | None:
         """Poll workspace container status for a thread.
 
         Returns:
             Workspace status dict {status, pod_ip, pod_name, namespace},
             or None on failure.
+
+        With ``raise_on_denied=True``, a 403 (capability-grant denial — the only
+        403 this endpoint raises; ``require_internal`` uses 401) raises
+        :class:`SessionGrantDenied` carrying the violation instead of collapsing
+        to ``None``, so the attach path can fail with the real reason rather than
+        the misleading 'No workspace container provisioned'. Other failures stay
+        ``None`` (transient — keep polling).
         """
         if not self._client:
             await self.connect()
 
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/workspace"
         try:
+            # New pinned runtimes bind credential delivery to their exact
+            # reciprocal thread/agent ownership. Older orchestrators ignore
+            # this additive header; compatibility mode still permits old
+            # agents until REQUIRE_PINNED_STATUS_IDENTITY is enabled.
+            headers: dict[str, str] = {}
+            if self.agent_id:
+                headers["X-Agent-ID"] = self.agent_id
+            if self.session_runtime_generation:
+                headers["X-Session-Runtime-Generation"] = (
+                    self.session_runtime_generation
+                )
+            if self.session_runtime_attach_token:
+                headers["X-Session-Runtime-Attach-Token"] = (
+                    self.session_runtime_attach_token
+                )
+            response = await self._client.get(url, headers=headers or None)
+            if response.status_code == 200:
+                return response.json()
+            if raise_on_denied and response.status_code == 403:
+                detail = "capability grants"
+                try:
+                    detail = response.json().get("detail") or detail
+                except Exception:
+                    pass
+                raise SessionGrantDenied(detail)
+            if response.status_code == 409:
+                try:
+                    detail = response.json().get("detail")
+                except Exception:
+                    detail = None
+                if isinstance(detail, dict) and detail.get("code") == "session_ended":
+                    raise SessionEnded("session ended before workspace attach")
+            return None
+        except (SessionGrantDenied, SessionEnded):
+            raise
+        except Exception as e:
+            logger.debug(f"Failed to get thread workspace: {e}")
+            return None
+
+    async def get_claim_bundle(self, unit_id: str, lease_token: int) -> dict:
+        """Fetch the resolved attach payload for a claimed run_queue unit.
+
+        M3 pinned contract (stateless_agents.md §5.6 — credentials are
+        delivered only against proof of the CURRENT lease):
+        ``GET {orchestrator}/internal/units/{unit_id}/claim-bundle?lease_token=N``,
+        authenticated exactly like every other internal call on this client
+        (``X-Internal-Key`` attached by :meth:`connect`). The 200 body carries
+        ``unit_id``/``thread_id``/``unit_kind``/``execution_lane``, the
+        ``watermarks`` pair, and the ``attach`` object — the existing
+        ``/session/attach`` body, fed to ``_attach_session`` unchanged.
+
+        Raises :class:`ClaimBundleError` on any non-200; network errors
+        propagate as httpx exceptions (the caller treats both as bundle
+        failure and releases its claim, token-guarded).
+        """
+        if not self._client:
+            await self.connect()
+        url = f"{self.orchestrator_url}/internal/units/{unit_id}/claim-bundle"
+        response = await self._client.get(
+            url,
+            params={
+                "lease_token": int(lease_token),
+                "pod_name": os.environ.get("POD_NAME")
+                or os.environ.get("HOSTNAME", ""),
+                "pod_uid": os.environ.get("POD_UID", ""),
+            },
+        )
+        if response.status_code == 200:
+            return response.json()
+        detail = ""
+        try:
+            detail = response.text or ""
+        except Exception:
+            pass
+        raise ClaimBundleError(response.status_code, detail)
+
+    async def get_thread_canvas(self, thread_id: str) -> dict[str, Any] | None:
+        """Fetch the delegated user's logical ``main`` Canvas state.
+
+        ``204`` means the Canvas has never been created. HTTP and authorization
+        failures are deliberately raised so a tool call cannot misrepresent
+        them as an empty stage.
+        """
+        if not self._client:
+            await self.connect()
+        assert self._client is not None
+
+        url = (
+            f"{self.orchestrator_url}/api/internal/persistent/threads/{thread_id}"
+            "/canvases/main"
+        )
+        try:
+            response = await self._client.get(
+                url, timeout=CANVAS_REQUEST_TIMEOUT_SECONDS
+            )
+        except httpx.RequestError:
+            raise CanvasClientError(
+                "canvas_service_unavailable",
+                "Canvas service is temporarily unavailable",
+            ) from None
+        if response.status_code == 204:
+            return None
+        if not response.is_success:
+            raise _canvas_response_error(response)
+        try:
+            data = response.json()
+        except Exception:
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            ) from None
+        if not isinstance(data, dict):
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            )
+        return data
+
+    async def set_thread_canvas(
+        self, thread_id: str, payload: dict[str, Any]
+    ) -> CanvasSetResult:
+        """Set ``main`` through the internal delegated-user Canvas adapter.
+
+        The mutation signal is transport-only. Its absence means ``true`` for
+        compatibility with older orchestrator replicas whose file/app set
+        endpoint always changed state; a present value is a closed contract.
+        """
+        if not self._client:
+            await self.connect()
+        assert self._client is not None
+
+        url = (
+            f"{self.orchestrator_url}/api/internal/persistent/threads/{thread_id}"
+            "/canvases/main/set"
+        )
+        try:
+            response = await self._client.post(
+                url,
+                json=payload,
+                timeout=CANVAS_REQUEST_TIMEOUT_SECONDS,
+            )
+        except httpx.RequestError:
+            raise CanvasClientError(
+                "canvas_service_unavailable",
+                "Canvas service is temporarily unavailable",
+            ) from None
+        if not response.is_success:
+            raise _canvas_response_error(response)
+        try:
+            data = response.json()
+        except Exception:
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            ) from None
+        if not isinstance(data, dict):
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            )
+        mutation_header = response.headers.get("X-Canvas-Mutation-Changed")
+        if mutation_header is None:
+            changed = True
+        elif mutation_header == "true":
+            changed = True
+        elif mutation_header == "false":
+            changed = False
+        else:
+            raise CanvasClientError(
+                "invalid_canvas_response",
+                "Canvas service returned an invalid response",
+            )
+        return CanvasSetResult(state=data, changed=changed)
+
+    async def clear_thread_canvas(self, thread_id: str) -> CanvasClearResult | None:
+        """Clear ``main`` through the internal delegated-user Canvas adapter.
+
+        ``204`` means no Canvas row has ever existed. An already-cleared row is
+        returned with ``changed=False`` so the tool can expose its revisioned
+        logical state without emitting a duplicate transition invalidation.
+        """
+        if not self._client:
+            await self.connect()
+        assert self._client is not None
+
+        url = (
+            f"{self.orchestrator_url}/api/internal/persistent/threads/{thread_id}"
+            "/canvases/main"
+        )
+        try:
+            response = await self._client.delete(
+                url, timeout=CANVAS_REQUEST_TIMEOUT_SECONDS
+            )
+        except httpx.RequestError:
+            raise CanvasClientError(
+                "canvas_service_unavailable",
+                "Canvas service is temporarily unavailable",
+            ) from None
+        if response.status_code == 204:
+            return None
+        if not response.is_success:
+            raise _canvas_response_error(response)
+        try:
+            data = response.json()
+        except Exception:
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            ) from None
+        if not isinstance(data, dict):
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            )
+        return CanvasClearResult(
+            state=data,
+            changed=(
+                response.headers.get("X-Canvas-Mutation-Changed", "true").lower()
+                == "true"
+            ),
+        )
+
+    async def request_job_workspace_upgrade(
+        self, job_id: str, target_tier: str = "sandbox"
+    ) -> bool:
+        """Provision a real workspace container for a lite (``virtual``/``none``)
+        worker job, in place — the worker analogue of
+        ``request_thread_workspace_upgrade`` (workspace_tier_upgrade.md §4.3 W2).
+
+        The job stays ``processing`` (no pause, no re-dispatch): the same running
+        agent provisions, then polls ``get_job_workspace_status`` until ready and
+        swaps its ``WorkspaceManager`` backend in place, re-``ainvoke``-ing from
+        the local checkpoint. Idempotent server-side.
+
+        Returns:
+            True if accepted (or already in progress), False on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/provision-workspace"
+        payload = {"target_tier": target_tier}
+
+        try:
+            response = await self._client.post(url, json=payload)
+            if response.status_code == 200:
+                logger.info(
+                    f"Workspace upgrade ({target_tier}) requested for job {job_id}"
+                )
+                return True
+            else:
+                logger.error(
+                    f"Job workspace upgrade request failed: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Job workspace upgrade request error: {e}")
+            return False
+
+    async def get_job_workspace_status(self, job_id: str) -> dict | None:
+        """Poll workspace container connection details for a running job.
+
+        The job-side analogue of ``get_thread_workspace`` — returns the
+        ``context.workspace_container`` block (status + pod connection fields)
+        the agent's ``_poll_job_workspace_ready`` consumes to build the upgraded
+        ``RemoteBackend`` (workspace_tier_upgrade.md §4.3 W1).
+
+        Returns:
+            Workspace status dict {status, pod_ip, pod_port, pod_name,
+            namespace, ssh_key_path}, or None on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/workspace-status"
+        try:
             response = await self._client.get(url)
             if response.status_code == 200:
                 return response.json()
             return None
         except Exception as e:
-            logger.debug(f"Failed to get thread workspace: {e}")
+            logger.debug(f"Failed to get job workspace status: {e}")
+            return None
+
+    async def get_job_brief(self, job_id: str) -> dict | None:
+        """Fetch the job's task-brief fields (internal ``/brief`` endpoint).
+
+        ``JobResumeRequest`` carries no description/required_deliverables/
+        kickoff_message, so a resumed agent backfills them from here before
+        serving the virtual ``task_brief.md``
+        (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+
+        Returns:
+            Dict {description, required_deliverables, kickoff_message}, or
+            None on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/brief"
+        try:
+            response = await self._client.get(url)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get job brief: {e}")
             return None
 
     async def get_thread_lifecycle(self, thread_id: str) -> dict | None:
@@ -354,9 +1161,27 @@ class OrchestratorClient:
 
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/lifecycle"
         try:
-            response = await self._client.get(url)
+            headers: dict[str, str] = {}
+            if self.agent_id:
+                headers["X-Agent-ID"] = self.agent_id
+            if self.session_runtime_generation:
+                headers["X-Session-Runtime-Generation"] = (
+                    self.session_runtime_generation
+                )
+            if self.session_runtime_attach_token:
+                headers["X-Session-Runtime-Attach-Token"] = (
+                    self.session_runtime_attach_token
+                )
+            response = await self._client.get(url, headers=headers or None)
             if response.status_code == 200:
                 return response.json()
+            if response.status_code in {403, 404, 409}:
+                # This internal endpoint is bound to the exact runtime
+                # identity. A definitive ownership/lifecycle refusal means
+                # the polling pod is stale; distinguish it from a transient
+                # transport failure so the watchdog exits instead of holding
+                # mounts/tools forever.
+                return {"status": "runtime_moved", "authority_refused": True}
             return None
         except Exception as e:
             logger.debug(f"Failed to get thread lifecycle: {e}")
@@ -383,6 +1208,7 @@ class OrchestratorClient:
             if response.status_code == 200:
                 logger.info(f"Deregistered agent {self.agent_id} from orchestrator")
                 self.agent_id = None
+                self.clear_session_runtime_identity()
                 return True
             else:
                 logger.error(
@@ -397,7 +1223,22 @@ class OrchestratorClient:
             logger.error(f"Unexpected error during deregistration: {e}")
             return False
 
-    async def update_thread_status(self, thread_id: str, status: str) -> bool:
+    async def update_thread_status(
+        self,
+        thread_id: str,
+        status: str,
+        *,
+        pinned_agent_id: Optional[str] = None,
+        session_runtime_generation: Optional[str] = None,
+        session_runtime_attach_token: Optional[str] = None,
+        retirement_disposition: Optional[str] = None,
+        retirement_permanent: Optional[bool] = None,
+        session_runtime_retirement_token: Optional[str] = None,
+        local_runtime_quiesced: bool = False,
+        local_quiescence_protocol: Optional[str] = None,
+        workspace_generation: Optional[str] = None,
+        workspace_runtime_incarnation: Optional[str] = None,
+    ) -> bool:
         """Update thread status via orchestrator REST.
 
         Args:
@@ -412,30 +1253,688 @@ class OrchestratorClient:
             return False
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/status"
         try:
-            r = await self._client.put(url, json={"status": status})
-            return r.status_code == 200
+            body = {"status": status}
+            if retirement_disposition is not None:
+                if status not in {"ending", "ended"} or retirement_disposition not in {
+                    "ended",
+                    "suspended",
+                }:
+                    return False
+                body["retirement_disposition"] = retirement_disposition
+            if retirement_permanent is not None:
+                if (
+                    status not in {"ending", "ended"}
+                    or type(retirement_permanent) is not bool
+                ):
+                    return False
+                body["retirement_permanent"] = retirement_permanent
+            retirement_token = None
+            if session_runtime_retirement_token is not None:
+                retirement_token = _canonical_runtime_uuid(
+                    session_runtime_retirement_token
+                )
+                if retirement_token is None or status != "ended":
+                    return False
+                body["session_runtime_retirement_token"] = retirement_token
+            if local_runtime_quiesced:
+                if (
+                    status != "ended"
+                    or retirement_token is None
+                    or local_quiescence_protocol
+                    not in _AGENT_LOCAL_QUIESCENCE_PROTOCOLS
+                ):
+                    return False
+                body["local_runtime_quiesced"] = True
+                body["local_quiescence_protocol"] = local_quiescence_protocol
+                canonical_workspace_generation = (
+                    _canonical_runtime_uuid(workspace_generation)
+                    if workspace_generation is not None
+                    else None
+                )
+                canonical_workspace_incarnation = (
+                    _canonical_runtime_uuid(workspace_runtime_incarnation)
+                    if workspace_runtime_incarnation is not None
+                    else None
+                )
+                if (canonical_workspace_generation is None) != (
+                    canonical_workspace_incarnation is None
+                ):
+                    return False
+                if workspace_generation is not None and (
+                    canonical_workspace_generation is None
+                    or canonical_workspace_incarnation is None
+                ):
+                    return False
+                if canonical_workspace_generation is not None:
+                    body["workspace_generation"] = canonical_workspace_generation
+                    body["workspace_runtime_incarnation"] = (
+                        canonical_workspace_incarnation
+                    )
+                if (
+                    local_quiescence_protocol == "workspace_process_zero_v1"
+                    and canonical_workspace_generation is None
+                ) or (
+                    local_quiescence_protocol == "agent_runtime_zero_v1"
+                    and canonical_workspace_generation is not None
+                ):
+                    return False
+            elif (
+                local_quiescence_protocol is not None
+                or workspace_generation is not None
+                or workspace_runtime_incarnation is not None
+            ):
+                return False
+            if pinned_agent_id is not None:
+                body["agent_id"] = pinned_agent_id
+                generation = _canonical_runtime_uuid(
+                    session_runtime_generation or self.session_runtime_generation
+                )
+                if self.pinned_runtime_generation_contract and generation is None:
+                    return False
+                if generation is not None:
+                    body["session_runtime_generation"] = generation
+                attach_token = _canonical_runtime_uuid(
+                    session_runtime_attach_token or self.session_runtime_attach_token
+                )
+                if (
+                    session_runtime_attach_token is not None
+                    or self.session_runtime_attach_token is not None
+                ) and attach_token is None:
+                    return False
+                if attach_token is not None:
+                    body["session_runtime_attach_token"] = attach_token
+            r = await self._client.put(url, json=body)
+            if r.status_code != 200:
+                return False
+            if not local_runtime_quiesced:
+                return True
+            # A generic 200 is not a local-quiescence receipt. A typed terminal
+            # settlement normally lets the old runtime clear its exact fence.
+            # Permanent dedicated-agent teardown has one additional exact
+            # handoff: after the server durably accepts local quiescence it may
+            # authorize this caller to exit so an owner retry can delete the
+            # now-unmounted agent PVC. The token echo prevents a generic or
+            # stale ``ending`` response from being mistaken for that handoff.
+            try:
+                payload = r.json()
+            except Exception:
+                return False
+            terminal_settlement = bool(
+                isinstance(payload, dict)
+                and payload.get("status")
+                in {"ended", "suspended", "deleted", "settled_or_superseded"}
+                and payload.get("retirement_disposition") == retirement_disposition
+                and payload.get("retirement_permanent") is retirement_permanent
+            )
+            exact_exit_handoff = bool(
+                isinstance(payload, dict)
+                and retirement_permanent is True
+                and payload.get("status") == "ending"
+                and payload.get("retiring_agent_exit_authorized") is True
+                and payload.get("retirement_disposition") == retirement_disposition
+                and payload.get("retirement_permanent") is True
+                and _canonical_runtime_uuid(
+                    payload.get("session_runtime_retirement_token")
+                )
+                == retirement_token
+            )
+            return terminal_settlement or exact_exit_handoff
         except Exception as e:
             logger.warning(f"Thread status update failed (non-fatal): {e}")
             return False
 
-    async def release_thread_agent(self, thread_id: str) -> bool:
+    async def begin_thread_retirement(
+        self,
+        thread_id: str,
+        *,
+        pinned_agent_id: str,
+        session_runtime_generation: str,
+        session_runtime_attach_token: str,
+        retirement_disposition: str,
+        retirement_permanent: bool = False,
+    ) -> dict[str, Any] | None:
+        """Authorize one exact pinned retirement and return its opaque token.
+
+        Unlike ordinary status writes, Begin is not complete merely because
+        HTTP returned 200. The response must echo the exact immutable
+        disposition and contain a canonical server-minted retirement token;
+        callers retain that token across local quiescence and lost-response
+        settlement retries.
+        """
+
+        if (
+            not self._client
+            or retirement_disposition not in {"ended", "suspended"}
+            or type(retirement_permanent) is not bool
+        ):
+            return None
+        generation = _canonical_runtime_uuid(session_runtime_generation)
+        attach_token = _canonical_runtime_uuid(session_runtime_attach_token)
+        if generation is None or attach_token is None or not pinned_agent_id:
+            return None
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/status"
+        body = {
+            "status": "ending",
+            "agent_id": pinned_agent_id,
+            "session_runtime_generation": generation,
+            "session_runtime_attach_token": attach_token,
+            "retirement_disposition": retirement_disposition,
+            "retirement_permanent": retirement_permanent,
+        }
+        try:
+            response = await self._client.put(url, json=body)
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+            retirement_token = _canonical_runtime_uuid(
+                payload.get("session_runtime_retirement_token")
+                if isinstance(payload, dict)
+                else None
+            )
+            if (
+                not isinstance(payload, dict)
+                or payload.get("status") != "ending"
+                or payload.get("retirement_disposition") != retirement_disposition
+                or payload.get("retirement_permanent") is not retirement_permanent
+                or retirement_token is None
+            ):
+                return None
+            return {
+                "status": "ending",
+                "retirement_disposition": retirement_disposition,
+                "retirement_permanent": retirement_permanent,
+                "session_runtime_retirement_token": retirement_token,
+            }
+        except Exception as exc:
+            logger.warning(
+                "Thread retirement begin failed (non-fatal): %s", type(exc).__name__
+            )
+            return None
+
+    async def get_thread_retirement_outcome(
+        self,
+        thread_id: str,
+        *,
+        pinned_agent_id: str,
+        session_runtime_generation: str,
+        session_runtime_attach_token: str,
+        session_runtime_retirement_token: str,
+        retirement_disposition: str,
+        retirement_permanent: bool,
+    ) -> dict[str, Any] | None:
+        """Read back only the exact append-only retirement outcome.
+
+        This is deliberately not a broad lifecycle inference.  A moved
+        generation, cleared binding, or generic 409 does not prove that this
+        runtime's local-quiescence receipt settled.  The server returns a
+        positive result only for the exact G/attach/T/disposition/permanent
+        ledger identity captured before local cleanup.
+        """
+
+        if (
+            not self._client
+            or not pinned_agent_id
+            or retirement_disposition not in {"ended", "suspended"}
+            or type(retirement_permanent) is not bool
+        ):
+            return None
+        generation = _canonical_runtime_uuid(session_runtime_generation)
+        attach_token = _canonical_runtime_uuid(session_runtime_attach_token)
+        retirement_token = _canonical_runtime_uuid(session_runtime_retirement_token)
+        if generation is None or attach_token is None or retirement_token is None:
+            return None
+        headers = {
+            "X-Agent-ID": pinned_agent_id,
+            "X-Session-Runtime-Generation": generation,
+            "X-Session-Runtime-Attach-Token": attach_token,
+            "X-Session-Runtime-Retirement-Token": retirement_token,
+            "X-Retirement-Disposition": retirement_disposition,
+            "X-Retirement-Permanent": ("true" if retirement_permanent else "false"),
+        }
+        url = (
+            f"{self.orchestrator_url}/api/agents/threads/{thread_id}/retirement-outcome"
+        )
+        try:
+            response = await self._client.get(url, headers=headers)
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+        except Exception as exc:
+            logger.warning(
+                "Thread retirement outcome read failed (non-fatal): %s",
+                type(exc).__name__,
+            )
+            return None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("retirement_disposition") != retirement_disposition
+            or payload.get("retirement_permanent") is not retirement_permanent
+        ):
+            return None
+        status = payload.get("status")
+        if status == "ending":
+            return {
+                "status": "ending",
+                "retirement_disposition": retirement_disposition,
+                "retirement_permanent": retirement_permanent,
+            }
+        if (
+            status != "settled_or_superseded"
+            or payload.get("outcome") not in {"settled", "deleted"}
+            or not isinstance(payload.get("settled_at"), str)
+            or not payload["settled_at"].strip()
+        ):
+            return None
+        return {
+            "status": "settled_or_superseded",
+            "retirement_disposition": retirement_disposition,
+            "retirement_permanent": retirement_permanent,
+            "outcome": payload["outcome"],
+            "settled_at": payload["settled_at"],
+        }
+
+    async def file_officer_wake(
+        self, thread_id: str, minutes: int, reason: str
+    ) -> bool:
+        """File an officer session's durable timer wake (centurion.md §4).
+
+        The orchestrator upserts the pending ``timer`` outbox row
+        (``fire_at = now + minutes``); its wake drain injects the timer wake
+        when due. Failure is non-fatal — the officer watchdog files
+        ``sleep_max`` whenever no timer row is pending.
+
+        Returns:
+            True if the orchestrator accepted the filing.
+        """
+        if not self._client:
+            return False
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/officer/wake"
+        try:
+            r = await self._client.post(
+                url, json={"minutes": int(minutes), "reason": reason or ""}
+            )
+            return r.status_code in (200, 201)
+        except Exception as e:
+            logger.warning(f"Officer wake filing failed (non-fatal): {e}")
+            return False
+
+    async def suspend_thread(
+        self,
+        thread_id: str,
+        *,
+        pinned_agent_id: str | None = None,
+        session_runtime_generation: str | None = None,
+        session_runtime_attach_token: str | None = None,
+        session_runtime_retirement_token: str | None = None,
+        local_runtime_quiesced: bool = False,
+        local_quiescence_protocol: str | None = None,
+        workspace_generation: str | None = None,
+        workspace_runtime_incarnation: str | None = None,
+    ) -> bool:
+        """Request a clean drain-suspend of a thread (drift-drain path).
+
+        The orchestrator snapshots the workspace to S3, tears down the
+        workspace + agent pods, and flips the thread to 'suspended' so the
+        next user input resumes on a fresh agent. Generous timeout — the
+        snapshot of a large workspace takes a while and this call is the
+        last thing the pod does before exiting.
+
+        Returns:
+            True only if the orchestrator confirmed the suspend.
+        """
+        if not self._client:
+            return False
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/suspend"
+        try:
+            agent_id = pinned_agent_id or self.agent_id
+            generation = _canonical_runtime_uuid(
+                session_runtime_generation or self.session_runtime_generation
+            )
+            token = _canonical_runtime_uuid(
+                session_runtime_attach_token or self.session_runtime_attach_token
+            )
+            headers: dict[str, str] = {}
+            if agent_id:
+                headers["X-Agent-ID"] = agent_id
+            if generation:
+                headers["X-Session-Runtime-Generation"] = generation
+            if token:
+                headers["X-Session-Runtime-Attach-Token"] = token
+            retirement_token = _canonical_runtime_uuid(session_runtime_retirement_token)
+            if local_runtime_quiesced:
+                if (
+                    retirement_token is None
+                    or local_quiescence_protocol
+                    not in _AGENT_LOCAL_QUIESCENCE_PROTOCOLS
+                ):
+                    return False
+                headers["X-Session-Runtime-Retirement-Token"] = retirement_token
+                headers["X-Session-Local-Quiesced"] = "true"
+                headers["X-Session-Local-Quiescence-Protocol"] = (
+                    local_quiescence_protocol
+                )
+                canonical_workspace_generation = (
+                    _canonical_runtime_uuid(workspace_generation)
+                    if workspace_generation is not None
+                    else None
+                )
+                canonical_workspace_incarnation = (
+                    _canonical_runtime_uuid(workspace_runtime_incarnation)
+                    if workspace_runtime_incarnation is not None
+                    else None
+                )
+                if (canonical_workspace_generation is None) != (
+                    canonical_workspace_incarnation is None
+                ):
+                    return False
+                if workspace_generation is not None and (
+                    canonical_workspace_generation is None
+                    or canonical_workspace_incarnation is None
+                ):
+                    return False
+                if canonical_workspace_generation is not None:
+                    headers["X-Workspace-Generation"] = canonical_workspace_generation
+                    headers["X-Workspace-Runtime-Incarnation"] = (
+                        canonical_workspace_incarnation
+                    )
+                if (
+                    local_quiescence_protocol == "workspace_process_zero_v1"
+                    and canonical_workspace_generation is None
+                ) or (
+                    local_quiescence_protocol == "agent_runtime_zero_v1"
+                    and canonical_workspace_generation is not None
+                ):
+                    return False
+            elif (
+                session_runtime_retirement_token is not None
+                or local_quiescence_protocol is not None
+                or workspace_generation is not None
+                or workspace_runtime_incarnation is not None
+            ):
+                return False
+            r = await self._client.post(
+                url,
+                timeout=300.0,
+                headers=headers or None,
+            )
+            if r.status_code != 200:
+                logger.warning(f"Thread suspend rejected: {r.status_code} - {r.text}")
+                return False
+            return bool(r.json().get("suspended"))
+        except Exception as e:
+            logger.warning(f"Thread suspend request failed: {e}")
+            return False
+
+    async def bind_pod_runtime_actor(self, thread_id: str) -> bool:
+        """Exchange this pod's thread-less bootstrap for the attached session.
+
+        Dedicated session pods get their actor inside ``register()`` because
+        the orchestrator knew the thread when it minted the pod. A warm pool
+        pod registers thread-less and learns its session later, so it has to
+        ask again — presenting the same kind of pod-unique secret, which the
+        orchestrator cross-checks against its own ``agents.thread_id`` binding.
+
+        Returns False when this pod holds no pod bootstrap (an older image, or
+        a pod the provisioner did not mint) or the exchange is refused. The
+        caller must treat that as a failed attach rather than continuing: a
+        session that runs without actor identity looks healthy and then denies
+        every machine-tag write several tool calls later.
+        """
+        if not self._client or not self.agent_id:
+            return False
+        bootstrap = os.environ.get("SRW_RUNTIME_ACTOR_POD_BOOTSTRAP", "").strip()
+        if not bootstrap:
+            logger.warning(
+                "No pod runtime actor bootstrap in env — this pod cannot take "
+                "a session that needs actor identity"
+            )
+            return False
+        url = (
+            f"{self.orchestrator_url}/api/agents/{self.agent_id}/runtime-actor/session"
+        )
+        try:
+            response = await self._client.post(
+                url,
+                json={"thread_id": str(thread_id)},
+                headers={RUNTIME_ACTOR_BOOTSTRAP_HEADER: bootstrap},
+            )
+        except Exception as e:
+            logger.warning(f"Pod runtime actor exchange failed: {e}")
+            return False
+        if response.status_code != 200:
+            logger.warning(
+                "Pod runtime actor exchange refused (%s): %s",
+                response.status_code,
+                response.text[:200],
+            )
+            return False
+        self.adopt_runtime_actor(
+            RuntimeActorContext.from_payload(response.json().get("runtime_actor"))
+        )
+        logger.info(f"Runtime actor bound for thread {thread_id}")
+        return True
+
+    def adopt_runtime_actor(self, actor: RuntimeActorContext | None) -> None:
+        """Bind the exact actor object shared by heartbeat and session tools."""
+
+        self.runtime_actor = actor
+        self._runtime_actor_maintenance_failures = 0
+        self._runtime_actor_retry_at = 0.0
+
+    def clear_runtime_actor(self) -> None:
+        """Drop the actor when this pod stops serving its session.
+
+        A pool pod goes back into the idle pool and may be handed a different
+        thread — and a different project — next. Keeping the old actor would
+        leave a credential scoped to the previous session lying in memory.
+        """
+        self.adopt_runtime_actor(None)
+
+    async def maintain_runtime_actor(self, *, force: bool = False) -> tuple[bool, str]:
+        """Renew/recover the hidden Officer actor with bounded local backoff.
+
+        Heartbeats call this before the refresh idle wall; the persistent turn
+        gate calls it with ``force=True`` before any provider request. Identity
+        is never supplied in the body: the opaque refresh bearer selects a
+        grant and the server re-derives its Post/thread/agent authority.
+        """
+
+        actor = self.runtime_actor
+        if actor is None:
+            return False, "server-derived actor context is missing"
+        if actor.caller_kind != "officer":
+            return True, "non-Officer grant keeps its existing lifecycle"
+        if not actor.refresh_credential:
+            return False, "runtime actor refresh credential is missing"
+        renew_before = int(
+            os.environ.get("RUNTIME_ACTOR_OFFICER_RENEW_BEFORE_SECONDS", "21600")
+        )
+        if not force and not actor.refresh_needs_renewal(skew_seconds=renew_before):
+            return True, "Officer runtime grant is inside its renewal window"
+        now = asyncio.get_running_loop().time()
+        if now < self._runtime_actor_retry_at:
+            return False, "Officer runtime authorization retry is backed off"
+
+        async with self._runtime_actor_maintenance_lock:
+            actor = self.runtime_actor
+            if actor is None or not actor.refresh_credential:
+                return False, "runtime actor refresh credential is missing"
+            now = asyncio.get_running_loop().time()
+            if now < self._runtime_actor_retry_at:
+                return False, "Officer runtime authorization retry is backed off"
+            if not self._client:
+                await self.connect()
+            assert self._client is not None
+            try:
+                refresh_headers = {
+                    RUNTIME_ACTOR_REFRESH_HEADER: actor.refresh_credential
+                }
+                if force:
+                    # ``force`` is used only by the persistent loop's
+                    # before-turn authorization callback. This hidden phase
+                    # assertion lets the dark verification plan wait for the
+                    # post-persistence/pre-provider boundary; it is not
+                    # identity or authorization input.
+                    refresh_headers[RUNTIME_ACTOR_MAINTENANCE_PHASE_HEADER] = (
+                        RUNTIME_ACTOR_MAINTENANCE_PHASE_PRE_TURN
+                    )
+                response = await self._client.post(
+                    f"{self.orchestrator_url}/api/runtime-actors/refresh",
+                    headers=refresh_headers,
+                )
+                if response.status_code != 200:
+                    code = f"http-{response.status_code}"
+                    try:
+                        detail = response.json().get("detail")
+                        if isinstance(detail, dict) and isinstance(
+                            detail.get("code"), str
+                        ):
+                            code = detail["code"]
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"refresh denied ({code})")
+                payload = response.json().get("runtime_actor")
+                if not actor.apply_refreshed_payload(payload):
+                    raise RuntimeError("refresh response changed identity")
+            except Exception as exc:
+                self._runtime_actor_maintenance_failures += 1
+                base = max(
+                    1,
+                    int(os.environ.get("RUNTIME_ACTOR_RETRY_BASE_SECONDS", "60")),
+                )
+                ceiling = max(
+                    base,
+                    int(os.environ.get("RUNTIME_ACTOR_RETRY_MAX_SECONDS", "900")),
+                )
+                delay = min(
+                    ceiling,
+                    base * (2 ** min(self._runtime_actor_maintenance_failures - 1, 8)),
+                )
+                self._runtime_actor_retry_at = now + delay
+                # Never include response bodies or credentials in this log.
+                reason = type(exc).__name__
+                logger.error(
+                    "Officer runtime authorization maintenance failed (%s); "
+                    "planning is suppressed for %ss",
+                    type(exc).__name__,
+                    delay,
+                )
+                return False, reason[:160]
+
+            self._runtime_actor_maintenance_failures = 0
+            self._runtime_actor_retry_at = 0.0
+            return True, "Officer runtime authorization maintained"
+
+    async def release_thread_agent(
+        self,
+        thread_id: str,
+        *,
+        session_runtime_generation: str | None = None,
+        session_runtime_attach_token: str | None = None,
+        agent_pod_uid: str | None = None,
+        local_runtime_quiesced: bool = False,
+        local_quiescence_protocol: str | None = None,
+        workspace_generation: str | None = None,
+        workspace_runtime_incarnation: str | None = None,
+    ) -> bool:
         """Clear threads.agent_id when this agent's session attach fails.
 
         Lets the orchestrator dispatch the next WS reconnect to a healthy
         agent instead of re-targeting this (now session-less) one.
         """
-        if not self._client:
+        if not self._client or not self.agent_id:
+            return False
+        generation = _canonical_runtime_uuid(
+            session_runtime_generation or self.session_runtime_generation
+        )
+        attach_token = _canonical_runtime_uuid(
+            session_runtime_attach_token or self.session_runtime_attach_token
+        )
+        if generation is None or attach_token is None:
+            logger.warning(
+                "Cannot release thread binding without its exact runtime "
+                "generation and attach token"
+            )
+            return False
+        pod_uid = str(agent_pod_uid or "").strip()
+        if (
+            not pod_uid
+            or local_runtime_quiesced is not True
+            or local_quiescence_protocol not in _ATTACH_RELEASE_QUIESCENCE_PROTOCOLS
+        ):
+            logger.warning(
+                "Cannot release delivered thread binding without exact local "
+                "quiescence proof"
+            )
+            return False
+        canonical_workspace_generation = (
+            _canonical_runtime_uuid(workspace_generation)
+            if workspace_generation is not None
+            else None
+        )
+        canonical_workspace_incarnation = (
+            _canonical_runtime_uuid(workspace_runtime_incarnation)
+            if workspace_runtime_incarnation is not None
+            else None
+        )
+        if (canonical_workspace_generation is None) != (
+            canonical_workspace_incarnation is None
+        ):
+            return False
+        if workspace_generation is not None and (
+            canonical_workspace_generation is None
+            or canonical_workspace_incarnation is None
+        ):
+            return False
+        if (
+            local_quiescence_protocol == "workspace_process_zero_v1"
+            and canonical_workspace_generation is None
+        ) or (
+            local_quiescence_protocol == "agent_runtime_zero_v1"
+            and canonical_workspace_generation is not None
+        ):
             return False
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/release-agent"
         try:
-            r = await self._client.post(url)
-            return r.status_code == 200
+            # The server CASes this exact agent/thread pair.  A delayed
+            # background attach failure must never clear a successor agent's
+            # binding after the thread has already been reassigned.
+            body: dict[str, Any] = {
+                "agent_id": self.agent_id,
+                "session_runtime_generation": generation,
+                "session_runtime_attach_token": attach_token,
+                "agent_pod_uid": pod_uid,
+                "local_runtime_quiesced": True,
+                "local_quiescence_protocol": local_quiescence_protocol,
+            }
+            if canonical_workspace_generation is not None:
+                body["workspace_generation"] = canonical_workspace_generation
+                body["workspace_runtime_incarnation"] = canonical_workspace_incarnation
+            r = await self._client.post(url, json=body)
+            if r.status_code != 200:
+                return False
+            try:
+                payload = r.json()
+            except Exception:
+                return False
+            return bool(
+                isinstance(payload, dict)
+                and payload.get("status")
+                in {
+                    "released",
+                    "already_detached",
+                    "retirement_acknowledged",
+                }
+            )
         except Exception as e:
             logger.warning(f"Thread→agent release failed (non-fatal): {e}")
             return False
 
     async def update_thread_config(
-        self, thread_id: str, config_override: dict[str, Any]
+        self,
+        thread_id: str,
+        config_override: dict[str, Any],
+        datasource_ids: Optional[list[str]] = None,
     ) -> Optional[dict[str, Any]]:
         """Persist runtime config changes for a thread.
 
@@ -443,24 +1942,53 @@ class OrchestratorClient:
             thread_id: Thread UUID
             config_override: Partial config dict to deep-merge
                              (e.g. ``{"llm": {"model": "..."}}``)
+            datasource_ids: Desired FULL datasource selection (live_session_
+                            settings.md Slice B). ``None`` = no change;
+                            ``[]`` = detach all. The orchestrator authorizes,
+                            grant-checks the derived tool flip, and persists
+                            ``metadata.datasource_ids``; the caller then
+                            re-fetches ``get_thread_workspace`` for the
+                            enriched datasource payloads.
 
         Returns:
             The orchestrator-enriched ``config_override`` (with resolved
             ``base_url``/``api_key`` for endpoint-backed models) on success,
-            or ``None`` on failure. Callers must use the returned dict —
-            not the input — when rebuilding the LLM, otherwise custom
-            endpoint requests fall through to api.openai.com.
+            or ``None`` on transient failure (network, 5xx). Callers must use
+            the returned dict — not the input — when rebuilding the LLM,
+            otherwise custom endpoint requests fall through to api.openai.com.
+
+        Raises:
+            ThreadConfigUpdateDenied: on a 4xx response — a deliberate
+                rejection (grant denial, invalid override, unknown thread)
+                whose ``detail`` must reach the user, not a transient failure
+                to retry or fall back from.
         """
         if not self._client:
             return None
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/config"
+        payload: dict[str, Any] = {"config_override": config_override}
+        if datasource_ids is not None:
+            payload["datasource_ids"] = [str(v) for v in datasource_ids]
         try:
-            r = await self._client.patch(url, json={"config_override": config_override})
+            r = await self._client.patch(url, json=payload)
             if r.status_code != 200:
+                if 400 <= r.status_code < 500:
+                    try:
+                        detail = r.json().get("detail")
+                    except Exception:
+                        detail = None
+                    if not isinstance(detail, str):
+                        detail = str(detail) if detail else (r.text or "")[:500]
+                    raise ThreadConfigUpdateDenied(r.status_code, detail)
+                logger.warning(
+                    f"Thread config update rejected: {r.status_code} - {r.text[:200]}"
+                )
                 return None
             data = r.json()
             enriched = data.get("config_override")
             return enriched if isinstance(enriched, dict) else config_override
+        except ThreadConfigUpdateDenied:
+            raise
         except Exception as e:
             logger.warning(f"Thread config update failed (non-fatal): {e}")
             return None
@@ -494,6 +2022,11 @@ class OrchestratorClient:
 
         url = f"{self.orchestrator_url}/api/agents/{self.agent_id}/heartbeat"
         payload: dict[str, Any] = {"status": status}
+
+        if self.session_runtime_generation is not None:
+            payload["session_runtime_generation"] = self.session_runtime_generation
+        if self.session_runtime_attach_token is not None:
+            payload["session_runtime_attach_token"] = self.session_runtime_attach_token
 
         if job_id:
             payload["current_job_id"] = job_id
@@ -577,6 +2110,17 @@ class OrchestratorClient:
                     metrics = get_metrics()
 
                     response = await self.heartbeat(status, job_id, metrics)
+                    actor = self.runtime_actor
+                    if (
+                        response is not None
+                        and actor is not None
+                        and actor.caller_kind == "officer"
+                    ):
+                        # Credential maintenance is liveness work, not model
+                        # choice. This call is normally a local no-op until the
+                        # six-hour renewal margin, then refreshes before the
+                        # 24-hour idle wall even if no privileged tool ran.
+                        await self.maintain_runtime_actor(force=False)
                     if response is not None and on_response is not None:
                         try:
                             ret = on_response(response)
@@ -685,6 +2229,174 @@ class OrchestratorClient:
             logger.warning(f"Unexpected error downloading file: {e}")
             return None
 
+    async def save_citation_snapshot(
+        self, data: bytes, content_type: str = "application/octet-stream"
+    ) -> Optional[str]:
+        """Persist a cited cloud document's original bytes to the snapshot store.
+
+        Phase 3 (D7): the agent has no S3 credentials, so the original bytes are
+        round-tripped through the orchestrator (``POST /api/citations/snapshot``,
+        internal-key auth), which content-addresses them and returns a
+        ``snapshot_blob_key``. Best-effort — returns the key, or ``None`` on any
+        failure (citation integrity rests on the extracted-text copy, not this
+        blob).
+
+        Args:
+            data: Raw original file bytes.
+            content_type: MIME type to store the blob under (for "view original").
+
+        Returns:
+            The content-addressed snapshot key, or None on failure.
+        """
+        if not data:
+            return None
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/citations/snapshot"
+        try:
+            response = await self._client.post(
+                url,
+                content=data,
+                params={"content_type": content_type},
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        except httpx.RequestError as e:
+            logger.warning(f"Citation snapshot upload failed (network): {e}")
+            return None
+
+        if response.status_code == 200:
+            return response.json().get("snapshot_blob_key")
+        logger.warning(
+            f"Citation snapshot upload rejected: {response.status_code} - "
+            f"{response.text[:200]}"
+        )
+        return None
+
+    async def record_verification_round(
+        self,
+        target_job_id: str,
+        critic_job_id: str,
+        asserted_verdict: str,
+        opened: list,
+        dispositions: list,
+        head_commit: Optional[str] = None,
+        content_tree: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Durably record this round and return the SERVER-COMPUTED verdict.
+
+        Journal-before-observe: the tool must not return to the model until the
+        round is committed. Raises VerdictRecordingError on any failure —
+        including a 409, whose ``errors`` list is model-facing and must be
+        surfaced verbatim so the model can correct itself.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{target_job_id}/verification/rounds"
+        payload = {
+            "critic_job_id": critic_job_id,
+            "asserted_verdict": asserted_verdict,
+            "opened": opened,
+            "dispositions": dispositions,
+            "head_commit": head_commit,
+            "content_tree": content_tree,
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.RequestError as e:
+            raise VerdictRecordingError(f"network error: {e}") from e
+
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code == 409:
+            detail = response.json().get("detail", {})
+            errors = detail.get("errors") if isinstance(detail, dict) else None
+            if isinstance(detail, dict) and detail.get("escalated"):
+                # The orchestrator hit the per-critic rejection cap and
+                # escalated the target to a human — the usual "correct and
+                # resubmit" instruction must become a stop order or the
+                # critic livelocks (rejected_verdict_livelocks_critic_and_
+                # wedges_parent.md).
+                err = VerdictRecordingError(
+                    "verdict rejected and the review has been escalated to a "
+                    "human after repeated invalid submissions:\n- "
+                    + "\n- ".join(errors or [str(detail)])
+                )
+                err.escalated = True
+                raise err
+            raise VerdictRecordingError(
+                "verdict rejected:\n- " + "\n- ".join(errors or [str(detail)])
+            )
+        raise VerdictRecordingError(
+            f"HTTP {response.status_code}: {response.text[:200]}"
+        )
+
+    async def record_completion_decision(
+        self,
+        job_id: str,
+        tool_call_id: str,
+        summary: str,
+        deliverables: list,
+        confidence: float,
+        notes: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Durably journal the job_complete decision before the tool returns.
+
+        Journal-before-observe: the sibling of ``record_verification_round``
+        for the worker's own terminating decision. Idempotent on
+        ``(job_id, tool_call_id)`` — a ToolNode re-execution of the same call
+        after a checkpoint gap returns the stored record (``replay: true``).
+        Raises CompletionDecisionError on any failure so the tool reports
+        NOT-recorded to the model instead of a false success.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/completion-decision"
+        payload = {
+            "tool_call_id": tool_call_id,
+            "summary": summary,
+            "deliverables": deliverables,
+            "confidence": confidence,
+            "notes": notes,
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.RequestError as e:
+            raise CompletionDecisionError(f"network error: {e}") from e
+
+        if response.status_code == 200:
+            return response.json()
+        raise CompletionDecisionError(
+            f"HTTP {response.status_code}: {response.text[:200]}"
+        )
+
+    async def fetch_completion_decision(self, job_id: str) -> Optional[dict[str, Any]]:
+        """Read back the journaled job_complete decision, or None.
+
+        Best-effort by design (unlike the write path): used by resume
+        hydration, where a fetch failure must degrade to "no cached decision"
+        — the durable record still exists and the graph-state mirror /
+        model re-decision paths remain.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/completion-decision"
+        try:
+            response = await self._client.get(url)
+            if response.status_code == 200:
+                decision = response.json().get("decision")
+                return decision if isinstance(decision, dict) else None
+            logger.warning(
+                f"Completion-decision fetch for {job_id} returned "
+                f"HTTP {response.status_code}"
+            )
+        except httpx.RequestError as e:
+            logger.warning(f"Completion-decision fetch for {job_id} failed: {e}")
+        return None
+
     async def resume_job(
         self,
         job_id: str,
@@ -782,7 +2494,12 @@ class OrchestratorClient:
             logger.error(f"Unexpected error triggering subjob merge: {e}")
             return False
 
-    async def report_pause(self, job_id: str) -> bool:
+    async def report_pause(
+        self,
+        job_id: str,
+        *,
+        lease_token: int | None = None,
+    ) -> bool:
         """Report that the agent is releasing a job (e.g. during graceful shutdown).
 
         Tells the orchestrator to set the job to 'paused' and clear its agent
@@ -802,7 +2519,12 @@ class OrchestratorClient:
         url = f"{self.orchestrator_url}/api/jobs/{job_id}/agent-release"
 
         try:
-            response = await self._client.put(url, timeout=10.0)
+            params: dict[str, str | int] = {}
+            if self.agent_id:
+                params["agent_id"] = self.agent_id
+            if lease_token is not None:
+                params["lease_token"] = lease_token
+            response = await self._client.put(url, params=params, timeout=10.0)
             if response.status_code == 200:
                 logger.info(f"Orchestrator accepted agent-release for job {job_id}")
                 return True
@@ -820,6 +2542,9 @@ class OrchestratorClient:
         self,
         job_id: str,
         result: dict[str, Any],
+        lease_token: int | None = None,
+        client_report_id: str | None = None,
+        agent_id: str | None = None,
     ) -> bool:
         """Report job completion to the orchestrator.
 
@@ -830,31 +2555,99 @@ class OrchestratorClient:
         Args:
             job_id: UUID of the completed job
             result: Final graph state (should_stop, goal_achieved, error, freeze_data)
+            lease_token: Current worker_batch fence for stateless jobs. Pinned
+                callers omit it and retain the historical payload byte shape.
+            client_report_id: Optional idempotency identity. When omitted, a
+                checkpointed graph envelope supplies it if present.
+            agent_id: Optional pinned-lane ownership fence. Stateless callers
+                use ``lease_token`` instead.
 
         Returns:
             True if the orchestrator handled completion successfully.
+
+        Raises:
+            CompletionNonTerminalReportError: The exact machine-coded 422
+                proves the stateless payload was refused before any write.
         """
         if not self._client:
             await self.connect()
 
         url = f"{self.orchestrator_url}/api/jobs/{job_id}/complete"
-        payload = {
-            "should_stop": result.get("should_stop", False),
-            "goal_achieved": result.get("goal_achieved", False),
-            "error": result.get("error"),
-            "freeze_data": result.get("freeze_data"),
-        }
+        checkpointed_payload = result.get("completion_report_payload")
+        if isinstance(checkpointed_payload, dict) and set(checkpointed_payload) == set(
+            _COMPLETION_REPORT_PAYLOAD_FIELDS
+        ):
+            # Never re-derive a retry payload. Freeze data can embed timestamps
+            # and repository state, so the checkpointed four-field operation
+            # envelope is the only safe source after a failed HTTP attempt.
+            payload: dict[str, Any] = {
+                field: checkpointed_payload[field]
+                for field in _COMPLETION_REPORT_PAYLOAD_FIELDS
+            }
+            if client_report_id is None:
+                stored_report_id = result.get("client_report_id")
+                if stored_report_id is not None:
+                    client_report_id = str(stored_report_id)
+        else:
+            # Backwards compatibility for old checkpoints and direct callers.
+            payload = {
+                "should_stop": result.get("should_stop", False),
+                "goal_achieved": result.get("goal_achieved", False),
+                "error": result.get("error"),
+                "freeze_data": result.get("freeze_data"),
+            }
+        if lease_token is not None:
+            payload["lease_token"] = int(lease_token)
+        if agent_id is not None:
+            payload["agent_id"] = str(agent_id)
+        if client_report_id is not None:
+            payload["client_report_id"] = str(client_report_id)
 
         try:
-            response = await self._client.post(url, json=payload, timeout=60.0)
-            if response.status_code == 200:
-                resp_data = response.json()
+            # Stateless terminal handling can include workspace/archive and
+            # verification side effects. A short client disconnect cancels the
+            # FastAPI handler, so the leased path gets a deliberately wide
+            # budget. Pinned retains its historical 60-second behavior.
+            timeout_seconds = 300.0 if lease_token is not None else 60.0
+            response = await self._client.post(
+                url, json=payload, timeout=timeout_seconds
+            )
+            if response.status_code in {200, 202}:
+                try:
+                    resp_data = response.json()
+                except ValueError:
+                    # A body is useful for logging but not part of the durable
+                    # acceptance contract; a bodyless 202 is still success.
+                    resp_data = {}
                 actions = resp_data.get("actions", [])
                 logger.info(
-                    f"Orchestrator handled completion for job {job_id}: "
+                    f"Orchestrator accepted completion for job {job_id}: "
                     f"status={resp_data.get('new_status')}, actions={actions}"
                 )
                 return True
+            elif response.status_code == 422:
+                try:
+                    response_payload = response.json()
+                except (TypeError, ValueError):
+                    response_payload = None
+                detail = (
+                    response_payload.get("detail")
+                    if isinstance(response_payload, dict)
+                    else None
+                )
+                if (
+                    isinstance(detail, dict)
+                    and detail.get("code") == CompletionNonTerminalReportError.code
+                ):
+                    message = detail.get("message")
+                    raise CompletionNonTerminalReportError(
+                        message if isinstance(message, str) else ""
+                    )
+                logger.warning(
+                    f"Completion report failed for job {job_id}: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
             elif response.status_code == 404:
                 logger.info(
                     "Orchestrator does not support /complete endpoint — "
@@ -868,6 +2661,8 @@ class OrchestratorClient:
                 )
                 return False
 
+        except CompletionNonTerminalReportError:
+            raise
         except httpx.RequestError as e:
             logger.warning(f"Failed to report completion for job {job_id}: {e}")
             return False
@@ -875,6 +2670,63 @@ class OrchestratorClient:
             logger.warning(
                 f"Unexpected error reporting completion for job {job_id}: {e}"
             )
+            return False
+
+    async def ack_job_guidance(
+        self,
+        job_id: str,
+        guidance_ids: list[str] | None = None,
+        reply_threads: list[str] | None = None,
+        reply_keys: list[str] | None = None,
+        feedback_keys: list[str] | None = None,
+        delegation_keys: list[str] | None = None,
+        checkpoint_id: str | None = None,
+    ) -> bool:
+        """Ack delivered supervisor guidance / drained queued replies.
+
+        The orchestrator atomically moves the named entries from
+        ``context.pending_guidance`` (by entry id) and
+        ``context.queued_replies`` (by exact key for stateless workers, thread
+        id for legacy pinned callers) to ``context.consumed_replies``. A
+        stateless caller supplies the committed checkpoint proving the entries
+        reached durable graph state. Best-effort: failure means redelivery.
+
+        Args:
+            job_id: UUID of the job the guidance was delivered to
+            guidance_ids: ``pending_guidance`` entry ids rendered into context
+            reply_threads: thread ids whose queued replies were drained
+            reply_keys: exact queued-reply identities absorbed by a checkpoint
+            feedback_keys: exact queued-feedback generations absorbed
+            delegation_keys: exact delegation-result generations absorbed
+            checkpoint_id: durable checkpoint proving stateless delivery
+
+        Returns:
+            True if the orchestrator recorded the ack.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/guidance/ack"
+        payload = {
+            "guidance_ids": guidance_ids or [],
+            "reply_threads": reply_threads or [],
+            "reply_keys": reply_keys or [],
+            "feedback_keys": feedback_keys or [],
+            "delegation_keys": delegation_keys or [],
+            "checkpoint_id": checkpoint_id,
+        }
+
+        try:
+            response = await self._client.post(url, json=payload)
+            if response.status_code == 200:
+                return True
+            logger.warning(
+                f"Guidance ack failed for job {job_id}: "
+                f"{response.status_code} - {response.text}"
+            )
+            return False
+        except httpx.RequestError as e:
+            logger.warning(f"Failed to ack guidance for job {job_id}: {e}")
             return False
 
     async def create_delegation_job(
@@ -889,6 +2741,9 @@ class OrchestratorClient:
         priority: int = 5,
     ) -> dict[str, Any] | None:
         """Create a delegation child job via the orchestrator.
+
+        Datasource IDs are intentionally omitted: the job endpoint inherits
+        and reauthorizes the authoritative parent job's materialized selection.
 
         Args:
             description: Task description for the child job
@@ -990,6 +2845,9 @@ class OrchestratorClient:
     ) -> Optional[dict[str, Any]]:
         """Create a critic verification job for a completed job.
 
+        Datasource IDs are intentionally omitted: the job endpoint inherits
+        and reauthorizes the target parent job's materialized selection.
+
         Loads the verification instructions template, formats it with
         target job details, and creates a new critic job via the
         orchestrator API.
@@ -1044,7 +2902,10 @@ class OrchestratorClient:
             "config_override": {
                 "autonomy": "full",  # Critic must run autonomously
                 "tools": {
-                    "evaluation": ["approve_job", "return_job_with_feedback"],
+                    "evaluation": [
+                        "approve_job_verdict",
+                        "return_job_with_feedback",
+                    ],
                 },
                 **({"llm": parent_llm_override} if parent_llm_override else {}),
             },
@@ -1161,7 +3022,9 @@ class OrchestratorClient:
             return None
 
 
-def create_orchestrator_client_from_env(config_name: str) -> OrchestratorClient:
+def create_orchestrator_client_from_env(
+    config_name: str, *, user_id: str | None = None
+) -> OrchestratorClient:
     """Create an OrchestratorClient from environment variables.
 
     Optional environment variables:
@@ -1172,6 +3035,8 @@ def create_orchestrator_client_from_env(config_name: str) -> OrchestratorClient:
 
     Args:
         config_name: Agent configuration name
+        user_id: Optional delegated persistent-session owner UUID. When set,
+            the client sends it alongside the internal service credential.
 
     Returns:
         OrchestratorClient configured from environment
@@ -1193,4 +3058,5 @@ def create_orchestrator_client_from_env(config_name: str) -> OrchestratorClient:
         pod_port=pod_port,
         hostname=hostname,
         config_name=config_name,
+        user_id=user_id,
     )

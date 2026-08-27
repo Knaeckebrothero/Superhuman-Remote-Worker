@@ -1,17 +1,35 @@
 name: db-migrations
 
-# Gate for changes under orchestrator/database/migrations/**.
+# Gate for changes under orchestrator/database/migrations/** (plus the schema
+# artifacts, the runner and its import surface, and the squawk config).
 #
-# Runs three jobs in parallel:
-#   1. squawk      — static lint of the SQL diff (lock safety, missing
-#                    NOT VALID, non-concurrent indexes, etc.)
-#   2. dry-run     — apply every migration to a fresh pgvector/pgvector:pg16
-#                    service container (transactional pass rolls back; non-tx
-#                    migrations are skipped under --dry-run)
-#   3. uniqueness  — refuse duplicate NNNN_ prefixes within each migrations
+# The trigger list carries database/__init__.py even though it is not a
+# migration: `python -m database.migrate` loads the package initializer first.
+# That initializer deliberately keeps application exports lazy so the runner
+# needs only asyncpg; changing the import boundary must exercise this workflow.
+# postgres.py remains listed because it owns the application-side schema
+# capabilities and migration invocation used during normal startup.
+#
+# Runs four jobs in parallel:
+#   1. squawk      — static lint of the migrations ADDED/MODIFIED by this push
+#                    or ordinary PR (lock safety, missing NOT VALID,
+#                    non-concurrent indexes, etc.). A develop-to-main release
+#                    promotion trusts develop's admission gates instead of
+#                    re-linting its frozen, already-applied history: those files
+#                    can't be edited (the runner's checksum guard rejects
+#                    drift), so their findings are unactionable and would keep
+#                    the promotion permanently red.
+#   2. dry-run     — dry-run every migration, then really apply the app chain
+#                    and exercise the Canvas viewer credential lifecycle on a
+#                    fresh pgvector/pgvector:pg15 service container (transactional
+#                    dry-run pass rolls back; non-tx migrations are skipped
+#                    under --dry-run and included in the real apply)
+#   3. artifact    — regenerate the *_current.sql schema artifacts (real apply,
+#                    all three families) and fail if they drift from committed
+#   4. uniqueness  — refuse duplicate NNNN_ prefixes within each migrations
 #                    subdirectory
 #
-# Design rationale: see docs/db_migration.md §Testing & CI.
+# Design rationale: see knowledge-base/knowledge/db_migration.md §Testing & CI.
 
 on:
   push:
@@ -19,12 +37,34 @@ on:
     paths:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
+      # Runner import surface, not migrations — see the header note.
+      - 'orchestrator/database/__init__.py'
+      - 'orchestrator/database/postgres.py'
+      - 'orchestrator/database/*_current.sql'
+      - 'orchestrator/services/canvas*.py'
+      - 'helm/files/canvas-viewer-role.sql'
+      - 'scripts/provision-canvas-gateway-database.sh'
+      - 'tests/test_canvas_gateway_operator_provision.py'
+      - 'tests/test_canvas_gateway_role_sql.py'
+      - 'tests/test_canvas_viewer_postgres_integration.py'
+      - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
       - '.squawk.toml'
   pull_request:
     paths:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
+      # Runner import surface, not migrations — see the header note.
+      - 'orchestrator/database/__init__.py'
+      - 'orchestrator/database/postgres.py'
+      - 'orchestrator/database/*_current.sql'
+      - 'orchestrator/services/canvas*.py'
+      - 'helm/files/canvas-viewer-role.sql'
+      - 'scripts/provision-canvas-gateway-database.sh'
+      - 'tests/test_canvas_gateway_operator_provision.py'
+      - 'tests/test_canvas_gateway_role_sql.py'
+      - 'tests/test_canvas_viewer_postgres_integration.py'
+      - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
       - '.squawk.toml'
   workflow_dispatch:
@@ -33,13 +73,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Squawk's GitHub Action posts findings as PR comments, which requires
-# write access to issues/pull-requests on top of the default read-only
-# token. Granted at the workflow level so the comment-posting step doesn't
-# 403 on PR runs (and to avoid having to repeat it per job).
+# Every job only reads the repo. squawk now runs the pinned binary directly
+# (findings surface in the job log, not as PR comments), so no write scope is
+# needed.
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   squawk:
@@ -50,49 +88,81 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Until the first real migration lands as 0002_*.sql, the only files
-      # matching the action's glob are the two 0001_initial.sql snapshots,
-      # which `.squawk.toml` excludes. Squawk then errors with "Failed to
-      # find files for provided patterns" and exits 1. Its TOML doesn't
-      # expose a knob for this and the v2 action doesn't pass through CLI
-      # flags, so short-circuit here when there's nothing to lint.
-      - name: Detect lintable migrations
-        id: detect
+      # Lint ONLY the migrations this push/PR adds or modifies — never the
+      # whole frozen history. Applied migrations can't be edited (the runner's
+      # checksum guard rejects any drift), so re-linting them just accumulates
+      # unactionable findings and keeps the job permanently red. New migrations
+      # still get the full rule set before they ever land.
+      - name: Lint changed migrations
+        env:
+          SQUAWK_VERSION: v2.59.0
         run: |
           set -euo pipefail
-          shopt -s globstar nullglob
-          files=()
-          for f in orchestrator/database/migrations/**/*.sql; do
-            [[ "$(basename "$f")" == 0001_initial.sql ]] && continue
-            files+=("$f")
-          done
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "has_files=false" >> "$GITHUB_OUTPUT"
-            echo "No non-snapshot migrations present; skipping squawk."
-          else
-            echo "has_files=true" >> "$GITHUB_OUTPUT"
+
+          # A release PR from develop to main contains every migration since
+          # main's previous release snapshot. Develop is the migration admission
+          # branch, and that accumulated history is checksum-locked after
+          # application. Re-linting it makes old, unactionable warnings block
+          # promotion. The other jobs in this workflow still replay the complete
+          # chain, regenerate all schema artifacts, and enforce unique prefixes
+          # on this PR.
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+             && [ "${{ github.base_ref }}" = "main" ] \
+             && [ "${{ github.head_ref }}" = "develop" ]; then
+            echo "Develop-to-main promotion: relying on develop admission gates; skipping immutable-history re-lint."
+            exit 0
           fi
-      # `.squawk.toml` at repo root is auto-discovered by squawk by walking
-      # up from the cwd — no `config` input needed (and the v2 action
-      # doesn't accept one anyway).
-      - uses: sbdchd/squawk-action@v2
-        if: steps.detect.outputs.has_files == 'true'
-        with:
-          pattern: "orchestrator/database/migrations/**/*.sql"
-          version: "latest"
-          fail-on-violations: true
+
+          # Diff base: the PR's base, or the previous tip of the pushed branch.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          # Fall back to the parent commit when base is missing / empty / the
+          # all-zero sentinel (first push of a branch, force-push, dispatch).
+          if [ -z "${base:-}" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git rev-parse -q --verify "$base^{commit}" >/dev/null 2>&1; then
+            base="$(git rev-parse -q --verify HEAD~1 || git rev-parse HEAD)"
+          fi
+
+          # Added/Modified migration files only, minus the 0001 bootstrap
+          # snapshots (they lint like ALTERs on a hot table but are empty-DB
+          # bootstraps; also pinned in .squawk.toml's excluded_paths).
+          mapfile -t files < <(
+            git diff --name-only --diff-filter=AM "$base" "${{ github.sha }}" \
+              -- 'orchestrator/database/migrations/**/*.sql' \
+              | grep -v '/0001_initial\.sql$' || true
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No added/modified migrations in this change — nothing to lint."
+            exit 0
+          fi
+          echo "Linting ${#files[@]} changed migration(s):"
+          printf '  %s\n' "${files[@]}"
+
+          # Pinned squawk binary (the same tool sbdchd/squawk-action wraps).
+          # Invoked directly so we control exactly which files are linted;
+          # .squawk.toml at the repo root is auto-discovered.
+          curl -fsSL -o /tmp/squawk \
+            "https://github.com/sbdchd/squawk/releases/download/${SQUAWK_VERSION}/squawk-linux-x64"
+          chmod +x /tmp/squawk
+          /tmp/squawk "${files[@]}"
 
   dry-run:
-    name: dry-run on pgvector/pgvector:pg16
+    name: dry-run on pgvector/pgvector:pg15
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
-      # pgvector/pgvector:pg16 is the canonical "Postgres 16 + pgvector"
-      # build. The vector DB's 0001_initial.sql declares vector(4096) on
-      # source_embeddings, so the stock postgres:16 image fails on
-      # CREATE EXTENSION vector. This image bundles the extension.
+      # pgvector/pgvector:pg15 matches the PROD major for the app + vector DBs
+      # (helm/values.yaml pins both to pg15). pg_dump/DDL behaviour is
+      # major-sensitive, so the gate must run the same major prod does. The
+      # vector DB's 0001_initial.sql declares vector(4096) on source_embeddings,
+      # so the stock postgres:15 image fails on CREATE EXTENSION vector; this
+      # image bundles the extension. (The audit DB is postgres:16 in prod and
+      # is covered by the `artifact` job below, which pins each family's major.)
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg15
         env:
           POSTGRES_PASSWORD: ci
           POSTGRES_USER: ci
@@ -109,9 +179,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # asyncpg drives the runner; cryptography is pulled in transitively
-      # via security.crypto (AESGCM) when database/__init__.py loads postgres.py.
-      - run: pip install --quiet asyncpg cryptography
+      # asyncpg drives the standalone runner. The remaining packages support
+      # the focused Canvas lifecycle checks, which import the application DB
+      # layer and its encryption/main-cloud value objects later in this job.
+      - run: >-
+          pip install --quiet asyncpg cryptography httpx tenacity
+          'pydantic>=2.10' pytest pytest-asyncio
       - name: Create the vector database
         env:
           PGPASSWORD: ci
@@ -124,10 +197,16 @@ jobs:
       # contents of orchestrator/ into /app/, so the package treats orchestrator/
       # as the top of sys.path (e.g. `from security.crypto import ...`,
       # `from utils.db_url import ...`). Run the migration runner the same way.
+      #
+      # That same /app also holds the repository-root `src/` tree (the
+      # Dockerfile copies it to /app/src/), so in production ONE sys.path entry
+      # resolves both roots. Here they are two directories, so carry the
+      # workspace in PYTHONPATH to match production's import root.
       - name: Dry-run app migrations
         working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m database.migrate \
             --dir database/migrations/app \
@@ -136,10 +215,64 @@ jobs:
         working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_vector
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m database.migrate \
             --dir database/migrations/vector \
             --dry-run
+      - name: Apply app migrations for Canvas viewer lifecycle test
+        working-directory: orchestrator
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m database.migrate --dir database/migrations/app
+      - name: Exercise Canvas viewer lifecycle against PostgreSQL
+        env:
+          CANVAS_TEST_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
+          PYTHONPATH: orchestrator:.
+        run: >-
+          pytest -q
+          tests/test_canvas_viewer_postgres_integration.py
+          tests/test_canvas_gateway_role_sql.py
+          tests/test_canvas_gateway_operator_provision.py
+
+  artifact:
+    # The keystone drift gate (HF-1): regenerate the canonical *_current.sql
+    # schema artifacts by replaying every migration from zero and fail if they
+    # differ from what's committed. Unlike `dry-run`, this does a REAL apply
+    # (so the .notx.sql CONCURRENTLY files execute), covers ALL THREE families
+    # including audit (net-new — no audit dry-run exists), and pins each
+    # family's prod major. See knowledge-base/knowledge/features/database_roadmap.md Phase 2.
+    name: schema artifacts fresh
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The migration runner is intentionally independent of the application
+      # database layer and needs only asyncpg.
+      - run: pip install --quiet asyncpg
+      # Docker is preinstalled on ubuntu-latest; the script auto-detects it and
+      # spins up one throwaway container per family (pgvector:pg15 x2,
+      # postgres:16), migrates from zero, and dumps inside the container.
+      - name: Regenerate schema artifacts
+        run: scripts/schema-snapshot.sh
+      # Fail if regeneration changed anything: a migration altered the schema
+      # without the author re-running the snapshot, or an artifact was
+      # hand-edited (regeneration overwrites hand edits -> diff). `git add -A`
+      # first so a brand-new artifact (untracked) is caught too, not just edits.
+      - name: Fail on stale or hand-edited artifacts
+        run: |
+          git add -A orchestrator/database/*_current.sql
+          if git diff --cached --quiet -- orchestrator/database/*_current.sql; then
+            echo "Schema artifacts are up to date."
+          else
+            echo "::error::Schema artifacts are stale or hand-edited. Regenerate with: scripts/schema-snapshot.sh && git add -A orchestrator/database/*_current.sql, then commit."
+            git --no-pager diff --cached -- orchestrator/database/*_current.sql
+            exit 1
+          fi
 
   uniqueness:
     name: unique NNNN_ prefixes

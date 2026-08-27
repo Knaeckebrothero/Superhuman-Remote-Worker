@@ -30,12 +30,140 @@ if "WORKSPACE_PATH" not in os.environ:
     _test_workspace = tempfile.mkdtemp(prefix="srw_test_workspace_")
     os.environ["WORKSPACE_PATH"] = _test_workspace
 
-# Provide a deterministic encryption key so any code path that touches
-# orchestrator.security.crypto during tests has a working cipher. Real
-# credentials never run through this key.
+# Provide a deterministic encryption key so any code path that touches the
+# orchestrator's canonical ``security.crypto`` module during tests has a working
+# cipher. Real credentials never run through this key.
 os.environ.setdefault(
     "APP_ENCRYPTION_KEY", "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="
 )
+
+from security import crypto as _encryption_crypto  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_encryption_cipher_cache():
+    """Prevent a test-specific encryption key from leaking between tests."""
+    _encryption_crypto.reset_cipher_cache()
+    yield
+    _encryption_crypto.reset_cipher_cache()
+
+
+# orchestrator/main.py also guards on vector-DB credentials at import time.
+# Tests only exercise its utility functions / pure models, never the vector
+# store, so provide a dummy URL. setdefault never overrides a real CI/prod value.
+os.environ.setdefault("VECTOR_DB_URL", "postgresql://test:test@localhost:5432/test")
+
+# Pin the orchestrator's top-level packages (``database``, ``services``, ...) in
+# sys.modules before any test runs. Both ``src`` and ``orchestrator`` ship
+# same-named top-level packages (each is its own import root in its own
+# container), and several agent-side tests prepend ``src`` to sys.path. Without
+# this, ``orchestrator.main``'s sibling imports (``from database import ...``,
+# ``from services... import ...``) can resolve to ``src/*`` once an agent test
+# has run, raising ImportError. Importing ``main`` here, while orchestrator/
+# leads sys.path, caches its whole import graph for the session. Agent code and
+# the src-inserting tests never bare-import these colliding packages, so the pin
+# is invisible to them. Best-effort: a failure here just leaves the prior
+# (order-dependent) behavior.
+try:
+    import main as _srw_orchestrator_main  # noqa: F401
+except Exception:
+    pass
+
+
+# =============================================================================
+# Hermetic build-provenance environment
+# =============================================================================
+#
+# Both workflows declare SRW_SOURCE_URL, SRW_DOCUMENTATION_URL and
+# SRW_RELEASE_VERSION in their top-level ``env:`` block, so GitHub injects them
+# into every step of every job — including ``pytest tests/``. Those are exactly
+# the names src/core/runtime_provenance.py reads, so a test asserting that a
+# provenance field is absent passes locally (unset) and fails in CI (set), which
+# no local run can reproduce. Strip the whole surface before each test; a test
+# that wants a value still sets it via monkeypatch, which runs after this.
+
+from src.core.product_capabilities import ProductComponent  # noqa: E402
+
+_PROVENANCE_FIELDS = (
+    "SOURCE_REVISION",
+    "SOURCE_URL",
+    "ARTIFACT_DIGEST",
+    "RELEASE_VERSION",
+    "DOCUMENTATION_URL",
+)
+_PROVENANCE_ENV_VARS = (
+    "SRW_COMPONENT",
+    "SRW_DEPLOYMENT_PROVENANCE_JSON",
+    # Declared alongside the fields above in the register payload.
+    "BUILD_SHA",
+    *(f"SRW_{field}" for field in _PROVENANCE_FIELDS),
+    *(
+        f"SRW_{component.value.upper()}_{field}"
+        for component in ProductComponent
+        for field in _PROVENANCE_FIELDS
+    ),
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_declared_provenance_env(monkeypatch):
+    """Keep ambient build metadata out of every test's environment."""
+    for name in _PROVENANCE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+# =============================================================================
+# Orchestrator module-singleton hygiene
+# =============================================================================
+#
+# orchestrator/main.py owns process-wide singletons (``postgres_db`` and
+# friends). A test that swaps one in with a bare assignment rather than
+# monkeypatch leaks it into every test that runs after it in the same process,
+# and the failure surfaces hundreds of tests later in a file that never touched
+# the global — e.g. a leaked ``MagicMock`` postgres_db turning an unrelated
+# ``await postgres_db.<method>()`` into "MagicMock can't be used in 'await'".
+# Snapshot the identities around every test and put them back, so a missing
+# restore stays local to the test that made it.
+#
+# ``main`` and ``orchestrator.main`` are distinct module objects here (both
+# import roots are on sys.path), so both are guarded.
+
+_ORCH_MAIN_MODULE_NAMES = ("main", "orchestrator.main")
+_ORCH_MAIN_SINGLETONS = (
+    "postgres_db",
+    "workspace_suspension_service",
+    "persistent_provisioner",
+    "email_service",
+    "headless_notifications",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_orchestrator_singletons():
+    modules = []
+    for name in _ORCH_MAIN_MODULE_NAMES:
+        module = sys.modules.get(name)
+        if module is not None and not any(module is seen for seen in modules):
+            modules.append(module)
+
+    snapshots = [
+        (
+            module,
+            {
+                name: getattr(module, name)
+                for name in _ORCH_MAIN_SINGLETONS
+                if hasattr(module, name)
+            },
+        )
+        for module in modules
+    ]
+    try:
+        yield
+    finally:
+        for module, snapshot in snapshots:
+            for name, value in snapshot.items():
+                if getattr(module, name, None) is not value:
+                    setattr(module, name, value)
 
 
 # =============================================================================
@@ -51,10 +179,10 @@ os.environ.setdefault(
 # Layout:
 #   user_a  ──owner──▶ project_a ──contains──▶ job_a
 #                                    │
-#                                    └─thread_a   builder_session_a
+#                                    └─thread_a
 #   user_b  ──owner──▶ project_b ──contains──▶ job_b
 #                                    │
-#                                    └─thread_b   builder_session_b
+#                                    └─thread_b
 #   user_admin (is_admin=True, no project membership; admin role bypasses)
 #
 # user_a has no membership in project_b (and vice versa). user_admin has no
@@ -131,24 +259,30 @@ def job_b() -> dict:
     return {"id": _JID_B, "user_id": _UID_B, "project_id": _PID_B, "status": "created"}
 
 
+# ``execution_lane`` mirrors the column's own contract: threads.execution_lane
+# is NOT NULL DEFAULT 'pinned' (migration 0115a), so a real row can never carry
+# None. Omitting it here made these fixtures the only place in the system where
+# the lane is absent, which routes callers into the deliberate fail-closed
+# "unknown future lanes" branch (resume_thread) rather than the pinned path
+# they are exercising.
 @pytest.fixture
 def thread_a() -> dict:
-    return {"id": _TID_A, "user_id": _UID_A, "title": "thread A"}
+    return {
+        "id": _TID_A,
+        "user_id": _UID_A,
+        "title": "thread A",
+        "execution_lane": "pinned",
+    }
 
 
 @pytest.fixture
 def thread_b() -> dict:
-    return {"id": _TID_B, "user_id": _UID_B, "title": "thread B"}
-
-
-@pytest.fixture
-def builder_session_a() -> dict:
-    return {"id": _SID_A, "user_id": _UID_A, "expert_id": None}
-
-
-@pytest.fixture
-def builder_session_b() -> dict:
-    return {"id": _SID_B, "user_id": _UID_B, "expert_id": None}
+    return {
+        "id": _TID_B,
+        "user_id": _UID_B,
+        "title": "thread B",
+        "execution_lane": "pinned",
+    }
 
 
 @pytest.fixture
@@ -204,8 +338,6 @@ def fake_db(
     job_b,
     thread_a,
     thread_b,
-    builder_session_a,
-    builder_session_b,
     datasource_a,
     datasource_b,
     datasource_global,
@@ -219,7 +351,6 @@ def fake_db(
     projects = {_PID_A: project_a, _PID_B: project_b}
     jobs = {_JID_A: job_a, _JID_B: job_b}
     threads = {_TID_A: thread_a, _TID_B: thread_b}
-    sessions = {_SID_A: builder_session_a, _SID_B: builder_session_b}
     datasources = {
         _DSID_A: datasource_a,
         _DSID_B: datasource_b,
@@ -254,18 +385,29 @@ def fake_db(
     async def get_thread(tid):
         return threads.get(_to_uuid(tid))
 
-    async def get_builder_session(sid):
-        return sessions.get(_to_uuid(sid))
-
     async def get_user_role_in_project(pid, uid):
         return memberships.get((_to_uuid(pid), _to_uuid(uid)))
 
-    async def get_projects_for_user(uid, limit=100):
+    async def get_projects_for_user(uid, limit=100, statuses=None):
         u = _to_uuid(uid)
-        return [
+        rows = [
             projects[pid]
             for (pid, member_uid), _role in memberships.items()
             if member_uid == u
+        ]
+        if statuses is None:
+            return rows
+        # Mirror project_status_filter_sql: requested statuses pass, and so
+        # does anything outside the known vocabulary (NULL included), so a row
+        # nobody can classify is never silently swallowed.
+        wanted = {str(s).lower() for s in statuses}
+        return [
+            row
+            for row in rows
+            if (str(row.get("status") or "active").lower() in wanted)
+            or (
+                str(row.get("status") or "active").lower() not in {"active", "archived"}
+            )
         ]
 
     async def get_datasource(dsid):
@@ -274,6 +416,16 @@ def fake_db(
     async def list_datasource_projects(dsid):
         return [str(pid) for pid in datasource_projects.get(_to_uuid(dsid), [])]
 
+    async def list_datasource_projects_bulk(dsids):
+        # Batched form: {datasource_id: [project_id, ...]}, entries only for
+        # linked datasources. Keys mirror the caller's str(ds["id"]) inputs.
+        out: dict[str, list[str]] = {}
+        for dsid in dsids:
+            pids = datasource_projects.get(_to_uuid(dsid), [])
+            if pids:
+                out[str(dsid)] = [str(pid) for pid in pids]
+        return out
+
     async def list_datasources(job_id=None, ds_type=None, limit=100):
         return list(datasources.values())
 
@@ -281,11 +433,13 @@ def fake_db(
     db.get_project = AsyncMock(side_effect=get_project)
     db.get_job = AsyncMock(side_effect=get_job)
     db.get_thread = AsyncMock(side_effect=get_thread)
-    db.get_builder_session = AsyncMock(side_effect=get_builder_session)
     db.get_user_role_in_project = AsyncMock(side_effect=get_user_role_in_project)
     db.get_projects_for_user = AsyncMock(side_effect=get_projects_for_user)
     db.get_datasource = AsyncMock(side_effect=get_datasource)
     db.list_datasource_projects = AsyncMock(side_effect=list_datasource_projects)
+    db.list_datasource_projects_bulk = AsyncMock(
+        side_effect=list_datasource_projects_bulk
+    )
     db.list_datasources = AsyncMock(side_effect=list_datasources)
     return db
 

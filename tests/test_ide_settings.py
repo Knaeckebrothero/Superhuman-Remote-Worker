@@ -8,9 +8,23 @@ The fake DB here faithfully replicates the real
 ``PostgresDB.update_user_settings`` semantics — a SHALLOW top-level JSONB
 ``||`` merge with ``jsonb_strip_nulls`` — because the store's correctness hinges
 on not clobbering sibling keys through that shallow merge.
+
+Also covers the honest-rc fix (§C1d, knowledge-base/knowledge/features/workspace_durability_tiering.md)
+for this module's OWN ``tar | zstd`` (capture, ``_ssh_tar_to_file``) and
+``zstd -d | tar`` (extract, ``_ssh_untar_from_file``) SSH commands — the third
+masking site after C1b (``snapshot_service.py``) and C1c (``ssh_helpers.py``):
+a shell pipeline only reports its LAST stage's exit code, so an upstream
+failure is hidden unless the remote command is wrapped in ``bash -c`` with a
+PIPESTATUS-discriminated verdict. Follows the C1b/C1c real-bash pattern in
+``tests/test_snapshot_ssh_extraction.py`` — mocked-subprocess tests can't
+catch shell bugs in the verdict tail itself.
 """
 
 import base64
+import json
+import shutil
+import subprocess
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -19,11 +33,14 @@ from orchestrator.services.ide_settings import (
     GLOBAL_STORAGE_DIR,
     IdeSettingsStore,
     OpenVsxClassifier,
+    _ssh_tar_to_file,
+    _ssh_untar_from_file,
     build_extension_install_script,
     build_extensions_list_script,
     build_seed_script,
     build_signature_script,
     capture_ide_profile,
+    evict_dead_workspaces,
     parse_extensions_list,
     parse_signature,
     parse_pull_output,
@@ -280,6 +297,44 @@ class TestResolveSshTarget:
     def test_no_target_returns_none(self):
         assert resolve_ssh_target({}) is None
         assert resolve_ssh_target({"workspace_container": {}}) is None
+
+    def test_stable_service_dns_preferred_over_pod_ip(self):
+        """A restarted workspace pod keeps its Service name, not its IP —
+        dialing the stale IP was the sweeper's residual 'No route to host'
+        source. The stable DNS must win when both are present."""
+        ctx = {
+            "workspace_container": {
+                "status": "ready",
+                "host": "workspace-965b0935-309.srw.svc.cluster.local",
+                "pod_ip": "10.42.0.99",
+                "port": 30022,
+            }
+        }
+        assert resolve_ssh_target(ctx) == (
+            "workspace-965b0935-309.srw.svc.cluster.local",
+            30022,
+        )
+
+    def test_legacy_pod_ip_only_row_still_resolves(self):
+        ctx = {
+            "workspace_container": {
+                "status": "ready",
+                "pod_ip": "10.0.0.5",
+                "port": 30022,
+            }
+        }
+        assert resolve_ssh_target(ctx) == ("10.0.0.5", 30022)
+
+    def test_host_only_row_uses_default_port(self):
+        ctx = {
+            "workspace_container": {
+                "status": "ready",
+                "host": "workspace-abc.srw.svc.cluster.local",
+            }
+        }
+        host, port = resolve_ssh_target(ctx)
+        assert host == "workspace-abc.srw.svc.cluster.local"
+        assert port > 0
 
 
 class TestBuildSeedScript:
@@ -801,6 +856,300 @@ class TestSignature:
         assert parse_signature("") == ""
 
 
+async def _capture_remote_cmd(tmp_path, remote_path="/some/remote/path") -> str:
+    """Drive ``_ssh_tar_to_file`` against a mocked subprocess and return the
+    exact ``remote`` command string it built — so tests assert against the
+    real construction instead of a hand-duplicated copy that could drift."""
+    fake = MagicMock()
+    fake.returncode = 0
+    fake.stdout = MagicMock()
+    fake.stdout.read = AsyncMock(side_effect=[b"tarball-bytes", b""])
+    fake.wait = AsyncMock(return_value=None)
+    local = tmp_path / "capture.tar.zst"
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)
+    ) as mock_exec:
+        await _ssh_tar_to_file("10.0.0.5", 30022, remote_path, str(local), key_path="")
+    return mock_exec.call_args.args[-1]
+
+
+async def _untar_remote_cmd(tmp_path) -> str:
+    """Drive ``_ssh_untar_from_file`` against a mocked subprocess and return
+    the exact ``remote`` command string it built."""
+    local = tmp_path / "extract.tar.zst"
+    local.write_bytes(b"fake-archive-bytes")
+    fake = MagicMock()
+    fake.returncode = 0
+    fake.stdin = MagicMock()
+    fake.stdin.write = MagicMock()
+    fake.stdin.drain = AsyncMock(return_value=None)
+    fake.stdin.close = MagicMock()
+    fake.wait = AsyncMock(return_value=None)
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)
+    ) as mock_exec:
+        await _ssh_untar_from_file("10.0.0.5", 30022, str(local), key_path="")
+    return mock_exec.call_args.args[-1]
+
+
+class TestSshTarToFileCommandShape:
+    """Capture-side ``tar | zstd`` honest-rc wrapper (§C1d).
+
+    ``_ssh_tar_to_file`` builds its own SSH remote command (separate from
+    snapshot_service's C1b fix) — a shell pipeline only reports the LAST
+    stage's exit code, so a fatal ``tar`` failure upstream of ``zstd`` was
+    silently masked (a failing tar with zstd still compressing whatever
+    partial/empty stream it received reports overall success). Wrap in
+    ``bash -c`` (guarantees PIPESTATUS regardless of the agent-host login
+    shell) and collapse to an honest verdict: accept tar rc in {0, 1} (rc==1
+    is the benign "file changed as we read it" warning on a live workspace)
+    with a clean zstd; reject tar rc>=2 or any zstd failure. The caller's
+    existing ``proc.returncode == 0 and total > 0`` gate is untouched — it
+    now just gates on the honest verdict instead of the masked raw zstd rc.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wrapped_in_bash_c_with_pipestatus_verdict(self, tmp_path):
+        remote_cmd = await _capture_remote_cmd(
+            tmp_path, "/var/lib/code-server/User/globalStorage"
+        )
+
+        assert remote_cmd.startswith("bash -c '")
+        assert remote_cmd.endswith("'")
+        assert (
+            "tar -cf - /var/lib/code-server/User/globalStorage 2>/dev/null"
+            in remote_cmd
+        )
+        assert "| zstd -1 -T0" in remote_cmd
+        # PIPESTATUS must be snapshotted into an array in ONE command before
+        # anything reads it (see the real-bash class below for why a bare
+        # `__x=${PIPESTATUS[0]}` assignment would silently clobber it).
+        assert '__ps=("${PIPESTATUS[@]}")' in remote_cmd
+        assert "${__ps[0]}" in remote_cmd
+        assert "${__ps[1]}" in remote_cmd
+        assert "exit 1" in remote_cmd
+        assert "exit 0" in remote_cmd
+        # The `-c` body is single-quoted: exactly the opening and closing
+        # quote should exist anywhere in the command.
+        assert remote_cmd.count("'") == 2
+
+    @pytest.mark.asyncio
+    async def test_remote_path_has_no_single_quote_so_embedding_is_safe(self, tmp_path):
+        # remote_path is interpolated directly into the single-quoted `-c`
+        # body with no shell-escaping — safe only because filesystem paths
+        # used here never contain a single quote. Assert that invariant
+        # explicitly, and that quoting stays balanced with a realistic path.
+        for path in (
+            GLOBAL_STORAGE_DIR,
+            "/var/lib/code-server/extensions/acme.private-1.2.3-universal",
+        ):
+            assert "'" not in path
+            remote_cmd = await _capture_remote_cmd(tmp_path, path)
+            assert path in remote_cmd
+            assert remote_cmd.count("'") == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_verdict_accepts(self, tmp_path):
+        fake = MagicMock()
+        fake.returncode = 0  # the wrapper's own accept code, not raw zstd rc
+        fake.stdout = MagicMock()
+        fake.stdout.read = AsyncMock(side_effect=[b"data", b""])
+        fake.wait = AsyncMock(return_value=None)
+        local = tmp_path / "out.tar.zst"
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            ok = await _ssh_tar_to_file("h", 22, "/p", str(local), key_path="")
+
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_verdict_rejects_despite_bytes_flowing(
+        self, tmp_path
+    ):
+        # Pins the `rc == 0` bool contract: even though bytes flowed to
+        # stdout (zstd compressed *something*), a nonzero wrapper verdict
+        # must still be reported as failure.
+        fake = MagicMock()
+        fake.returncode = 1  # the wrapper's reject code
+        fake.stdout = MagicMock()
+        fake.stdout.read = AsyncMock(side_effect=[b"data", b""])
+        fake.wait = AsyncMock(return_value=None)
+        local = tmp_path / "out.tar.zst"
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            ok = await _ssh_tar_to_file("h", 22, "/p", str(local), key_path="")
+
+        assert ok is False
+
+
+class TestSshUntarFromFileCommandShape:
+    """Extract-side ``zstd -d | tar`` honest-rc wrapper (§C1d).
+
+    ``_ssh_untar_from_file`` returns a bool straight off ``proc.returncode``
+    (``return proc.returncode == 0`` — confirmed below), so the fix must
+    make that raw exit code honest rather than change the caller. Same
+    verdict shape as the capture side: accept tar rc in {0, 1}; reject tar
+    rc>=2 or any zstd failure — the previously-masked case being a corrupt
+    archive's ``zstd -d`` decompression failure hidden behind tar's own
+    (last-stage) exit 0.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wrapped_in_bash_c_with_pipestatus_verdict(self, tmp_path):
+        remote_cmd = await _untar_remote_cmd(tmp_path)
+
+        assert remote_cmd.startswith("bash -c '")
+        assert remote_cmd.endswith("'")
+        assert "zstd -d | tar -xf - -C /" in remote_cmd
+        assert '__ps=("${PIPESTATUS[@]}")' in remote_cmd
+        assert "${__ps[0]}" in remote_cmd
+        assert "${__ps[1]}" in remote_cmd
+        assert "exit 1" in remote_cmd
+        assert "exit 0" in remote_cmd
+        assert remote_cmd.count("'") == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_true_on_accept_verdict(self, tmp_path):
+        # Confirms the exact return line: `return proc.returncode == 0`.
+        local = tmp_path / "in.tar.zst"
+        local.write_bytes(b"x")
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdin = MagicMock()
+        fake.stdin.write = MagicMock()
+        fake.stdin.drain = AsyncMock(return_value=None)
+        fake.stdin.close = MagicMock()
+        fake.wait = AsyncMock(return_value=None)
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            ok = await _ssh_untar_from_file("h", 22, str(local), key_path="")
+
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_reject_verdict(self, tmp_path):
+        local = tmp_path / "in.tar.zst"
+        local.write_bytes(b"x")
+        fake = MagicMock()
+        fake.returncode = 1  # the wrapper's reject code
+        fake.stdin = MagicMock()
+        fake.stdin.write = MagicMock()
+        fake.stdin.drain = AsyncMock(return_value=None)
+        fake.stdin.close = MagicMock()
+        fake.wait = AsyncMock(return_value=None)
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            ok = await _ssh_untar_from_file("h", 22, str(local), key_path="")
+
+        assert ok is False
+
+
+class TestIdeSettingsHonestRcRealBash:
+    """Real-``bash`` verdict-matrix proof for both C1d wrappers.
+
+    Mocked-subprocess tests (above) only prove the STRING shape of the
+    remote command; they give zero runtime coverage of whether the embedded
+    PIPESTATUS shell arithmetic actually computes the right verdict — the
+    C1b lesson (see ``test_pipestatus_discrimination_tail_maps_stage_exits_
+    correctly`` in ``tests/test_snapshot_ssh_extraction.py``): a subtly
+    wrong tail can look right and still be wrong (e.g. a bare
+    ``__x=${PIPESTATUS[0]}`` assignment is itself a simple command and
+    immediately resets PIPESTATUS, clobbering it before a second read).
+    This extracts the real verdict tail from the command strings the module
+    actually builds and executes it under real bash with synthetic
+    ``( exit A ) | ( exit B )`` stages standing in for tar/zstd, so a
+    regression to a broken tail fails here even though every mocked test
+    above stays green.
+    """
+
+    @staticmethod
+    def _tail_after(body: str, anchor: str) -> str:
+        return body[body.index(anchor) + len(anchor) :]
+
+    @pytest.mark.asyncio
+    async def test_capture_verdict_matrix_under_real_bash(self, tmp_path):
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available")
+
+        remote_cmd = await _capture_remote_cmd(tmp_path, "/some/remote/path")
+        assert remote_cmd.startswith("bash -c '") and remote_cmd.endswith("'")
+        body = remote_cmd[len("bash -c '") : -1]
+        tail = self._tail_after(body, "| zstd -1 -T0; ")
+
+        def run(tar_rc: int, zstd_rc: int, *, wrapped: bool) -> int:
+            pipeline = f"( exit {tar_rc} ) | ( exit {zstd_rc} )"
+            script = f"{pipeline}; {tail}" if wrapped else pipeline
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True
+            )
+            return result.returncode
+
+        # (tar_rc, zstd_rc) -> honest verdict: accept tar in {0,1} + clean
+        # zstd (0); reject tar>=2 or any zstd failure (1).
+        cases = [
+            (0, 0, 0),
+            (1, 0, 0),  # tolerated: benign tar "file changed as we read it"
+            (2, 0, 1),  # rejected: fatal tar failure
+            (0, 5, 1),  # rejected: zstd failure
+        ]
+        for tar_rc, zstd_rc, expected in cases:
+            got = run(tar_rc, zstd_rc, wrapped=True)
+            assert got == expected, (
+                f"tar_rc={tar_rc} zstd_rc={zstd_rc}: expected {expected}, got {got}"
+            )
+
+        # The load-bearing with/without contrast for capture's OWN masking
+        # case: tar fails fatally (rc=2) but zstd, as the pipeline's LAST
+        # stage, still exits 0 compressing whatever partial/empty stream it
+        # received. The plain (unwrapped) pipeline reports SUCCESS — today's
+        # bug — and only stops being a false 0 once the extracted verdict
+        # tail runs. Proves the matrix above isn't passing vacuously.
+        assert run(2, 0, wrapped=False) == 0
+        assert run(2, 0, wrapped=True) != 0
+
+    @pytest.mark.asyncio
+    async def test_extract_verdict_matrix_under_real_bash(self, tmp_path):
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available")
+
+        remote_cmd = await _untar_remote_cmd(tmp_path)
+        assert remote_cmd.startswith("bash -c '") and remote_cmd.endswith("'")
+        body = remote_cmd[len("bash -c '") : -1]
+        tail = self._tail_after(body, "-C /; ")
+
+        def run(zstd_rc: int, tar_rc: int, *, wrapped: bool) -> int:
+            pipeline = f"( exit {zstd_rc} ) | ( exit {tar_rc} )"
+            script = f"{pipeline}; {tail}" if wrapped else pipeline
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True
+            )
+            return result.returncode
+
+        # (zstd_rc, tar_rc) -> honest verdict: accept a clean zstd (0) + tar
+        # in {0,1}; reject any zstd failure or tar>=2.
+        cases = [
+            (0, 0, 0),
+            (0, 1, 0),  # tolerated
+            (0, 2, 1),  # rejected: fatal tar failure
+            (1, 0, 1),  # rejected: masked zstd decompression failure
+        ]
+        for zstd_rc, tar_rc, expected in cases:
+            got = run(zstd_rc, tar_rc, wrapped=True)
+            assert got == expected, (
+                f"zstd_rc={zstd_rc} tar_rc={tar_rc}: expected {expected}, got {got}"
+            )
+
+        # The load-bearing with/without contrast for the extract-side
+        # masking fix (§C1d, mirrors C1c's zstd-fail proof in
+        # tests/test_snapshot_ssh_extraction.py): a corrupt archive's
+        # `zstd -d` failure (rc=1) with `tar` still exiting 0 (it received a
+        # short/empty stream and didn't itself error) reports SUCCESS on the
+        # plain, unwrapped pipeline — exactly today's bug — and only stops
+        # being a false 0 once the extracted verdict tail runs.
+        assert run(1, 0, wrapped=False) == 0
+        assert run(1, 0, wrapped=True) != 0
+
+
 class TestCaptureProfile:
     @pytest.mark.asyncio
     async def test_skips_when_signature_unchanged(self):
@@ -983,3 +1332,143 @@ class TestCaptureBytesExtension:
         # only globalStorage tarred; the bytes folder was never resolved
         assert tarred == [GLOBAL_STORAGE_DIR]
         assert n == 1
+
+
+JOB_ID = "22222222-2222-2222-2222-222222222222"
+THREAD_ID = "33333333-3333-3333-3333-333333333333"
+
+
+def _container_row(entity_type, entity_id, **container_extra):
+    container = {"status": "ready", "pod_ip": "10.42.0.9", **container_extra}
+    return {
+        "entity_type": entity_type,
+        "id": entity_id,
+        "user_id": UID,
+        "context": {"workspace_container": container},
+    }
+
+
+def _evict_mocks(live):
+    provisioner = MagicMock()
+    provisioner.workspace_pod_live = AsyncMock(return_value=live)
+    db = MagicMock()
+    db.merge_workspace_container_context = AsyncMock(return_value=True)
+    db.merge_thread_workspace_context = AsyncMock(return_value=True)
+    return provisioner, db
+
+
+class TestEvictDeadWorkspaces:
+    @pytest.mark.asyncio
+    async def test_dead_job_pod_is_evicted_and_context_cleared(self):
+        provisioner, db = _evict_mocks(live=False)
+        row = _container_row("job", JOB_ID)
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == []
+        owner = provisioner.workspace_pod_live.await_args.args[0]
+        assert (owner.kind, owner.id) == ("job", JOB_ID)
+        db.merge_workspace_container_context.assert_awaited_once_with(
+            JOB_ID, {"status": "deleted", "pod_ip": None}
+        )
+        db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dead_thread_pod_is_evicted_via_thread_merge(self):
+        provisioner, db = _evict_mocks(live=False)
+        row = _container_row("thread", THREAD_ID)
+        # Worklist contexts may arrive as JSON strings — must still be probed.
+        row["context"] = json.dumps(row["context"])
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == []
+        owner = provisioner.workspace_pod_live.await_args.args[0]
+        assert (owner.kind, owner.id) == ("session", THREAD_ID)
+        db.merge_thread_workspace_context.assert_awaited_once_with(
+            THREAD_ID, {"status": "deleted", "pod_ip": None}
+        )
+        db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_pod_is_kept(self):
+        provisioner, db = _evict_mocks(live=True)
+        row = _container_row("job", JOB_ID)
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == [row]
+        db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_liveness_is_treated_as_live(self):
+        provisioner, db = _evict_mocks(live=None)
+        row = _container_row("job", JOB_ID)
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == [row]
+        db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_probe_exception_keeps_the_row(self):
+        provisioner, db = _evict_mocks(live=False)
+        provisioner.workspace_pod_live = AsyncMock(side_effect=RuntimeError("api down"))
+        row = _container_row("job", JOB_ID)
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == [row]
+        db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_vm_row_passes_through_unprobed(self):
+        provisioner, db = _evict_mocks(live=False)
+        row = {
+            "entity_type": "job",
+            "id": JOB_ID,
+            "user_id": UID,
+            "context": {"vm": {"status": "ready", "ssh_host": "vm-1"}},
+        }
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == [row]
+        provisioner.workspace_pod_live.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_merge_failure_still_evicts_the_dead_row(self):
+        provisioner, db = _evict_mocks(live=False)
+        db.merge_workspace_container_context = AsyncMock(
+            side_effect=RuntimeError("db blip")
+        )
+        dead = _container_row("job", JOB_ID)
+        alive_row = _container_row("thread", THREAD_ID)
+        provisioner.workspace_pod_live = AsyncMock(side_effect=[False, True])
+
+        kept = await evict_dead_workspaces([dead, alive_row], provisioner, db)
+
+        assert kept == [alive_row]
+
+
+class TestSweeperRegistrationShape:
+    def test_settings_sweeper_is_leader_gated(self):
+        import inspect
+
+        import main as orchestrator_main
+
+        source = inspect.getsource(orchestrator_main.lifespan)
+        assert (
+            "run_when_leader(code_server_settings_sweeper, _shutdown_event)" in source
+        )
+
+    def test_disabled_sweeper_parks_instead_of_returning(self):
+        # A bare return would make run_when_leader respawn (and log) the
+        # disabled sweeper every poll second for the whole leadership tenure.
+        import inspect
+
+        import main as orchestrator_main
+
+        source = inspect.getsource(orchestrator_main.code_server_settings_sweeper)
+        disabled_branch = source.split("from services.ide_settings import")[0]
+        assert "await shutdown_event.wait()" in disabled_branch

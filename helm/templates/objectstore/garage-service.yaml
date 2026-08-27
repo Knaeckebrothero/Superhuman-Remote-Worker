@@ -1,0 +1,19 @@
+{{- if (include "srw.garageEnabled" .) }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-garage
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "garage") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: s3
+      port: 3900
+      targetPort: 3900
+    - name: admin
+      port: 3903
+      targetPort: 3903
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "garage") | nindent 4 }}
+{{- end }}

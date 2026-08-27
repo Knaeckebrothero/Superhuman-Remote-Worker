@@ -1,0 +1,46 @@
+{{- if .Values.canvas.livePreview.viewer.enabled }}
+{{- $viewer := .Values.canvas.livePreview.viewer -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-canvas-gateway-config
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway") | nindent 4 }}
+data:
+  # Deliberately allowlisted for the public-origin process. Do not replace this
+  # with the shared application ConfigMap or add unrelated platform endpoints.
+  CANVAS_LIVE_PREVIEW_ENABLED: {{ ternary "true" "false" .Values.canvas.livePreview.enabled | quote }}
+  CANVAS_VIEWER_ENABLED: "true"
+  CANVAS_VIEWER_DEPLOYMENT_PROFILE: {{ $viewer.deploymentProfile | quote }}
+  CANVAS_VIEWER_COOKIE_MODE: {{ $viewer.cookieMode | quote }}
+  CANVAS_VIEWER_DOMAIN: {{ $viewer.domain | quote }}
+  CANVAS_VIEWER_HOST_SUFFIX: {{ $viewer.hostSuffix | quote }}
+  CANVAS_VIEWER_COCKPIT_ORIGINS: {{ join "," $viewer.cockpitOrigins | quote }}
+  CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED: {{ ternary "true" "false" $viewer.pslBoundaryVerified | quote }}
+  CANVAS_VIEWER_SESSION_TTL_SECONDS: {{ $viewer.sessionTtlSeconds | int | quote }}
+  CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS: {{ $viewer.bootstrapTtlSeconds | int | quote }}
+  CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS: {{ $viewer.attachmentTtlSeconds | int | quote }}
+  CANVAS_VIEWER_REVALIDATE_SECONDS: {{ $viewer.revalidateSeconds | int | quote }}
+  CANVAS_VIEWER_MAX_CONNECTIONS: {{ $viewer.limits.maxConnections | int | quote }}
+  CANVAS_VIEWER_MAX_HTTP_PER_SESSION: {{ $viewer.limits.maxHttpPerSession | int | quote }}
+  CANVAS_VIEWER_MAX_HEADER_BYTES: {{ $viewer.limits.maxHeaderBytes | int | quote }}
+  CANVAS_VIEWER_MAX_HEADER_FIELDS: {{ $viewer.limits.maxHeaderFields | int | quote }}
+  CANVAS_VIEWER_MAX_QUERY_BYTES: {{ $viewer.limits.maxQueryBytes | int | quote }}
+  CANVAS_VIEWER_MAX_QUERY_FIELDS: {{ $viewer.limits.maxQueryFields | int | quote }}
+  CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES: {{ $viewer.limits.maxRequestBodyBytes | int | quote }}
+  CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES: {{ $viewer.limits.maxResponseBodyBytes | int | quote }}
+  CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS: {{ $viewer.limits.connectTimeoutSeconds | int | quote }}
+  CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS: {{ $viewer.limits.idleTimeoutSeconds | int | quote }}
+  CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS: {{ $viewer.limits.exchangeTimeoutSeconds | int | quote }}
+  CANVAS_VIEWER_POSTGRES_HOST: {{ include "srw.postgresHost" . | quote }}
+  CANVAS_VIEWER_POSTGRES_PORT: {{ include "srw.postgresPort" . | quote }}
+  CANVAS_VIEWER_POSTGRES_DB: {{ include "srw.postgresDb" . | quote }}
+  # The role NAME is configuration, not secret material: it is pinned by
+  # database.username and single-sourced here so the Secret/Vault contract is
+  # one key (the password) and the login can never drift from the role the
+  # reconciler provisioned.
+  CANVAS_VIEWER_POSTGRES_USER: {{ $viewer.database.username | quote }}
+  CANVAS_VIEWER_POSTGRES_MIN_CONNECTIONS: {{ $viewer.database.pool.min | int | quote }}
+  CANVAS_VIEWER_POSTGRES_MAX_CONNECTIONS: {{ $viewer.database.pool.max | int | quote }}
+  LOG_LEVEL: {{ .Values.logLevel | quote }}
+{{- end }}

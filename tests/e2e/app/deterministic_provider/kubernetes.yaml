@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srw-e2e-model-fixture
+  labels:
+    app.kubernetes.io/name: srw-e2e-model-fixture
+    app.kubernetes.io/part-of: srw-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: srw-e2e-model-fixture
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: srw-e2e-model-fixture
+        app.kubernetes.io/part-of: srw-e2e
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: provider
+          image: srw-e2e-model-fixture:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: E2E_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: srw-e2e-model-fixture
+                  key: control-token
+            - name: E2E_INFERENCE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-e2e-model-fixture
+                  key: inference-api-key
+          ports:
+            - name: inference
+              containerPort: 8000
+              protocol: TCP
+            - name: control
+              containerPort: 8001
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: inference
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: inference
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: srw-e2e-model-fixture
+  labels:
+    app.kubernetes.io/name: srw-e2e-model-fixture
+    app.kubernetes.io/part-of: srw-e2e
+spec:
+  selector:
+    app.kubernetes.io/name: srw-e2e-model-fixture
+  ports:
+    - name: inference
+      port: 8000
+      targetPort: inference
+      protocol: TCP

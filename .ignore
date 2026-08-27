@@ -1,0 +1,10 @@
+# ripgrep-only overrides. Read by rg (and fd) at higher precedence than
+# .gitignore; git itself never looks at this file.
+#
+# The design vault is cloned into this tree as separate repositories and is
+# gitignored so a stray `git add -A` cannot publish a private repo into the
+# public one. But gitignoring it also hides it from a bare `rg <term>`, which
+# silently turns "no design exists" into the wrong answer. Re-include it for
+# search only.
+!knowledge-base/
+!knowledge-history/

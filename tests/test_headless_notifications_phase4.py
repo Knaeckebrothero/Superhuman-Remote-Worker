@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import orchestrator.services.headless_notifications as hn
+import services.headless_notifications as hn
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +320,7 @@ class TestSendPermissionPendingEmail:
         #   permission row (fetchrow)            → permission_row
         #   user row (fetchrow)                  → user_row
         #   generate_magic_link_token x2 (fetchval) → "tok-row-1", "tok-row-2"
-        #   record_notification (execute)        → None
+        #   claim_sent_notification (fetchrow)   → {"id": 1}  (wins the slot)
         db = _make_db()
         db._fake_conn.fetchval = AsyncMock(
             side_effect=[
@@ -331,7 +331,7 @@ class TestSendPermissionPendingEmail:
             ]
         )
         db._fake_conn.fetchrow = AsyncMock(
-            side_effect=[thread_row, permission_row, user_row]
+            side_effect=[thread_row, permission_row, user_row, {"id": 1}]
         )
         db._fake_conn.execute = AsyncMock()
 
@@ -350,8 +350,16 @@ class TestSendPermissionPendingEmail:
         assert send_kwargs["to"] == "user@example.com"
         assert "run_command" in send_kwargs["subject"]
         assert "approve" in send_kwargs["body_html"].lower()
-        # thread_notifications.INSERT happened.
-        assert db._fake_conn.execute.await_count >= 1
+        # The 'sent' slot was claimed BEFORE sending (claim_sent_notification,
+        # INSERT ... RETURNING id via fetchrow — not execute). The claim is the
+        # 4th and final fetchrow on the happy path.
+        assert db._fake_conn.fetchrow.await_count == 4
+        claim_sql = db._fake_conn.fetchrow.await_args.args[0]
+        assert "INSERT INTO thread_notifications" in claim_sql
+        assert "delivery_status = 'sent'" in claim_sql
+        # Claim won → send succeeded → we never downgrade, so execute (only used
+        # by downgrade_sent_claim) stays untouched on the happy path.
+        db._fake_conn.execute.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_skips_when_user_has_no_email(self):
@@ -532,7 +540,7 @@ class TestTruncateArgsForEmail:
 
 class TestPermissionNotifySweeperSQL:
     @pytest.mark.asyncio
-    async def test_dedup_filter_includes_permanent_skips_and_floor(self):
+    async def test_dedup_filter_includes_permanent_skips_and_floor(self, monkeypatch):
         import asyncio
 
         import orchestrator.main as orch_main
@@ -558,8 +566,12 @@ class TestPermissionNotifySweeperSQL:
             async def __aexit__(self_inner, exc_type, exc, tb):
                 return None
 
-        orch_main.postgres_db = MagicMock()
-        orch_main.postgres_db.acquire = lambda: _Acquire()
+        # monkeypatch, not bare assignment: `postgres_db` is a module global,
+        # and a leaked MagicMock breaks every later test in the run that
+        # awaits a real DB method.
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire()
+        monkeypatch.setattr(orch_main, "postgres_db", fake_db)
 
         await orch_main.thread_permission_notify_sweeper(evt)
 
@@ -578,3 +590,24 @@ class TestPermissionNotifySweeperSQL:
         # Args is (age_threshold_str, recency_floor_secs).
         assert isinstance(args[1], int)
         assert args[1] >= 60
+
+
+def test_permission_email_uses_brand_palette_and_ghost_deny() -> None:
+    import re
+    from services import brand
+    from services import headless_notifications as hn
+
+    _text, html = hn._build_permission_email_bodies(
+        tool_name="run_command",
+        tool_args_preview='{"cmd": "ls"}',
+        approve_url="http://x/magic/approve/T1",
+        deny_url="http://x/magic/deny/T1",
+        cockpit_link="http://x/cockpit",
+        request_age_minutes=3,
+    )
+    assert "#1e1e2e" not in html and "#a6e3a1" not in html  # Catppuccin gone
+    assert brand.TRAVERTINE["panel-bg"] in html
+
+    deny_cell = re.search(r"<td[^>]*>\s*<a[^>]*>Deny</a>", html, re.S).group(0)
+    assert f"background-color:{brand.TRAVERTINE['panel-bg']}" in deny_cell
+    assert f"border:2px solid {brand.TRAVERTINE['danger']}" in deny_cell

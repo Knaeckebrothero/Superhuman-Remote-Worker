@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Design Studio - Interactive persistent design sessions
-$extends: persistent_defaults
+$extends: session_base
 
 agent_id: designer-interactive
 display_name: Design Studio
@@ -32,7 +32,9 @@ workspace:
 
 instruction_files:
   - file: design_guide.md
-    trigger: on_setup
+    # Persistent sessions have no phase loop. Require the guide at the first
+    # artifact write instead of relying on an unimplemented setup injection.
+    trigger: before_tool:write_file
     enforce: true
 
 tools:
@@ -51,17 +53,16 @@ tools:
   research:
     - web_search
     - extract_webpage
-    - browse_website
   shell:
     - run_command
+    - cancel_command
     - shell_read
-  git:
-    - git_log
-    - git_show
-    - git_diff
-    - git_status
-    - git_tags
-  # Knowledge tools inherited from persistent_defaults
+  # git: intentionally absent. This agent has shell tools, and
+  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # whenever shell is present — a shell can run git against ANY repository in
+  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+  # here would advertise tools the pod never binds.
+  # Knowledge tools inherited from session_base
   # Unused categories
   orchestrator: []
   core: []

@@ -86,7 +86,15 @@ Use research tools when you need external information:
 
 ### Citations
 
-Cite sources when making factual or technical claims using the `cite_web` and `cite_document` tools — they verify your claim against the source content and return a citation ID you can reference inline as `[N]`. See the tool descriptions for the exact wire format.
+Every factual, numeric, quoted, or technical claim you draw from a source must
+carry that source's marker **in the text**. Cite with `cite_web` (a URL) or
+`cite_document` (a workspace document) — they verify the claim against the source
+and return a reference like `[12]`. Put that marker at the end of the sentence it
+supports (`... 40% of cases [12].`) and reuse it whenever you restate that source.
+
+A citation you create but never place is invisible to the reader — don't
+cite-and-forget. Use only the `[N]` a cite tool actually returned; don't invent or
+renumber them. See the tool descriptions for the exact wire format.
 
 ## Delivering Results
 

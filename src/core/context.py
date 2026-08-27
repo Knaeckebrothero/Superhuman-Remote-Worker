@@ -14,9 +14,12 @@ References:
 - LangGraph: Manage Conversation History
 """
 
-import asyncio
+import hashlib
+import json
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -29,7 +32,15 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from src.core.image_tokens import (
+    content_to_summary_text,
+    estimate_image_block_tokens,
+    has_image_content,
+    split_text_and_image_blocks,
+    split_text_and_images,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +64,16 @@ def extract_summary_text(messages: List[BaseMessage]) -> Optional[str]:
         ):
             return content.split(prefix, 1)[1].strip()
     return None
+
+
+class IdentityAnchor(BaseModel):
+    """Identity persistence payload for deterministic compaction stitching."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_role: str = ""
+    current_task: str = ""
+    active_constraints: List[str] = Field(default_factory=list)
 
 
 class ConversationSummary(BaseModel):
@@ -90,7 +111,7 @@ class ConversationSummary(BaseModel):
     pinned_instructions: str | List[str] = Field(
         default="", description="Rules from instructions/config that must persist"
     )
-    identity_anchor: dict | str | List[str] = Field(
+    identity_anchor: IdentityAnchor | str | List[str] = Field(
         default="",
         description="Agent role, current task, and active constraints for identity persistence",
     )
@@ -109,7 +130,8 @@ class ConversationSummary(BaseModel):
             return data
         for key, value in data.items():
             if key == "identity_anchor" and isinstance(value, dict):
-                continue  # dicts handled downstream
+                data[key] = IdentityAnchor(**value)
+                continue
             if isinstance(value, list):
                 data[key] = "\n".join(
                     f"- {item}" if isinstance(item, str) else f"- {item}"
@@ -304,7 +326,11 @@ def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
             kept = [tc for tc in tool_calls if tc.get("id") in valid_ids]
             if len(kept) != len(tool_calls):
                 stripped_calls += len(tool_calls) - len(kept)
-                m = AIMessage(content=m.content, tool_calls=kept, id=m.id)
+                # Preserve provider-native metadata, reasoning blocks, usage,
+                # name and response ids. Reconstructing a bare AIMessage here
+                # fixed pairing while silently discarding everything else on
+                # the turn; model_copy changes only the poisoned field.
+                m = m.model_copy(update={"tool_calls": kept})
             if not kept and not m.content:
                 continue  # empty assistant turn carries no information
             repaired.append(m)
@@ -322,6 +348,373 @@ def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
             f"result(s), stripped {stripped_calls} orphaned tool call(s)"
         )
     return repaired
+
+
+# --- Provider-boundary history sanitizer (live_session_settings.md Slice D) ---
+
+# Reasoning/thinking content-block types that must never be replayed to a
+# provider that didn't produce them. Anthropic rejects thinking blocks whose
+# signature it can't validate (any cross-model replay); OpenAI-compatible
+# servers 400 on unknown content-part types the langchain serializer passes
+# through ("redacted_thinking", Responses-style "reasoning" blocks).
+_REASONING_BLOCK_TYPES = frozenset(
+    {"thinking", "redacted_thinking", "reasoning", "reasoning_content"}
+)
+
+# additional_kwargs keys that carry a captured reasoning channel. Stock
+# langchain-openai never serializes them outbound, but custom transports have
+# no such guarantee — and a reasoning_content + tool_calls combo crashes
+# gpt-oss chat templates server-side. Foreign reasoning carries no replay
+# value, so it is dropped at the boundary.
+_REASONING_KWARGS_KEYS = ("reasoning_content", "reasoning", "reasoning_details")
+
+# Mistral validates tool-call ids as exactly 9 alphanumerics; everything else
+# we route to accepts [a-zA-Z0-9_-] (OpenAI mints ~29-30 chars, Anthropic
+# toolu_ + 24). 40 is a conservative common bound observed across providers.
+_MISTRAL_TOOL_ID_RE = re.compile(r"^[a-zA-Z0-9]{9}$")
+_GENERIC_TOOL_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
+
+
+def _conforming_tool_call_id(raw_id: str, target_family: str) -> str:
+    """Return ``raw_id`` unchanged when the target accepts it, else a
+    deterministic replacement derived from its hash.
+
+    Deterministic (pure function of the id) so the assistant tool_calls side
+    and the ToolMessage result side always map to the same value, and so a
+    repeated sanitizer pass is a no-op.
+    """
+    if target_family == "mistral":
+        if _MISTRAL_TOOL_ID_RE.match(raw_id):
+            return raw_id
+        return hashlib.blake2b(raw_id.encode(), digest_size=16).hexdigest()[:9]
+    if _GENERIC_TOOL_ID_RE.match(raw_id):
+        return raw_id
+    return "call_" + hashlib.blake2b(raw_id.encode(), digest_size=16).hexdigest()[:24]
+
+
+def sanitize_history_for_provider_boundary(
+    messages: List[BaseMessage], target_model: str
+) -> List[BaseMessage]:
+    """Make a history produced under one provider/family safe to replay under
+    another (live_session_settings.md Slice D — the #1 session killer).
+
+    Three transforms, then a pairing verification:
+
+    1. **Strip foreign reasoning**: thinking/reasoning content blocks are
+       removed from list-form AIMessage content (signed Anthropic thinking
+       blocks fail signature validation on any cross-model replay; unknown
+       block types 400 on OpenAI-compatible servers), and captured reasoning
+       keys are dropped from ``additional_kwargs``. ``invalid_tool_calls``
+       (failed parses) are dropped too — they serialize outbound with no
+       matching result and are pure replay risk.
+    2. **Remap tool-call ids** to the target's accepted format, consistently
+       on the assistant and tool-result sides (LiteLLM's
+       ``_sanitize_anthropic_tool_use_id`` is the reference for the class of
+       bug; Mistral's strict 9-alphanumeric format is the worst case).
+    3. **Verify pairing** via :func:`repair_tool_pairing` so a strict-pairing
+       API never sees an orphaned call or result.
+
+    Operates on the in-memory working set only — persisted ``thread_messages``
+    rows stay provider-native. Returns a new list; input messages are never
+    mutated. Idempotent: a second pass over sanitized output is a no-op.
+    """
+    from src.core.model_registry import family_of
+
+    target_family = family_of(target_model or "")
+    id_map: Dict[str, str] = {}
+
+    def _map_id(raw_id: str) -> str:
+        if not raw_id:
+            return raw_id
+        if raw_id not in id_map:
+            id_map[raw_id] = _conforming_tool_call_id(raw_id, target_family)
+        return id_map[raw_id]
+
+    out: List[BaseMessage] = []
+    stripped_blocks = 0
+    stripped_kwargs = 0
+    dropped_invalid = 0
+    for m in messages:
+        if isinstance(m, AIMessage):
+            update: Dict[str, Any] = {}
+
+            content = m.content
+            if isinstance(content, list):
+                kept = [
+                    b
+                    for b in content
+                    if not (
+                        isinstance(b, dict) and b.get("type") in _REASONING_BLOCK_TYPES
+                    )
+                ]
+                if len(kept) != len(content):
+                    stripped_blocks += len(content) - len(kept)
+                    if all(
+                        isinstance(b, dict) and b.get("type") == "text" for b in kept
+                    ):
+                        # Only plain text remains — collapse to the string form
+                        # every provider accepts.
+                        update["content"] = "".join(b.get("text", "") for b in kept)
+                    else:
+                        update["content"] = kept
+
+            ak = m.additional_kwargs or {}
+            removed_keys = [k for k in _REASONING_KWARGS_KEYS if k in ak]
+            if removed_keys:
+                stripped_kwargs += len(removed_keys)
+                update["additional_kwargs"] = {
+                    k: v for k, v in ak.items() if k not in _REASONING_KWARGS_KEYS
+                }
+
+            tool_calls = getattr(m, "tool_calls", None) or []
+            new_calls = []
+            calls_changed = False
+            for tc in tool_calls:
+                new_id = _map_id(tc.get("id") or "")
+                if new_id != (tc.get("id") or ""):
+                    calls_changed = True
+                    tc = {**tc, "id": new_id}
+                new_calls.append(tc)
+            if calls_changed:
+                update["tool_calls"] = new_calls
+
+            if getattr(m, "invalid_tool_calls", None):
+                dropped_invalid += len(m.invalid_tool_calls)
+                update["invalid_tool_calls"] = []
+
+            # A message whose content was reasoning-only ends up empty; with
+            # no tool calls left it carries nothing and some providers 400 on
+            # an empty assistant turn — drop it.
+            final_content = update.get("content", m.content)
+            if not final_content and not new_calls:
+                continue
+
+            out.append(m.model_copy(update=update) if update else m)
+
+        elif isinstance(m, ToolMessage):
+            raw_id = getattr(m, "tool_call_id", "") or ""
+            new_id = _map_id(raw_id)
+            if new_id != raw_id:
+                m = m.model_copy(update={"tool_call_id": new_id})
+            out.append(m)
+
+        else:
+            out.append(m)
+
+    remapped = sum(1 for k, v in id_map.items() if k != v)
+    if stripped_blocks or stripped_kwargs or remapped or dropped_invalid:
+        logger.info(
+            "Provider-boundary sanitize (target family=%s): stripped %d "
+            "reasoning block(s) + %d reasoning kwarg(s), remapped %d "
+            "tool-call id(s), dropped %d invalid tool call(s)",
+            target_family,
+            stripped_blocks,
+            stripped_kwargs,
+            remapped,
+            dropped_invalid,
+        )
+    return repair_tool_pairing(out)
+
+
+def _try_repair_json_object(raw: Any) -> Optional[Dict[str, Any]]:
+    """Best-effort repair of a malformed JSON-object string.
+
+    Handles the shapes models actually emit when a generation degrades:
+    prose/markdown fences around the object, trailing commas, and mid-string
+    truncation. Returns the parsed dict, or None if the string can't be
+    coaxed into a JSON object (non-object JSON also returns None — tool
+    arguments must be objects).
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip()
+
+    def _loads(text: str) -> Optional[Dict[str, Any]]:
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    parsed = _loads(s)
+    if parsed is not None:
+        return parsed
+
+    # Trim prose/fences around the outermost object.
+    start = s.find("{")
+    if start == -1:
+        return None
+    s = s[start:]
+    end = s.rfind("}")
+    if end != -1:
+        parsed = _loads(s[: end + 1])
+        if parsed is not None:
+            return parsed
+
+    # Trailing commas: {"a": 1,} / [1, 2,].
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    parsed = _loads(s)
+    if parsed is not None:
+        return parsed
+
+    # Truncation: close an open string, then unwind the bracket stack.
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    for ch in s:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    candidate = s + ('"' if in_string else "") + "".join(reversed(stack))
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    return _loads(candidate)
+
+
+def repair_tool_call_arguments(msg: BaseMessage, *, note: bool = True) -> BaseMessage:
+    """Repair or scrub tool calls whose arguments are not valid JSON.
+
+    Models occasionally emit a tool call whose ``arguments`` string is broken
+    JSON (observed from MiniMax-M3 after a 441s generation — the 2026-07-11
+    job `6a186c76` incident). LangChain parks the parse failure in
+    ``invalid_tool_calls``, but the RAW malformed string survives in
+    ``additional_kwargs["tool_calls"]`` — and once checkpointed it is
+    replayed to the provider on every subsequent request. MiniMax validates
+    history tool calls on input and rejects its own prior output with a
+    deterministic ``400 bad_request_error: invalid function arguments json
+    string``, permanently poisoning the job/session
+    (knowledge-base/knowledge/features/outbound_message_hygiene.md).
+
+    Repair-first: a call whose arguments ``_try_repair_json_object`` can fix
+    is promoted into ``tool_calls`` (raw entry rewritten) so it executes
+    normally. Unrepairable calls are removed everywhere; with ``note=True``
+    (ingestion) a short note is appended to the message content so the model
+    knows the call was discarded. Pairing stays intact by construction — an
+    invalid call never had a result message.
+
+    Mutates ``msg`` in place (AIMessage and AIMessageChunk) and returns it.
+    No-ops on non-AI messages and well-formed messages.
+    """
+    if not isinstance(msg, AIMessage):
+        return msg
+
+    kwargs = getattr(msg, "additional_kwargs", None)
+    raw_entries = kwargs.get("tool_calls") if isinstance(kwargs, dict) else None
+    if not isinstance(raw_entries, list):
+        raw_entries = None
+
+    repaired_names: List[str] = []
+    dropped_names: List[str] = []
+
+    def _raw_rewrite(call_id: Optional[str], fixed: Dict[str, Any]) -> None:
+        for entry in raw_entries or []:
+            fn = entry.get("function") if isinstance(entry, dict) else None
+            if isinstance(fn, dict) and (call_id is None or entry.get("id") == call_id):
+                if (
+                    call_id is not None
+                    or _try_repair_json_object(fn.get("arguments")) == fixed
+                ):
+                    fn["arguments"] = json.dumps(fixed)
+
+    def _raw_remove(call_id: Optional[str]) -> None:
+        if raw_entries is None:
+            return
+        if call_id is not None:
+            raw_entries[:] = [
+                e
+                for e in raw_entries
+                if not (isinstance(e, dict) and e.get("id") == call_id)
+            ]
+
+    # 1. LangChain-detected parse failures.
+    for itc in list(getattr(msg, "invalid_tool_calls", None) or []):
+        name = itc.get("name") or "unknown_tool"
+        call_id = itc.get("id")
+        fixed = _try_repair_json_object(itc.get("args"))
+        if fixed is not None:
+            msg.tool_calls = list(msg.tool_calls or []) + [
+                {"name": name, "args": fixed, "id": call_id, "type": "tool_call"}
+            ]
+            _raw_rewrite(call_id, fixed)
+            repaired_names.append(name)
+        else:
+            _raw_remove(call_id)
+            dropped_names.append(name)
+    if getattr(msg, "invalid_tool_calls", None):
+        msg.invalid_tool_calls = []
+
+    # 2. Raw-entry sweep — catches malformed arguments that bypassed
+    #    LangChain's parser (checkpoint round-trips, provider quirks).
+    for entry in list(raw_entries or []):
+        fn = entry.get("function") if isinstance(entry, dict) else None
+        raw_args = fn.get("arguments") if isinstance(fn, dict) else None
+        if not isinstance(raw_args, str):
+            continue
+        try:
+            if isinstance(json.loads(raw_args), dict):
+                continue
+        except (ValueError, TypeError):
+            pass
+        name = fn.get("name") or "unknown_tool"
+        fixed = _try_repair_json_object(raw_args)
+        if fixed is not None:
+            fn["arguments"] = json.dumps(fixed)
+            repaired_names.append(name)
+        else:
+            raw_entries.remove(entry)
+            call_id = entry.get("id")
+            if call_id and msg.tool_calls:
+                msg.tool_calls = [
+                    tc for tc in msg.tool_calls if tc.get("id") != call_id
+                ]
+            dropped_names.append(name)
+
+    if not repaired_names and not dropped_names:
+        return msg
+
+    logger.warning(
+        f"repair_tool_call_arguments: repaired {repaired_names or 'none'}, "
+        f"discarded {dropped_names or 'none'} (malformed JSON arguments)"
+    )
+    if dropped_names:
+        notice = (
+            f"[system note: {len(dropped_names)} tool call(s) "
+            f"({', '.join(dropped_names)}) had unparseable JSON arguments and "
+            f"were discarded — re-issue with valid JSON if still needed]"
+        )
+        if note and isinstance(msg.content, str):
+            msg.content = f"{msg.content}\n\n{notice}" if msg.content else notice
+        elif not msg.content and not msg.tool_calls:
+            # History scrub of a now-empty assistant message: keep a stub so
+            # providers that reject empty assistant turns don't 400.
+            msg.content = notice
+    return msg
+
+
+def scrub_history_tool_call_arguments(
+    messages: List[BaseMessage],
+) -> List[BaseMessage]:
+    """Send-time backstop: run the argument repair over every AIMessage.
+
+    Catches poison already sitting in old checkpoints (jobs/sessions frozen
+    before the ingestion repair shipped) and anything a future ingestion-path
+    bug lets through. Cost: one ``json.loads`` per historical raw tool call —
+    negligible against an LLM round-trip. Mutations self-heal the checkpoint
+    at its next write.
+    """
+    for m in messages:
+        if isinstance(m, AIMessage):
+            repair_tool_call_arguments(m, note=False)
+    return messages
 
 
 # Try to import tiktoken for accurate token counting
@@ -345,6 +738,9 @@ class ContextManagementState:
     total_messages_trimmed: int = 0
     total_summarizations: int = 0
     current_token_count: int = 0
+    # Real input_tokens of the last provider call — the compaction-trigger
+    # anchor (context_token_accounting.md S1). None until the first response.
+    last_provider_input_tokens: Optional[int] = None
     summaries: List[str] = field(default_factory=list)
     last_compaction_iteration: int = 0
 
@@ -365,8 +761,6 @@ class ContextConfig:
         tool_retry_count: Number of retries for failed tool calls
         tool_retry_delay_seconds: Delay between retries
         model_max_context_tokens: Hard limit for model context window
-        summarization_safe_limit: Max input tokens for summarization LLM
-        summarization_chunk_size: Chunk size for recursive summarization
         preserve_tool_names: Tool names whose results are kept verbatim even when
             older than keep_recent_tool_results — evidence of side effects the
             strategic phase audit needs to cite.
@@ -378,19 +772,28 @@ class ContextConfig:
     compaction_threshold_tokens: int = 80_000
     summarization_threshold_tokens: int = 100_000
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 40_000
+    # Floored at the compaction threshold so the message-count branch of
+    # should_summarize() can never fire before the token gate. Mirrors
+    # loader.MESSAGE_COUNT_MIN_FRACTION (a base=100_000 instance).
+    message_count_min_tokens: int = 80_000
     keep_recent_tool_results: int = 15
     keep_recent_messages: int = 10
     max_tool_result_length: int = 5000
+    keep_window_max_tool_result_chars: int = 16000
     placeholder_text: str = "[Result processed - see workspace if needed]"
     tool_retry_count: int = 3
     tool_retry_delay_seconds: float = 1.0
-    # Safety layer constants — a base=100_000 instance of the limit fractions in
-    # src/core/loader.py (threshold .80 / safe .90 / chunk .60 / msg_min .40).
-    # Real values come from the matrix derivation; these are fallback-only.
+    # Safety layer constant — a base=100_000 instance of the limit fractions in
+    # src/core/loader.py; fallback-only, the real value comes from the matrix
+    # derivation. Summarization budgets are deliberately NOT config leaves:
+    # they are computed at call time from the auxiliary model's own window
+    # (src/core/summarizer.py) — deriving them from the MAIN model's window
+    # sent 951k-token payloads to a 131k summarizer
+    # (knowledge-base/knowledge/features/context_summarization_rework.md).
     model_max_context_tokens: int = 100_000
-    summarization_safe_limit: int = 90_000
-    summarization_chunk_size: int = 60_000
+    # Per-family image-token estimator config (matrix settings.image_tokens via
+    # LimitsConfig). None -> flat DEFAULT_IMAGE_TOKENS per image. S4.
+    image_tokens: Optional[Dict[str, Any]] = None
     # Evidence-preservation filter: side effects and failures survive compaction
     # so the strategic-phase audit protocol can cite verbatim tool output.
     preserve_tool_names: Tuple[str, ...] = (
@@ -399,31 +802,37 @@ class ContextConfig:
         "patch_file",
         "patch_tool",
     )
-    preserve_content_patterns: Tuple[str, ...] = (
-        "error:",
-        "exception",
-        "traceback",
-        "enoent",
-        "no such file",
-        "permission denied",
-        "not found",
-        "failed",
-        "non-zero exit",
-    )
+    # Failure-content preservation is OFF. It existed to feed the strategic
+    # <phase_audit_protocol>, which was deleted in 4eba5d47 — the consumer is
+    # gone but the unbounded retention stayed, and it is actively harmful:
+    # keeping an agent's own old error traces in context is the measured
+    # "self-conditioning" effect (arXiv 2509.09677 — accuracy falls from ~70%
+    # to ~15% as induced past errors rise, and it does not diminish with model
+    # scale). Recent failures are still visible: keep_recent_tool_results
+    # retains the last N results verbatim regardless of content. This carve-out
+    # only ever governed results OLDER than that window, which are exactly the
+    # ones that should decay to a placeholder. Restore by re-adding patterns.
+    preserve_content_patterns: Tuple[str, ...] = ()
 
 
-def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> int:
+def count_tokens_tiktoken(
+    messages: List[BaseMessage],
+    model: str = "gpt-4",
+    image_config: Optional[Dict[str, Any]] = None,
+) -> int:
     """Count tokens using tiktoken for accurate counting.
 
     Args:
         messages: List of messages to count
         model: Model name for tokenizer selection
+        image_config: Resolved per-family image-token estimator config; image
+            blocks are billed by their pixel dimensions, never their base64.
 
     Returns:
         Token count
     """
     if not TIKTOKEN_AVAILABLE:
-        return count_tokens_approximate(messages)
+        return count_tokens_approximate(messages, image_config)
 
     try:
         # Try to get encoding for specific model
@@ -444,10 +853,18 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
         debug_details = []
         for i, msg in enumerate(messages):
             msg_tokens = 0
-            # Count message content
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            content_tokens = len(enc.encode(content, disallowed_special=()))
-            msg_tokens += content_tokens
+            # Count message content. Multimodal content is a list of blocks;
+            # split out image blocks and count them as flat image tokens
+            # instead of tokenizing their base64 data URL as text (which
+            # inflated session 5dbb5770 to ~9.2M phantom tokens). See
+            # src/core/image_tokens.py + knowledge-history/done/context_token_accounting.md.
+            text, image_blocks = split_text_and_image_blocks(msg.content)
+            content_tokens = len(enc.encode(text, disallowed_special=()))
+            image_tokens = sum(
+                estimate_image_block_tokens(b, image_config) for b in image_blocks
+            )
+            n_images = len(image_blocks)
+            msg_tokens += content_tokens + image_tokens
 
             # Count tool calls if present
             tool_call_tokens = 0
@@ -465,7 +882,9 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
             if msg_tokens > 1000:
                 msg_type = type(msg).__name__
                 debug_details.append(
-                    f"[{i}] {msg_type}: {content_tokens}t content, {tool_call_tokens}t tools, {len(content)} chars"
+                    f"[{i}] {msg_type}: {content_tokens}t content, "
+                    f"{image_tokens}t images ({n_images}), {tool_call_tokens}t tools, "
+                    f"{len(text)} chars"
                 )
 
         if (
@@ -482,10 +901,13 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
 
     except Exception as e:
         logger.warning(f"tiktoken error, falling back to approximate: {e}")
-        return count_tokens_approximate(messages)
+        return count_tokens_approximate(messages, image_config)
 
 
-def count_tokens_approximate(messages: List[BaseMessage]) -> int:
+def count_tokens_approximate(
+    messages: List[BaseMessage],
+    image_config: Optional[Dict[str, Any]] = None,
+) -> int:
     """Approximate token count using character-based estimation.
 
     Uses ~4 characters per token as a rough estimate.
@@ -493,35 +915,46 @@ def count_tokens_approximate(messages: List[BaseMessage]) -> int:
 
     Args:
         messages: List of messages to count
+        image_config: Resolved per-family image-token estimator config.
 
     Returns:
         Approximate token count
     """
     total_chars = 0
+    total_image_tokens = 0
     for msg in messages:
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        total_chars += len(content)
+        text, image_blocks = split_text_and_image_blocks(msg.content)
+        total_chars += len(text)
+        total_image_tokens += sum(
+            estimate_image_block_tokens(b, image_config) for b in image_blocks
+        )
 
         # Add tool calls if present
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             total_chars += len(str(msg.tool_calls))
 
-    # ~4 chars per token on average
-    return total_chars // 4
+    # ~4 chars per token on average, plus flat per-image tokens
+    return total_chars // 4 + total_image_tokens
 
 
-def get_token_counter(model: str = "gpt-4") -> Callable[[List[BaseMessage]], int]:
+def get_token_counter(
+    model: str = "gpt-4",
+    image_config: Optional[Dict[str, Any]] = None,
+) -> Callable[[List[BaseMessage]], int]:
     """Get the appropriate token counter function.
 
     Args:
         model: Model name for tokenizer selection
+        image_config: Resolved per-family image-token estimator config, bound
+            into the returned counter so multimodal blocks are billed by their
+            pixel dimensions rather than their base64 length.
 
     Returns:
         Token counter function
     """
     if TIKTOKEN_AVAILABLE:
-        return lambda msgs: count_tokens_tiktoken(msgs, model)
-    return count_tokens_approximate
+        return lambda msgs: count_tokens_tiktoken(msgs, model, image_config)
+    return lambda msgs: count_tokens_approximate(msgs, image_config)
 
 
 class ContextManager:
@@ -556,7 +989,7 @@ class ContextManager:
         model: str = "gpt-4",
         strategic_model: Optional[str] = None,
         tactical_model: Optional[str] = None,
-        summarization_timeout: float = 600.0,
+        summarization_call_timeout: float = 240.0,
     ):
         """Initialize context manager.
 
@@ -565,25 +998,81 @@ class ContextManager:
             model: Model name for token counting (default/fallback)
             strategic_model: Model name for strategic phase token counting
             tactical_model: Model name for tactical phase token counting
-            summarization_timeout: Total timeout in seconds for summarization LLM calls
+            summarization_call_timeout: Per fold-call timeout in seconds for
+                summarization LLM calls (N passes get N bounded calls, not
+                one shared blob — see src/core/summarizer.py)
         """
         self.config = config or ContextConfig()
-        self._default_counter = get_token_counter(model)
+        # getattr-guarded: some callers pass a non-ContextConfig (e.g. tests
+        # hand the whole AgentConfig). image_tokens is an optional new field —
+        # absent -> flat estimation, never a constructor crash.
+        image_config = getattr(self.config, "image_tokens", None)
+        self._default_counter = get_token_counter(model, image_config)
         self._phase_counters: Dict[str, Callable[[List[BaseMessage]], int]] = {}
         if strategic_model:
-            self._phase_counters["strategic"] = get_token_counter(strategic_model)
+            self._phase_counters["strategic"] = get_token_counter(
+                strategic_model, image_config
+            )
         if tactical_model:
-            self._phase_counters["tactical"] = get_token_counter(tactical_model)
+            self._phase_counters["tactical"] = get_token_counter(
+                tactical_model, image_config
+            )
         self.token_counter = self._default_counter
         self._state = ContextManagementState()
-        self._summarization_timeout = summarization_timeout
+        self._summarization_call_timeout = summarization_call_timeout
+        # Optional async (event_name, params) callback for compaction
+        # progress (knowledge-base/knowledge/features/context_summarization_rework.md). The
+        # transport decides rendering: persistent sessions broadcast SSE
+        # frames, the worker graph logs. None = silent.
+        self.progress_cb: Optional[Callable[[str, Dict[str, Any]], Any]] = None
+        # Stats of the most recent successful summarization, read by the
+        # transport into the context.compacted completion event.
+        self._last_summarization_stats: Optional[Dict[str, Any]] = None
         # Set by summarize_and_compact to the id of the last message the newest
         # summary covers (the summarized/kept boundary). The persistent-session
         # transport reads it to record a message-granular `boundary_seq` on the
         # summary row so resume loads `summary + messages after the boundary`
         # instead of whole post-boundary turns. None when the last call did not
-        # actually compact. See docs/issues/persistent_session_midturn_message_loss.md.
+        # actually compact. See knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md.
         self._last_compaction_boundary_id: Optional[str] = None
+        # Monotonic count of *successful* summarizations. Transports snapshot
+        # it around a compaction call to know whether a summary was actually
+        # produced this call — the authoritative signal, replacing length-delta
+        # heuristics that false-fire on stray RemoveMessage markers (the
+        # duplicate-banner bug, 2026-06-12).
+        self.compaction_runs: int = 0
+
+    def _note_compaction_success(self) -> None:
+        """Bump the run counter and invalidate the provider-usage anchor.
+
+        The anchor (``last_provider_input_tokens``) describes a context that
+        no longer exists once a compaction lands — left in place it keeps the
+        trigger (``max(local, anchor)``) above threshold and re-fires a
+        needless second compaction on the next check until an LLM call heals
+        it (worst on a model hot-swap, where the pre-swap fit compaction is
+        followed immediately by the first post-swap turn's check).
+        """
+        self.compaction_runs += 1
+        self._state.last_provider_input_tokens = None
+
+    def update_limits(self, config: ContextConfig, model: str) -> None:
+        """Rebind thresholds + token counter to a new model's window, in place.
+
+        Called on a session model hot-swap. Mutating (rather than rebuilding)
+        keeps every reference the running loop captured valid and preserves
+        accumulated state — critically ``_state.last_provider_input_tokens``,
+        so a downswitch to a smaller-window model sees the real context size
+        and compacts on the very next turn instead of resending an oversized
+        history until the model returns empty responses. See
+        knowledge-history/done/session_model_switch_stale_context_manager_empty_response.md.
+        """
+        self.config = config
+        image_config = getattr(config, "image_tokens", None)
+        self._default_counter = get_token_counter(model, image_config)
+        # Sessions use only the default counter (no phase counters); rebind the
+        # active pointer unless a worker phase counter is currently selected.
+        if self.token_counter not in self._phase_counters.values():
+            self.token_counter = self._default_counter
 
     def set_current_phase(self, phase: str) -> None:
         """Switch token counter to the appropriate phase-specific model.
@@ -594,6 +1083,21 @@ class ContextManager:
             phase: Phase name ("strategic" or "tactical")
         """
         self.token_counter = self._phase_counters.get(phase, self._default_counter)
+
+    def set_progress_callback(
+        self, callback: Optional[Callable[[str, Dict[str, Any]], Any]]
+    ) -> None:
+        """Install the compaction progress callback (async ``(event, params)``)."""
+        self.progress_cb = callback
+
+    async def _emit_compaction_event(self, event: str, params: Dict[str, Any]) -> None:
+        """Emit a compaction lifecycle event; failures never break compaction."""
+        if self.progress_cb is None:
+            return
+        try:
+            await self.progress_cb(event, params)
+        except Exception as e:
+            logger.debug(f"Compaction event emit failed (non-fatal): {e}")
 
     @property
     def state(self) -> ContextManagementState:
@@ -613,6 +1117,33 @@ class ContextManager:
         self._state.current_token_count = count
         return count
 
+    def record_provider_usage(self, input_tokens: Optional[int]) -> None:
+        """Anchor the compaction trigger on the provider's real input_tokens.
+
+        Called after each main-model response that carries usage. The provider
+        count is ground truth for the current context size (it includes the
+        system prompt, tool schemas, and real image-token cost) and self-heals
+        the trigger every turn. None / non-positive values are ignored so an
+        empty-usage turn never clobbers the anchor.
+        """
+        if input_tokens and input_tokens > 0:
+            self._state.last_provider_input_tokens = int(input_tokens)
+
+    def _trigger_token_count(self, messages: List[BaseMessage]) -> int:
+        """Token count for compaction-*trigger* decisions.
+
+        The image-aware local count, floored by the last real provider
+        ``input_tokens``. Both numbers are honest now that image blocks are no
+        longer stringified; the floor is biased-high (it carries the
+        system-prompt / tool-schema / injection overhead the bare message list
+        lacks) and guards against local under-counting. The raw local count
+        still drives the post-compaction elision checks against the model max —
+        only the trigger uses the floor.
+        """
+        local = self.get_token_count(messages)
+        anchor = self._state.last_provider_input_tokens or 0
+        return max(local, anchor)
+
     def should_compact(self, messages: List[BaseMessage]) -> bool:
         """Check if context needs compaction.
 
@@ -622,7 +1153,10 @@ class ContextManager:
         Returns:
             True if compaction threshold exceeded
         """
-        return self.get_token_count(messages) > self.config.compaction_threshold_tokens
+        return (
+            self._trigger_token_count(messages)
+            > self.config.compaction_threshold_tokens
+        )
 
     def should_summarize(self, messages: List[BaseMessage]) -> bool:
         """Check if summarization is needed.
@@ -638,7 +1172,7 @@ class ContextManager:
         Returns:
             True if summarization threshold exceeded
         """
-        token_count = self.get_token_count(messages)
+        token_count = self._trigger_token_count(messages)
         message_count = len(messages)
 
         # Original threshold: high token count
@@ -660,7 +1194,7 @@ class ContextManager:
         Tool results that carry evidence of side effects (file writes, edits)
         or failures (errors, exceptions, missing files) are preserved so the
         strategic phase audit protocol can cite verbatim tool output after
-        long tactical phases. See docs/features/phase_audit_protocol.md.
+        long tactical phases. See knowledge-base/knowledge/features/phase_audit_protocol.md.
 
         Args:
             msg: The ToolMessage to inspect
@@ -905,6 +1439,8 @@ class ContextManager:
         summarization_prompt: Optional[str] = None,
         max_summary_length: int = 10000,
         force: bool = False,
+        trigger: str = "auto",
+        focus: Optional[str] = None,
     ) -> List[BaseMessage]:
         """Ensure messages are within configured limits, summarizing if needed.
 
@@ -917,6 +1453,8 @@ class ContextManager:
             summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Max length for summary
             force: If True, summarize even if thresholds not exceeded
+            trigger: ``auto`` | ``manual`` | ``resume`` — compaction event metadata
+            focus: Optional user compaction focus (``/compact <focus>``)
 
         Returns:
             Messages (possibly compacted) guaranteed to be within limits
@@ -931,7 +1469,24 @@ class ContextManager:
                 auxiliary,
                 summarization_prompt,
                 max_summary_length,
+                trigger=trigger,
+                focus=focus,
             )
+
+            # Keep-window elision (session_silent_failure_audit.md #6): tool
+            # results inside the keep window are protected from summarization
+            # by tool-call pairing, so a few giant reads can hold the context
+            # above the model limit even after a successful summary — every
+            # retry then resends the same overflowing request (thread
+            # b60166ee: four PDF results = 234k tokens on a 128k model).
+            # Eliding only the *content* preserves pairing. Runs on both the
+            # per-turn and force paths; the force-path emergency truncation
+            # below stays as the last resort.
+            non_remove = [m for m in result if not isinstance(m, RemoveMessage)]
+            if self.get_token_count(non_remove) > self.config.model_max_context_tokens:
+                result = self._elide_largest_tool_results(
+                    result, self.config.model_max_context_tokens
+                )
 
             # Progressive compaction: if force=True and still too many messages,
             # retry with progressively smaller keep_recent windows
@@ -979,6 +1534,8 @@ class ContextManager:
                             summarization_prompt,
                             max_summary_length,
                             keep_recent_override=next_keep,
+                            trigger=trigger,
+                            focus=focus,
                         )
                         conv_count = sum(
                             1
@@ -1006,6 +1563,109 @@ class ContextManager:
             return result
         return messages
 
+    def _shed_image_messages(
+        self, messages: List[BaseMessage]
+    ) -> Tuple[List[BaseMessage], int]:
+        """Replace every multimodal image ``HumanMessage`` with a text marker.
+
+        Shared by both compaction-time elision tiers (S3). Image re-deliveries
+        (the synthetic "image content from tool call …" messages, or a user's
+        own uploaded image) are lossless to shed — the model already processed
+        the image — and carry no tool-call pairing contract, so this is
+        unconditionally safe. Returns a new list (same length, order, and ids
+        preserved) and the number of messages shed.
+        """
+        result = list(messages)
+        shed = 0
+        for i, msg in enumerate(result):
+            if isinstance(msg, HumanMessage) and has_image_content(msg.content):
+                tokens = self.token_counter([msg])
+                _text, n_images = split_text_and_images(msg.content)
+                replacement = HumanMessage(
+                    content=(
+                        f"[image content elided by compaction: {n_images} image(s), "
+                        f"~{tokens:,} tokens. The model already processed it; "
+                        f"re-read the source if the visual is needed again.]"
+                    )
+                )
+                if getattr(msg, "id", None):
+                    replacement.id = msg.id
+                result[i] = replacement
+                shed += 1
+        return result, shed
+
+    def _elide_largest_tool_results(
+        self,
+        messages: List[BaseMessage],
+        target_tokens: int,
+    ) -> List[BaseMessage]:
+        """Shed the largest sheddable messages until under target.
+
+        Two candidate classes, shed in order:
+        1. Multimodal image ``HumanMessage``s — lossless (the model already saw
+           the image) and free of any tool-pairing contract, so they go first
+           and free the most room with the least cost.
+        2. ``ToolMessage`` results — content elided, ``tool_call_id`` kept so
+           the parent AIMessage's tool calls stay answered. Largest-first, so
+           the minimum number is sacrificed.
+
+        Evidence preservation is deliberately ignored here: this stage only runs
+        when the request cannot otherwise fit the model at all — an elided
+        result beats a permanently dead session. Mutating the live list is why
+        elision is **compaction-time only**: adding/removing an image
+        invalidates the provider prompt cache (context_token_accounting.md §4.4).
+
+        Args:
+            messages: Message list (may contain RemoveMessage markers)
+            target_tokens: Stop once the non-marker total fits this budget
+        """
+        # Images first — lossless and the dominant bloat for multimodal sessions.
+        result, images_shed = self._shed_image_messages(messages)
+        non_remove = [m for m in result if not isinstance(m, RemoveMessage)]
+        if self.get_token_count(non_remove) <= target_tokens:
+            if images_shed:
+                logger.warning(
+                    f"Keep-window elision: shed {images_shed} image message(s) to "
+                    f"fit the {target_tokens:,}-token model limit"
+                )
+            return result
+
+        sized = []
+        for i, msg in enumerate(result):
+            if isinstance(msg, ToolMessage) and isinstance(msg.content, str):
+                if msg.content.startswith("[tool result elided"):
+                    continue  # already elided
+                sized.append((self.token_counter([msg]), i))
+        sized.sort(reverse=True)
+
+        elided = 0
+        for msg_tokens, idx in sized:
+            non_remove = [m for m in result if not isinstance(m, RemoveMessage)]
+            if self.get_token_count(non_remove) <= target_tokens:
+                break
+            msg = result[idx]
+            replacement = ToolMessage(
+                content=(
+                    f"[tool result elided by compaction: ~{msg_tokens:,} tokens. "
+                    f"Re-run the tool if this data is needed again.]"
+                ),
+                tool_call_id=msg.tool_call_id,
+            )
+            if getattr(msg, "name", None):
+                replacement.name = msg.name
+            if getattr(msg, "id", None):
+                replacement.id = msg.id
+            result[idx] = replacement
+            elided += 1
+
+        if images_shed or elided:
+            logger.warning(
+                f"Keep-window elision: shed {images_shed} image message(s) and "
+                f"replaced {elided} tool result(s) to fit the "
+                f"{target_tokens:,}-token model limit"
+            )
+        return result
+
     def _emergency_truncate_tool_results(
         self,
         messages: List[BaseMessage],
@@ -1025,6 +1685,14 @@ class ContextManager:
         Returns:
             Messages with truncated tool results
         """
+        # Last-resort path: shed image re-deliveries too. The largest-first
+        # elision tier handles them first, but a re-summarized keep-window can
+        # reintroduce them — and char-truncation can't touch list content.
+        # Lossless and pairing-free, so unconditional here.
+        messages, images_shed = self._shed_image_messages(messages)
+        if images_shed:
+            logger.warning(f"Emergency truncation: shed {images_shed} image message(s)")
+
         for limit in [initial_limit, final_limit]:
             # Build list of (index, content_length) for ToolMessages, sorted largest first
             tool_sizes = []
@@ -1149,11 +1817,12 @@ class ContextManager:
                     formatted_parts.append(f"Prior Summary: {msg.content}")
                 continue
             elif isinstance(msg, HumanMessage):
-                formatted_parts.append(f"User: {msg.content[:500]}")
+                # Image-safe: list content (a multimodal re-delivery) becomes
+                # text + "[image: ...]" markers, never stringified base64.
+                text = content_to_summary_text(msg.content)
+                formatted_parts.append(f"User: {text[:500]}")
             elif isinstance(msg, AIMessage):
-                content = (
-                    msg.content if isinstance(msg.content, str) else str(msg.content)
-                )
+                content = content_to_summary_text(msg.content)
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     tool_names = [tc.get("name", "unknown") for tc in msg.tool_calls]
                     if content:
@@ -1170,9 +1839,7 @@ class ContextManager:
                     formatted_parts.append(f"Assistant: {content[:800]}...")
             elif isinstance(msg, ToolMessage):
                 tool_name = getattr(msg, "name", None) or "unknown"
-                content = (
-                    msg.content if isinstance(msg.content, str) else str(msg.content)
-                )
+                content = content_to_summary_text(msg.content)
                 if i in recent_tool_indices:
                     # Recent: include truncated content for summarization
                     truncated = content[:300]
@@ -1188,315 +1855,144 @@ class ContextManager:
 
         return formatted_parts
 
-    def _split_into_chunks(
-        self,
-        parts: List[str],
-        target_tokens: int,
-    ) -> List[List[str]]:
-        """Split formatted parts into chunks of approximately target_tokens.
-
-        Args:
-            parts: List of formatted message strings
-            target_tokens: Target token count per chunk
-
-        Returns:
-            List of chunks, each chunk being a list of parts
-        """
-        chunks: List[List[str]] = []
-        current_chunk: List[str] = []
-        current_tokens = 0
-
-        for part in parts:
-            # Approximate token count: ~4 chars per token
-            part_tokens = len(part) // 4
-            if current_tokens + part_tokens > target_tokens and current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = []
-                current_tokens = 0
-            current_chunk.append(part)
-            current_tokens += part_tokens
-
-        if current_chunk:
-            chunks.append(current_chunk)
-
-        return chunks
-
-    async def _single_pass_summarize(
-        self,
-        conversation_text: str,
-        auxiliary,
-        summarization_prompt: Optional[str],
-        max_summary_length: int,
-    ) -> str:
-        """Single-pass summarization of conversation text.
-
-        Delegates to AuxiliaryLLM.chain(SummarizeTask(...)) for the actual
-        LLM call with structured output.
-
-        Args:
-            conversation_text: Formatted conversation as string
-            auxiliary: AuxiliaryLLM instance for summarization
-            summarization_prompt: Optional custom prompt template (reasoning level pre-rendered)
-            max_summary_length: Maximum summary length
-
-        Returns:
-            Summary string
-        """
-        from src.services.auxiliary import SummarizeTask
-
-        task = SummarizeTask(
-            conversation_text=conversation_text,
-            summarization_prompt=summarization_prompt or "",
-            max_summary_length=max_summary_length,
-        )
-
-        try:
-            # Structured summarization gets the full, dedicated summarization
-            # budget — NOT the short interactive auxiliary.timeout that guards
-            # quick aux tasks (memory/titles). A large conversation can't be
-            # summarized under a schema in the ~120s aux window.
-            result: ConversationSummary = await auxiliary.chain(
-                task, timeout=self._summarization_timeout
-            )
-
-            # Format into readable text
-            parts = []
-            if result.summary.strip():
-                parts.append(f"**Summary:**\n{result.summary.strip()}")
-            if result.tasks_completed.strip():
-                parts.append(f"**Tasks Completed:**\n{result.tasks_completed.strip()}")
-            if result.tasks_in_progress and result.tasks_in_progress.strip():
-                parts.append(
-                    f"**Tasks In Progress:**\n{result.tasks_in_progress.strip()}"
-                )
-            if result.key_decisions.strip():
-                parts.append(f"**Key Decisions:**\n{result.key_decisions.strip()}")
-            if result.current_state.strip():
-                parts.append(f"**Current State:**\n{result.current_state.strip()}")
-            if result.blockers and result.blockers.strip():
-                parts.append(f"**Blockers:**\n{result.blockers.strip()}")
-            if result.critical_facts and result.critical_facts.strip():
-                parts.append(f"**Critical Facts:**\n{result.critical_facts.strip()}")
-            if result.state_changes and result.state_changes.strip():
-                parts.append(f"**State Changes:**\n{result.state_changes.strip()}")
-            if result.pinned_instructions and result.pinned_instructions.strip():
-                parts.append(
-                    f"**Pinned Instructions:**\n{result.pinned_instructions.strip()}"
-                )
-            if result.identity_anchor:
-                if isinstance(result.identity_anchor, dict):
-                    anchor_parts = []
-                    if result.identity_anchor.get("agent_role"):
-                        anchor_parts.append(
-                            f"Role: {result.identity_anchor['agent_role']}"
-                        )
-                    if result.identity_anchor.get("current_task"):
-                        anchor_parts.append(
-                            f"Task: {result.identity_anchor['current_task']}"
-                        )
-                    if result.identity_anchor.get("active_constraints"):
-                        constraints = result.identity_anchor["active_constraints"]
-                        if isinstance(constraints, list):
-                            anchor_parts.append(
-                                "Constraints: " + "; ".join(constraints)
-                            )
-                    if anchor_parts:
-                        parts.append("**Identity Anchor:**\n" + "\n".join(anchor_parts))
-                elif (
-                    isinstance(result.identity_anchor, str)
-                    and result.identity_anchor.strip()
-                ):
-                    parts.append(
-                        f"**Identity Anchor:**\n{result.identity_anchor.strip()}"
-                    )
-            summary = "\n\n".join(parts)
-
-            return summary
-
-        except Exception as e:
-            # Sequential, never raced: the structured pass ran and failed
-            # (timeout / schema / endpoint). Log it loudly with the traceback,
-            # then try the cheaper unstructured pass before giving up.
-            logger.error(
-                f"Structured summarization failed, falling back to unstructured: {e}",
-                exc_info=True,
-            )
-
-            # Fallback: unstructured summarization using the raw LLM
-            try:
-                logger.info("Falling back to unstructured summarization")
-                fallback_prompt = (
-                    f"Summarize this agent conversation concisely. Include: what was accomplished, "
-                    f"key decisions, current state, and any blockers. Keep under {max_summary_length} characters.\n\n"
-                    f"Conversation:\n{conversation_text}"
-                )
-                response = await asyncio.wait_for(
-                    auxiliary.llm.ainvoke([HumanMessage(content=fallback_prompt)]),
-                    timeout=self._summarization_timeout,
-                )
-                fallback_summary = (
-                    response.content if hasattr(response, "content") else str(response)
-                )
-                if fallback_summary and len(fallback_summary.strip()) > 50:
-                    logger.info(
-                        f"Unstructured fallback succeeded ({len(fallback_summary)} chars)"
-                    )
-                    return fallback_summary.strip()
-            except Exception as fallback_err:
-                logger.error(f"Unstructured fallback also failed: {fallback_err}")
-
-            return f"[Summarization failed: {e}]"
-
-    async def _recursive_summarize(
-        self,
-        formatted_parts: List[str],
-        auxiliary,
-        summarization_prompt: Optional[str],
-        max_summary_length: int,
-        depth: int = 0,
-    ) -> str:
-        """Recursively summarize large inputs by chunking.
-
-        This method handles arbitrarily large inputs by:
-        1. Splitting formatted_parts into chunks of ~chunk_size tokens
-        2. Summarizing each chunk
-        3. If combined summaries > safe_limit, recursing
-        4. Returning the final combined summary
-
-        Args:
-            formatted_parts: List of formatted message strings
-            auxiliary: AuxiliaryLLM instance for summarization
-            summarization_prompt: Optional custom prompt template (reasoning level pre-rendered)
-            max_summary_length: Maximum final summary length
-            depth: Current recursion depth (for logging)
-
-        Returns:
-            Final summarized text
-        """
-        max_depth = 5  # Safety limit to prevent infinite recursion
-        if depth >= max_depth:
-            logger.warning(
-                f"Recursive summarization hit max depth ({max_depth}). "
-                "Returning truncated content."
-            )
-            # Truncate and return what we have
-            combined = "\n".join(formatted_parts)
-            return combined[
-                : max_summary_length * 4
-            ]  # Approximate chars for token limit
-
-        chunk_size = self.config.summarization_chunk_size
-
-        # Split into chunks
-        chunks = self._split_into_chunks(formatted_parts, chunk_size)
-        logger.info(
-            f"Recursive summarization depth {depth}: "
-            f"split into {len(chunks)} chunks (target {chunk_size} tokens each)"
-        )
-
-        # Summarize each chunk
-        chunk_summaries = []
-        for i, chunk in enumerate(chunks):
-            chunk_text = "\n".join(chunk)
-            logger.debug(
-                f"Summarizing chunk {i + 1}/{len(chunks)} ({len(chunk_text)} chars)"
-            )
-
-            # Allocate proportional max length to each chunk
-            chunk_max_length = max(1000, max_summary_length // max(len(chunks), 1))
-            summary = await self._single_pass_summarize(
-                chunk_text,
-                auxiliary,
-                summarization_prompt,
-                chunk_max_length,
-            )
-            chunk_summaries.append(summary)
-
-        # Combine summaries
-        combined = "\n\n---\n\n".join(chunk_summaries)
-        combined_tokens = len(combined) // 4  # Approximate
-
-        logger.debug(
-            f"Combined summaries: {combined_tokens} tokens (safe limit: {self.config.summarization_safe_limit})"
-        )
-
-        # If still too large, recurse
-        if combined_tokens > self.config.summarization_safe_limit:
-            logger.info(
-                f"Combined summaries still too large ({combined_tokens} tokens). "
-                f"Recursing to depth {depth + 1}."
-            )
-            return await self._recursive_summarize(
-                [f"Previous summary section:\n{s}" for s in chunk_summaries],
-                auxiliary,
-                summarization_prompt,
-                max_summary_length,
-                depth + 1,
-            )
-
-        # Final pass to unify the chunk summaries into a coherent summary
-        if len(chunks) > 1:
-            logger.info(f"Unifying {len(chunks)} chunk summaries into final summary")
-            return await self._single_pass_summarize(
-                f"Combine these section summaries into a unified summary:\n\n{combined}",
-                auxiliary,
-                summarization_prompt,
-                max_summary_length,
-            )
-
-        return combined
-
     async def summarize_conversation(
         self,
         messages: List[BaseMessage],
         auxiliary,
         summarization_prompt: Optional[str] = None,
         max_summary_length: int = 10000,
-    ) -> str:
-        """Generate a summary of the conversation.
+        seed_summary: Optional[str] = None,
+        focus: Optional[str] = None,
+        trigger: str = "auto",
+        context_tokens: Optional[int] = None,
+    ) -> Optional[str]:
+        """Generate a summary of the conversation via the rolling-fold engine.
 
-        Handles arbitrarily large inputs via recursive chunked summarization.
-        If the input exceeds summarization_safe_limit, it will be split into
-        chunks, each chunk summarized, and the results combined.
+        Arbitrarily large inputs are planned into chunks sized for the
+        *auxiliary model's own* context window and folded sequentially
+        (``src/core/summarizer.py``) — never sized against the main model's
+        window. Emits ``compaction.started`` / ``compaction.failed`` through
+        the progress callback; per-pass ``compaction.progress`` comes from the
+        engine.
 
         Args:
             messages: Messages to summarize
             auxiliary: AuxiliaryLLM instance for summarization
             summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Maximum length for the final summary
+            seed_summary: Prior summary text seeding the rolling fold
+            focus: Optional user compaction focus (``/compact <focus>``)
+            trigger: ``auto`` | ``manual`` | ``resume`` (event metadata)
+            context_tokens: Full-context token count for event display
+                (defaults to the planned input size)
 
         Returns:
-            Summary string
+            Summary string, or None on total summarizer failure — callers
+            must keep the original messages (never compact behind a
+            placeholder).
         """
-        # Format messages for summarization
+        from src.core.summarizer import SummarizationEngine, SummarizationFailed
+
         formatted_parts = self._format_messages_for_summary(messages)
-        conversation_text = "\n".join(formatted_parts)
+        if not formatted_parts:
+            logger.info("Nothing to summarize (no formattable messages)")
+            return None
 
-        # Check if input exceeds safe limit for summarization LLM
-        # Approximate token count: ~4 chars per token
-        input_tokens = len(conversation_text) // 4
+        # Stamp the trigger onto every engine frame: a reload can replay a
+        # compaction.progress without its compaction.started, and the cockpit
+        # should not have to guess the trigger when it synthesizes state.
+        engine_cb = None
+        if self.progress_cb is not None:
+            outer_cb = self.progress_cb
 
-        if input_tokens > self.config.summarization_safe_limit:
-            logger.info(
-                f"Input too large for single summarization ({input_tokens} tokens > "
-                f"{self.config.summarization_safe_limit} limit). Using recursive chunked summarization."
-            )
-            summary = await self._recursive_summarize(
-                formatted_parts,
-                auxiliary,
-                summarization_prompt,
-                max_summary_length,
-            )
-        else:
-            logger.info(f"Starting single-pass summarization ({input_tokens} tokens)")
-            summary = await self._single_pass_summarize(
-                conversation_text,
-                auxiliary,
-                summarization_prompt,
-                max_summary_length,
-            )
+            async def engine_cb(event: str, params: Dict[str, Any]) -> None:
+                await outer_cb(event, {"trigger": trigger, **params})
 
-        logger.info(f"Generated summary ({len(summary)} chars)")
+        engine = SummarizationEngine(
+            auxiliary,
+            summarization_prompt=summarization_prompt,
+            max_summary_length=max_summary_length,
+            call_timeout=self._summarization_call_timeout,
+            progress_cb=engine_cb,
+        )
+
+        try:
+            plan = engine.plan(formatted_parts)
+        except SummarizationFailed as e:
+            logger.error(f"Summarization planning failed ({e.reason}): {e}")
+            await self._emit_compaction_event(
+                "compaction.failed",
+                {
+                    "trigger": trigger,
+                    "reason": e.reason,
+                    "pass": 0,
+                    "n_passes": 0,
+                    "kept_messages": True,
+                },
+            )
+            return None
+
+        ctx_used = context_tokens if context_tokens is not None else plan.total_tokens
+        ctx_limit = max(self.config.model_max_context_tokens, 1)
+        logger.info(
+            f"Summarization plan: {plan.total_tokens} tokens in "
+            f"{plan.n_passes} pass(es), chunk budget {plan.chunk_budget}, "
+            f"aux window {plan.aux_window}"
+        )
+        await self._emit_compaction_event(
+            "compaction.started",
+            {
+                "trigger": trigger,
+                "total_tokens": plan.total_tokens,
+                "ctx_used_tokens": ctx_used,
+                "ctx_limit_tokens": ctx_limit,
+                "ctx_used_pct": round(100 * ctx_used / ctx_limit),
+                "aux_limit_tokens": plan.aux_window,
+                "n_passes": plan.n_passes,
+                "plan": plan.describe(),
+            },
+        )
+
+        start_time = time.monotonic()
+        try:
+            summary = await engine.run(plan, seed_summary=seed_summary, focus=focus)
+        except SummarizationFailed as e:
+            logger.error(f"Summarization failed ({e.reason}): {e}")
+            await self._emit_compaction_event(
+                "compaction.failed",
+                {
+                    "trigger": trigger,
+                    "reason": e.reason,
+                    "pass": e.pass_index,
+                    "n_passes": e.n_passes or plan.n_passes,
+                    "kept_messages": True,
+                },
+            )
+            return None
+
+        if not summary:
+            logger.error("Summarization produced no summary")
+            await self._emit_compaction_event(
+                "compaction.failed",
+                {
+                    "trigger": trigger,
+                    "reason": "empty_summary",
+                    "pass": plan.n_passes,
+                    "n_passes": plan.n_passes,
+                    "kept_messages": True,
+                },
+            )
+            return None
+
+        self._last_summarization_stats = {
+            "n_passes": plan.n_passes,
+            "duration_ms": int((time.monotonic() - start_time) * 1000),
+            "before_tokens": plan.total_tokens,
+        }
+
+        logger.info(
+            f"Generated summary ({len(summary)} chars, {plan.n_passes} pass(es))"
+        )
         # Debug: log tail
         tail = summary[-500:] if len(summary) > 500 else summary
         logger.debug(f"Summary tail:\n{tail}")
@@ -1512,6 +2008,8 @@ class ContextManager:
         summarization_prompt: Optional[str] = None,
         max_summary_length: int = 10000,
         keep_recent_override: Optional[int] = None,
+        trigger: str = "auto",
+        focus: Optional[str] = None,
     ) -> List[BaseMessage]:
         """Summarize older messages and compact the conversation.
 
@@ -1524,6 +2022,8 @@ class ContextManager:
             summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Max length for summary
             keep_recent_override: Override keep_recent_messages (for progressive compaction)
+            trigger: ``auto`` | ``manual`` | ``resume`` — compaction event metadata
+            focus: Optional user compaction focus (``/compact <focus>``)
 
         Returns:
             Compacted message list with summary prepended
@@ -1613,24 +2113,107 @@ class ContextManager:
         # removal_markers loop so the originals' IDs are evicted from state.
         conversation = sanitized_conversation
 
+        def _tool_result_is_already_truncated(msg: ToolMessage) -> bool:
+            content = msg.content if isinstance(msg.content, str) else ""
+            if not content:
+                return False
+            lower = content.lower()
+            if lower.startswith("[tool result elided by compaction"):
+                return True
+            # The truncation marker is appended AFTER the kept head, so it
+            # must be detected in the content tail — otherwise every later
+            # compaction re-truncates the message and rewrites the marker's
+            # original-size provenance.
+            return "[tool result truncated by compaction" in lower[-600:]
+
+        def _cap_keep_window_tool_results(
+            tool_messages: List[BaseMessage],
+        ) -> Tuple[List[BaseMessage], int, int]:
+            """Head-truncate oversized tail tool messages.
+
+            Returns:
+                capped_messages, before_tokens, after_tokens
+            """
+            before_tokens = self.get_token_count(
+                [m for m in tool_messages if not isinstance(m, RemoveMessage)]
+            )
+            capped_messages: List[BaseMessage] = []
+            for msg in tool_messages:
+                if not isinstance(msg, ToolMessage):
+                    capped_messages.append(msg)
+                    continue
+
+                content = msg.content if isinstance(msg.content, str) else ""
+                if len(content) <= self.config.keep_window_max_tool_result_chars:
+                    capped_messages.append(msg)
+                    continue
+                if _tool_result_is_already_truncated(msg):
+                    capped_messages.append(msg)
+                    continue
+
+                omitted_chars = (
+                    len(content) - self.config.keep_window_max_tool_result_chars
+                )
+                omitted_tokens = max(1, omitted_chars // 4)
+                capped_messages.append(
+                    ToolMessage(
+                        content=(
+                            f"{content[: self.config.keep_window_max_tool_result_chars]}\n\n"
+                            f"[tool result truncated by compaction: kept "
+                            f"{self.config.keep_window_max_tool_result_chars:,} of "
+                            f"{len(content):,} chars (~{omitted_tokens:,} tokens). "
+                            "Full content was saved to the workspace / is re-fetchable — "
+                            "re-run the tool or read the saved file if the rest is needed.]"
+                        ),
+                        tool_call_id=msg.tool_call_id,
+                        name=getattr(msg, "name", None),
+                    )
+                )
+
+            after_tokens = self.get_token_count(
+                [m for m in capped_messages if not isinstance(m, RemoveMessage)]
+            )
+            return capped_messages, before_tokens, after_tokens
+
         # Helper: when normal compaction can't proceed (too few messages,
         # summary larger than original, etc.) but we *did* substitute
         # oversized messages, return the substitution as a standalone
         # result so the backstop still wins. Without this, the runaway
         # AIMessage would survive the early returns and re-poison the
         # next turn.
-        def _substitution_only_result() -> List[BaseMessage]:
+        def _substitution_only_result(
+            fresh_messages: Optional[List[BaseMessage]] = None,
+        ) -> List[BaseMessage]:
             markers = [
                 RemoveMessage(id=m.id)
                 for m in original_conversation
                 if hasattr(m, "id") and m.id
             ]
-            return markers + system_msgs + sanitized_conversation
+            replacement = fresh_messages or sanitized_conversation
+            return markers + system_msgs + replacement
 
         if len(conversation) <= effective_keep_recent:
             if oversized_count > 0:
-                return _substitution_only_result()
-            return messages
+                capped_conversation, _, _ = _cap_keep_window_tool_results(conversation)
+                return _substitution_only_result(
+                    fresh_messages=capped_conversation
+                    if capped_conversation != conversation
+                    else None
+                )
+
+            capped_conversation, before_tokens, after_tokens = (
+                _cap_keep_window_tool_results(conversation)
+            )
+            if after_tokens >= before_tokens:
+                return messages
+
+            self._note_compaction_success()
+            markers = [
+                RemoveMessage(id=m.id)
+                for m in original_conversation
+                if hasattr(m, "id") and m.id
+            ]
+            return markers + system_msgs + capped_conversation
 
         # Find safe slice point that doesn't orphan ToolMessages
         target_start = len(conversation) - effective_keep_recent
@@ -1639,25 +2222,71 @@ class ContextManager:
         # Messages to summarize (older ones) and recent messages to keep
         messages_to_summarize = conversation[:safe_start]
         recent_messages = conversation[safe_start:]
+        capped_recent_messages, recent_before_tokens, recent_after_tokens = (
+            _cap_keep_window_tool_results(recent_messages)
+        )
+        keep_window_token_savings = max(0, recent_before_tokens - recent_after_tokens)
 
-        # Include old summaries at the start so their context is incorporated
-        # into the new summary (rolling summary pattern)
-        messages_for_summarization = old_summaries + messages_to_summarize
+        # Rolling-summary continuation: prior summaries seed the fold (the
+        # engine prepends them as "Prior Summary:" to the first pass) instead
+        # of being re-formatted as messages.
+        seed_summary: Optional[str] = None
+        if old_summaries:
+            seed_summary = "\n\n".join(
+                m.content.replace("[Summary of prior work]\n", "", 1)
+                for m in old_summaries
+            )
 
         # Generate summary
         summary = await self.summarize_conversation(
-            messages_for_summarization,
+            conversation,
             auxiliary,
             summarization_prompt,
             max_summary_length,
+            seed_summary=seed_summary,
+            focus=focus,
+            trigger=trigger,
+            context_tokens=self.get_token_count(
+                [m for m in messages if not isinstance(m, RemoveMessage)]
+            ),
         )
+
+        # Stopgap (knowledge-base/knowledge/issues/session_silent_failure_audit.md #4): when the
+        # summarizer is fully unavailable, keep the original history rather
+        # than compacting it away behind a placeholder. The turn may then
+        # fail on context overflow — visibly — instead of the agent being
+        # silently lobotomized.
+        if summary is None:
+            logger.error(
+                "Compaction aborted: summarization unavailable (aux LLM "
+                f"failure) — keeping {len(messages)} messages uncompacted"
+            )
+            if oversized_count > 0:
+                return _substitution_only_result()
+            return messages
 
         # Guard: if summary is larger than what we're replacing, skip compaction
         summary_tokens = self.get_token_count([SystemMessage(content=summary)])
-        original_tokens = self.get_token_count(messages_for_summarization)
+        original_tokens = (
+            self.get_token_count(old_summaries + messages_to_summarize)
+            + keep_window_token_savings
+        )
         if summary_tokens > original_tokens:
             logger.error(
                 f"Summary ({summary_tokens} tokens) larger than original ({original_tokens} tokens) — skipping compaction"
+            )
+            # The engine already journaled compaction.started/progress; without
+            # a journaled terminal frame an SSE replay resurrects the progress
+            # UI with nothing to clear it. compaction.skipped closes the
+            # lifecycle (the cockpit clears the block, silently).
+            await self._emit_compaction_event(
+                "compaction.skipped",
+                {
+                    "trigger": trigger,
+                    "reason": "summary_not_smaller",
+                    "summary_tokens": summary_tokens,
+                    "original_tokens": original_tokens,
+                },
             )
             if oversized_count > 0:
                 return _substitution_only_result()
@@ -1697,7 +2326,7 @@ class ContextManager:
         # Create fresh copies of recent messages without IDs so they get appended
         # after the summary instead of staying in their original positions
         fresh_recent = []
-        for msg in recent_messages:
+        for msg in capped_recent_messages:
             if isinstance(msg, AIMessage):
                 fresh_recent.append(
                     AIMessage(
@@ -1711,6 +2340,7 @@ class ContextManager:
                     ToolMessage(
                         content=msg.content,
                         tool_call_id=msg.tool_call_id,
+                        name=getattr(msg, "name", None),
                     )
                 )
             elif isinstance(msg, HumanMessage):
@@ -1728,6 +2358,11 @@ class ContextManager:
             f"removing {len(removal_markers)}, {messages_without_ids} without IDs)"
         )
 
+        # A summary was produced and the compacted result is being returned —
+        # bump the run counter (the transports' "did it actually compact this
+        # call" signal; see __init__) and drop the now-stale provider anchor.
+        self._note_compaction_success()
+
         # Record the summarized/kept boundary for the persistent transport: the
         # newest message the summary covers is original_conversation[safe_start-1]
         # (original, not sanitized, so the id matches the persisted row). Its seq
@@ -1738,6 +2373,13 @@ class ContextManager:
             if safe_start >= 1
             else None
         )
+
+        # Completion stats for the context.compacted event (read by the
+        # persistent transport's _record_compaction).
+        if self._last_summarization_stats is not None:
+            self._last_summarization_stats["after_tokens"] = self.get_token_count(
+                system_msgs + [summary_msg] + fresh_recent
+            )
 
         # Return: removal markers + system messages + summary + fresh recent
         # Order matters: summary comes BEFORE recent messages

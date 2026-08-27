@@ -1,20 +1,60 @@
 import { Injectable } from '@angular/core';
-import { FilePreview, FileType, UploadStatus } from '../models/file.model';
+import { FilePreview, FilePreviewResult, FileType, RejectedFile, UploadStatus } from '../models/file.model';
 import { RecordingResult } from '../models/recording.model';
+
+/** Optional override for `createFilePreviews()`'s size/count caps — see the
+ *  job-creation caps below for why a caller would need this. */
+export interface FileCaps {
+  maxFileSizeMB: number;
+  maxFiles: number;
+}
 
 /**
  * Service for handling file-related operations such as validation,
  * preview generation, and utility functions for file type detection.
+ *
+ * Two call sites use this service against two different backend endpoints
+ * with genuinely different caps, not just one the frontend used to
+ * over-report:
+ *  - persistent-chat's composer uploads into a *live* thread workspace
+ *    (`POST /api/persistent/threads/{id}/uploads`, orchestrator/services/
+ *    thread_uploads.py) — 100MB per file is a real server limit that binds
+ *    on every request (thread_uploads.py:69). 20 files is NOT a server
+ *    limit here: it's our own composer policy, because the composer now
+ *    sends one request per file, so the server's per-request file-count cap
+ *    can never be hit by this client (see MAX_FILES below).
+ *  - job-create uploads into local orchestrator storage for a not-yet-
+ *    running job (`POST /api/uploads`, orchestrator/uploads.py:53-54) —
+ *    genuinely capped at 5GB / 100 files server-side, a different order of
+ *    magnitude because it never touches a live container/VM.
+ * `MAX_FILE_SIZE_MB`/`MAX_FILES` below are the first (smaller) pair, applied
+ * by default; job-create passes its own larger pair explicitly (see
+ * `getJobUploadMaxFileSizeMB`/`getJobUploadMaxFiles`) so neither caller lies
+ * about what the server will actually accept.
  */
 @Injectable({
   providedIn: 'root',
 })
 export class FileHandlingService {
-  /** Maximum file size in MB */
-  private readonly MAX_FILE_SIZE_MB = 5120; // 5GB
+  /** Maximum file size in MB. Mirrors MAX_FILE_SIZE in
+   *  orchestrator/services/thread_uploads.py:69 — the server rejects anything
+   *  larger with 413, and the client should say so before the bytes move. */
+  private readonly MAX_FILE_SIZE_MB = 100;
 
-  /** Maximum number of files per upload */
-  private readonly MAX_FILES = 100;
+  /** Maximum files per upload. The server's own per-request cap
+   *  (MAX_FILES_PER_REQUEST = 20, thread_uploads.py:70) can no longer bind
+   *  here now that the composer sends one request per file (Task 2) — this
+   *  is a deliberate composer-level policy cap, not a mirror of a server
+   *  limit we'd otherwise hit. */
+  private readonly MAX_FILES = 20;
+
+  /** Job-creation uploads (`POST /api/uploads`) land in local orchestrator
+   *  storage rather than a live workspace, so the server allows much larger
+   *  batches — see orchestrator/uploads.py:53. */
+  private readonly JOB_UPLOAD_MAX_FILE_SIZE_MB = 5120; // 5GB
+
+  /** Mirrors MAX_FILES_PER_UPLOAD in orchestrator/uploads.py:54. */
+  private readonly JOB_UPLOAD_MAX_FILES = 100;
 
   /**
    * Validates file size against maximum limit.
@@ -35,31 +75,57 @@ export class FileHandlingService {
   }
 
   /**
-   * Get maximum file size in MB.
+   * Get maximum file size in MB for thread/session composer uploads.
    */
   getMaxFileSizeMB(): number {
     return this.MAX_FILE_SIZE_MB;
   }
 
   /**
-   * Get maximum file count.
+   * Get maximum file count for thread/session composer uploads.
    */
   getMaxFiles(): number {
     return this.MAX_FILES;
   }
 
+  /** Get maximum file size in MB for job-creation uploads (`POST /api/uploads`). */
+  getJobUploadMaxFileSizeMB(): number {
+    return this.JOB_UPLOAD_MAX_FILE_SIZE_MB;
+  }
+
+  /** Get maximum file count for job-creation uploads (`POST /api/uploads`). */
+  getJobUploadMaxFiles(): number {
+    return this.JOB_UPLOAD_MAX_FILES;
+  }
+
   /**
-   * Creates file previews from selected files.
+   * Creates file previews from selected files, honestly enforcing the same
+   * caps the target endpoint does: files over the size cap or past the count
+   * cap are reported back via `rejected` instead of silently vanishing (the
+   * previous behaviour — a `console.warn` no user ever sees).
+   *
+   * Defaults to the thread/session composer's caps. Pass `caps` to validate
+   * against a different endpoint's limits (job-create's `POST /api/uploads`
+   * allows much larger batches — see `getJobUploadMaxFileSizeMB`/
+   * `getJobUploadMaxFiles`).
+   *
    * @param files Array of files to create previews for
-   * @returns Promise with array of file previews
+   * @param caps Optional override of the default size/count caps
+   * @returns Promise of accepted previews plus anything rejected, and why
    */
-  async createFilePreviews(files: File[]): Promise<FilePreview[]> {
+  async createFilePreviews(files: File[], caps?: FileCaps): Promise<FilePreviewResult> {
+    const maxFileSizeBytes = (caps?.maxFileSizeMB ?? this.MAX_FILE_SIZE_MB) * 1024 * 1024;
+    const maxFiles = caps?.maxFiles ?? this.MAX_FILES;
     const previews: FilePreview[] = [];
+    const rejected: RejectedFile[] = [];
 
     for (const file of files) {
-      // Skip oversized files
-      if (!this.validateFileSize(file)) {
-        console.warn(`File "${file.name}" exceeds ${this.MAX_FILE_SIZE_MB}MB limit`);
+      if (file.size > maxFileSizeBytes) {
+        rejected.push({ name: file.name, reason: 'size' });
+        continue;
+      }
+      if (previews.length >= maxFiles) {
+        rejected.push({ name: file.name, reason: 'count' });
         continue;
       }
 
@@ -86,7 +152,7 @@ export class FileHandlingService {
       previews.push(preview);
     }
 
-    return previews;
+    return { previews, rejected };
   }
 
   /**

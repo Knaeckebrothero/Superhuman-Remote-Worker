@@ -1,12 +1,15 @@
 (function(window) {
   window['env'] = window['env'] || {};
   window['env']['apiUrl'] = 'http://localhost:8085/api';
+  // Remains null until an isolated wildcard viewer domain is provisioned.
+  window['env']['canvasViewerHostSuffix'] = null;
+  // Remains null until the Collabora hostname is provisioned.
+  window['env']['canvasOfficeOrigin'] = null;
   window['env']['giteaUrl'] = 'http://localhost:3000/srw';
   window['env']['dozzleUrl'] = 'http://localhost:9999';
   window['env']['minioConsoleUrl'] = 'http://localhost:9001';
   window['env']['neo4jUrl'] = 'http://localhost:7474';
   window['env']['pgadminUrl'] = 'http://localhost:5050';
-  window['env']['mongoExpressUrl'] = 'http://localhost:8081';
   window['env']['mcpUrl'] = 'http://localhost:8055/mcp';
   window['env']['cloudUrl'] = 'http://localhost:9200';
 

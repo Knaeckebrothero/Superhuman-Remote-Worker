@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -51,7 +52,7 @@ async def agent_create_thread(
     Includes the system-default chat/auxiliary/embedding pin injection
     that lands a config_override in thread metadata. Without this, the
     standalone agent boots against its YAML default and 401s on
-    api.openai.com (see docs/hardcoded_model_defaults.md).
+    api.openai.com (see knowledge-base/knowledge/hardcoded_model_defaults.md).
     """
     thread_id = await db.create_thread(
         user_id=None,
@@ -100,7 +101,7 @@ async def agent_create_thread(
 
     if gitea.is_initialized:
         repo_name = f"thread-{thread_id[:8]}"
-        git_remote_url = await gitea.create_repo(repo_name)
+        git_remote_url = await gitea.create_repo(repo_name, intent_marker=str(uuid4()))
         if git_remote_url:
             await db.merge_thread_workspace_context(
                 thread_id, {"git_remote_url": git_remote_url, "repo_name": repo_name}
@@ -139,11 +140,22 @@ def parse_workspace_metadata(thread):
     }
 
 
-async def agent_upgrade_to_vm(db, vm_provisioner, thread_id):
-    """5.3: POST /api/agents/threads/{thread_id}/upgrade-to-vm"""
+async def agent_upgrade_to_vm(db, vm_provisioner, thread_id, grant_gate=None):
+    """5.3: POST /api/agents/threads/{thread_id}/upgrade-to-vm
+
+    ``grant_gate`` mirrors the shared Sec-1 authorization gate
+    (``_enforce_workspace_upgrade_grants``), now run on this endpoint too
+    (Phase 2: it was previously ungated). Async ``(thread, target_tier) -> None``
+    raising ``_GateDenied`` on refusal, run BEFORE provisioning (fail-closed).
+    """
     thread = await db.get_thread(thread_id)
     if not thread:
         return {"error": 404, "detail": "Thread not found"}
+    if grant_gate is not None:
+        try:
+            await grant_gate(thread, "vm")
+        except _GateDenied as exc:
+            return {"error": 403, "detail": str(exc)}
     if not vm_provisioner.is_available:
         return {"error": 503, "detail": "VM provisioning not available"}
 
@@ -172,6 +184,83 @@ async def agent_upgrade_to_vm(db, vm_provisioner, thread_id):
         "status": "provisioning",
         "thread_id": thread_id,
         "vm_provisioner_mode": vm_provisioner.mode,
+    }
+
+
+class _GateDenied(Exception):
+    """Stand-in for the orchestrator's HTTPException(403) raised by the shared
+    Sec-1 grant gate (_enforce_workspace_upgrade_grants)."""
+
+
+async def agent_upgrade_to_workspace(
+    db,
+    provisioner,
+    thread_id,
+    target_tier="sandbox",
+    grant_gate=None,
+    vm_provisioner=None,
+):
+    """5.3b: POST /api/agents/threads/{thread_id}/upgrade-to-workspace
+    (workspace_tier_upgrade.md §4.2 S2 + S4 / Phase 2) — mirrors orchestrator/main.py.
+
+    Provisions a real container for a lite thread (virtual/none -> sandbox).
+    Idempotent on an in-flight/ready container. ``vm`` is delegated to the
+    operator-gated upgrade-to-vm path (Phase 2), which runs the same grant gate.
+    ``grant_gate`` mirrors the shared Sec-1 authorization gate
+    (``_enforce_workspace_upgrade_grants``): an async ``(thread, target_tier) ->
+    None`` that raises ``_GateDenied`` on refusal, run BEFORE provisioning
+    (fail-closed).
+    """
+    target_tier = target_tier or "sandbox"
+    if target_tier not in ("sandbox", "vm"):
+        return {"error": 400, "detail": f"unsupported target_tier {target_tier!r}"}
+
+    # vm delegates to the operator-gated VM path (which runs the same gate,
+    # provisions the VM, and records metadata.vm). Mirrors the real endpoint's
+    # `return await agent_upgrade_thread_to_vm(request, thread_id)`.
+    if target_tier == "vm":
+        return await agent_upgrade_to_vm(
+            db, vm_provisioner, thread_id, grant_gate=grant_gate
+        )
+
+    thread = await db.get_thread(thread_id)
+    if not thread:
+        return {"error": 404, "detail": "Thread not found"}
+
+    if grant_gate is not None:
+        try:
+            await grant_gate(thread, target_tier)
+        except _GateDenied as exc:
+            return {"error": 403, "detail": str(exc)}
+
+    if not (provisioner.is_available and provisioner.in_cluster):
+        return {
+            "error": 503,
+            "detail": "Workspace container provisioning not available",
+        }
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    wc = metadata.get("workspace_container") or {}
+    if wc.get("status") in ("pending", "creating", "created", "ready"):
+        return {
+            "status": wc["status"],
+            "thread_id": thread_id,
+            "target_tier": "sandbox",
+            "message": "Workspace container already provisioned or in progress",
+        }
+
+    await db.merge_thread_workspace_context(thread_id, {"status": "pending"})
+    await provisioner.create_workspace(WorkspaceOwner.session(thread_id))
+
+    return {
+        "status": "provisioning",
+        "thread_id": thread_id,
+        "target_tier": "sandbox",
     }
 
 
@@ -425,10 +514,15 @@ def _mock_gitea(initialized=False):
     return g
 
 
-def _mock_provisioner(available=False):
+def _mock_provisioner(available=False, in_cluster=None):
     p = AsyncMock()
     type(p).is_available = PropertyMock(return_value=available)
-    p.create_workspace = AsyncMock()
+    # Defaults to tracking is_available unless overridden (the upgrade-to-
+    # workspace gate requires both is_available AND in_cluster).
+    type(p).in_cluster = PropertyMock(
+        return_value=available if in_cluster is None else in_cluster
+    )
+    p.create_workspace = AsyncMock(return_value=True)
     p.delete_workspace = AsyncMock()
     return p
 
@@ -511,7 +605,8 @@ class TestAgentCreateThread:
 
         await agent_create_thread(db, gitea, prov)
 
-        gitea.create_repo.assert_awaited_once_with("thread-aaaaaaaa")
+        assert gitea.create_repo.await_args.args == ("thread-aaaaaaaa",)
+        UUID(gitea.create_repo.await_args.kwargs["intent_marker"])
         db.merge_thread_workspace_context.assert_awaited_once_with(
             "aaaaaaaa-1111-2222-3333-444444444444",
             {
@@ -588,7 +683,7 @@ class TestAgentCreateThread:
         + auxiliary + embedding sections so the agent doesn't fall
         through to YAML defaults at attach. This is the fix for the
         "Untitled Session" + missing-memory + embedding-401 bug
-        documented in docs/hardcoded_model_defaults.md."""
+        documented in knowledge-base/knowledge/hardcoded_model_defaults.md."""
         db = _mock_db()
 
         async def _resolve(cap):
@@ -737,6 +832,176 @@ class TestAgentGetThreadWorkspace:
         assert result["project_ids"] == ["proj-1", "proj-2"]
 
 
+def resolve_cloud_sync_fork(
+    *,
+    thread: dict,
+    metadata: dict,
+    cloud_mount_cfg,
+    mount_rows: list,
+    driver: str,
+    cloud_up: bool,
+    build_agent_cloud_sync,
+):
+    """5.2 cloud_sync fork — mirrors ``agent_get_thread_workspace``
+    (orchestrator/main.py), including:
+
+    - B8 F2: a ``protected_cloud`` thread whose ``cloud_mount_cfg`` resolved
+      to None (flag off, VM tier, or a refused/absent grant) must NOT fall
+      into the live rclone/session-folder ``cloud_sync`` fallback — that
+      would hand a protected thread a live write path.
+    - B10 F-C1: ``cloud_sync_degraded`` drops the ``nc_session_folder`` veto
+      for a protected thread — a protected thread with no resolved mount is
+      ALWAYS degraded, even when a (now-unused) legacy ``nc_session_folder``
+      happens to still be set on the row. Previously a protected thread with
+      a stale ``nc_session_folder`` reported ``cloud_sync_degraded=False``
+      despite having no live cloud access at all.
+    - B10 F-C1: also returns the ``protected_cloud`` response key the
+      endpoint now surfaces, so the agent can gate its own legacy shim on
+      the same signal.
+
+    ``driver`` stands in for ``_cloud_workspace_driver()`` so this stays
+    hermetic (no env coupling).
+    """
+    if cloud_mount_cfg:
+        cloud_sync_cfg = None
+    elif metadata.get("protected_cloud"):
+        cloud_sync_cfg = None
+    elif driver == "rclone_mount":
+        cloud_sync_cfg = build_agent_cloud_sync(thread, mount_rows=[])
+    else:
+        cloud_sync_cfg = build_agent_cloud_sync(thread, mount_rows=mount_rows)
+    protected_cloud = bool(metadata.get("protected_cloud"))
+    cloud_sync_degraded = bool(
+        cloud_up
+        and not cloud_mount_cfg
+        and not cloud_sync_cfg
+        and (protected_cloud or not thread.get("nc_session_folder"))
+    )
+    return cloud_sync_cfg, cloud_sync_degraded, protected_cloud
+
+
+class TestResolveCloudSyncFork:
+    """B8 review F2: a protected_cloud thread whose cloud_mount_cfg resolved
+    to None must get NO live cloud_sync fallback, and must be flagged
+    degraded so the agent surfaces the same degraded-cloud state it shows
+    for a failed initial pull."""
+
+    def test_protected_thread_with_no_mount_skips_live_fallback_and_is_degraded(self):
+        thread = {"id": "t1"}
+        build_sync = MagicMock()
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={"protected_cloud": True},
+            cloud_mount_cfg=None,
+            mount_rows=[{"backend_id": "nextcloud", "cloud_handle": "handle::Proj"}],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is None
+        assert degraded is True
+        assert protected_cloud is True
+        build_sync.assert_not_called()
+
+    def test_protected_thread_with_no_mount_skips_rclone_fallback_too(self):
+        """Same guard must hold even when CLOUD_WORKSPACE_DRIVER=rclone_mount,
+        which for an unprotected thread would otherwise take the rclone-driver
+        branch (empty mount_rows session-folder fallback)."""
+        thread = {"id": "t1"}
+        build_sync = MagicMock()
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={"protected_cloud": True},
+            cloud_mount_cfg=None,
+            mount_rows=[],
+            driver="rclone_mount",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is None
+        assert degraded is True
+        assert protected_cloud is True
+        build_sync.assert_not_called()
+
+    def test_protected_thread_with_resolved_mount_is_not_degraded(self):
+        thread = {"id": "t1"}
+        build_sync = MagicMock()
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={"protected_cloud": True},
+            cloud_mount_cfg={"driver": "rclone", "protected": True},
+            mount_rows=[],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is None
+        assert degraded is False
+        assert protected_cloud is True
+        build_sync.assert_not_called()
+
+    def test_non_protected_thread_still_gets_live_fallback(self):
+        """Regression guard: the new elif must not swallow the ordinary
+        (non-protected) fallback path."""
+        thread = {"id": "t1"}
+        sentinel = {"kind": "session_folder"}
+        build_sync = MagicMock(return_value=sentinel)
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={},
+            cloud_mount_cfg=None,
+            mount_rows=[],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is sentinel
+        assert degraded is False
+        assert protected_cloud is False
+        build_sync.assert_called_once_with(thread, mount_rows=[])
+
+    def test_protected_thread_with_nc_session_folder_set_is_still_degraded(self):
+        """B10 F-C1: the exact bug being fixed. A protected thread with no
+        resolved mount, but a still-set legacy ``nc_session_folder`` (e.g. a
+        thread created before the protected-mode refactor, or one whose
+        session-folder provisioning raced ahead of the protected marker),
+        must NOT get to hide behind the nc_session_folder veto — it is
+        degraded (no live cloud access at all) regardless."""
+        thread = {"id": "t1", "nc_session_folder": "Sessions/thread-1"}
+        build_sync = MagicMock()
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={"protected_cloud": True},
+            cloud_mount_cfg=None,
+            mount_rows=[],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is None
+        assert degraded is True
+        assert protected_cloud is True
+        build_sync.assert_not_called()
+
+    def test_non_protected_thread_with_nc_session_folder_set_is_not_degraded(self):
+        """Regression guard: the dropped nc_session_folder veto is
+        protected-only — an ordinary thread with a working legacy session
+        folder (and no cloud_sync resolved, hypothetically) is unaffected."""
+        thread = {"id": "t1", "nc_session_folder": "Sessions/thread-1"}
+        build_sync = MagicMock(return_value=None)
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={},
+            cloud_mount_cfg=None,
+            mount_rows=[],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert degraded is False
+        assert protected_cloud is False
+
+
 # =============================================================================
 # 5.3: POST /api/agents/threads/{thread_id}/upgrade-to-vm
 # =============================================================================
@@ -808,6 +1073,189 @@ class TestAgentUpgradeToVm:
 
         result = await agent_upgrade_to_vm(db, vm, "tid-1")
         assert result["error"] == 500
+
+    @pytest.mark.asyncio
+    async def test_grant_gate_refusal_returns_403_before_provisioning(self):
+        # Phase 2 (⚠️ gap closed): this endpoint now runs the shared Sec-1 gate.
+        # A refusal is a 403 BEFORE the availability check or provisioning.
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        vm = _mock_vm_provisioner(available=True)
+
+        async def _deny(_thread, _tier):
+            raise _GateDenied("User is not permitted to use VM workspaces")
+
+        result = await agent_upgrade_to_vm(db, vm, "tid-1", grant_gate=_deny)
+        assert result["error"] == 403
+        vm.create_thread_vm.assert_not_awaited()
+
+
+# =============================================================================
+# 5.3b: POST /api/agents/threads/{thread_id}/upgrade-to-workspace (S2)
+# =============================================================================
+
+
+class TestAgentUpgradeToWorkspace:
+    """Tests for POST /api/agents/threads/{thread_id}/upgrade-to-workspace —
+    lite -> sandbox container provisioning (workspace_tier_upgrade.md §4.2 S2).
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_400_for_unknown_tier(self):
+        # Only sandbox|vm are valid targets; anything else is a 400.
+        db = _mock_db()
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(
+            db, prov, "tid-1", target_tier="bogus"
+        )
+        assert result["error"] == 400
+        prov.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_delegates_to_vm_path(self):
+        # Phase 2: vm delegates to the VM provisioner (not the container path),
+        # records nothing on the container, and reports provisioning.
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        vm = _mock_vm_provisioner(available=True, mode="nats")
+        result = await agent_upgrade_to_workspace(
+            db, prov, "tid-1", target_tier="vm", vm_provisioner=vm
+        )
+        assert result["status"] == "provisioning"
+        assert result["vm_provisioner_mode"] == "nats"
+        vm.create_thread_vm.assert_awaited_once()
+        # The container provisioner is untouched on a vm upgrade.
+        prov.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_refused_by_grant_gate_returns_403(self):
+        # Phase 2: an owner without can_use_vm / vm_workspace is refused 403 and
+        # no VM is provisioned (the gate runs inside the delegated vm path).
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        vm = _mock_vm_provisioner(available=True)
+
+        async def _deny(_thread, _tier):
+            raise _GateDenied("User is not permitted to use VM workspaces")
+
+        result = await agent_upgrade_to_workspace(
+            db, prov, "tid-1", target_tier="vm", vm_provisioner=vm, grant_gate=_deny
+        )
+        assert result["error"] == 403
+        vm.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_thread_not_found(self):
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=None)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["error"] == 404
+
+    @pytest.mark.asyncio
+    async def test_returns_503_when_not_in_cluster(self):
+        # Provisioner available but out-of-cluster (e.g. dev compose) → no pod.
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=_make_thread())
+        prov = _mock_provisioner(available=True, in_cluster=False)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["error"] == 503
+        prov.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_503_when_provisioner_unavailable(self):
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=_make_thread())
+        prov = _mock_provisioner(available=False)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["error"] == 503
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_already_provisioning(self):
+        thread = _make_thread(metadata={"workspace_container": {"status": "pending"}})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["status"] == "pending"
+        assert (
+            result["message"]
+            == "Workspace container already provisioned or in progress"
+        )
+        # No duplicate provisioning, no status churn.
+        prov.create_workspace.assert_not_awaited()
+        db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_already_ready(self):
+        thread = _make_thread(metadata={"workspace_container": {"status": "ready"}})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["status"] == "ready"
+        prov.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provisions_for_new_request(self):
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["status"] == "provisioning"
+        assert result["target_tier"] == "sandbox"
+        db.merge_thread_workspace_context.assert_awaited_once_with(
+            "tid-1", {"status": "pending"}
+        )
+        prov.create_workspace.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_sandbox_when_tier_omitted(self):
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1")
+        assert result["status"] == "provisioning"
+
+    @pytest.mark.asyncio
+    async def test_grant_gate_refusal_returns_403_before_provisioning(self):
+        # Sec-1 (S4): a shell-restricted owner (or vm without vm_workspace) is
+        # refused 403 and nothing provisions.
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+
+        async def _deny(_thread, _tier):
+            raise _GateDenied("config exceeds your capability grants: shell_tools")
+
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1", grant_gate=_deny)
+        assert result["error"] == 403
+        assert "shell_tools" in result["detail"]
+        prov.create_workspace.assert_not_awaited()
+        db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_grant_gate_pass_provisions(self):
+        # A default (ungated) sandbox upgrade passes the gate and provisions.
+        thread = _make_thread(metadata={})
+        db = _mock_db()
+        db.get_thread = AsyncMock(return_value=thread)
+        prov = _mock_provisioner(available=True, in_cluster=True)
+
+        async def _allow(_thread, _tier):
+            return None
+
+        result = await agent_upgrade_to_workspace(db, prov, "tid-1", grant_gate=_allow)
+        assert result["status"] == "provisioning"
+        prov.create_workspace.assert_awaited_once()
 
 
 # =============================================================================
@@ -898,6 +1346,40 @@ class TestUserCreateThread:
         if request_model:
             config_override.setdefault("llm", {})["model"] = request_model
         assert config_override["llm"]["model"] == "claude-opus-4-6"
+
+    def test_request_permission_mode_overrides_user_default(self):
+        """Per-session permission mode override takes priority over user defaults.
+
+        Regression: the request's permission_mode used to be written only to
+        the threads.permission_mode column (which the agent never reads) and
+        never bridged into config_override.interactive — so a non-default pick
+        in the New Session form was dropped and every session booted
+        "supervised". The agent reads config.interactive.permission_mode, so the
+        per-session choice must land there, exactly like the model bridge above.
+        """
+        # User default already applied to config_override (main.py:12146).
+        config_override = {"interactive": {"permission_mode": "supervised"}}
+        request_permission_mode = "autonomous"
+        if request_permission_mode:
+            config_override.setdefault("interactive", {})["permission_mode"] = (
+                request_permission_mode
+            )
+        assert config_override["interactive"]["permission_mode"] == "autonomous"
+        # Column stays in sync with the resolved config_override value.
+        effective = (config_override.get("interactive") or {}).get(
+            "permission_mode"
+        ) or "supervised"
+        assert effective == "autonomous"
+
+    def test_omitted_permission_mode_keeps_user_default(self):
+        """Omitting permission_mode (None) preserves the user's saved default."""
+        config_override = {"interactive": {"permission_mode": "auto_accept"}}
+        request_permission_mode = None
+        if request_permission_mode:  # pragma: no cover - documents the None path
+            config_override.setdefault("interactive", {})["permission_mode"] = (
+                request_permission_mode
+            )
+        assert config_override["interactive"]["permission_mode"] == "auto_accept"
 
     def test_project_ids_normalization(self):
         """Legacy project_id → [project_id] normalization."""

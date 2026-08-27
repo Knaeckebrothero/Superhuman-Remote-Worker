@@ -33,15 +33,15 @@ import { AppIconComponent } from '../../ui/icon';
       position: relative;
       padding: 6px;
       border-radius: var(--radius-control);
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary);
       font-size: 20px;
       line-height: 1;
       transition: color 0.15s, background 0.15s;
     }
 
     .bell-btn:hover {
-      color: var(--text-primary, #cdd6f4);
-      background: var(--surface-0, #313244);
+      color: var(--text-primary);
+      background: var(--surface-0);
     }
 
     .badge {
@@ -52,8 +52,8 @@ import { AppIconComponent } from '../../ui/icon';
       height: 16px;
       padding: 0 4px;
       border-radius: var(--radius-pill);
-      background: var(--accent-color, #cba6f7);
-      color: var(--on-accent, var(--panel-bg, #1e1e2e));
+      background: var(--accent-color);
+      color: var(--on-accent, var(--panel-bg));
       font-size: 10px;
       font-weight: 700;
       line-height: 16px;

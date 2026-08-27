@@ -7,7 +7,7 @@ Provides MongoDB tools when a MongoDB datasource is attached to a job:
 - Document insertion
 - Document updates
 
-See docs/datasources.md for the datasource connector system.
+See knowledge-base/knowledge/datasources.md for the datasource connector system.
 """
 
 from typing import Any, Dict, List

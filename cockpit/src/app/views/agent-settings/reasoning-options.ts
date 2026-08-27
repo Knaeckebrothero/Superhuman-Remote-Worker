@@ -1,85 +1,91 @@
 /**
- * Pure function to determine available reasoning levels for a given model.
- *
- * Mirrors backend logic in src/core/loader.py (detect_model_family + detect_reasoning_method).
- * Extracted here so it can be shared between job and session creation components and tested independently.
+ * Reasoning level options for the Cockpit, driven by the backend-provided
+ * per-model reasoning capability (config/model_config_matrix.yaml's `reasoning`
+ * block, surfaced via /api/models → ModelService.reasoningByModel). This file
+ * no longer hardcodes family/provider logic — the backend is the single source
+ * of truth. See knowledge-base/knowledge/features/family_centered_reasoning.md.
  */
+import type {ReasoningCapability} from '../../core/services/model.service';
 
 export interface ReasoningOption {
   value: string | null;
   label: string;
 }
 
+const LABELS: Record<string, string> = {
+  none: 'None',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'X-High',
+  max: 'Max',
+  on: 'On',
+  off: 'Off',
+};
+
+function labelFor(value: string): string {
+  return LABELS[value] ?? value.charAt(0).toUpperCase() + value.slice(1);
+}
+
 /**
- * Returns the available reasoning level options for a given model identifier.
+ * Build the dropdown options for a model's reasoning capability.
  *
- * The logic matches the backend's provider/family detection:
- * - OpenRouter: supports all 6 levels natively
- * - Groq: no reasoning control
- * - gpt-oss (vLLM): supports all 6 levels via prompt injection
- * - Claude, Gemini: no reasoning control
- * - OpenAI, DeepSeek, Qwen, Llama: standard 4 levels
+ * - `none` / missing capability → just "Default" (no control).
+ * - `always_on` → a single non-selectable "Always on" entry (no off switch).
+ * - `effort_enum` / `binary_toggle` → "Default" + the family's exact options
+ *   (e.g. Low/Medium/High, or On/Off for gemma).
+ *
+ * "Default" (value `null`) means "don't override" — the family default applies.
  */
-export function getReasoningOptions(model: string | null): ReasoningOption[] {
-  const base: ReasoningOption[] = [{ value: null, label: 'Default' }];
+export function getReasoningOptions(
+  cap?: ReasoningCapability | null,
+): ReasoningOption[] {
+  const base: ReasoningOption[] = [{value: null, label: 'Default'}];
+  if (!cap || cap.method === 'none') return base;
+  if (cap.method === 'always_on') return [{value: null, label: 'Always on'}];
+  if (!cap.options?.length) return base;
+  return [...base, ...cap.options.map((o) => ({value: o, label: labelFor(o)}))];
+}
 
-  if (!model) {
-    return [...base,
-      { value: 'none', label: 'None' },
-      { value: 'low', label: 'Low' },
-      { value: 'medium', label: 'Medium' },
-      { value: 'high', label: 'High' },
-    ];
-  }
+/**
+ * Convenience: resolve options for a model id against the capability map from
+ * ModelService.reasoningByModel(). Unknown / not-yet-loaded models fall back to
+ * "Default" only (the backend supplies a capability for every catalog model).
+ */
+export function reasoningOptionsForModel(
+  modelId: string | null,
+  byModel: Record<string, ReasoningCapability>,
+): ReasoningOption[] {
+  return getReasoningOptions(modelId ? byModel[modelId] : null);
+}
 
-  const lower = model.toLowerCase();
+/**
+ * Concrete options WITHOUT the "Default" sentinel, for controls that preselect
+ * the resolved default value instead of offering a Default entry (the
+ * Settings-tab Reasoning select). Empty when the capability offers nothing the
+ * user can choose (`none`, `always_on`, missing/empty options) — callers hide
+ * the control entirely in that case.
+ */
+export function getSelectableReasoningOptions(
+  cap?: ReasoningCapability | null,
+): ReasoningOption[] {
+  if (!cap || cap.method === 'none' || cap.method === 'always_on') return [];
+  if (!cap.options?.length) return [];
+  return cap.options.map((o) => ({value: o, label: labelFor(o)}));
+}
 
-  // Provider-level: OpenRouter supports all 6 levels natively
-  if (lower.startsWith('openrouter/')) {
-    return [...base,
-      { value: 'none', label: 'None' },
-      { value: 'minimal', label: 'Minimal' },
-      { value: 'low', label: 'Low' },
-      { value: 'medium', label: 'Medium' },
-      { value: 'high', label: 'High' },
-      { value: 'xhigh', label: 'X-High' },
-    ];
-  }
-
-  // Provider-level: Groq doesn't pass reasoning through
-  if (lower.startsWith('groq/')) return base;
-
-  // Strip provider prefix for model family detection
-  let name = lower;
-  for (const prefix of ['openai/']) {
-    if (name.startsWith(prefix)) {
-      name = name.slice(prefix.length);
-      break;
-    }
-  }
-
-  // Model families that don't support reasoning control.
-  // Gemma 4 has a binary thinking toggle, not level control, and we keep it off
-  // due to vLLM parser bugs under tool calling (vllm#39043).
-  if (name.startsWith('claude') || name.startsWith('gemini') || name.includes('gemma')) return base;
-
-  // gpt-oss (vLLM prompt injection) supports all levels
-  if (name.startsWith('gpt-oss')) {
-    return [...base,
-      { value: 'none', label: 'None' },
-      { value: 'minimal', label: 'Minimal' },
-      { value: 'low', label: 'Low' },
-      { value: 'medium', label: 'Medium' },
-      { value: 'high', label: 'High' },
-      { value: 'xhigh', label: 'X-High' },
-    ];
-  }
-
-  // OpenAI, DeepSeek, Qwen, Llama, default -> low/medium/high
-  return [...base,
-    { value: 'none', label: 'None' },
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-  ];
+/**
+ * The value a capability resolves to when the user picks nothing: the family
+ * default when it is one of the selectable options, else the first option (an
+ * out-of-set default must not leave a native select unmatched — that renders
+ * as a blank control). `null` when nothing is selectable.
+ */
+export function defaultSelectableReasoning(
+  cap?: ReasoningCapability | null,
+): string | null {
+  const options = getSelectableReasoningOptions(cap);
+  if (!options.length) return null;
+  const fam = cap?.default ?? null;
+  return options.some((o) => o.value === fam) ? fam : options[0].value;
 }

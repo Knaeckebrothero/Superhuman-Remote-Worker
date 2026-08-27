@@ -6,24 +6,32 @@
 # block can carry up to three subsections:
 #   - prompts:       (prompt_type)      → filename in config/prompts/
 #   - instructions:  (instruction_type) → filename in config/templates/
-#   - settings:      inference parameters and `limits:` block
+#   - settings:      inference parameters (incl. model_max_context_tokens)
 #
 # Resolution: per-section, expert family → expert default → base family →
 # base default → hardcoded fallback. Sections and keys missing for a family
 # fall through to `default`.
 #
-# Limits derivation: a family's `limits:` block carries ONLY
-# `model_max_context_tokens` — the conservative working-window BASE. The other
-# leaves (context_threshold_tokens, summarization_safe_limit,
-# summarization_chunk_size, message_count_min_tokens) are DERIVED at load as
-# fixed fractions of the base (see the *_FRACTION constants + _apply_settings_matrix
-# in src/core/loader.py); do not hand-author them here. When a model is added
-# with an explicit per-model context window (Admin → Models `context_window`),
-# that value overrides the base and the same fractions re-derive the leaves.
-# `settings.model_max_context_tokens` (the top-level one) stays the model's true
-# nominal/API ceiling for the Layer-1 safety check + output-token sizing.
+# Context window: a family's `settings.model_max_context_tokens` is the model's
+# true max — a SINGLE value, with no separate conservative working-window cap.
+# The context-management `limits` leaves (model_max_context_tokens,
+# context_threshold_tokens, message_count_min_tokens) are DERIVED at load as
+# fixed fractions of that base (see the *_FRACTION constants +
+# _apply_settings_matrix in src/core/loader.py); do not hand-author them here.
+# When a model is added with an explicit per-model context window (Admin →
+# Models `context_window`), that value overrides the family base and the same
+# fractions re-derive the leaves. To run a model below its true max, set a
+# smaller per-model `context_window` — the app imposes no default cap of its own.
+#
+# Summarization budgets are deliberately NOT derived here: they are computed
+# at call time from the AUXILIARY model's own window (src/core/summarizer.py).
+# Deriving them from the main model's window sent 951k-token payloads to a
+# 131k summarizer — knowledge-base/knowledge/features/context_summarization_rework.md.
 
 default:
+  # Reasoning control per family (see knowledge-base/knowledge/features/family_centered_reasoning.md).
+  # method: effort_enum | binary_toggle | token_budget | always_on | none
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt.txt
     systemprompt_interactive: systemprompt_interactive.txt
@@ -34,13 +42,14 @@ default:
     memory_extraction: memory_extraction_prompt.txt
     memory_assembler: memory_assembler_prompt.txt
     curation: curation_prompt.txt
+    knowledge_assembler: knowledge_assembler_prompt.txt
+    citation_verification: citation_verification_prompt.txt
   instructions:
     instructions: instructions.md
     strategic_todos_initial: strategic_todos_initial.yaml
     strategic_todos_transition: strategic_todos_transition.yaml
     strategic_todos_resume: strategic_todos_resume.yaml
     workspace_template: workspace_template.md
-    todo_guide: todo_guide.md
   guardrails:
     file: default.yaml
   settings:
@@ -48,10 +57,17 @@ default:
     multimodal: false
     parallel_tool_calls: false
     model_max_context_tokens: 128000
-    limits:
-      model_max_context_tokens: 100000
+    # Per-image token cost for the compaction trigger. `default` is the flat
+    # biased-high fallback used for unknown families and unreadable image dims;
+    # multimodal families below override with a dimension-aware mode. Verified
+    # formulas: knowledge-history/done/context_token_accounting.md §4 + appendix.
+    image_tokens: { mode: flat, flat: 1600 }
 
 minimax:
+  # M2.7 reasoning is not a level we drive (no effort param); rely on endpoint
+  # default. NOTE: may actually be a thinking toggle (vLLM minimax_m2_append_think
+  # parser) — verify before promoting to binary_toggle.
+  reasoning: { method: none }
   prompts:
     systemprompt: systemprompt_minimax.txt
     persona: persona_minimax.txt
@@ -63,13 +79,21 @@ minimax:
   guardrails:
     file: minimax.yaml
   settings:
+    structured_output_method: json_schema
     temperature: 1.0  # M2.7 is a reasoning model; use default
     top_p: 0.95
     multimodal: false
     parallel_tool_calls: true
     model_max_context_tokens: 204800  # M2.7: 204,800 context, 131K max output
-    limits:
-      model_max_context_tokens: 170000
+    max_output_tokens: 49152  # reasoning headroom (resolver clamps to ctx backstop)
+    # MiniMax's OpenAI-compatible API defaults to thinking inside `content`
+    # wrapped in <think> tags (+ a stray extra `</think>` on tool-call turns).
+    # reasoning_split moves it to reasoning_content/reasoning_details — fields
+    # the reasoning capture layer already parses. Harmless via OpenRouter
+    # (normalizes either way). See
+    # knowledge-base/knowledge/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md
+    extra_body:
+      reasoning_split: true
 
 # MiniMax M3 (released 2026-06-01) — distinct family from `minimax` (M2.7) so
 # the two coexist. M3 ships the MSA sparse-attention architecture, a 1M-token
@@ -78,6 +102,22 @@ minimax:
 # API (LangChain ChatOpenAI), so tool calls use standard parens-form
 # serialization and `default.yaml` guardrails apply.
 minimax-m3:
+  # M3 thinking toggle on the NATIVE MiniMax API (the current transport):
+  # `thinking: {"type": adaptive|disabled}` on the OpenAI-compat wire. The API
+  # originally also took "enabled"; MiniMax removed it (live 400 on 2026-07-23:
+  # 'invalid thinking.type: "enabled" (allowed: adaptive, disabled)'), so "on"
+  # now maps to "adaptive" (the surviving reasoning-on value). Default "on" is
+  # sent explicitly (gemma precedent — robust against upstream default flips).
+  # NOTE: if an M3 row is ever served from self-hosted vLLM instead, the kwarg
+  # differs (chat_template_kwargs — verify the parser) and OpenRouter can't
+  # express this at all (effort ignored, invalid values 400 → its factory
+  # injects nothing, provider default applies).
+  reasoning:
+    method: binary_toggle
+    default: "on"
+    options: ["on", "off"]
+    toggle_param: thinking.type
+    toggle_map: { "on": "adaptive", "off": "disabled" }
   prompts:
     systemprompt: systemprompt_minimax_m3.txt
     persona: persona_minimax_m3.txt
@@ -89,6 +129,8 @@ minimax-m3:
   guardrails:
     file: minimax_m3.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    structured_output_method: function_calling
     temperature: 1.0   # MiniMax recommends temp 1.0 for M-series reasoning models
     top_p: 0.95        # MiniMax recommended top_p
     # top_k: intentionally omitted. MiniMax recommends top_k=40, but the OpenAI
@@ -99,20 +141,31 @@ minimax-m3:
     multimodal: true   # M3 is natively multimodal (image + video input)
     parallel_tool_calls: true  # M3 supports continuous + parallel tool calls
     model_max_context_tokens: 1000000  # M3: up to 1M context (>=512K guaranteed) via MSA
-    limits:
-      # MSA makes very long windows viable, but we cap the working window like
-      # the other 1M-class models (claude-opus, gpt-5, gemini) to bound cost and
-      # avoid long-context accuracy drift. Revisit upward after real M3 runs.
-      model_max_context_tokens: 200000
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    image_tokens: { mode: flat, flat: 1600 }  # no public per-image formula — calibrate via usage
+    # Same as the `minimax` family: without reasoning_split MiniMax's direct
+    # API returns thinking as <think> tags inside `content` (leaky titles,
+    # duplicated streaming text, stray double closer on tool-call turns).
+    # See knowledge-base/knowledge/issues/minimax_m3_think_tag_reasoning_leak_post_gateway.md
+    extra_body:
+      reasoning_split: true
 
 o-series:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0
     multimodal: true  # o3/o4-mini support image inputs
     parallel_tool_calls: true
     model_max_context_tokens: 200000
-    limits:
-      model_max_context_tokens: 170000
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # o1/o3 tile model: 75 base + 150/tile after 2048/768 fit. NOTE: o4-mini is
+    # actually patch-based, but family_of() folds o1/o3/o4 -> "o-series"
+    # (model_registry.py), so a standalone o4-mini matrix row would be dead
+    # config — it shares this tile estimate (biased-low for o4-mini). Acceptable
+    # while o4-mini is unused; the real fix when it is adopted is splitting it
+    # into its own family + an openai_patches row (budget 1536, x1.72).
+    image_tokens: { mode: openai_tiles, base: 75, per_tile: 150, tile_px: 512, flat: 1000 }
 
 # DeepSeek V4 family (released 2026-04-24). Covers BOTH variants — family_of()
 # maps `deepseek-v4-pro` (1.6T/49B) and `deepseek-v4-flash` (284B/13B) to this
@@ -135,6 +188,8 @@ o-series:
 # would add maintenance with no benefit. Fork the phase prompts only if real V4 runs
 # show a need.
 deepseek:
+  # Served via OpenRouter → unified effort param (superset incl. xhigh→max upstream).
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [none, minimal, low, medium, high, xhigh] }
   prompts:
     # Worker-path scaffold + identity
     systemprompt: systemprompt_deepseek.txt
@@ -148,6 +203,7 @@ deepseek:
   guardrails:
     file: deepseek.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     # In THINKING mode DeepSeek V4 ignores temperature/top_p/penalties — tune the
     # prompt, not sampling. These values apply only to any non-thinking fallback
     # turn; DeepSeek's own guidance is temp 0.0 for code/agentic work. Reasoning
@@ -158,32 +214,105 @@ deepseek:
     multimodal: false  # V4 Pro + Flash are text-only
     parallel_tool_calls: false  # DeepSeek parallel tool calls remain unreliable
     model_max_context_tokens: 1000000  # V4 Pro + Flash: 1M context (was 64K on V3/R1)
-    limits:
-      # Cap the working window like the other 1M-class families (claude-opus,
-      # gpt-5, gemini, minimax-m3) to bound cost + avoid long-context drift.
-      # Revisit upward after real V4 runs.
-      model_max_context_tokens: 200000
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+
+# Zhipu GLM-5.2 (released 2026-06-13) — text-only hybrid reasoning model,
+# 744B-MoE / ~40B-active, with a usable 1M-token context window, served
+# OpenAI-compatible via OpenRouter (LangChain ChatOpenAI). Closest analogue is
+# `deepseek`: standard parens-form tool wire, reasoning returned out-of-band and
+# captured by src/llm/reasoning_chat.py. Reasoning EFFORT rides on the per-model
+# catalog row (reasoning_level → OpenRouter `reasoning.effort`), NOT here. Vision
+# is a separate model (GLM-5V-Turbo), so this family is text-only.
+#
+# Prompts: forks the worker scaffold (`systemprompt`), the persistent-chat
+# scaffold (`systemprompt_interactive`), and the identity (`persona`). The phase
+# prompts (`strategic`/`tactical`/`summarization`) and `instructions` inherit
+# `default` — they are model-agnostic and GLM's tool wire is the standard
+# parens-form, so a fork would add maintenance with no benefit. Aux-path prompts
+# (memory_*, curation) are NOT forked: GLM is a chat/worker model, not the
+# auxiliary model.
+glm:
+  # Served via OpenRouter → unified effort param (superset incl. xhigh→max upstream).
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [none, minimal, low, medium, high, xhigh] }
+  prompts:
+    systemprompt: systemprompt_glm.txt
+    systemprompt_interactive: systemprompt_interactive_glm.txt
+    persona: persona_glm.txt
+  guardrails:
+    file: glm.yaml
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    temperature: 1.0           # Z.ai published default for GLM-5.2 (thinking on by default)
+    top_p: 0.95                # Z.ai published default
+    multimodal: false          # text-only; vision is the separate GLM-5V-Turbo
+    parallel_tool_calls: false # brand-new model — start safe, flip to true once validated
+    model_max_context_tokens: 1000000  # usable 1M-token window
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 
 gemini:
+  # Phase 2 → token_budget (thinkingConfig.thinkingBudget; 2.5 Pro is always_on).
+  # v1: no control wired; output capture via include_thoughts stays in the factory.
+  reasoning: { method: none }
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     top_p: 0.95
     top_k: 40
     multimodal: true  # Gemini models are natively multimodal
     parallel_tool_calls: true
     model_max_context_tokens: 1000000
-    limits:
-      model_max_context_tokens: 200000
+    max_output_tokens: 65536  # thinking counts against output (always-on) — give room
+    # Gemini API (ai.google.dev) bills a small flat per image (258 at MEDIUM /
+    # ~1120 at Gemini-3 HIGH). 2304 = biased-high (256 + Pan&Scan upside). NOT
+    # Vertex (which crop-tiles ~7x higher) — log the endpoint if that changes.
+    image_tokens: { mode: flat, flat: 2304 }
 
 claude-opus:
+  # Phase 2 → token_budget (thinking.budget_tokens; min 1024; no temp/top_p/top_k).
+  reasoning: { method: none }
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
     multimodal: true  # Claude Opus 4.6 supports vision
     parallel_tool_calls: true
     model_max_context_tokens: 1000000  # Opus 4.6: 1M context, 128K max output
-    limits:
-      model_max_context_tokens: 200000
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 2576, max_tokens: 4784, flat: 4784 }
+
+# Claude Sonnet / Haiku — NEW rows. Without them family_of('claude-sonnet')
+# falls through to `default` (multimodal:false!), so the homelab interactive
+# main model never counted images and compacted at the 128k default window.
+# Vision = 28px patches at the legacy cap (1568px edge / 1568 tok).
+claude-sonnet:
+  reasoning: { method: none }   # Phase 2 → token_budget
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    temperature: 1.0
+    multimodal: true
+    parallel_tool_calls: true
+    model_max_context_tokens: 1000000  # Sonnet 4.x: up to 1M context
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
+    # 1568px edge cap ⇒ the provider downscales a 150-DPI A4 anyway; render at
+    # 130 (~at the cap) to stop paying for pixels the model discards. Omitting
+    # this key on a family ⇒ renderer default (150). Tune with calibration data
+    # (multimodal_image_cost_optimization.md §1) before lowering other families.
+    pdf_render_dpi: 130
+
+claude-haiku:
+  reasoning: { method: none }   # Phase 2 → token_budget
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    temperature: 1.0
+    multimodal: true
+    parallel_tool_calls: true
+    model_max_context_tokens: 200000  # Haiku 4.5: 200K context
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
+    pdf_render_dpi: 130  # legacy 1568px cap — see claude-sonnet note
 
 gpt-5:
+  # minimal (GPT-5 family) is the deferred correctness pass — clamped to low today.
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt_gpt_5.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
@@ -200,17 +329,60 @@ gpt-5:
   guardrails:
     file: gpt_5.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5 supports image inputs
-    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
-    # LangChain's Responses API streaming corrupts parallel tool call args,
-    # and the Codex proxy only supports the Responses API.
-    parallel_tool_calls: false
+    # Enabled 2026-07-15. langchain#34660 is still OPEN but only concerns the
+    # final `response.completed` Responses chunk lacking tool_calls; the
+    # incremental function_call/args-delta stream chunks are emitted correctly
+    # and the graph loop aggregates them via AIMessageChunk (verified against
+    # langchain-openai 1.1.12 and upstream master — code path unchanged). The
+    # Codex proxy only supports the Responses API; validated on gpt-5.6, and
+    # gpt-5/codex/codex-spark share the identical transport.
+    parallel_tool_calls: true
     model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
-    limits:
-      model_max_context_tokens: 200000
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # 32px patches. gpt-5.5 `auto`->original (budget 10000); gpt-5.4 `auto`->high
+    # (2500). budget 10000 is biased-high across both; full models bill patches
+    # ~1:1 (no published multiplier). A 1700x2200 page ~= 3726 tok.
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
+
+gpt-5.6:
+  # GPT-5.6 (GA 2026-07-09): Luna / Terra / Sol tiers, 1M ctx / 128K max output.
+  # Dedicated family because effort options are a family-level property and
+  # 5.6 adds xhigh + max, which older gpt-5.x rows must not offer. `ultra` is
+  # NOT an effort — it's `reasoning.mode` (standard/pro/ultra), deliberately
+  # unsupported here (different API param, ~4x token burn).
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
+  prompts:
+    # Aliases the gpt-5 prompt set (same wire format) — exactly how `codex`
+    # does it. Fork into _gpt_5_6 files only when 5.6-specific drift shows up.
+    systemprompt: systemprompt_gpt_5.txt
+    systemprompt_interactive: systemprompt_interactive_gpt_5.txt
+    persona: persona_gpt_5.txt
+    strategic: strategic_gpt_5.txt
+    tactical: tactical_gpt_5.txt
+    summarization: summarization_prompt_gpt_5.txt
+    memory_extraction: memory_extraction_prompt_gpt_5.txt
+    memory_assembler: memory_assembler_prompt_gpt_5.txt
+    curation: curation_prompt_gpt_5.txt
+  guardrails:
+    file: gpt_5_6.yaml
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    structured_output_method: json_schema
+    temperature: 1.0  # Reasoning model: only default 1.0 is supported
+    multimodal: true  # GPT-5.6 supports image inputs
+    # Enabled 2026-07-15 — empirically validated. Same Responses-API path as
+    # gpt-5; see the gpt-5 block for why langchain#34660 doesn't block this.
+    parallel_tool_calls: true
+    model_max_context_tokens: 1000000  # Luna/Terra/Sol: 1M ctx, 128K max output
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # Same 32px-patch vision scheme as the gpt-5 family.
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
 codex:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt_gpt_5.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
@@ -225,15 +397,19 @@ codex:
   guardrails:
     file: codex.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: true  # gpt-5.3-codex supports image inputs (screenshots, diagrams, UI)
-    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
-    parallel_tool_calls: false
+    # Enabled 2026-07-15. Same Responses-API/codex-proxy path as gpt-5; see the
+    # gpt-5 block for why langchain#34660 doesn't block the graph loop.
+    parallel_tool_calls: true
     model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
-    limits:
-      model_max_context_tokens: 350000
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # Same 32px-patch vision scheme as the gpt-5 family.
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
 codex-spark:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt_codex_spark.txt
     systemprompt_interactive: systemprompt_interactive_gpt_5.txt
@@ -244,15 +420,18 @@ codex-spark:
   guardrails:
     file: codex_spark.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: false  # Codex Spark is code-focused, no vision
-    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
-    parallel_tool_calls: false
+    # Enabled 2026-07-15. Same Responses-API/codex-proxy path as gpt-5; see the
+    # gpt-5 block for why langchain#34660 doesn't block the graph loop.
+    parallel_tool_calls: true
     model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
-    limits:
-      model_max_context_tokens: 110000
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 
 gpt-oss:
+  # Effort delivered via the `Reasoning: {level}` system-prompt line (harmony), not an API param.
+  reasoning: { method: effort_enum, delivery: prompt, default: medium, options: [low, medium, high] }
   prompts:
     systemprompt: systemprompt_gpt_oss.txt
     persona: persona_gpt_oss.txt
@@ -264,7 +443,6 @@ gpt-oss:
     curation: curation_prompt_gpt_oss.txt
   instructions:
     instructions: instructions_gpt_oss.md
-    todo_guide: todo_guide_gpt_oss.md
     strategic_todos_transition: strategic_todos_transition_gpt_oss.yaml
   guardrails:
     file: gpt_oss.yaml
@@ -276,8 +454,7 @@ gpt-oss:
     multimodal: false  # gpt-oss-120b is text-only (MoE architecture)
     parallel_tool_calls: false  # Served via vLLM; parallel calls need provider support
     model_max_context_tokens: 131072  # True 128K context (MoE: 117B total, 5.1B active)
-    limits:
-      model_max_context_tokens: 110000
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 
 # Gemma 4 has native system role, native multimodality, and strong Markdown
 # instruction following. Two integration challenges drove the variants below:
@@ -290,7 +467,7 @@ gpt-oss:
 #    `instructions_gemma.md` teach the canonical format with concrete examples
 #    and a positive contrast ("braces, never parens"). The runtime-side
 #    no-tool-call streak detector in `src/graph.py` is the safety net.
-#    Precipitating incident: docs/issues/gemma_tool_call_parser_loop.md.
+#    Precipitating incident: knowledge-base/knowledge/issues/gemma_tool_call_parser_loop.md.
 #
 # 2. Repetition loops: the structured-output (memory/curation) variants add
 #    explicit anti-repetition guidance to mitigate vllm#40080 (xgrammar JSON
@@ -298,6 +475,17 @@ gpt-oss:
 #    `repetition_penalty` / `frequency_penalty` below are the runtime-side
 #    mitigation.
 gemma:
+  reasoning:
+    # Gemma 4 is a hybrid thinking model — binary on/off via the vLLM chat
+    # template (`enable_thinking`), NOT an effort level. Default ON so SRW gets
+    # reasoning regardless of the upstream endpoint default (which other tenants
+    # can flip off). Verified live on k3d 2026-06-22. The previous behaviour sent
+    # an inert `reasoning_effort` the gemma4 parser ignores.
+    method: binary_toggle
+    default: "on"
+    options: ["on", "off"]
+    toggle_param: chat_template_kwargs.enable_thinking
+    toggle_map: { "on": true, "off": false }
   prompts:
     # Worker-path variants
     systemprompt: systemprompt_gemma.txt
@@ -319,6 +507,7 @@ gemma:
   guardrails:
     file: gemma.yaml
   settings:
+    structured_output_method: json_schema
     # Google official for Gemma 4 instruct is temp=1.0, top_p=0.95, top_k=64.
     # We run temp=0.3 because the workload is heavy tool-calling / structured
     # output and community evidence shows high entropy increases malformed
@@ -335,14 +524,48 @@ gemma:
     multimodal: true  # Gemma 4 31B accepts text + image + video (no audio on 31B)
     parallel_tool_calls: false  # vllm#39392: concurrent tool calls can emit <pad> tokens
     model_max_context_tokens: 131072  # Endpoint reports 131072 for current deployment
-    limits:
-      model_max_context_tokens: 110000
+    # Flat per image (Gemma 4 default 280; pan-and-scan off in vLLM). 320 =
+    # 280 x ~1.14 bias. Forward-looking — gemma is the text-only summarizer.
+    image_tokens: { mode: flat, flat: 320 }
 
-# Model-specific overrides — add as needed:
-# claude-sonnet:
+# Mistral 3 family — Large 3 / Medium 3.5 / Small 4 / Codestral, wired as a
+# native first-class provider (provider slug 'mistral' → ReasoningChatOpenAI at
+# api.mistral.ai/v1, see src/core/loader._create_mistral_llm). Like claude/
+# gemini/o-series this is a SETTINGS-ONLY family: Mistral speaks the standard
+# OpenAI Chat Completions wire (parens-form tool calls + function calling), so
+# the `default` prompts/instructions and `default.yaml` guardrails apply
+# unchanged — only vision/context/sampling need a row. WITHOUT this block,
+# family_of() maps mistral-* → "mistral" but the lookup falls through to
+# `default` (multimodal: false!), so the vision models accept images yet
+# mis-count image tokens and compact at the wrong window — the failure the
+# claude-sonnet row documents. Codestral is text-only but shares the block; its
+# catalog row omits the `vision` capability, so it never receives images.
+mistral:
+  reasoning: { method: none }   # Mistral has no reasoning-level control we drive
+  settings:
+    temperature: 0.0   # agentic/tool-use default (matches `default`/deepseek); raise toward ~0.3 for freeform chat
+    multimodal: true   # Large 3 / Medium 3.5 / Small 4 take image input
+    # Mistral's documented default ("the model decides if it uses parallel tool
+    # calls"); Large 3 / Medium 3.5 / Small / Codestral all support it. Safe here
+    # because we hit Chat Completions via ChatOpenAI — the gpt-5/codex
+    # Responses-API parallel-call corruption bug (langchain#34660) doesn't apply.
+    parallel_tool_calls: true
+    model_max_context_tokens: 256000  # Mistral 3 family: 256K (a per-model catalog context_window still overrides this)
+    # Mistral 3 vision encoder: 14px patches merged into 2x2 blocks ⇒ one image
+    # token per 28x28px region (Mistral docs bill at 784px = 28²). The longest
+    # edge is resized to ≤1540 (short side to the nearest multiple of 28), so the
+    # ceiling is (1540/28)² = 55×55 = 3025 tokens/image. `anthropic_patches` is
+    # the generic two-constraint (max_edge + max_tokens) resize-then-patchify
+    # estimator — reused here with Mistral's numbers, not Anthropic's. Sources:
+    # docs.mistral.ai/capabilities/vision + the Mistral-Small-2503 encoder spec.
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1540, max_tokens: 3025, flat: 3025 }
+
+# Model-specific overrides — add as needed (use a real family_of() key; note
+# claude-sonnet/claude-haiku already have rows above):
+# my-custom-family:
 #   prompts:
-#     systemprompt: systemprompt_claude_sonnet.txt
+#     systemprompt: systemprompt_custom.txt
 #   instructions:
-#     instructions: instructions_claude_sonnet.md
+#     instructions: instructions_custom.md
 #   settings:
 #     temperature: 1.0

@@ -32,10 +32,12 @@ def create_workspace_tools(context: ToolContext) -> List[Any]:
 
     from .files import create_file_tools
     from .filesystem import create_filesystem_tools
+    from .skills import create_skill_tools
 
     tools = []
     tools.extend(create_file_tools(context))
     tools.extend(create_filesystem_tools(context))
+    tools.extend(create_skill_tools(context))
 
     return tools
 
@@ -44,8 +46,9 @@ def get_workspace_metadata() -> Dict[str, Dict[str, Any]]:
     """Get metadata for all workspace tools."""
     from .files import FILE_TOOLS_METADATA
     from .filesystem import FILESYSTEM_TOOLS_METADATA
+    from .skills import SKILL_TOOLS_METADATA
 
-    return {**FILE_TOOLS_METADATA, **FILESYSTEM_TOOLS_METADATA}
+    return {**FILE_TOOLS_METADATA, **FILESYSTEM_TOOLS_METADATA, **SKILL_TOOLS_METADATA}
 
 
 # Re-export metadata for backwards compatibility
@@ -53,5 +56,6 @@ def _get_combined_metadata() -> Dict[str, Dict[str, Any]]:
     """Internal: get combined metadata (called at module level for registry)."""
     from .files import FILE_TOOLS_METADATA
     from .filesystem import FILESYSTEM_TOOLS_METADATA
+    from .skills import SKILL_TOOLS_METADATA
 
-    return {**FILE_TOOLS_METADATA, **FILESYSTEM_TOOLS_METADATA}
+    return {**FILE_TOOLS_METADATA, **FILESYSTEM_TOOLS_METADATA, **SKILL_TOOLS_METADATA}

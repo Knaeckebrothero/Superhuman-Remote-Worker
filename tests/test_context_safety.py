@@ -1,19 +1,39 @@
-"""Tests for two-layer context safety system.
+"""Tests for the context safety system.
 
-Tests the recursive summarization (Layer 2) and pre-request safety check (Layer 1)
-that prevent LLM requests from exceeding the model context limit.
+Covers the aux-budgeted rolling-fold summarization engine
+(src/core/summarizer.py), its integration through ContextManager
+(summarize_conversation / summarize_and_compact / ensure_within_limits),
+and the pre-request formatting/observation-masking helpers.
+
+Design: knowledge-base/knowledge/features/context_summarization_rework.md.
 """
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from src.core.context import ContextManager, ContextConfig, ConversationSummary
+from src.core.summarizer import (
+    SummarizationEngine,
+    SummarizationFailed,
+    is_overflow_error,
+)
 
 
 # =============================================================================
 # Test Fixtures
 # =============================================================================
+
+
+# Deterministic counter for planner tests: 4 chars per token, no tiktoken.
+def char_counter(text: str) -> int:
+    return len(text) // 4
 
 
 @pytest.fixture
@@ -26,10 +46,7 @@ def context_config():
         message_count_min_tokens=500,
         keep_recent_messages=3,
         keep_recent_tool_results=2,
-        # Safety layer constants - low values for testing
         model_max_context_tokens=2000,
-        summarization_safe_limit=800,  # Triggers recursive summarization
-        summarization_chunk_size=400,  # Small chunks for testing
     )
 
 
@@ -39,18 +56,12 @@ def context_manager(context_config):
     return ContextManager(config=context_config, model="gpt-4")
 
 
-@pytest.fixture
-def mock_llm():
-    """Create a mock AuxiliaryLLM that returns structured summaries.
-
-    Returns an AuxiliaryLLM-compatible object with a mock LLM that supports
-    with_structured_output() for use in ContextManager methods.
-    """
+def make_mock_aux(max_context_tokens=15_000):
+    """Create a mock AuxiliaryLLM that returns structured summaries."""
     from src.services.auxiliary import AuxiliaryLLM
 
     llm = MagicMock()
 
-    # Mock the with_structured_output method (include_raw=True format)
     parsed_value = ConversationSummary(
         summary="Test summary of the conversation.",
         tasks_completed="- Task 1 completed\n- Task 2 completed",
@@ -69,7 +80,31 @@ def mock_llm():
     )
     llm.with_structured_output = MagicMock(return_value=structured_llm)
 
-    return AuxiliaryLLM(llm=llm)
+    return AuxiliaryLLM(llm=llm, max_context_tokens=max_context_tokens)
+
+
+@pytest.fixture
+def mock_llm():
+    """AuxiliaryLLM-compatible mock with a 15k-token window."""
+    return make_mock_aux()
+
+
+def make_failing_aux(error: Exception, max_context_tokens=15_000):
+    """Create a mock AuxiliaryLLM whose every call raises ``error``."""
+    from src.services.auxiliary import AuxiliaryLLM
+
+    llm = MagicMock()
+    structured_llm = AsyncMock()
+    structured_llm.ainvoke = AsyncMock(side_effect=error)
+    llm.with_structured_output = MagicMock(return_value=structured_llm)
+    llm.ainvoke = AsyncMock(side_effect=error)
+    return AuxiliaryLLM(llm=llm, max_context_tokens=max_context_tokens)
+
+
+@pytest.fixture(autouse=True)
+def fast_backoff(monkeypatch):
+    """No real sleeps between summarization retries in tests."""
+    monkeypatch.setattr("src.core.summarizer.BACKOFF_SECONDS", (0.0, 0.0))
 
 
 def create_large_message_history(
@@ -87,48 +122,423 @@ def create_large_message_history(
     return messages
 
 
+def make_engine(aux, *, max_summary_length=3000, **kwargs):
+    """Engine with deterministic char-based counting for planner tests."""
+    return SummarizationEngine(
+        aux,
+        max_summary_length=max_summary_length,
+        token_counter=char_counter,
+        **kwargs,
+    )
+
+
 # =============================================================================
-# Tests for _split_into_chunks
+# Tests for SummarizationEngine.plan
 # =============================================================================
 
 
-class TestSplitIntoChunks:
-    """Tests for the _split_into_chunks helper method."""
+class TestSummarizationPlanner:
+    """The plan is pure and deterministic: no chunk may exceed the budget
+    derived from the AUXILIARY model's window (never the main model's)."""
 
-    def test_single_chunk_when_small(self, context_manager):
-        """Small input should result in a single chunk."""
-        parts = ["Short message 1", "Short message 2", "Short message 3"]
-        chunks = context_manager._split_into_chunks(parts, target_tokens=1000)
+    def test_single_chunk_when_small(self, mock_llm):
+        engine = make_engine(mock_llm)
+        plan = engine.plan(["Short message 1", "Short message 2"])
 
-        assert len(chunks) == 1
-        assert chunks[0] == parts
+        assert plan.n_passes == 1
+        assert plan.chunks[0].first_part == 1
+        assert plan.chunks[0].last_part == 2
 
-    def test_multiple_chunks_when_large(self, context_manager):
-        """Large input should be split into multiple chunks."""
-        # Each part is ~100 tokens (400 chars / 4)
-        parts = ["x" * 400 for _ in range(10)]
-        chunks = context_manager._split_into_chunks(parts, target_tokens=200)
+    def test_multiple_chunks_when_large(self, mock_llm):
+        # window 15000 → budget = floor(15000*0.85) - overhead(2000) - 2*1000
+        engine = make_engine(mock_llm)
+        budget = engine.chunk_budget
+        assert budget > 0
 
-        # Should create multiple chunks
-        assert len(chunks) > 1
-        # All parts should be included
-        all_parts = [p for chunk in chunks for p in chunk]
-        assert len(all_parts) == 10
+        # 30 parts of ~1000 tokens each (4000 chars / 4)
+        parts = [f"part {i}: " + "x" * 4000 for i in range(30)]
+        plan = engine.plan(parts)
 
-    def test_empty_input(self, context_manager):
-        """Empty input should return empty list."""
-        chunks = context_manager._split_into_chunks([], target_tokens=1000)
-        assert chunks == []
+        assert plan.n_passes > 1
+        # Every chunk within budget
+        for chunk in plan.chunks:
+            assert chunk.tokens <= budget
+        # All parts covered, in order, no gaps
+        assert plan.chunks[0].first_part == 1
+        assert plan.chunks[-1].last_part == 30
+        for prev, nxt in zip(plan.chunks, plan.chunks[1:]):
+            assert nxt.first_part == prev.last_part + 1
 
-    def test_single_large_part(self, context_manager):
-        """Single part larger than target should be its own chunk."""
-        # One part that's ~250 tokens
-        parts = ["x" * 1000]
-        chunks = context_manager._split_into_chunks(parts, target_tokens=100)
+    def test_empty_input_yields_empty_plan(self, mock_llm):
+        engine = make_engine(mock_llm)
+        plan = engine.plan([])
+        assert plan.n_passes == 0
 
-        # Should still be one chunk (can't split a single part)
-        assert len(chunks) == 1
-        assert chunks[0] == parts
+    def test_oversized_single_part_is_split(self, mock_llm):
+        """One giant tool result must not produce an over-budget chunk."""
+        engine = make_engine(mock_llm)
+        budget = engine.chunk_budget
+
+        # Single part at ~3x the budget
+        parts = ["x" * (budget * 4 * 3)]
+        plan = engine.plan(parts)
+
+        assert plan.n_passes >= 3
+        for chunk in plan.chunks:
+            assert chunk.tokens <= budget
+            # All belong to the same original part ordinal
+            assert chunk.first_part == 1
+            assert chunk.last_part == 1
+        assert "[part 1/" in plan.chunks[0].text
+
+    def test_window_too_small_raises(self):
+        aux = make_mock_aux(max_context_tokens=3000)
+        engine = make_engine(aux, max_summary_length=10000)
+
+        with pytest.raises(SummarizationFailed) as exc_info:
+            engine.plan(["hello"])
+        assert exc_info.value.reason == "aux_window_too_small"
+
+    def test_budget_derives_from_aux_window_not_main(self, mock_llm):
+        """The regression this rework exists for: a giant main-model window
+        must not inflate the summarizer's chunk budget."""
+        engine = make_engine(mock_llm)
+        # Budget must be bounded by the aux window regardless of any main
+        # model configuration (the engine never sees the main config at all).
+        assert engine.chunk_budget < mock_llm.max_context_tokens
+
+    def test_unknown_window_falls_back_conservative(self):
+        aux = make_mock_aux(max_context_tokens=None)
+        engine = make_engine(aux)
+        from src.core.summarizer import DEFAULT_AUX_WINDOW
+
+        assert engine.aux_window == DEFAULT_AUX_WINDOW
+
+
+# =============================================================================
+# Tests for the extracted ChunkPlanner (Slice 1)
+# =============================================================================
+
+
+class TestChunkPlannerParity:
+    """SummarizationEngine.plan now delegates to the shared ChunkPlanner. The
+    extraction refactor must not move a single chunk boundary (byte parity),
+    and the load-bearing double-subtraction of the output budget must survive.
+    """
+
+    def test_engine_delegates_byte_identically(self, mock_llm):
+        import math
+
+        from src.core.chunk_planner import ChunkPlanner
+
+        engine = make_engine(mock_llm)
+        # A standalone planner built from the same authority as the engine's
+        # internal one (two reserves = output_budget, no overlap).
+        planner = ChunkPlanner(
+            engine.aux_window,
+            overhead_tokens=engine._overhead,
+            output_reserve=engine.output_budget,
+            carry_reserve=engine.output_budget,
+            overlap_ratio=0.0,
+            token_counter=char_counter,
+        )
+        budget = engine.chunk_budget
+        cases = [
+            [],
+            ["short message 1", "short message 2"],
+            [f"part {i}: " + "x" * 4000 for i in range(30)],  # multi-chunk
+            ["x" * (budget * 4 * 3)],  # oversized single part → hard split
+        ]
+        for parts in cases:
+            assert planner.chunk_budget == engine.chunk_budget
+            assert planner.plan(parts).describe() == engine.plan(parts).describe()
+            assert math.isclose(
+                planner.plan(parts).total_tokens, engine.plan(parts).total_tokens
+            )
+
+    def test_budget_subtracts_output_budget_twice(self, mock_llm):
+        """The fold carries the rolling summary, so output_budget is reserved
+        twice. Pin it — a regression that drops the second subtraction would
+        silently oversize every fold chunk (the 5dbb5770-class failure)."""
+        import math
+
+        from src.core.chunk_planner import SAFETY_MARGIN
+
+        engine = make_engine(mock_llm)
+        expected = (
+            math.floor(engine.aux_window * SAFETY_MARGIN)
+            - engine._overhead
+            - 2 * engine.output_budget
+        )
+        assert engine.chunk_budget == expected
+
+
+class TestChunkPlannerOverlap:
+    """overlap_ratio > 0 (extraction-only): adjacent chunks share a whole-part
+    seed so a fact straddling a boundary lands in two chunks, yet no chunk ever
+    exceeds the budget and every part is still covered."""
+
+    def _planner(self, overlap_ratio):
+        from src.core.chunk_planner import ChunkPlanner
+
+        # Window comfortably above the 1_000-token planning floor.
+        return ChunkPlanner(
+            12_000,
+            overhead_tokens=0,
+            output_reserve=0,
+            carry_reserve=0,
+            overlap_ratio=overlap_ratio,
+            token_counter=char_counter,
+        )
+
+    def _parts(self, planner, n=12, frac=5):
+        # Each part ~ budget/frac tokens (char_counter = len // 4).
+        part_tokens = planner.chunk_budget // frac
+        return ["x" * (part_tokens * 4) for _ in range(n)]
+
+    def test_no_overlap_has_contiguous_disjoint_ranges(self):
+        planner = self._planner(0.0)
+        plan = planner.plan(self._parts(planner))
+        assert plan.n_passes >= 2
+        for cur, nxt in zip(plan.chunks, plan.chunks[1:]):
+            assert nxt.first_part == cur.last_part + 1  # hard boundary
+
+    def test_overlap_ranges_intersect_and_stay_in_budget(self):
+        planner = self._planner(0.3)
+        budget = planner.chunk_budget
+        parts = self._parts(planner)
+        plan = planner.plan(parts)
+
+        assert plan.n_passes >= 2
+        # No chunk exceeds the real budget despite the prepended seed.
+        assert all(c.tokens <= budget for c in plan.chunks)
+        # At least one adjacent pair shares a part (ranges intersect).
+        assert any(
+            nxt.first_part <= cur.last_part
+            for cur, nxt in zip(plan.chunks, plan.chunks[1:])
+        )
+        # Every part is still covered — overlap adds, never drops.
+        covered = set()
+        for c in plan.chunks:
+            covered.update(range(c.first_part, c.last_part + 1))
+        assert covered == set(range(1, len(parts) + 1))
+
+    def test_overlap_terminates_with_parts_larger_than_seed(self):
+        # Parts bigger than the overlap allowance must not loop or drop content
+        # (the seed is empty for those, packing just proceeds normally).
+        planner = self._planner(0.3)
+        parts = self._parts(planner, n=6, frac=2)  # ~budget/2 each > overlap
+        plan = planner.plan(parts)
+        assert plan.n_passes >= 2
+        covered = set()
+        for c in plan.chunks:
+            covered.update(range(c.first_part, c.last_part + 1))
+        assert covered == set(range(1, len(parts) + 1))
+
+
+# =============================================================================
+# Tests for the rolling fold (SummarizationEngine.run)
+# =============================================================================
+
+
+class TestRollingFold:
+    """summary_i = summarize(summary_{i-1} + chunk_i), with bounded retries
+    on the SAME structured call — no unstructured fallback exists anymore."""
+
+    @pytest.mark.asyncio
+    async def test_single_pass_returns_formatted_summary(self, mock_llm):
+        engine = make_engine(mock_llm)
+        plan = engine.plan(["User: Hello", "Assistant: Hi"])
+        result = await engine.run(plan)
+
+        assert "**Summary:**" in result
+        assert "Test summary" in result
+
+    @pytest.mark.asyncio
+    async def test_fold_threads_running_summary(self, mock_llm):
+        """Pass 2 must see pass 1's summary as 'Prior Summary:'."""
+        engine = make_engine(mock_llm)
+        parts = [f"part {i}: " + "x" * 4000 for i in range(30)]
+        plan = engine.plan(parts)
+        assert plan.n_passes > 1
+
+        await engine.run(plan)
+
+        structured = mock_llm.llm.with_structured_output.return_value
+        assert structured.ainvoke.call_count == plan.n_passes
+        # Second call's human message carries the running summary
+        second_call_messages = structured.ainvoke.call_args_list[1][0][0]
+        human_content = second_call_messages[1].content
+        assert "Prior Summary:" in human_content
+        assert "Test summary" in human_content
+
+    @pytest.mark.asyncio
+    async def test_seed_summary_reaches_first_pass(self, mock_llm):
+        engine = make_engine(mock_llm)
+        plan = engine.plan(["User: continue please"])
+        await engine.run(plan, seed_summary="Previously: built the parser.")
+
+        structured = mock_llm.llm.with_structured_output.return_value
+        first_call_messages = structured.ainvoke.call_args_list[0][0][0]
+        assert "Prior Summary: Previously: built the parser." in (
+            first_call_messages[1].content
+        )
+
+    @pytest.mark.asyncio
+    async def test_focus_included_in_fold(self, mock_llm):
+        engine = make_engine(mock_llm)
+        plan = engine.plan(["User: lots of stuff"])
+        await engine.run(plan, focus="keep the SQL schema details")
+
+        structured = mock_llm.llm.with_structured_output.return_value
+        first_call_messages = structured.ainvoke.call_args_list[0][0][0]
+        assert "keep the SQL schema details" in first_call_messages[1].content
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_retried_then_succeeds(self, mock_llm):
+        parsed_value = ConversationSummary(
+            summary="Recovered summary.",
+            tasks_completed="",
+            key_decisions="",
+            current_state="",
+        )
+        structured = mock_llm.llm.with_structured_output.return_value
+        structured.ainvoke = AsyncMock(
+            side_effect=[
+                Exception("503 all backends unavailable"),
+                {
+                    "raw": AIMessage(content="ok"),
+                    "parsed": parsed_value,
+                    "parsing_error": None,
+                },
+            ]
+        )
+
+        engine = make_engine(mock_llm)
+        plan = engine.plan(["User: hello"])
+        result = await engine.run(plan)
+
+        assert "Recovered summary" in result
+        assert structured.ainvoke.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_raises_after_max_attempts(self):
+        aux = make_failing_aux(Exception("503 all backends unavailable"))
+        engine = make_engine(aux)
+        plan = engine.plan(["User: hello"])
+
+        with pytest.raises(SummarizationFailed) as exc_info:
+            await engine.run(plan)
+
+        assert exc_info.value.reason == "aux_unavailable"
+        from src.core.summarizer import MAX_ATTEMPTS
+
+        structured = aux.llm.with_structured_output.return_value
+        assert structured.ainvoke.call_count == MAX_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_overflow_error_never_retried(self):
+        """A planned call that overflows is a plan bug — deterministic, so
+        retrying it just hammers the endpoint."""
+
+        class ContextOverflowError(Exception):
+            pass
+
+        aux = make_failing_aux(ContextOverflowError("951682 exceeds limit of 131072"))
+        engine = make_engine(aux)
+        plan = engine.plan(["User: hello"])
+
+        with pytest.raises(SummarizationFailed) as exc_info:
+            await engine.run(plan)
+
+        assert exc_info.value.reason == "aux_overflow"
+        structured = aux.llm.with_structured_output.return_value
+        assert structured.ainvoke.call_count == 1  # no retry
+
+    @pytest.mark.asyncio
+    async def test_empty_plan_raises(self, mock_llm):
+        engine = make_engine(mock_llm)
+        plan = engine.plan([])
+        with pytest.raises(SummarizationFailed) as exc_info:
+            await engine.run(plan)
+        assert exc_info.value.reason == "empty_plan"
+
+
+class TestOverflowDetection:
+    def test_detects_typed_overflow_in_cause_chain(self):
+        class ContextOverflowError(Exception):
+            pass
+
+        inner = ContextOverflowError("too big")
+        outer = Exception("wrapped")
+        outer.__cause__ = inner
+        assert is_overflow_error(outer)
+
+    def test_detects_synthetic_413(self):
+        e = Exception("api error")
+        e.status_code = 413
+        assert is_overflow_error(e)
+
+    def test_detects_aux_preflight_guard(self):
+        from src.services.auxiliary import AuxInputTooLarge
+
+        assert is_overflow_error(AuxInputTooLarge(951_682, 131_072, "SummarizeTask"))
+
+    def test_ignores_transient_errors(self):
+        assert not is_overflow_error(Exception("503 backend unavailable"))
+        assert not is_overflow_error(TimeoutError("read timeout"))
+
+
+# =============================================================================
+# Tests for the aux pre-flight guard
+# =============================================================================
+
+
+class TestAuxPreflightGuard:
+    @pytest.mark.asyncio
+    async def test_chain_rejects_oversized_input(self):
+        """Non-summarization aux tasks fail fast instead of overflowing at
+        the transport (951k memory-extraction payloads to a 131k model)."""
+        from src.services.auxiliary import AuxInputTooLarge, SummarizeTask
+
+        aux = make_mock_aux(max_context_tokens=100)
+        task = SummarizeTask(
+            conversation_text="word " * 2000,
+            summarization_prompt="",
+            max_summary_length=1000,
+        )
+
+        with pytest.raises(AuxInputTooLarge):
+            await aux.chain(task)
+
+        # The LLM was never invoked
+        structured = aux.llm.with_structured_output.return_value
+        structured.ainvoke.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chain_allows_fitting_input(self, mock_llm):
+        from src.services.auxiliary import SummarizeTask
+
+        task = SummarizeTask(
+            conversation_text="User: short conversation",
+            summarization_prompt="",
+            max_summary_length=1000,
+        )
+        result = await mock_llm.chain(task)
+        assert result.summary == "Test summary of the conversation."
+
+    @pytest.mark.asyncio
+    async def test_no_guard_when_window_unknown(self):
+        from src.services.auxiliary import SummarizeTask
+
+        aux = make_mock_aux(max_context_tokens=None)
+        task = SummarizeTask(
+            conversation_text="word " * 2000,
+            summarization_prompt="",
+            max_summary_length=1000,
+        )
+        result = await aux.chain(task)  # no raise
+        assert result is not None
 
 
 # =============================================================================
@@ -413,125 +823,6 @@ class TestFormatMessagesForSummary:
 
 
 # =============================================================================
-# Tests for _single_pass_summarize
-# =============================================================================
-
-
-class TestSinglePassSummarize:
-    """Tests for the _single_pass_summarize helper method."""
-
-    @pytest.mark.asyncio
-    async def test_returns_formatted_summary(self, context_manager, mock_llm):
-        """Should return properly formatted summary."""
-        result = await context_manager._single_pass_summarize(
-            conversation_text="User: Hello\nAssistant: Hi",
-            auxiliary=mock_llm,
-            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-            max_summary_length=10000,
-        )
-
-        assert "**Summary:**" in result
-        assert "**Tasks Completed:**" in result
-        assert "Test summary" in result
-
-    @pytest.mark.asyncio
-    async def test_uses_custom_prompt(self, context_manager, mock_llm):
-        """Should use custom prompt when provided."""
-        custom_prompt = "Custom: {conversation}"
-
-        await context_manager._single_pass_summarize(
-            conversation_text="test",
-            auxiliary=mock_llm,
-            summarization_prompt=custom_prompt,
-            max_summary_length=10000,
-        )
-
-        # Verify LLM was called (mock_llm is AuxiliaryLLM wrapping the mock)
-        mock_llm.llm.with_structured_output.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_handles_llm_error(self, context_manager):
-        """Should return error message when LLM fails."""
-        from src.services.auxiliary import AuxiliaryLLM
-
-        error_llm = MagicMock()
-        structured_llm = AsyncMock()
-        structured_llm.ainvoke = AsyncMock(side_effect=Exception("LLM error"))
-        error_llm.with_structured_output = MagicMock(return_value=structured_llm)
-        # Also mock raw ainvoke for unstructured fallback
-        error_llm.ainvoke = AsyncMock(side_effect=Exception("Fallback also fails"))
-
-        aux = AuxiliaryLLM(llm=error_llm)
-
-        result = await context_manager._single_pass_summarize(
-            conversation_text="test",
-            auxiliary=aux,
-            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-            max_summary_length=10000,
-        )
-
-        assert "[Summarization failed:" in result
-
-
-# =============================================================================
-# Tests for _recursive_summarize
-# =============================================================================
-
-
-class TestRecursiveSummarize:
-    """Tests for the _recursive_summarize method."""
-
-    @pytest.mark.asyncio
-    async def test_splits_large_input_into_chunks(self, context_manager, mock_llm):
-        """Large input should be split and each chunk summarized."""
-        # Create large formatted parts (~1000 tokens total, config chunk_size=400)
-        parts = ["x" * 1600 for _ in range(3)]  # ~400 tokens each
-
-        result = await context_manager._recursive_summarize(
-            formatted_parts=parts,
-            auxiliary=mock_llm,
-            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-            max_summary_length=5000,
-        )
-
-        # Should have called the LLM multiple times (once per chunk + final unification)
-        assert mock_llm.llm.with_structured_output.call_count >= 2
-        assert result  # Should return something
-
-    @pytest.mark.asyncio
-    async def test_respects_max_depth(self, context_manager, mock_llm):
-        """Should stop recursing at max depth."""
-        # Create very large input that would need many recursion levels
-        parts = ["x" * 4000 for _ in range(20)]  # Very large
-
-        # This should complete without infinite recursion
-        result = await context_manager._recursive_summarize(
-            formatted_parts=parts,
-            auxiliary=mock_llm,
-            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-            max_summary_length=1000,
-        )
-
-        assert result  # Should return something even if truncated
-
-    @pytest.mark.asyncio
-    async def test_single_chunk_no_recursion(self, context_manager, mock_llm):
-        """Small input should not recurse."""
-        parts = ["Short message"]
-
-        result = await context_manager._recursive_summarize(
-            formatted_parts=parts,
-            auxiliary=mock_llm,
-            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-            max_summary_length=10000,
-        )
-
-        # Should only call LLM once (no chunking needed)
-        # Actually will be 1 call since single chunk
-        assert result
-
-
-# =============================================================================
 # Tests for summarize_conversation (main entry point)
 # =============================================================================
 
@@ -540,8 +831,7 @@ class TestSummarizeConversation:
     """Tests for the main summarize_conversation method."""
 
     @pytest.mark.asyncio
-    async def test_small_input_uses_single_pass(self, context_manager, mock_llm):
-        """Small input should use single-pass summarization."""
+    async def test_small_input_single_pass(self, context_manager, mock_llm):
         messages = [
             HumanMessage(content="Hello"),
             AIMessage(content="Hi there!"),
@@ -554,12 +844,30 @@ class TestSummarizeConversation:
 
         assert "**Summary:**" in result
         assert context_manager.state.total_summarizations == 1
+        structured = mock_llm.llm.with_structured_output.return_value
+        assert structured.ainvoke.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_large_input_triggers_recursive(self, context_manager, mock_llm):
-        """Large input should trigger recursive summarization."""
-        # Create messages that exceed summarization_safe_limit (800 tokens = 3200 chars)
-        messages = create_large_message_history(num_messages=20, chars_per_message=500)
+    async def test_large_input_folds_in_multiple_passes(
+        self, context_manager, mock_llm
+    ):
+        """Input beyond the aux chunk budget folds across several calls.
+
+        Note the formatter truncates each message (User 500 / Assistant 800
+        chars), so multi-pass needs a genuinely LONG history — which is
+        exactly the production shape (very long sessions), not four giant
+        PDFs (those are bounded per-message by the formatter).
+        """
+        # 80 messages of varied words ≈ well past the ~4k-token chunk budget
+        # for a 15k aux window even after per-message truncation.
+        messages = []
+        for i in range(80):
+            content = " ".join(f"w{i}x{j}" for j in range(150))
+            messages.append(
+                HumanMessage(content=content)
+                if i % 2 == 0
+                else AIMessage(content=content)
+            )
 
         result = await context_manager.summarize_conversation(
             messages=messages,
@@ -567,8 +875,29 @@ class TestSummarizeConversation:
         )
 
         assert result
-        # Should have made multiple LLM calls for chunked summarization
-        assert mock_llm.llm.with_structured_output.call_count > 1
+        structured = mock_llm.llm.with_structured_output.return_value
+        assert structured.ainvoke.call_count > 1
+
+    @pytest.mark.asyncio
+    async def test_failure_returns_none(self, context_manager):
+        """Total summarizer failure returns None — callers keep history
+        uncompacted, never a placeholder (audit #4)."""
+        aux = make_failing_aux(Exception("LLM error"))
+
+        result = await context_manager.summarize_conversation(
+            messages=[HumanMessage(content="test")],
+            auxiliary=aux,
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_messages_return_none(self, context_manager, mock_llm):
+        result = await context_manager.summarize_conversation(
+            messages=[],
+            auxiliary=mock_llm,
+        )
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_tracks_summarization_state(self, context_manager, mock_llm):
@@ -582,6 +911,193 @@ class TestSummarizeConversation:
 
         assert context_manager.state.total_summarizations == 1
         assert len(context_manager.state.summaries) == 1
+
+
+# =============================================================================
+# Tests for compaction progress events
+# =============================================================================
+
+
+class TestProgressEvents:
+    """compaction.started / compaction.progress / compaction.failed flow
+    through the ContextManager progress callback (S3 transport contract)."""
+
+    @pytest.mark.asyncio
+    async def test_success_emits_started_and_progress(self, context_manager, mock_llm):
+        events = []
+
+        async def recorder(event, params):
+            events.append((event, params))
+
+        context_manager.set_progress_callback(recorder)
+        await context_manager.summarize_conversation(
+            messages=[HumanMessage(content="Hello"), AIMessage(content="Hi")],
+            auxiliary=mock_llm,
+            trigger="manual",
+        )
+
+        names = [e[0] for e in events]
+        assert names[0] == "compaction.started"
+        started = events[0][1]
+        assert started["trigger"] == "manual"
+        assert started["n_passes"] == 1
+        assert started["aux_limit_tokens"] == 15_000
+        assert started["plan"][0]["pass"] == 1
+        assert "compaction.progress" in names
+        assert "compaction.failed" not in names
+        # Stats stashed for the context.compacted completion event
+        assert context_manager._last_summarization_stats["n_passes"] == 1
+
+    @pytest.mark.asyncio
+    async def test_failure_emits_failed_event(self, context_manager):
+        events = []
+
+        async def recorder(event, params):
+            events.append((event, params))
+
+        context_manager.set_progress_callback(recorder)
+        aux = make_failing_aux(Exception("503"))
+        result = await context_manager.summarize_conversation(
+            messages=[HumanMessage(content="Hello")],
+            auxiliary=aux,
+        )
+
+        assert result is None
+        names = [e[0] for e in events]
+        assert "compaction.failed" in names
+        failed = [p for n, p in events if n == "compaction.failed"][0]
+        assert failed["reason"] == "aux_unavailable"
+        assert failed["kept_messages"] is True
+
+    @pytest.mark.asyncio
+    async def test_retry_bumps_attempt_in_progress(self, context_manager, mock_llm):
+        parsed_value = ConversationSummary(
+            summary="ok",
+            tasks_completed="",
+            key_decisions="",
+            current_state="",
+        )
+        structured = mock_llm.llm.with_structured_output.return_value
+        structured.ainvoke = AsyncMock(
+            side_effect=[
+                Exception("503"),
+                {
+                    "raw": AIMessage(content="ok"),
+                    "parsed": parsed_value,
+                    "parsing_error": None,
+                },
+            ]
+        )
+        events = []
+
+        async def recorder(event, params):
+            events.append((event, params))
+
+        context_manager.set_progress_callback(recorder)
+        result = await context_manager.summarize_conversation(
+            messages=[HumanMessage(content="Hello")],
+            auxiliary=mock_llm,
+        )
+
+        assert result
+        attempts = [p["attempt"] for n, p in events if n == "compaction.progress"]
+        assert 2 in attempts  # the retry was visible
+
+    @pytest.mark.asyncio
+    async def test_progress_frames_carry_trigger(self, context_manager, mock_llm):
+        """Every engine progress frame is stamped with the trigger so a
+        replayed progress frame (reload mid-compaction, started frame behind
+        the cursor) reconstructs the UI without guessing 'auto'."""
+        events = []
+
+        async def recorder(event, params):
+            events.append((event, params))
+
+        context_manager.set_progress_callback(recorder)
+        await context_manager.summarize_conversation(
+            messages=[HumanMessage(content="Hello"), AIMessage(content="Hi")],
+            auxiliary=mock_llm,
+            trigger="manual",
+        )
+
+        progress = [p for (e, p) in events if e == "compaction.progress"]
+        assert progress, "expected at least one progress frame"
+        assert all(p["trigger"] == "manual" for p in progress)
+
+
+# =============================================================================
+# Tests for the compaction run counter (transport did-it-compact signal)
+# =============================================================================
+
+
+class TestCompactionRunCounter:
+    """``compaction_runs`` increments only on a *successful* summarization —
+    the transports' authoritative did-it-compact signal, replacing length
+    heuristics that false-fired on stray RemoveMessage markers (the
+    duplicate-banner bug, 2026-06-12)."""
+
+    @pytest.mark.asyncio
+    async def test_increments_on_successful_compaction(self, context_manager, mock_llm):
+        messages = create_large_message_history(12)
+        assert context_manager.compaction_runs == 0
+        result = await context_manager.summarize_and_compact(messages, mock_llm)
+        assert context_manager.compaction_runs == 1
+        assert any(
+            isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+            for m in result
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_increment_when_nothing_to_summarize(
+        self, context_manager, mock_llm
+    ):
+        # len(conversation) <= keep_recent_messages (3) → early no-op return.
+        messages = [HumanMessage(content="hi"), AIMessage(content="hello")]
+        result = await context_manager.summarize_and_compact(messages, mock_llm)
+        assert context_manager.compaction_runs == 0
+        assert [m.content for m in result] == [m.content for m in messages]
+
+    @pytest.mark.asyncio
+    async def test_no_increment_on_summarizer_failure(self, context_manager):
+        failing = make_failing_aux(RuntimeError("aux endpoint down"))
+        messages = create_large_message_history(12)
+        result = await context_manager.summarize_and_compact(messages, failing)
+        assert context_manager.compaction_runs == 0
+        # History kept intact — never compact behind a placeholder.
+        assert [m.content for m in result] == [m.content for m in messages]
+
+    @pytest.mark.asyncio
+    async def test_size_guard_skip_emits_compaction_skipped(
+        self, context_manager, mock_llm
+    ):
+        """When the summary comes out larger than what it would replace, the
+        guard keeps the originals — and must emit a journaled terminal frame
+        (compaction.skipped) so a replayed progress UI can clear. Counter
+        stays untouched (no adoption, no banner row)."""
+        events = []
+
+        async def recorder(event, params):
+            events.append((event, params))
+
+        context_manager.set_progress_callback(recorder)
+        # One tiny message beyond keep_recent (3): original ≈ a few tokens,
+        # the structured summary is always bigger → guard fires.
+        messages = [
+            HumanMessage(content="hi"),
+            AIMessage(content="yo"),
+            HumanMessage(content="ok"),
+            AIMessage(content="k"),
+        ]
+        result = await context_manager.summarize_and_compact(messages, mock_llm)
+
+        assert context_manager.compaction_runs == 0
+        assert [m.content for m in result] == [m.content for m in messages]
+        names = [e for e, _ in events]
+        assert "compaction.started" in names
+        assert "compaction.skipped" in names
+        skipped = next(p for e, p in events if e == "compaction.skipped")
+        assert skipped["reason"] == "summary_not_smaller"
+        assert skipped["trigger"] == "auto"
 
 
 # =============================================================================
@@ -639,48 +1155,304 @@ class TestEnsureWithinLimitsForce:
 
 
 # =============================================================================
+# Keep-window elision (audit #6): pairing-protected giants must not wedge
+# =============================================================================
+
+
+class TestKeepWindowElision:
+    def test_elide_largest_first_until_under_target(self, context_manager):
+        ai = AIMessage(
+            content="",
+            id="a1",
+            tool_calls=[
+                {"id": "t1", "name": "read_pdf", "args": {}},
+                {"id": "t2", "name": "read_pdf", "args": {}},
+            ],
+        )
+        big = ToolMessage(content="regulation " * 4000, tool_call_id="t1", id="t1")
+        small = ToolMessage(content="tiny result", tool_call_id="t2", id="t2")
+        messages = [HumanMessage(content="read these", id="h1"), ai, big, small]
+
+        result = context_manager._elide_largest_tool_results(messages, 500)
+
+        tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
+        assert tool_msgs[0].content.startswith("[tool result elided")
+        # Pairing preserved
+        assert tool_msgs[0].tool_call_id == "t1"
+        # The small result survived (target reached after the largest)
+        assert tool_msgs[1].content == "tiny result"
+        assert context_manager.get_token_count(result) <= 500
+
+    @pytest.mark.asyncio
+    async def test_per_turn_path_elides_when_summary_cannot_shrink(
+        self, context_manager, mock_llm
+    ):
+        """The b60166ee shape: compaction succeeds but keep-window tool
+        results alone exceed the model limit — previously the request was
+        resent at 183% forever. Now the giants get elided."""
+        # Old, summarizable conversation
+        messages = []
+        for i in range(10):
+            messages.append(
+                HumanMessage(content=f"question {i} " + "x" * 400, id=f"h{i}")
+            )
+            messages.append(AIMessage(content=f"answer {i} " + "y" * 400, id=f"a{i}"))
+        # Recent keep-window: a tool pair with results far beyond the
+        # 2000-token model_max_context_tokens of the test config.
+        messages.append(
+            AIMessage(
+                content="",
+                id="ai-tools",
+                tool_calls=[
+                    {"id": "t1", "name": "read_pdf", "args": {}},
+                    {"id": "t2", "name": "read_pdf", "args": {}},
+                ],
+            )
+        )
+        messages.append(
+            ToolMessage(content="cfr part " * 2000, tool_call_id="t1", id="t1")
+        )
+        messages.append(
+            ToolMessage(content="eu reg " * 2000, tool_call_id="t2", id="t2")
+        )
+
+        result = await context_manager.ensure_within_limits(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        from langchain_core.messages import RemoveMessage
+
+        non_remove = [m for m in result if not isinstance(m, RemoveMessage)]
+        # Under the model limit now…
+        assert context_manager.get_token_count(non_remove) <= 2000
+        # …because the giant results were elided, with pairing intact.
+        elided = [
+            m
+            for m in non_remove
+            if isinstance(m, ToolMessage)
+            and m.content.startswith("[tool result elided")
+        ]
+        assert len(elided) == 2
+        assert {m.tool_call_id for m in elided} == {"t1", "t2"}
+
+    @pytest.mark.asyncio
+    async def test_run_counter_increments_for_tail_tool_truncation_no_summary(
+        self, context_manager, mock_llm
+    ):
+        """When the conversation stays under keep_recent, keep-window truncation
+        is still an actual compaction event and must bump compaction_runs."""
+        context_manager.config.keep_window_max_tool_result_chars = 32
+
+        messages = [
+            HumanMessage(content="query", id="h1"),
+            ToolMessage(
+                content="x" * 20000,
+                tool_call_id="t1",
+                name="read_file",
+                id="t1",
+            ),
+            AIMessage(content="ack", id="a1"),
+        ]
+        result = await context_manager.summarize_and_compact(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        assert context_manager.compaction_runs == 1
+        assert not any(
+            isinstance(m, SystemMessage)
+            and "[Summary of prior work]" in (m.content or "")
+            for m in result
+        )
+        assert any(
+            isinstance(m, ToolMessage)
+            and "[tool result truncated by compaction" in (m.content or "")
+            for m in result
+            if not isinstance(m, RemoveMessage)
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_truncated_tail_is_skipped(self, context_manager, mock_llm):
+        """Already-truncated tool results are recognized and left untouched.
+
+        Uses the REAL truncation shape — kept head first, marker appended at
+        the end — so a regression to a startswith-style check fails here.
+        """
+        context_manager.config.keep_window_max_tool_result_chars = 20
+        already_truncated = (
+            "y"
+            * 20
+            + "\n\n[tool result truncated by compaction: kept 20 of 20,000 chars "
+            "(~5,000 tokens). Full content was saved to the workspace / is "
+            "re-fetchable — re-run the tool or read the saved file if the rest "
+            "is needed.]"
+        )
+        messages = [
+            HumanMessage(content="short", id="h1"),
+            ToolMessage(
+                content=already_truncated,
+                tool_call_id="t1",
+                name="read_file",
+                id="t1",
+            ),
+            AIMessage(content="done", id="a1"),
+        ]
+        result = await context_manager.summarize_and_compact(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        assert context_manager.compaction_runs == 0
+        assert result == messages
+
+    @pytest.mark.asyncio
+    async def test_fresh_tool_message_preserves_name(self, context_manager, mock_llm):
+        """ToolMessage rebuild in the keep-window slice preserves `name`."""
+        context_manager.config.keep_window_max_tool_result_chars = 40
+        context_manager.summarize_conversation = AsyncMock(
+            return_value="manual summary"
+        )
+
+        messages = [
+            HumanMessage(content="seed", id="h0"),
+            AIMessage(content="response", id="a0"),
+            HumanMessage(content="next", id="h1"),
+            AIMessage(content="response", id="a1"),
+            HumanMessage(content="probe", id="h2"),
+            HumanMessage(content="status", id="h3"),
+            AIMessage(
+                content="",
+                id="a2",
+                tool_calls=[{"id": "t1", "name": "read_pdf", "args": {}}],
+            ),
+            ToolMessage(
+                content="x" * 120,
+                tool_call_id="t1",
+                name="read_pdf",
+                id="t1",
+            ),
+        ]
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        assert context_manager.compaction_runs == 1
+        tool_msgs = [
+            m
+            for m in result
+            if isinstance(m, ToolMessage) and not isinstance(m, RemoveMessage)
+        ]
+        assert any(
+            m.tool_call_id == "t1" and m.name == "read_pdf" for m in tool_msgs
+        ), "re-built keep-window tool results must preserve `name`"
+
+    @pytest.mark.asyncio
+    async def test_summarize_receives_full_conversation(
+        self, context_manager, mock_llm
+    ):
+        """Manual cap lives inside summarize_and_compact; the summarizer sees
+        the whole conversation, not only the pre-summarized slice."""
+        observed = []
+
+        async def _fake_summarize(messages, *args, **kwargs):
+            observed.extend(messages)
+            return "manual summary"
+
+        context_manager.summarize_conversation = AsyncMock(side_effect=_fake_summarize)
+
+        messages = [
+            HumanMessage(content=f"hi {i}", id=f"h{i}")
+            if i % 2 == 0
+            else AIMessage(
+                content=f"reply {i}",
+                id=f"a{i}",
+            )
+            for i in range(6)
+        ]
+        result = await context_manager.summarize_and_compact(messages, mock_llm)
+
+        assert [m.content for m in observed] == [m.content for m in messages]
+        assert any(
+            isinstance(m, SystemMessage)
+            and "[Summary of prior work]" in (m.content or "")
+            for m in result
+        )
+
+
+# =============================================================================
+# Failure semantics (audit #4): never destroy history
+# =============================================================================
+
+
+class TestFailureKeepsHistory:
+    @pytest.mark.asyncio
+    async def test_compaction_keeps_history_when_summarization_fails(
+        self, context_manager
+    ):
+        """summarize_and_compact must not replace history with a placeholder
+        when the summarizer is fully unavailable."""
+        aux = make_failing_aux(Exception("aux 503"))
+
+        messages = []
+        for i in range(12):
+            messages.append(HumanMessage(content=f"question {i}", id=f"h{i}"))
+            messages.append(AIMessage(content=f"answer {i}", id=f"a{i}"))
+
+        result = await context_manager.summarize_and_compact(messages, aux)
+
+        # Unchanged: same objects, no RemoveMessage markers, no placeholder.
+        assert result == messages
+        assert not any("[Summarization failed" in str(m.content) for m in result)
+
+
+# =============================================================================
 # Integration-style tests
 # =============================================================================
 
 
 class TestContextSafetyIntegration:
-    """Integration tests for the two-layer safety system."""
+    """Integration tests for the safety system."""
 
     @pytest.mark.asyncio
-    async def test_handles_very_large_input(self, mock_llm):
+    async def test_handles_very_large_input(self):
         """System should handle arbitrarily large inputs without error."""
         config = ContextConfig(
             compaction_threshold_tokens=1000,
             summarization_threshold_tokens=1000,
-            summarization_safe_limit=500,  # Very low to force recursion
-            summarization_chunk_size=200,
         )
         mgr = ContextManager(config=config)
+        aux = make_mock_aux(max_context_tokens=15_000)
 
-        # Create very large message history
-        messages = create_large_message_history(
-            num_messages=100, chars_per_message=1000
-        )
+        # ~100 messages of varied content (compressible x-runs would
+        # undercount; words behave like real conversations)
+        messages = []
+        for i in range(100):
+            content = " ".join(f"w{i}_{j}" for j in range(150))
+            messages.append(
+                HumanMessage(content=content)
+                if i % 2 == 0
+                else AIMessage(content=content)
+            )
 
         # Should complete without error
-        result = await mgr.summarize_conversation(messages=messages, auxiliary=mock_llm)
+        result = await mgr.summarize_conversation(messages=messages, auxiliary=aux)
 
         assert result
         assert "[Summarization failed:" not in result
 
     def test_config_defaults_are_safe(self):
-        """Default config values should be safe for 100k effective context."""
-        config = ContextConfig()
+        """Default config keeps the conservative 100k working-window base.
 
-        # Fallback defaults are a base=100k instance of the loader limit
-        # fractions (safe .90, chunk .60); real values come from the matrix.
+        Summarization budgets are no longer config leaves — they derive from
+        the auxiliary model's window at call time (src/core/summarizer.py).
+        """
+        config = ContextConfig()
         assert config.model_max_context_tokens == 100_000
-        assert config.summarization_safe_limit == 90_000
-        assert config.summarization_chunk_size == 60_000
-        # Safe limit should leave room for prompt overhead
-        assert config.summarization_safe_limit < config.model_max_context_tokens
-        # Chunk size should be less than safe limit
-        assert config.summarization_chunk_size < config.summarization_safe_limit
+        assert not hasattr(config, "summarization_safe_limit")
+        assert not hasattr(config, "summarization_chunk_size")
 
 
 # =============================================================================
@@ -798,7 +1570,7 @@ class TestOversizedMessageCompaction:
 
 
 # Tests for the compaction boundary marker that drives message-granular resume
-# (docs/issues/persistent_session_midturn_message_loss.md, Phase 3).
+# (knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md, Phase 3).
 class TestCompactionBoundaryId:
     """summarize_and_compact records the id of the last message its summary
     covers, so the persistent transport can store a message-level boundary_seq."""

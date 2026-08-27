@@ -1,6 +1,6 @@
 """Unified instance lifecycle management.
 
-See ``docs/features/unified_instance_lifecycle.md`` for the design.
+See ``knowledge-base/knowledge/features/unified_instance_lifecycle.md`` for the design.
 
 Phase 1a ships the type / Protocol surface and a reconciler skeleton.
 The actual cutover (AgentInstanceManager replacing _drain_stale_image_agents,
@@ -16,6 +16,7 @@ from .reconciler import (
     DisruptionBudget,
     InstanceLifecycleReconciler,
 )
+from .persistent_agent_manager import PersistentAgentInstanceManager
 from .types import (
     Instance,
     InstanceLifecycleManager,
@@ -37,6 +38,7 @@ __all__ = [
     "Instance",
     "InstanceLifecycleManager",
     "InstanceLifecycleReconciler",
+    "PersistentAgentInstanceManager",
     "ReapableInstanceManager",
     "StatefulInstanceManager",
     "VMInstanceManager",

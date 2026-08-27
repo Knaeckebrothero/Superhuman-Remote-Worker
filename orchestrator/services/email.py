@@ -25,6 +25,9 @@ from email.mime.text import MIMEText
 
 import aiosmtplib
 
+from services.email_layout import Action, escape_text, render_email
+from services.email_markdown import render_markdown
+
 logger = logging.getLogger(__name__)
 
 
@@ -160,6 +163,36 @@ class EmailService:
             logger.error(f"Failed to send email to {recipients}: {e}")
             return False
 
+    def _build_system_notification_html(
+        self, *, to_name: str, body_md: str, cockpit_link: str
+    ) -> str:
+        greeting = escape_text(to_name)
+        return render_email(
+            title="Superhuman Remote Worker",
+            body_html=f"<p style='margin:0 0 12px 0;'>Hello {greeting},</p>"
+            f"{render_markdown(body_md)}",
+            actions=[Action(label="Open Cockpit", url=cockpit_link)],
+        )
+
+    def _build_agent_message_html(
+        self,
+        *,
+        message_md: str,
+        job_description: str,
+        config_name: str,
+        phase_str: str,
+        cockpit_link: str,
+        reply_to_addr: str | None,
+    ) -> str:
+        subtitle = f"Job: {job_description[:80]} • Agent: {config_name} • {phase_str}"
+        return render_email(
+            title="SRW Agent Message",
+            subtitle=subtitle,  # escaped inside render_email
+            body_html=render_markdown(message_md),
+            actions=[Action(label="Reply in Cockpit", url=cockpit_link)],
+            footer_note="or reply directly to this email" if reply_to_addr else None,
+        )
+
     async def send_system_notification(
         self,
         to: str,
@@ -179,7 +212,7 @@ class EmailService:
             to: Recipient email address
             to_name: Recipient display name
             subject: Subject line (prefixed with [SRW])
-            body_md: Body in markdown (rendered as plain text in HTML)
+            body_md: Body in markdown (rendered to HTML by email_markdown)
             cockpit_path: Optional path appended to COCKPIT_EXTERNAL_URL
                 for the "Open Cockpit" link (e.g. "/automations").
 
@@ -197,19 +230,8 @@ class EmailService:
             f"Open Cockpit: {cockpit_link}\n"
         )
 
-        body_html_msg = (
-            body_md.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\n", "<br>")
-        )
-        body_html = (
-            '<!DOCTYPE html><html><body style="font-family: sans-serif; color: #222;">'
-            f"<p>Hello {to_name},</p>"
-            f"<p>{body_html_msg}</p>"
-            "<hr>"
-            f'<p style="color: #666;"><a href="{cockpit_link}">Open Cockpit</a></p>'
-            "</body></html>"
+        body_html = self._build_system_notification_html(
+            to_name=to_name, body_md=body_md, cockpit_link=cockpit_link
         )
 
         return await self._send(
@@ -241,7 +263,8 @@ class EmailService:
             to: Recipient email address
             to_name: Recipient display name
             subject: Email subject (will be prefixed with [SRW])
-            message_md: Message body in markdown (rendered as plain text)
+            message_md: Message body in markdown (rendered to HTML by
+                email_markdown; the text/plain leg carries the source as-is)
             job_id: Job UUID for context and deep links
             job_description: Job description for context
             config_name: Agent config name
@@ -289,41 +312,14 @@ class EmailService:
         if reply_to_addr:
             body_text += "Or reply directly to this email.\n"
 
-        # HTML version
-        # Escape basic HTML entities in the message
-        message_html = (
-            message_md.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\n", "<br>")
+        body_html = self._build_agent_message_html(
+            message_md=message_md,
+            job_description=job_description,
+            config_name=config_name,
+            phase_str=phase_str,
+            cockpit_link=cockpit_link,
+            reply_to_addr=reply_to_addr,
         )
-
-        reply_hint = (
-            '<p style="margin: 12px 0 0 0; color: #6c7086; font-size: 12px;">or reply directly to this email</p>'
-            if reply_to_addr
-            else ""
-        )
-
-        body_html = f"""\
-<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #cdd6f4; background: #1e1e2e;">
-  <div style="border: 1px solid #313244; border-radius: 12px; overflow: hidden;">
-    <div style="background: #181825; padding: 16px 20px; border-bottom: 1px solid #313244;">
-      <h2 style="margin: 0 0 4px 0; color: #cba6f7; font-size: 16px;">SRW Agent Message</h2>
-      <p style="margin: 0; color: #a6adc8; font-size: 13px;">
-        Job: {job_description[:80]}
-        &nbsp;&bull;&nbsp; Agent: {config_name}
-        &nbsp;&bull;&nbsp; {phase_str}
-      </p>
-    </div>
-    <div style="padding: 20px; font-size: 14px; line-height: 1.6; color: #cdd6f4;">
-      {message_html}
-    </div>
-    <div style="background: #181825; padding: 16px 20px; border-top: 1px solid #313244; text-align: center;">
-      <a href="{cockpit_link}" style="display: inline-block; background: #cba6f7; color: #1e1e2e; padding: 10px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px;">Reply in Cockpit</a>
-      {reply_hint}
-    </div>
-  </div>
-</div>"""
 
         success = await self._send(
             to,

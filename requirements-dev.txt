@@ -1,0 +1,13 @@
+# Dev/test-only dependencies — NOT installed into the runtime images.
+# CI installs this alongside requirements.txt + orchestrator/requirements.txt
+# in the test jobs (.github/workflows/{main,develop}.yml).
+
+# Ephemeral PostgreSQL for the audit-store schema + partition-module tests
+# (tests/test_audit_schema.py, tests/test_audit_partitions.py). The fixtures
+# skip automatically when no container runtime (Docker/Podman) is reachable.
+testcontainers[postgres]>=4.0
+
+# Parallel local and CI test execution. Use scripts/pytest-fast.sh rather than
+# ``-n auto``: importing this repository is memory-heavy, so a bounded worker
+# count is faster and more predictable across machines.
+pytest-xdist>=3.8,<4.0

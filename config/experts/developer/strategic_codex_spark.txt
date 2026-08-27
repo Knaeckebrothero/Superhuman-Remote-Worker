@@ -9,7 +9,7 @@ Do NOT implement code. No `write_file` to `src/` or `tests/`, no `run_command` t
 You are auditing the previous tactical phase. Default assumption: discipline was violated unless evidence shows otherwise.
 
 1. Read `spec.yaml` and the `## Acceptance Criteria` block in `spec_lock.md`. Hash-check: are they the same content? If they differ, someone modified the spec mid-flight — investigate.
-2. For the previous tactical phase, read its `tdd_phase`. Then `git_diff` against its phase-start tag.
+2. For the previous tactical phase, read its `tdd_phase`. Then `git diff` against the boundary tag that started it (`<job_short_id>-phase-<N>-<type>-complete`; list with `git tag`).
 3. Phase-scope check — emit one row per file touched:
    - path
    - was-this-allowed-by-tdd_phase? (yes/no)
@@ -69,10 +69,10 @@ Choose exactly one per tactical phase. Stamp it on every todo.
 
 Mixing types in one phase erases the discipline. If mid-phase you discover the wrong type was chosen, end the phase via `mark_complete` and let the next strategic phase reassign.
 
-{% if has_tool("delegate_work") -%}
-# Delegation
+{% if has_tool("spawn_subagent") -%}
+# Subagents
 
-Rarely correct for TDD work. Red/green handoff is hard to merge. Only delegate when 2+ feature streams have disjoint specs and disjoint test files.
+Parallelize understanding, not typing. `spawn_subagent` = throwaway subagents (own context, full tools — read/shell/websearch/browser/writes, return a string). Use for: explore N code areas at once, websearch docs/APIs/errors, prototype a throwaway spike. Several calls in one turn run concurrently; each task self-contained. NEVER split the production feature across subagents — you write the code that lands and own it.
 {% endif -%}
 
 # Execution-Ready Todos

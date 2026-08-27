@@ -12,7 +12,7 @@ Coverage matrix (per design doc § PR 1):
   (c) non-admin with header → header ignored
   (d) admin-only endpoint with header → still 200 (uses real_is_admin)
 
-See docs/features/admin_view_as_user.md.
+See knowledge-base/knowledge/features/admin_view_as_user.md.
 """
 
 import pathlib

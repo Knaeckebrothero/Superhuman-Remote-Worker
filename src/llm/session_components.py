@@ -2,7 +2,7 @@
 
 Converts a LangChain response into four normalized components (reasoning, text,
 tool calls, tool results) PLUS the verbatim provider-raw payload, and back into a
-provider request. See docs/features/persistent_session_source_of_truth.md (D2/D6).
+provider request. See knowledge-base/knowledge/features/persistent_session_source_of_truth.md (D2/D6).
 """
 
 from __future__ import annotations

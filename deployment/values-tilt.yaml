@@ -14,7 +14,7 @@
 #      on Tilt-built tags. Disable for Tilt.
 #
 # Everything else carries over from values-local.yaml (LLM keys, dev
-# passwords, sessionRouter wiring, the OpenCloud hostAliases trick).
+# passwords, sessionRouter wiring, the Nextcloud-only cloud backend).
 # =============================================================================
 
 image:
@@ -29,12 +29,63 @@ image:
   workspace:
     pullPolicy: IfNotPresent
 
+# Stateless worker jobs remain default-off in the production chart. Tilt is
+# the explicit local acceptance environment for the S3 worker driver, with a
+# shorter batch floor so an A -> B rotation is observable in one test run.
+agent:
+  stateless:
+    # The worker gate is invalid without the shared stateless executor pool.
+    # Keep both explicit so this overlay renders safely without a private file.
+    enabled: true
+    worker:
+      enabled: true
+      # Preserve explicit-lane S3 acceptance runs unless the default is the test.
+      defaultEnabled: false
+      batchMinWallSeconds: 60
+
 # Pre-warm DaemonSet pulls with `Always` and would crash on Tilt-built tags.
 # Side-effect: agent/workspace pods pull on first session/job spawn rather
 # than at cluster boot. ~10–30 s slower first-session experience; acceptable.
 workspace:
   prewarm:
     enabled: false
+
+# Object store — bundled single-node Garage, the same store self-hosters get.
+# Replaces the old separate MinIO fixture: the chart deploys Garage + an
+# idempotent bootstrap Job (buckets srw-snapshots + srw-workspaces,
+# native-format keys) and AUTO-WIRES both seams to it — snapshots (S3_ENDPOINT,
+# boto3) and the virtual tier (VIRTUAL_WORKSPACE_*, rclone provider "Other").
+# Creds auto-generate in the chart Secret (secrets.create).
+#
+# `garage.enabled` is deliberately NOT set here. The chart default is auto
+# (null = run the bundled store unless you brought your own `s3.endpoint`), so
+# leaving it unset makes local dev exercise the same resolution a fresh chart
+# consumer gets, instead of a forced-on path nobody else runs.
+#
+# Blanking the endpoints below is what makes that safe. They are the auto
+# input, and this overlay loads AFTER the private values-local.yaml — a stale
+# one carrying an endpoint would otherwise flip auto off and leave local dev
+# with no object store at all. Same defensive reason as the secrets block
+# below, which already clears stale MinIO-format credentials.
+#
+# For a pure no-store smoke test: garage.enabled=false +
+# virtualWorkspace.rclone.type="memory".
+s3:
+  endpoint: ""
+virtualWorkspace:
+  s3:
+    endpoint: ""
+
+# Older private values-local.yaml files carried MinIO-style placeholder S3
+# credentials. Garage rejects those identifiers, so the later Tilt overlay
+# deliberately clears them and lets the chart generate/preserve native scoped
+# keys. This is inert when Garage is disabled outside Tilt.
+secrets:
+  values:
+    SNAPSHOT_S3_ACCESS_KEY_ID: ""
+    SNAPSHOT_S3_SECRET_ACCESS_KEY: ""
+    VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID: ""
+    VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY: ""
 
 # Cockpit dev image runs `ng serve`, which serves files from the Angular
 # source tree at /app/src/assets/. Land the chart-rendered env.js there so

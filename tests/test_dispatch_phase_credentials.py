@@ -7,7 +7,7 @@ phase blocks. The agent's LLM factory then fell back to the parent's
 `base_url` and returned `404 Model 'X' not found` in an infinite retry
 loop.
 
-See docs/issues/orchestrator_phase_override_credentials_not_injected.md
+See knowledge-base/knowledge/issues/orchestrator_phase_override_credentials_not_injected.md
 for the incident write-up.
 """
 
@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-# Same path-setup pattern as test_create_builder_llm.py.
+# Add orchestrator/ to sys.path so its top-level modules import bare.
 _ORCH = Path(__file__).parent.parent / "orchestrator"
 if str(_ORCH) not in sys.path:
     sys.path.insert(0, str(_ORCH))
@@ -138,6 +138,50 @@ class TestPhaseOverrideCredentialInjection:
         assert result["llm"]["strategic"]["api_key"] == CODEX_API_KEY
 
     @pytest.mark.asyncio
+    async def test_blob_delivery_injects_phase_pin_transport(self, patched_main):
+        """eec20eeb regression (blob-delivery path).
+
+        ``serialize_resolved_config`` emits the phase blocks with explicit
+        ``base_url: None`` / ``provider: None`` leaves. ``inject_blob_credentials``
+        only stripped None at the TOP level of ``llm``, so the nested phase
+        leaves survived and defeated ``_inject_model_credentials``'s
+        ``setdefault`` (a present-but-None key is not overwritten). Codex phase
+        pins therefore shipped without transport and the agent fell back to
+        api.openai.com → 401. The base model worked (its top-level None WAS
+        stripped), masking the gap. This exercises the REAL resolve_config blob
+        through the REAL injector — the path jobs actually use.
+        """
+        from orchestrator.services.config_resolver import (
+            inject_blob_credentials,
+            resolve_config,
+        )
+
+        blob = resolve_config(
+            base_config_name="defaults",
+            request_override={
+                "llm": {
+                    "strategic": {"model": "gpt-5.3-codex-spark"},
+                    "tactical": {"model": "gpt-5.3-codex-spark"},
+                }
+            },
+            expert_type="worker",
+        )
+        # Precondition: serialize emits the None transport leaves that trigger
+        # the bug (guards against the fixture silently changing shape).
+        assert "base_url" in blob["agent"]["llm"]["strategic"]
+        assert blob["agent"]["llm"]["strategic"]["base_url"] is None
+
+        delivered = await inject_blob_credentials(
+            blob, lambda co: main._inject_dispatch_credentials(_job(), co)
+        )
+
+        llm = delivered["agent"]["llm"]
+        assert llm["strategic"]["base_url"] == CODEX_BASE_URL
+        assert llm["strategic"]["api_key"] == CODEX_API_KEY
+        assert llm["tactical"]["base_url"] == CODEX_BASE_URL
+        assert llm["tactical"]["api_key"] == CODEX_API_KEY
+
+    @pytest.mark.asyncio
     async def test_auxiliary_override_also_injected(self, patched_main):
         """Same hole existed for top-level `auxiliary` overrides."""
         override = {"auxiliary": {"model": "gpt-5.3-codex-spark"}}
@@ -148,28 +192,24 @@ class TestPhaseOverrideCredentialInjection:
         assert result["auxiliary"]["api_key"] == CODEX_API_KEY
 
     @pytest.mark.asyncio
-    async def test_existing_base_url_in_phase_block_is_not_overwritten(
+    async def test_existing_base_url_in_phase_block_is_refreshed_from_endpoint(
         self, patched_main
     ):
-        """Caller-supplied base_url wins; injection is additive-only."""
+        """Endpoint-backed phase models refresh stale caller/persisted transport."""
         override = {
             "llm": {
                 "tactical": {
                     "model": "gpt-5.3-codex-spark",
                     "base_url": "https://caller-pinned.example/v1",
+                    "api_key": "sk-stale",
                 }
             }
         }
 
         result = await main._inject_dispatch_credentials(_job(), override)
 
-        assert (
-            result["llm"]["tactical"]["base_url"] == "https://caller-pinned.example/v1"
-        )
-        # The guard skips injection entirely when base_url is already set,
-        # so api_key from the endpoint is NOT injected either — matching
-        # the pre-existing _inject_model_credentials early-return contract.
-        assert "api_key" not in result["llm"]["tactical"]
+        assert result["llm"]["tactical"]["base_url"] == CODEX_BASE_URL
+        assert result["llm"]["tactical"]["api_key"] == CODEX_API_KEY
 
     @pytest.mark.asyncio
     async def test_unknown_phase_model_logs_warning_no_crash(
@@ -198,6 +238,95 @@ class TestPhaseOverrideCredentialInjection:
         assert "tactical" not in result.get("llm", {})
         assert "strategic" not in result.get("llm", {})
         assert "auxiliary" not in result
+
+
+# ---------------------------------------------------------------------------
+# Per-phase account model defaults were REMOVED (Layer 1).
+#
+# default_strategic_model / default_tactical_model in users.settings used to be
+# injected as llm.strategic / llm.tactical phase pins at dispatch. A phase pin
+# beats the top-level model in get_phase_config, so they silently shadowed an
+# explicit per-loop/per-job top-level model (a loop pinned to gpt-5.5 ran
+# entirely on gpt-5.3-codex-spark). Dispatch must no longer read them.
+# See knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def patched_main_phase_prefs(monkeypatch):
+    """User settings still carry the (removed) per-phase model defaults; the
+    registry resolves any model so an injected pin would be visible with
+    transport. If dispatch ever re-reads the keys, the assertions below fail."""
+
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        return ModelMeta(
+            model_id=model_id,
+            provider="openai",
+            family="codex",
+            display_name=model_id,
+            origin="custom",
+            endpoint_id=CODEX_ENDPOINT_ID,
+            api_key_ref="openai",
+        )
+
+    monkeypatch.setattr(
+        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+    )
+
+    async def fake_get_endpoint(endpoint_id):
+        return {
+            "id": CODEX_ENDPOINT_ID,
+            "label": "codex-proxy",
+            "base_url": CODEX_BASE_URL,
+            "api_key": CODEX_API_KEY,
+        }
+
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(side_effect=fake_get_endpoint),
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "resolve_api_keys_for_job", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_settings",
+        AsyncMock(
+            return_value={
+                "default_strategic_model": "gpt-5.3-codex-spark",
+                "default_tactical_model": "gpt-5.3-codex-spark",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        main.postgres_db,
+        "resolve_default_for_capability",
+        AsyncMock(return_value=None),
+    )
+
+
+class TestPerPhaseAccountDefaultsRemoved:
+    @pytest.mark.asyncio
+    async def test_account_phase_defaults_do_not_shadow_explicit_model(
+        self, patched_main_phase_prefs
+    ):
+        """The loop scenario: an explicit top-level model, no phase pins on the
+        job. Account phase defaults must NOT add strategic/tactical pins."""
+        result = await main._inject_dispatch_credentials(
+            _job(), {"llm": {"model": "gpt-5.5"}}
+        )
+        assert result["llm"]["model"] == "gpt-5.5"
+        assert "strategic" not in result["llm"]
+        assert "tactical" not in result["llm"]
+
+    @pytest.mark.asyncio
+    async def test_account_phase_defaults_not_injected_on_empty_override(
+        self, patched_main_phase_prefs
+    ):
+        result = await main._inject_dispatch_credentials(_job(), {})
+        assert "strategic" not in result.get("llm", {})
+        assert "tactical" not in result.get("llm", {})
 
 
 # ---------------------------------------------------------------------------
@@ -422,3 +551,368 @@ class TestContextWindowInjection:
         )
         assert result["auxiliary"]["base_url"] == CTX_BASE_URL
         assert "model_max_context_tokens" not in result["auxiliary"]
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-backed model routing.
+#
+# Endpoint rows are the transport authority for catalog/self-hosted models. The
+# injector refreshes base_url/api_key/provider from the endpoint row so resumed
+# jobs and hot-swapped sessions cannot keep stale transport from an older model.
+# ---------------------------------------------------------------------------
+
+
+def _patch_resolve_provider(monkeypatch, *, provider: str):
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        return ModelMeta(
+            model_id=model_id,
+            provider=provider,
+            family="gpt-5",
+            display_name=model_id,
+            origin="catalog",
+            endpoint_id=CODEX_ENDPOINT_ID,
+        )
+
+    monkeypatch.setattr(
+        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+    )
+
+    async def fake_get_endpoint(endpoint_id):
+        if endpoint_id == CODEX_ENDPOINT_ID:
+            return {
+                "id": CODEX_ENDPOINT_ID,
+                "label": "codex-proxy",
+                "base_url": CODEX_BASE_URL,
+                "api_key": CODEX_API_KEY,
+            }
+        return None
+
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(side_effect=fake_get_endpoint),
+    )
+
+
+class TestEndpointDirectRouting:
+    """Endpoint-backed models inject their configured endpoint transport."""
+
+    @pytest.mark.asyncio
+    async def test_codex_model_hits_endpoint(self, monkeypatch):
+        _patch_resolve_provider(monkeypatch, provider="codex")
+        section = {"model": "gpt-5.5"}
+        await main._inject_model_credentials(
+            section=section,
+            model_id="gpt-5.5",
+            user_id="u",
+            resolved_keys={},
+        )
+        assert section["base_url"] == CODEX_BASE_URL
+        assert section["api_key"] == CODEX_API_KEY
+        assert section.get("provider") == "codex"
+
+    @pytest.mark.asyncio
+    async def test_openai_endpoint_model_hits_endpoint(self, monkeypatch):
+        _patch_resolve_provider(monkeypatch, provider="openai")
+        section = {"model": "gemma-4-moe"}
+        await main._inject_model_credentials(
+            section=section,
+            model_id="gemma-4-moe",
+            user_id="u",
+            resolved_keys={},
+        )
+        assert section["base_url"] == CODEX_BASE_URL
+        assert section["api_key"] == CODEX_API_KEY
+        assert section.get("provider") == "openai"
+
+    @pytest.mark.asyncio
+    async def test_endpoint_model_replaces_stale_transport(self, monkeypatch):
+        """A persisted section can carry a stale base_url/provider from a
+        previous model. Endpoint-backed rows must refresh the whole transport
+        from the endpoint table."""
+        _patch_resolve_provider(monkeypatch, provider="codex")
+        section = {
+            "model": "gpt-5.5",
+            "base_url": "https://stale.example/v1",
+            "api_key": "sk-stale",
+            "provider": "openai",  # stale factory from the same prior model
+        }
+        await main._inject_model_credentials(
+            section=section,
+            model_id="gpt-5.5",
+            user_id="u",
+            resolved_keys={},
+        )
+        assert section["base_url"] == CODEX_BASE_URL
+        assert section["api_key"] == CODEX_API_KEY
+        assert section["provider"] == "codex"
+
+    @pytest.mark.asyncio
+    async def test_endpoint_model_replaces_caller_pinned_transport(self, monkeypatch):
+        """For a catalog endpoint model, the endpoint row wins over caller-pinned
+        transport so persisted overrides cannot split model/provider/key."""
+        _patch_resolve_provider(monkeypatch, provider="codex")
+        section = {
+            "model": "gpt-5.5",
+            "base_url": "https://byo-codex.example/v1",
+            "api_key": "sk-byo",
+        }
+        await main._inject_model_credentials(
+            section=section,
+            model_id="gpt-5.5",
+            user_id="u",
+            resolved_keys={},
+        )
+        assert section["base_url"] == CODEX_BASE_URL
+        assert section["api_key"] == CODEX_API_KEY
+
+
+# ---------------------------------------------------------------------------
+# Embedding credential reliability (memory + KB).
+#
+# The embedding key drives memory (RecallStore) + KB (KnowledgeStore). It was
+# resolved ONLY inside the `if job.get("user_id")` block, so a job whose user
+# had no embedding preference (or no user) silently shipped without a key and
+# ran with memory/KB dead and no signal. The fix gives embedding the same
+# system-default fallback the chat model has (outside the user gate), stops a
+# pre-present EMBEDDING_MODEL from suppressing the key, and refuses to emit a
+# half-credential when the endpoint key can't decrypt.
+# See knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
+# ---------------------------------------------------------------------------
+
+EMB_ENDPOINT_ID = "33333333-3333-3333-3333-333333333333"
+EMB_BASE_URL = "https://ai.h4ll.app/v1"
+EMB_API_KEY = "sk-emb-test"
+EMB_MODEL = "qwen3-embedding-8b"
+
+
+def _job_no_user(*, job_id: str = "00000000-0000-0000-0000-000000000002") -> dict:
+    """A job with NO user_id — the user-preference dispatch block is skipped."""
+    return {"id": job_id, "project_id": "00000000-0000-0000-0000-0000000000bb"}
+
+
+@pytest.fixture
+def patched_main_embedding(monkeypatch):
+    """System embedding model `qwen3-embedding-8b` on an endpoint with a key.
+
+    No user settings; `resolve_default_for_capability` returns the embedding
+    model only for the "embedding" capability (None elsewhere, so the chat /
+    vision / aux fallbacks stay no-ops). Returns a mutable holder so a test can
+    simulate a decrypt failure (`holder["api_key"] = None`).
+    """
+    holder = {"api_key": EMB_API_KEY}
+
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
+        if model_id == EMB_MODEL:
+            return ModelMeta(
+                model_id=EMB_MODEL,
+                provider="openai",
+                family="default",
+                display_name="Qwen3 Embedding 8B",
+                origin="system",
+                endpoint_id=EMB_ENDPOINT_ID,
+                api_key_ref="openai",
+            )
+        return None
+
+    monkeypatch.setattr(
+        main, "_resolve_model", AsyncMock(side_effect=fake_resolve), raising=True
+    )
+
+    async def fake_get_endpoint(endpoint_id):
+        if endpoint_id == EMB_ENDPOINT_ID:
+            return {
+                "id": EMB_ENDPOINT_ID,
+                "label": "Local Router",
+                "base_url": EMB_BASE_URL,
+                "api_key": holder["api_key"],
+            }
+        return None
+
+    monkeypatch.setattr(
+        main.postgres_db,
+        "get_user_llm_endpoint",
+        AsyncMock(side_effect=fake_get_endpoint),
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "resolve_api_keys_for_job", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        main.postgres_db, "get_user_settings", AsyncMock(return_value={})
+    )
+
+    async def fake_default(capability):
+        return EMB_MODEL if capability == "embedding" else None
+
+    monkeypatch.setattr(
+        main.postgres_db,
+        "resolve_default_for_capability",
+        AsyncMock(side_effect=fake_default),
+    )
+    return holder
+
+
+class TestEmbeddingCredentialReliability:
+    @pytest.mark.asyncio
+    async def test_system_default_injected_without_user(self, patched_main_embedding):
+        """No user_id → user block skipped; the system-default fallback still
+        injects the embedding endpoint + key (the core asymmetry fix)."""
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(), {}, include_kb_profile=True
+        )
+        env = result["env_keys"]
+        assert env["EMBEDDING_MODEL"] == EMB_MODEL
+        assert env["EMBEDDING_BASE_URL"] == EMB_BASE_URL
+        assert env["EMBEDDING_API_KEY"] == EMB_API_KEY
+        assert env["KB_EMBEDDING_MODEL"] == EMB_MODEL
+        assert env["KB_EMBEDDING_BASE_URL"] == EMB_BASE_URL
+        assert env["KB_EMBEDDING_API_KEY"] == EMB_API_KEY
+        assert env["KB_EMBEDDING_PROVIDER"] == "openai"
+        assert env["KB_EMBEDDING_DIMENSIONS"] == "4096"
+        assert env["KB_EMBEDDING_PROFILE_ID"] == f"system:{EMB_ENDPOINT_ID}"
+
+    @pytest.mark.asyncio
+    async def test_kb_profile_is_system_owned(self, patched_main_embedding):
+        """A request cannot make KB queries use a user/BYO vector profile."""
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(),
+            {
+                "env_keys": {
+                    "KB_EMBEDDING_MODEL": "attacker-model",
+                    "KB_EMBEDDING_BASE_URL": "https://attacker.invalid/v1",
+                    "KB_EMBEDDING_API_KEY": "attacker-key",
+                    "KB_EMBEDDING_PROVIDER": "openrouter",
+                }
+            },
+            include_kb_profile=True,
+        )
+        env = result["env_keys"]
+        assert env["KB_EMBEDDING_MODEL"] == EMB_MODEL
+        assert env["KB_EMBEDDING_BASE_URL"] == EMB_BASE_URL
+        assert env["KB_EMBEDDING_API_KEY"] == EMB_API_KEY
+        assert env["KB_EMBEDDING_PROVIDER"] == "openai"
+
+    @pytest.mark.asyncio
+    async def test_unscoped_job_receives_no_system_kb_secret(
+        self, patched_main_embedding
+    ):
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(),
+            {
+                "env_keys": {
+                    "KB_EMBEDDING_MODEL": "caller-model",
+                    "KB_EMBEDDING_API_KEY": "caller-key",
+                }
+            },
+        )
+
+        assert not any(
+            key.startswith("KB_EMBEDDING_") for key in result.get("env_keys", {})
+        )
+
+    @pytest.mark.asyncio
+    async def test_central_indexer_uses_dispatched_kb_profile(
+        self, patched_main_embedding
+    ):
+        dispatched = await main._inject_dispatch_credentials(
+            _job_no_user(), {}, include_kb_profile=True
+        )
+        service = await main._build_kb_embedding_service()
+        env = dispatched["env_keys"]
+
+        assert service.model == env["KB_EMBEDDING_MODEL"]
+        assert service.base_url == env["KB_EMBEDDING_BASE_URL"]
+        assert service.api_key == env["KB_EMBEDDING_API_KEY"]
+        assert service.provider == env["KB_EMBEDDING_PROVIDER"]
+        assert service.expected_dimensions == int(env["KB_EMBEDDING_DIMENSIONS"])
+        assert service.profile_identity == env["KB_EMBEDDING_PROFILE_ID"]
+
+    @pytest.mark.asyncio
+    async def test_dev_env_fallback_is_dispatched_as_authoritative_kb_profile(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+        monkeypatch.setenv("EMBEDDING_MODEL", "dev-kb-model")
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://dev.example/v1")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "dev-system-key")
+        monkeypatch.setenv("EMBEDDING_DIMENSIONS", "4096")
+        monkeypatch.setattr(
+            main.postgres_db,
+            "resolve_default_for_capability",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "resolve_api_keys_for_job",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_user_settings",
+            AsyncMock(return_value={}),
+        )
+
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(), {}, include_kb_profile=True
+        )
+        service = await main._build_kb_embedding_service()
+        env = result["env_keys"]
+
+        assert env["KB_EMBEDDING_MODEL"] == "dev-kb-model"
+        assert env["KB_EMBEDDING_BASE_URL"] == "https://dev.example/v1"
+        assert env["KB_EMBEDDING_API_KEY"] == "dev-system-key"
+        assert service.model == env["KB_EMBEDDING_MODEL"]
+        assert service.base_url == env["KB_EMBEDDING_BASE_URL"]
+        assert service.api_key == env["KB_EMBEDDING_API_KEY"]
+
+    @pytest.mark.asyncio
+    async def test_user_without_embedding_pref_still_gets_key(
+        self, patched_main_embedding
+    ):
+        """A job WITH a user but no embedding preference still resolves the
+        system default embedding key."""
+        result = await main._inject_dispatch_credentials(_job(), {})
+        assert result["env_keys"]["EMBEDDING_API_KEY"] == EMB_API_KEY
+
+    @pytest.mark.asyncio
+    async def test_pre_present_model_does_not_suppress_key(
+        self, patched_main_embedding
+    ):
+        """A pre-present EMBEDDING_MODEL must NOT skip _API_KEY injection."""
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(), {"env_keys": {"EMBEDDING_MODEL": EMB_MODEL}}
+        )
+        assert result["env_keys"]["EMBEDDING_API_KEY"] == EMB_API_KEY
+
+    @pytest.mark.asyncio
+    async def test_preset_api_key_is_not_overwritten(self, patched_main_embedding):
+        """A per-job/BYO embedding key already in env_keys wins (additive)."""
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(), {"env_keys": {"EMBEDDING_API_KEY": "user-byo"}}
+        )
+        assert result["env_keys"]["EMBEDDING_API_KEY"] == "user-byo"
+
+    @pytest.mark.asyncio
+    async def test_decrypt_failure_emits_no_half_credential(
+        self, patched_main_embedding, caplog
+    ):
+        """Endpoint has a base_url but the key didn't decrypt (api_key=None):
+        do NOT inject a base_url-without-key half-credential, and log loudly."""
+        patched_main_embedding["api_key"] = None
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            result = await main._inject_dispatch_credentials(_job_no_user(), {})
+        env = result.get("env_keys", {})
+        assert "EMBEDDING_API_KEY" not in env
+        assert "EMBEDDING_BASE_URL" not in env
+        assert any(EMB_ENDPOINT_ID in rec.getMessage() for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_catalog_kb_profile_never_indexes_with_env_fallback(
+        self, patched_main_embedding, monkeypatch
+    ):
+        """A broken selected profile must fail, not index with another model."""
+        patched_main_embedding["api_key"] = None
+        monkeypatch.setenv("EMBEDDING_MODEL", "different-env-model")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "env-key")
+
+        assert await main._build_kb_embedding_service() is None

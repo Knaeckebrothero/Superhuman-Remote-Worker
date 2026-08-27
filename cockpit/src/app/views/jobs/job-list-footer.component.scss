@@ -1,0 +1,40 @@
+@use '../../../styles/variables' as v;
+
+.job-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: v.$space-md;
+  flex-wrap: wrap;
+  padding: v.$space-sm v.$space-md;
+  border-top: 1px solid var(--border-color);
+  font-size: v.$font-size-sm;
+  color: var(--text-secondary);
+}
+
+.job-footer__range {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.job-footer__controls {
+  display: flex;
+  align-items: center;
+  gap: v.$space-md;
+}
+
+.job-footer__size {
+  display: flex;
+  align-items: center;
+  gap: v.$space-sm;
+}
+
+.job-footer__size-label {
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.job-footer__page {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}

@@ -41,7 +41,6 @@ from .core.job import create_job_tools, get_final_phase_data, clear_final_phase_
 from .core.todo import create_todo_tools
 from .description_manager import (
     DescriptionManager,
-    generate_workspace_tool_docs,
     generate_tool_description,
     generate_tool_index,
     apply_description_overrides,
@@ -117,7 +116,6 @@ __all__ = [
     "apply_instruction_enforcement",
     # Description manager
     "DescriptionManager",
-    "generate_workspace_tool_docs",
     "generate_tool_description",
     "generate_tool_index",
     "apply_description_overrides",

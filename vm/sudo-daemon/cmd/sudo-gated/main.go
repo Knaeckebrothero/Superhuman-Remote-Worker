@@ -1,11 +1,12 @@
 // sudo-gated is the sudo approval gate daemon.
 //
 // It listens on a Unix domain socket for requests from the sudo approval
-// plugin (sudo_gate.so), forwards them to the orchestrator via NATS
-// request/reply, and relays the approval/denial decision back.
+// plugin (sudo_gate.so), forwards them to the orchestrator over HTTP or NATS,
+// and relays the approval/denial decision back.
 //
 // Configuration is loaded from a YAML file (--config flag) with environment
-// variable overrides (NATS_URL, JOB_ID, VM_ID).
+// variable overrides (ORCHESTRATOR_URL, VM_AUTH_TOKEN, ENTITY_ID, NATS_URL,
+// JOB_ID, VM_ID).
 package main
 
 import (
@@ -13,6 +14,8 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -44,6 +47,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(1)
 	}
+	transport, err := cfg.Transport()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Set up structured logging.
 	var logLevel slog.Level
@@ -65,49 +73,70 @@ func main() {
 
 	logger.Info("starting",
 		"socket", cfg.SocketPath,
-		"nats", cfg.NATS.URL,
+		"transport", transport,
 		"job_id", cfg.JobID,
 		"vm_id", cfg.VMID,
 	)
 
-	if cfg.JobID == "" {
+	if transport == "nats" && cfg.JobID == "" {
 		logger.Warn("JOB_ID not set — NATS subject will use empty job_id")
 	}
 
-	// Connect to NATS.
-	nc, err := nats.Connect(cfg.NATS.URL,
-		nats.MaxReconnects(cfg.NATS.MaxReconnects),
-		nats.ReconnectWait(cfg.NATS.ReconnectWait),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			logger.Warn("NATS disconnected", "error", err)
-		}),
-		nats.ReconnectHandler(func(_ *nats.Conn) {
-			logger.Info("NATS reconnected")
-		}),
-		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-			logger.Error("NATS error", "error", err)
-		}),
-	)
-	if err != nil {
-		logger.Error("NATS connect failed", "error", err, "url", cfg.NATS.URL)
-		os.Exit(1)
+	var approver gate.Approver
+	var nc *nats.Conn
+	if transport == "http" {
+		if cfg.EntityID == "" {
+			logger.Error("ENTITY_ID must be set in HTTP mode")
+			os.Exit(1)
+		}
+		httpTransport := &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 40 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		}
+		client := &http.Client{Transport: httpTransport}
+		approver = gate.NewHTTPApprover(client, cfg.Orchestrator.URL, cfg.Orchestrator.Token, cfg.EntityID).
+			WithLogger(logger.With("component", "http-approver"))
+		logger.Info("HTTP approver configured", "orchestrator", cfg.Orchestrator.URL, "entity_id", cfg.EntityID)
+	} else {
+		nc, err = nats.Connect(cfg.NATS.URL,
+			nats.MaxReconnects(cfg.NATS.MaxReconnects),
+			nats.ReconnectWait(cfg.NATS.ReconnectWait),
+			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+				logger.Warn("NATS disconnected", "error", err)
+			}),
+			nats.ReconnectHandler(func(_ *nats.Conn) {
+				logger.Info("NATS reconnected")
+			}),
+			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+				logger.Error("NATS error", "error", err)
+			}),
+		)
+		if err != nil {
+			logger.Error("NATS connect failed", "error", err, "url", cfg.NATS.URL)
+			os.Exit(1)
+		}
+		defer nc.Close()
+		logger.Info("NATS connected", "url", cfg.NATS.URL)
+		approver = gate.NewNATSApprover(nc, cfg.NATS.SubjectPrefix)
 	}
-	defer nc.Close()
-	logger.Info("NATS connected", "url", cfg.NATS.URL)
 
 	// Build the handler.
 	limiter := gate.NewRateLimiter(cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst)
 
 	handler := gate.NewHandler(gate.HandlerConfig{
-		NC:          nc,
-		VMID:        cfg.VMID,
-		JobID:       cfg.JobID,
-		Subject:     cfg.NATS.SubjectPrefix,
-		NATSTimeout: cfg.Timeouts.NATSRequest,
-		ReadTimeout: cfg.Timeouts.SocketRead,
-		Limiter:     limiter,
-		SkipVerify:  *skipVerify,
-		Logger:      logger.With("component", "handler"),
+		Approver:        approver,
+		ApprovalTimeout: cfg.Timeouts.NATSRequest,
+		VMID:            cfg.VMID,
+		JobID:           cfg.JobID,
+		ReadTimeout:     cfg.Timeouts.SocketRead,
+		Limiter:         limiter,
+		SkipVerify:      *skipVerify,
+		Logger:          logger.With("component", "handler"),
 	})
 
 	// Build the server.

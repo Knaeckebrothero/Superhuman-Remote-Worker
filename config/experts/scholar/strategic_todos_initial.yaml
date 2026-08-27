@@ -65,9 +65,20 @@ todos:
       Include:
       - "## Exploration Questions" — the specific questions from todo 2
       - Phase table with: phase name, exploration mode, target questions, expected output
-        (idea artifacts, experiment results, or notes)
+        (idea artifacts, experiment results, or notes), and a fan-out decision —
+        "fan-out (N subagents)" or "sequential: <reason>"
 
-      PHASE SIZING: Target 5-7 todos per tactical phase.
+      FAN-OUT DECISION (required for every phase): You can spawn throwaway subagents
+      with the spawn_subagent tool — several calls in ONE turn run in parallel, each
+      reads with a fresh context and returns a distilled result string, and you author
+      the synthesis. Any phase covering 2+ independent questions, sources, or topics
+      MUST default to "fan-out (N subagents)"; mark a phase "sequential" only with an
+      explicit reason (threads depend on each other's results, or a single narrow
+      topic). Record the decision in the phase table — later phases follow the plan.
+
+      PHASE SIZING: Cover the investigation in ONE exploration phase (10-20 todos)
+      where you can. A second phase must earn its planning cycle — plan one only when
+      its questions cannot be written until the first phase's findings land.
 
       PHASE ORDERING: Start with broad web exploration or codebase archaeology to
       establish context. Follow with focused investigation of promising leads.
@@ -77,7 +88,8 @@ todos:
       based on what you discover.
 
       COMPLETION CRITERIA: plan.md exists with at least 2 exploration phases defined,
-      each targeting specific questions and exploration modes.
+      each targeting specific questions and exploration modes, and every phase row
+      records a fan-out decision.
 
       INSTEAD OF: Planning "deliverable" phases — the scholar produces ideas, not
       finished products. Instead of a single monolithic research phase — break into
@@ -110,10 +122,9 @@ todos:
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE calling next_phase_todos.
-      The tool will reject your call if you haven't read the guide.
+      Create 10-20 todos for the exploration phase. (The todo-guide skill at
+      skills/todo-guide/SKILL.md covers todo crafting.)
 
-      After reading the guide, create 5-7 todos for the first exploration phase.
       Each todo must:
       - Target a specific question from your exploration plan
       - Name the exploration mode (web search, codebase read, log query, experiment)
@@ -123,10 +134,13 @@ todos:
       The first phase should typically be a broad exploration sweep — web search
       or codebase archaeology — to establish context before going deeper.
 
+      If your plan marked this phase as "fan-out (N subagents)", create the fan-out
+      todo FIRST (one todo instructing N spawn_subagent calls in a single turn, each
+      task self-contained) and synthesis todos AFTER it.
+
       Include at least one todo for recording findings as knowledge notes (kb_write).
 
-      COMPLETION CRITERIA: next_phase_todos called successfully with 5-7 todos.
+      COMPLETION CRITERIA: next_phase_todos called successfully with the exploration todos.
 
-      INSTEAD OF: Skipping reading todo_guide.md — the tool enforces this.
-      Instead of vague todos like "research the topic" — specify what to search,
+      INSTEAD OF: Vague todos like "research the topic" — specify what to search,
       where to look, and what artifact to produce.

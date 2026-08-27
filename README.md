@@ -1,25 +1,35 @@
-# Superhuman Remote Worker
+# Project SRW
+
+> **Goal: a foundation for artificial intelligence to act in the digital world — functionally and safely.**
+
+"SRW" stands for *Superhuman Remote Worker* — the north star, not a description of today. The name is the goal: an AI you can hand real work and a machine to do it on. This repository builds the layer *underneath* that goal: the model-agnostic substrate any such system needs, whichever model does the thinking.
+
+Why a foundation and not just a smarter model? A decision isn't something a model "has"; it emerges when a predictive core is wired to a value signal and a selection loop. Today that core is an LLM predicting tokens — tomorrow it may be a world model predicting latent state, or a vision-language-action model predicting motor commands, with state shifting from text to vectors to frames. What *doesn't* change is everything around the core: a machine to run on, connectors to act through, durable memory and state, observability, scaling, cooperation between agents, and the guardrails that keep it safe. The cognitive core is a swappable organ; the harness is the durable part — and it's where the decision-making loop actually lives. In effect, SRW is an operating system for AI to interact with the digital world.
+
+Concrete capabilities are **milestones** toward that foundation, not the point in themselves. The flagship milestone today is the self-improving loop.
+
+## Milestone: The Self-Improving Loop
 
 A self-improving AI agent system. Specialized agents form a continuous innovation cycle: one explores ideas, one tears them apart, one builds the survivors, one curates what was learned. The system gets better on its own.
 
 Built on LangGraph with a config-driven architecture. Same codebase, different YAML configs, different roles. Runs as job-based workers or interactive persistent sessions.
 
-## The Innovation Cycle
+### The Innovation Cycle
 
 The typical human-AI workflow looks like this: you have an idea, you dump it on the AI, the AI builds it, then you spend forever refactoring because your inner perfectionist won't let you merge something that works but isn't elegant. Repeat.
 
 This system replaces that loop with four agents that run it continuously:
 
 ```
-         ┌──────────────────────────────────────────────────┐
-         │                                                  │
-         ▼                                                  │
+         ┌─────────────────────────────────────────────────┐
+         │                                                 │
+         ▼                                                 │
    ┌──────────┐     writes ideas     ┌──────────┐          │
-   │  SCHOLAR │ ──────────────────► │  CRITIC  │          │
+   │  SCHOLAR │ ───────────────────► │  CRITIC  │          │
    │          │                      │          │          │
    │ Explores │     reviews &        │ Reviews  │          │
    │ the web, │     rates them       │ rejects  │          │
-   │ codebase,│ ◄────────────────── │ or       │          │
+   │ codebase,│ ◄─────────────────── │ or       │          │
    │ papers,  │  feedback/issues     │ approves │          │
    │ logs     │                      └────┬─────┘          │
    └──────────┘                           │                │
@@ -70,9 +80,9 @@ No human bottleneck in the loop. You set the direction, the system iterates.
 
 Not everything fits the innovation loop. The system also has agents for direct interaction and design work:
 
-**General Secretary** (`config/defaults.yaml`) — Jack-of-all-trades with all tools enabled and no specialization. The agent you talk to directly for ad-hoc tasks. The escape hatch for "just do this thing."
+**General Worker** — The database-backed application default for new jobs. A safe generalist for research, writing, analysis, planning, and file deliverables; administrators can customize it without rebuilding the image.
 
-**Interactive** — Conversational assistant for persistent sessions. No phase/todo structure — continuous tool-calling loop with WebSocket transport. For when you need an agent that stays online and responds in real time.
+**Assistant** — The database-backed application default for persistent sessions. It uses the continuous tool-calling loop and can be customized by administrators or forked as a user's personal default.
 
 **Designer** — UI/UX design specialist that creates self-contained HTML/CSS mockups using the project's design system. Analyzes interface patterns and produces structured design specifications.
 
@@ -142,9 +152,9 @@ python agent.py --port 8001 --loop
 
 ## Docker Compose Deployment
 
-Deploy the complete system using containers. This is the simplest deployment option — no Kubernetes required. The orchestrator auto-detects the environment and uses static workspace pools instead of dynamic pod provisioning. See [`docs/docker_compose_mode.md`](docs/docker_compose_mode.md) for architecture details.
+Deploy the complete system using containers. This is the simplest deployment option — no Kubernetes required. The orchestrator auto-detects the environment and uses static workspace pools instead of dynamic pod provisioning. See [`knowledge-base/knowledge/docker_compose_mode.md`](knowledge-base/knowledge/docker_compose_mode.md) for architecture details.
 
-For Kubernetes deployment (recommended for production), see [`docs/deployment.md`](docs/deployment.md) and the `deployment/` or `deployment-local/` directories.
+For Kubernetes deployment (recommended for production), see [`knowledge-base/knowledge/deployment.md`](knowledge-base/knowledge/deployment.md) and the `deployment/` or `deployment-local/` directories.
 
 ### 1. Clone and Configure
 
@@ -184,7 +194,6 @@ podman-compose up -d
 This starts:
 - **PostgreSQL** — Job tracking and data storage (+ SSO databases for Keycloak/Nextcloud)
 - **PostgreSQL (Vector)** — Citations, embeddings, knowledge index (pgvector)
-- **MongoDB** — LLM request logging and audit trail
 - **Neo4j** — Graph database for project knowledge base
 - **Keycloak** — SSO identity provider (OIDC for all services)
 - **Gitea** — Git server for agent workspace repositories (Keycloak OIDC login)
@@ -197,7 +206,7 @@ This starts:
 - **Cockpit** — Web UI for job management and monitoring
 - **NATS** — Messaging for VM lifecycle and agent communication
 - **MinIO** — S3-compatible object storage for VM snapshots and IDE sessions
-- **pgAdmin / mongo-express** — Database admin UIs
+- **pgAdmin** — Database admin UI
 - **Dozzle** — Container log viewer
 
 ### 4. Access Services
@@ -269,13 +278,13 @@ Sanity check: `docker run --rm hello-world`, `k3d version`, `kubectl version --c
 ./scripts/local-dev-up.sh
 ```
 
-Idempotent — re-runs are safe. Creates the k3d cluster (host ports 80/443 → Traefik, local image registry on `localhost:5000`), installs cert-manager, registers a `mkcert-issuer` ClusterIssuer wrapping your mkcert root CA, creates the `srw` namespace, and seeds a dummy `srw-vm-ssh-key` Secret (the orchestrator mounts it unconditionally for VM workspaces; locally a stub is fine).
+Idempotent — re-runs are safe. Creates the k3d cluster (host ports 80/443 → Traefik, local image registry on `localhost:5005`), installs cert-manager, registers a `mkcert-issuer` ClusterIssuer wrapping your mkcert root CA, creates the `srw` namespace, and seeds a dummy `srw-vm-ssh-key` Secret (the orchestrator mounts it unconditionally for VM workspaces; locally a stub is fine).
 
 The script's behaviour is documented inline; if anything fails it bails out with a clear message rather than silently continuing.
 
 ### 2. Set the OpenCloud OIDC workaround address
 
-OpenCloud's proxy needs to reach Keycloak from inside the pod, and on k3d `auth.localhost` resolves to the pod's own loopback. `values-local.example.yaml` ships a `hostAliases` block that maps `auth.localhost` to Traefik's ClusterIP — but that IP is determined at cluster-create time, so grab it now:
+OpenCloud's proxy needs to reach Keycloak from inside the pod, and on k3d `auth.localhost` resolves to the pod's own loopback. `values-local.yaml.example` ships a `hostAliases` block that maps `auth.localhost` to Traefik's ClusterIP — but that IP is determined at cluster-create time, so grab it now:
 
 ```bash
 kubectl --context=k3d-srw -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'
@@ -295,11 +304,16 @@ kubectl --context=k3d-srw -n srw create secret generic srw-session-jwt \
 ### 4. Copy the values template and install the chart
 
 ```bash
-cp deployment/values-local.example.yaml deployment/values-local.yaml
+cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml
 # - paste at least one LLM key (OPENAI_API_KEY / ANTHROPIC_API_KEY / GROQ_API_KEY)
 # - paste the Traefik ClusterIP from step 2 into opencloud.hostAliases[0].ip
 
+# the chart depends on the Collabora subchart (Canvas Office rendering), so its
+# repo must be registered before `helm dependency build` will resolve Chart.lock
+helm repo add collabora https://collaboraonline.github.io/online --force-update
+helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
+helm dependency build ./helm
 helm install srw ./helm -n srw --kube-context=k3d-srw -f deployment/values-local.yaml
 ```
 
@@ -326,7 +340,7 @@ The `test` user is pre-seeded in the Keycloak realm with `admin` + `user` roles,
 | `https://api.localhost/`    | Orchestrator REST API |
 | `https://auth.localhost/`   | Keycloak (admin console at `/admin`) |
 | `https://git.localhost/`    | Gitea |
-| `https://cloud.localhost/`  | OpenCloud |
+| `https://cloud.localhost/`  | Nextcloud (the main cloud backend) |
 | `https://mcp.localhost/`    | MCP server |
 
 `*.localhost` resolves to `::1` automatically (RFC 6761 + glibc `myhostname` NSS), so there's no DNS config to do.
@@ -335,9 +349,9 @@ The `test` user is pre-seeded in the Keycloak realm with `admin` + `user` roles,
 
 Quick checklist after a fresh `helm install` (or after recreating the cluster). Each step exercises an independent slice of the stack.
 
-**1. Cockpit + Keycloak login** — open `https://localhost/`, log in as `test`/`test`. Lands on `/builder`. If you land in a refresh loop, jump to the matching troubleshooting entry below.
+**1. Cockpit + Keycloak login** — open `https://localhost/`, log in as `test`/`test`. Lands on the Sessions list (`/sessions`). If you land in a refresh loop, jump to the matching troubleshooting entry below.
 
-**2. Sessions (persistent agent + WS)** — Sessions → **New Session** → pick any expert (e.g. Scholar) → **Create Session**. Expected sequence in the UI:
+**2. Sessions (persistent agent + WS)** — Sessions → **New Session** → keep the preselected Assistant (or choose another session expert) → **Create Session**. Expected sequence in the UI:
 
 - "Creating thread" ✓ within 1 s
 - "Provisioning agent" ✓ within ~10 s (k8s pulls the agent + workspace images on the first run)
@@ -361,7 +375,26 @@ kubectl --context=k3d-srw -n srw get pods -l app.kubernetes.io/component=workspa
 
 **4. Gitea SSO** — open `https://git.localhost/`, click **Sign In** → **Sign in with Keycloak**. Should land on `test - Dashboard` without a manual credentials step.
 
-**5. OpenCloud SSO** — open `https://cloud.localhost/`. Should redirect through Keycloak and land on `Personal - OpenCloud` (`/files/spaces/personal/test`). If you land on `/access-denied`, the OpenCloud OIDC workaround isn't applied — see Troubleshooting (almost always: stale `hostAliases` IP).
+**5. Nextcloud SSO** — open `https://cloud.localhost/`, click **Log in with Keycloak**. Should land on the Files view. A plain `curl -sk https://cloud.localhost/status.php` is the cheaper check that the pod and Ingress are healthy (`"installed":true`).
+
+> The local stack runs **Nextcloud**, not OpenCloud (`nextcloud.enabled=true` + `opencloud.enabled=false` in `values-local.yaml.example`). Sections below that describe an OpenCloud `hostAliases` workaround are leftovers from before that switch and no longer apply — the example values file has no `hostAliases` block.
+
+### 6. VM workspaces (optional)
+
+The VM tier (KubeVirt VMs as agent workspaces, with gated `sudo`) runs on the same k3d
+cluster. Install KubeVirt + CDI with the bootstrap script — it picks the KubeVirt line for the
+cluster's Kubernetes minor, uses your host's KVM when `/dev/kvm` is visible inside the node,
+patches the `local-path` StorageProfile, and ends with a boot + import smoke test:
+
+```bash
+./scripts/local-kubevirt-up.sh
+kubectl -n srw create secret generic srw-vm-lifecycle-hmac \
+  --from-literal=VM_LIFECYCLE_HMAC_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+```
+
+Then uncomment the `vm:` / `vmController:` block in `deployment/values-local.yaml` (pin a
+published `agent-vm-base` tag) and let Tilt apply it on the next image rebuild. Prerequisites,
+sizing and troubleshooting: `helm/README.md` → "VM workspaces on your cluster".
 
 ### Daily usage
 
@@ -384,7 +417,7 @@ Tilt watches the repo and live-syncs source files into the running pods (or rebu
 | MCP | `live_update` sync + `watchfiles` wrapper | ~10–15 s (watchfiles + Tilt debounce) |
 | Agent | full image rebuild + helm fan-out + Reloader bounce | ~50 s (~8 s warm docker build + orchestrator restart) |
 
-Tilt is opt-in but is now the **default development workflow**. The `helm install` path above still works standalone for people without Tilt installed. Design and rationale: [`docs/features/tilt_inner_loop_dev.md`](docs/features/tilt_inner_loop_dev.md).
+Tilt is opt-in but is now the **default development workflow**. The `helm install` path above still works standalone for people without Tilt installed. Design and rationale: [`knowledge-base/knowledge/features/tilt_inner_loop_dev.md`](knowledge-base/knowledge/features/tilt_inner_loop_dev.md).
 
 **One-time install** (binary to `~/.local/bin/`, no sudo):
 
@@ -402,7 +435,13 @@ tilt version
 ./scripts/local-dev-tilt-up.sh
 ```
 
-This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, and finally runs `tilt up` in the foreground.
+This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath
+(cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the
+`srw-session-jwt` Secret, syncs the current Traefik ClusterIP into
+`values-local.yaml`'s `opencloud.hostAliases` entry, and runs `tilt up` in the
+foreground. The chart deploys and bootstraps its bundled single-node Garage for
+the `virtual` workspace tier and workspace snapshot/IDE-session storage; no
+separate MinIO image mirror is required.
 
 **Run Tilt — subsequent sessions**: the cluster, secrets, and Helm release persist across `k3d cluster stop/start`, and the Traefik ClusterIP is stable for the life of the cluster, so you don't need the bootstrap again. Just bring the cluster back and start Tilt directly (always cluster first, then Tilt — Tilt deploys *into* a running cluster):
 
@@ -417,7 +456,7 @@ Press Ctrl-C to stop Tilt (the cluster keeps running; use `k3d cluster stop srw`
 
 The point of having Tilt + a local prod-parity cluster is that **every change can be verified locally before it ships**. The loop:
 
-1. **Plan**: design doc under `docs/features/` or `docs/issues/` (whatever fits). Get alignment on scope + acceptance before you start editing.
+1. **Plan**: design doc under `knowledge-base/knowledge/features/` or `knowledge-base/knowledge/issues/` (whatever fits). Get alignment on scope + acceptance before you start editing.
 2. **Develop**: edit the relevant source. Tilt handles the rebuild/sync automatically — watch the Tilt UI at `https://localhost:10350` for the affected resource going green again.
 3. **Verify locally** — do not push until this passes:
    - **Unit/lint tests** at file granularity:
@@ -438,7 +477,7 @@ What to watch for in the Tilt UI / pod logs to confirm an edit actually took eff
 
 - **Orchestrator** (`orchestrator/*.py`, `src/*.py`, `config/*`): orchestrator pod log shows `WatchFiles detected changes in '/app/...'` followed by a uvicorn worker re-import. Hit `kubectl ... curl http://localhost:8085/api/health` to confirm.
 - **Cockpit** (`cockpit/src/**/*.ts|html|scss`): cockpit pod log shows `Component update sent to client(s)` (CSS) or `Page reload required` (TS/HTML). Browser auto-refreshes within ~5 s. If `[vite] connected.` is missing from the browser console, the HMR WebSocket dropped — refresh.
-- **MCP** (`orchestrator/mcp/*.py`, `orchestrator/services/formatters.py`): mcp pod log shows `watchfiles: N changes detected` followed by the FastMCP banner with the (potentially updated) server name. `/health` returns 200 within ~10 s.
+- **MCP** (`orchestrator/mcp/*.py`, `src/shared/`): mcp pod log shows `watchfiles: N changes detected` followed by the FastMCP banner with the (potentially updated) server name. `/health` returns 200 within ~10 s.
 - **Agent** (`src/*.py`, `config/*`, `agent.py`): srw-agent image rebuilds (visible in Tilt UI), helm upgrade fans the new `tilt-<hash>` tag into `srw-config`'s `PERSISTENT_AGENT_IMAGE`, Stakater Reloader rolls the orchestrator, **next** session/job picks up the new code. Existing agent pods are unaffected (they hold the old image — agent pods are per-job, not long-running).
 - **Requirements / Dockerfile edits**: trigger `fall_back_on` → full image rebuild + roll. Cold rebuild is ~3-5 min the first time after a `tilt down`; warm is ~10-20 s thanks to the cache mounts in `Dockerfile.*.dev`.
 
@@ -491,9 +530,15 @@ k3d cluster delete srw                     # destroy the whole cluster (includin
     --docker-username=<github-user> --docker-password=<github-PAT-with-read:packages>
   ```
 - **`PersistentVolumeClaim ... is invalid: ... storage: Forbidden: field can not be less than previous value`** — you tried to shrink a PVC. Either bump the size back up in `values-local.yaml` or delete the PVC and re-upgrade (`kubectl -n srw delete pvc <name>`).
-- **Keycloak in `CreateContainerConfigError` for missing secret keys** — the realm import references env vars for every OIDC client (even disabled ones). Check that all keys from `values-local.example.yaml` are present in `values-local.yaml`.
+- **Keycloak in `CreateContainerConfigError` for missing secret keys** — the realm import references env vars for every OIDC client (even disabled ones). Check that all keys from `values-local.yaml.example` are present in `values-local.yaml`.
+- **Every Tilt deploy fails with `Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress`** — a previous `helm upgrade` was killed mid-flight (superseding build, Ctrl-C, or the `k8s_upsert_timeout_secs` deadline) and left its release Secret in `pending-upgrade`. The lock lives in the cluster, so **restarting Tilt does not clear it**. `scripts/tilt-helm-apply.sh` now clears this automatically on the next deploy, once the pending revision is >60 s old (`SRW_HELM_STALE_AFTER`). To clear it by hand:
+  ```bash
+  helm history srw -n srw            # find the pending revision N
+  kubectl -n srw delete secret sh.helm.release.v1.srw.v<N>
+  ```
+  The previous revision stays `deployed` and becomes the head again; `--take-ownership` re-adopts anything the killed run already applied. **Do not use `tilt trigger srw` to recover** — a Force Update runs `delete_cmd` (`helm uninstall`) first, which reinstalls the release from scratch and restarts every workload. Data survives (PVCs and the `resource-policy: keep` Secret are preserved), but it costs a multi-minute full-stack restart for nothing.
 - **`https://localhost/` returns 404 right after `k3d cluster start srw`** — Traefik's endpoint discovery can go stale through a long idle (the pod restart cascade after `k3d cluster stop`/`start` sometimes leaves Traefik holding empty endpoint state). Kick it: `kubectl --context=k3d-srw -n kube-system rollout restart deploy/traefik`.
-- **Login lands in a 401-refresh loop in Brave/Firefox** — the chart defaults to `auth.bff.sameOriginApi: true` in `values-local.example.yaml` so the cockpit and BFF share an origin and the session cookie is first-party. If you flipped that off, either flip it back on or allowlist `[*.]localhost` for cookies in the browser. Symptom in orchestrator logs: `GET /auth/callback 302` immediately followed by `GET /api/auth/me 401` on repeat.
+- **Login lands in a 401-refresh loop in Brave/Firefox** — the chart defaults to `auth.bff.sameOriginApi: true` in `values-local.yaml.example` so the cockpit and BFF share an origin and the session cookie is first-party. If you flipped that off, either flip it back on or allowlist `[*.]localhost` for cookies in the browser. Symptom in orchestrator logs: `GET /auth/callback 302` immediately followed by `GET /api/auth/me 401` on repeat.
 - **New session stuck on "Provisioning agent" / WebSocket errors `Unexpected response code: 200`** — usually the cockpit's Service Worker (`ngsw-worker.js`) is serving stale assets that point at the legacy `/ws/persistent/...` WS path (which the orchestrator no longer hosts). In DevTools → Application → Service Workers, **Unregister** all SWs and clear caches under Storage, then hard-reload. Programmatic version:
   ```js
   (await navigator.serviceWorker.getRegistrations()).forEach(r => r.unregister());
@@ -531,7 +576,6 @@ pip install -r requirements.txt
 # System dependencies (Fedora)
 sudo dnf install poppler-utils         # PDF rendering
 # Debian/Ubuntu: sudo apt-get install poppler-utils
-playwright install chromium            # Browser-based research
 ```
 
 ### 2. Configure Environment
@@ -600,6 +644,8 @@ python init.py --restore-backup backups/20260201_001    # Restore
 ### 7. Testing
 
 ```bash
+python -m pip install -r requirements-dev.txt  # One-time test dependencies
+./scripts/pytest-fast.sh                   # All tests, bounded parallel runner
 pytest tests/                              # All tests
 pytest tests/test_graph.py -v              # Single file
 pytest tests/ -k "todo"                    # Pattern match
@@ -637,8 +683,8 @@ pytest tests/ --cov=src                    # With coverage
        │           │           │           │
        ▼           ▼           ▼           ▼
  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐
- │ PostgreSQL│ │  MongoDB  │ │   Neo4j   │ │Datasources│
- │ (system)  │ │ (logging) │ │(knowledge)│ │ (per-job) │
+ │ PostgreSQL│ │  AuditDB  │ │   Neo4j   │ │Datasources│
+ │ (system)  │ │  (audit)  │ │(knowledge)│ │ (per-job) │
  └───────────┘ └───────────┘ └───────────┘ └───────────┘
 ```
 
@@ -646,16 +692,20 @@ pytest tests/ --cov=src                    # With coverage
 
 | Expert | Config | Mode | Role |
 |--------|--------|------|------|
-| **General Secretary** | `config/defaults.yaml` | Worker | Default — all tools, no specialization, ad-hoc tasks |
+| **General Worker** | managed DB expert seeded from `config/experts/general-worker/` | Worker | Application default for general jobs |
 | **Scholar** | `config/experts/scholar/` | Worker | R&D exploration, idea generation, web research, paper analysis |
 | **Critic** | `config/experts/critic/` | Worker | Code review, proposal review, codebase audits, test execution |
 | **Developer** | `config/experts/developer/` | Worker | Claude Code delegation, PR factory, implementation |
 | **Curator** | `config/experts/curator/` | Worker | Knowledge extraction from job artifacts into project KB |
 | **Designer** | `config/experts/designer/` | Worker | UI/UX design, HTML/CSS mockups, design specifications |
-| **Interactive** | `config/experts/interactive/` | Persistent | Conversational assistant, real-time tool use via WebSocket |
+| **Assistant** | managed DB expert seeded from `config/experts/assistant/` | Persistent | Application default for conversational sessions |
 | **Designer-Interactive** | `config/experts/designer-interactive/` | Persistent | Collaborative design iteration in real-time sessions |
 
-All experts share the same universal agent codebase. Worker-mode experts extend `config/defaults.yaml`, persistent-mode experts extend `config/persistent_defaults.yaml`. Both use `$extends` for deep-merge inheritance. See [config/README.md](config/README.md) for details.
+All experts share the same universal agent codebase. Worker experts extend
+`config/worker_base.yaml`; session experts extend `config/session_base.yaml`.
+Those files are conservative inheritance fallbacks, while the user-facing
+defaults are database expert pointers selected by the administrator, project,
+or user. See [config/README.md](config/README.md) for details.
 
 ### Two Operating Modes
 
@@ -669,7 +719,7 @@ All experts share the same universal agent codebase. Worker-mode experts extend 
 
 - No phase/todo structure. The agent stays online and responds in real time via WebSocket.
 - Supports idle timeout handling and memory injection across turns.
-- Used by Interactive and Designer-Interactive experts.
+- Used by Assistant and Designer-Interactive experts.
 
 Agents run in `dual` mode by default, accepting both jobs and persistent sessions.
 
@@ -706,4 +756,10 @@ rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
 
 ## License
 
-Creative Commons Attribution 4.0 International License (CC BY 4.0). See [LICENSE.txt](LICENSE.txt).
+Licensed under the [Functional Source License, Version 1.1 (FSL-1.1-ALv2)](LICENSE) — a source-available license permitting use, modification, and redistribution for any purpose **except competing with the Software**, with each release converting to the Apache License 2.0 two years after its publication.
+
+Third-party components bundled into our images (and their upstream NOTICE
+obligations) are inventoried in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+Server images the Helm chart pulls from public registries (Neo4j, PostgreSQL,
+…) arrive under their own upstream licenses and are not redistributed by
+this project.

@@ -13,7 +13,7 @@ Run this FIRST, before any planning. You are auditing the previous tactical phas
 2. For each todo the tactical phase marked completed, emit one audit row:
    - todo_id: <id>
    - claimed_deliverable: <one-line description of what the todo said it would produce>
-   - evidence_tool_call: <name of the tool call whose output proves the work happened, e.g. write_file, edit_file, run_command, graph_write>
+   - evidence_tool_call: <name of the tool call whose output proves the work happened, e.g. write_file, edit_file, {% if has_shell %}run_command, {% endif %}graph_write>
    - evidence_excerpt: <verbatim excerpt from that tool's output, max 200 chars, copied not paraphrased>
    - verdict: VERIFIED | UNVERIFIED | CONTRADICTED
 
@@ -41,7 +41,7 @@ Run this FIRST, before any planning. You are auditing the previous tactical phas
 4. Evaluate: Is the current plan still valid? What has changed?
 5. Identify blockers, completed tasks, and next priorities.
 6. Update plan.md with revised strategy if needed.
-7. Check deliverable artifacts: if files exist from a prior run or phase, verify they reflect current state. Regenerate deliverables from scratch rather than editing stale artifacts — check timestamps, IDs, and content.
+7. Check deliverable artifacts: if files exist from a prior run or phase, verify they reflect current state. Edit them in place — work committed earlier in THIS run is yours and your context for it is intact. Regenerate from scratch only when an artifact predates this run, or when you cannot account for how it got its contents.
 
 ## Knowledge Maintenance
 

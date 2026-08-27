@@ -10,6 +10,7 @@ Covers the new pool management and reservation-aware provisioning:
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 
@@ -49,6 +50,59 @@ def _make_provisioner(
     mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_ctx.__aexit__ = AsyncMock(return_value=False)
     p._db.acquire.return_value = mock_ctx
+    mock_conn.execute.return_value = "UPDATE 1"
+    runtime_generation = "22222222-2222-4222-8222-222222222222"
+
+    async def _thread(thread_id):
+        try:
+            canonical = str(UUID(str(thread_id)))
+        except (TypeError, ValueError):
+            return None
+        return {
+            "id": canonical,
+            "status": "created",
+            "runtime_generation": runtime_generation,
+            "runtime_retirement_token": None,
+        }
+
+    async def _reserve(
+        thread_id,
+        *,
+        expected_runtime_generation,
+        attempt_id,
+        pod_name,
+        provisioner,
+        pvc_name=None,
+    ):
+        claim = (
+            {
+                "claim_id": "33333333-3333-4333-8333-333333333333",
+                "thread_id": str(thread_id),
+                "created_runtime_generation": str(expected_runtime_generation),
+                "create_attempt": str(attempt_id),
+                "provisioner": provisioner,
+                "pvc_name": pvc_name,
+                "status": "planned",
+                "pvc_uid": None,
+            }
+            if pvc_name
+            else None
+        )
+        return {
+            "attempt_id": attempt_id,
+            "thread_id": thread_id,
+            "runtime_generation": expected_runtime_generation,
+            "provisioner": provisioner,
+            "pod_name": pod_name,
+            "status": "planned",
+            "pod_uid": None,
+            "workspace_claim": claim,
+        }
+
+    p._db.get_thread.side_effect = _thread
+    p._db.reserve_pinned_agent_pod_provision_intent.side_effect = _reserve
+    p._db.publish_pinned_agent_workspace_claim.return_value = True
+    p._db.publish_pinned_agent_pod_provision_intent.return_value = True
     return p, mock_conn
 
 
@@ -542,6 +596,7 @@ class TestScaleDownIdle:
         conn.fetch.return_value = [
             {"id": f"agent-{i}", "hostname": f"pod-{i}"} for i in range(4)
         ]
+        p._count_idle_agents = AsyncMock(return_value=4)
 
         with patch(
             "orchestrator.services.agent_provisioner.asyncio.to_thread",
@@ -564,6 +619,7 @@ class TestScaleDownIdle:
         conn.fetch.return_value = [
             {"id": f"agent-{i}", "hostname": f"pod-{i}"} for i in range(8)
         ]
+        p._count_idle_agents = AsyncMock(return_value=8)
 
         with patch(
             "orchestrator.services.agent_provisioner.asyncio.to_thread",
@@ -572,6 +628,35 @@ class TestScaleDownIdle:
             result = await p.scale_down_idle(max_terminate=1)
 
         assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_leaves_buffer_idle_pods_alone(self):
+        """Idle pods within AGENT_BUFFER are warm-pool inventory, not excess.
+
+        Regression for the warm-pool/scale-down thrash: with 3 busy + 1 idle
+        and buffer=1, the old active-vs-min check (4 > 2) killed the idle pod
+        that ensure_warm_pool had just created — one pod/minute churn for
+        hours (knowledge-base/knowledge/issues/session_silent_failure_audit.md #12).
+        """
+        p, conn = _make_provisioner(min_agents=2)
+        p._agent_buffer = 1
+
+        # active_count returns 4 (3 busy + 1 idle)
+        pods_result = MagicMock()
+        pods_result.items = [_make_pod(f"pod-{i}") for i in range(4)]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+
+        conn.fetch.return_value = [{"id": "agent-0", "hostname": "pod-0"}]
+        p._count_idle_agents = AsyncMock(return_value=1)
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.scale_down_idle(max_terminate=2)
+
+        assert result == 0
+        p._core_api.delete_namespaced_pod.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_noop_when_no_idle_agents(self):
@@ -713,7 +798,8 @@ class TestProvisionWithEviction:
             side_effect=_fake_to_thread,
         ):
             result = await p.provision_agent(
-                purpose="session", thread_id="test-thread-id"
+                purpose="session",
+                thread_id="11111111-2222-4333-8444-555555555555",
             )
 
         # Should have evicted one pod and created a new one
@@ -734,7 +820,8 @@ class TestProvisionWithEviction:
             side_effect=_fake_to_thread,
         ):
             result = await p.provision_agent(
-                purpose="session", thread_id="test-thread-id"
+                purpose="session",
+                thread_id="11111111-2222-4333-8444-555555555555",
             )
 
         assert result is None
@@ -755,7 +842,8 @@ class TestProvisionWithEviction:
             side_effect=_fake_to_thread,
         ):
             result = await p.provision_agent(
-                purpose="session", thread_id="test-thread-id"
+                purpose="session",
+                thread_id="11111111-2222-4333-8444-555555555555",
             )
 
         assert result is not None
@@ -832,6 +920,393 @@ class TestProvisionBasic:
 
         # 409 is treated as success (pod already exists)
         assert result is not None
+
+
+# =============================================================================
+# TestSessionAgentWorkspacePvc
+# =============================================================================
+
+
+class TestSessionAgentWorkspacePvc:
+    """Durable ``/workspace`` for SESSION agent pods (WORKSPACE_PVC_ENABLED).
+
+    The agent pod's ``/workspace`` was framed as pure scratch — the real tree
+    lives in the separate workspace pod it reaches over SSH — but that framing
+    is incomplete: ``backend: none`` / lite sessions have no workspace pod at
+    all, so agent-local state written there is the only copy and died with every
+    pod recycle (drift drain, crash, node loss, version upgrade). Since the pod
+    name is random per provision, the volume identity has to come from the
+    thread, which is what makes a recycled pod reattach rather than boot onto
+    empty scratch.
+
+    Job agent pods stay emptyDir: they are stateless dispatch runners whose
+    durable state is in the workspace pod, the job repo and Postgres.
+    """
+
+    _TID = "11111111-2222-3333-4444-555555555555"
+    _PVC = "pvc-agent-s-11111111-222"
+
+    def _provisioner(self, pvc_enabled=True):
+        p, conn = _make_provisioner()
+        p._pvc_enabled = pvc_enabled
+        p._pvc_size = "10Gi"
+        p._storage_class = "longhorn-ephemeral"
+        pods_list = MagicMock()
+        pods_list.items = []
+        p._core_api.list_namespaced_pod.return_value = pods_list
+        return p, conn
+
+    @staticmethod
+    def _capture(p, pod_body, pvc_body=None):
+        def _pod_create(**kw):
+            pod_body.update(kw.get("body", {}))
+            created = MagicMock()
+            created.metadata.uid = "pod-uid-created"
+            return created
+
+        p._core_api.create_namespaced_pod = _pod_create
+        if pvc_body is not None:
+
+            def _pvc_create(**kw):
+                pvc_body.update(kw.get("body", {}))
+                created = MagicMock()
+                created.metadata.uid = "pvc-uid-created"
+                return created
+
+            p._core_api.create_namespaced_persistent_volume_claim = _pvc_create
+
+    @pytest.mark.asyncio
+    async def test_session_pod_gets_a_thread_keyed_pvc(self):
+        p, _conn = self._provisioner()
+        pod_body, pvc_body = {}, {}
+        self._capture(p, pod_body, pvc_body)
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is not None and name.startswith("srw-agent-s-")
+        # Keyed on the thread, not the (random) pod name — that is the whole point.
+        assert pvc_body["metadata"]["name"] == self._PVC
+        assert pvc_body["spec"]["accessModes"] == ["ReadWriteOnce"]
+        # The pod mounts the claim, not scratch.
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert vols["workspace"]["persistentVolumeClaim"]["claimName"] == self._PVC
+        assert "emptyDir" not in vols["workspace"]
+
+    @pytest.mark.asyncio
+    async def test_pvc_carries_the_labels_gc_selects_on(self):
+        """Without ``srw.io/component: agent-workspace`` the claim is invisible
+        to the lifecycle reaper's label selector and leaks storage forever once
+        its thread is gone — the bug the legacy PersistentProvisioner helper has,
+        which is why this path does not reuse it. The thread id must be the FULL
+        uuid: the reaper resolves PVC → thread row by that value, and the pod's
+        12-char ``srw/thread-id`` label is not a thread key.
+        """
+        p, _conn = self._provisioner()
+        pod_body, pvc_body = {}, {}
+        self._capture(p, pod_body, pvc_body)
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        labels = pvc_body["metadata"]["labels"]
+        assert labels["srw.io/component"] == "agent-workspace"
+        assert labels["srw/thread-id"] == self._TID
+
+    @pytest.mark.asyncio
+    async def test_job_agent_pod_stays_emptydir(self):
+        p, _conn = self._provisioner()
+        pod_body = {}
+        self._capture(p, pod_body)
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock()
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="job")
+
+        assert name is not None
+        p._core_api.create_namespaced_persistent_volume_claim.assert_not_called()
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert vols["workspace"]["emptyDir"]["sizeLimit"] == "10Gi"
+        assert "persistentVolumeClaim" not in vols["workspace"]
+
+    @pytest.mark.asyncio
+    async def test_flag_off_keeps_session_pods_on_emptydir(self):
+        """Mixed-fleet safety: same switch as workspace PVCs, and a cluster that
+        hasn't flipped it behaves exactly as before."""
+        p, _conn = self._provisioner(pvc_enabled=False)
+        pod_body = {}
+        self._capture(p, pod_body)
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock()
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is not None
+        p._core_api.create_namespaced_persistent_volume_claim.assert_not_called()
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert "emptyDir" in vols["workspace"]
+
+    @pytest.mark.asyncio
+    async def test_pvc_failure_fails_closed_without_creating_a_pod(self):
+        """An emptyDir fallback would hand the user a session that looks healthy
+        and then loses its agent-local state on the next recycle — the exact
+        failure the PVC exists to prevent, with nothing in the UI to explain it.
+        A visible provision failure the caller can retry is strictly better.
+        """
+        p, conn = self._provisioner()
+        p._core_api.create_namespaced_pod = MagicMock()
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=Exception("PVC API down")
+        )
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is None
+        p._core_api.create_namespaced_pod.assert_not_called()
+        # A partial metadata marker would masquerade as deletion authority.
+        # The durable planned claim is the retry/recovery signal instead.
+        p._db.reserve_pinned_agent_pod_provision_intent.assert_awaited_once()
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_quota_403_also_fails_closed(self):
+        """Capacity exhaustion surfaces as a 403 from the namespace
+        ResourceQuota. Never silently drop durability because the cluster is
+        full."""
+        p, _conn = self._provisioner()
+
+        class _QuotaExc(Exception):
+            status = 403
+            body = "exceeded quota: srw-workspace-storage"
+
+        p._core_api.create_namespaced_pod = MagicMock()
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=_QuotaExc()
+        )
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is None
+        p._core_api.create_namespaced_pod.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_existing_claim_is_reused_not_recreated(self):
+        """409 is the reattach path every pod recycle takes — it must read as
+        success, or a recycled session agent could never come back to its data.
+        """
+        p, _conn = self._provisioner()
+        pod_body = {}
+        self._capture(p, pod_body)
+
+        conflict = type("ApiErr", (Exception,), {"status": 409})()
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=conflict
+        )
+        existing = MagicMock()
+        existing.metadata.uid = "pvc-existing-uid"
+        existing.metadata.labels = {
+            "srw.io/thread-id": self._TID,
+            "srw.io/runtime-generation": ("22222222-2222-4222-8222-222222222222"),
+            "srw.io/workspace-claim": "33333333-3333-4333-8333-333333333333",
+            "srw.io/provision-attempt": (
+                p._db.reserve_pinned_agent_pod_provision_intent.side_effect and "unused"
+            ),
+            "srw.io/claim-provisioner": "agent",
+        }
+
+        async def _reserve_with_known_attempt(*args, **kwargs):
+            result = await _make_reserved_intent_for_test(*args, **kwargs)
+            existing.metadata.labels["srw.io/provision-attempt"] = str(
+                result["attempt_id"]
+            )
+            return result
+
+        async def _make_reserved_intent_for_test(
+            thread_id,
+            *,
+            expected_runtime_generation,
+            attempt_id,
+            pod_name,
+            provisioner,
+            pvc_name=None,
+        ):
+            return {
+                "attempt_id": attempt_id,
+                "thread_id": thread_id,
+                "runtime_generation": expected_runtime_generation,
+                "provisioner": provisioner,
+                "pod_name": pod_name,
+                "status": "planned",
+                "pod_uid": None,
+                "workspace_claim": {
+                    "claim_id": "33333333-3333-4333-8333-333333333333",
+                    "thread_id": thread_id,
+                    "created_runtime_generation": expected_runtime_generation,
+                    "create_attempt": attempt_id,
+                    "provisioner": provisioner,
+                    "pvc_name": pvc_name,
+                    "status": "planned",
+                    "pvc_uid": None,
+                },
+            }
+
+        p._db.reserve_pinned_agent_pod_provision_intent.side_effect = (
+            _reserve_with_known_attempt
+        )
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = existing
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is not None
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert vols["workspace"]["persistentVolumeClaim"]["claimName"] == self._PVC
+
+    @pytest.mark.asyncio
+    async def test_pvc_name_never_collides_with_the_legacy_persistent_claim(self):
+        """``pvc-persistent-<id>`` belongs to the legacy PersistentProvisioner
+        pod path. Sharing one RWO claim between both paths would wedge whichever
+        pod attached second if the two ever coexist for a thread."""
+        p, _conn = self._provisioner()
+        pod_body, pvc_body = {}, {}
+        self._capture(p, pod_body, pvc_body)
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert not pvc_body["metadata"]["name"].startswith("pvc-persistent-")
+
+    @pytest.mark.asyncio
+    async def test_effect_then_timeout_recovers_only_exact_claim_labels(self):
+        p, _ = self._provisioner()
+        timeout = TimeoutError("create response lost")
+        p._core_api.create_namespaced_persistent_volume_claim.side_effect = timeout
+        observed = MagicMock()
+        observed.metadata.uid = "pvc-uid-after-timeout"
+        observed.metadata.labels = {
+            "srw.io/thread-id": self._TID,
+            "srw.io/runtime-generation": ("22222222-2222-4222-8222-222222222222"),
+            "srw.io/workspace-claim": "33333333-3333-4333-8333-333333333333",
+            "srw.io/provision-attempt": "44444444-4444-4444-8444-444444444444",
+            "srw.io/claim-provisioner": "agent",
+        }
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = observed
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            uid = await p._ensure_pinned_agent_pvc(
+                self._PVC,
+                thread_id=self._TID,
+                runtime_generation="22222222-2222-4222-8222-222222222222",
+                claim_id="33333333-3333-4333-8333-333333333333",
+                create_attempt="44444444-4444-4444-8444-444444444444",
+                expected_pvc_uid=None,
+            )
+        assert uid == "pvc-uid-after-timeout"
+
+        observed.metadata.labels["srw.io/thread-id"] = (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        )
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert (
+                await p._ensure_pinned_agent_pvc(
+                    self._PVC,
+                    thread_id=self._TID,
+                    runtime_generation="22222222-2222-4222-8222-222222222222",
+                    claim_id="33333333-3333-4333-8333-333333333333",
+                    create_attempt="44444444-4444-4444-8444-444444444444",
+                    expected_pvc_uid=None,
+                )
+                is None
+            )
+
+    @pytest.mark.asyncio
+    async def test_permanent_claim_fence_is_inert_and_classifies_original(self):
+        p, _ = self._provisioner()
+        incumbent = MagicMock()
+        incumbent.metadata.uid = "original-pvc-uid"
+        incumbent.metadata.labels = {
+            "srw.io/thread-id": self._TID,
+            "srw.io/runtime-generation": ("22222222-2222-4222-8222-222222222222"),
+            "srw.io/workspace-claim": "33333333-3333-4333-8333-333333333333",
+            "srw.io/provision-attempt": "44444444-4444-4444-8444-444444444444",
+            "srw.io/claim-provisioner": "agent",
+        }
+        conflict = type("ApiErr", (Exception,), {"status": 409})()
+        p._core_api.create_namespaced_persistent_volume_claim.side_effect = conflict
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = incumbent
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.fence_agent_workspace_claim(
+                self._PVC,
+                expected_thread_id=self._TID,
+                expected_runtime_generation=("22222222-2222-4222-8222-222222222222"),
+                expected_claim_id="33333333-3333-4333-8333-333333333333",
+                expected_create_attempt="44444444-4444-4444-8444-444444444444",
+            )
+        assert result == {"state": "exact_original", "pvc_uid": "original-pvc-uid"}
+
+        p._core_api.create_namespaced_persistent_volume_claim.side_effect = None
+        created_fence = MagicMock()
+        created_fence.metadata.uid = "fence-pvc-uid"
+        created_fence.metadata.labels = {
+            **incumbent.metadata.labels,
+            "srw.io/workspace-claim-fence": "true",
+        }
+        p._core_api.create_namespaced_persistent_volume_claim.return_value = (
+            created_fence
+        )
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.fence_agent_workspace_claim(
+                self._PVC,
+                expected_thread_id=self._TID,
+                expected_runtime_generation=("22222222-2222-4222-8222-222222222222"),
+                expected_claim_id="33333333-3333-4333-8333-333333333333",
+                expected_create_attempt="44444444-4444-4444-8444-444444444444",
+            )
+        assert result == {"state": "exact_fence", "pvc_uid": "fence-pvc-uid"}
+        manifest = (
+            p._core_api.create_namespaced_persistent_volume_claim.call_args.kwargs[
+                "body"
+            ]
+        )
+        assert manifest["spec"]["storageClassName"] == ""
+        assert manifest["spec"]["resources"]["requests"]["storage"] == "1Mi"
 
 
 # =============================================================================
@@ -971,6 +1446,7 @@ def test_pod_manifest_includes_full_thread_id_label():
         memory_request="256Mi",
         cpu_limit="1",
         memory_limit="2Gi",
+        session_runtime_generation="22222222-2222-4222-8222-222222222222",
     )
 
     labels = manifest["metadata"]["labels"]
@@ -1026,6 +1502,27 @@ def test_pod_manifest_injects_pod_uid_via_downward_api():
     assert pod_uid_entry["valueFrom"]["fieldRef"]["fieldPath"] == "metadata.uid"
 
 
+def test_pod_manifest_injects_internal_key_for_canvas_tools():
+    p = _bare_provisioner_for_manifest()
+    manifest = p._build_pod_manifest(
+        pod_name="srw-agent-s-canvas",
+        purpose="session",
+        thread_id="11111111-2222-3333-4444-555555555555",
+        config_name="persistent_defaults",
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+    env = manifest["spec"]["containers"][0]["env"]
+    internal = next(e for e in env if e["name"] == "MCP_INTERNAL_KEY")
+    assert internal["valueFrom"]["secretKeyRef"] == {
+        "name": "srw-secret",
+        "key": "MCP_INTERNAL_KEY",
+        "optional": True,
+    }
+
+
 def test_pod_manifest_injects_session_bound_thread_id_env():
     """Session pods carry SESSION_BOUND_THREAD_ID env so the pod's JWT
     validator can check the `tid` claim matches its own thread."""
@@ -1057,6 +1554,7 @@ def test_pod_manifest_injects_session_bound_thread_id_env():
         memory_request="256Mi",
         cpu_limit="1",
         memory_limit="2Gi",
+        runtime_actor_bootstrap="srb_session_only",
     )
 
     env = manifest["spec"]["containers"][0].get("env", [])
@@ -1065,6 +1563,13 @@ def test_pod_manifest_injects_session_bound_thread_id_env():
     )
     assert tid_entry is not None
     assert tid_entry["value"] == "11111111-2222-3333-4444-555555555555"
+    actor_entry = next(
+        (e for e in env if e.get("name") == "SRW_RUNTIME_ACTOR_BOOTSTRAP"), None
+    )
+    assert actor_entry == {
+        "name": "SRW_RUNTIME_ACTOR_BOOTSTRAP",
+        "value": "srb_session_only",
+    }
 
 
 def test_pod_manifest_injects_session_jwt_secret_env_from_secretref(monkeypatch):
@@ -1161,3 +1666,236 @@ class TestTailscaleSidecar:
     def test_sidecar_liveness_threshold_scales_with_timeout(self):
         ts = self._manifest_with_tailscale(dark_timeout=300)
         assert ts["livenessProbe"]["failureThreshold"] == 10  # ceil(300 / 30)
+
+
+# =============================================================================
+# _archive_pod_logs — post-mortem log archive (knowledge-base/knowledge/features/job_log_archive.md)
+# =============================================================================
+
+
+def _make_snapshot_mock(available=True, put_ok=True):
+    snap = MagicMock()
+    snap.is_available = available
+    snap.put_blob = AsyncMock(return_value=put_ok)
+    return snap
+
+
+class TestArchivePodLogs:
+    """Tests for _archive_pod_logs() + the delete_agent_pod hook."""
+
+    def _wire_pod(self, p, pod, current="line1\nline2", previous=None):
+        """Wire read_namespaced_pod + read_namespaced_pod_log on the mock API."""
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        def _read_log(name, namespace, container, **kwargs):
+            if kwargs.get("previous"):
+                if previous is None:
+                    raise RuntimeError("no previous container")
+                return previous
+            return current
+
+        p._core_api.read_namespaced_pod_log.side_effect = _read_log
+
+    @pytest.mark.asyncio
+    async def test_archives_and_stamps_session_pod(self):
+        p, conn = _make_provisioner()
+        pod = _make_pod(
+            "srw-agent-s-abc", thread_id="11111111-2222-3333-4444-555555555555"
+        )
+        pod.metadata.labels["srw.io/thread-id"] = "11111111-2222-3333-4444-555555555555"
+        self._wire_pod(p, pod, current="hello", previous="crashed earlier")
+        snap = _make_snapshot_mock()
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            await p._archive_pod_logs("srw-agent-s-abc")
+
+        # Both incarnations uploaded under agent_logs/<pod>/
+        keys = [c.args[0] for c in snap.put_blob.await_args_list]
+        assert len(keys) == 2
+        assert all(k.startswith("agent_logs/srw-agent-s-abc/") for k in keys)
+        assert any(k.endswith(".previous.log") for k in keys)
+
+        # Thread stamped (metadata) AND jobs stamped (context via agents join)
+        sqls = [c.args[0] for c in conn.execute.await_args_list]
+        assert any("UPDATE threads" in s for s in sqls)
+        assert any("UPDATE jobs" in s for s in sqls)
+        thread_call = next(
+            c for c in conn.execute.await_args_list if "UPDATE threads" in c.args[0]
+        )
+        assert thread_call.args[1] == "11111111-2222-3333-4444-555555555555"
+
+    @pytest.mark.asyncio
+    async def test_worker_pod_stamps_jobs_only(self):
+        p, conn = _make_provisioner()
+        pod = _make_pod("srw-agent-j-xyz")  # no thread labels
+        self._wire_pod(p, pod, current="worker log")
+        snap = _make_snapshot_mock()
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            await p._archive_pod_logs("srw-agent-j-xyz")
+
+        sqls = [c.args[0] for c in conn.execute.await_args_list]
+        assert not any("UPDATE threads" in s for s in sqls)
+        jobs_call = next(
+            c for c in conn.execute.await_args_list if "UPDATE jobs" in c.args[0]
+        )
+        # Resolves jobs through the agents registration by pod hostname
+        assert "agents" in jobs_call.args[0]
+        assert jobs_call.args[1] == "srw-agent-j-xyz"
+
+    @pytest.mark.asyncio
+    async def test_noop_when_snapshot_store_unavailable(self):
+        p, conn = _make_provisioner()
+        snap = _make_snapshot_mock(available=False)
+        with patch("services.snapshot_service.snapshot_service", snap):
+            await p._archive_pod_logs("srw-agent-j-xyz")
+        p._core_api.read_namespaced_pod.assert_not_called()
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_pod_already_gone(self):
+        p, conn = _make_provisioner()
+        err = RuntimeError("gone")
+        err.status = 404
+        p._core_api.read_namespaced_pod.side_effect = err
+        snap = _make_snapshot_mock()
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            await p._archive_pod_logs("srw-agent-j-xyz")
+        snap.put_blob.assert_not_awaited()
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_stamp_when_upload_fails(self):
+        p, conn = _make_provisioner()
+        pod = _make_pod("srw-agent-j-xyz")
+        self._wire_pod(p, pod, current="some log")
+        snap = _make_snapshot_mock(put_ok=False)
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            await p._archive_pod_logs("srw-agent-j-xyz")
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_archive_failure_never_blocks_deletion(self):
+        p, _ = _make_provisioner()
+        p._core_api.read_namespaced_pod.side_effect = RuntimeError("k8s down")
+        snap = _make_snapshot_mock()
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            # Must not raise — and the pod delete must still go through.
+            assert await p.delete_agent_pod("srw-agent-j-xyz") is True
+        p._core_api.delete_namespaced_pod.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_agent_pod_archives_first(self):
+        p, _ = _make_provisioner()
+        p._archive_pod_logs = AsyncMock()
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await p.delete_agent_pod("srw-agent-j-xyz") is True
+        p._archive_pod_logs.assert_awaited_once_with("srw-agent-j-xyz")
+        p._core_api.delete_namespaced_pod.assert_called_once()
+
+
+class TestExactClaimantPodAuthority:
+    @staticmethod
+    def _pod(*, uid="uid-a", phase="Running", deleting=False, terminated=False):
+        pod = MagicMock()
+        pod.metadata.uid = uid
+        pod.metadata.deletion_timestamp = "now" if deleting else None
+        pod.status.phase = phase
+        state = MagicMock()
+        state.terminated = object() if terminated else None
+        status = MagicMock()
+        status.state = state
+        pod.status.container_statuses = [status]
+        return pod
+
+    @pytest.mark.asyncio
+    async def test_same_name_uid_replacement_is_not_old_claimant(self):
+        p, _ = _make_provisioner()
+        p._core_api.read_namespaced_pod.return_value = self._pod(uid="uid-new")
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert (
+                await p.agent_pod_authority("pod-a", expected_pod_uid="uid-old")
+                == "replacement"
+            )
+
+    @pytest.mark.asyncio
+    async def test_deleting_and_unknown_are_not_quiescence_proof(self):
+        p, _ = _make_provisioner()
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            p._core_api.read_namespaced_pod.return_value = self._pod(deleting=True)
+            assert (
+                await p.agent_pod_authority("pod-a", expected_pod_uid="uid-a")
+                == "unknown"
+            )
+            p._core_api.read_namespaced_pod.return_value = self._pod(phase="Unknown")
+            assert (
+                await p.agent_pod_authority("pod-a", expected_pod_uid="uid-a")
+                == "unknown"
+            )
+
+    @pytest.mark.asyncio
+    async def test_exact_terminal_containers_are_positive_proof(self):
+        p, _ = _make_provisioner()
+        p._core_api.read_namespaced_pod.return_value = self._pod(
+            phase="Failed", terminated=True
+        )
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert (
+                await p.agent_pod_authority("pod-a", expected_pod_uid="uid-a")
+                == "exact_terminal"
+            )
+
+    @pytest.mark.asyncio
+    async def test_exact_delete_is_graceful_and_uid_preconditioned(self):
+        p, _ = _make_provisioner()
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await p.delete_agent_pod_exact("pod-a", expected_pod_uid="uid-a")
+        p._core_api.delete_namespaced_pod.assert_called_once_with(
+            name="pod-a",
+            namespace="test-ns",
+            grace_period_seconds=180,
+            body={"preconditions": {"uid": "uid-a"}},
+        )

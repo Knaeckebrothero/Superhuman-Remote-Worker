@@ -6,26 +6,53 @@ via the Model Context Protocol using FastMCP.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from datetime import datetime, timezone
+import functools
+import hashlib
+from importlib.metadata import PackageNotFoundError, version
+import json
 import os
+from pathlib import Path
+import platform
 from typing import Any, Literal
 
 from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
-try:
-    from .client import AsyncCockpitClient
-except ImportError:
-    from client import AsyncCockpitClient  # type: ignore[no-redef]
+# Shared-surface imports resolve identically in-repo (repo root on sys.path)
+# and in-image (/app/src/shared), so no fallback chain is needed for them.
+from src.shared.expert_reference import (
+    ExpertReferenceConflict,
+    resolve_expert_selection,
+)
+from src.shared.orch_surface import formatters as fmt
+from src.shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
+from src.shared.orch_surface.jobs import AUTH_CONTEXT_FAILURE_NOTICE, CallerCtx
+
+DatasourceType = Literal[
+    "generic",
+    "repository",
+    "kb",
+    "postgresql",
+    "neo4j",
+    "mongodb",
+    "webdav",
+    "email",
+    "mcp",
+    "kubeconfig",
+    "ssh_key",
+    "generic_file",
+]
+DatasourceScopeMode = Literal["all", "projects"]
+DatasourceVisibility = Literal["public", "private"]
+DatasourceOwnership = Literal["mine", "shared"]
+DatasourceAvailability = Literal["all", "projects", "unavailable"]
 
 try:
-    from ..services import formatters as fmt
+    from .capabilities import TOOL_CAPABILITIES
 except ImportError:
-    try:
-        from services import formatters as fmt  # type: ignore[no-redef]
-    except ImportError:
-        import importlib
-
-        fmt = importlib.import_module("orchestrator.services.formatters")  # type: ignore[assignment]
+    from capabilities import TOOL_CAPABILITIES  # type: ignore[no-redef]
 
 # Conditional auth: HTTP transport uses token verification, stdio skips it
 _transport = os.environ.get("MCP_TRANSPORT", "http").lower()
@@ -67,53 +94,222 @@ if _transport == "http":
 # Create the MCP server instance
 mcp = FastMCP("cockpit-debug", auth=_auth)
 
+
+def mcp_tool(function):
+    """Register a tool using its authoritative capability contract."""
+    contract = TOOL_CAPABILITIES.get(function.__name__)
+    if contract is None:
+        raise RuntimeError(
+            f"MCP tool {function.__name__!r} has no capability contract entry"
+        )
+
+    @functools.wraps(function)
+    async def scoped_invocation(*args: Any, **kwargs: Any):
+        client = _get_client()
+        caller = _get_mcp_caller_ctx()
+        scope_manager = (
+            client.invocation_scope(
+                user_id=caller.user_id,
+                scope=caller.scope_header,
+                unauthenticated=caller.auth_failed,
+            )
+            if isinstance(client, AsyncCockpitClient)
+            else nullcontext()
+        )
+        with scope_manager:
+            if not caller.auth_failed:
+                return await function(*args, **kwargs)
+            # http-mode auth context failed: the binding above carries no
+            # identity headers at all (never the internal key), so guarded
+            # endpoints 401. Lead the tool result with the real cause.
+            try:
+                outcome = await function(*args, **kwargs)
+            except Exception as error:
+                outcome = f"{type(error).__name__}: {error}"
+            return f"{AUTH_CONTEXT_FAILURE_NOTICE}\n{outcome}"
+
+    return mcp.tool(
+        scoped_invocation,
+        annotations=contract.annotations,
+        meta={"io.srw.capability": contract.metadata()},
+    )
+
+
 # Global client instance (initialized lazily)
 _client: AsyncCockpitClient | None = None
 
 
 def _get_client() -> AsyncCockpitClient:
-    """Get or create the async client instance.
-
-    When running with auth, injects scope headers from the authenticated token
-    so the orchestrator can apply per-user filtering.
-    """
+    """Get or create the process-wide async client instance."""
     global _client
     if _client is None:
         _client = AsyncCockpitClient()
+    return _client
 
-    # Inject scope headers from authenticated MCP token (if present)
+
+def _get_mcp_caller_ctx() -> CallerCtx:
+    """Translate the authenticated token into trusted hidden caller context.
+
+    Two deliberately different anonymous shapes:
+
+    * stdio transport is the documented internal mode (docker/Dockerfile.mcp):
+      there is no token middleware, and requests authenticate with
+      ``MCP_INTERNAL_KEY`` alone. That is its contract and it stays.
+    * http transport has exactly one identity source — the verified bearer
+      token. Any failure to resolve it (middleware error OR missing token)
+      yields ``auth_failed=True``: the invocation is bound with NO identity
+      headers (the internal key is never an error fallback), guarded
+      orchestrator endpoints 401 — the pre-unification fail-closed
+      behavior — and the tool result names the auth context failure.
+    """
+    if _transport != "http":
+        return CallerCtx(kind="mcp")
     try:
         from mcp.server.auth.middleware.auth_context import get_access_token
 
         token = get_access_token()
-        if token:
-            _client.set_scope_headers(
-                user_id=token.client_id,
-                scope=token.scopes[0] if token.scopes else "user",
+        if not token:
+            return CallerCtx(kind="mcp", auth_failed=True)
+        scopes = tuple(str(scope) for scope in (token.scopes or ()) if scope)
+        project_ids = tuple(
+            dict.fromkeys(
+                scope.split(":", 1)[1]
+                for scope in scopes
+                if scope.startswith("project:") and scope.split(":", 1)[1]
             )
-        else:
-            _client.clear_scope_headers()
+        )
+        explicit_scope = scopes[0] if len(scopes) == 1 else None
+        lineage_project_id = project_ids[0] if len(project_ids) == 1 else None
+        return CallerCtx(
+            kind="mcp",
+            user_id=str(token.client_id),
+            project_ids=project_ids,
+            lineage_project_id=lineage_project_id,
+            explicit_scope=explicit_scope,
+        )
     except Exception:
-        _client.clear_scope_headers()
+        return CallerCtx(kind="mcp", auth_failed=True)
 
-    return _client
+
+def _format_action_error(action: str, target: str, error: Exception) -> str:
+    """Keep an ambiguous mutation distinct from a confirmed failure."""
+    if isinstance(error, MutationOutcomeUnknown):
+        return f"Action '{action}' has an unknown outcome for {target}:\n{error}"
+    return fmt.format_action_error(action, target, error)
 
 
 # =============================================================================
 # Health Check Endpoint
 # =============================================================================
 
+# Bump when an MCP tool signature or meaning changes in a way that callers need
+# to distinguish from a cached/deployed schema. Build provenance says which
+# source produced the pod; this small contract revision says which tool surface
+# that source promises.
+# "9": officer_supervision_surface E1-E4 — three job_evidence tools,
+# caller-aware get_stuck_jobs threshold, liveness-backed progress output.
+# "10": officer_message_routing M3 — reply_to_job_message,
+# escalate_job_message, acknowledge_job_message (officer inbox actions).
+# "11": officer_legate_channel — list_officers, get_project_officer,
+# send_officer_note (the Legate's side), plus newest_first on
+# get_persistent_thread_messages.
+# "12": one expert selector — create_job / create_project_job take `expert`
+# (a bundled expert id or a DB expert UUID, exactly as list_experts prints
+# it); config_name and expert_id stay as deprecated single-store aliases.
+MCP_TOOL_SCHEMA_REVISION = "12"
+_tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
+
+
+async def canonical_tool_schema() -> tuple[list[dict[str, Any]], str]:
+    """Return canonical raw ``tools/list`` material and its SHA-256 digest.
+
+    The middleware chain runs because it is part of what a client receives:
+    FastMCP enables ``DereferenceRefsMiddleware`` by default, which inlines
+    ``$defs``/``$ref`` on the way out for clients that cannot follow them.
+    Bypassing it was invisible while every tool returned a plain ``str`` and
+    no schema carried a ``$ref``; the first descriptor with a model in its
+    return type (``read_job_evidence`` -> ``JobToolResult``) made this artifact
+    disagree with two fresh clients and failed the image smoke at build time.
+    """
+    global _tool_schema_cache
+    if _tool_schema_cache is None:
+        registered = await mcp.list_tools()
+        tools = [
+            tool.to_mcp_tool(name=tool.name).model_dump(
+                mode="json", by_alias=True, exclude_none=True
+            )
+            for tool in registered
+        ]
+        tools.sort(key=lambda tool: tool["name"])
+        canonical = json.dumps(
+            {"tools": tools},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        _tool_schema_cache = (tools, f"sha256:{hashlib.sha256(canonical).hexdigest()}")
+    return _tool_schema_cache
+
+
+async def _mcp_build_info() -> dict[str, str | int]:
+    tools, schema_digest = await canonical_tool_schema()
+    try:
+        fastmcp_version = version("fastmcp")
+    except PackageNotFoundError:
+        fastmcp_version = "unavailable"
+    try:
+        mcp_sdk_version = version("mcp")
+    except PackageNotFoundError:
+        mcp_sdk_version = "unavailable"
+    schema_artifact_path = os.environ.get("MCP_SCHEMA_ARTIFACT")
+    schema_artifact_digest = "unavailable"
+    schema_artifact_status = "not_configured"
+    if schema_artifact_path:
+        try:
+            artifact = json.loads(
+                Path(schema_artifact_path).read_text(encoding="utf-8")
+            )
+            schema_artifact_digest = str(artifact.get("digest") or "unavailable")
+            schema_artifact_status = (
+                "match" if artifact.get("tools") == tools else "mismatch"
+            )
+        except (OSError, ValueError, TypeError):
+            schema_artifact_status = "invalid_or_missing"
+    return {
+        "tool_schema_revision": MCP_TOOL_SCHEMA_REVISION,
+        "tool_schema_digest": schema_digest,
+        "tool_count": len(tools),
+        "source_revision": os.environ.get("SRW_SOURCE_REVISION") or "unavailable",
+        "release_version": os.environ.get("SRW_RELEASE_VERSION") or "development",
+        "artifact_digest": os.environ.get("SRW_ARTIFACT_DIGEST") or "unavailable",
+        "schema_artifact_digest": schema_artifact_digest,
+        "schema_artifact_status": schema_artifact_status,
+        "python_version": platform.python_version(),
+        "fastmcp_version": fastmcp_version,
+        "mcp_sdk_version": mcp_sdk_version,
+    }
+
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     """Kubernetes health probe endpoint."""
+    build_info = await _mcp_build_info()
+    if build_info["schema_artifact_status"] not in {"match", "not_configured"}:
+        return JSONResponse(
+            {
+                "status": "degraded",
+                "error": "runtime tools/list does not match the image schema artifact",
+                **build_info,
+            },
+            status_code=503,
+        )
     try:
         client = _get_client()
         await client.health_check()
-        return JSONResponse({"status": "healthy", "backend": "connected"})
+        return JSONResponse({"status": "healthy", "backend": "connected", **build_info})
     except Exception as e:
         return JSONResponse(
-            {"status": "degraded", "error": str(e)},
+            {"status": "degraded", "error": str(e), **build_info},
             status_code=503,
         )
 
@@ -122,210 +318,23 @@ async def health_check(request):
 # MCP Tools
 # =============================================================================
 
+# Job operations are the only descriptor-backed slice. Every other MCP tool in
+# this module remains hand-written and behaviorally unchanged.
+try:
+    from .job_adapter import register_job_tools
+except ImportError:
+    from job_adapter import register_job_tools  # type: ignore[no-redef]
 
-@mcp.tool
-async def list_jobs(
-    status: Literal[
-        "created", "processing", "completed", "failed", "cancelled", "pending_review"
-    ]
-    | None = None,
-    limit: int = 20,
-) -> str:
-    """List agent jobs with optional status filter.
-
-    Returns job ID, status, config name, timestamps, and audit entry count.
-    Use this to find jobs to investigate.
-
-    Args:
-        status: Filter by status (created, processing, completed, failed, cancelled, pending_review)
-        limit: Maximum jobs to return (1-100, default 20)
-
-    Returns:
-        Formatted list of jobs with ID, status, config, timestamps
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 100:
-        limit = 100
-
-    client = _get_client()
-    jobs = await client.list_jobs(status=status, limit=limit)
-    return fmt.format_jobs(jobs)
+_REGISTERED_JOB_TOOLS = register_job_tools(
+    mcp,
+    client_provider=lambda: _get_client(),
+    caller_provider=lambda: _get_mcp_caller_ctx(),
+    capabilities=TOOL_CAPABILITIES,
+)
+globals().update(_REGISTERED_JOB_TOOLS)
 
 
-@mcp.tool
-async def get_job(job_id: str) -> str:
-    """Get detailed information about a specific job by ID.
-
-    Returns full job details including description, config, status,
-    timestamps, and audit count.
-
-    Args:
-        job_id: Job UUID to retrieve
-
-    Returns:
-        Formatted job details
-    """
-    client = _get_client()
-    job = await client.get_job(job_id)
-    return fmt.format_job_detail(job)
-
-
-@mcp.tool
-async def get_audit_trail(
-    job_id: str,
-    page: int = 1,
-    page_size: int = 20,
-    filter: Literal["all", "messages", "tools", "errors"] = "all",
-) -> str:
-    """Get paginated audit entries for a job's execution.
-
-    Shows LLM messages, tool calls, and errors.
-    Use filter to narrow results. Page -1 returns the last page.
-
-    Args:
-        job_id: Job UUID to get audit for
-        page: Page number (1-indexed, -1 for last page)
-        page_size: Entries per page (max 200, default 20)
-        filter: Filter category (all, messages, tools, errors)
-
-    Returns:
-        Formatted audit trail entries
-    """
-    if page_size < 1:
-        page_size = 1
-    elif page_size > 200:
-        page_size = 200
-
-    client = _get_client()
-    audit = await client.get_audit_trail(
-        job_id=job_id,
-        page=page,
-        page_size=page_size,
-        filter_category=filter,
-    )
-    return fmt.format_audit(audit)
-
-
-@mcp.tool
-async def get_audit_bulk(
-    job_id: str,
-    offset: int = 0,
-    limit: int = 500,
-    filter: Literal["all", "messages", "tools", "errors"] = "all",
-) -> str:
-    """Get bulk audit entries using offset/limit pagination.
-
-    Better than page-based audit trail for scanning large histories.
-    Supports up to 500 entries per request.
-
-    Args:
-        job_id: Job UUID to get audit for
-        offset: Number of entries to skip (default: 0)
-        limit: Maximum entries to return (max 500, default 500)
-        filter: Filter category (all, messages, tools, errors)
-
-    Returns:
-        Formatted audit entries with offset metadata
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 500:
-        limit = 500
-
-    client = _get_client()
-    data = await client.get_audit_bulk(
-        job_id=job_id,
-        offset=offset,
-        limit=limit,
-    )
-    return fmt.format_audit_bulk(data)
-
-
-@mcp.tool
-async def get_chat_history(
-    job_id: str,
-    page: int = 1,
-    page_size: int = 20,
-) -> str:
-    """Get paginated chat history for a job showing conversation turns.
-
-    Returns clean sequential view of input/response pairs without duplicates.
-    Use this to understand the agent's reasoning flow.
-
-    Args:
-        job_id: Job UUID to get chat history for
-        page: Page number (1-indexed, -1 for last page)
-        page_size: Entries per page (max 200, default 20)
-
-    Returns:
-        Formatted chat history
-    """
-    if page_size < 1:
-        page_size = 1
-    elif page_size > 200:
-        page_size = 200
-
-    client = _get_client()
-    chat = await client.get_chat_history(
-        job_id=job_id,
-        page=page,
-        page_size=page_size,
-    )
-    return fmt.format_chat_history(chat)
-
-
-@mcp.tool
-async def get_chat_bulk(
-    job_id: str,
-    offset: int = 0,
-    limit: int = 500,
-) -> str:
-    """Get bulk chat history using offset/limit pagination.
-
-    Better than page-based chat history for scanning large conversations.
-    Supports up to 500 entries per request.
-
-    Args:
-        job_id: Job UUID to get chat history for
-        offset: Number of entries to skip (default: 0)
-        limit: Maximum entries to return (max 500, default 500)
-
-    Returns:
-        Formatted chat turns with offset metadata
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 500:
-        limit = 500
-
-    client = _get_client()
-    data = await client.get_chat_bulk(
-        job_id=job_id,
-        offset=offset,
-        limit=limit,
-    )
-    return fmt.format_chat_bulk(data)
-
-
-@mcp.tool
-async def get_todos(job_id: str) -> str:
-    """Get all todos for a job including current active todos and archives.
-
-    Shows task planning and execution progress across phases.
-
-    Args:
-        job_id: Job UUID to get todos for
-
-    Returns:
-        Formatted todos with current and archived phases
-    """
-    client = _get_client()
-    todos = await client.get_todos(job_id)
-    return fmt.format_todos(todos)
-
-
-@mcp.tool
+@mcp_tool
 async def get_graph_changes(job_id: str) -> str:
     """Get timeline of Neo4j graph mutations for a job.
 
@@ -343,278 +352,20 @@ async def get_graph_changes(job_id: str) -> str:
     return fmt.format_graph_changes(changes)
 
 
-@mcp.tool
-async def get_llm_request(doc_id: str) -> str:
-    """Get full LLM request/response by MongoDB document ID.
-
-    Returns complete message history, model response, and token usage.
-    Use document IDs from audit trail entries.
-
-    Args:
-        doc_id: MongoDB ObjectId (24 hex characters)
-
-    Returns:
-        Formatted LLM request with messages and response
-    """
-    client = _get_client()
-    request = await client.get_llm_request(doc_id)
-    return fmt.format_llm_request(request)
-
-
-@mcp.tool
-async def get_job_summary(job_id: str) -> str:
-    """Get a comprehensive one-shot summary of a job.
-
-    Fetches status, progress, todos, workspace overview, and recent tool
-    calls in parallel. Returns everything in a single response — ideal for
-    understanding a job's current state without multiple tool calls.
-
-    Args:
-        job_id: Job UUID to summarize
-
-    Returns:
-        Combined summary with status, progress, todos, workspace, and recent activity
-    """
-    import asyncio
-
-    client = _get_client()
-
-    results = await asyncio.gather(
-        client.get_job(job_id),
-        client.get_job_progress(job_id),
-        client.get_todos(job_id),
-        client.get_workspace_overview(job_id),
-        client.get_audit_trail(job_id, page=-1, page_size=10, filter_category="tools"),
-        return_exceptions=True,
-    )
-
-    return fmt.format_job_summary(*results)
-
-
-@mcp.tool
-async def search_audit(
-    job_id: str,
-    query: str,
-    limit: int = 20,
-) -> str:
-    """Search audit entries by content pattern.
-
-    Searches across message content, tool names, and arguments.
-    Returns matching entries with context.
-
-    Args:
-        job_id: Job UUID to search within
-        query: Search string (case-insensitive substring match)
-        limit: Maximum results to return (1-100, default 20)
-
-    Returns:
-        Formatted search results
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 100:
-        limit = 100
-
-    client = _get_client()
-    return await _search_audit(client, job_id=job_id, query=query, limit=limit)
-
-
 # =============================================================================
 # Action & Operations Tools (Category A)
 # =============================================================================
 
 
-@mcp.tool
-async def approve_job(job_id: str) -> str:
-    """Approve a frozen job, marking it as completed.
-
-    MUTATION: This marks the job as completed, writes job_completion.json,
-    and deletes job_frozen.json. The job must be in 'pending_review' status.
-    This action cannot be undone.
-
-    Args:
-        job_id: Job UUID to approve
-
-    Returns:
-        Approval result with completion details
-    """
-    client = _get_client()
-    try:
-        result = await client.approve_job(job_id)
-        return fmt.format_action_result("approve", job_id, result)
-    except Exception as e:
-        return fmt.format_action_error("approve", job_id, e)
-
-
-@mcp.tool
-async def resume_job_with_feedback(
-    job_id: str,
-    feedback: str | None = None,
-) -> str:
-    """Resume a frozen/failed job from its checkpoint, optionally injecting feedback.
-
-    MUTATION: This resumes agent execution on the job. If feedback is provided,
-    it is injected into the agent's context before re-execution. The job can be
-    in any status except 'completed'. If the originally assigned agent is
-    unavailable, the orchestrator auto-selects a ready agent.
-
-    Args:
-        job_id: Job UUID to resume
-        feedback: Natural language feedback to inject into the agent's context
-
-    Returns:
-        Resume result with status
-    """
-    client = _get_client()
-    try:
-        result = await client.resume_job(job_id, feedback=feedback)
-        return fmt.format_action_result("resume", job_id, result, feedback=feedback)
-    except Exception as e:
-        return fmt.format_action_error("resume", job_id, e)
-
-
-@mcp.tool
-async def cancel_job(job_id: str) -> str:
-    """Cancel a running job.
-
-    MUTATION: This cancels the job and sends a cancel signal to the agent pod
-    if one is assigned. The job must not already be completed or cancelled.
-    In-progress work may be lost.
-
-    Args:
-        job_id: Job UUID to cancel
-
-    Returns:
-        Cancellation result
-    """
-    client = _get_client()
-    try:
-        result = await client.cancel_job(job_id)
-        return fmt.format_action_result("cancel", job_id, result)
-    except Exception as e:
-        return fmt.format_action_error("cancel", job_id, e)
-
-
-@mcp.tool
-async def pause_job(job_id: str) -> str:
-    """Pause a running job.
-
-    MUTATION: This sends a graceful pause request to the agent. The agent
-    finishes its current node, saves a checkpoint, and becomes available
-    for other work. The job must be in 'processing' status.
-
-    Args:
-        job_id: Job UUID to pause
-
-    Returns:
-        Pause result with status
-    """
-    client = _get_client()
-    try:
-        result = await client.pause_job(job_id)
-        return fmt.format_action_result("pause", job_id, result)
-    except Exception as e:
-        return fmt.format_action_error("pause", job_id, e)
-
-
-@mcp.tool
-async def create_job(
-    description: str,
-    config_name: str = "default",
-    datasource_ids: list[str] | None = None,
-    instructions: str | None = None,
-    config_override: dict[str, Any] | None = None,
-    context: dict[str, Any] | None = None,
-) -> str:
-    """Create a new job for agent execution.
-
-    MUTATION: This creates a job record and a Gitea repository. The job starts
-    in 'created' status and must be assigned to an agent to begin processing.
-    Jobs requiring input documents should use the cockpit UI instead.
-
-    Args:
-        description: Natural language task description
-        config_name: Expert/agent config to use (default: "default")
-        datasource_ids: List of global datasource UUIDs to clone as job-scoped
-        instructions: Additional inline markdown instructions
-        config_override: Per-job config overrides as JSON. To set the model,
-            use {"llm": {"model": "<model_id>"}} — e.g.
-            {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
-            Use the list_models tool to discover available model IDs.
-        context: Additional context dictionary
-
-    Returns:
-        Created job details with ID
-    """
-    client = _get_client()
-    try:
-        result = await client.create_job(
-            description=description,
-            config_name=config_name,
-            datasource_ids=datasource_ids,
-            instructions=instructions,
-            config_override=config_override,
-            context=context,
-        )
-        return fmt.format_created_job(result, config_name)
-    except Exception as e:
-        return fmt.format_action_error("create", "N/A", e)
-
-
-@mcp.tool
-async def delete_job(job_id: str) -> str:
-    """Delete a job and its associated data.
-
-    MUTATION: This permanently deletes the job record and its requirements.
-    Any job can be deleted regardless of status. WARNING: Deleting a job in
-    'processing' status may leave an orphaned agent. This action is irreversible.
-
-    Args:
-        job_id: Job UUID to delete
-
-    Returns:
-        Deletion result
-    """
-    client = _get_client()
-    try:
-        result = await client.delete_job(job_id)
-        return fmt.format_action_result("delete", job_id, result)
-    except Exception as e:
-        return fmt.format_action_error("delete", job_id, e)
-
-
-@mcp.tool
-async def assign_job(job_id: str, agent_id: str) -> str:
-    """Assign a created job to a ready agent.
-
-    MUTATION: This sends a JobStartRequest to the agent pod and updates the
-    job status to 'processing'. The job must be in 'created' or 'failed' status,
-    and the agent must be in 'ready' status.
-
-    Args:
-        job_id: Job UUID to assign
-        agent_id: Agent UUID to assign to
-
-    Returns:
-        Assignment result
-    """
-    client = _get_client()
-    try:
-        result = await client.assign_job(job_id, agent_id)
-        return fmt.format_action_result("assign", job_id, result, agent_id=agent_id)
-    except Exception as e:
-        return fmt.format_action_error("assign", job_id, e)
-
-
-@mcp.tool
+@mcp_tool
 async def test_datasource(datasource_id: str) -> str:
-    """Test connectivity to a datasource.
+    """Test connectivity to a connector.
 
-    Attempts to connect to the datasource using stored connection details.
+    Attempts to connect to the connector using stored connection details.
     Supports PostgreSQL, Neo4j, and MongoDB. Does not modify any data.
 
     Args:
-        datasource_id: Datasource UUID to test
+        datasource_id: Connector UUID to test
 
     Returns:
         Test result with status and connection details
@@ -624,7 +375,7 @@ async def test_datasource(datasource_id: str) -> str:
         result = await client.test_datasource(datasource_id)
         return fmt.format_datasource_test(datasource_id, result)
     except Exception as e:
-        return fmt.format_action_error("test_datasource", datasource_id, e)
+        return _format_action_error("test_datasource", datasource_id, e)
 
 
 # =============================================================================
@@ -632,140 +383,7 @@ async def test_datasource(datasource_id: str) -> str:
 # =============================================================================
 
 
-@mcp.tool
-async def list_job_commits(
-    job_id: str,
-    ref: str = "main",
-    since_ref: str | None = None,
-    limit: int = 20,
-    page: int = 1,
-) -> str:
-    """List git commits for a job's repository.
-
-    Shows the agent's work history as git commits. Use since_ref to see only
-    commits after a specific phase tag (e.g., "phase_2_end").
-
-    Args:
-        job_id: Job UUID
-        ref: Branch or tag to list from (default: main)
-        since_ref: Only show commits after this ref (e.g., "phase_2_end")
-        limit: Max commits to return (default: 20)
-        page: Page number for pagination (default: 1)
-
-    Returns:
-        List of commits with hash, message, author, and timestamp
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 100:
-        limit = 100
-
-    client = _get_client()
-    try:
-        result = await client.list_job_commits(
-            job_id, sha=ref, since_ref=since_ref, page=page, limit=limit
-        )
-        return fmt.format_commits(job_id, result, ref=ref, since_ref=since_ref)
-    except Exception as e:
-        return fmt.format_git_error("list commits", job_id, e)
-
-
-@mcp.tool
-async def get_job_diff(
-    job_id: str,
-    base: str,
-    head: str = "HEAD",
-    file_path: str | None = None,
-    max_chars: int = 50000,
-) -> str:
-    """Show the diff between two git refs in a job's repository.
-
-    Use base="job-frozen" to see changes since the last freeze, or base="phase_2_end"
-    to see what changed in phase 3.
-
-    Args:
-        job_id: Job UUID
-        base: Base ref (commit SHA, tag, or branch)
-        head: Head ref (default: HEAD)
-        file_path: Filter diff to a specific file (optional)
-        max_chars: Truncate diff beyond this limit (default: 50000, 0 for unlimited)
-
-    Returns:
-        Unified diff output, truncated if exceeding max_chars
-    """
-    client = _get_client()
-    try:
-        result = await client.get_job_diff(job_id, base=base, head=head)
-        diff_text = result.get("diff", "")
-
-        # Filter to specific file if requested
-        if file_path and diff_text:
-            diff_text = fmt.filter_diff_by_file(diff_text, file_path)
-
-        return fmt.format_diff(job_id, base, head, diff_text, max_chars=max_chars)
-    except Exception as e:
-        return fmt.format_git_error("get diff", job_id, e)
-
-
-@mcp.tool
-async def get_job_file(
-    job_id: str,
-    file_path: str,
-    ref: str | None = None,
-) -> str:
-    """Read a specific file from the job's Gitea repo at any ref.
-
-    View files at different points in time using refs (branch, tag, or commit SHA).
-    For example, ref="phase_2_end" shows the file at the end of phase 2.
-
-    Args:
-        job_id: Job UUID
-        file_path: Path within the repo (e.g., "workspace.md", "output/report.md")
-        ref: Branch, tag, or commit SHA (default: HEAD)
-
-    Returns:
-        File content as text
-    """
-    client = _get_client()
-    try:
-        result = await client.get_job_file(job_id, path=file_path, ref=ref)
-        content = result.get("content", "")
-        ref_label = ref or "HEAD"
-        size = result.get("size", len(content))
-        header = f"File: {file_path} (ref: {ref_label}, {size} bytes)\n"
-        return header + "---\n" + content
-    except Exception as e:
-        return fmt.format_git_error(f"read file '{file_path}'", job_id, e)
-
-
-@mcp.tool
-async def list_job_files(
-    job_id: str,
-    path: str = "",
-    ref: str | None = None,
-) -> str:
-    """Browse the repository directory tree at any ref.
-
-    Lists files and directories at a given path. Use ref to browse
-    at a specific point in history.
-
-    Args:
-        job_id: Job UUID
-        path: Directory path (default: root)
-        ref: Branch, tag, or commit SHA (default: HEAD)
-
-    Returns:
-        Directory listing with file names, types, and sizes
-    """
-    client = _get_client()
-    try:
-        entries = await client.list_job_files(job_id, path=path, ref=ref)
-        return fmt.format_file_listing(job_id, path, entries, ref=ref)
-    except Exception as e:
-        return fmt.format_git_error(f"list files at '{path or '/'}'", job_id, e)
-
-
-@mcp.tool
+@mcp_tool
 async def list_job_tags(job_id: str) -> str:
     """List phase tags to understand the job's phase history.
 
@@ -791,38 +409,19 @@ async def list_job_tags(job_id: str) -> str:
 # =============================================================================
 
 
-@mcp.tool
-async def get_frozen_job(job_id: str) -> str:
-    """Get the frozen job review data including summary, confidence, and deliverables.
-
-    Returns the agent's self-assessment when it froze the job for review.
-    The job must be in 'pending_review' status (or the frozen data must still exist).
-
-    Args:
-        job_id: Job UUID
-
-    Returns:
-        Frozen job summary with confidence score, deliverables, and agent notes
-    """
-    client = _get_client()
-    try:
-        data = await client.get_frozen_job(job_id)
-        return fmt.format_frozen_job(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("get frozen job data", job_id, e)
-
-
-@mcp.tool
+@mcp_tool
 async def get_workspace_file(job_id: str, path: str) -> str:
-    """Read any file from the job's local workspace filesystem.
+    """Read a file from the job's workspace repo (Gitea-backed).
 
-    Unlike get_job_file (which reads from Gitea at any ref), this reads the
-    current local file. Useful when Gitea is unavailable or for real-time state.
+    Returns committed state as of the worker's last phase-boundary push —
+    workers push at every phase boundary, freeze, and finalize, so mid-phase
+    edits are not visible yet. Reads the job branch head; use get_job_file
+    with a ref to read a phase tag instead.
 
     Args:
         job_id: Job UUID
-        path: Relative path within the workspace (e.g., "workspace.md", "plan.md",
-              "todos.yaml", "archive/phase_1_retrospective.md")
+        path: Relative path within the workspace repo (e.g., "plan.md",
+              "notes/decisions.md", "archive/phase_1_retrospective.md")
 
     Returns:
         File content as text
@@ -836,54 +435,12 @@ async def get_workspace_file(job_id: str, path: str) -> str:
         return fmt.format_workspace_error(f"read workspace file '{path}'", job_id, e)
 
 
-@mcp.tool
-async def get_workspace_overview(job_id: str) -> str:
-    """Get a summary of the workspace state.
-
-    Returns file listing, truncated workspace.md/plan.md previews,
-    current todo counts, and archive count.
-
-    Args:
-        job_id: Job UUID
-
-    Returns:
-        Workspace overview with file list, content previews, and statistics
-    """
-    client = _get_client()
-    try:
-        data = await client.get_workspace_overview(job_id)
-        return fmt.format_workspace_overview(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("get workspace overview", job_id, e)
-
-
-@mcp.tool
-async def get_job_progress(job_id: str) -> str:
-    """Get detailed job progress including phase information and ETA.
-
-    Shows current status, requirement completion stats, elapsed time,
-    and estimated time remaining.
-
-    Args:
-        job_id: Job UUID
-
-    Returns:
-        Progress data with phase info and completion statistics
-    """
-    client = _get_client()
-    try:
-        data = await client.get_job_progress(job_id)
-        return fmt.format_job_progress(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("get job progress", job_id, e)
-
-
 # =============================================================================
 # System Monitoring Tools (Category D)
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def get_job_stats() -> str:
     """Get job queue statistics with counts by status.
 
@@ -898,7 +455,7 @@ async def get_job_stats() -> str:
         return fmt.format_monitoring_error("get job stats", e)
 
 
-@mcp.tool
+@mcp_tool
 async def get_agent_stats() -> str:
     """Get agent workforce summary with counts by status.
 
@@ -913,33 +470,7 @@ async def get_agent_stats() -> str:
         return fmt.format_monitoring_error("get agent stats", e)
 
 
-@mcp.tool
-async def get_stuck_jobs(threshold_minutes: int = 30) -> str:
-    """Get jobs stuck in processing beyond a threshold.
-
-    A job is considered stuck if it's in 'processing' status but hasn't
-    been updated within the threshold period.
-
-    Args:
-        threshold_minutes: Minutes after which a job is considered stuck (default: 30)
-
-    Returns:
-        List of stuck jobs with details and last update time
-    """
-    if threshold_minutes < 1:
-        threshold_minutes = 1
-    elif threshold_minutes > 1440:
-        threshold_minutes = 1440
-
-    client = _get_client()
-    try:
-        data = await client.get_stuck_jobs(threshold_minutes)
-        return fmt.format_stuck_jobs(data, threshold_minutes)
-    except Exception as e:
-        return fmt.format_monitoring_error("get stuck jobs", e)
-
-
-@mcp.tool
+@mcp_tool
 async def list_agents(status: str | None = None) -> str:
     """List registered agents with status and current assignment.
 
@@ -957,7 +488,7 @@ async def list_agents(status: str | None = None) -> str:
         return fmt.format_monitoring_error("list agents", e)
 
 
-@mcp.tool
+@mcp_tool
 async def list_experts() -> str:
     """List available expert/agent configurations.
 
@@ -972,12 +503,12 @@ async def list_experts() -> str:
         return fmt.format_monitoring_error("list experts", e)
 
 
-@mcp.tool
+@mcp_tool
 async def get_expert(expert_id: str) -> str:
     """Get full detail for an expert config including merged config and instructions.
 
     Args:
-        expert_id: Expert config ID (e.g., "default", "researcher")
+        expert_id: Expert config ID (e.g., "general-worker", "researcher")
 
     Returns:
         Full config detail with system prompt, tool list, and instructions
@@ -990,7 +521,52 @@ async def get_expert(expert_id: str) -> str:
         return fmt.format_monitoring_error(f"get expert '{expert_id}'", e)
 
 
-@mcp.tool
+@mcp_tool
+async def list_skills() -> str:
+    """List available agent skills (the catalog the agent selects from).
+
+    Returns:
+        Skills with id, name, description, and tags.
+    """
+    client = _get_client()
+    try:
+        skills = await client.list_skills()
+        return fmt.format_skills(skills)
+    except Exception as e:
+        return fmt.format_monitoring_error("list skills", e)
+
+
+@mcp_tool
+async def get_skill(skill_id: str) -> str:
+    """Get full detail for a skill including its SKILL.md body and file list.
+
+    Args:
+        skill_id: Skill id (bundled name or DB UUID).
+
+    Returns:
+        The skill's metadata, body, and bundled file paths.
+    """
+    client = _get_client()
+    try:
+        data = await client.get_skill(skill_id)
+        return fmt.format_skill_detail(skill_id, data)
+    except Exception as e:
+        return fmt.format_monitoring_error(f"get skill '{skill_id}'", e)
+
+
+@mcp_tool
+async def reload_skills() -> str:
+    """Force reload of bundled skills from disk.
+
+    Returns:
+        Reload confirmation with skill count.
+    """
+    client = _get_client()
+    result = await client.reload_skills()
+    return f"Skills reloaded ({result.get('count', 0)} bundled skills loaded)."
+
+
+@mcp_tool
 async def list_models() -> str:
     """List available AI models grouped by provider.
 
@@ -1009,22 +585,80 @@ async def list_models() -> str:
         return fmt.format_monitoring_error("list models", e)
 
 
-@mcp.tool
-async def list_datasources(ds_type: str | None = None) -> str:
-    """List configured datasources.
+@mcp_tool
+async def list_datasources(
+    ds_type: DatasourceType | None = None,
+    q: str | None = None,
+    project_id: str | None = None,
+    scope_mode: DatasourceScopeMode = None,  # type: ignore[assignment]
+    auto_attach: bool = None,  # type: ignore[assignment]
+    visibility: DatasourceVisibility = None,  # type: ignore[assignment]
+    ownership: DatasourceOwnership = None,  # type: ignore[assignment]
+    availability: DatasourceAvailability = None,  # type: ignore[assignment]
+    limit: int = 50,
+    cursor: str | None = None,
+) -> str:
+    """List the authorized connector management catalog.
+
+    Results contain complete connector and project UUIDs plus the current
+    policy revision needed for safe scope/default updates. Pagination is
+    cursor-based; pass the reported next cursor unchanged to continue.
 
     Args:
-        ds_type: Filter by type (postgresql, neo4j, mongodb)
+        ds_type: Filter by canonical connector type
+        q: Search connector name or description
+        project_id: Filter to connectors linked to this authorized project
+        scope_mode: Filter by availability scope (all or projects)
+        auto_attach: Filter by the owner's automatic-default preference
+        visibility: Filter to public or private connectors
+        ownership: Filter to connectors owned by the caller or shared with them
+        availability: Filter by effective scope shape (all, projects, unavailable)
+        limit: Page size from 1 to 100 (default 50)
+        cursor: Opaque next cursor from the previous page
 
     Returns:
-        Datasource list with ID, name, type, connection info, and scope
+        Connector list with full IDs, policy revisions, and next cursor
     """
     client = _get_client()
     try:
-        datasources = await client.list_datasources(ds_type=ds_type)
-        return fmt.format_datasources(datasources, type_filter=ds_type)
+        page = await client.list_datasources(
+            ds_type=ds_type,
+            q=q,
+            project_id=project_id,
+            scope_mode=scope_mode,
+            auto_attach=auto_attach,
+            visibility=visibility,
+            ownership=ownership,
+            availability=availability,
+            limit=limit,
+            cursor=cursor,
+        )
+        rendered = fmt.format_datasources(page.get("items") or [], type_filter=ds_type)
+        return f"{rendered}\n\nNext cursor: {page.get('next_cursor') or 'none'}"
     except Exception as e:
-        return fmt.format_monitoring_error("list datasources", e)
+        return fmt.format_monitoring_error("list connectors", e)
+
+
+@mcp_tool
+async def get_datasource(datasource_id: str) -> str:
+    """Get one connector's exact management state.
+
+    Use this before update_datasource to load the complete connector UUID,
+    project scope, and current policy_revision. Credentials are always redacted
+    by the orchestrator.
+
+    Args:
+        datasource_id: Complete connector UUID
+
+    Returns:
+        Connector detail with full IDs and current policy revision
+    """
+    client = _get_client()
+    try:
+        datasource = await client.get_datasource(datasource_id)
+        return fmt.format_datasource_detail(datasource)
+    except Exception as e:
+        return fmt.format_monitoring_error("get connector", e)
 
 
 # =============================================================================
@@ -1032,7 +666,7 @@ async def list_datasources(ds_type: str | None = None) -> str:
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def list_tables() -> str:
     """List all database tables with row counts.
 
@@ -1047,7 +681,7 @@ async def list_tables() -> str:
         return fmt.format_monitoring_error("list tables", e)
 
 
-@mcp.tool
+@mcp_tool
 async def query_table(
     table_name: str,
     limit: int = 50,
@@ -1079,7 +713,7 @@ async def query_table(
         return fmt.format_monitoring_error(f"query table '{table_name}'", e)
 
 
-@mcp.tool
+@mcp_tool
 async def get_table_schema(table_name: str) -> str:
     """Get column definitions for a database table.
 
@@ -1102,7 +736,7 @@ async def get_table_schema(table_name: str) -> str:
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def list_job_sources(
     job_id: str | None = None,
     source_type: str | None = None,
@@ -1137,7 +771,7 @@ async def list_job_sources(
         return fmt.format_citation_error("list sources", e, job_id=job_id)
 
 
-@mcp.tool
+@mcp_tool
 async def get_source_detail(
     source_id: int,
     content_limit: int = 2000,
@@ -1159,7 +793,7 @@ async def get_source_detail(
         return fmt.format_citation_error(f"get source {source_id}", e)
 
 
-@mcp.tool
+@mcp_tool
 async def list_job_citations(
     job_id: str,
     source_id: int | None = None,
@@ -1198,7 +832,7 @@ async def list_job_citations(
         return fmt.format_citation_error("list citations", e, job_id=job_id)
 
 
-@mcp.tool
+@mcp_tool
 async def get_citation_detail(citation_id: int) -> str:
     """Get full citation record with source info, verification details, and locator.
 
@@ -1216,7 +850,7 @@ async def get_citation_detail(citation_id: int) -> str:
         return fmt.format_citation_error(f"get citation {citation_id}", e)
 
 
-@mcp.tool
+@mcp_tool
 async def search_job_sources(
     job_id: str,
     query: str,
@@ -1260,7 +894,7 @@ async def search_job_sources(
         return fmt.format_citation_error("search sources", e, job_id=job_id)
 
 
-@mcp.tool
+@mcp_tool
 async def get_source_annotations(
     job_id: str,
     source_id: int,
@@ -1292,7 +926,7 @@ async def get_source_annotations(
         )
 
 
-@mcp.tool
+@mcp_tool
 async def get_source_tags(job_id: str, source_id: int) -> str:
     """Get tags assigned to a source within a job.
 
@@ -1313,7 +947,7 @@ async def get_source_tags(job_id: str, source_id: int) -> str:
         )
 
 
-@mcp.tool
+@mcp_tool
 async def get_citation_stats(job_id: str) -> str:
     """Get citation statistics for a job — counts by verification status, source type, confidence.
 
@@ -1331,7 +965,7 @@ async def get_citation_stats(job_id: str) -> str:
         return fmt.format_citation_error("get citation stats", e, job_id=job_id)
 
 
-@mcp.tool
+@mcp_tool
 async def get_memory_stats(job_id: str) -> str:
     """Get memory statistics for a job — counts by type, source channel, tokens, and access patterns.
 
@@ -1349,7 +983,7 @@ async def get_memory_stats(job_id: str) -> str:
         return fmt.format_citation_error("get memory stats", e, job_id=job_id)
 
 
-@mcp.tool
+@mcp_tool
 async def get_agent_system_info(agent_id: str) -> str:
     """Get system information from an agent's container.
 
@@ -1378,7 +1012,7 @@ async def get_agent_system_info(agent_id: str) -> str:
         return f"Failed to get system info for agent {agent_id}:\n{error_msg}"
 
 
-@mcp.tool
+@mcp_tool
 async def get_daily_stats(days: int = 7) -> str:
     """Get daily job statistics for the past N days.
 
@@ -1396,7 +1030,7 @@ async def get_daily_stats(days: int = 7) -> str:
     return fmt.format_daily_stats(data, days)
 
 
-@mcp.tool
+@mcp_tool
 async def reload_experts() -> str:
     """Force reload of expert configurations from disk.
 
@@ -1412,7 +1046,7 @@ async def reload_experts() -> str:
     return f"Expert configurations reloaded ({count} experts loaded)."
 
 
-@mcp.tool
+@mcp_tool
 async def deregister_agent(agent_id: str) -> str:
     """Remove an agent from the system.
 
@@ -1436,20 +1070,22 @@ async def deregister_agent(agent_id: str) -> str:
 # =============================================================================
 
 
-@mcp.tool
-async def get_job_log(
-    job_id: str,
+@mcp_tool
+async def get_thread_log(
+    thread_id: str,
     lines: int = 100,
     grep: str | None = None,
     level: str | None = None,
 ) -> str:
-    """Read the tail of a job's log file with optional filtering.
+    """Read the archived agent-pod log for a persistent session.
 
-    Returns the last N lines of the log file, optionally filtered by log
-    level and/or grep pattern. Useful for diagnosing agent errors.
+    Post-mortem debugging for sessions whose agent pod has been torn down
+    (idle timeout, session end, crash + reap): the pod's full log is archived
+    to S3 at deletion and served here, scoped to this thread's lines. Returns
+    404 while the pod is still alive — the log is only archived at teardown.
 
     Args:
-        job_id: Job UUID
+        thread_id: Thread UUID
         lines: Number of tail lines to return (max 1000, default 100)
         grep: Case-insensitive substring filter
         level: Log level filter (DEBUG, INFO, WARNING, ERROR)
@@ -1464,74 +1100,12 @@ async def get_job_log(
 
     client = _get_client()
     try:
-        data = await client.get_job_logs(
-            job_id=job_id, lines=lines, grep=grep, level=level
+        data = await client.get_thread_logs(
+            thread_id=thread_id, lines=lines, grep=grep, level=level
         )
-        return fmt.format_job_log(job_id, data)
+        return fmt.format_thread_log(thread_id, data)
     except Exception as e:
-        return fmt.format_workspace_error("get job log", job_id, e)
-
-
-@mcp.tool
-async def list_llm_requests(
-    job_id: str,
-    limit: int = 20,
-    offset: int = 0,
-) -> str:
-    """List LLM requests for a job with token usage and tool call summaries.
-
-    Shows each request's model, timestamp, token counts, iteration number,
-    and which tools were called. Use the doc_id with get_llm_request to see
-    full message history for a specific request.
-
-    Args:
-        job_id: Job UUID
-        limit: Maximum entries to return (max 100, default 20)
-        offset: Pagination offset (default: 0)
-
-    Returns:
-        Formatted list of LLM requests with token usage and tool calls
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 100:
-        limit = 100
-
-    client = _get_client()
-    try:
-        data = await client.list_llm_requests(job_id=job_id, limit=limit, offset=offset)
-        return fmt.format_llm_requests(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("list LLM requests", job_id, e)
-
-
-@mcp.tool
-async def get_shell_state(job_id: str) -> str:
-    """Get shell tab state from the agent processing a job.
-
-    Returns the list of open terminal tabs with their type (ssh, repl,
-    claude-code, etc.) and recent output. Requires the job to be actively
-    processing on an agent.
-
-    Args:
-        job_id: Job UUID (must be in 'processing' status)
-
-    Returns:
-        Shell state with tab names, types, and recent output
-    """
-    client = _get_client()
-    try:
-        data = await client.get_shell_state(job_id)
-        return fmt.format_shell_state(job_id, data)
-    except Exception as e:
-        error_msg = str(e)
-        if hasattr(e, "response"):
-            try:
-                detail = e.response.json().get("detail", error_msg)
-                error_msg = detail
-            except Exception:
-                error_msg = f"HTTP {e.response.status_code}: {error_msg}"
-        return f"Failed to get shell state for job {job_id}:\n{error_msg}"
+        return fmt.format_workspace_error("get thread log", thread_id, e)
 
 
 # =============================================================================
@@ -1539,92 +1113,12 @@ async def get_shell_state(job_id: str) -> str:
 # =============================================================================
 
 
-@mcp.tool
-async def get_current_todos(job_id: str) -> str:
-    """Get only the current active todos from todos.yaml.
-
-    Lighter than get_todos which includes all archives. Shows pending,
-    in-progress, and completed items with a progress summary.
-
-    Args:
-        job_id: Job UUID to get current todos for
-
-    Returns:
-        Formatted current todos with progress count
-    """
-    client = _get_client()
-    data = await client.get_current_todos(job_id)
-    if data is None:
-        return f"No current todos found for job {job_id}."
-    return fmt.format_current_todos(data)
-
-
-@mcp.tool
-async def list_todo_archives(job_id: str) -> str:
-    """List all archived todo files for a job.
-
-    Returns metadata for each phase archive (filename, phase name, timestamp).
-    Use get_todo_archive to read the full content of a specific archive.
-
-    Args:
-        job_id: Job UUID to list archives for
-
-    Returns:
-        List of archived todo files with metadata
-    """
-    client = _get_client()
-    archives = await client.list_archived_todos(job_id)
-    return fmt.format_todo_archives(job_id, archives)
-
-
-@mcp.tool
-async def get_todo_archive(job_id: str, filename: str) -> str:
-    """Get the full content of an archived todo file for a specific phase.
-
-    Use list_todo_archives first to get available filenames.
-
-    Args:
-        job_id: Job UUID
-        filename: Archive filename (e.g. 'todos_phase1_20260124_183618.md')
-
-    Returns:
-        Full archived todos with status and notes
-    """
-    client = _get_client()
-    data = await client.get_archived_todos(job_id, filename)
-    if data is None:
-        return f"Archive '{filename}' not found for job {job_id}."
-    return fmt.format_todo_archive_detail(job_id, filename, data)
-
-
-@mcp.tool
-async def get_audit_timerange(job_id: str) -> str:
-    """Get the first and last timestamps for a job's audit entries.
-
-    Quick way to see when a job started and when it last had activity.
-    Requires MongoDB to be available.
-
-    Args:
-        job_id: Job UUID to get time range for
-
-    Returns:
-        Start and end timestamps, or error if MongoDB unavailable
-    """
-    client = _get_client()
-    data = await client.get_audit_time_range(job_id)
-    if data is None:
-        return f"No audit time range available for job {job_id} (MongoDB may be unavailable)."
-    start = data.get("start", "unknown")
-    end = data.get("end", "unknown")
-    return f"Audit time range for job {job_id}:\n  Start: {start}\n  End:   {end}"
-
-
 # =============================================================================
 # Knowledge Base
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def get_knowledge_summary(project_id: str) -> str:
     """Get knowledge base summary statistics for a project.
 
@@ -1642,7 +1136,7 @@ async def get_knowledge_summary(project_id: str) -> str:
     return fmt.format_knowledge_summary(project_id, data)
 
 
-@mcp.tool
+@mcp_tool
 async def list_knowledge_notes(
     project_id: str,
     note_type: str | None = None,
@@ -1682,7 +1176,7 @@ async def list_knowledge_notes(
     return fmt.format_knowledge_notes(data)
 
 
-@mcp.tool
+@mcp_tool
 async def get_knowledge_note(project_id: str, note_id: str) -> str:
     """Get a single knowledge note with full content and relationships.
 
@@ -1701,7 +1195,7 @@ async def get_knowledge_note(project_id: str, note_id: str) -> str:
     return fmt.format_knowledge_note_detail(data)
 
 
-@mcp.tool
+@mcp_tool
 async def search_knowledge(
     project_id: str,
     query: str,
@@ -1735,24 +1229,38 @@ async def search_knowledge(
 # =============================================================================
 
 
-@mcp.tool
-async def list_projects(user_id: str | None = None) -> str:
-    """List projects, optionally filtered by user membership.
+@mcp_tool
+async def list_projects(
+    user_id: str | None = None, include_archived: bool = False
+) -> str:
+    """List ACTIVE projects, optionally filtered by user membership.
 
-    Shows project name, status, goal, and last update time.
+    Shows project name, status, goal, and last update time. Archived
+    projects are excluded by default — they are a historical record, and
+    dispatching work or commissioning an officer against one is almost
+    always a mistake. The count of hidden archives is reported in the
+    footer, so nothing disappears silently.
 
     Args:
         user_id: Filter to projects this user belongs to (optional)
+        include_archived: Also list archived projects, each marked
+            [ARCHIVED]. Use when looking for historical context, never to
+            pick a target for new work.
 
     Returns:
         Formatted list of projects
     """
     client = _get_client()
-    projects = await client.list_projects(user_id=user_id)
-    return fmt.format_projects(projects)
+    # The server now default-excludes archived rows, so the archives have to be
+    # requested explicitly — otherwise `include_archived=True` marks nothing,
+    # because there is nothing left to mark. The formatter still owns the
+    # hide-and-report behaviour; this only widens what it is given.
+    statuses = ["active", "archived"] if include_archived else None
+    projects = await client.list_projects(user_id=user_id, statuses=statuses)
+    return fmt.format_projects(projects, include_archived=include_archived)
 
 
-@mcp.tool
+@mcp_tool
 async def get_project(project_id: str) -> str:
     """Get full details for a specific project.
 
@@ -1769,13 +1277,14 @@ async def get_project(project_id: str) -> str:
     return fmt.format_project_detail(project)
 
 
-@mcp.tool
+@mcp_tool
 async def create_project(
     name: str,
     user_id: str,
     description: str | None = None,
     goal: str | None = None,
     default_config_name: str | None = None,
+    default_config_override: dict[str, Any] | None = None,
 ) -> str:
     """Create a new project.
 
@@ -1788,6 +1297,7 @@ async def create_project(
         description: Project description (optional)
         goal: Project goal statement (optional)
         default_config_name: Default agent config for new jobs (optional)
+        default_config_override: Default per-job config overrides (optional)
 
     Returns:
         Created project summary with ID
@@ -1799,11 +1309,12 @@ async def create_project(
         description=description,
         goal=goal,
         default_config_name=default_config_name,
+        default_config_override=default_config_override,
     )
     return fmt.format_created_project(result)
 
 
-@mcp.tool
+@mcp_tool
 async def list_project_jobs(
     project_id: str,
     status: str | None = None,
@@ -1830,44 +1341,80 @@ async def list_project_jobs(
     return fmt.format_jobs(jobs)
 
 
-@mcp.tool
+@mcp_tool
 async def create_project_job(
     project_id: str,
     description: str,
-    config_name: str = "default",
+    expert: str | None = None,
+    config_name: str = "worker_base",
+    expert_id: str | None = None,
     instructions: str | None = None,
+    kickoff_message: str | None = None,
     config_override: dict[str, Any] | None = None,
-    datasource_ids: list[str] | None = None,
+    context: dict[str, Any] | None = None,
+    datasource_ids: list[str] = None,  # type: ignore[assignment]
+    priority: int = 5,
+    required_deliverables: list[str] | None = None,
 ) -> str:
     """Create a job within a project context.
 
     Uses the project's default config if not overridden. The job is
-    automatically linked to the project and gets a Gitea branch.
+    automatically linked to the project, gets a Gitea branch, and is queued for
+    workspace provisioning and automatic agent assignment.
 
     Args:
         project_id: Project UUID
         description: Task description
-        config_name: Expert/agent config (default: uses project default)
+        expert: Which expert runs this job — the worker profile that decides
+            its tools, prompts and model. Takes either form the catalogue
+            prints: a bundled expert id ("developer") or a database expert
+            UUID. Use the `list_experts` tool to discover valid values and
+            `get_expert` to inspect one. Omit to accept the project's default.
+        config_name: DEPRECATED alias for `expert`, bundled experts only.
+        expert_id: DEPRECATED alias for `expert`, database experts only.
         instructions: Additional inline instructions (optional)
+        kickoff_message: Opening task brief sent to the agent (optional)
         config_override: Per-job config overrides as JSON (optional). To set
             the model, use {"llm": {"model": "<model_id>"}} — e.g.
             {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
             Use the list_models tool to discover available model IDs.
-        datasource_ids: Global datasource IDs to clone (optional)
+        datasource_ids: Connector selection. Omit to use the project's
+            automatic defaults; pass [] to attach none; pass IDs to request
+            exactly those connectors.
+        context: Additional context dictionary (optional)
+        priority: Dispatch priority from 0 (low) to 10 (high), default 5
+        required_deliverables: Deliverable contract — workspace-relative
+            artifact paths (e.g. "output/report.md") or "kb:<slug>" note
+            slugs that must exist before a completion claiming success may
+            seal. Shown to the worker at dispatch; missing deliverables
+            bounce the seal back to the worker with the precise list.
 
     Returns:
         Created job summary with ID
     """
+    # Same resolver the shared create_job descriptor and the REST funnel use;
+    # see src/shared/expert_reference.py.
+    try:
+        choice = resolve_expert_selection(
+            expert=expert, config_name=config_name, expert_id=expert_id
+        )
+    except ExpertReferenceConflict as conflict:
+        return f"Refusing to create job: {conflict}"
     client = _get_client()
     result = await client.create_project_job(
         project_id=project_id,
         description=description,
-        config_name=config_name,
+        config_name=choice.config_name,
+        expert_id=choice.expert_id,
         instructions=instructions,
+        kickoff_message=kickoff_message,
         config_override=config_override,
+        context=context,
         datasource_ids=datasource_ids,
+        priority=priority,
+        required_deliverables=required_deliverables,
     )
-    return fmt.format_created_job(result, config_name)
+    return fmt.format_created_job(result, choice.config_name, expert=choice.reference)
 
 
 # =============================================================================
@@ -1875,7 +1422,7 @@ async def create_project_job(
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def update_project(
     project_id: str,
     name: str | None = None,
@@ -1883,6 +1430,7 @@ async def update_project(
     goal: str | None = None,
     status: str | None = None,
     default_config_name: str | None = None,
+    default_config_override: dict[str, Any] | None = None,
 ) -> str:
     """Update a project's metadata or default config.
 
@@ -1895,6 +1443,7 @@ async def update_project(
         goal: New goal statement (optional)
         status: New status (optional)
         default_config_name: Default agent config for new jobs (optional)
+        default_config_override: Default per-job config overrides (optional)
 
     Returns:
         Update confirmation
@@ -1907,12 +1456,13 @@ async def update_project(
         goal=goal,
         status=status,
         default_config_name=default_config_name,
+        default_config_override=default_config_override,
     )
     s = result.get("status", "unknown")
     return f"Project {project_id} updated ({s})."
 
 
-@mcp.tool
+@mcp_tool
 async def delete_project(project_id: str) -> str:
     """Permanently delete a project and its associated data.
 
@@ -1931,7 +1481,7 @@ async def delete_project(project_id: str) -> str:
     return f"Project {project_id} deleted ({s})."
 
 
-@mcp.tool
+@mcp_tool
 async def list_project_members(project_id: str) -> str:
     """List all members of a project with their roles.
 
@@ -1949,7 +1499,7 @@ async def list_project_members(project_id: str) -> str:
     return fmt.format_project_members(project_id, members)
 
 
-@mcp.tool
+@mcp_tool
 async def add_project_member(
     project_id: str,
     user_id: str,
@@ -1978,7 +1528,7 @@ async def add_project_member(
     return f"Added {name} to project {project_id} as {actual_role}."
 
 
-@mcp.tool
+@mcp_tool
 async def update_project_member(
     project_id: str,
     user_id: str,
@@ -2006,7 +1556,7 @@ async def update_project_member(
     return f"Updated member {user_id} role to {role} in project {project_id} ({s})."
 
 
-@mcp.tool
+@mcp_tool
 async def remove_project_member(
     project_id: str,
     user_id: str,
@@ -2031,7 +1581,7 @@ async def remove_project_member(
     return f"Removed member {user_id} from project {project_id} ({s})."
 
 
-@mcp.tool
+@mcp_tool
 async def list_project_experts(project_id: str) -> str:
     """List project-specific expert configurations.
 
@@ -2049,7 +1599,7 @@ async def list_project_experts(project_id: str) -> str:
     return fmt.format_project_experts(project_id, experts)
 
 
-@mcp.tool
+@mcp_tool
 async def get_project_expert(
     project_id: str,
     expert_name: str,
@@ -2076,35 +1626,54 @@ async def get_project_expert(
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def create_datasource(
     name: str,
-    type: str,
+    type: DatasourceType,
     connection_url: str | None = None,
     description: str | None = None,
     credentials: dict[str, Any] | None = None,
-    job_id: str | None = None,
     cli_hint: str | None = None,
     default_branch: str | None = None,
+    config: dict[str, Any] | None = None,
+    is_global: bool = False,
+    read_only: bool | None = None,
+    scope_mode: DatasourceScopeMode = "all",
+    project_ids: list[str] = None,  # type: ignore[assignment]
+    auto_attach: bool = False,
 ) -> str:
-    """Create a new datasource.
+    """Create a new connector.
 
-    Types: generic (CLI via env vars), repository (git repo),
-    postgresql, neo4j, mongodb, webdav (managed connectors).
-    Use job_id=null for global datasources available to all jobs.
+    Supports generic, repository, kb, PostgreSQL, Neo4j, MongoDB, WebDAV,
+    email, MCP, and credential-file connectors. New connectors are canonical
+    user-owned resources; job-scoped connector creation is no longer
+    supported. Global publication is controlled separately by is_global and
+    requires the server-side public_datasources capability.
 
     Args:
         name: User-provided label
-        type: Datasource type (generic, repository, postgresql, neo4j, mongodb, webdav)
+        type: Canonical connector type
         connection_url: Connection string (optional for generic)
-        description: What this datasource contains (optional)
-        credentials: Auth details (optional)
-        job_id: Job UUID for job-scoped datasource (omit for global)
+        description: What this connector contains (optional)
+        credentials: Auth details (optional). Stored values are never returned.
+            Credential-file types accept credentials.files; SSH-key generation
+            and interactive OAuth onboarding deliberately remain REST/UI-only.
         cli_hint: Suggested CLI command (optional, for generic type)
         default_branch: Branch to clone (optional, for repository type)
+        config: Non-secret type-specific config. Includes kb root_path; email
+            access/folders/drafts_folder/from_address/recipient_allowlist/
+            unattended_send; and repository options. MCP connectors reject it.
+        is_global: Publish to all users (capability-gated; default false)
+        read_only: Declarative read-only setting (public defaults true; kb always true)
+        scope_mode: Availability scope. ``all`` allows every otherwise-authorized
+            work context; ``projects`` restricts use to project_ids.
+        project_ids: Full initial project scope. Omit for all scope; projects
+            mode requires a nonempty list. Explicit null is invalid.
+        auto_attach: Preselect for the creator's new work when available.
+            This is a default only and never force-attaches the connector.
 
     Returns:
-        Created datasource summary with masked URL
+        Created connector summary with masked URL
     """
     client = _get_client()
     result = await client.create_datasource(
@@ -2113,14 +1682,19 @@ async def create_datasource(
         connection_url=connection_url,
         description=description,
         credentials=credentials,
-        job_id=job_id,
         cli_hint=cli_hint,
         default_branch=default_branch,
+        config=config,
+        is_global=is_global,
+        read_only=read_only,
+        scope_mode=scope_mode,
+        project_ids=project_ids,
+        auto_attach=auto_attach,
     )
     return fmt.format_created_datasource(result)
 
 
-@mcp.tool
+@mcp_tool
 async def update_datasource(
     datasource_id: str,
     name: str | None = None,
@@ -2129,19 +1703,36 @@ async def update_datasource(
     credentials: dict[str, Any] | None = None,
     cli_hint: str | None = None,
     default_branch: str | None = None,
+    config: dict[str, Any] | None = None,
+    is_global: bool | None = None,
+    read_only: bool | None = None,
+    scope_mode: DatasourceScopeMode = None,  # type: ignore[assignment]
+    project_ids: list[str] = None,  # type: ignore[assignment]
+    auto_attach: bool = None,  # type: ignore[assignment]
+    policy_revision: int = None,  # type: ignore[assignment]
 ) -> str:
-    """Update an existing datasource's connection details or metadata.
+    """Update an existing connector's connection details or metadata.
 
     Only provided fields are updated; others remain unchanged.
 
     Args:
-        datasource_id: Datasource UUID
+        datasource_id: Connector UUID
         name: New label (optional)
         description: New description (optional)
         connection_url: New connection string (optional)
-        credentials: New auth details (optional)
+        credentials: New auth details (optional; omit to preserve stored secrets)
         cli_hint: New CLI hint (optional)
         default_branch: New default branch (optional)
+        config: New non-secret type-specific config (optional)
+        is_global: Publish/unpublish. Publishing is capability-gated (optional)
+        read_only: New declarative read-only setting (optional)
+        scope_mode: New availability scope; omit to preserve it.
+        project_ids: Desired full project set. Omit to preserve links; pass []
+            to remove all links (valid only with resulting all scope).
+            Explicit null is invalid.
+        auto_attach: New owner-only default-selection preference
+        policy_revision: Revision returned by the management API. Required
+            whenever scope_mode, project_ids, or auto_attach is changed.
 
     Returns:
         Update confirmation
@@ -2155,19 +1746,36 @@ async def update_datasource(
         credentials=credentials,
         cli_hint=cli_hint,
         default_branch=default_branch,
+        config=config,
+        is_global=is_global,
+        read_only=read_only,
+        scope_mode=scope_mode,
+        project_ids=project_ids,
+        auto_attach=auto_attach,
+        policy_revision=policy_revision,
     )
-    status = result.get("status", "unknown")
-    return f"Datasource {datasource_id} updated ({status})."
+    status = result.get("status") or "updated"
+    lines = [f"Connector {datasource_id} updated ({status})."]
+    if result.get("policy_revision") is not None:
+        lines.append(f"Policy revision: {result['policy_revision']}")
+    if result.get("scope_mode") is not None:
+        lines.append(f"Availability scope: {result['scope_mode']}")
+    if result.get("auto_attach") is not None:
+        lines.append(f"Auto-attach default: {bool(result['auto_attach'])}")
+    if result.get("project_ids") is not None:
+        projects = ", ".join(str(value) for value in result["project_ids"]) or "none"
+        lines.append(f"Projects: {projects}")
+    return "\n".join(lines)
 
 
-@mcp.tool
+@mcp_tool
 async def delete_datasource(datasource_id: str) -> str:
-    """Permanently delete a datasource.
+    """Permanently delete a connector.
 
     This does not affect jobs that have already cloned it.
 
     Args:
-        datasource_id: Datasource UUID
+        datasource_id: Connector UUID
 
     Returns:
         Deletion confirmation
@@ -2175,7 +1783,7 @@ async def delete_datasource(datasource_id: str) -> str:
     client = _get_client()
     result = await client.delete_datasource(datasource_id)
     status = result.get("status", "unknown")
-    return f"Datasource {datasource_id} deleted ({status})."
+    return f"Connector {datasource_id} deleted ({status})."
 
 
 # =============================================================================
@@ -2183,33 +1791,33 @@ async def delete_datasource(datasource_id: str) -> str:
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def list_project_datasources(project_id: str) -> str:
-    """List datasources linked to a project.
+    """List connectors linked to a project.
 
     Args:
         project_id: Project UUID
 
     Returns:
-        Formatted datasource list
+        Formatted connector list
     """
     client = _get_client()
     datasources = await client.list_project_datasources(project_id)
     if not datasources:
-        return f"No datasources linked to project {project_id}."
+        return f"No connectors linked to project {project_id}."
     return fmt.format_datasources(datasources)
 
 
-@mcp.tool
+@mcp_tool
 async def link_datasource_to_project(project_id: str, datasource_id: str) -> str:
-    """Link a datasource to a project.
+    """Link a connector to a project.
 
-    Creates a knowledge entry so agents can discover the datasource
+    Creates a knowledge entry so agents can discover the connector
     through the project's knowledge base.
 
     Args:
         project_id: Project UUID
-        datasource_id: Datasource UUID
+        datasource_id: Connector UUID
 
     Returns:
         Link confirmation
@@ -2217,18 +1825,18 @@ async def link_datasource_to_project(project_id: str, datasource_id: str) -> str
     client = _get_client()
     result = await client.link_datasource_to_project(project_id, datasource_id)
     status = result.get("status", "unknown")
-    return f"Datasource {datasource_id} linked to project {project_id} ({status})."
+    return f"Connector {datasource_id} linked to project {project_id} ({status})."
 
 
-@mcp.tool
+@mcp_tool
 async def unlink_datasource_from_project(project_id: str, datasource_id: str) -> str:
-    """Unlink a datasource from a project.
+    """Unlink a connector from a project.
 
     Removes the corresponding knowledge entry.
 
     Args:
         project_id: Project UUID
-        datasource_id: Datasource UUID
+        datasource_id: Connector UUID
 
     Returns:
         Unlink confirmation
@@ -2236,7 +1844,7 @@ async def unlink_datasource_from_project(project_id: str, datasource_id: str) ->
     client = _get_client()
     result = await client.unlink_datasource_from_project(project_id, datasource_id)
     status = result.get("status", "unknown")
-    return f"Datasource {datasource_id} unlinked from project {project_id} ({status})."
+    return f"Connector {datasource_id} unlinked from project {project_id} ({status})."
 
 
 # =============================================================================
@@ -2244,7 +1852,7 @@ async def unlink_datasource_from_project(project_id: str, datasource_id: str) ->
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def update_knowledge_note(
     project_id: str,
     note_id: str,
@@ -2279,7 +1887,7 @@ async def update_knowledge_note(
     return f"Knowledge note {note_id} updated ({s})."
 
 
-@mcp.tool
+@mcp_tool
 async def delete_knowledge_note(project_id: str, note_id: str) -> str:
     """Permanently delete a knowledge note from both PostgreSQL and Neo4j.
 
@@ -2298,7 +1906,7 @@ async def delete_knowledge_note(project_id: str, note_id: str) -> str:
     return f"Knowledge note {note_id} deleted ({s})."
 
 
-@mcp.tool
+@mcp_tool
 async def export_knowledge(project_id: str) -> str:
     """Export a project's knowledge base as Obsidian-compatible markdown.
 
@@ -2324,50 +1932,39 @@ async def export_knowledge(project_id: str) -> str:
     )
 
 
+@mcp_tool
+async def reindex_knowledge(project_id: str, full: bool = False) -> str:
+    """Rebuild/refresh a project KB's chunk index from its vault repo.
+
+    The `kb reindex --full` operator hatch (OKF KB slice 3): incremental by
+    default (only notes whose git blob changed re-embed, via the per-KB commit
+    watermark); `full=True` re-embeds the whole vault — use after an embedding
+    model/chunker change or to recover a corrupt index.
+
+    Args:
+        project_id: Project UUID
+        full: Re-embed every note instead of only changed blobs
+
+    Returns:
+        Reindex summary (status, commit, upserted/deleted/skipped/errors)
+    """
+    client = _get_client()
+    result = await client.reindex_knowledge(project_id, full=full)
+    status = result.get("status", "unknown")
+    commit = (result.get("indexed_commit") or "")[:12]
+    return (
+        f"KB reindex: {status} (commit {commit or 'n/a'}, "
+        f"full={result.get('full', False)}).\n"
+        f"  Upserted: {result.get('upserted', 0)}, "
+        f"deleted: {result.get('deleted', 0)}, "
+        f"skipped: {result.get('skipped', 0)}, "
+        f"errors: {result.get('errors', 0)}"
+    )
+
+
 # =============================================================================
 # Job Promotion
 # =============================================================================
-
-
-@mcp.tool
-async def promote_job(
-    job_id: str,
-    name: str,
-    user_id: str,
-    description: str | None = None,
-    goal: str | None = None,
-) -> str:
-    """Promote a completed job into a dedicated project.
-
-    Creates a new project, seeds its repo from the job's branch
-    (preserving git history), and moves the job. The job must be
-    completed and in a default project.
-
-    Args:
-        job_id: Job UUID (must be completed)
-        name: Name for the new project
-        user_id: Owner user UUID
-        description: Project description (optional)
-        goal: Project goal (optional)
-
-    Returns:
-        Promotion summary with new project ID
-    """
-    client = _get_client()
-    result = await client.promote_job(
-        job_id=job_id,
-        name=name,
-        user_id=user_id,
-        description=description,
-        goal=goal,
-    )
-    project_id = result.get("project_id", "unknown")
-    project_name = result.get("project_name", name)
-    return (
-        f"Job {job_id} promoted to project '{project_name}'.\n"
-        f"  New project ID: {project_id}\n"
-        f"  Git history preserved from job branch."
-    )
 
 
 # =============================================================================
@@ -2375,83 +1972,12 @@ async def promote_job(
 # =============================================================================
 
 
-async def _search_audit(
-    client: AsyncCockpitClient,
-    job_id: str,
-    query: str,
-    limit: int = 20,
-) -> str:
-    """Search audit entries for a pattern."""
-    import json as _json
-
-    query_lower = query.lower()
-    matches: list[dict] = []
-
-    # Fetch pages until we have enough matches or run out
-    page = 1
-    while len(matches) < limit:
-        audit = await client.get_audit_trail(
-            job_id=job_id,
-            page=page,
-            page_size=100,
-            filter_category="all",
-        )
-
-        if audit.get("error") or not audit.get("entries"):
-            break
-
-        for entry in audit["entries"]:
-            if fmt.entry_matches(entry, query_lower):
-                matches.append(entry)
-                if len(matches) >= limit:
-                    break
-
-        if not audit.get("hasMore"):
-            break
-        page += 1
-
-    if not matches:
-        return f"No audit entries matching '{query}' found."
-
-    lines = [f"Found {len(matches)} entries matching '{query}':\n"]
-
-    for entry in matches:
-        step_num = entry.get("step_number", "?")
-        step_type = entry.get("step_type", "unknown")
-
-        if step_type == "tool":
-            tool = entry.get("tool", {})
-            tool_name = tool.get("name", "unknown")
-            lines.append(f"[{step_num}] Tool: {tool_name}")
-            args = _json.dumps(tool.get("arguments", {}))[:150]
-            lines.append(f"    Args: {args}")
-            result_preview = tool.get("result_preview")
-            if result_preview:
-                lines.append(f"    Result: {str(result_preview)[:150]}")
-        elif step_type == "llm":
-            llm = entry.get("llm", {})
-            preview = (llm.get("response_content_preview", "") or "")[:150]
-            request_id = llm.get("request_id")
-            line = f"[{step_num}] LLM: {preview}"
-            if request_id:
-                line += f" (doc_id: {request_id})"
-            lines.append(line)
-        elif step_type == "error":
-            error = entry.get("error", "Unknown error")
-            lines.append(f"[{step_num}] ERROR: {error}")
-        else:
-            lines.append(f"[{step_num}] {step_type}")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
 # =============================================================================
 # Sudo Approval Gate
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def list_sudo_requests(
     job_id: str | None = None,
     status: str | None = None,
@@ -2515,7 +2041,7 @@ async def list_sudo_requests(
     return "\n".join(lines)
 
 
-@mcp.tool
+@mcp_tool
 async def approve_sudo_request(
     request_id: str,
     reason: str = "",
@@ -2540,7 +2066,7 @@ async def approve_sudo_request(
         return f"Failed to approve: {e}"
 
 
-@mcp.tool
+@mcp_tool
 async def deny_sudo_request(
     request_id: str,
     reason: str,
@@ -2570,98 +2096,97 @@ async def deny_sudo_request(
 # =============================================================================
 
 
-@mcp.tool
-async def list_message_threads(job_id: str) -> str:
-    """List message threads for an agent job.
-
-    Shows all communication threads between the agent and humans,
-    including thread ID, subject, message count, and status.
-
-    Args:
-        job_id: Job UUID to list threads for
-
-    Returns:
-        Formatted list of message threads
-    """
-    client = _get_client()
-    data = await client.list_message_threads(job_id)
-    return fmt.format_message_threads(data.get("threads", []))
+# =============================================================================
+# Officers — the Legate's side (knowledge-base/knowledge/features/officer_legate_channel.md)
+# =============================================================================
 
 
-@mcp.tool
-async def send_message_to_job(
-    job_id: str,
-    thread_id: str,
-    message: str,
-    urgent: bool = False,
-) -> str:
-    """Send a reply to an agent's message thread (as a human).
+@mcp_tool
+async def list_officers() -> str:
+    """List every project officer (centurion) you can see, vacant posts included.
 
-    Routes the reply to the agent. If the agent is waiting for a reply
-    on this thread (blocking mode), it resumes immediately. Otherwise
-    the reply is queued for the next strategic phase.
-
-    Args:
-        job_id: Job UUID
-        thread_id: Thread ID to reply to
-        message: Reply body text
-        urgent: If true, deliver as immediate interrupt regardless of mode
+    The roster answers "which of my projects has an officer, and is anything
+    waiting on him" in one call: commissioned / vacant / held, when he next
+    wakes, jobs in flight, events pending on him, pages he sent today.
 
     Returns:
-        Delivery confirmation with strategy used
+        One block per post, or a note that no project you can see has one.
     """
     client = _get_client()
     try:
-        result = await client.reply_to_message(
-            job_id,
-            thread_id,
-            message,
-            urgent=urgent,
-        )
-        strategy = result.get("delivery_strategy", "unknown")
-        seq = result.get("sequence", "?")
-        return (
-            f"Reply delivered to thread {thread_id} (message #{seq}).\n"
-            f"Delivery strategy: {strategy}"
-        )
+        data = await client.list_officers()
     except Exception as e:
-        return f"Failed to send reply: {e}"
+        return _format_action_error("list_officers", "N/A", e)
+    return fmt.format_officer_roster(data)
 
 
-@mcp.tool
-async def get_message_thread(job_id: str, thread_id: str) -> str:
-    """Get full message history for a specific thread.
+@mcp_tool
+async def get_project_officer(project_id: str, recent: int = 10) -> str:
+    """Get one project's officer: his post, his capacity, and his recent log.
 
-    Shows all messages in chronological order with direction,
-    timestamps, and content.
+    Reads the post card (commission state, hold, kit utilization with pool
+    depth, next wake, page budget, digest ring, open conference) and, when the
+    post is filled, the tail of his session log — so you can see what he has
+    actually been doing, not only what he is configured to do.
 
     Args:
-        job_id: Job UUID
-        thread_id: Thread ID to retrieve
+        project_id: Project UUID
+        recent: How many trailing log messages to include (0 disables)
 
     Returns:
-        Formatted thread message history
+        The post as a briefing, with a recent-log section when available.
     """
     client = _get_client()
-    data = await client.list_message_threads(job_id)
-    threads = data.get("threads", [])
+    try:
+        post = await client.get_project_officer(project_id)
+    except Exception as e:
+        return _format_action_error("get_project_officer", project_id, e)
 
-    # Find the matching thread and its messages
-    target = None
-    for t in threads:
-        if t.get("thread_id") == thread_id:
-            target = t
-            break
+    thread_id = (post.get("officer") or {}).get("thread_id")
+    tail = None
+    footnote = None
+    if post.get("commissioned") and thread_id and recent > 0:
+        try:
+            tail = await client.get_persistent_thread_messages(
+                thread_id,
+                limit=max(2, min(int(recent), 100)),
+                before=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as e:
+            # His post is the answer; the log is the bonus. Say which half is
+            # missing instead of failing the whole read.
+            footnote = f"(recent log unavailable: {type(e).__name__})"
+    rendered = fmt.format_officer_post(post, recent=tail)
+    return f"{rendered}\n{footnote}" if footnote else rendered
 
-    if not target:
-        return f"Thread {thread_id} not found in job {job_id}."
 
-    messages = target.get("messages", [])
-    if not messages:
-        # Thread found but no inline messages — format what we have
-        return fmt.format_message_threads([target])
+@mcp_tool
+async def send_officer_note(project_id: str, message: str) -> str:
+    """Send the project's officer a one-way note from the Legate.
 
-    return fmt.format_thread_messages(messages, thread_id)
+    MUTATION: the note reaches a running agent. Use it to give direction,
+    answer something he paged about, or redirect his backlog — he treats a
+    Legate note as top authority. It is stamped with who sent it, so a note
+    you compose does not read as words the user typed.
+
+    There is no reply channel here: his answer shows up in his log, in his
+    digest, or as a page. The result states which delivery happened — reaching
+    his input queue, queuing durably for his next wake, or waiting behind a
+    hold — so never report a note as read until it actually is.
+
+    Args:
+        project_id: Project UUID whose officer should receive the note
+        message: The direction itself (max 8000 chars)
+
+    Returns:
+        How the note landed, including when he is expected to read it.
+    """
+    client = _get_client()
+    try:
+        result = await client.send_officer_note(project_id, message)
+    except Exception as e:
+        return _format_action_error("send_officer_note", project_id, e)
+    return fmt.format_officer_note_result(result)
 
 
 # =============================================================================
@@ -2669,13 +2194,14 @@ async def get_message_thread(job_id: str, thread_id: str) -> str:
 # =============================================================================
 
 
-@mcp.tool
+@mcp_tool
 async def create_persistent_thread(
     title: str = "Untitled Session",
-    config_name: str = "defaults",
+    config_name: str = "session_base",
     permission_mode: Literal["supervised", "auto_accept", "autonomous"] = "supervised",
     project_id: str | None = None,
     project_ids: list[str] | None = None,
+    datasource_ids: list[str] = None,  # type: ignore[assignment]
     model: str | None = None,
     temperature: float | None = None,
 ) -> str:
@@ -2685,12 +2211,25 @@ async def create_persistent_thread(
     container and agent pod. The thread starts in 'created' status and
     waits for an agent to connect.
 
+    **Deliberately exposes no ``config_override``, and adding one is a
+    security decision, not a convenience.** Session create accepts any tool
+    name the registry knows in its own category, including the
+    ``grant: "explicit"`` control-plane writes (``set_expert_bundle`` and
+    friends) — safe today only because no *model-authored* path reaches that
+    parameter. This tool is the one that would open it: an MCP caller is an
+    LLM, and a prompt-injected fragment would arrive as a legitimate request.
+    Pinned by ``tests/test_tool_override_boundary.py``
+    ``TestNoModelAuthoredPathReachesSessionCreate``. If you add the parameter,
+    that test fails and you must first decide what a model may name.
+
     Args:
         title: Human-readable session title
-        config_name: Agent config to use (default: "defaults")
+        config_name: Agent config to use (default: "session_base")
         permission_mode: Tool approval mode (supervised, auto_accept, autonomous)
         project_id: Single project UUID to scope (legacy)
         project_ids: List of project UUIDs to scope
+        datasource_ids: Connector selection. Omit to use automatic defaults;
+            pass [] for none, or IDs for exactly that authorized selection.
         model: LLM model override (e.g. "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
         temperature: Temperature override
 
@@ -2705,15 +2244,16 @@ async def create_persistent_thread(
             permission_mode=permission_mode,
             project_id=project_id,
             project_ids=project_ids,
+            datasource_ids=datasource_ids,
             model=model,
             temperature=temperature,
         )
         return fmt.format_created_thread(result, config_name, title)
     except Exception as e:
-        return fmt.format_action_error("create_thread", "N/A", e)
+        return _format_action_error("create_thread", "N/A", e)
 
 
-@mcp.tool
+@mcp_tool
 async def list_persistent_threads(
     project_id: str | None = None,
     status: Literal["created", "active", "ended"] | None = None,
@@ -2735,7 +2275,7 @@ async def list_persistent_threads(
     return fmt.format_persistent_threads(data.get("threads", []))
 
 
-@mcp.tool
+@mcp_tool
 async def get_persistent_thread(thread_id: str) -> str:
     """Get detailed information about a specific persistent thread.
 
@@ -2753,7 +2293,7 @@ async def get_persistent_thread(thread_id: str) -> str:
     return fmt.format_persistent_thread_detail(thread)
 
 
-@mcp.tool
+@mcp_tool
 async def end_persistent_thread(thread_id: str, permanent: bool = False) -> str:
     """End or permanently delete a persistent thread.
 
@@ -2776,37 +2316,48 @@ async def end_persistent_thread(thread_id: str, permanent: bool = False) -> str:
             "delete_thread" if permanent else "end_thread", thread_id, result
         )
     except Exception as e:
-        return fmt.format_action_error("end_thread", thread_id, e)
+        return _format_action_error("end_thread", thread_id, e)
 
 
-@mcp.tool
-async def resume_persistent_thread(thread_id: str) -> str:
+@mcp_tool
+async def resume_persistent_thread(
+    thread_id: str, acknowledge: list[str] | None = None
+) -> str:
     """Resume an ended persistent thread.
 
     MUTATION: Resets the thread status to 'created', clears the stale
     agent binding, and re-provisions the agent pod. The thread must be
     in 'ended' status.
 
+    If the session's config has drifted (deleted connector, revoked
+    project, withdrawn grant), this returns the drifted items and their
+    ids; call again with `acknowledge` set to those ids to resume without
+    them.
+
     Args:
         thread_id: Thread UUID to resume
+        acknowledge: Drift item ids to resume without (optional)
 
     Returns:
         Action result with new status
     """
     client = _get_client()
     try:
-        result = await client.resume_persistent_thread(thread_id)
+        result = await client.resume_persistent_thread(
+            thread_id, acknowledge=acknowledge
+        )
         return fmt.format_thread_action_result("resume_thread", thread_id, result)
     except Exception as e:
-        return fmt.format_action_error("resume_thread", thread_id, e)
+        return _format_action_error("resume_thread", thread_id, e)
 
 
-@mcp.tool
+@mcp_tool
 async def get_persistent_thread_messages(
     thread_id: str,
     limit: int = 50,
     offset: int = 0,
     full_content: bool = False,
+    newest_first: bool = False,
 ) -> str:
     """Get message history for a persistent thread session.
 
@@ -2816,10 +2367,14 @@ async def get_persistent_thread_messages(
     Args:
         thread_id: Thread UUID to get messages for
         limit: Maximum messages to return (1-500, default 50)
-        offset: Pagination offset (default 0)
+        offset: Pagination offset (default 0), ignored when newest_first
         full_content: If True, emit each message's content in full instead of
             the default 500-char preview. Pair with a small ``limit`` — full
             bodies can be very large.
+        newest_first: Read the END of the log — the newest ``limit`` messages,
+            still printed oldest-first within that window. Use this on long
+            sessions (an officer runs hundreds of turns); paging ``offset``
+            from zero to reach the current state is the slow way there.
 
     Returns:
         Formatted message history
@@ -2830,13 +2385,22 @@ async def get_persistent_thread_messages(
         limit = 500
 
     client = _get_client()
-    data = await client.get_persistent_thread_messages(
-        thread_id, limit=limit, offset=offset
+    if newest_first:
+        data = await client.get_persistent_thread_messages(
+            thread_id,
+            limit=limit,
+            before=datetime.now(timezone.utc).isoformat(),
+        )
+    else:
+        data = await client.get_persistent_thread_messages(
+            thread_id, limit=limit, offset=offset
+        )
+    return fmt.format_persistent_thread_messages(
+        data, full_content=full_content, tail=newest_first
     )
-    return fmt.format_persistent_thread_messages(data, full_content=full_content)
 
 
-@mcp.tool
+@mcp_tool
 async def get_persistent_thread_ide(thread_id: str) -> str:
     """Get IDE/workspace session status for a persistent thread.
 

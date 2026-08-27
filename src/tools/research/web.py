@@ -4,6 +4,7 @@ Provides web search and content extraction capabilities using Tavily API.
 Supports search, extract, crawl, and map operations.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Literal, Optional
 
@@ -15,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 # Maximum words per result/page to protect LLM context window
 MAX_RAW_CONTENT_WORDS = 5000
+MAX_SNIPPET_CHARS = 1000
+MAX_TOTAL_INLINE_CHARS = 60_000
+NO_WORKSPACE_MAX_WORDS = 1500
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
@@ -22,26 +26,42 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "web_search": {
         "module": "research.web",
         "function": "web_search",
-        "description": "Search the web using Tavily API",
+        "description": (
+            "Search the web using Tavily API. Results are returned as bounded "
+            "snippets; raw page content can be fetched and archived to the "
+            "workspace for later reading/citation."
+        ),
         "category": "research",
         "defer_to_workspace": True,
-        "short_description": "Search the web via Tavily for context and research.",
+        "short_description": (
+            "Search the web via Tavily; archive full text and return compact snippets."
+        ),
         "phases": ["tactical"],
     },
     "extract_webpage": {
         "module": "research.web",
         "function": "extract_webpage",
-        "description": "Extract full content from one or more web pages using Tavily Extract",
+        "description": (
+            "Extract full content from one or more web pages using Tavily "
+            "Extract. Content is archived when possible and inline output is "
+            "bounded per call."
+        ),
         "category": "research",
-        "short_description": "Extract full page content from URLs via Tavily Extract.",
+        "short_description": (
+            "Extract and archive page content from URLs with bounded inline output."
+        ),
         "phases": ["tactical"],
     },
     "crawl_website": {
         "module": "research.web",
         "function": "crawl_website",
-        "description": "Crawl a website starting from a URL using Tavily Crawl",
+        "description": (
+            "Crawl a website starting from a URL using Tavily Crawl. Crawled "
+            "page content is archived when possible and returned as snippets "
+            "with saved-file pointers."
+        ),
         "category": "research",
-        "short_description": "Crawl website pages with depth/breadth control via Tavily Crawl.",
+        "short_description": "Crawl and archive website pages with compact snippets.",
         "phases": ["tactical"],
     },
     "map_website": {
@@ -82,6 +102,61 @@ def _truncate_content(content: str, max_words: int = MAX_RAW_CONTENT_WORDS) -> s
     return content
 
 
+def _truncate_snippet(content: str, max_chars: int = MAX_SNIPPET_CHARS) -> str:
+    """Truncate content to a compact character-bounded snippet."""
+    if not content:
+        return ""
+    text = content.strip()
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "..."
+    return text
+
+
+def _bounded_inline_excerpt(
+    content: str,
+    remaining_chars: int,
+    max_words: int = NO_WORKSPACE_MAX_WORDS,
+) -> tuple[str, int]:
+    """Return an inline excerpt bounded by words and shared char budget."""
+    remaining_chars = max(0, remaining_chars)
+    if not content:
+        return "", remaining_chars
+    if remaining_chars <= 0:
+        return "[inline excerpt omitted: aggregate cap reached]", 0
+
+    excerpt = _truncate_content(content, max_words=max_words)
+    if len(excerpt) <= remaining_chars:
+        return excerpt, remaining_chars - len(excerpt)
+
+    cap_note = "\n... (inline aggregate cap reached)"
+    available_chars = max(0, remaining_chars - len(cap_note))
+    if available_chars == 0:
+        return cap_note.strip(), 0
+    return excerpt[:available_chars].rstrip() + cap_note, 0
+
+
+def _saved_content_line(saved_path: str) -> str:
+    """Format the saved-content pointer shown in tool results."""
+    return (
+        f"   Full text saved: {saved_path} — read it or "
+        "extract_webpage(url) if you need the whole page.\n"
+    )
+
+
+def _run_async(coro: Any, loop: Optional[asyncio.AbstractEventLoop] = None) -> Any:
+    """Drive an async coroutine from synchronous web-tool code.
+
+    ``ToolContext.get_or_register_web_source`` is async (it does I/O on the
+    shared ``srw_vector`` pool), but the web tools are sync and run in executor
+    threads with no running loop. Scheduling the coroutine on the loop that
+    created the tools (captured in ``create_web_tools``) preserves asyncpg
+    connection-pool affinity. Mirrors the bridge in ``knowledge_tools.py``.
+    """
+    if loop is not None and loop.is_running():
+        return asyncio.run_coroutine_threadsafe(coro, loop).result()
+    return asyncio.run(coro)
+
+
 def create_web_tools(context: ToolContext) -> List[Any]:
     """Create web search tools with injected context.
 
@@ -91,6 +166,14 @@ def create_web_tools(context: ToolContext) -> List[Any]:
     Returns:
         List of LangChain tool functions
     """
+
+    # Capture the loop at tool-creation time (async graph setup) so the sync
+    # tools below can drive ToolContext's async source registration on the
+    # original loop, preserving asyncpg pool affinity (see _run_async).
+    try:
+        _creator_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+    except RuntimeError:
+        _creator_loop = None
 
     @tool
     def web_search(
@@ -116,10 +199,12 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             time_range: Filter by recency: "day", "week", "month", "year", or None
             include_domains: Comma-separated domains to restrict search to
             exclude_domains: Comma-separated domains to exclude from results
-            include_raw_content: If true, return full page content instead of snippets
+            include_raw_content: If true, fetch and archive raw page content.
+                The result still returns compact snippets plus saved-file
+                pointers instead of inlining full page bodies.
 
         Returns:
-            Search results with snippets (or full content), URLs, and source IDs
+            Search results with snippets, saved-file pointers, URLs, and source IDs
         """
         return _direct_web_search(
             query,
@@ -131,6 +216,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             include_domains=include_domains,
             exclude_domains=exclude_domains,
             include_raw_content=include_raw_content,
+            creator_loop=_creator_loop,
         )
 
     @tool
@@ -143,7 +229,9 @@ def create_web_tools(context: ToolContext) -> List[Any]:
 
         Retrieves the complete text content of web pages as clean markdown.
         Useful for reading articles, documentation, or any web content in full.
-        Each extracted URL is automatically registered as a citation source.
+        Each extracted URL is automatically registered as a citation source and
+        archived to the workspace. Inline output is bounded per call; results
+        past the budget return a snippet plus the saved-file path to read.
 
         Args:
             urls: URL or comma-separated list of URLs to extract (max 20)
@@ -151,9 +239,16 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             extract_depth: "basic" (fast, default) or "advanced" (JS-heavy sites)
 
         Returns:
-            Extracted content from each URL with source IDs for citation
+            Extracted content (bounded) from each URL with source IDs for
+            citation and saved-file pointers
         """
-        return _extract_webpage(urls, context, query=query, extract_depth=extract_depth)
+        return _extract_webpage(
+            urls,
+            context,
+            query=query,
+            extract_depth=extract_depth,
+            creator_loop=_creator_loop,
+        )
 
     @tool
     def crawl_website(
@@ -168,9 +263,9 @@ def create_web_tools(context: ToolContext) -> List[Any]:
         """Crawl a website starting from a URL using Tavily Crawl.
 
         Performs a breadth-first traversal from the starting URL, extracting
-        content from discovered pages. Each crawled page is automatically
-        registered as a citation source. Good for exploring documentation
-        sites, regulatory pages, or multi-page resources.
+        and archiving content from discovered pages. Each crawled page is
+        automatically registered as a citation source. Good for exploring
+        documentation sites, regulatory pages, or multi-page resources.
 
         Args:
             url: Starting URL to crawl from
@@ -182,7 +277,8 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             exclude_paths: Comma-separated regex patterns for paths to exclude
 
         Returns:
-            Crawled content from each page with source IDs for citation
+            Compact crawled page snippets, saved-file pointers, and source IDs
+            for citation
         """
         return _crawl_website(
             url,
@@ -193,6 +289,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             limit=limit,
             select_paths=select_paths,
             exclude_paths=exclude_paths,
+            creator_loop=_creator_loop,
         )
 
     @tool
@@ -243,6 +340,7 @@ def _direct_web_search(
     include_domains: Optional[str] = None,
     exclude_domains: Optional[str] = None,
     include_raw_content: bool = False,
+    creator_loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> str:
     """Direct Tavily web search.
 
@@ -255,10 +353,11 @@ def _direct_web_search(
         time_range: "day", "week", "month", "year", or None
         include_domains: Comma-separated domains to include
         exclude_domains: Comma-separated domains to exclude
-        include_raw_content: Whether to return full page content
+        include_raw_content: Whether to fetch and archive raw page content
 
     Returns:
-        Search results with snippets, URLs, and source IDs (if context provided)
+        Search results with snippets, saved-file pointers, URLs, and source IDs
+        (if context provided)
     """
     api_key = _get_tavily_api_key()
     if not api_key:
@@ -304,8 +403,9 @@ def _direct_web_search(
                 title = r.get("title", "Untitled")
                 if url:
                     try:
-                        source_id, fetch_error = context.get_or_register_web_source(
-                            url, name=title
+                        source_id, fetch_error = _run_async(
+                            context.get_or_register_web_source(url, name=title),
+                            creator_loop,
                         )
                         registered_sources.append((url, source_id))
                         if fetch_error:
@@ -314,19 +414,23 @@ def _direct_web_search(
                         logger.warning(f"Could not register web source {url}: {e}")
 
         # Save web content to disk for persistence
+        saved_paths: Dict[str, str] = {}
         if context is not None:
             for r in results:
                 url = r.get("url", "")
                 if url:
-                    content = r.get("raw_content") or r.get("content") or ""
-                    if content and len(content) > 50:
+                    raw_content = r.get("raw_content")
+                    content = raw_content or r.get("content") or ""
+                    if content and (raw_content or len(content) > 50):
                         title = r.get("title", "Untitled")
                         source_id = next(
                             (sid for u, sid in registered_sources if u == url), None
                         )
-                        context.save_web_content_to_disk(
+                        saved_path = context.save_web_content_to_disk(
                             url, content, title=title, source_id=source_id
                         )
+                        if saved_path:
+                            saved_paths[url] = saved_path
 
         # Format output
         result = f"Web Search Results for: {query}\n"
@@ -335,10 +439,14 @@ def _direct_web_search(
         else:
             result += f"Results: {len(results)}\n\n"
 
+        remaining_fallback_chars = MAX_TOTAL_INLINE_CHARS
         for i, r in enumerate(results, 1):
             url = r.get("url", "N/A")
             source_id = next((sid for u, sid in registered_sources if u == url), None)
             is_inaccessible = any(u == url for u, _ in inaccessible_sources)
+            saved_path = saved_paths.get(url)
+            raw_content = r.get("raw_content") or r.get("content") or ""
+            snippet = r.get("content") or raw_content
             result += f"{i}. {r.get('title', 'Untitled')}\n"
             result += f"   URL: {url}\n"
             if source_id and is_inaccessible:
@@ -348,11 +456,22 @@ def _direct_web_search(
             elif source_id:
                 result += f"   Source ID: {source_id} (archived)\n"
 
-            if include_raw_content:
-                content = r.get("raw_content") or r.get("content") or ""
-                result += f"   {_truncate_content(content)}\n\n"
-            else:
-                result += f"   {(r.get('content') or '')[:300]}...\n\n"
+            result += f"   Snippet: {_truncate_snippet(snippet)}\n"
+            if saved_path and not is_inaccessible:
+                result += _saved_content_line(saved_path)
+            elif (
+                not saved_path
+                and not is_inaccessible
+                and include_raw_content
+                and raw_content
+            ):
+                excerpt, remaining_fallback_chars = _bounded_inline_excerpt(
+                    raw_content,
+                    remaining_fallback_chars,
+                    max_words=NO_WORKSPACE_MAX_WORDS,
+                )
+                result += f"   Content excerpt (not saved):\n{excerpt}\n"
+            result += "\n"
 
         if inaccessible_sources:
             result += (
@@ -383,6 +502,7 @@ def _extract_webpage(
     context: Optional[ToolContext] = None,
     query: Optional[str] = None,
     extract_depth: str = "basic",
+    creator_loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> str:
     """Extract full content from web pages using Tavily Extract.
 
@@ -428,19 +548,26 @@ def _extract_webpage(
                 url = r.get("url", "")
                 if url:
                     try:
-                        source_id, fetch_error = context.get_or_register_web_source(url)
+                        source_id, fetch_error = _run_async(
+                            context.get_or_register_web_source(url), creator_loop
+                        )
                         registered.append((url, source_id))
                     except Exception as e:
                         logger.warning(f"Could not register source {url}: {e}")
 
         # Save web content to disk for persistence (before truncation)
+        saved_paths: Dict[str, str] = {}
         if context is not None:
             for r in results:
                 url = r.get("url", "")
                 raw = r.get("raw_content", "")
                 if url and raw:
                     source_id = next((sid for u, sid in registered if u == url), None)
-                    context.save_web_content_to_disk(url, raw, source_id=source_id)
+                    saved_path = context.save_web_content_to_disk(
+                        url, raw, source_id=source_id
+                    )
+                    if saved_path:
+                        saved_paths[url] = saved_path
 
         # Format output
         output = f"Extracted Content from {len(results)} URL(s)"
@@ -448,19 +575,36 @@ def _extract_webpage(
             output += f" ({len(failed)} failed)"
         output += ":\n\n"
 
+        remaining_inline_chars = MAX_TOTAL_INLINE_CHARS
         for i, r in enumerate(results, 1):
             url = r.get("url", "N/A")
-            content = r.get("raw_content") or ""
+            raw_content = r.get("raw_content") or ""
             source_id = next((sid for u, sid in registered if u == url), None)
+            saved_path = saved_paths.get(url)
 
-            word_count = len(content.split()) if content else 0
-            content = _truncate_content(content)
+            word_count = len(raw_content.split()) if raw_content else 0
 
             output += f"{i}. {url}\n"
             if source_id:
                 output += f"   Source ID: {source_id} (archived)\n"
             output += f"   Words: {word_count:,}\n"
-            output += f"   Content:\n{content}\n\n"
+
+            inline_content = _truncate_content(raw_content)
+            if saved_path and len(inline_content) <= remaining_inline_chars:
+                remaining_inline_chars -= len(inline_content)
+                output += f"   Content:\n{inline_content}\n\n"
+            elif saved_path:
+                remaining_inline_chars = 0
+                output += f"   Snippet:\n{_truncate_snippet(raw_content)}\n"
+                output += _saved_content_line(saved_path)
+                output += "\n"
+            else:
+                excerpt, remaining_inline_chars = _bounded_inline_excerpt(
+                    raw_content,
+                    remaining_inline_chars,
+                    max_words=NO_WORKSPACE_MAX_WORDS,
+                )
+                output += f"   Content excerpt (not saved):\n{excerpt}\n\n"
 
         if failed:
             output += "Failed URLs:\n"
@@ -491,6 +635,7 @@ def _crawl_website(
     limit: int = 20,
     select_paths: Optional[str] = None,
     exclude_paths: Optional[str] = None,
+    creator_loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> str:
     """Crawl a website using Tavily Crawl.
 
@@ -549,14 +694,16 @@ def _crawl_website(
                 page_url = r.get("url", "")
                 if page_url:
                     try:
-                        source_id, fetch_error = context.get_or_register_web_source(
-                            page_url
+                        source_id, fetch_error = _run_async(
+                            context.get_or_register_web_source(page_url),
+                            creator_loop,
                         )
                         registered.append((page_url, source_id))
                     except Exception as e:
                         logger.warning(f"Could not register source {page_url}: {e}")
 
         # Save web content to disk for persistence (before truncation)
+        saved_paths: Dict[str, str] = {}
         if context is not None:
             for r in results:
                 page_url = r.get("url", "")
@@ -565,25 +712,40 @@ def _crawl_website(
                     source_id = next(
                         (sid for u, sid in registered if u == page_url), None
                     )
-                    context.save_web_content_to_disk(page_url, raw, source_id=source_id)
+                    saved_path = context.save_web_content_to_disk(
+                        page_url, raw, source_id=source_id
+                    )
+                    if saved_path:
+                        saved_paths[page_url] = saved_path
 
         # Format output
         output = f"Website Crawl Results for: {url}\n"
         output += f"Pages crawled: {len(results)}\n\n"
 
+        remaining_fallback_chars = MAX_TOTAL_INLINE_CHARS
         for i, r in enumerate(results, 1):
             page_url = r.get("url", "N/A")
-            content = r.get("raw_content") or ""
+            raw_content = r.get("raw_content") or ""
             source_id = next((sid for u, sid in registered if u == page_url), None)
+            saved_path = saved_paths.get(page_url)
 
-            word_count = len(content.split()) if content else 0
-            content = _truncate_content(content)
+            word_count = len(raw_content.split()) if raw_content else 0
 
             output += f"{i}. {page_url}\n"
             if source_id:
                 output += f"   Source ID: {source_id} (archived)\n"
             output += f"   Words: {word_count:,}\n"
-            output += f"   Content:\n{content}\n\n"
+            if saved_path:
+                output += f"   Snippet:\n{_truncate_snippet(raw_content, 500)}\n"
+                output += _saved_content_line(saved_path)
+                output += "\n"
+            else:
+                excerpt, remaining_fallback_chars = _bounded_inline_excerpt(
+                    raw_content,
+                    remaining_fallback_chars,
+                    max_words=NO_WORKSPACE_MAX_WORDS,
+                )
+                output += f"   Content excerpt (not saved):\n{excerpt}\n\n"
 
         if registered:
             output += "To cite: use cite_web(text, url) - sources are already archived."

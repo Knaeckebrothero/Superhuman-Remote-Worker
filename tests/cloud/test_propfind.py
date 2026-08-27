@@ -84,3 +84,42 @@ def test_href_decoded_against_encoded_prefix():
 def test_empty_multistatus_yields_nothing():
     body = '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"></d:multistatus>'
     assert parse_propfind_entries(body, href_prefix=PREFIX) == []
+
+
+# A Depth:1 PROPFIND OF the "Documents" subdir: the response's first entry is
+# the subdir itself (self-href), followed by its children. Without self_path,
+# the subdir re-appears (the double-subdir bug, design §11.5); with
+# self_path="Documents" it is dropped.
+SUBDIR_BODY = (
+    '<?xml version="1.0"?>'
+    '<d:multistatus xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">'
+    "<d:response>"
+    "<d:href>/remote.php/dav/groupfolders/agent-service/NC%20Validation%20Project/Documents/</d:href>"
+    "<d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype>"
+    "<d:getetag>&quot;dir456&quot;</d:getetag></d:prop>"
+    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+    "<d:response>"
+    "<d:href>/remote.php/dav/groupfolders/agent-service/NC%20Validation%20Project/Documents/report.md</d:href>"
+    "<d:propstat><d:prop><d:getcontentlength>12</d:getcontentlength>"
+    "<d:resourcetype/><d:getetag>&quot;file789&quot;</d:getetag></d:prop>"
+    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+    "</d:multistatus>"
+)
+
+
+def test_self_path_drops_the_subdir_self_entry():
+    paths = {
+        e.path
+        for e in parse_propfind_entries(
+            SUBDIR_BODY, href_prefix=PREFIX, self_path="Documents"
+        )
+    }
+    assert paths == {"Documents/report.md"}  # "Documents" self-entry dropped
+
+
+def test_self_path_default_keeps_backward_compatible_root_drop():
+    # No self_path → only the root (empty stripped path) is dropped; the
+    # subdir self-entry survives (this is the pre-fix behavior the walker
+    # must now suppress by passing self_path).
+    paths = {e.path for e in parse_propfind_entries(SUBDIR_BODY, href_prefix=PREFIX)}
+    assert paths == {"Documents", "Documents/report.md"}

@@ -12,13 +12,14 @@
 # `projects.network_tier`). Tier `internet-only` is the default for pods
 # lacking the tier label; the other tiers are opted into per project.
 #
-# See docs/features/workspace_network_policy_unification.md for the full
-# unification rationale, and docs/features/workspace_network_isolation.md §3
+# See knowledge-base/knowledge/features/workspace_network_policy_unification.md for the full
+# unification rationale, and knowledge-base/knowledge/features/workspace_network_isolation.md §3
 # for the tier model.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "srw.fullname" $ }}-workspace-policy-{{ $tier.name }}
+  namespace: {{ $.Release.Namespace }}
   labels:
     {{- include "srw.labels" $ | nindent 4 }}
     srw.io/network-tier: {{ $tier.name }}
@@ -32,9 +33,12 @@ spec:
     - Egress
   ingress:
     # SSH + CDP from agent pods (RemoteBackend + browser automation).
-    # Agent pods are created by the orchestrator's provisioners (not by Helm),
-    # so they carry the custom `app: srw-agent` / `app: srw-persistent-agent`
-    # labels rather than Helm's `app.kubernetes.io/component` labels.
+    # Legacy agent pods are created by the orchestrator's provisioners (not by
+    # Helm), so they carry the custom `app: srw-agent` /
+    # `app: srw-persistent-agent` labels rather than Helm's
+    # `app.kubernetes.io/component` labels. The flag-gated stateless Deployment
+    # has its own non-overlapping `app` label and joins this allow-list only
+    # while that lane is enabled.
     - from:
         - podSelector:
             matchLabels:
@@ -42,21 +46,46 @@ spec:
         - podSelector:
             matchLabels:
               app: srw-persistent-agent
+        {{- if $.Values.agent.stateless.enabled }}
+        - podSelector:
+            matchLabels:
+              app: srw-agent-stateless
+        {{- end }}
       ports:
+        {{- if include "srw.vmSameCluster" $ }}
+        - protocol: TCP
+          port: 22
+        {{- end }}
         - protocol: TCP
           port: 30022
         - protocol: TCP
           port: 9222
-    # SFTP from orchestrator: thread workspace uploads (camera capture, voice
-    # messages, attachments) land in <workspace>/uploads/ via paramiko SFTP.
-    # See orchestrator/services/thread_uploads.py.
+    # SSH from orchestrator: thread uploads plus IDE/snapshot control paths.
     - from:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "orchestrator") | nindent 14 }}
       ports:
+        {{- if include "srw.vmSameCluster" $ }}
+        - protocol: TCP
+          port: 22
+        {{- end }}
         - protocol: TCP
           port: 30022
+    {{- if $.Values.canvas.livePreview.viewer.enabled }}
+    # The Canvas gateway opens request-scoped direct channels to workspace
+    # loopback. Container workspaces use 30022; VM/KubeVirt inventory may use
+    # the conventional port 22. No application port is opened on the pod net.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "canvas-gateway") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 30022
+        - protocol: TCP
+          port: 22
+    {{- end }}
     # code-server from orchestrator (IDE session proxying)
     - from:
         - podSelector:
@@ -77,6 +106,16 @@ spec:
         - protocol: TCP
           port: 38080
   egress:
+    {{- if include "srw.vmSameCluster" $ }}
+    # Guest daemons call the co-located orchestrator directly over HTTP.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8085
+    {{- end }}
     # DNS resolution
     - ports:
         - protocol: UDP
@@ -121,6 +160,30 @@ spec:
       ports:
         - protocol: TCP
           port: 3000
+        {{- if $.Values.gitea.ssh.enabled }}
+        - protocol: TCP
+          port: {{ $.Values.gitea.ssh.internalPort }}
+        {{- end }}
+    {{- if $.Values.nextcloud.enabled }}
+    # Nextcloud (rclone/WebDAV cloud mounts)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "nextcloud") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 80
+    {{- end }}
+    {{- if $.Values.opencloud.enabled }}
+    # OpenCloud (rclone/WebDAV cloud mounts)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "opencloud") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9200
+    {{- end }}
     # PostgreSQL (App DB — for datasource shell tools like psql)
     - to:
         - podSelector:
@@ -145,14 +208,11 @@ spec:
       ports:
         - protocol: TCP
           port: 7688
-    # MongoDB (for datasource shell tools)
-    - to:
-        - podSelector:
-            matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "mongodb") | nindent 14 }}
-      ports:
-        - protocol: TCP
-          port: 27017
+    {{- with $.Values.workspace.networkPolicy.extraEgress }}
+    # Deployment-specific extra egress from the values overlay — e.g. local
+    # k3d's in-cluster Traefik hairpin for the OpenCloud tus data gateway.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
     # No general internet beyond TCP 80/443 + Tailscale UDP. Workspaces
     # cannot reach each other (no podSelector matchLabels srw.io/component:
     # agent-workspace in any allowed source).
@@ -173,6 +233,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "srw.fullname" . }}-workspace-fallback-deny
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "srw.labels" . | nindent 4 }}
 spec:

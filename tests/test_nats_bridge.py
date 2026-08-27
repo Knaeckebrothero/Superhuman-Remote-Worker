@@ -6,15 +6,14 @@ Tests cover:
 3. request_vm_create() — message format, payload, timeout handling
 4. request_vm_delete() — message format
 5. query_vm_status() — request/reply pattern, timeout
-6. send_control() — freeze/resume/terminate actions
 7. _on_vm_lifecycle_status() — parsing status messages, context updates
-8. _on_daemon_register() — daemon registration with IP/hostname, callback
+8. _on_daemon_register() — daemon registration with SSH readiness gating
 9. _on_daemon_heartbeat() — heartbeat processing, IDE session tracking
-10. _on_daemon_status() — agent process exit reporting
 11. NATS connection error/disconnect/reconnect callbacks
 12. Edge cases: malformed JSON, missing fields, reconnection, publish errors
 """
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -22,10 +21,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.services.vm_lifecycle_auth import sign_payload
+
 # Add project root to path
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+
+PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
 
 
 # =============================================================================
@@ -81,8 +84,34 @@ def mock_db():
     """Create a mock database instance."""
     db = AsyncMock()
     db.merge_vm_context = AsyncMock()
+    db.merge_thread_vm_context = AsyncMock()
+    db.merge_vm_context_if_current = AsyncMock(return_value=True)
+    db.merge_thread_vm_context_if_current = AsyncMock(return_value=True)
+    db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    db.get_vm_provision_generation = AsyncMock(return_value=PROVISION_GENERATION)
     db.merge_ide_session_context = AsyncMock()
+    db.merge_thread_ide_session_context = AsyncMock()
+    db.bind_thread_workspace_backing = AsyncMock()
+    # VM callbacks resolve thread-vs-job by DB lookup (never process-local
+    # state), so these must be explicit: a bare AsyncMock returns a truthy mock
+    # and would silently make every entity look like a thread. Default is job;
+    # thread tests set get_thread.return_value themselves.
+    db.get_thread = AsyncMock(return_value=None)
+    db.get_job = AsyncMock(return_value={"id": "job", "user_id": "u1"})
     return db
+
+
+@pytest.fixture
+def leader():
+    """Mark this replica as the elected leader for register/probe tests."""
+    from services.leader_election import is_leader
+
+    is_leader.set()
+    try:
+        yield
+    finally:
+        is_leader.clear()
 
 
 @pytest.fixture
@@ -103,9 +132,10 @@ def bridge(mock_nats_module, mock_nc, monkeypatch):
 
 
 @pytest.fixture
-def bridge_with_db(bridge, mock_db):
+def bridge_with_db(bridge, mock_db, monkeypatch):
     """Create a NatsBridge with both mock client and mock database."""
     bridge._db = mock_db
+    monkeypatch.setenv("VM_MODE", "external")
     return bridge
 
 
@@ -224,14 +254,13 @@ class TestConnect:
         assert bridge._db is mock_db
 
         # Verify subscriptions were created (4 VM lifecycle + 1 sudo + 1 session.events)
-        assert mock_nc.subscribe.call_count == 6
+        assert mock_nc.subscribe.call_count == 5
 
         # All broadcast subjects are per-orchestrator scoped.
         subjects = [call.args[0] for call in mock_nc.subscribe.call_args_list]
         assert "vm.lifecycle.status.srw-test" in subjects
         assert "agent.vm.srw-test.*.register" in subjects
         assert "agent.vm.srw-test.*.heartbeat" in subjects
-        assert "agent.vm.srw-test.*.status" in subjects
         assert "sudo.request.srw-test.>" in subjects
         assert "session.events.srw-test.>" in subjects
         # Regression: legacy flat subjects must not appear
@@ -239,7 +268,6 @@ class TestConnect:
             "vm.lifecycle.status",
             "agent.vm.*.register",
             "agent.vm.*.heartbeat",
-            "agent.vm.*.status",
             "sudo.request.>",
             "session.events.>",
         ):
@@ -399,6 +427,7 @@ class TestRequestVmCreate:
 
         payload = json.loads(call_args.args[1].decode())
         assert payload["job_id"] == "test-job-123"
+        assert payload["entity_type"] == "job"
         assert payload["agent_config"] == "scholar"
         assert payload["cpu_cores"] == 4
         assert payload["memory"] == "8Gi"
@@ -420,6 +449,19 @@ class TestRequestVmCreate:
         assert payload["vm_image"] == "registry.example.com/vm-base:latest"
 
     @pytest.mark.asyncio
+    async def test_create_carries_thread_identity_to_controller(
+        self, bridge_with_db, mock_nc
+    ):
+        await bridge_with_db.request_vm_create(
+            job_id="thread-123",
+            entity_type="thread",
+        )
+
+        payload = json.loads(mock_nc.publish.call_args.args[1].decode())
+        assert payload["job_id"] == "thread-123"
+        assert payload["entity_type"] == "thread"
+
+    @pytest.mark.asyncio
     async def test_create_excludes_vm_image_when_none(self, bridge_with_db, mock_nc):
         await bridge_with_db.request_vm_create(
             job_id="test-job-123",
@@ -434,9 +476,9 @@ class TestRequestVmCreate:
         await bridge_with_db.request_vm_create(job_id="test-job-123")
 
         payload = json.loads(mock_nc.publish.call_args.args[1].decode())
-        assert payload["agent_config"] == "defaults"
-        assert payload["cpu_cores"] == 2
-        assert payload["memory"] == "4Gi"
+        assert payload["agent_config"] == "worker_base"
+        assert payload["cpu_cores"] == 8
+        assert payload["memory"] == "16Gi"
         assert payload["description"] == ""
 
     @pytest.mark.asyncio
@@ -446,6 +488,22 @@ class TestRequestVmCreate:
         mock_db.merge_vm_context.assert_awaited_once_with(
             "test-job-123", {"status": "provisioning"}
         )
+
+    @pytest.mark.asyncio
+    async def test_golden_poll_skips_provisioning_status(
+        self, bridge_with_db, mock_nc, mock_db
+    ):
+        """set_provisioning=False (dispatcher golden poll) must not overwrite
+        the context status — it must stay ``waiting_golden`` between polls so
+        the decision logic keeps polling instead of treating the job as a
+        booting VM."""
+        result = await bridge_with_db.request_vm_create(
+            job_id="test-job-123", set_provisioning=False
+        )
+
+        assert result is True
+        mock_nc.publish.assert_awaited_once()  # the create IS still published
+        mock_db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_returns_false_when_unavailable(self, disconnected_bridge):
@@ -489,15 +547,31 @@ class TestRequestVmDelete:
         assert call_args.args[0] == "vm.lifecycle.delete.srw-test"
 
         payload = json.loads(call_args.args[1].decode())
-        assert payload == {"job_id": "test-job-456", "orchestrator_id": "srw-test"}
+        assert payload == {
+            "job_id": "test-job-456",
+            "orchestrator_id": "srw-test",
+            # Terminal by default; False keeps the persistent rootdisk.
+            "purge_disk": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_delete_can_request_a_kept_disk(self, bridge_with_db, mock_nc):
+        await bridge_with_db.request_vm_delete("test-job-456", purge_disk=False)
+        payload = json.loads(mock_nc.publish.call_args.args[1].decode())
+        assert payload["purge_disk"] is False
 
     @pytest.mark.asyncio
     async def test_delete_updates_vm_context(self, bridge_with_db, mock_db):
         await bridge_with_db.request_vm_delete(job_id="test-job-456")
 
-        mock_db.merge_vm_context.assert_awaited_once_with(
-            "test-job-456", {"status": "deleting"}
-        )
+        mock_db.merge_vm_context.assert_awaited_once()
+        job_id, ctx = mock_db.merge_vm_context.await_args.args
+        assert job_id == "test-job-456"
+        assert ctx["status"] == "deleting"
+        # The dispatcher needs this anchor to tell an in-flight teardown from a
+        # stuck one; without it a dropped NATS message strands the job forever
+        # (dispatch_guards.vm_provisioning_decision).
+        assert isinstance(ctx["deleting_started_at"], float)
 
     @pytest.mark.asyncio
     async def test_delete_returns_false_when_unavailable(self, disconnected_bridge):
@@ -572,69 +646,36 @@ class TestQueryVmStatus:
         result = await bridge.query_vm_status("test-job-789")
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_query_rejects_jetstream_ack(self, bridge, mock_nc):
+        # If a JetStream stream's subjects ever cover vm.lifecycle.get.*, the
+        # request inbox receives the stream's publish-ack instead of the
+        # controller reply. That ack must never be surfaced as VM status.
+        # See knowledge-base/knowledge/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
+        ack = MagicMock()
+        ack.data = json.dumps({"stream": "VM_EVENTS", "seq": 42}).encode()
+        mock_nc.request = AsyncMock(return_value=ack)
 
-# =============================================================================
-# Test: send_control()
-# =============================================================================
-
-
-class TestSendControl:
-    """Tests for NatsBridge.send_control()."""
+        result = await bridge.query_vm_status("test-job-789")
+        assert result is None
 
     @pytest.mark.asyncio
-    async def test_send_freeze(self, bridge, mock_nc):
-        result = await bridge.send_control("test-job-123", "freeze")
+    async def test_query_allows_reply_with_seq_field(self, bridge, mock_nc):
+        # A genuine controller reply carrying job_id is NOT an ack even if it
+        # happens to include stream/seq-like keys — the guard keys on the
+        # absence of job_id.
+        response_data = {
+            "job_id": "test-job-789",
+            "vm_name": "vm-test-job-789",
+            "stream": "ignored",
+            "seq": 7,
+        }
+        response_msg = MagicMock()
+        response_msg.data = json.dumps(response_data).encode()
+        mock_nc.request = AsyncMock(return_value=response_msg)
 
-        assert result is True
-        mock_nc.publish.assert_awaited_once()
-
-        call_args = mock_nc.publish.call_args
-        assert call_args.args[0] == "agent.vm.srw-test.test-job-123.control"
-        payload = json.loads(call_args.args[1].decode())
-        assert payload == {"action": "freeze", "orchestrator_id": "srw-test"}
-
-    @pytest.mark.asyncio
-    async def test_send_resume(self, bridge, mock_nc):
-        result = await bridge.send_control("test-job-123", "resume")
-
-        assert result is True
-        payload = json.loads(mock_nc.publish.call_args.args[1].decode())
-        assert payload == {"action": "resume", "orchestrator_id": "srw-test"}
-
-    @pytest.mark.asyncio
-    async def test_send_terminate(self, bridge, mock_nc):
-        result = await bridge.send_control("test-job-123", "terminate")
-
-        assert result is True
-        payload = json.loads(mock_nc.publish.call_args.args[1].decode())
-        assert payload == {"action": "terminate", "orchestrator_id": "srw-test"}
-
-    @pytest.mark.asyncio
-    async def test_send_control_subject_format(self, bridge, mock_nc):
-        """Verify the scoped subject embeds orchestrator_id and job_id."""
-        await bridge.send_control("abc-def-ghi", "freeze")
-        subject = mock_nc.publish.call_args.args[0]
-        assert subject == "agent.vm.srw-test.abc-def-ghi.control"
-
-    @pytest.mark.asyncio
-    async def test_send_control_refused_when_id_unset(self, unscoped_bridge, mock_nc):
-        result = await unscoped_bridge.send_control("test-job-123", "freeze")
-        assert result is False
-        mock_nc.publish.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_send_control_returns_false_when_unavailable(
-        self, disconnected_bridge
-    ):
-        result = await disconnected_bridge.send_control("test-job-123", "freeze")
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_send_control_returns_false_on_publish_error(self, bridge, mock_nc):
-        mock_nc.publish = AsyncMock(side_effect=RuntimeError("publish failed"))
-
-        result = await bridge.send_control("test-job-123", "freeze")
-        assert result is False
+        result = await bridge.query_vm_status("test-job-789")
+        assert result == response_data
 
 
 # =============================================================================
@@ -644,6 +685,19 @@ class TestSendControl:
 
 class TestOnVmLifecycleStatus:
     """Tests for NatsBridge._on_vm_lifecycle_status()."""
+
+    @pytest.mark.asyncio
+    async def test_same_cluster_ignores_nats_lifecycle_evidence(
+        self, bridge_with_db, mock_db, monkeypatch
+    ):
+        monkeypatch.setenv("VM_MODE", "same-cluster")
+
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg({"job_id": "job-001", "status": "ready"})
+        )
+
+        mock_db.merge_vm_context.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_basic_status_update(self, bridge_with_db, mock_db):
@@ -666,6 +720,115 @@ class TestOnVmLifecycleStatus:
                 "namespace": "agent-vms",
             },
         )
+
+    @pytest.mark.asyncio
+    async def test_created_status_persists_admitted_vm_uid(
+        self, bridge_with_db, mock_db
+    ):
+        secret = b"nats-bridge-lifecycle-test-secret-at-least-32-bytes"
+        bridge_with_db._lifecycle_hmac_secret = secret
+        generation = "00000000-0000-4000-8000-000000000001"
+        msg = make_msg(
+            sign_payload(
+                {
+                    "job_id": "job-vm-uid",
+                    "status": "created",
+                    "vm_name": "agent-vm-job-vm-uid",
+                    "vm_uid": "admitted-vm-uid-123",
+                    "rootdisk_pvc_uid": "admitted-root-pvc-uid-456",
+                    "namespace": "agent-vms",
+                    "provision_generation": generation,
+                },
+                direction="response",
+                operation="create",
+                secret=secret,
+            )
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(msg)
+
+        updates = mock_db.merge_vm_context_if_provision_generation.await_args.args[2]
+        assert updates["vm_uid"] == "admitted-vm-uid-123"
+        assert updates["rootdisk_pvc_uid"] == "admitted-root-pvc-uid-456"
+        assert updates["identity_authenticated"] is True
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_authenticated_status_never_falls_back_to_unguarded_merge(
+        self, bridge_with_db, mock_db
+    ):
+        secret = b"nats-bridge-lifecycle-test-secret-at-least-32-bytes"
+        bridge_with_db._lifecycle_hmac_secret = secret
+        mock_db.merge_vm_context_if_provision_generation.return_value = False
+        payload = sign_payload(
+            {
+                "job_id": "job-stale",
+                "status": "failed",
+                "error": "old failure",
+                "provision_generation": "00000000-0000-4000-8000-000000000001",
+            },
+            direction="response",
+            operation="create",
+            secret=secret,
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(make_msg(payload))
+
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_authenticated_status_without_generation_is_dropped(
+        self, bridge_with_db, mock_db
+    ):
+        secret = b"nats-bridge-lifecycle-test-secret-at-least-32-bytes"
+        bridge_with_db._lifecycle_hmac_secret = secret
+        payload = sign_payload(
+            {"job_id": "job-no-generation", "status": "failed"},
+            direction="response",
+            operation="create",
+            secret=secret,
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(make_msg(payload))
+
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_old_or_invalid_status_does_not_overwrite_vm_uid(
+        self, bridge_with_db, mock_db
+    ):
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg(
+                {
+                    "job_id": "job-old-controller",
+                    "status": "created",
+                    "vm_name": "agent-vm-job-old-controller",
+                    "namespace": "agent-vms",
+                }
+            )
+        )
+        old_updates = mock_db.merge_vm_context.await_args.args[1]
+        assert "vm_uid" not in old_updates
+        assert "rootdisk_pvc_uid" not in old_updates
+
+        mock_db.merge_vm_context.reset_mock()
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg(
+                {
+                    "job_id": "job-invalid-uid",
+                    "status": "created",
+                    "vm_name": "agent-vm-job-invalid-uid",
+                    "vm_uid": "invalid uid",
+                    "rootdisk_pvc_uid": "invalid uid",
+                    "namespace": "agent-vms",
+                }
+            )
+        )
+        invalid_updates = mock_db.merge_vm_context.await_args.args[1]
+        assert "vm_uid" not in invalid_updates
+        assert "rootdisk_pvc_uid" not in invalid_updates
 
     @pytest.mark.asyncio
     async def test_status_with_error(self, bridge_with_db, mock_db):
@@ -702,6 +865,48 @@ class TestOnVmLifecycleStatus:
 
         updates = mock_db.merge_vm_context.call_args.args[1]
         assert updates["pod_ip"] == "10.0.0.42"
+
+    @pytest.mark.asyncio
+    async def test_waiting_golden_passes_import_telemetry(
+        self, bridge_with_db, mock_db
+    ):
+        """waiting_golden statuses carry golden DV name + import progress —
+        the dispatcher's poll logging and park error message read them from
+        context.vm."""
+        msg = make_msg(
+            {
+                "job_id": "job-golden",
+                "status": "waiting_golden",
+                "golden": "agent-vm-golden-9ca967a4ca08",
+                "golden_phase": "ImportInProgress",
+                "golden_progress": "68.19%",
+            }
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(msg)
+
+        updates = mock_db.merge_vm_context.call_args.args[1]
+        assert updates["status"] == "waiting_golden"
+        assert updates["golden"] == "agent-vm-golden-9ca967a4ca08"
+        assert updates["golden_phase"] == "ImportInProgress"
+        assert updates["golden_progress"] == "68.19%"
+
+    @pytest.mark.asyncio
+    async def test_non_golden_status_has_no_golden_keys(self, bridge_with_db, mock_db):
+        msg = make_msg(
+            {
+                "job_id": "job-005",
+                "status": "created",
+                "vm_name": "vm-job-005",
+                "namespace": "agent-vms",
+            }
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(msg)
+
+        updates = mock_db.merge_vm_context.call_args.args[1]
+        assert "golden" not in updates
+        assert "golden_progress" not in updates
 
     @pytest.mark.asyncio
     async def test_status_with_ssh_nodeport(self, bridge_with_db, mock_db):
@@ -771,57 +976,236 @@ class TestOnVmLifecycleStatus:
 
 
 class TestOnDaemonRegister:
-    """Tests for NatsBridge._on_daemon_register()."""
+    """Tests for NatsBridge._on_daemon_register().
+
+    Readiness evidence is daemon-supplied (``ssh_ready``) or, for legacy
+    golden images that omit the field, inferred from a tailnet ``ssh_host``.
+    There is NO orchestrator-side SSH probe — the orchestrator has no route
+    to the tailnet, so a probe gate can never pass (see knowledge-base/knowledge/issues/
+    vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+    """
 
     @pytest.mark.asyncio
-    async def test_register_with_ip(self, bridge_with_db, mock_db):
+    async def test_register_is_ignored_outside_external_mode(
+        self, bridge_with_db, mock_db, monkeypatch
+    ):
+        monkeypatch.setenv("VM_MODE", "same-cluster")
+        await bridge_with_db._on_daemon_register(
+            make_msg({"job_id": "job-reg", "ip": "100.64.1.5", "ssh_ready": True})
+        )
+        mock_db.get_vm_provision_generation.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_thread_vm_guest_identity_does_not_enable_canvas(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """Guest NATS self-report is not provisioner-attested; fail closed."""
+        thread_id = "thread-reg-canvas-closed"
+        mock_db.get_thread = AsyncMock(return_value={"id": thread_id, "user_id": "u1"})
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+        await bridge_with_db._on_daemon_register(
+            make_msg(
+                {
+                    "job_id": thread_id,
+                    "hostname": "vm-thread",
+                    "ip": "100.64.1.55",
+                    "pid": 44,
+                    "ssh_ready": True,
+                    "ssh_host_key_fingerprint": "SHA256:self-reported",
+                    "workspace_backing_id": "self-reported-boot",
+                }
+            )
+        )
+
+        updates = (
+            mock_db.merge_thread_vm_context_if_provision_generation.call_args.args[2]
+        )
+        assert updates["status"] == "ready"
+        assert updates["_canvas_workspace_generation"] is None
+        mock_db.bind_thread_workspace_backing.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ssh_ready_true_promotes_to_ready(
+        self, bridge_with_db, mock_db, leader
+    ):
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
         msg = make_msg(
             {
                 "job_id": "job-reg-001",
                 "hostname": "vm-agent-001",
                 "ip": "100.64.1.5",
                 "pid": 12345,
+                "ssh_ready": True,
+            }
+        )
+
+        await bridge_with_db._on_daemon_register(msg)
+        await asyncio.sleep(0)  # let the seed task run
+
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
+        assert (
+            mock_db.merge_vm_context_if_provision_generation.call_args.args[0]
+            == "job-reg-001"
+        )
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
+        assert updates["status"] == "ready"
+        assert updates["ssh_host"] == "100.64.1.5"
+        assert updates["ssh_port"] == 22
+        assert updates["hostname"] == "vm-agent-001"
+        assert updates["daemon_pid"] == 12345
+        assert updates["recovering"] is False
+        assert updates["registered_at"]
+        assert updates["ssh_registration_id"]
+        assert updates["ssh_ready_source"] == "daemon"
+        assert updates["ssh_verified_at"]
+        assert updates["ssh_probe_error"] is None
+        callback.assert_called_once()
+        bridge_with_db._seed_vm_ide_config.assert_called_once_with(
+            "job-reg-001", False, "100.64.1.5", 22
+        )
+
+    @pytest.mark.asyncio
+    async def test_ssh_ready_false_holds_ssh_pending(
+        self, bridge_with_db, mock_db, leader
+    ):
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+        msg = make_msg(
+            {
+                "job_id": "job-reg-002",
+                "hostname": "vm-agent-002",
+                "ip": "100.64.1.6",
+                "pid": 2,
+                "ssh_ready": False,
+            }
+        )
+
+        await bridge_with_db._on_daemon_register(msg)
+        await asyncio.sleep(0)
+
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
+        assert updates["status"] == "ssh_pending"
+        assert updates["ssh_verified_at"] is None
+        assert updates["ssh_ready_source"] is None
+        assert "re-register" in updates["ssh_probe_error"]
+        callback.assert_not_called()
+        bridge_with_db._seed_vm_ide_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_register_with_tailnet_ip_promotes(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """Golden images without the ssh_ready report: tailnet IP ⇒ ready."""
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+        msg = make_msg(
+            {
+                "job_id": "job-reg-003",
+                "hostname": "vm-agent-003",
+                "ip": "100.64.2.10",
+                "pid": 3,
+            }
+        )
+
+        await bridge_with_db._on_daemon_register(msg)
+        await asyncio.sleep(0)
+
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
+        assert updates["status"] == "ready"
+        assert updates["ssh_ready_source"] == "legacy_tailnet_ip"
+        assert updates["ssh_verified_at"]
+        callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_legacy_register_with_nat_fallback_ip_holds_pending(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """The daemon registers with the QEMU NAT IP when tailscale takes
+        >60s; that address is unroutable — hold until the tailnet
+        re-register."""
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
+        msg = make_msg(
+            {
+                "job_id": "job-reg-004",
+                "hostname": "vm-agent-004",
+                "ip": "10.0.2.15",
+                "pid": 4,
             }
         )
 
         await bridge_with_db._on_daemon_register(msg)
 
-        mock_db.merge_vm_context.assert_awaited_once_with(
-            "job-reg-001",
-            {
-                "status": "ready",
-                "ssh_host": "100.64.1.5",
-                "ssh_port": 22,
-                "hostname": "vm-agent-001",
-                "daemon_pid": 12345,
-                "recovering": False,
-            },
-        )
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
+        assert updates["status"] == "ssh_pending"
+        assert "not a tailnet IP" in updates["ssh_probe_error"]
+        callback.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_register_falls_back_to_hostname(self, bridge_with_db, mock_db):
-        """When ip is missing, hostname is used as ssh_host."""
+    async def test_reregister_readiness_flip_promotes(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """ssh_ready False → True across two registers ends dispatchable."""
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+        payload = {
+            "job_id": "job-reg-005",
+            "hostname": "vm-agent-005",
+            "ip": "100.64.3.1",
+            "pid": 5,
+        }
+
+        await bridge_with_db._on_daemon_register(
+            make_msg({**payload, "ssh_ready": False})
+        )
+        callback.assert_not_called()
+
+        await bridge_with_db._on_daemon_register(
+            make_msg({**payload, "ssh_ready": True})
+        )
+        await asyncio.sleep(0)
+
+        assert mock_db.merge_vm_context_if_provision_generation.await_count == 2
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
+        assert updates["status"] == "ready"
+        callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_register_falls_back_to_hostname(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """When ip is missing, hostname is used as ssh_host (a hostname is
+        not tailnet evidence, so a legacy register stays pending)."""
         msg = make_msg(
             {
-                "job_id": "job-reg-002",
-                "hostname": "vm-agent-002.local",
+                "job_id": "job-reg-006",
+                "hostname": "vm-agent-006.local",
                 "pid": 99,
             }
         )
 
         await bridge_with_db._on_daemon_register(msg)
 
-        updates = mock_db.merge_vm_context.call_args.args[1]
-        assert updates["ssh_host"] == "vm-agent-002.local"
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
+        assert updates["ssh_host"] == "vm-agent-006.local"
         assert updates["ssh_port"] == 22
+        assert updates["status"] == "ssh_pending"
 
     @pytest.mark.asyncio
-    async def test_register_ip_preferred_over_hostname(self, bridge_with_db, mock_db):
+    async def test_register_ip_preferred_over_hostname(
+        self, bridge_with_db, mock_db, leader
+    ):
         """When both ip and hostname are present, ip is preferred for ssh_host."""
         msg = make_msg(
             {
-                "job_id": "job-reg-003",
-                "hostname": "vm-agent-003",
+                "job_id": "job-reg-007",
+                "hostname": "vm-agent-007",
                 "ip": "100.64.2.10",
                 "pid": 50,
             }
@@ -829,68 +1213,54 @@ class TestOnDaemonRegister:
 
         await bridge_with_db._on_daemon_register(msg)
 
-        updates = mock_db.merge_vm_context.call_args.args[1]
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
         assert updates["ssh_host"] == "100.64.2.10"
-        assert updates["hostname"] == "vm-agent-003"
+        assert updates["hostname"] == "vm-agent-007"
 
     @pytest.mark.asyncio
-    async def test_register_triggers_on_vm_ready_callback(
-        self, bridge_with_db, mock_db
+    async def test_promote_callback_error_handled(
+        self, bridge_with_db, mock_db, leader
     ):
-        callback = MagicMock()
-        bridge_with_db._on_vm_ready = callback
-
-        msg = make_msg(
-            {
-                "job_id": "job-reg-004",
-                "hostname": "vm-agent-004",
-                "ip": "100.64.3.1",
-                "pid": 1,
-            }
-        )
-
-        await bridge_with_db._on_daemon_register(msg)
-
-        callback.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_register_callback_error_handled(self, bridge_with_db, mock_db):
         """Callback errors should not prevent registration from completing."""
         callback = MagicMock(side_effect=RuntimeError("callback boom"))
         bridge_with_db._on_vm_ready = callback
-
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
         msg = make_msg(
             {
-                "job_id": "job-reg-005",
-                "hostname": "vm-agent-005",
+                "job_id": "job-reg-008",
+                "hostname": "vm-agent-008",
                 "ip": "100.64.4.1",
-                "pid": 2,
+                "pid": 8,
+                "ssh_ready": True,
             }
         )
 
-        # Should not raise
         await bridge_with_db._on_daemon_register(msg)
+        await asyncio.sleep(0)
 
-        # Context update should still have happened
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
+        callback.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_register_no_callback_set(self, bridge_with_db, mock_db):
-        """Register works fine when no on_vm_ready callback is set."""
+    async def test_register_no_callback_set(self, bridge_with_db, mock_db, leader):
+        """Promotion works fine when no on_vm_ready callback is set."""
         bridge_with_db._on_vm_ready = None
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
 
         msg = make_msg(
             {
-                "job_id": "job-reg-006",
-                "hostname": "vm-agent-006",
+                "job_id": "job-reg-009",
+                "hostname": "vm-agent-009",
                 "ip": "100.64.5.1",
-                "pid": 3,
+                "pid": 9,
+                "ssh_ready": True,
             }
         )
 
         await bridge_with_db._on_daemon_register(msg)
+        await asyncio.sleep(0)
 
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_register_missing_job_id_ignored(self, bridge_with_db, mock_db):
@@ -898,7 +1268,7 @@ class TestOnDaemonRegister:
 
         await bridge_with_db._on_daemon_register(msg)
 
-        mock_db.merge_vm_context.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_register_malformed_json(self, bridge_with_db, mock_db):
@@ -906,39 +1276,226 @@ class TestOnDaemonRegister:
 
         await bridge_with_db._on_daemon_register(msg)
 
-        mock_db.merge_vm_context.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_register_clears_recovering_flag(self, bridge_with_db, mock_db):
+    async def test_register_clears_recovering_flag(
+        self, bridge_with_db, mock_db, leader
+    ):
         """Registration should set recovering=False to clear any recovery guard."""
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
         msg = make_msg(
             {
-                "job_id": "job-reg-007",
-                "hostname": "vm-agent-007",
+                "job_id": "job-reg-010",
+                "hostname": "vm-agent-010",
                 "ip": "100.64.7.1",
                 "pid": 7,
             }
         )
 
         await bridge_with_db._on_daemon_register(msg)
+        await asyncio.sleep(0)
 
-        updates = mock_db.merge_vm_context.call_args.args[1]
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
         assert updates["recovering"] is False
 
     @pytest.mark.asyncio
-    async def test_register_neither_ip_nor_hostname(self, bridge_with_db, mock_db):
-        """When both ip and hostname are missing, ssh_host should be None."""
+    async def test_register_neither_ip_nor_hostname(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """Missing SSH host is recorded as non-dispatchable."""
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
         msg = make_msg(
             {
-                "job_id": "job-reg-008",
+                "job_id": "job-reg-011",
                 "pid": 8,
             }
         )
 
         await bridge_with_db._on_daemon_register(msg)
 
-        updates = mock_db.merge_vm_context.call_args.args[1]
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
         assert updates["ssh_host"] is None
+        assert updates["status"] == "ssh_unreachable"
+        assert "SSH host" in updates["ssh_probe_error"]
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ssh_ready_true_without_tailnet_ip_trusted(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """An explicit daemon ssh_ready=True is trusted over IP inspection
+        (the daemon's own check already requires a tailnet IP)."""
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+        msg = make_msg(
+            {
+                "job_id": "job-reg-012",
+                "hostname": "vm-agent-012",
+                "ip": "100.64.9.9",
+                "pid": 12,
+                "ssh_ready": True,
+            }
+        )
+
+        await bridge_with_db._on_daemon_register(msg)
+        await asyncio.sleep(0)
+
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
+        assert updates["status"] == "ready"
+        assert updates["ssh_ready_source"] == "daemon"
+
+    @pytest.mark.asyncio
+    async def test_register_ignored_on_follower(self, bridge_with_db, mock_db):
+        from services.leader_election import is_leader
+
+        is_leader.clear()
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
+        msg = make_msg(
+            {
+                "job_id": "job-reg-follower",
+                "hostname": "vm-agent-follower",
+                "ip": "100.64.9.1",
+                "pid": 9,
+                "ssh_ready": True,
+            }
+        )
+
+        await bridge_with_db._on_daemon_register(msg)
+
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
+        callback.assert_not_called()
+
+
+# =============================================================================
+# Test: thread-vs-job routing is durable, not process-local (Defect 4)
+# knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md
+# =============================================================================
+
+
+class TestVmEntityRoutingIsDurable:
+    """Under HA (2 replicas), the replica that PUBLISHED vm.lifecycle.create is
+    not necessarily the leader that handles the daemon's register. Routing must
+    therefore come from the database, never from state left in the publishing
+    process — otherwise the leader treats a thread UUID as a job and writes
+    ssh_host into a jobs row that does not exist, stranding the thread at
+    status='created' forever.
+
+    Every test here uses a bridge that never published anything, which is
+    exactly the non-publishing replica's situation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_register_routes_to_thread_on_non_publishing_replica(
+        self, bridge_with_db, mock_db, leader
+    ):
+        tid = "77b3d3e6-6dfc-422e-a8ec-a5848cb8febc"
+        mock_db.get_thread = AsyncMock(return_value={"id": tid, "user_id": "u1"})
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+
+        await bridge_with_db._on_daemon_register(
+            make_msg(
+                {
+                    "job_id": tid,
+                    "hostname": "vm-thread",
+                    "ip": "100.64.1.55",
+                    "pid": 44,
+                    "ssh_ready": True,
+                }
+            )
+        )
+
+        mock_db.merge_thread_vm_context_if_provision_generation.assert_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
+        assert (
+            mock_db.merge_thread_vm_context_if_provision_generation.call_args.args[2][
+                "status"
+            ]
+            == "ready"
+        )
+
+    @pytest.mark.asyncio
+    async def test_register_routes_to_job_when_id_is_not_a_thread(
+        self, bridge_with_db, mock_db, leader
+    ):
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+
+        await bridge_with_db._on_daemon_register(
+            make_msg(
+                {
+                    "job_id": "job-durable-001",
+                    "hostname": "vm-job",
+                    "ip": "100.64.1.7",
+                    "pid": 7,
+                    "ssh_ready": True,
+                }
+            )
+        )
+
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited()
+        mock_db.merge_thread_vm_context_if_provision_generation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_register_writes_nothing_for_unknown_entity(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """Neither a thread nor a job: writing to either table would be a guess.
+        Fail safe — the wrong-table write is the bug being fixed."""
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value=None)
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+
+        await bridge_with_db._on_daemon_register(
+            make_msg(
+                {
+                    "job_id": "ghost-entity",
+                    "hostname": "vm-ghost",
+                    "ip": "100.64.1.9",
+                    "pid": 9,
+                    "ssh_ready": True,
+                }
+            )
+        )
+
+        mock_db.merge_thread_vm_context_if_provision_generation.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_status_routes_to_thread_on_non_publishing_replica(
+        self, bridge_with_db, mock_db
+    ):
+        tid = "77b3d3e6-6dfc-422e-a8ec-a5848cb8febc"
+        mock_db.get_thread = AsyncMock(return_value={"id": tid, "user_id": "u1"})
+
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg({"job_id": tid, "status": "created", "vm_name": "agent-vm-x"})
+        )
+
+        mock_db.merge_thread_vm_context.assert_awaited()
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_routes_to_thread_on_non_publishing_replica(
+        self, bridge_with_db, mock_db, leader
+    ):
+        tid = "77b3d3e6-6dfc-422e-a8ec-a5848cb8febc"
+        mock_db.get_thread = AsyncMock(return_value={"id": tid, "user_id": "u1"})
+
+        await bridge_with_db._on_daemon_heartbeat(
+            make_msg(
+                {
+                    "job_id": tid,
+                    "agent_running": True,
+                    "code_server_connections": 1,
+                }
+            )
+        )
+
+        mock_db.merge_thread_vm_context_if_provision_generation.assert_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
+        mock_db.merge_thread_ide_session_context.assert_awaited_once()
+        mock_db.merge_ide_session_context.assert_not_awaited()
 
 
 # =============================================================================
@@ -946,6 +1503,7 @@ class TestOnDaemonRegister:
 # =============================================================================
 
 
+@pytest.mark.usefixtures("leader")
 class TestOnDaemonHeartbeat:
     """Tests for NatsBridge._on_daemon_heartbeat()."""
 
@@ -964,10 +1522,10 @@ class TestOnDaemonHeartbeat:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_awaited_once()
-        call_args = mock_db.merge_vm_context.call_args
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
+        call_args = mock_db.merge_vm_context_if_provision_generation.call_args
         assert call_args.args[0] == "job-hb-001"
-        updates = call_args.args[1]
+        updates = call_args.args[2]
         assert "last_heartbeat" in updates
         # Should be an ISO format timestamp
         assert "T" in updates["last_heartbeat"]
@@ -989,7 +1547,7 @@ class TestOnDaemonHeartbeat:
         await bridge_with_db._on_daemon_heartbeat(msg)
 
         # Should update both VM context and IDE session
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
         mock_db.merge_ide_session_context.assert_awaited_once()
 
         ide_call = mock_db.merge_ide_session_context.call_args
@@ -1035,7 +1593,7 @@ class TestOnDaemonHeartbeat:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
         mock_db.merge_ide_session_context.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1058,7 +1616,7 @@ class TestOnDaemonHeartbeat:
         await bridge_with_db._on_daemon_heartbeat(msg)
 
         # VM context should still be updated
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_heartbeat_missing_job_id(self, bridge_with_db, mock_db):
@@ -1071,7 +1629,7 @@ class TestOnDaemonHeartbeat:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_heartbeat_malformed_json(self, bridge_with_db, mock_db):
@@ -1079,7 +1637,7 @@ class TestOnDaemonHeartbeat:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_heartbeat_no_db_skips_ide_update(self, bridge, mock_nc):
@@ -1097,61 +1655,6 @@ class TestOnDaemonHeartbeat:
 
         # Should not raise despite _db being None
         await bridge._on_daemon_heartbeat(msg)
-
-
-# =============================================================================
-# Test: _on_daemon_status()
-# =============================================================================
-
-
-class TestOnDaemonStatus:
-    """Tests for NatsBridge._on_daemon_status()."""
-
-    @pytest.mark.asyncio
-    async def test_status_completed(self, bridge_with_db):
-        """Completed status is logged without error."""
-        msg = make_msg(
-            {
-                "job_id": "job-st-001",
-                "status": "completed",
-                "exit_code": 0,
-            }
-        )
-
-        # Should not raise
-        await bridge_with_db._on_daemon_status(msg)
-
-    @pytest.mark.asyncio
-    async def test_status_failed(self, bridge_with_db):
-        """Failed status is logged without error."""
-        msg = make_msg(
-            {
-                "job_id": "job-st-002",
-                "status": "failed",
-                "exit_code": 1,
-            }
-        )
-
-        await bridge_with_db._on_daemon_status(msg)
-
-    @pytest.mark.asyncio
-    async def test_status_missing_job_id(self, bridge_with_db):
-        """Missing job_id is handled (early return)."""
-        msg = make_msg({"status": "completed", "exit_code": 0})
-
-        await bridge_with_db._on_daemon_status(msg)
-
-    @pytest.mark.asyncio
-    async def test_status_malformed_json(self, bridge_with_db):
-        msg = make_msg_raw(b"bad json")
-
-        await bridge_with_db._on_daemon_status(msg)
-
-    @pytest.mark.asyncio
-    async def test_status_empty_payload(self, bridge_with_db):
-        msg = make_msg({})
-
-        await bridge_with_db._on_daemon_status(msg)
 
 
 # =============================================================================
@@ -1234,17 +1737,12 @@ class TestGracefulDegradation:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_control_returns_false(self, disconnected_bridge):
-        result = await disconnected_bridge.send_control("job-1", "freeze")
-        assert result is False
-
     @pytest.mark.asyncio
     async def test_all_actions_return_falsy(self, disconnected_bridge):
         """Comprehensive check: every public method returns a falsy value."""
         assert await disconnected_bridge.request_vm_create(job_id="j") is False
         assert await disconnected_bridge.request_vm_delete(job_id="j") is False
         assert await disconnected_bridge.query_vm_status("j") is None
-        assert await disconnected_bridge.send_control("j", "freeze") is False
 
 
 # =============================================================================
@@ -1301,8 +1799,11 @@ class TestEdgeCases:
         assert updates["ssh_nodeport"] == 31022
 
     @pytest.mark.asyncio
-    async def test_register_with_unicode_hostname(self, bridge_with_db, mock_db):
+    async def test_register_with_unicode_hostname(
+        self, bridge_with_db, mock_db, leader
+    ):
         """Hostnames with unusual characters should be handled."""
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
         msg = make_msg(
             {
                 "job_id": "job-edge-002",
@@ -1314,7 +1815,7 @@ class TestEdgeCases:
 
         await bridge_with_db._on_daemon_register(msg)
 
-        updates = mock_db.merge_vm_context.call_args.args[1]
+        updates = mock_db.merge_vm_context_if_provision_generation.call_args.args[2]
         assert updates["hostname"] == "vm-agent-\u00e4\u00f6\u00fc"
 
     @pytest.mark.asyncio
@@ -1333,7 +1834,7 @@ class TestEdgeCases:
 
     @pytest.mark.asyncio
     async def test_heartbeat_with_none_code_server_connections(
-        self, bridge_with_db, mock_db
+        self, bridge_with_db, mock_db, leader
     ):
         """Explicit null for code_server_connections should not update IDE session.
 
@@ -1350,7 +1851,7 @@ class TestEdgeCases:
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
         mock_db.merge_ide_session_context.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1373,9 +1874,14 @@ class TestEdgeCases:
         await bridge_with_db._on_vm_lifecycle_status(msg)
 
     @pytest.mark.asyncio
-    async def test_db_merge_vm_context_error_in_register(self, bridge_with_db, mock_db):
+    async def test_db_merge_vm_context_error_in_register(
+        self, bridge_with_db, mock_db, leader
+    ):
         """DB errors in daemon register handler should be caught."""
-        mock_db.merge_vm_context = AsyncMock(side_effect=RuntimeError("db gone"))
+        mock_db.merge_vm_context_if_provision_generation = AsyncMock(
+            side_effect=RuntimeError("db gone")
+        )
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
 
         msg = make_msg(
             {
@@ -1444,7 +1950,7 @@ class TestEdgeCases:
 
     @pytest.mark.asyncio
     async def test_heartbeat_negative_code_server_connections(
-        self, bridge_with_db, mock_db
+        self, bridge_with_db, mock_db, leader
     ):
         """Negative connection count (edge case) should still be processed.
 
@@ -1587,3 +2093,122 @@ class TestSubjectScoping:
         assert b._url is None
         assert b._orchestrator_id == ""
         assert b.is_available is False
+
+
+# =============================================================================
+# request_vm_list() — orphan-sweep inventory over NATS
+# =============================================================================
+
+
+class TestRequestVmList:
+    """Tests for NatsBridge.request_vm_list()."""
+
+    @staticmethod
+    def _reply(data: dict) -> MagicMock:
+        msg = MagicMock()
+        msg.data = json.dumps(data).encode()
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_returns_vm_list(self, bridge, mock_nc):
+        vms = [{"vm_name": "agent-vm-j1", "entity_id": "j1"}]
+        mock_nc.request = AsyncMock(return_value=self._reply({"vms": vms}))
+
+        assert await bridge.request_vm_list() == vms
+        call_args = mock_nc.request.call_args
+        assert call_args.args[0] == "vm.lifecycle.list.srw-test"
+        assert json.loads(call_args.args[1].decode()) == {"orchestrator_id": "srw-test"}
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_none(self, bridge, mock_nc):
+        # Includes the old-controller case: no subscriber on the list subject.
+        mock_nc.request = AsyncMock(side_effect=TimeoutError("no responders"))
+        assert await bridge.request_vm_list() is None
+
+    @pytest.mark.asyncio
+    async def test_unavailable_returns_none(self, disconnected_bridge):
+        assert await disconnected_bridge.request_vm_list() is None
+
+    @pytest.mark.asyncio
+    async def test_jetstream_ack_returns_none(self, bridge, mock_nc):
+        # A stream shadowing the request subject answers with its publish-ack.
+        mock_nc.request = AsyncMock(
+            return_value=self._reply({"stream": "vm-events", "seq": 42})
+        )
+        assert await bridge.request_vm_list() is None
+
+    @pytest.mark.asyncio
+    async def test_list_failed_reply_returns_none(self, bridge, mock_nc):
+        mock_nc.request = AsyncMock(
+            return_value=self._reply({"status": "list_failed", "error": "boom"})
+        )
+        assert await bridge.request_vm_list() is None
+
+
+class TestRootdiskDispositionIsRecorded:
+    """The controller's answer, not the orchestrator's intent.
+
+    A controller without VM_PERSISTENT_ROOTDISK cascade-deletes the disk
+    whatever purge_disk said, so context.vm.rootdisk must reflect what came
+    back — the kept-disk GC sweep keys off it.
+    knowledge-base/knowledge/features/vm_persistent_rootdisk.md D2/D4.
+    """
+
+    @pytest.mark.asyncio
+    async def test_kept_disk_is_persisted(self, bridge_with_db, mock_db):
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value={"id": "j1"})
+
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg({"job_id": "j1", "status": "deleted", "rootdisk": "kept"})
+        )
+
+        ctx = mock_db.merge_vm_context.await_args.args[1]
+        assert ctx["rootdisk"] == "kept"
+
+    @pytest.mark.asyncio
+    async def test_purged_disk_overwrites_an_optimistic_keep(
+        self, bridge_with_db, mock_db
+    ):
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value={"id": "j1"})
+
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg({"job_id": "j1", "status": "deleted", "rootdisk": "purged"})
+        )
+
+        ctx = mock_db.merge_vm_context.await_args.args[1]
+        assert ctx["rootdisk"] == "purged"
+
+    @pytest.mark.asyncio
+    async def test_old_controller_silence_is_reported(
+        self, bridge_with_db, mock_db, caplog
+    ):
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value={"id": "j1"})
+
+        with caplog.at_level("WARNING"):
+            await bridge_with_db._on_vm_lifecycle_status(
+                make_msg({"job_id": "j1", "status": "deleted"})
+            )
+
+        assert "no rootdisk disposition" in caplog.text
+        ctx = mock_db.merge_vm_context.await_args.args[1]
+        assert "rootdisk" not in ctx
+
+    @pytest.mark.asyncio
+    async def test_non_delete_status_is_untouched(
+        self, bridge_with_db, mock_db, caplog
+    ):
+        """created/failed statuses say nothing about disks — no key, no noise."""
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value={"id": "j1"})
+
+        with caplog.at_level("WARNING"):
+            await bridge_with_db._on_vm_lifecycle_status(
+                make_msg({"job_id": "j1", "status": "created"})
+            )
+
+        assert "rootdisk" not in caplog.text
+        ctx = mock_db.merge_vm_context.await_args.args[1]
+        assert "rootdisk" not in ctx

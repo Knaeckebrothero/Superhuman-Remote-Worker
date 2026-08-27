@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Developer - test-driven implementation. Spec first, tests first, code last.
-$extends: defaults
+$extends: worker_base
 
 agent_id: developer
 display_name: Developer
@@ -20,6 +20,19 @@ tags:
 llm:
   reasoning_level: high
 
+# Subagent delegation — light in-process subagents for parallel EXPLORATION,
+# research, and prototyping/experiments. They inherit the full toolset (including
+# writes) so they can run tests/spikes; the guardrail that the *production*
+# implementation stays single-threaded and yours is by PROMPT, not tool-stripping
+# (allow_writes stays true — we monitor rather than lock down). Reader MODEL comes
+# from the llm.subagent tier (falls back to llm.tactical; per-job override via
+# config_override.llm.subagent).
+delegation:
+  enabled: true
+  mode: light
+  light:
+    allow_writes: true
+
 workspace:
   structure:
     - archive/
@@ -38,19 +51,31 @@ tools:
     - get_document_info
   shell:
     - run_command
+    - cancel_command
     - shell_read
   core:
     - next_phase_todos
     - todo_complete
-    - todo_rewind
+    - request_replan
     - mark_complete
     - job_complete
-  git:
-    - git_log
-    - git_diff
-    - git_status
-    - git_tags
+  # git: intentionally absent. This agent has shell tools, and
+  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # whenever shell is present — a shell can run git against ANY repository in
+  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+  # here would advertise tools the pod never binds.
+  # Websearch — a coder must be able to look things up (docs, APIs, error
+  # messages). browser_direct (step-by-step Chromium) is inherited from worker_base.
+  research:
+    - web_search
+    - extract_webpage
+    - crawl_website
+    - map_website
+    - research_topic
+  # Light subagent delegation via spawn_subagent (replaces the inherited heavy
+  # delegate_work / resume_delegation_child grant from the former broad base).
+  delegation:
+    - spawn_subagent
   # Disable unused tool categories
-  research: []
   citation: []
   graph: []

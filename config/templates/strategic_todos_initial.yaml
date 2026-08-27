@@ -39,7 +39,7 @@ todos:
 
       COMPLETION CRITERIA: Critical rules recorded in notes/task_rules.md under the four
       categories above. instructions.md and task_brief.md have been read in full.
-      {% endif -%}
+      {%- endif %}
 
       INSTEAD OF: Starting to write output files now — this phase is read-only exploration.
       Instead of skimming instructions.md — read every line, since every task failure
@@ -59,12 +59,18 @@ todos:
       - Phase type: research, elaboration, execution, batch, integration, or verification
       - Expected output: which deliverable(s) this phase advances
 
-      PHASE SIZING: Target 3-7 todos per tactical phase. Prefer many short phases
-      over few long ones. Each phase should be one coherent unit of work (e.g.,
-      "research the topic," "write section 3," "verify chapter 2 citations").
+      PHASE SIZING: Default to ONE execution phase covering the whole task, and
+      prefer few long phases over many short ones. Every extra phase costs a full
+      planning cycle, so a second phase must earn it: plan one only when its todos
+      genuinely cannot be written until the first phase's results are in. Choose
+      todo granularity to fit the work into a single phase (up to 30 todos), and if
+      execution reveals the plan is wrong, the tactical phase invokes
+      `request_replan` rather than you pre-splitting phases in anticipation.
 
-      PHASE ORDERING: Plan research phases first to gather context, then elaboration
-      phases to detail the approach, then execution phases to produce deliverables.
+      PHASE ORDERING: Scaffold the deliverable file in phase 1 — create it at its
+      output/ path with the required structure — and update it at every phase
+      boundary. Research fills the scaffold in; it does not precede it. An
+      interrupted job must still leave a partial deliverable, never just notes.
       Use web_search before writing about any topic — your training data may be outdated.
 
       Focus on the first 2-3 phases in detail. Later phases can be sketches — they
@@ -122,17 +128,16 @@ todos:
       COMPLETION CRITERIA: prior context reviewed; goal and discovered facts recorded in notes/.
 
       INSTEAD OF: Skipping this step — prior context can save significant work.
-      {% endif -%}
+      {%- endif %}
 
   - id: 4
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE invoking next_phase_todos.
-      The tool will reject your call if you haven't read the guide. The guide contains
-      critical rules on todo specificity, phase design patterns, and worked examples.
+      Create the todos for the execution phase — enough to cover the task. (The todo-guide skill at
+      skills/todo-guide/SKILL.md covers todo specificity, phase design patterns,
+      and worked examples.)
 
-      After reading the guide, create 3-7 todos for the first tactical phase.
       Each todo must be:
       - A concrete action completable in 1-3 tool calls
       - Specific: names exact files, sections, page ranges, or tool calls
@@ -141,19 +146,20 @@ todos:
 
       SIMPLE TASK SHORTCUT: If the entire task can be completed in one phase
       (e.g., a straightforward transformation, simple analysis, or single-document
-      output), skip the research phase and create execution todos directly. Not every
-      task needs multiple phases — match the structure to the complexity.
+      output), create execution todos directly. Not every task needs multiple
+      phases — match the structure to the complexity.
 
-      For complex or unfamiliar tasks, the first tactical phase should be a RESEARCH
-      phase — gather context and sources before producing deliverables.
+      For complex or unfamiliar tasks, phase 1 should scaffold the deliverable
+      file(s) first, then gather the context and sources that fill them in —
+      research feeds the scaffold, it doesn't precede it.
 
       Include a final verification todo (e.g., "Verify Phase 1 outputs: confirm
       [specific files] exist and contain [specific content]").
 
-      COMPLETION CRITERIA: next_phase_todos called successfully with 3-7 todos.
+      COMPLETION CRITERIA: next_phase_todos called successfully with todos covering the phase.
 
-      INSTEAD OF: Skipping reading todo_guide.md — the tool enforces this. Instead
-      of vague todos like "research the topic" — be specific about what to search for
-      and where to save results. Instead of meta-todos about workspace management,
-      archiving, status updates, or file reorganization — every todo must advance
-      the actual task. The system handles workspace management automatically.
+      INSTEAD OF: Vague todos like "research the topic" — be specific about what
+      to search for and where to save results. Instead of meta-todos about
+      workspace management, archiving, status updates, or file reorganization —
+      every todo must advance the actual task. The system handles workspace
+      management automatically.

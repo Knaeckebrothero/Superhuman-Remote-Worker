@@ -1,3 +1,16 @@
+/* The host is a flex item in the shell's .content-area, which clips. Without a
+   definite height here, .automations-page's `height: 100%` has nothing to
+   resolve against, so the page grows to its content and its own `overflow-y`
+   never engages — the create form's Cancel/Create buttons ended up below the
+   viewport with no scrollbar anywhere. min-height:0 is the other half: a flex
+   item's automatic minimum size is its min-content height, which would push the
+   host back past the clip even with height:100% set. */
+:host {
+  display: block;
+  height: 100%;
+  min-height: 0;
+}
+
 .automations-page {
   padding: var(--space-6, 1.5rem);
   height: 100%;
@@ -8,7 +21,7 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-4, 1rem);
-  max-width: 1100px;
+  max-width: var(--content-max-width);
   margin: 0 auto;
 }
 
@@ -288,6 +301,14 @@
 }
 
 @media (max-width: 720px) {
+  // The header is a single non-wrapping flex row (toggle + title + spacer +
+  // New-automation button); at phone widths the long title + verbose button
+  // overflow and the button clips off the right edge. Allow it to wrap so the
+  // button drops to its own line instead. Desktop is untouched (>720px fits on
+  // one line, so wrap never triggers).
+  .page-header {
+    flex-wrap: wrap;
+  }
   .editor-grid {
     grid-template-columns: 1fr;
   }

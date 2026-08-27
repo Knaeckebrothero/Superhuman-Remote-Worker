@@ -45,9 +45,13 @@ Phase Alternation:
 
 import json
 import logging
+import math
 import re
+import asyncio
 import time
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Literal, Optional
+from uuid import UUID, uuid4
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -67,14 +71,48 @@ from .core.context import (
     ContextManager,
     ContextConfig,
     ToolRetryManager,
+    repair_tool_call_arguments,
     sanitize_message_history,
+    scrub_history_tool_call_arguments,
+)
+
+# LLM provider-error triage lives in src/core/llm_retry.py (pure, stdlib-only)
+# so that call sites which cannot import this module — notably the light
+# subagent reader, which is deliberately infra-free — share one verdict per
+# provider failure. Re-exported here because this was the historical home and
+# the whole codebase (plus its tests) still imports these names from `graph`.
+from .core.llm_retry import (  # noqa: F401
+    _extract_rate_limit_delay,
+    _is_codex_auth_unavailable,
+    _request_url_str,
+    _is_codex_proxy_url,
+    _is_codex_proxy_error,
+    _COOLDOWN_MIN_RESET_SECONDS,
+    _COOLDOWN_MAX_PAUSE_SECONDS,
+    _cooldown_within_pause_budget,
+    _cooldown_reset_seconds,
+    _cooldown_detail,
+    _cooldown_failfast_error,
+    _is_insufficient_quota,
+    _STREAM_DISCONNECT_MARKERS,
+    _is_stream_disconnect,
+    _has_api_error_body,
+    _infra_edge_status,
+    _summarize_llm_error,
+    _TEXT_INPUT_REJECTION_STATUS,
+    _classify_llm_error,
+    initial_error_freeze_fields,
 )
 from .core.loader import (
     AgentConfig,
+    resolve_model_settings,
     load_summarization_prompt,
     load_auxiliary_prompt,
     get_phase_system_prompt,
+    _resolve_max_output_tokens,
+    _is_output_truncated,
 )
+from .core.model_registry import family_of
 from .core.phase import (
     handle_phase_transition,
     get_initial_strategic_todos,
@@ -83,16 +121,172 @@ from .core.phase import (
 )
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.response_validator import validate_response
-from .core.state import UniversalAgentState
+from .core.state import CompletionReportPayload, UniversalAgentState
+from .core.toolcall_recovery import (
+    has_leaked_tool_call_markup,
+    parse_leaked_tool_calls,
+    strip_tool_call_markup,
+)
 from .core.workspace import WorkspaceManager
+from .core.workspace_backend import WorkspaceUnavailableError
 from .llm.exceptions import ContextOverflowError
+from .shared.job_steering import queued_reply_key
+from .shared.tool_arg_coercion import coerce_tool_args
 from .llm.response_guards import is_degenerate_response
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .services.guardrails import format_nudge
-from .services.image_content import extract_image_tags, make_multimodal_user_message
+from .services.image_content import (
+    extract_image_tags,
+    make_multimodal_user_message,
+    resolve_image_max_edge,
+)
+from .shared.job_freeze_types import FREEZE_TYPE_BATCH_BOUNDARY
 from .tools.context import ToolContext
+from .utils.db_url import checkpointer_backend
+
+
+# Worker rotation is wall-clock-first. Five minutes is the compatibility and
+# production default; the claim driver may stamp a lower effective floor for
+# an explicit per-job test/tuning override.
+WORKER_BATCH_MIN_WALL_SECONDS = 300.0
+
+_WORKER_BATCH_ARMING_FIELDS = (
+    "worker_batch_started_at",
+    "worker_batch_start_iteration",
+    "worker_batch_target_wall_seconds",
+    "worker_batch_min_wall_seconds",
+    "worker_batch_iteration_cap",
+)
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    """Return a finite float for numeric checkpoint values, else None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _worker_batch_disarm_updates() -> Dict[str, None]:
+    """Clear claim-local budget state before any Continue-as-New handoff."""
+    return {field: None for field in _WORKER_BATCH_ARMING_FIELDS}
+
+
+def worker_batch_boundary_updates(
+    state: UniversalAgentState,
+    *,
+    now: Optional[float] = None,
+    boundary: Literal["mid_phase", "phase_boundary"] = "mid_phase",
+) -> Optional[Dict[str, Any]]:
+    """Build a clean ``batch_boundary`` stop when an armed budget is due.
+
+    Missing or invalid arming fields disable the boundary, which is the
+    compatibility contract for pinned jobs, sessions, and old checkpoints.
+    The wall target is clamped to the claim-stamped floor (five minutes for
+    legacy arming envelopes). The optional iteration cap is secondary and
+    cannot fire before the same wall-clock floor.
+    """
+    if (
+        state.get("should_stop")
+        or state.get("goal_achieved")
+        or state.get("freeze_data") is not None
+        or (state.get("error") and boundary == "mid_phase")
+    ):
+        return None
+
+    started_at = _finite_number(state.get("worker_batch_started_at"))
+    target = _finite_number(state.get("worker_batch_target_wall_seconds"))
+    if started_at is None or target is None or target <= 0:
+        return None
+
+    current_time = _finite_number(time.time() if now is None else now)
+    if current_time is None:
+        return None
+    elapsed = max(0.0, current_time - started_at)
+    configured_min = _finite_number(state.get("worker_batch_min_wall_seconds"))
+    min_wall_seconds = (
+        WORKER_BATCH_MIN_WALL_SECONDS
+        if configured_min is None
+        else max(0.0, configured_min)
+    )
+    target = max(target, min_wall_seconds)
+    wall_due = elapsed >= target
+
+    iteration = _finite_number(state.get("iteration"))
+    start_iteration = _finite_number(state.get("worker_batch_start_iteration"))
+    iteration_cap = _finite_number(state.get("worker_batch_iteration_cap"))
+    iteration_delta: Optional[float] = None
+    iteration_due = False
+    if (
+        iteration is not None
+        and start_iteration is not None
+        and iteration_cap is not None
+        and iteration_cap > 0
+    ):
+        iteration_delta = max(0.0, iteration - start_iteration)
+        iteration_due = elapsed >= min_wall_seconds and iteration_delta >= iteration_cap
+
+    if not (wall_due or iteration_due):
+        return None
+
+    phase = "strategic" if state.get("is_strategic_phase", True) else "tactical"
+    trigger = "wall_clock" if wall_due else "iteration_cap"
+    freeze_data: Dict[str, Any] = {
+        "freeze_type": FREEZE_TYPE_BATCH_BOUNDARY,
+        "boundary": boundary,
+        "phase": phase,
+        "phase_number": state.get("phase_number", 0),
+        "reason": f"stateless worker batch {trigger} budget reached",
+        "trigger": trigger,
+        "elapsed_seconds": round(elapsed, 3),
+        "target_wall_seconds": target,
+    }
+    if iteration_delta is not None and iteration_cap is not None:
+        freeze_data["iteration_delta"] = int(iteration_delta)
+        freeze_data["iteration_cap"] = int(iteration_cap)
+
+    # Clear the entire arming envelope in the same checkpoint as the freeze. A
+    # successor must deliberately stamp a fresh claim budget; stale state can
+    # never immediately re-freeze a resumed job.
+    updates: Dict[str, Any] = {
+        "freeze_data": freeze_data,
+        "should_stop": True,
+        "error": None,
+    }
+    updates.update(_worker_batch_disarm_updates())
+    return updates
+
+
+def _log_worker_batch_boundary(job_id: str, updates: Dict[str, Any]) -> None:
+    """Emit the tuning line consumed by worker batch probes."""
+    freeze = updates["freeze_data"]
+    logger.info(
+        "[%s] worker_batch_boundary: boundary=%s trigger=%s elapsed=%.3fs "
+        "target=%.3fs iteration_delta=%s iteration_cap=%s",
+        job_id,
+        freeze["boundary"],
+        freeze["trigger"],
+        freeze["elapsed_seconds"],
+        freeze["target_wall_seconds"],
+        freeze.get("iteration_delta", "-"),
+        freeze.get("iteration_cap", "-"),
+    )
+
 
 logger = logging.getLogger(__name__)
+
+_COMPLETION_REPORT_PAYLOAD_FIELDS = frozenset(
+    {"should_stop", "goal_achieved", "error", "freeze_data"}
+)
+
+# Model families whose tool-call grammar the fallback recovery parser
+# understands. When such a model's serving layer leaks a tool call into message
+# content as text, the execute node rebuilds it into a structured call. Detection
+# (the no-tool-call circuit breaker) is NOT gated by family — only recovery is.
+RECOVERABLE_TOOLCALL_FAMILIES = {"gemma"}
 
 
 # =============================================================================
@@ -100,194 +294,32 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-def _extract_rate_limit_delay(error: Exception) -> Optional[float]:
-    """Extract retry-after delay from rate limit errors.
+# Mirrors langgraph.prebuilt.tool_node.TOOL_CALL_ERROR_TEMPLATE — the string
+# handle_tool_errors=True produced. Inlined to avoid coupling to a private const.
+_TOOL_CALL_ERROR_TEMPLATE = "Error: {error}\n Please fix your mistakes."
 
-    Checks the exception and its chain for rate limit indicators (HTTP 429)
-    and extracts the retry-after value from headers or error messages.
 
-    Args:
-        error: The exception to inspect
+def _handle_tool_errors_reraise_workspace(e: Exception) -> str:
+    """ToolNode error handler.
 
-    Returns:
-        Delay in seconds if rate limit detected, None otherwise
+    Re-raise WorkspaceUnavailableError so a dead-workspace tool call propagates
+    out of the graph → src/agent.py's isinstance check → a recoverable
+    ``workspace_unavailable`` freeze. Every other exception is stringified exactly
+    as handle_tool_errors=True did, so the model can fix its own mistakes.
+    Annotating ``e: Exception`` makes ToolNode._infer_handled_types route ALL
+    exceptions here (giving us the chance to re-raise ours).
+    See knowledge-base/knowledge/issues/agent_fast_freeze_on_dead_workspace.md.
     """
-    error_str = str(error)
-
-    # Check if this is a rate limit error
-    is_rate_limit = (
-        "429" in error_str
-        or "rate limit" in error_str.lower()
-        or "too many requests" in error_str.lower()
-    )
-    if not is_rate_limit:
-        return None
-
-    # Try to extract retry-after from the exception chain
-    # Anthropic/OpenAI SDK exceptions may have response headers
-    current = error
-    while current is not None:
-        # Check for response attribute with headers (httpx/SDK exceptions)
-        response = getattr(current, "response", None)
-        if response is not None:
-            headers = getattr(response, "headers", {})
-            retry_after = headers.get("retry-after")
-            if retry_after:
-                try:
-                    return float(retry_after) + 5.0  # Add buffer
-                except (ValueError, TypeError):
-                    pass
-
-        current = current.__cause__ if current.__cause__ != current else None
-
-    # Fallback: try to extract retry-after from error message text
-    match = re.search(
-        r"retry.?after['\"]?\s*[:=]\s*['\"]?(\d+)", error_str, re.IGNORECASE
-    )
-    if match:
-        return float(match.group(1)) + 5.0
-
-    # Rate limit detected but no retry-after found — use conservative default
-    return 90.0
+    if isinstance(e, WorkspaceUnavailableError):
+        raise e
+    return _TOOL_CALL_ERROR_TEMPLATE.format(error=repr(e))
 
 
-def _is_codex_auth_unavailable(exc: BaseException) -> bool:
-    """True if a 401 is a Codex/OAuth-proxy *token-unavailable* error rather
-    than a genuinely-bad API key.
-
-    The Codex proxy (CLIProxyAPI) surfaces an invalidated/expired OAuth token
-    — or one stuck mid-refresh — as ``code: auth_unavailable`` /
-    "invalidated oauth token for user". Unlike a bad API key, that clears after
-    a proxy re-auth or the next token refresh, so the caller retries (bounded)
-    instead of failing the job permanently. Inspects a single exception; the
-    caller walks the ``__cause__`` chain.
-    """
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        err_obj = body.get("error") or {}
-        if isinstance(err_obj, dict):
-            code = (err_obj.get("code") or "").lower()
-            msg = (err_obj.get("message") or "").lower()
-            if code == "auth_unavailable" or "invalidated oauth token" in msg:
-                return True
-    text = str(exc).lower()
-    return "auth_unavailable" in text or "invalidated oauth token" in text
-
-
-def _classify_llm_error(error: Exception) -> str:
-    """Classify an LLM exception as ``permanent``, ``rate_limit``, or ``transient``.
-
-    Drives the retry decision in ``create_execute_node`` so non-retriable
-    failures (404 model-not-found, 401/403 auth, 400 invalid_request) fail
-    the job fast instead of looping forever — see
-    docs/issues/agent_infinite_retry_on_permanent_llm_errors.md for the
-    incident this prevents.
-
-    Walks the exception's ``__cause__`` chain because LangChain wraps the
-    underlying provider exception. Inspection order:
-
-    1. ``status_code`` attribute (``openai.APIStatusError`` and the
-       ``anthropic`` SDK use the same convention) — most reliable signal.
-    2. Class name match against the well-known SDK error types — avoids
-       a hard dependency on every provider SDK at import time.
-    3. Error-message text fallback for stringified provider errors that
-       made it through without preserving the original class (already
-       observed in production audit logs).
-
-    Returns one of:
-
-    * ``permanent``  — short-circuit retries, mark the job failed.
-    * ``rate_limit`` — transient, but the caller should respect Retry-After
-      via :func:`_extract_rate_limit_delay`.
-    * ``transient``  — retry with the existing backoff schedule.
-    """
-    _PERMANENT_STATUS = {400, 401, 403, 404}
-
-    current: Optional[BaseException] = error
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-
-        status_code = getattr(current, "status_code", None)
-        if isinstance(status_code, int):
-            if status_code == 429:
-                return "rate_limit"
-            if status_code in _PERMANENT_STATUS:
-                # 400 needs to be disambiguated — Groq's tool_use_failed and
-                # some rate-limit-disguised-as-400 errors are NOT permanent.
-                if status_code == 400:
-                    body = getattr(current, "body", None)
-                    if isinstance(body, dict):
-                        err_obj = body.get("error") or {}
-                        if isinstance(err_obj, dict):
-                            code = (err_obj.get("code") or "").lower()
-                            etype = (err_obj.get("type") or "").lower()
-                            if "rate" in code or "rate" in etype:
-                                return "rate_limit"
-                            if code == "tool_use_failed":
-                                return "transient"
-                            if etype == "invalid_request_error":
-                                return "permanent"
-                    # 400 without a parseable body — be conservative, retry.
-                    return "transient"
-                if status_code == 401 and _is_codex_auth_unavailable(current):
-                    # Codex/OAuth-proxy token invalidated or mid-refresh —
-                    # recoverable by a proxy re-auth + resume, so retry rather
-                    # than fail the job. A genuinely-bad API key carries no
-                    # ``auth_unavailable`` marker and stays "permanent" below.
-                    return "auth_unavailable"
-                return "permanent"
-            if 500 <= status_code < 600:
-                return "transient"
-
-        cls_name = type(current).__name__
-        if cls_name in (
-            "NotFoundError",
-            "AuthenticationError",
-            "PermissionDeniedError",
-        ):
-            return "permanent"
-        if cls_name == "RateLimitError":
-            return "rate_limit"
-        if cls_name == "BadRequestError":
-            # Same disambiguation as the 400 status branch above.
-            body = getattr(current, "body", None)
-            if isinstance(body, dict):
-                err_obj = body.get("error") or {}
-                if isinstance(err_obj, dict):
-                    code = (err_obj.get("code") or "").lower()
-                    etype = (err_obj.get("type") or "").lower()
-                    if "rate" in code or "rate" in etype:
-                        return "rate_limit"
-                    if code == "tool_use_failed":
-                        return "transient"
-                    if etype == "invalid_request_error":
-                        return "permanent"
-
-        nxt = getattr(current, "__cause__", None)
-        current = nxt if nxt is not current else None
-
-    error_str = str(error).lower()
-    if "auth_unavailable" in error_str or "invalidated oauth token" in error_str:
-        return "auth_unavailable"
-    if "model" in error_str and (
-        "not found" in error_str or "does not exist" in error_str
-    ):
-        return "permanent"
-    if "404" in error_str and "model" in error_str:
-        return "permanent"
-    if "authenticationerror" in error_str or "invalid_api_key" in error_str:
-        return "permanent"
-    if "permissiondenied" in error_str:
-        return "permanent"
-    if (
-        "429" in error_str
-        or "rate limit" in error_str
-        or "too many requests" in error_str
-    ):
-        return "rate_limit"
-
-    return "transient"
+# C2 circuit breaker: after this many CONSECUTIVE execute-node invocations that
+# exhaust their inner LLM retries with no progress, stop instead of letting the
+# outer graph loop re-enter execute forever (the deferred "Fix 3" from
+# knowledge-history/done/agent_infinite_retry_on_permanent_llm_errors.md).
+_LLM_ERROR_STREAK_CAP = 5
 
 
 def _extract_tool_use_failed(error: Exception) -> Optional[str]:
@@ -459,21 +491,29 @@ def _check_no_tool_call_streak(
     current_streak: int,
     last_hash: str,
     threshold: int = 3,
+    *,
+    is_leaked_markup: bool = False,
 ) -> tuple[int, bool, str]:
-    """Track consecutive identical no-tool-call responses (parser-failure signal).
+    """Track consecutive no-tool-call responses (parser-failure signal).
 
-    Catches the case where a response has non-empty content but zero tool calls
-    AND the content repeats verbatim across iterations — the upstream tool-call
-    parser is failing to lift the model's output into structured tool_calls and
-    the agent would otherwise loop forever calling the LLM with unchanged
-    context (e.g. job 3c30d72e: Gemma 4 emitted Python-style ``call:fn(args)``
-    instead of canonical ``call:fn{args}``; vLLM's gemma4 parser refused the
-    format and ``tool_calls`` stayed None for 1385 iterations).
+    Catches the case where a response has non-empty content but zero tool calls —
+    the upstream tool-call parser is failing to lift the model's output into
+    structured tool_calls and the agent would otherwise loop forever calling the
+    LLM with unchanged context (e.g. job 3c30d72e: Gemma 4 emitted Python-style
+    ``call:fn(args)`` instead of canonical ``call:fn{args}``; vLLM's gemma4 parser
+    refused the format and ``tool_calls`` stayed None for 1385 iterations).
+
+    The streak advances when either:
+
+    * the content repeats verbatim across iterations (hash match), or
+    * ``is_leaked_markup`` is set — the content is a bare leaked tool-call block
+      the fallback parser could not recover. This catches the variant where the
+      leaked payload *differs* every turn (job 2dacba6f: git_log, git_tags,
+      todo_complete…), which a pure hash-match would never accumulate.
 
     Distinct from _check_empty_response_streak (which requires content==0).
-    The hash-match condition prevents false positives on legitimate
-    natural-language reflections that happen to produce no tool calls — those
-    vary across iterations and won't accumulate.
+    Legitimate natural-language reflections (no markup, varying text) neither
+    match a prior hash nor look like leaked markup, so they won't accumulate.
 
     Args:
         content_str: The response's text content (post-normalization).
@@ -481,13 +521,16 @@ def _check_no_tool_call_streak(
         current_streak: Current streak count.
         last_hash: Truncated SHA-256 of the previous iteration's content. Empty
             string on first call or after a reset.
-        threshold: Number of consecutive identical no-tool responses tolerated.
+        threshold: Number of consecutive no-tool responses tolerated.
+        is_leaked_markup: True when the content is dominated by unrecovered
+            leaked tool-call markup (see has_leaked_tool_call_markup).
 
     Returns:
         Tuple of (new_streak, should_fail, new_hash). Streak resets to 0 (and
         new_hash to "") when a tool call is present or content is empty. On a
-        no-tool-call response with new content, streak resets to 1 with the
-        new hash. On a hash match, streak increments.
+        no-tool-call response that neither matches the prior hash nor looks like
+        leaked markup, the streak resets to 1 with the new hash. Otherwise it
+        increments.
     """
     import hashlib
 
@@ -497,7 +540,7 @@ def _check_no_tool_call_streak(
     new_hash = hashlib.sha256(
         content_str.encode("utf-8", errors="replace")
     ).hexdigest()[:16]
-    if new_hash == last_hash:
+    if is_leaked_markup or new_hash == last_hash:
         new_streak = current_streak + 1
         return new_streak, new_streak > threshold, new_hash
     return 1, False, new_hash
@@ -572,12 +615,41 @@ def create_init_strategic_todos_node(
         except FileNotFoundError:
             task_brief = ""
 
-        # Read instructions for context (backward compat — removed in Phase 0)
+        # Read instructions for context (optional: the inline/expert channel)
         try:
             instructions = workspace.read_file("instructions.md")
         except FileNotFoundError:
             instructions = ""
-            logger.warning(f"[{job_id}] instructions.md not found")
+
+        # Refuse to start an agent that was never told its task.
+        #
+        # Both files are served by in-process virtual providers
+        # (knowledge-base/knowledge/features/virtual_directories.md) and are never on disk, so
+        # every way the overlay can fail — a provider raising, a missed
+        # registration, a backend swap that loses the rebind — surfaces right
+        # here as two empty reads. The composed HumanMessage below then
+        # degrades to its boilerplate tail ("You are starting in strategic
+        # mode…") with no task in it, and the agent runs a full job against
+        # instructions it never received, producing confident work on the wrong
+        # thing. That failure used to be one WARNING line.
+        #
+        # This check is what replaced VIRTUAL_DIRS_ENABLED. The kill switch
+        # guarded exactly one route to this state (overlay off => nothing
+        # materialized) by writing the two files to disk — which, on a subjob
+        # sharing its parent's workspace, dropped the critic's brief into the
+        # root the target reads from and convinced the target it was the
+        # reviewer (knowledge-history/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md).
+        # A lever whose "off" position reintroduces a high-severity defect is
+        # not a rollback. Failing closed here covers every cause instead of one,
+        # and cannot corrupt a shared workspace to do it.
+        if not task_brief.strip() and not instructions.strip():
+            raise RuntimeError(
+                f"[{job_id}] Refusing to start: no task description available. "
+                "Both task_brief.md and instructions.md resolved empty — the "
+                "virtual instruction providers did not serve content. Starting "
+                "anyway would run the job against an empty brief. See "
+                "knowledge-base/knowledge/features/virtual_directories.md."
+            )
 
         # Load predefined strategic todos from config template
         strategic_todos = get_initial_strategic_todos(config, tool_names=tool_names)
@@ -657,6 +729,7 @@ def create_execute_node(
     memory_assembler_prompt: str = "",
     tool_context: Optional[ToolContext] = None,
     tool_names: Optional[List[str]] = None,
+    memory_service: Optional[Any] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node with phase-specific LLM selection.
 
@@ -677,6 +750,10 @@ def create_execute_node(
         memory_extraction_prompt: Prompt for memory extraction task
         memory_assembler_prompt: Prompt for memory assembler task
         tool_names: List of loaded tool names for system prompt conditionals
+        memory_service: MemoryManager seam (src.services.memory) — when
+            bound, replaces the direct-store memory read/write paths in
+            this node (memory overhaul Phase 1 cutover); None keeps the
+            legacy paths.
     """
 
     # Extract tool schemas from bound LLMs once at creation time for archiving
@@ -714,6 +791,11 @@ def create_execute_node(
 
     # Track consecutive tool_use_failed errors (mutable container for closure access)
     _tool_use_failed_streak = [0]
+    # C2 circuit breaker: consecutive execute invocations that exhausted their
+    # inner LLM retries with NO progress. Reset on any successful LLM response;
+    # trips a hard fail at _LLM_ERROR_STREAK_CAP so the outer graph loop can't
+    # spin forever on a never-recovering retriable error.
+    _llm_error_streak = [0]
     # Track consecutive response degeneration events
     _degeneration_streak = [0]
     # Track consecutive empty LLM responses (no content, no tool calls).
@@ -724,7 +806,7 @@ def create_execute_node(
     # signal). Catches malformed tool-call wire formats that the upstream
     # parser leaves as content text — the empty-response guard above misses
     # these because content is non-empty.
-    # See docs/issues/gemma_tool_call_parser_loop.md.
+    # See knowledge-base/knowledge/issues/gemma_tool_call_parser_loop.md.
     _no_tool_call_streak = [0]
     _no_tool_call_last_hash = [""]
 
@@ -734,6 +816,9 @@ def create_execute_node(
         iteration = state.get("iteration", 0)
         messages = state.get("messages", [])
         is_strategic = state.get("is_strategic_phase", True)
+        phase_number = state.get("phase_number", 0)
+        phase_name = "strategic" if is_strategic else "tactical"
+        turn_count = state.get("turn_count", 0)
 
         # Select LLM based on current phase
         llm_with_tools = (
@@ -742,7 +827,15 @@ def create_execute_node(
 
         # Update tool context for phase-aware behavior (e.g., multimodal override)
         if tool_context is not None:
-            tool_context.set_current_phase("strategic" if is_strategic else "tactical")
+            tool_context.set_current_phase(
+                phase_name,
+                phase_number=phase_number,
+                turn_count=turn_count,
+            )
+
+        from src.core.knowledge_injection import selected_knowledge_bindings
+
+        _kb_bindings = selected_knowledge_bindings(tool_context)
 
         logger.debug(f"[{job_id}] Execute iteration {iteration}")
 
@@ -759,8 +852,6 @@ def create_execute_node(
         prepared_messages = []
 
         # Get phase-aware system prompt (todos, memory, and knowledge are injected as transient messages below)
-        phase_number = state.get("phase_number", 0)
-        phase_name = "strategic" if is_strategic else "tactical"
         phase_llm_config = config.llm.get_phase_config(phase_name)
         full_system = get_phase_system_prompt(
             config=config,
@@ -790,7 +881,11 @@ def create_execute_node(
             injection_overhead_tokens += config.memory.budget_tokens
 
         # Add knowledge injection budget overhead (~2500 tokens for 5 notes)
-        if tool_context and tool_context.has_knowledge() and tool_context.project_id:
+        if (
+            tool_context
+            and tool_context.has_knowledge()
+            and (tool_context.project_id or _kb_bindings)
+        ):
             injection_overhead_tokens += 2500
 
         # Temporarily lower compaction thresholds to account for injection overhead
@@ -807,6 +902,28 @@ def create_execute_node(
             original_summarization_threshold // 2,
             original_summarization_threshold - injection_overhead_tokens,
         )
+
+        # Memory extraction before compaction: if this call is about to trigger a
+        # summary, snapshot the slice ensure_within_limits will evict and mine it
+        # for durable memories BEFORE the lossy summary replaces it
+        # (knowledge-history/done/memory_extraction_before_compaction.md). Fire-and-forget
+        # over the snapshot so compaction latency is unchanged; the gate is
+        # evaluated under the same lowered thresholds ensure_within_limits uses.
+        if memory_service is not None and context_mgr.should_summarize(messages):
+            from src.services.memory import CaptureEvent
+
+            keep_recent = context_mgr.config.keep_recent_messages
+            evicted = (
+                list(messages[:-keep_recent]) if keep_recent > 0 else list(messages)
+            )
+            if evicted:
+                memory_service.capture_nowait(
+                    CaptureEvent(
+                        kind="pre_compaction",
+                        messages=evicted,
+                        phase=phase_number,
+                    )
+                )
 
         # Ensure context is within limits before LLM call
         original_message_count = len(messages)
@@ -839,8 +956,26 @@ def create_execute_node(
                 f"(removing {len(remove_markers)} old messages)"
             )
 
-        # Memory Light: store compaction summary as free-source memory
-        if recall_store and context_was_compacted:
+        # Memory Light: store compaction summary as free-source memory.
+        # Manager path (memory overhaul Phase 1): one capture() event —
+        # the compaction_memory writer reproduces the store call below.
+        if memory_service is not None and context_was_compacted:
+            summaries_count_after = (
+                len(context_mgr._state.summaries)
+                if hasattr(context_mgr, "_state")
+                else 0
+            )
+            if summaries_count_after > summaries_count_before:
+                from src.services.memory import CaptureEvent
+
+                await memory_service.capture(
+                    CaptureEvent(
+                        kind="compaction",
+                        phase=state.get("phase_number", 0),
+                        extra={"summary": context_mgr._state.summaries[-1]},
+                    )
+                )
+        elif recall_store and context_was_compacted:
             summaries_count_after = (
                 len(context_mgr._state.summaries)
                 if hasattr(context_mgr, "_state")
@@ -865,12 +1000,17 @@ def create_execute_node(
         # Sanitize message history to remove orphaned ToolMessages
         # (can occur from improper context compaction or checkpoint corruption)
         messages = sanitize_message_history(messages)
+        # Backstop: scrub malformed tool-call arguments already sitting in the
+        # checkpoint (poison predating the ingestion repair) so a resumed job
+        # sends clean history instead of dying on a deterministic 400.
+        messages = scrub_history_tool_call_arguments(messages)
 
-        # Add full conversation history in specific order:
+        # Add full conversation history in specific order (stable prefix first,
+        # per-turn transients last — prompt-cache friendly):
         # 1. Summary SystemMessages first (context from before compaction)
-        # 1.5. Todo injection (full todo list as transient HumanMessage)
-        # 2. Workspace injection (fake tool call - current workspace state)
-        # 3. Rest of conversation (excluding regular SystemMessages)
+        # 2. Rest of conversation (excluding regular SystemMessages)
+        # 3. Transient injections at the tail (memories, knowledge, citation
+        #    feedback, instruction files, then the todo list last)
 
         # Step 1: Add summaries first
         for msg in messages:
@@ -883,13 +1023,97 @@ def create_execute_node(
         from src.core.workspace_injection import (
             create_todos_human_message,
             create_instruction_tool_messages,
+            find_tail_injection_anchor,
         )
 
         todos_injection_content = todo_manager.format_for_injection()
 
+        # MemoryManager seam read path (memory overhaul Phase 1 cutover).
+        # When bound, one assemble() replaces the two direct-store retrieval
+        # blocks below — those stay byte-identical for the flag-off path
+        # (pinned by tests/test_memory_worker_equivalence.py) and are
+        # skipped via the `memory_service is None` guard terms.
+        _manager_payload = None
+        _manager_injection_messages = []
+        _manager_memory_text = ""  # assembler's current_injection_text
+        if memory_service is not None:
+            from src.services.memory import AssembleRequest, TaskFrame
+            from src.services.memory.plugins.legacy import build_worker_query_text
+            from src.services.memory.query import build_digest_query_text
+
+            _mm_pending = todo_manager.list_pending()
+            _mm_frame = TaskFrame(
+                top_todo=_mm_pending[0].content if _mm_pending else None,
+                phase_number=phase_number,
+                is_strategic=is_strategic,
+            )
+            # Unified request digest (§4) behind memory.query.digest;
+            # legacy top-todo+phase query while the flag is off.
+            if config.memory.query.digest:
+                _mm_query = build_digest_query_text(
+                    messages,
+                    _mm_frame,
+                    window=config.memory.query.digest_window,
+                    max_chars_per_message=(
+                        config.memory.query.digest_max_chars_per_message
+                    ),
+                )
+            else:
+                _mm_query = build_worker_query_text(_mm_frame)
+            _manager_payload = await memory_service.assemble(
+                AssembleRequest(
+                    query_text=_mm_query,
+                    task_frame=_mm_frame,
+                    budget_tokens=config.memory.budget_tokens,
+                    model=config.llm.model,
+                )
+            )
+            _manager_injection_messages = _manager_payload.messages()
+            if _kb_bindings:
+                # Bound KBs use the shared chunk-retrieval policy below. Keep
+                # manager-provided memories, but suppress its legacy note-level
+                # KB block so native notes are not injected twice.
+                _manager_injection_messages = [
+                    message
+                    for block in _manager_payload.blocks
+                    if block.kind != "knowledge"
+                    for message in block.messages
+                ]
+            for _mm_block in _manager_payload.blocks:
+                if _mm_block.kind == "memory" and _mm_block.items:
+                    _manager_memory_text = _mm_block.content
+                    logger.debug(
+                        f"[{job_id}] Memory injection: "
+                        f"{len(_mm_block.items)} memories retrieved"
+                    )
+                    # Audit memory injection (legacy data shape + the
+                    # manager's stats — the eval-harness/cockpit tap)
+                    inject_auditor = get_archiver()
+                    if inject_auditor:
+                        inject_auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="memory_inject",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "count": len(_mm_block.items),
+                                "total_tokens": _mm_block.token_count,
+                                "stats": _manager_payload.stats.to_dict(),
+                            },
+                            metadata=state.get("metadata"),
+                            phase="strategic" if is_strategic else "tactical",
+                            phase_number=phase_number,
+                        )
+                elif _mm_block.kind == "knowledge" and _mm_block.items:
+                    logger.debug(
+                        f"[{job_id}] Knowledge injection: "
+                        f"{len(_mm_block.items)} notes retrieved"
+                    )
+
         # Memory Light: decrement TTLs then retrieve relevant memories for injection
         _memory_block = [""]  # mutable container for closure access
-        if recall_store:
+        if memory_service is None and recall_store:
             try:
                 await recall_store.decrement_ttl()
             except Exception as e:
@@ -943,7 +1167,59 @@ def create_execute_node(
             if tool_context and tool_context.has_knowledge()
             else None
         )
-        if knowledge_store and tool_context.project_id:
+        if knowledge_store and _kb_bindings:
+            try:
+                # Build retrieval context from current todo + phase info.
+                pending_todos = todo_manager.list_pending()
+                kb_context_parts = []
+                if pending_todos:
+                    kb_context_parts.append(pending_todos[0].content)
+                kb_context_parts.append(
+                    f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}"
+                )
+                kb_context_text = " ".join(kb_context_parts)
+
+                from src.core.knowledge_injection import retrieve_bound_knowledge
+                from src.services.knowledge_store import KnowledgeStore as _KS
+
+                selection = await retrieve_bound_knowledge(
+                    knowledge_store,
+                    _kb_bindings,
+                    kb_context_text,
+                )
+                if selection.notes:
+                    _knowledge_block[0] = _KS.assemble_knowledge_block(
+                        selection.notes,
+                        model=config.llm.model,
+                        bindings=selection.bindings,
+                        external_watermarks=selection.external_watermarks,
+                    )
+                    logger.debug(
+                        f"[{job_id}] Knowledge injection: "
+                        f"{len(selection.notes)} notes retrieved "
+                        f"by binding={selection.counts_by_binding}"
+                    )
+                    inject_auditor = get_archiver()
+                    if inject_auditor:
+                        inject_auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="knowledge_inject",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "count": len(selection.notes),
+                                "counts_by_binding": selection.counts_by_binding,
+                            },
+                            metadata=state.get("metadata"),
+                            phase="strategic" if is_strategic else "tactical",
+                            phase_number=phase_number,
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}"
+                )
+        elif memory_service is None and knowledge_store and tool_context.project_id:
             try:
                 import uuid as _uuid
 
@@ -982,18 +1258,104 @@ def create_execute_node(
                     f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}"
                 )
 
+        # Citation verification feedback (Phase 2b / D4): surface still-failed
+        # citations so the agent can correct them. DB-driven — re-computed from
+        # verification_status each turn — so it self-resolves once the agent
+        # edits/removes the citation. Only runs after citation activity (the
+        # engine is lazily created on first cite/source registration).
+        _citation_feedback_block = [""]
+        _cit_engine = (
+            getattr(tool_context, "citation_engine", None) if tool_context else None
+        )
+        if _cit_engine is not None:
+            try:
+                _failed_cites = await _cit_engine.list_citations(
+                    verification_status="failed"
+                )
+                if _failed_cites:
+                    from src.core.citation_feedback_injection import (
+                        format_failed_citations,
+                    )
+
+                    _citation_feedback_block[0] = format_failed_citations(_failed_cites)
+                    logger.debug(
+                        f"[{job_id}] Citation feedback: {len(_failed_cites)} failed "
+                        f"citation(s) to surface"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[{job_id}] Citation feedback retrieval failed (non-fatal): {e}"
+                )
+
+        # Supervisor guidance (P1-A): the non-destructive steer. Entries land
+        # in the dual_app inbox via the heartbeat response (worst case one
+        # heartbeat interval, currently 60s, to reach the inbox) and render
+        # here on the very next LLM turn — no kill, no compaction, no
+        # re-plan. Re-derived per turn, so compaction-immune; keeps rendering
+        # until the post-turn ack (below) clears ``context.pending_guidance``
+        # (~1-2 turns of overlap, at-least-once).
+        _stateless_steering = bool(
+            tool_context is not None and tool_context._stateless_worker
+        )
+        _delivered_guidance_ids = {
+            str(value)
+            for value in state.get("delivered_guidance_ids") or []
+            if value is not None
+        }
+        _guidance_entries = _get_pending_supervisor_guidance(job_id)
+        if _stateless_steering:
+            _guidance_entries = [
+                entry
+                for entry in _guidance_entries
+                if not entry.get("id")
+                or str(entry["id"]) not in _delivered_guidance_ids
+            ]
+        _absorbed_guidance_ids: set[str] = set()
+        _guidance_block = [""]
+        if _guidance_entries:
+            from src.core.guidance_injection import format_supervisor_guidance
+
+            _guidance_block[0] = format_supervisor_guidance(_guidance_entries)
+            if _guidance_block[0]:
+                logger.info(
+                    f"[{job_id}] Supervisor guidance injection: "
+                    f"{len(_guidance_entries)} pending entrie(s)"
+                )
+
+        completed_phase_injections = set(
+            state.get("phase_instruction_injections") or []
+        )
+        pending_phase_injections: set[str] = set()
+
         def _inject_transient_messages(target_messages: list) -> None:
-            """Append transient injection messages (todos, memories, knowledge, instruction files)."""
-            # Todo list as transient HumanMessage
-            target_messages.append(create_todos_human_message(todos_injection_content))
+            """Splice transient injections (memories, knowledge, instruction files, todos) at the tail.
+
+            The block goes AFTER the conversation (see find_tail_injection_anchor):
+            it changes every turn, and provider prompt caches match on a strict
+            left-to-right prefix — injected ahead of the history it invalidated
+            the cache for the whole conversation on every request. At the tail
+            only the block itself is re-processed.
+
+            Within the block the todo list goes LAST: it is the agent's current
+            "query", and models weight the end of the prompt highest.
+            """
+            block: list = []
+            target_phase_injections: set[str] = set()
+
+            # MemoryManager seam: the assembled payload replaces the legacy
+            # _memory_block/_knowledge_block branches below (both stay ""
+            # when the manager is bound). Safety rebuilds re-call this into
+            # a fresh list, so reusing the same pair objects is safe.
+            if _manager_payload is not None:
+                block.extend(_manager_injection_messages)
 
             # Memory Light: inject recalled memories
             if _memory_block[0]:
                 from src.core.memory_injection import create_memory_injection_messages
 
                 mem_ai, mem_tool = create_memory_injection_messages(_memory_block[0])
-                target_messages.append(mem_ai)
-                target_messages.append(mem_tool)
+                block.append(mem_ai)
+                block.append(mem_tool)
 
             # Knowledge Base: inject relevant project knowledge after memories
             if _knowledge_block[0]:
@@ -1004,37 +1366,90 @@ def create_execute_node(
                 kb_ai, kb_tool = create_knowledge_injection_messages(
                     _knowledge_block[0]
                 )
-                target_messages.append(kb_ai)
-                target_messages.append(kb_tool)
+                block.append(kb_ai)
+                block.append(kb_tool)
 
-            # Phase-triggered instruction files (active injection)
+            # Citation verification feedback: surface failed citations (Phase 2b)
+            if _citation_feedback_block[0]:
+                from src.core.citation_feedback_injection import (
+                    create_citation_feedback_injection_messages,
+                )
+
+                cit_ai, cit_tool = create_citation_feedback_injection_messages(
+                    _citation_feedback_block[0]
+                )
+                block.append(cit_ai)
+                block.append(cit_tool)
+
+            # Phase-start instruction files: each concrete phase instance sees
+            # each bound artifact once. The successful LLM turn checkpoints the
+            # keys below; unlike dynamic todos/memory, static skills are never
+            # re-presented as a fresh tail instruction on every request.
             if tool_context and hasattr(tool_context, "get_phase_instruction_files"):
-                _phase_name = "strategic" if is_strategic else "tactical"
-                phase_entries = tool_context.get_phase_instruction_files(_phase_name)
+                phase_entries = tool_context.get_phase_instruction_files(phase_name)
                 if phase_entries:
                     for entry in phase_entries:
+                        injection_key = (
+                            f"{phase_number}:{phase_name}:{entry.path.lstrip('/')}"
+                        )
+                        if (
+                            injection_key in completed_phase_injections
+                            or injection_key in target_phase_injections
+                        ):
+                            continue
                         try:
-                            instr_content = workspace_manager.read_file(entry.file)
+                            instr_content = workspace_manager.read_file(entry.path)
                             instr_ai, instr_tool = create_instruction_tool_messages(
-                                entry.file, instr_content
+                                entry.path, instr_content
                             )
-                            target_messages.append(instr_ai)
-                            target_messages.append(instr_tool)
+                            block.append(instr_ai)
+                            block.append(instr_tool)
+                            target_phase_injections.add(injection_key)
+                            pending_phase_injections.add(injection_key)
                             logger.debug(
-                                f"[{job_id}] Injected instruction file: {entry.file}"
+                                f"[{job_id}] Injected phase-start instruction "
+                                f"once: {entry.path}"
                             )
                         except FileNotFoundError:
                             logger.warning(
-                                f"[{job_id}] Phase instruction file not found: {entry.file}"
+                                f"[{job_id}] Phase instruction file not found: {entry.path}"
                             )
 
-        # Inject transient messages (todos, memory, knowledge, instruction files)
-        _inject_transient_messages(prepared_messages)
+            # Supervisor guidance: the last synthetic pair before the todo
+            # list, so mid-run steering is the freshest context short of the
+            # current tasks themselves.
+            if _guidance_block[0]:
+                from src.core.guidance_injection import (
+                    create_guidance_injection_messages,
+                )
+
+                guid_ai, guid_tool = create_guidance_injection_messages(
+                    _guidance_block[0]
+                )
+                block.append(guid_ai)
+                block.append(guid_tool)
+
+            # Todo list as transient HumanMessage — last, so the request ends
+            # with the current tasks (query-at-end) and the synthetic tool-call
+            # pairs above stay sandwiched between real turns.
+            block.append(create_todos_human_message(todos_injection_content))
+
+            # Anchor after the last Human/Tool message (normally the very end;
+            # keeps the synthetic function-call pairs Gemini-valid — a
+            # function-call turn must follow a user or function-response turn).
+            anchor = find_tail_injection_anchor(target_messages)
+            target_messages[anchor:anchor] = block
 
         # Step 3: Add rest of conversation (excluding all SystemMessages)
         for msg in messages:
             if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
+
+        # Inject transient messages (memory, knowledge, instruction files, todos)
+        # AFTER the conversation: the stable history prefix stays byte-identical
+        # across turns, so provider prompt caches reuse it instead of
+        # re-processing the whole conversation every request.
+        _inject_transient_messages(prepared_messages)
 
         # Todo reminders are injected post-LLM-response (see below) so they
         # persist in conversation history and survive context compaction.
@@ -1069,7 +1484,8 @@ def create_execute_node(
             messages = [m for m in messages if not isinstance(m, RemoveMessage)]
 
             # Rebuild prepared_messages with compacted history
-            # Keep system prompt, re-inject ALL transient messages, replace conversation
+            # Keep system prompt, replace conversation, re-inject ALL transient
+            # messages at the tail (same order as the normal path)
             system_msg = prepared_messages[0] if prepared_messages else None
             prepared_messages = []
             if system_msg and isinstance(system_msg, SystemMessage):
@@ -1081,15 +1497,16 @@ def create_execute_node(
                     if "[Summary of prior work]" in msg.content:
                         prepared_messages.append(msg)
 
-            # Re-inject ALL transient messages (todos + memory + knowledge + instruction files)
+            for msg in messages:
+                if not isinstance(msg, SystemMessage):
+                    prepared_messages.append(msg)
+
+            # Re-inject ALL transient messages (memory + knowledge + instruction
+            # files + todos) at the tail
             _inject_transient_messages(prepared_messages)
             logger.debug(
                 f"[{job_id}] Re-injected transient messages after safety compaction"
             )
-
-            for msg in messages:
-                if not isinstance(msg, SystemMessage):
-                    prepared_messages.append(msg)
 
             # Merge remove markers if compaction occurred
             if safety_remove_markers:
@@ -1131,6 +1548,16 @@ def create_execute_node(
         # Retry loop for LLM call with exponential backoff
         attempt = 0
 
+        # First error of this retry sequence. The LAST error is frequently a
+        # downstream symptom of the FIRST: on 2026-07-29 job d251e513 the real
+        # failure was a 408 upstream stream drop, which flipped the Codex
+        # proxy's sole auth entry to `status: error` — so retries 2-6 all came
+        # back `503 auth_unavailable` and overwrote the only useful evidence.
+        # Freezing with just the tail sent every operator hunting a phantom
+        # auth problem. Carry the head along too.
+        first_error_summary: Optional[str] = None
+        first_classification: Optional[str] = None
+
         # Total wall-clock timeout for LLM calls. httpx read timeout only fires
         # when no bytes arrive within the window, but vLLM sends HTTP headers
         # immediately and then blocks during inference — so the read timeout
@@ -1148,8 +1575,49 @@ def create_execute_node(
                 )
                 latency_ms = int((time.time() - start_time) * 1000)
 
-                # Reset tool_use_failed streak on successful response
+                # Reset failure streaks on a successful LLM response.
                 _tool_use_failed_streak[0] = 0
+                _llm_error_streak[0] = 0
+
+                # Anchor the compaction trigger on the provider's real
+                # input_tokens, mirroring the session loop
+                # (persistent_graph.py:1968). Workers never did this, so the
+                # trigger ran on a local estimate blind to the bound tool
+                # schemas — 60-90 tools is roughly 10-25k tokens per request
+                # that the threshold could not see. Forced boundary compaction
+                # masked the undercount by resetting history every two phases;
+                # once that stops, the local count would sit below threshold
+                # while the real request ran far larger. See
+                # knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md.
+                _record_usage = getattr(context_mgr, "record_provider_usage", None)
+                if _record_usage is not None:
+                    _usage = getattr(response, "usage_metadata", None) or {}
+                    _record_usage(_usage.get("input_tokens"))
+
+                # Supervisor guidance rendered into THIS turn's request. The
+                # pinned lane keeps its historical fire-and-forget ack. A
+                # stateless worker records the ids in this execute-node update;
+                # its fenced saver acks only after that checkpoint commits.
+                if _guidance_entries:
+                    _turn_guidance_ids = {
+                        str(entry["id"])
+                        for entry in _guidance_entries
+                        if entry.get("id")
+                    }
+                    if _stateless_steering:
+                        _absorbed_guidance_ids.update(_turn_guidance_ids)
+                    else:
+                        _ack_supervisor_guidance(
+                            job_id,
+                            guidance_ids=sorted(_turn_guidance_ids),
+                        )
+                    _guidance_entries = []
+
+                # Repair/scrub malformed tool-call arguments BEFORE anything
+                # else reads the response — an unparseable call otherwise
+                # reaches the checkpoint raw and poisons every subsequent
+                # request (knowledge-base/knowledge/features/outbound_message_hygiene.md).
+                response = repair_tool_call_arguments(response)
 
                 tool_calls_count = (
                     len(response.tool_calls)
@@ -1166,6 +1634,104 @@ def create_execute_node(
                 logger.info(
                     f"[{job_id}] LLM response: {content_len} chars, {tool_calls_count} tool calls"
                 )
+
+                # --- Fallback: recover tool calls leaked into content ---
+                # Some serving layers (vLLM's gemma4 parser) drop a tool call to
+                # plain text when the model emits a slightly off-spec wire format,
+                # leaving content=markup and tool_calls=empty. Rebuild the call so
+                # the tools node can execute it instead of the agent looping. Gated
+                # to families whose grammar this is; the parser bails unless the
+                # whole message is well-formed blocks for known tools.
+                if (
+                    tool_calls_count == 0
+                    and isinstance(content_str, str)
+                    and content_str
+                    and family_of(phase_model) in RECOVERABLE_TOOLCALL_FAMILIES
+                ):
+                    recovered = parse_leaked_tool_calls(
+                        content_str, allowed_names=set(tool_names or [])
+                    )
+                    if recovered:
+                        response.tool_calls = recovered
+                        response.content = strip_tool_call_markup(content_str)
+                        tool_calls_count = len(recovered)
+                        content_str = response.content
+                        content_len = len(content_str)
+                        _no_tool_call_streak[0] = 0
+                        _no_tool_call_last_hash[0] = ""
+                        logger.info(
+                            f"[{job_id}] Recovered {tool_calls_count} leaked tool "
+                            f"call(s) from content (model={phase_model}): "
+                            f"{[tc['name'] for tc in recovered]}"
+                        )
+                        if auditor:
+                            auditor.audit_step(
+                                job_id=job_id,
+                                agent_type=config.agent_id,
+                                step_type="toolcall_recovered",
+                                node_name="execute",
+                                iteration=iteration,
+                                data={
+                                    "toolcall_recovered": {
+                                        "model": phase_model,
+                                        "recovered": [
+                                            {
+                                                "name": tc["name"],
+                                                "args_preview": str(tc["args"])[:200],
+                                            }
+                                            for tc in recovered
+                                        ],
+                                    }
+                                },
+                                metadata=state.get("metadata"),
+                                phase=phase_str,
+                                phase_number=phase_number,
+                            )
+
+                # --- Output-cap truncation (finish_reason=length) — fail loud ---
+                # Reasoning tokens share max_output_tokens; a length-truncated turn
+                # with no content means reasoning consumed the entire output budget
+                # before any answer (the minimax/o-series empty-response bug). This
+                # is NOT the langchain/codex empty-AIMessage bug, so it must NOT
+                # accrue toward the unrecoverable empty-streak hard-fail below.
+                # Surface it distinctly + recoverable so the job pauses for review
+                # (raise the cap / lower reasoning / regenerate) instead of dying
+                # after 3. Tolerant substring detects the "lengthlength" merge (§7.1).
+                _finish_reason = (
+                    getattr(response, "response_metadata", None) or {}
+                ).get("finish_reason")
+                _is_length_trunc = _is_output_truncated(_finish_reason)
+                if _is_length_trunc and content_len == 0 and tool_calls_count == 0:
+                    _cap = _resolve_max_output_tokens(config.llm, config.limits)
+                    logger.error(
+                        f"[{job_id}] Output truncated at the model's limit "
+                        f"(finish_reason=length, max_output_tokens={_cap}): reasoning "
+                        f"consumed the entire output budget before answering."
+                    )
+                    return {
+                        "error": {
+                            "message": (
+                                f"The model used its entire output budget ({_cap} "
+                                "tokens) on reasoning and was cut off before producing "
+                                "an answer (finish_reason=length). Raise the model's "
+                                "output cap, lower the reasoning level, or shorten the "
+                                "prompt, then resume."
+                            ),
+                            "type": "output_truncated",
+                            "recoverable": True,
+                            "model": phase_model,
+                        },
+                        "iteration": iteration + 1,
+                    }
+                if _is_length_trunc and content_len > 0:
+                    # Truncated mid-answer: the partial is real work — keep it and
+                    # let the turn proceed, but log loudly (never a silent success).
+                    logger.warning(
+                        f"[{job_id}] Response truncated at output limit "
+                        f"(finish_reason=length, "
+                        f"max_output_tokens={_resolve_max_output_tokens(config.llm, config.limits)}, "
+                        f"{content_len} chars) — partial answer kept."
+                    )
 
                 # --- Empty response circuit breaker ---
                 # The codex proxy + langchain Responses API non-streaming path
@@ -1231,16 +1797,19 @@ def create_execute_node(
                 # non-empty but tool_calls is None — happens when the upstream
                 # tool-call parser refuses the model's wire format and returns
                 # the raw output as content (e.g. Gemma 4 emitting parens
-                # instead of canonical braces). Hash-match across iterations
-                # makes this deterministic: legitimate natural-language
-                # reflections vary and won't trip it.
+                # instead of canonical braces). Trips on either verbatim repeats
+                # (hash match) or bare leaked markup the fallback parser could not
+                # recover (even when the payload varies each turn); legitimate
+                # natural-language reflections do neither and won't trip it.
                 content_for_streak = content_str if isinstance(content_str, str) else ""
+                leaked_markup = has_leaked_tool_call_markup(content_for_streak)
                 no_tc_streak, no_tc_should_fail, no_tc_hash = (
                     _check_no_tool_call_streak(
                         content_str=content_for_streak,
                         tool_calls_count=tool_calls_count,
                         current_streak=_no_tool_call_streak[0],
                         last_hash=_no_tool_call_last_hash[0],
+                        is_leaked_markup=leaked_markup,
                     )
                 )
                 _no_tool_call_streak[0] = no_tc_streak
@@ -1263,8 +1832,8 @@ def create_execute_node(
                                     "type": "parser_failure",
                                     "message": (
                                         "LLM response has content but no "
-                                        "tool_calls; same content repeating "
-                                        "across iterations"
+                                        "tool_calls; leaked/malformed tool-call "
+                                        "markup or repeated content"
                                     ),
                                     "streak": no_tc_streak,
                                     "model": phase_model,
@@ -1285,15 +1854,13 @@ def create_execute_node(
                     return {
                         "error": {
                             "message": (
-                                f"LLM emitted identical non-empty content "
-                                f"with no tool_calls for {no_tc_streak} "
-                                f"consecutive iterations. Likely a tool-call "
-                                f"parser failure — the upstream inference "
-                                f"backend may be returning malformed "
-                                f"tool-call syntax that the parser cannot "
-                                f"lift into structured tool_calls. Verify "
-                                f"the model is emitting the parser's "
-                                f"canonical format. Model: {phase_model}. "
+                                f"LLM emitted non-empty content with no "
+                                f"usable tool_calls for {no_tc_streak} "
+                                f"consecutive iterations (leaked/malformed "
+                                f"tool-call markup the parser could not lift, "
+                                f"or identical repeated content). Verify the "
+                                f"model is emitting the parser's canonical "
+                                f"format. Model: {phase_model}. "
                                 f"Sample: {sample!r}"
                             ),
                             "type": "parser_failure",
@@ -1530,7 +2097,30 @@ def create_execute_node(
                 extraction_triggered = False
                 assembly_triggered = False
                 recall_store_exec = tool_context.recall_store if tool_context else None
-                if (
+
+                # Manager path (memory overhaul Phase 1): one fire-and-forget
+                # turn_end capture replaces the two create_tasks below. The
+                # interval_extractor/memory_assembler writers reproduce the
+                # gates and calls; interval state lives in the writers, so
+                # the last_observed_turn/last_assembled_turn state keys stop
+                # advancing (documented resume-window delta).
+                if memory_service is not None:
+                    import asyncio
+
+                    from src.services.memory import CaptureEvent
+
+                    asyncio.create_task(
+                        memory_service.capture(
+                            CaptureEvent(
+                                kind="turn_end",
+                                messages=messages,
+                                phase=phase_number,
+                                turn_count=new_turn_count,
+                                extra={"current_injection_text": _manager_memory_text},
+                            )
+                        )
+                    )
+                elif (
                     recall_store_exec
                     and config.auxiliary.enabled
                     and config.auxiliary.tasks.get("extract_memories", None)
@@ -1563,8 +2153,10 @@ def create_execute_node(
                         )
 
                 # Memory assembler: review conversation and adjust memory TTLs
+                # (manager path: rides the turn_end capture above)
                 if (
-                    recall_store_exec
+                    memory_service is None
+                    and recall_store_exec
                     and config.auxiliary.enabled
                     and config.auxiliary.tasks.get("assemble_memories", None)
                     and config.auxiliary.tasks["assemble_memories"].enabled
@@ -1600,10 +2192,18 @@ def create_execute_node(
                     "turn_count": new_turn_count,
                     "error": None,
                 }
+                if pending_phase_injections:
+                    result_update["phase_instruction_injections"] = sorted(
+                        completed_phase_injections | pending_phase_injections
+                    )
                 if extraction_triggered:
                     result_update["last_observed_turn"] = new_turn_count
                 if assembly_triggered:
                     result_update["last_assembled_turn"] = new_turn_count
+                if _absorbed_guidance_ids:
+                    result_update["delivered_guidance_ids"] = sorted(
+                        _delivered_guidance_ids | _absorbed_guidance_ids
+                    )
 
                 # Return compacted messages + response if compaction occurred,
                 # otherwise just append the response (add_messages reducer handles this)
@@ -1663,6 +2263,13 @@ def create_execute_node(
                                 prepared_messages.append(msg)
                         else:
                             prepared_messages.append(msg)
+
+                    # The provider rejected the previous request before it
+                    # could consume any tail guidance. Rebuild the same
+                    # transient block after emergency compaction; otherwise a
+                    # phase-start key could be checkpointed even though the
+                    # successful retry never saw its instruction body.
+                    _inject_transient_messages(prepared_messages)
 
                     # Merge remove markers
                     if emergency_remove_markers:
@@ -1803,6 +2410,9 @@ def create_execute_node(
                 # (check_todos → check_goal → END) then surfaces error to
                 # determine_job_status which marks the job 'failed'.
                 classification = _classify_llm_error(e)
+                if first_error_summary is None:
+                    first_error_summary = _summarize_llm_error(e)
+                    first_classification = classification
                 if classification == "permanent":
                     logger.error(
                         f"[{job_id}] LLM error is permanent "
@@ -1830,10 +2440,161 @@ def create_execute_node(
                         )
                     return {
                         "error": {
-                            "message": str(e),
+                            "message": _summarize_llm_error(e, phase_model),
                             "type": "llm_error",
                             "recoverable": False,
                         },
+                        "iteration": iteration + 1,
+                        "should_stop": True,
+                    }
+
+                if classification == "quota_exhausted":
+                    # An OpenAI insufficient_quota billing wall (a 429 that no
+                    # wait fixes). Fail fast with an actionable reason instead of
+                    # pausing the job for hours on the outage backoff path — a
+                    # spend cap needs an operator, not a retry.
+                    # llm_outage_pause_and_backoff_redispatch.md §Error taxonomy.
+                    qe_msg = (
+                        f"Model '{phase_model}' returned insufficient_quota — the "
+                        f"provider account/key is out of quota or over its spend "
+                        f"cap. Failed fast rather than retry-looping; top up "
+                        f"billing or switch to a different provider/key, then re-run."
+                    )
+                    logger.error(
+                        f"[{job_id}] LLM quota exhausted (insufficient_quota) — "
+                        f"failing job without retry: {e}"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="error",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "llm_error",
+                                    "message": qe_msg[:500],
+                                    "recoverable": False,
+                                    "classification": "quota_exhausted",
+                                    "attempts": attempt + 1,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                    return {
+                        "error": {
+                            "message": qe_msg,
+                            "type": "llm_error",
+                            "recoverable": False,
+                        },
+                        "iteration": iteration + 1,
+                        "should_stop": True,
+                    }
+
+                if classification == "cooldown":
+                    # A quota cooldown (all credentials cooling down). If the
+                    # provider's stated reset window fits inside our pause budget
+                    # AND we're on the Postgres checkpointer (safe cross-pod
+                    # resume), PAUSE and wait it out via the llm_unavailable outage
+                    # path — the job resumes from its checkpoint when the window
+                    # reopens (retry_after_seconds floors the backoff to the true
+                    # window). Otherwise — a multi-day wall, an unknown reset, or
+                    # sqlite — fail fast with an actionable reason instead of
+                    # looping (the gpt-5.3-codex-spark incident): re-run after the
+                    # reset or pin a fallback model.
+                    # knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md
+                    reset_s, cd_model = _cooldown_detail(e)
+                    when = (
+                        f"~{reset_s / 3600:.1f}h" if reset_s else "an extended period"
+                    )
+
+                    if (
+                        _cooldown_within_pause_budget(reset_s)
+                        and checkpointer_backend() == "postgres"
+                    ):
+                        cd_summary = (
+                            f"Model '{cd_model or phase_model}' in quota cooldown "
+                            f"(all credentials cooling down); resets in {when}"
+                        )
+                        logger.warning(
+                            f"[{job_id}] LLM quota cooldown on "
+                            f"'{cd_model or phase_model}' (resets in {when}) — pausing "
+                            f"for backoff re-dispatch within the "
+                            f"{_COOLDOWN_MAX_PAUSE_SECONDS / 3600:.0f}h budget (resumes "
+                            f"from checkpoint when the window reopens): {e}"
+                        )
+                        if auditor:
+                            auditor.audit_step(
+                                job_id=job_id,
+                                agent_type=config.agent_id,
+                                step_type="warning",
+                                node_name="execute",
+                                iteration=iteration,
+                                data={
+                                    "error": {
+                                        "type": "llm_error",
+                                        "message": cd_summary[:500],
+                                        "recoverable": True,
+                                        "classification": "cooldown",
+                                        "action": "pause_backoff_redispatch",
+                                        "attempts": attempt + 1,
+                                        "reset_seconds": reset_s,
+                                    }
+                                },
+                                metadata=state.get("metadata"),
+                                phase=phase_str,
+                                phase_number=phase_number,
+                            )
+                        return {
+                            "freeze_data": {
+                                "freeze_type": "llm_unavailable",
+                                "classification": "cooldown",
+                                "error_summary": cd_summary[:500],
+                                "model": cd_model or phase_model,
+                                "retry_after_seconds": reset_s,
+                            },
+                            "should_stop": True,
+                            "iteration": iteration + 1,
+                        }
+
+                    # Over budget / unknown reset / sqlite → fail fast.
+                    cd_msg = (
+                        f"Model '{cd_model or phase_model}' is in a quota cooldown "
+                        f"(all credentials cooling down); it resets in {when}. Failed "
+                        f"fast rather than retry-looping — re-run after the reset or "
+                        f"pin a different/fallback model."
+                    )
+                    logger.error(
+                        f"[{job_id}] LLM quota cooldown — failing job without retry: {e}"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="error",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "llm_error",
+                                    "message": cd_msg[:500],
+                                    "recoverable": False,
+                                    "classification": "cooldown",
+                                    "attempts": attempt + 1,
+                                    "reset_seconds": reset_s,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                    return {
+                        "error": _cooldown_failfast_error(
+                            cd_msg, cd_model or phase_model, reset_s
+                        ),
                         "iteration": iteration + 1,
                         "should_stop": True,
                     }
@@ -1887,6 +2648,149 @@ def create_execute_node(
                     f"[{job_id}] LLM error after {attempt + 1} attempts: {e}{auth_hint}"
                 )
 
+                # Tier 2: a transient LLM outage (connection refused, 5xx, 529,
+                # sustained per-minute 429, or a Codex/OAuth token blip) exhausted
+                # the in-process retries. Rather than counting toward the circuit
+                # breaker and failing the job, FREEZE it for pause + backoff
+                # re-dispatch so an overnight loop survives a multi-minute/hour
+                # provider outage and resumes from its checkpoint when the endpoint
+                # recovers. No ``error`` key — that would short-circuit
+                # determine_job_status straight to ``failed`` (completion.py). The
+                # freeze point is side-effect-clean: the LLM call failed, so no
+                # ``tools`` node ran and there is nothing to duplicate on resume.
+                #
+                # Gated on the shared Postgres checkpointer — the only backend
+                # where cross-pod resume is side-effect-safe. On pod-local sqlite
+                # the feature no-ops to today's fail-fast (the circuit breaker
+                # below). Only the retriable classes reach here — permanent /
+                # quota_exhausted / cooldown already returned above.
+                # knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md
+                if (
+                    classification in ("transient", "rate_limit", "auth_unavailable")
+                    and checkpointer_backend() == "postgres"
+                ):
+                    outage_freeze: Dict[str, Any] = {
+                        "freeze_type": "llm_unavailable",
+                        "classification": classification,
+                        "error_summary": (_summarize_llm_error(e)[:500] + auth_hint),
+                        "model": phase_model,
+                    }
+                    if _infra_edge_status(e) is not None:
+                        # An edge-shaped response repeats an identical body for
+                        # as long as the provider's gateway is down — that is
+                        # an outage signature, not a deterministic request
+                        # rejection. Exempt it from the determinism
+                        # fingerprint (completion.llm_outage_fingerprint) so
+                        # the job rides the outage ceilings like a 5xx outage
+                        # instead of failing after two identical pause cycles.
+                        outage_freeze["deterministic_exempt"] = True
+                    retry_after = _extract_rate_limit_delay(e)
+                    if retry_after is not None:
+                        outage_freeze["retry_after_seconds"] = retry_after
+                    initial_fields = initial_error_freeze_fields(
+                        first_error_summary,
+                        first_classification,
+                        _summarize_llm_error(e),
+                        classification,
+                    )
+                    initial_differs = bool(initial_fields)
+                    outage_freeze.update(initial_fields)
+                    logger.warning(
+                        f"[{job_id}] LLM endpoint unavailable ({classification}) "
+                        f"after {attempt + 1} in-process attempts — freezing for "
+                        f"pause+backoff re-dispatch (resumes from checkpoint on "
+                        f"recovery): {e}"
+                        + (
+                            f" [first error of this sequence was "
+                            f"({first_classification}) {first_error_summary}]"
+                            if initial_differs
+                            else ""
+                        )
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="warning",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "llm_error",
+                                    "message": (str(e)[:500] + auth_hint),
+                                    "recoverable": True,
+                                    "classification": classification,
+                                    "action": "pause_backoff_redispatch",
+                                    "attempts": attempt + 1,
+                                    **(
+                                        {
+                                            "initial_error": first_error_summary[:500],
+                                            "initial_classification": (
+                                                first_classification
+                                            ),
+                                        }
+                                        if initial_differs
+                                        else {}
+                                    ),
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                    return {
+                        "freeze_data": outage_freeze,
+                        "should_stop": True,
+                        "iteration": iteration + 1,
+                    }
+
+                # C2 circuit breaker: this execute invocation exhausted its inner
+                # retries. The inner attempt counter resets each invocation, but
+                # the outer graph loop re-enters execute and tries again — so
+                # count CONSECUTIVE no-progress invocations and hard-stop at the
+                # cap rather than spin forever on a never-recovering error.
+                _llm_error_streak[0] += 1
+                if _llm_error_streak[0] >= _LLM_ERROR_STREAK_CAP:
+                    cb_msg = (
+                        f"LLM call failed on {_llm_error_streak[0]} consecutive "
+                        f"iterations with no progress (last error: "
+                        f"{str(e)[:200]}{auth_hint}). Failing fast instead of "
+                        f"looping — check the model endpoint/provider/quota."
+                    )
+                    logger.error(
+                        f"[{job_id}] LLM error circuit breaker tripped after "
+                        f"{_llm_error_streak[0]} no-progress iterations: {e}"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="error",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "llm_error",
+                                    "message": cb_msg[:500],
+                                    "recoverable": False,
+                                    "classification": "circuit_breaker",
+                                    "consecutive_failures": _llm_error_streak[0],
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                    return {
+                        "error": {
+                            "message": cb_msg,
+                            "type": "llm_error",
+                            "recoverable": False,
+                        },
+                        "iteration": iteration + 1,
+                        "should_stop": True,
+                    }
+
                 # Audit error
                 if auditor:
                     auditor.audit_step(
@@ -1924,15 +2828,38 @@ def create_check_todos_node(
     todo_manager: TodoManager,
     config: AgentConfig,
     tool_names: Optional[List[str]] = None,
+    tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the check_todos node.
 
-    This node checks if all todos are complete.
+    This node checks if all todos are complete, or if the tactical phase has
+    asked to end early via ``request_replan``.
     """
 
     def check_todos(state: UniversalAgentState) -> Dict[str, Any]:
         """Check if all todos are complete."""
         job_id = state.get("job_id", "unknown")
+
+        # Replan requested: end the phase now, keeping every todo exactly as it
+        # is. This is the only way out of a tactical phase without completing
+        # all todos, and it exists so an agent that learns mid-phase that the
+        # approach is wrong can say so instead of grinding through todos it
+        # knows are pointless. Deliberately does NOT clear or archive-as-failed
+        # anything — archive_phase records the real statuses at the boundary,
+        # which is what the incoming strategic phase needs to decide what to
+        # keep.
+        if tool_context is not None:
+            replan_reason = tool_context.consume_replan_request()
+            if replan_reason:
+                todo_state = todo_manager.export_state()
+                logger.info(f"[{job_id}] Replan requested — ending phase early")
+                return {
+                    "phase_complete": True,
+                    "replan_reason": replan_reason,
+                    "todos": todo_state["todos"],
+                    "staged_todos": todo_state["staged_todos"],
+                    "todo_next_id": todo_state["next_id"],
+                }
 
         # Validate todos exist before checking completion
         todos = todo_manager.list_all()
@@ -1989,6 +2916,26 @@ def create_check_todos_node(
                 "todo_next_id": todo_state["next_id"],
             }
 
+        # Mid-phase rotation is allowed only on the pending-todos path at this
+        # natural graph break. audited_tools has drained memory/freeze/reply
+        # carriers, the one-superstep-delayed replan request was consumed above,
+        # and completed/empty phases retained their normal transition/recovery
+        # routing. Never interrupt audited_tools or an in-flight tool effect.
+        # A version drain remains higher priority and owns the next clean phase
+        # boundary rather than being relabeled as an ordinary batch rotation.
+        batch_updates = worker_batch_boundary_updates(state)
+        if batch_updates is not None and not _is_drain_requested():
+            batch_updates.update(
+                {
+                    "phase_complete": False,
+                    "todos": todo_state["todos"],
+                    "staged_todos": todo_state["staged_todos"],
+                    "todo_next_id": todo_state["next_id"],
+                }
+            )
+            _log_worker_batch_boundary(job_id, batch_updates)
+            return batch_updates
+
         return {
             "phase_complete": False,
             "todos": todo_state["todos"],
@@ -2012,6 +2959,9 @@ def create_archive_phase_node(
     workspace_manager: Optional[WorkspaceManager] = None,
     memory_extraction_prompt: str = "",
     curation_prompt: str = "",
+    knowledge_assembler_prompt: str = "",
+    knowledge_verdict_prompt: str = "",
+    memory_service: Optional[Any] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
 
@@ -2019,6 +2969,8 @@ def create_archive_phase_node(
     Also performs context compaction if configured.
     Creates phase snapshots for recovery if snapshot_manager is provided.
     Runs inline knowledge curation if knowledge base is available.
+    When memory_service (MemoryManager seam) is bound, the phase-boundary
+    extraction is emitted as a capture() event instead of the direct call.
     """
 
     async def archive_phase(state: UniversalAgentState) -> Dict[str, Any]:
@@ -2029,13 +2981,59 @@ def create_archive_phase_node(
         is_strategic = state.get("is_strategic_phase", True)
         messages = state.get("messages", [])
 
+        # Exactly-once guard per phase INSTANCE (knowledge-base/knowledge/issues/
+        # phase_boundary_tags_are_moved_then_rejected_by_remote.md, fix
+        # direction 4): a rejected transition routes back to execute, and the
+        # retried completion re-enters this node with the SAME phase number —
+        # re-archiving an already-emptied todo list, re-marking the plan,
+        # re-snapshotting and re-extracting memories for a boundary that
+        # already happened. The key is checkpointed, so the guard holds
+        # across a same-lineage resume; a successful transition changes
+        # phase_number and naturally re-arms it.
+        instance_key = f"{phase_number}:{'strategic' if is_strategic else 'tactical'}"
+        if state.get("last_archived_phase") == instance_key:
+            logger.info(
+                f"[{job_id}] Phase instance {instance_key} already archived — "
+                f"exactly-once guard skipping duplicate archive side effects "
+                f"(transition retry after a rejection)"
+            )
+            return {}
+
         current_phase = plan_manager.get_current_phase()
         logger.info(f"[{job_id}] Archiving phase: {current_phase}")
+
+        # Citation verification (Phase 2b / D4): flush in-flight verdicts at the
+        # phase boundary so any failures surface in the next phase's injection
+        # (the execute node re-reads verification_status each turn).
+        _cit_engine = (
+            getattr(tool_context, "citation_engine", None) if tool_context else None
+        )
+        if _cit_engine is not None:
+            try:
+                await _cit_engine.await_pending_verifications(timeout=15)
+            except Exception as e:
+                logger.debug(
+                    f"[{job_id}] Citation verification flush failed (non-fatal): {e}"
+                )
 
         import asyncio
 
         # Memory Light: extract memories at phase boundary via AuxiliaryLLM (async, non-blocking)
-        if (
+        # Manager path (memory overhaul Phase 1): the phase_boundary_extractor
+        # writer reproduces the gates and the call below.
+        if memory_service is not None:
+            from src.services.memory import CaptureEvent
+
+            asyncio.create_task(
+                memory_service.capture(
+                    CaptureEvent(
+                        kind="phase_boundary",
+                        messages=messages,
+                        phase=phase_number,
+                    )
+                )
+            )
+        elif (
             recall_store
             and config.auxiliary.enabled
             and config.auxiliary.tasks.get("extract_memories", None)
@@ -2147,6 +3145,18 @@ def create_archive_phase_node(
                     phase_context_parts.append(f"Archive: {archive_path}")
                 phase_context_parts.extend(curation_todo_summaries)
                 curation_phase_data = "\n".join(phase_context_parts)
+                # Build the ingestion verdict gate if curate_knowledge.verdict is
+                # on (OKF KB slice 2 PR2) — otherwise None and the curator writes
+                # ungated, exactly as before. Prompt is resolved at build time and
+                # handed to the gate per curation event (kb_write → gate_candidate).
+                from src.services.knowledge.ingestion import (
+                    build_knowledge_verdict_service,
+                )
+
+                verdict_service = build_knowledge_verdict_service(
+                    auxiliary_llm,
+                    config.auxiliary.tasks.get("curate_knowledge"),
+                )
                 asyncio.create_task(
                     curate_and_store_knowledge(
                         auxiliary_llm=auxiliary_llm,
@@ -2155,10 +3165,40 @@ def create_archive_phase_node(
                         workspace_md=ws_md or "",
                         plan_md=plan_md_content or "",
                         curation_prompt=curation_prompt,
+                        verdict_service=verdict_service,
+                        verdict_prompt=knowledge_verdict_prompt,
                     )
                 )
             except Exception as e:
                 logger.warning(f"[{job_id}] Inline curation failed (non-fatal): {e}")
+
+        # Inline KB convergence (KB convergence / loop_review F13): re-verify the
+        # stale queue (notes whose cycle TTL ran out) and supersede/merge/archive
+        # the dead ones. Async, non-blocking — and the runner self-gates on a
+        # non-empty stale queue, so this is a cheap no-op (one indexed query) when
+        # nothing has expired (e.g. every non-loop job). Same enablement as the
+        # curation/populate pass above; the two are the KB's extractor/assembler
+        # pair, mirroring memory's ExtractMemoriesTask/AssembleMemoriesTask.
+        if (
+            tool_context
+            and tool_context.has_knowledge()
+            and config.extra.get("curator", {}).get("enabled", False)
+            and config.auxiliary.enabled
+        ):
+            try:
+                from src.services.auxiliary import assemble_and_converge_knowledge
+
+                asyncio.create_task(
+                    assemble_and_converge_knowledge(
+                        auxiliary_llm=auxiliary_llm,
+                        tool_context=tool_context,
+                        knowledge_assembler_prompt=knowledge_assembler_prompt,
+                    )
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{job_id}] Inline KB convergence failed (non-fatal): {e}"
+                )
 
         message = AIMessage(
             content=f"Phase complete. Archived todos to {archive_path}. Moving to next phase."
@@ -2171,7 +3211,19 @@ def create_archive_phase_node(
         if config.context_management.compact_on_archive:
             # Force summarization when transitioning from strategic to tactical
             # This gives tactical phases a "fresh conversation" with just the plan summary
-            force_summarize = is_strategic  # True when completing strategic phase
+            # Threshold-driven only. This used to be `is_strategic`, forcing a
+            # full LLM summarization at every strategic->tactical hop to give
+            # the tactical phase a "fresh conversation with just the plan
+            # summary". That erased the context the NEXT strategic phase needed,
+            # which is why the transition template tells the agent to use git
+            # evidence "not memory (memory may be wrong after compaction)" — the
+            # archaeology was a workaround for platform-induced amnesia, and it
+            # got more expensive every phase (106s -> 768s across 16 phases on
+            # job 396a5d4c). Repeated irreversible query-agnostic compaction
+            # grows end-task error super-linearly in the number of events
+            # (arXiv 2607.08032); no major harness compacts on a structural
+            # boundary. See knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md.
+            force_summarize = False
 
             compacted_messages = await context_mgr.ensure_within_limits(
                 messages,
@@ -2214,6 +3266,7 @@ def create_archive_phase_node(
             )
             return {
                 "messages": compacted_messages + [message],
+                "last_archived_phase": instance_key,
             }
 
         logger.debug(
@@ -2221,6 +3274,7 @@ def create_archive_phase_node(
         )
         return {
             "messages": [message],
+            "last_archived_phase": instance_key,
         }
 
     return archive_phase
@@ -2230,16 +3284,23 @@ async def _process_queued_replies(
     job_id: str,
     workspace: "WorkspaceManager",
     postgres_db,
-) -> int:
+    *,
+    delivered_reply_keys: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
     """Consume queued async replies from job context and write to workspace.
 
-    Called at tactical→strategic phase boundaries so replies appear in
-    ``git_diff`` during the upcoming strategic review.
+    Called at tactical→strategic phase boundaries. Writes each reply as a
+    ``messages/{thread}/{seq}_received.md`` audit file; the caller
+    (handle_transition) injects the drained content into LLM-visible context
+    as a persistent HumanMessage and acks the drained thread ids so the
+    orchestrator moves them ``context.queued_replies`` →
+    ``context.consumed_replies`` (the clearing contract — without it every
+    boundary re-materialized duplicates and nothing ever told the worker to
+    read the files).
 
     Returns:
-        Number of replies processed.
+        The drained reply entries (``thread_id``/``message``/``timestamp``).
     """
-    from datetime import datetime, timezone as tz
 
     # Read queued_replies from job context
     row = await postgres_db.fetchrow(
@@ -2247,7 +3308,7 @@ async def _process_queued_replies(
         job_id,
     )
     if not row:
-        return 0
+        return []
 
     ctx = row.get("context") or {}
     if isinstance(ctx, str):
@@ -2255,14 +3316,42 @@ async def _process_queued_replies(
 
     queued = ctx.get("queued_replies")
     if not queued:
-        return 0
+        return []
 
-    # NOTE: queued_replies are cleared from DB context by the orchestrator
-    # when the agent reports completion with consumed_reply_threads=True.
-    # We only write the replies to workspace files here.
+    # The checkpoint ledger is authoritative on stateless reclaim.  An ack can
+    # fail after the absorbing checkpoint committed, leaving the same reply in
+    # jobs.context.  Filter before *any* workspace mutation; filtering only the
+    # later HumanMessage would still create duplicate received-mail files.
+    pending = [
+        reply
+        for reply in queued
+        if not delivered_reply_keys or _reply_key(reply) not in delivered_reply_keys
+    ]
+    if not pending:
+        return []
 
-    # Write each reply as a workspace file
-    for reply in queued:
+    _write_reply_files(job_id, workspace, pending)
+    logger.info(
+        f"[{job_id}] Processed {len(pending)} queued async replies at phase boundary"
+    )
+    return list(pending)
+
+
+def _write_reply_files(
+    job_id: str,
+    workspace: "WorkspaceManager",
+    replies: List[Dict[str, Any]],
+) -> None:
+    """Archive queued replies as ``messages/{thread}/{seq}_received.md`` files.
+
+    Shared by both drain paths (the natural-break drain in audited_tools and
+    the phase-boundary backstop). The files are the durable record; the
+    LLM-visible message the caller injects is what actually makes the agent
+    read them.
+    """
+    from datetime import datetime, timezone as tz
+
+    for reply in replies:
         thread_id = reply.get("thread_id", "unknown")
         message = reply.get("message", "")
         timestamp = reply.get(
@@ -2290,13 +3379,34 @@ async def _process_queued_replies(
         )
         workspace.write_file(f"{msg_dir}/{seq:03d}_received.md", msg_content)
 
-    if queued and workspace.git_manager and workspace.git_manager.is_active:
-        workspace.git_manager.commit(f"Received {len(queued)} queued reply(ies)")
+    if replies and workspace.git_manager and workspace.git_manager.is_active:
+        workspace.git_manager.commit(f"Received {len(replies)} queued reply(ies)")
 
-    logger.info(
-        f"[{job_id}] Processed {len(queued)} queued async replies at phase boundary"
+
+def _format_drained_replies(replies: List[Dict[str, Any]]) -> str:
+    """Render drained queued replies as one visible message-block.
+
+    Injected as a persistent HumanMessage at the tactical→strategic boundary
+    — a compaction point, so the cache impact is nil — because the audit
+    files alone were a dead letter box: nothing told the worker to read them.
+    """
+    lines = [
+        "[QUEUED MESSAGES] Messages received while you were working "
+        "(also archived under messages/):",
+        "",
+    ]
+    for reply in replies:
+        thread_id = reply.get("thread_id", "unknown")
+        timestamp = reply.get("timestamp", "")
+        meta = ", ".join(str(p) for p in (thread_id, timestamp) if p)
+        lines.append(f"--- ({meta}) ---")
+        lines.append(str(reply.get("message", "")).strip())
+        lines.append("")
+    lines.append(
+        "Weigh these against the current plan during the strategic review; "
+        "they do not force a re-plan by themselves."
     )
-    return len(queued)
+    return "\n".join(lines)
 
 
 def _is_drain_requested() -> bool:
@@ -2316,6 +3426,171 @@ def _is_drain_requested() -> bool:
         return False
 
 
+def _get_pending_supervisor_guidance(job_id: str) -> List[Dict[str, Any]]:
+    """Pending supervisor guidance from the dual-mode heartbeat inbox (P1-A).
+
+    Same lazy-import contract as ``_is_drain_requested``: outside the dual
+    app (tests, standalone runs) there is no inbox and no guidance.
+    """
+    try:
+        from src.api.dual_app import get_pending_guidance
+
+        return get_pending_guidance(job_id)
+    except Exception:
+        return []
+
+
+def _get_queued_replies(job_id: str) -> List[Dict[str, Any]]:
+    """Queued (non-urgent) replies from the dual-mode heartbeat inbox.
+
+    Same lazy-import contract as ``_get_pending_supervisor_guidance``: outside
+    the dual app there is no inbox, and the phase-boundary backstop in
+    ``handle_transition`` still reads them straight from the DB.
+    """
+    try:
+        from src.api.dual_app import get_queued_replies
+
+        return get_queued_replies(job_id)
+    except Exception:
+        return []
+
+
+def _replies_overdue(replies: List[Dict[str, Any]], max_wait_seconds: float) -> bool:
+    """True when the oldest queued reply has waited longer than the floor.
+
+    The wall-clock floor exists for the same reason the progress-commit one
+    does: the natural-break trigger is anti-correlated with need. An agent
+    stuck on a single long todo never completes one, so a break-only policy
+    strands its mail exactly when a supervisor is most likely to be writing.
+
+    An unparseable timestamp counts as overdue. Delivering a reply twice is a
+    tolerated outcome here (the ack path is explicitly at-least-once);
+    stranding one is the failure being fixed.
+    """
+    if max_wait_seconds <= 0:
+        return False
+
+    from datetime import datetime, timezone as tz
+
+    now = datetime.now(tz.utc)
+    for reply in replies:
+        raw = str(reply.get("timestamp") or "").strip()
+        if not raw:
+            return True
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=tz.utc)
+        except (ValueError, TypeError):
+            return True
+        if (now - parsed).total_seconds() >= max_wait_seconds:
+            return True
+    return False
+
+
+def _reply_key(reply: Dict[str, Any]) -> str:
+    """Stable identity for a queued reply.
+
+    Kept as a compatibility seam for existing imports/tests; the shared helper
+    prefers new UUIDs and hashes legacy thread/timestamp/body rows.
+    """
+    return queued_reply_key(reply)
+
+
+def _deliver_queued_replies(
+    job_id: str,
+    tool_context: "ToolContext",
+    config: AgentConfig,
+    result: Dict[str, Any],
+) -> None:
+    """Drain queued replies into the conversation at a natural break.
+
+    Steering has two lanes. Lane A (``pending_guidance``) is the urgent one and
+    renders as a transient block on every LLM turn — it does not pass through
+    here. Lane B is this one: non-urgent mail, held until the agent surfaces.
+
+    "Surfacing" used to mean a tactical->strategic phase boundary, which was a
+    reasonable proxy while phases were small. It stops being one as phases grow
+    — at three phases a job has exactly one such boundary, and a reply sent
+    during the review phase would never be delivered at all. A completed todo
+    is the better break: same intent ("finish the current unit of work, then
+    read your mail"), roughly an order of magnitude more often, and independent
+    of phase structure.
+
+    The reply is appended as a persistent HumanMessage rather than a transient
+    injection: unlike a nudge, a reply is durable information the agent should
+    still have several turns later.
+    """
+    inbox = _get_queued_replies(job_id)
+
+    # Drop anything already appended to the conversation. The ack is
+    # fire-and-forget, so the heartbeat keeps returning delivered entries for
+    # up to one interval; without this filter every todo completed inside that
+    # window would append the same reply again. Lane A can ignore this because
+    # its block is transient and re-rendered each turn — lane B's messages are
+    # persistent, so a duplicate would sit in history forever.
+    delivered = tool_context._delivered_reply_keys
+    replies = [r for r in inbox if _reply_key(r) not in delivered]
+
+    if not replies:
+        # Clear any stale break flag so it can't fire against later mail.
+        tool_context.consume_reply_drain()
+        return
+
+    at_break = tool_context.consume_reply_drain()
+    max_wait = float(getattr(config.limits, "queued_reply_max_wait_seconds", 300) or 0)
+    if not at_break and not _replies_overdue(replies, max_wait):
+        return
+
+    workspace = getattr(tool_context, "workspace_manager", None)
+    if workspace is not None:
+        try:
+            _write_reply_files(job_id, workspace, replies)
+        except Exception as e:
+            # The archive is best-effort; the conversation delivery below is
+            # the part that actually makes the agent act.
+            logger.warning(f"[{job_id}] Failed to archive queued replies: {e}")
+
+    result["messages"] = list(result.get("messages") or []) + [
+        HumanMessage(content=_format_drained_replies(replies))
+    ]
+
+    delivered.update(_reply_key(r) for r in replies)
+    # Persist the cumulative set in the SAME node update as the HumanMessage.
+    # A successor can therefore hydrate process-local dedup only from a
+    # checkpoint that already absorbed the corresponding reply content.
+    result["delivered_reply_keys"] = sorted(delivered)
+
+    if not tool_context._stateless_worker:
+        threads = sorted(
+            {str(r.get("thread_id")) for r in replies if r.get("thread_id")}
+        )
+        _ack_supervisor_guidance(job_id, reply_threads=threads)
+    logger.info(
+        f"[{job_id}] Delivered {len(replies)} queued reply(ies) at "
+        f"{'a completed todo' if at_break else 'the wall-clock floor'}"
+    )
+
+
+def _ack_supervisor_guidance(
+    job_id: str,
+    guidance_ids: Optional[List[str]] = None,
+    reply_threads: Optional[List[str]] = None,
+) -> None:
+    """Fire-and-forget delivery ack via the dual-mode orchestrator client.
+
+    Moves the named entries ``context.pending_guidance`` /
+    ``context.queued_replies`` → ``context.consumed_replies`` on the
+    orchestrator. Best-effort: failure just means redelivery.
+    """
+    try:
+        from src.api.dual_app import ack_guidance
+
+        ack_guidance(job_id, guidance_ids=guidance_ids, reply_threads=reply_threads)
+    except Exception:
+        pass
+
+
 def create_handle_transition_node(
     workspace: WorkspaceManager,
     todo_manager: TodoManager,
@@ -2324,6 +3599,7 @@ def create_handle_transition_node(
     max_todos: int = 20,
     postgres_db: Optional[Any] = None,
     tool_names: Optional[List[str]] = None,
+    tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the handle_transition node.
 
@@ -2350,12 +3626,33 @@ def create_handle_transition_node(
             f"{'strategic' if is_strategic else 'tactical'} phase"
         )
 
-        # Process queued async replies at tactical→strategic boundaries.
-        # Writes received message files to workspace so they appear in
-        # git_diff during the upcoming strategic review phase.
+        # Queued-reply BACKSTOP. The primary drain is now the natural-break one
+        # in audited_tools (a completed todo, plus a wall-clock floor), which is
+        # phase-independent and fires far more often. This path survives for the
+        # case that one cannot serve: outside the dual app there is no heartbeat
+        # inbox to read, so the DB is the only source.
+        #
+        # Filtered by the same delivered-keys set, because the two paths race:
+        # the natural-break ack is fire-and-forget, so a boundary reached before
+        # it lands would otherwise re-append mail the agent already has.
+        drained_replies: List[Dict[str, Any]] = []
         if not is_strategic and postgres_db:
             try:
-                await _process_queued_replies(job_id, workspace, postgres_db)
+                _already = (
+                    tool_context._delivered_reply_keys
+                    if tool_context is not None
+                    else None
+                )
+                drained_replies = await _process_queued_replies(
+                    job_id,
+                    workspace,
+                    postgres_db,
+                    delivered_reply_keys=_already,
+                )
+                if tool_context is not None and drained_replies:
+                    tool_context._delivered_reply_keys.update(
+                        _reply_key(r) for r in drained_replies
+                    )
             except Exception as e:
                 logger.warning(f"[{job_id}] Failed to process queued replies: {e}")
 
@@ -2423,6 +3720,53 @@ def create_handle_transition_node(
         if result.freeze_data:
             updates["freeze_data"] = result.freeze_data
 
+        # Tell the incoming strategic phase why it was called early. Without
+        # this the phase would see a boundary it cannot explain: the todos are
+        # archived with some still pending, and nothing says whether that was a
+        # deliberate replan or a failure. Cleared in the same breath so a stale
+        # reason cannot steer a later phase.
+        replan_reason = state.get("replan_reason")
+        if replan_reason:
+            replan_msg = HumanMessage(
+                content=(
+                    "[REPLAN REQUESTED] The previous phase ended early and on "
+                    "purpose — it is not a failure, and nothing was undone. "
+                    "Completed todos stayed completed; unfinished ones are in "
+                    "the phase archive with their real status.\n\n"
+                    f"Stated reason: {replan_reason}\n\n"
+                    "Check the plan against this, change what it invalidates, "
+                    "and stage the next batch. Work that is still valid does "
+                    "not need redoing — carry it forward."
+                )
+            )
+            updates["messages"] = list(updates.get("messages") or []) + [replan_msg]
+            updates["replan_reason"] = None
+
+        # Deliver drained queued replies into context (persistent HumanMessage
+        # — the boundary is already a compaction point, so cache impact is
+        # nil) and ack the drained threads so the orchestrator clears
+        # ``context.queued_replies`` (no re-materialization at the next
+        # boundary). If the ack fails the same replies are re-drained once —
+        # at-least-once beats the old unbounded duplicate loop.
+        if drained_replies:
+            reply_message = HumanMessage(
+                content=_format_drained_replies(drained_replies)
+            )
+            updates["messages"] = list(updates.get("messages") or []) + [reply_message]
+            if tool_context is None or not tool_context._stateless_worker:
+                drained_threads = sorted(
+                    {
+                        str(r.get("thread_id"))
+                        for r in drained_replies
+                        if r.get("thread_id")
+                    }
+                )
+                _ack_supervisor_guidance(job_id, reply_threads=drained_threads)
+            if tool_context is not None:
+                updates["delivered_reply_keys"] = sorted(
+                    tool_context._delivered_reply_keys
+                )
+
         # Phase 1d — Continue-as-New on orchestrator drain intent.
         # The lifecycle reconciler marks workers on a stale image with
         # ``intents.should_drain``; the dual_app heartbeat callback
@@ -2450,10 +3794,33 @@ def create_handle_transition_node(
                 )
             updates["freeze_data"] = upgrade_freeze
             updates["should_stop"] = True
+            # Clear any stale error the mid-phase run left in state: the phase
+            # boundary is clean and the resume continues from the checkpoint, so
+            # a residual error must not ride out with the freeze and get the
+            # orchestrator to fail (instead of pause) this re-dispatchable job.
+            # knowledge-history/done/version_upgrade_drain_masked_by_coincident_error.md
+            updates["error"] = None
+            updates.update(_worker_batch_disarm_updates())
             logger.info(
                 f"[{job_id}] Drain intent at phase boundary — "
                 f"freezing for version_upgrade re-dispatch"
             )
+        elif not (
+            updates.get("should_stop")
+            or updates.get("goal_achieved")
+            or updates.get("freeze_data") is not None
+            or updates.get("error")
+        ):
+            # Normal phase boundaries are the preferred rotation point: the
+            # transition and any pending replan have already been checkpointed.
+            # Drain intent wins above, and completion/human/error freezes from
+            # the transition win through this guard.
+            batch_updates = worker_batch_boundary_updates(
+                state, boundary="phase_boundary"
+            )
+            if batch_updates is not None:
+                updates.update(batch_updates)
+                _log_worker_batch_boundary(job_id, batch_updates)
         return updates
 
     return handle_transition
@@ -2631,6 +3998,65 @@ def create_check_goal_node(
     return check_goal
 
 
+def checkpoint_completion_report(
+    state: UniversalAgentState,
+) -> Dict[str, Any]:
+    """Freeze one completion operation identity and payload before graph END.
+
+    HTTP retries must not reconstruct this payload from live state: completion
+    freezes can contain timestamps and repository state that legitimately
+    change between attempts. A valid existing envelope therefore wins
+    verbatim. Resume nodes clear the pair before new work can reach another
+    genuine stop.
+
+    ``batch_boundary`` is a Continue-as-New handoff, not a completion report,
+    so it deliberately reaches END without minting an idempotency key.
+    """
+    freeze_data = state.get("freeze_data")
+    if (
+        isinstance(freeze_data, dict)
+        and freeze_data.get("freeze_type") == FREEZE_TYPE_BATCH_BOUNDARY
+    ):
+        return _clear_completion_report_updates(state)
+
+    report_id = state.get("client_report_id")
+    payload = state.get("completion_report_payload")
+    if isinstance(report_id, str) and isinstance(payload, dict):
+        try:
+            UUID(report_id)
+        except ValueError:
+            pass
+        else:
+            if set(payload) == _COMPLETION_REPORT_PAYLOAD_FIELDS:
+                return {}
+
+    report_payload: CompletionReportPayload = {
+        "should_stop": state.get("should_stop", False),
+        "goal_achieved": state.get("goal_achieved", False),
+        "error": deepcopy(state.get("error")),
+        "freeze_data": deepcopy(freeze_data),
+    }
+    return {
+        "client_report_id": str(uuid4()),
+        "completion_report_payload": report_payload,
+    }
+
+
+def _clear_completion_report_updates(
+    state: UniversalAgentState,
+) -> Dict[str, None]:
+    """Clear a prior stop's retry envelope only when one is present."""
+    if (
+        state.get("client_report_id") is None
+        and state.get("completion_report_payload") is None
+    ):
+        return {}
+    return {
+        "client_report_id": None,
+        "completion_report_payload": None,
+    }
+
+
 # =============================================================================
 # ROUTING FUNCTIONS
 # =============================================================================
@@ -2680,6 +4106,42 @@ def route_entry(
     return "init_workspace"
 
 
+def hydrate_todo_manager_from_state(
+    todo_manager: TodoManager,
+    state: UniversalAgentState | Dict[str, Any],
+) -> bool:
+    """Hydrate process-local todo state from one durable graph snapshot.
+
+    The graph entry node uses this on ordinary END-lane resumes.  The worker
+    driver also calls it before *any* resume because a checkpoint can continue
+    at a pending next node and bypass ``route_entry`` entirely (the historical
+    mid-loop resume bug).  Keeping the mapping here prevents those two paths
+    from drifting.
+
+    Returns ``True`` when the snapshot carried todo data.  Old checkpoints
+    without those fields retain the existing recovery behavior.
+    """
+
+    todos = state.get("todos")
+    staged_todos = state.get("staged_todos")
+    if todos is None and staged_todos is None:
+        # Phase is still useful to tools even for an old checkpoint.
+        todo_manager.is_strategic_phase = state.get("is_strategic_phase", True)
+        todo_manager.phase_number = state.get("phase_number", 1)
+        return False
+
+    todo_manager.restore_state(
+        {
+            "todos": todos,
+            "staged_todos": staged_todos,
+            "next_id": state.get("todo_next_id"),
+            "phase_number": state.get("phase_number", 1),
+            "is_strategic_phase": state.get("is_strategic_phase", True),
+        }
+    )
+    return True
+
+
 def create_restore_todo_state_node(
     todo_manager: TodoManager,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
@@ -2700,19 +4162,7 @@ def create_restore_todo_state_node(
         """Restore TodoManager from checkpointed state."""
         job_id = state.get("job_id", "unknown")
 
-        todos = state.get("todos")
-        staged_todos = state.get("staged_todos")
-        todo_next_id = state.get("todo_next_id")
-
-        # Check if we have todo state in the checkpoint
-        if todos is not None or staged_todos is not None:
-            todo_manager.restore_state(
-                {
-                    "todos": todos,
-                    "staged_todos": staged_todos,
-                    "next_id": todo_next_id,
-                }
-            )
+        if hydrate_todo_manager_from_state(todo_manager, state):
             logger.info(f"[{job_id}] Restored TodoManager from checkpoint state")
         else:
             # No todo state in checkpoint - this is expected for old checkpoints
@@ -2720,11 +4170,6 @@ def create_restore_todo_state_node(
             logger.warning(
                 f"[{job_id}] No todo state in checkpoint, using legacy recovery"
             )
-
-        # Also restore phase state on TodoManager for tool access
-        is_strategic = state.get("is_strategic_phase", True)
-        todo_manager.is_strategic_phase = is_strategic
-        todo_manager.phase_number = state.get("phase_number", 1)
 
         # Detect phase-boundary resume: agent had staged tactical todos ready
         # when it froze. Apply them and flip to tactical so execution continues
@@ -2738,7 +4183,7 @@ def create_restore_todo_state_node(
             )
 
             todo_state = todo_manager.export_state()
-            return {
+            updates: Dict[str, Any] = {
                 "is_strategic_phase": False,
                 "should_stop": False,
                 "goal_achieved": False,
@@ -2746,11 +4191,15 @@ def create_restore_todo_state_node(
                 "staged_todos": todo_state["staged_todos"],
                 "todo_next_id": todo_state["next_id"],
             }
+            updates.update(_clear_completion_report_updates(state))
+            return updates
 
         # Always clear stop flags on resume — the checkpoint may carry
         # should_stop=True from a previous freeze, which would cause
         # check_goal to immediately stop the graph.
-        return {"should_stop": False, "goal_achieved": False}
+        updates = {"should_stop": False, "goal_achieved": False}
+        updates.update(_clear_completion_report_updates(state))
+        return updates
 
     return restore_todo_state
 
@@ -2792,6 +4241,17 @@ def create_restore_from_feedback_node(
         feedback = state.get("resume_feedback", "")
         messages = state.get("messages", [])
 
+        # Why the job was resumed with feedback, as passed through the resume
+        # payload (``feedback_reason``). Free-form on purpose — new callers
+        # (e.g. a deliverable-gate bounce) inject their own reason without
+        # touching this node. Absent → honest generic fallback; the old
+        # hardcoded "previously frozen for human review" was frequently false
+        # (supervisor escalations arrive on running jobs that were never
+        # frozen for review).
+        resume_reason = (state.get("resume_reason") or "").strip() or (
+            "This job was interrupted and resumed with feedback from its operator."
+        )
+
         logger.info(
             f"[{job_id}] Restoring from feedback resume ({len(feedback)} chars)"
         )
@@ -2821,10 +4281,7 @@ def create_restore_from_feedback_node(
 
         # Step 2: Write feedback.md to workspace for persistence across context compaction
         feedback_content = (
-            f"# Human Feedback\n\n"
-            f"Received when resuming frozen job.\n\n"
-            f"## Feedback\n\n"
-            f"{feedback}\n"
+            f"# Resume Feedback\n\n{resume_reason}\n\n## Feedback\n\n{feedback}\n"
         )
         workspace.write_file("feedback.md", feedback_content)
         logger.info(f"[{job_id}] Wrote feedback.md to workspace")
@@ -2865,19 +4322,59 @@ def create_restore_from_feedback_node(
                 f"[{job_id}] Wrote received message to {msg_dir}/{seq:03d}_received.md"
             )
 
-        # Step 3: Create HumanMessage with formatted feedback
+        # Step 3: Create HumanMessage with formatted feedback. The banner
+        # states the ACTUAL cause (see resume_reason above), never a blanket
+        # "previously frozen for human review".
         feedback_message = HumanMessage(
             content=(
-                f"[FEEDBACK_RESUME] This job was previously frozen for human review. "
-                f"The human operator has provided feedback and resumed the job.\n\n"
-                f"## Human Feedback\n\n{feedback}\n\n"
+                f"[FEEDBACK_RESUME] {resume_reason}\n\n"
+                f"## Feedback\n\n{feedback}\n\n"
                 f"The feedback has been saved to feedback.md for reference. "
                 f"Process the feedback using the strategic todos below, then create "
                 f"corrective tactical todos to address each feedback item."
             )
         )
 
-        # Step 4: Load resume-specific strategic todos
+        # Step 4a: Archive any in-flight todos from the checkpoint before the
+        # resume todos replace them. This node is the entry point on a
+        # feedback resume (restore_todo_state never ran), so the manager is
+        # empty and the checkpointed todos would otherwise be silently
+        # discarded — the officer's steer used to destroy the very tactical
+        # work it was demanding. Archive with a preemption note instead
+        # (staged-but-unapplied todos are not in flight and are dropped as
+        # before).
+        checkpoint_todos = state.get("todos") or []
+        if checkpoint_todos:
+            todo_manager.restore_state(
+                {
+                    "todos": checkpoint_todos,
+                    "staged_todos": None,
+                    "next_id": state.get("todo_next_id"),
+                    "phase_number": state.get("phase_number", 0),
+                    "is_strategic_phase": state.get("is_strategic_phase", True),
+                }
+            )
+            if todo_manager.list_all():
+                try:
+                    archive_path = todo_manager.archive_with_failure_note(
+                        "A feedback resume preempted this phase before it "
+                        "completed — these todos were in flight, not failed. "
+                        "Re-plan against the feedback and re-stage whatever "
+                        "is still relevant.",
+                        phase_label="preempted",
+                        heading="Preempted by Feedback Resume",
+                    )
+                    logger.info(
+                        f"[{job_id}] Archived {len(checkpoint_todos)} in-flight "
+                        f"todo(s) preempted by feedback resume: {archive_path}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[{job_id}] Could not archive preempted todos "
+                        f"(continuing with resume): {e}"
+                    )
+
+        # Step 4b: Load resume-specific strategic todos
         resume_todos = get_resume_strategic_todos(config, tool_names=tool_names)
         todo_list = [todo.to_dict() for todo in resume_todos]
         todo_manager.set_todos_from_list(todo_list)
@@ -2900,6 +4397,8 @@ def create_restore_from_feedback_node(
                 iteration=state.get("iteration", 0),
                 data={
                     "feedback_length": len(feedback),
+                    "resume_reason": resume_reason,
+                    "preempted_todos": len(checkpoint_todos),
                     "resume_todos": len(resume_todos),
                     "messages_before": len(messages),
                     "messages_after": len(actual_messages),
@@ -2913,10 +4412,25 @@ def create_restore_from_feedback_node(
         # Include remove markers + compacted messages + feedback message
         result_messages = remove_markers + actual_messages + [feedback_message]
 
-        return {
+        # A feedback resume demands NEW work, so any journaled finalization
+        # decision from the previous round is void: clear the process caches
+        # (a loop-mode agent resumes in the SAME process, where the audited
+        # tool node would otherwise re-mirror the stale decision every batch)
+        # and null the checkpointed mirrors. The orchestrator drops the
+        # durable ``context.completion_decision`` in queue_job_for_resume.
+        from .tools.core.job import clear_final_phase_data
+        from .tools.evaluation.evaluation_tools import clear_verdict_data
+
+        clear_final_phase_data(job_id)
+        clear_verdict_data(job_id)
+
+        updates: Dict[str, Any] = {
             "messages": result_messages,
             "resume_feedback": None,  # Clear — consumed
+            "resume_reason": None,  # Clear — consumed
             "is_final_phase": False,
+            "completion_decision": None,  # Void — new round, new decision
+            "verdict_decision": None,  # Void — new round, new decision
             "should_stop": False,
             "goal_achieved": False,
             "is_strategic_phase": True,
@@ -2925,6 +4439,8 @@ def create_restore_from_feedback_node(
             "staged_todos": todo_state["staged_todos"],
             "todo_next_id": todo_state["next_id"],
         }
+        updates.update(_clear_completion_report_updates(state))
+        return updates
 
     return restore_from_feedback
 
@@ -2981,18 +4497,19 @@ def create_audited_tool_node(
     config: AgentConfig,
     recall_store=None,
     tool_context: Optional[ToolContext] = None,
+    memory_service: Optional[Any] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create a tool node with audit logging, stuck detection, and tool masking.
 
     This wraps LangGraph's ToolNode to add:
-    - MongoDB audit logging for tool calls and results
+    - Postgres audit logging for tool calls and results
     - Fingerprint-based loop detection → tool masking
     - Progress-based stuck detection → diagnostic messages → freeze
     - Category failure tracking → category-wide masking
     - Hard budget caps per phase
     - Tool-not-found enrichment with actionable guidance
 
-    See docs/features/stuck_agent_recovery.md for full design rationale.
+    See knowledge-base/knowledge/features/stuck_agent_recovery.md for full design rationale.
 
     Args:
         tools: List of tool objects
@@ -3003,11 +4520,17 @@ def create_audited_tool_node(
     Returns:
         A callable node function with audit logging
     """
-    tool_node = ToolNode(tools, handle_tool_errors=True)
+    tool_node = ToolNode(
+        tools, handle_tool_errors=_handle_tool_errors_reraise_workspace
+    )
+    _tools_by_name = {
+        getattr(tool, "name", ""): tool for tool in tools if getattr(tool, "name", "")
+    }
 
     # Loop detection state: track recent tool calls as (name, args_hash) tuples
     import hashlib
     from collections import deque
+    from fnmatch import fnmatch
 
     _tool_call_history: deque = deque(maxlen=30)
     _LOOP_WARNING_THRESHOLD = 10  # warn after 10 identical calls in last 30
@@ -3016,6 +4539,7 @@ def create_audited_tool_node(
     _calls_since_progress = [0]
     _reflection_injected = [False]
     _phase_tool_call_count = [0]
+    _job_tool_call_count = [0]  # never reset at a phase boundary
     _last_phase_number = [-1]
 
     # Loop warning state: signatures that have triggered warnings
@@ -3023,8 +4547,26 @@ def create_audited_tool_node(
     _category_failures: dict = {}  # category -> set of failed tool names
 
     # Config-driven thresholds
-    _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 15
-    _HARD_CAP = config.limits.max_tool_calls_per_phase  # default 100
+    _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 30
+    # Per-phase ceiling, now OFF by default (0). See LimitsConfig.
+    _PHASE_CAP = config.limits.max_tool_calls_per_phase
+    # Job ceiling — the actual backstop. Counted across phases, never reset at a
+    # boundary, because bounding a *phase* stopped bounding a *job* the moment
+    # phases got large.
+    _JOB_CAP = getattr(config.limits, "max_tool_calls_per_job", 5000)
+
+    # Act-ratio tripwire: N consecutive executed tool actions touching ONLY
+    # process artifacts (todos/plan/archive) get a one-line "stop planning"
+    # nudge. Patterns come from config; 0 disables.
+    _ACT_RATIO_THRESHOLD = config.limits.act_ratio_nudge_threshold  # default 6
+    _PROCESS_PATTERNS = [
+        str(p).lstrip("/").strip()
+        for p in (config.limits.process_artifact_patterns or [])
+    ]
+    _process_only_streak = [0]
+
+    _TOOL_TIMEOUT_RETRIES = [0]  # tracks consecutive batch timeouts
+    _TOOL_BATCH_TIMEOUT_SECONDS = 900  # absolute cap for any audited tool batch
 
     # Tools that indicate forward progress (reset stuck counter)
     PROGRESS_TOOLS = {
@@ -3036,6 +4578,36 @@ def create_audited_tool_node(
         "kb_write",
         "kb_update",
     }
+
+    # Todo-state tools manipulate todos.yaml by definition — they count as
+    # process actions for the act-ratio tripwire.
+    TODO_STATE_TOOLS = {
+        "todo_complete",
+        "todo_list",
+        "request_replan",
+        "next_phase_todos",
+    }
+
+    # Arg keys inspected for file targets when classifying process actions.
+    # Content-bearing args (e.g. write_file's `content`) are deliberately
+    # excluded — only the target path decides.
+    PATH_ARG_KEYS = ("path", "file_path", "source", "dest", "directory", "filename")
+
+    def _is_process_action(name: str, args: Optional[dict]) -> bool:
+        """True when a call touches only process artifacts (act-ratio guard)."""
+        if name in TODO_STATE_TOOLS:
+            return True
+        targets = []
+        for key in PATH_ARG_KEYS:
+            value = (args or {}).get(key)
+            if isinstance(value, str) and value.strip():
+                targets.append(value.lstrip("/").strip())
+        if not targets:
+            return False
+        return all(
+            any(fnmatch(target, pattern) for pattern in _PROCESS_PATTERNS)
+            for target in targets
+        )
 
     TOOL_NOT_FOUND_PATTERN = "is not a valid tool"
 
@@ -3052,6 +4624,65 @@ def create_audited_tool_node(
             for name, meta in TOOL_REGISTRY.items()
             if meta.get("category") == category
         ]
+
+    def _get_tool_category_timeout(tool_name: str) -> int:
+        configured = dict(config.limits.tool_category_timeouts or {})
+        category = _get_tool_category(tool_name) or "default"
+        fallback = int(configured.get("default", 120))
+        raw = configured.get(category, fallback)
+        value = raw if isinstance(raw, (int, float)) else fallback
+        timeout = int(value)
+        if timeout <= 0:
+            timeout = max(1, int(fallback))
+        return timeout
+
+    def _get_batch_tool_timeout(tool_calls: List[dict]) -> int:
+        if not tool_calls:
+            return max(
+                1,
+                int((config.limits.tool_category_timeouts or {}).get("default", 120)),
+            )
+        timeout = max(_get_tool_category_timeout(tc["name"]) for tc in tool_calls)
+        return min(_TOOL_BATCH_TIMEOUT_SECONDS, max(1, timeout))
+
+    def _build_timeout_error_result(
+        tool_calls: List[dict], timeout_seconds: int, hint: str = ""
+    ) -> Dict[str, Any]:
+        timeout_msgs: list[ToolMessage] = []
+        for tc in tool_calls:
+            call_id = tc["call_id"]
+            name = tc["name"]
+            content = (
+                f"Error: tool execution timed out after {timeout_seconds}s for "
+                f"tool '{name}'."
+            )
+            if hint:
+                content += f" {hint}"
+            timeout_msgs.append(
+                ToolMessage(
+                    content=content,
+                    tool_call_id=call_id,
+                    name=name,
+                )
+            )
+        return {"messages": timeout_msgs}
+
+    def _reconnect_workspace() -> None:
+        if not tool_context or not tool_context.workspace_manager:
+            raise WorkspaceUnavailableError(
+                "Tool execution timed out and no workspace manager is available"
+            )
+        backend = tool_context.workspace_manager.backend
+        # Tool cancellation does not stop a synchronous worker thread already
+        # executing inside remote tmux. disconnect() is transport-only so that
+        # claim handoff preserves shell state; timeout recovery is the one path
+        # that must explicitly and synchronously reset the exact owned shell
+        # first. If the fence cannot prove the reset, fail recovery rather than
+        # let a late command mutate the workspace after its timeout result.
+        if backend.supports_shell:
+            backend.shell_reset_after_timeout()
+        backend.disconnect()
+        backend.connect()
 
     # Build phase-allowed tool sets for defense-in-depth validation.
     # Primary enforcement is LLM schema binding; this catches hallucinated calls.
@@ -3078,12 +4709,43 @@ def create_audited_tool_node(
         phase_number = state.get("phase_number", 0)
         phase_str = "strategic" if is_strategic else "tactical"
 
+        # A checkpoint may resume directly at this node after the LLM response
+        # was persisted. Rehydrate the phase clock before ToolNode evaluates
+        # instruction bindings; otherwise phase-scoped gates see the fresh
+        # ToolContext defaults and can be skipped on the first successor batch.
+        if tool_context is not None:
+            tool_context.set_current_phase(
+                phase_str,
+                phase_number=phase_number,
+                turn_count=state.get("turn_count", 0),
+            )
+
         # Extract tool calls from last message
         tool_calls_info = []
         if messages and isinstance(messages[-1], AIMessage):
             last_msg = messages[-1]
             if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                 for tc in last_msg.tool_calls:
+                    # Repair array arguments a weak model encoded as a JSON
+                    # string or a wrapper object BEFORE ToolNode validates
+                    # them. Mutating the call on the message is deliberate:
+                    # ToolNode reads from the message, not from this copy.
+                    # Without it the model gets "Input should be a valid list",
+                    # retries with the other wrong shape, and eventually drops
+                    # the argument entirely — a silent wrong answer.
+                    tool_obj = _tools_by_name.get(tc.get("name", ""))
+                    if tool_obj is not None:
+                        coerced, repaired_fields = coerce_tool_args(
+                            getattr(tool_obj, "args_schema", None),
+                            tc.get("args", {}),
+                        )
+                        if repaired_fields:
+                            tc["args"] = coerced
+                            logger.info(
+                                "Repaired list argument(s) %s on %s",
+                                ", ".join(repaired_fields),
+                                tc.get("name", "unknown"),
+                            )
                     tool_calls_info.append(
                         {
                             "name": tc.get("name", "unknown"),
@@ -3095,7 +4757,11 @@ def create_audited_tool_node(
         # Defense-in-depth: reject tool calls not declared for the current phase.
         # LLM schema binding is the primary gate; this catches hallucinated calls.
         # ToolNode can't selectively skip calls, so if any call violates the
-        # phase gate we reject the entire batch with explicit error messages.
+        # phase gate we reject the entire batch — but only the violating calls
+        # get the "not available" error. Co-batched phase-legal calls get an
+        # honest "not executed, re-issue" message: telling a legal tool it is
+        # phase-illegal teaches the model its tool surface is unreliable
+        # (proven "stale palette" belief spiral, job edd06963).
         allowed = _phase_allowed.get(phase_str, set())
         phase_violations = [
             tc
@@ -3108,13 +4774,28 @@ def create_audited_tool_node(
                 f"[{job_id}] Phase gate: {violated_names} not available "
                 f"in {phase_str} phase — rejecting entire batch"
             )
+            # Violation is decided purely by tool name, so name membership
+            # exactly identifies the violating calls.
+            violated_name_set = set(violated_names)
+            violated_list = ", ".join(f"'{n}'" for n in sorted(violated_name_set))
             return {
                 "messages": [
                     ToolMessage(
                         content=(
-                            f"Error: '{tc['name']}' is not available in the "
-                            f"{phase_str} phase. Use tools appropriate for "
-                            f"this phase."
+                            (
+                                f"Error: '{tc['name']}' is not available in the "
+                                f"{phase_str} phase. Use tools appropriate for "
+                                f"this phase."
+                            )
+                            if tc["name"] in violated_name_set
+                            else (
+                                f"Not executed: '{tc['name']}' IS available in "
+                                f"the {phase_str} phase, but the batch also "
+                                f"contained {violated_list} (not available in "
+                                f"this phase) and was rejected as a whole. "
+                                f"Re-issue '{tc['name']}' in a new batch "
+                                f"without the phase-restricted tool."
+                            )
                         ),
                         tool_call_id=tc["call_id"],
                         name=tc["name"],
@@ -3130,95 +4811,77 @@ def create_audited_tool_node(
             _calls_since_progress[0] = 0
             _reflection_injected[0] = False
             _phase_tool_call_count[0] = 0
+            _process_only_streak[0] = 0
             _warned_signatures.clear()
             _category_failures.clear()
+            _TOOL_TIMEOUT_RETRIES[0] = 0
 
-        # Hard cap check
+        # Budget check. The job ceiling is the real backstop; the per-phase one
+        # is an opt-in extra (0 = off) and no longer fires by default.
         _phase_tool_call_count[0] += len(tool_calls_info)
-        if _phase_tool_call_count[0] > _HARD_CAP:
-            if phase_str == "strategic":
-                # Strategic phases should be short — freeze if budget exceeded.
-                logger.error(
-                    f"[{job_id}] Hard cap in strategic phase: "
-                    f"{_phase_tool_call_count[0]} calls "
-                    f"(phase {phase_number})"
-                )
-                freeze_data = {
-                    "freeze_type": "budget_exceeded",
-                    "phase": phase_str,
-                    "phase_number": phase_number,
-                    "reason": f"Hard cap of {_HARD_CAP} tool calls exceeded in strategic phase",
-                    "tool_calls_this_phase": _phase_tool_call_count[0],
-                    "warned_signatures": len(_warned_signatures),
-                }
-                if tool_context and tool_context.workspace_manager:
-                    try:
-                        tool_context.workspace_manager.write_file(
-                            "output/job_frozen.json",
-                            json.dumps(freeze_data, indent=2, ensure_ascii=False),
-                        )
-                    except Exception as e:
-                        logger.error(f"[{job_id}] Failed to write freeze file: {e}")
-                freeze_msgs = [
-                    ToolMessage(
-                        content=(
-                            f"PHASE FROZEN: {_phase_tool_call_count[0]} tool "
-                            "calls in strategic phase without completing "
-                            "review. Job paused for human review."
-                        ),
-                        tool_call_id=tc["call_id"],
-                        name=tc["name"],
+        _job_tool_call_count[0] += len(tool_calls_info)
+        _over_job_cap = _JOB_CAP > 0 and _job_tool_call_count[0] > _JOB_CAP
+        _over_phase_cap = _PHASE_CAP > 0 and _phase_tool_call_count[0] > _PHASE_CAP
+        if _over_job_cap or _over_phase_cap:
+            # Always freeze — never the old destructive tactical rewind, which
+            # called archive_with_failure_note and so wrote every todo (the
+            # COMPLETED ones included) into a failure archive and emptied the
+            # list. That is the same behaviour removed from request_replan, and
+            # it destroyed the phase record of a job that had usually done real
+            # work. A freeze loses nothing: budget_exceeded parks for human
+            # review (it is not in AUTO_REDISPATCH_FREEZE_TYPES), and the
+            # workspace is committed and pushed.
+            _scope = "job" if _over_job_cap else "phase"
+            _cap = _JOB_CAP if _over_job_cap else _PHASE_CAP
+            _used = (
+                _job_tool_call_count[0] if _over_job_cap else _phase_tool_call_count[0]
+            )
+            logger.error(
+                f"[{job_id}] Tool-call budget exceeded ({_scope}): "
+                f"{_used} > {_cap} (phase {phase_number} {phase_str})"
+            )
+            freeze_data = {
+                "freeze_type": "budget_exceeded",
+                "phase": phase_str,
+                "phase_number": phase_number,
+                "reason": (
+                    f"{_scope.capitalize()} budget of {_cap} tool calls "
+                    f"exceeded ({_used} used)"
+                ),
+                "budget_scope": _scope,
+                "tool_calls_this_phase": _phase_tool_call_count[0],
+                "tool_calls_this_job": _job_tool_call_count[0],
+                "warned_signatures": len(_warned_signatures),
+            }
+            if tool_context and tool_context.workspace_manager:
+                try:
+                    tool_context.workspace_manager.write_file(
+                        "output/job_frozen.json",
+                        json.dumps(freeze_data, indent=2, ensure_ascii=False),
                     )
-                    for tc in tool_calls_info
-                ]
-                return {"should_stop": True, "messages": freeze_msgs}
-            else:
-                # Tactical phase — don't freeze, rewind and let the agent retry.
-                logger.warning(
-                    f"[{job_id}] Hard cap in tactical phase: "
-                    f"{_phase_tool_call_count[0]} calls "
-                    f"(phase {phase_number}). Triggering rewind."
+                except Exception as e:
+                    logger.error(f"[{job_id}] Failed to write freeze file: {e}")
+            # Push before parking: a human is about to read this workspace.
+            _committer = getattr(tool_context, "progress_committer", None)
+            if _committer is not None:
+                _committer.flush(f"Frozen: {_scope} tool-call budget exceeded")
+            freeze_msgs = [
+                ToolMessage(
+                    content=(
+                        f"JOB FROZEN: {_used} tool calls exceeded the {_scope} "
+                        f"budget of {_cap}. Nothing was discarded — your todos, "
+                        "files and commits are intact. Parked for human review."
+                    ),
+                    tool_call_id=tc["call_id"],
+                    name=tc["name"],
                 )
-                rewind_note = f"Budget of {_HARD_CAP} tool calls reached in this phase"
-                # Archive current todos and clear the list
-                if tool_context and tool_context.todo_manager:
-                    try:
-                        tool_context.todo_manager.archive_with_failure_note(rewind_note)
-                        if tool_context.todo_manager.has_staged_todos():
-                            tool_context.todo_manager.clear_staged_todos()
-                    except Exception as e:
-                        logger.error(f"[{job_id}] Failed to rewind todos: {e}")
-                # Capture count before reset for the message
-                calls_used = _phase_tool_call_count[0]
-                # Reset counters so the next phase starts fresh
-                _phase_tool_call_count[0] = 0
-                _calls_since_progress[0] = 0
-                _tool_call_history.clear()
-                _warned_signatures.clear()
-                _reflection_injected[0] = False
-
-                rewind_msg = SystemMessage(
-                    content=format_nudge(
-                        "budget_rewind",
-                        model=config.llm.model,
-                        used=calls_used,
-                        cap=_HARD_CAP,
-                    )
-                )
-                # Return ToolMessages (to satisfy pending tool calls) + the rewind message.
-                # Don't execute the tools — skip straight to the rewind.
-                tool_msgs = [
-                    ToolMessage(
-                        content=(
-                            f"Skipped: phase budget of {_HARD_CAP} tool calls "
-                            "reached. Todos archived — rethink your approach."
-                        ),
-                        tool_call_id=tc["call_id"],
-                        name=tc["name"],
-                    )
-                    for tc in tool_calls_info
-                ]
-                return {"messages": tool_msgs + [rewind_msg]}
+                for tc in tool_calls_info
+            ]
+            return {
+                "should_stop": True,
+                "freeze_data": freeze_data,
+                "messages": freeze_msgs,
+            }
 
         # Fingerprint-based loop detection -> track signatures for warnings
         _loop_warned_call_ids: set = set()  # call_ids to warn about after execution
@@ -3259,8 +4922,73 @@ def create_audited_tool_node(
 
         # Execute all tools (loop detection is advisory, never blocks execution)
         start_time = time.time()
-        result = await tool_node.ainvoke(state)
+        batch_timeout = _get_batch_tool_timeout(tool_calls_info)
+        executed_tool_batch = len(tool_calls_info) > 0
+        try:
+            result = await asyncio.wait_for(
+                tool_node.ainvoke(state), timeout=batch_timeout
+            )
+            _TOOL_TIMEOUT_RETRIES[0] = 0
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[{job_id}] Tool batch timed out after {batch_timeout}s "
+                f"across {len(tool_calls_info)} calls"
+            )
+            # A delegation-only batch (spawn_subagent fan-out) runs in-process
+            # LLM loops, not workspace SSH ops — its latency says nothing about
+            # workspace health. Reconnecting would cancel nothing useful and
+            # escalating to WorkspaceUnavailableError fails the whole job over
+            # a slow fan-out (job 472ea457). Return timeout ToolMessages and
+            # let the LLM adapt; the SSH wedge watchdog stays armed for every
+            # other category.
+            delegation_only = bool(tool_calls_info) and all(
+                _get_tool_category(tc["name"]) == "delegation" for tc in tool_calls_info
+            )
+            if delegation_only:
+                result = _build_timeout_error_result(
+                    tool_calls_info,
+                    batch_timeout,
+                    hint=(
+                        "The subagent batch was cancelled for exceeding its "
+                        "time budget; the workspace itself is healthy. Spawn "
+                        "fewer subagents per turn or give each a narrower "
+                        "task, or continue without them."
+                    ),
+                )
+            else:
+                if _TOOL_TIMEOUT_RETRIES[0] >= 1:
+                    _TOOL_TIMEOUT_RETRIES[0] = 0
+                    raise WorkspaceUnavailableError(
+                        "Tool batch repeatedly timed out — workspace may be wedged"
+                    )
+
+                _TOOL_TIMEOUT_RETRIES[0] += 1
+                try:
+                    _reconnect_workspace()
+                except Exception as e:
+                    logger.error(
+                        f"[{job_id}] Tool-batch reconnect failed after timeout: {e}"
+                    )
+                    raise WorkspaceUnavailableError(
+                        f"Tool batch timeout recovery failed: {e}"
+                    )
+
+                result = _build_timeout_error_result(tool_calls_info, batch_timeout)
         execution_time_ms = int((time.time() - start_time) * 1000)
+
+        # Heartbeat visibility marker:
+        # each completed tool batch increments a monotonic counter so the
+        # orchestrator can detect long-running "still heartbeating, no progress"
+        # stalls.
+        if executed_tool_batch and tool_context is not None:
+            increment_progress = getattr(tool_context, "next_graph_progress", None)
+            if callable(increment_progress):
+                try:
+                    increment_progress()
+                except Exception:
+                    logger.debug(
+                        "Failed to increment graph progress marker", exc_info=True
+                    )
 
         # Append loop warnings to tool results for flagged calls
         if _loop_warned_call_ids and "messages" in result:
@@ -3275,19 +5003,10 @@ def create_audited_tool_node(
                         + format_nudge("loop_warning_suffix", model=config.llm.model)
                     )
 
-        # Check for workspace unavailable errors (VM connection lost).
-        # ToolNode catches all exceptions and turns them into error messages,
-        # but WorkspaceUnavailableError should propagate for VM recovery.
-        if "messages" in result:
-            for msg in result["messages"]:
-                if isinstance(msg, ToolMessage) and msg.content:
-                    if "WorkspaceUnavailableError" in msg.content:
-                        from .core.workspace_backend import WorkspaceUnavailableError
-
-                        raise WorkspaceUnavailableError(
-                            f"VM workspace connection lost during tool execution: "
-                            f"{msg.content[:300]}"
-                        )
+        # Workspace-unavailable errors now propagate by TYPE: the ToolNode error
+        # handler (_handle_tool_errors_reraise_workspace) re-raises
+        # WorkspaceUnavailableError out of tool_node.ainvoke, so it bubbles to
+        # agent.py's isinstance check. No substring watchdog needed.
 
         # Multimodal image delivery: image-bearing tools embed base64 in a
         # `<image_data>` / `<page_image>` tag inside the result string.
@@ -3298,6 +5017,7 @@ def create_audited_tool_node(
         # the base64 lives transiently in this local `result`.
         if "messages" in result:
             image_followups: list[HumanMessage] = []
+            img_max_edge = resolve_image_max_edge(config)
             for msg in result["messages"]:
                 if not isinstance(msg, ToolMessage) or not msg.content:
                     continue
@@ -3309,6 +5029,7 @@ def create_audited_tool_node(
                     make_multimodal_user_message(
                         text=(f"Image content from tool call {msg.tool_call_id}:"),
                         images=extracted,
+                        max_edge=img_max_edge,
                     )
                 )
             if image_followups:
@@ -3371,14 +5092,14 @@ def create_audited_tool_node(
         else:
             _calls_since_progress[0] += len(tool_calls_info)
 
-        # todo_rewind is a deliberate re-plan: reset loop detection state
-        if "todo_rewind" in {tc["name"] for tc in tool_calls_info}:
+        # request_replan is a deliberate re-plan: reset loop detection state
+        if "request_replan" in {tc["name"] for tc in tool_calls_info}:
             for msg in result.get("messages", []):
                 if (
                     isinstance(msg, ToolMessage)
                     and not _is_tool_error(msg.content or "")
                     and any(
-                        tc["name"] == "todo_rewind"
+                        tc["name"] == "request_replan"
                         and tc["call_id"] == msg.tool_call_id
                         for tc in tool_calls_info
                     )
@@ -3387,22 +5108,29 @@ def create_audited_tool_node(
                     _warned_signatures.clear()
                     _calls_since_progress[0] = 0
                     _reflection_injected[0] = False
-                    logger.info(f"[{job_id}] Loop detection reset after todo_rewind")
+                    logger.info(f"[{job_id}] Loop detection reset after request_replan")
                     break
 
         # Progress nudge: periodic reminders to write findings down.
-        # Never freezes the job — the hard cap (Layer 4) is the only stop.
+        # Never freezes the job — the job budget is the only stop.
         if _calls_since_progress[0] >= _PROGRESS_THRESHOLD:
             calls = _calls_since_progress[0]
             nudge_count = (calls - _PROGRESS_THRESHOLD) // _PROGRESS_THRESHOLD + 1
             # Inject a nudge every _PROGRESS_THRESHOLD calls without progress
             if calls == _PROGRESS_THRESHOLD or calls % _PROGRESS_THRESHOLD == 0:
-                remaining = _HARD_CAP - _phase_tool_call_count[0]
+                # Quote the budget only when one is actually armed — an
+                # unbounded job must not be told it has "0 calls remaining".
+                if _JOB_CAP > 0:
+                    budget_line = (
+                        f" Job budget: {_JOB_CAP - _job_tool_call_count[0]}/"
+                        f"{_JOB_CAP} calls remaining."
+                    )
+                else:
+                    budget_line = ""
                 diagnostic = SystemMessage(
                     content=(
                         f"OBSERVATION: {calls} tool calls since the last file "
-                        f"write or todo completion. Phase budget: "
-                        f"{remaining}/{_HARD_CAP} calls remaining.\n\n"
+                        f"write or todo completion.{budget_line}\n\n"
                         "If you have gathered useful information, write it to "
                         "a file now — findings not written to files are lost "
                         "during context compaction. If you still need specific "
@@ -3414,6 +5142,33 @@ def create_audited_tool_node(
                     f"[{job_id}] Progress nudge #{nudge_count}: "
                     f"{calls} calls without progress "
                     f"(phase {phase_number} {phase_str})"
+                )
+
+        # Act-ratio tripwire: count consecutive process-artifact-only actions;
+        # any concrete action resets. At threshold, inject the one-line nudge
+        # and re-arm the counter.
+        if _ACT_RATIO_THRESHOLD > 0 and executed_tool_batch:
+            if all(
+                _is_process_action(tc["name"], tc["args"]) for tc in tool_calls_info
+            ):
+                _process_only_streak[0] += len(tool_calls_info)
+            else:
+                _process_only_streak[0] = 0
+            if _process_only_streak[0] >= _ACT_RATIO_THRESHOLD:
+                streak = _process_only_streak[0]
+                _process_only_streak[0] = 0
+                result.setdefault("messages", []).append(
+                    SystemMessage(
+                        content=format_nudge(
+                            "act_ratio_nudge",
+                            model=config.llm.model,
+                            count=streak,
+                        )
+                    )
+                )
+                logger.info(
+                    f"[{job_id}] Act-ratio nudge: {streak} consecutive "
+                    f"process-artifact actions (phase {phase_number} {phase_str})"
                 )
 
         # Update tool audit documents with results
@@ -3435,8 +5190,21 @@ def create_audited_tool_node(
                             error=content[:500] if is_error else None,
                         )
 
-        # Memory Light: flush queued memories from sync tool functions
-        if recall_store and tool_context:
+        # Memory Light: flush queued memories from sync tool functions.
+        # Manager path (memory overhaul Phase 1): the queued_memory writer
+        # reproduces the per-item store loop below.
+        if memory_service is not None and tool_context:
+            _queued = tool_context.drain_pending_memories()
+            if _queued:
+                from src.services.memory import CaptureEvent
+
+                await memory_service.capture(
+                    CaptureEvent(
+                        kind="todo_complete",
+                        extra={"queued_memories": _queued},
+                    )
+                )
+        elif recall_store and tool_context:
             for mem in tool_context.drain_pending_memories():
                 try:
                     await recall_store.store(**mem)
@@ -3457,6 +5225,15 @@ def create_audited_tool_node(
                         ws.git_manager.commit("Job frozen: waiting for reply")
                     result["should_stop"] = True
                     result["freeze_data"] = freeze_req
+                    # Push immediately rather than waiting for the throttle: the
+                    # entire point of this freeze is that a human or the officer
+                    # is about to read the workspace. Deliberately ordered AFTER
+                    # the freeze state is recorded — this shares the enclosing
+                    # try, and losing the freeze to a git error would be far
+                    # worse than a late push.
+                    _committer = getattr(tool_context, "progress_committer", None)
+                    if _committer is not None:
+                        _committer.flush("Job frozen: waiting for reply")
                     logger.info(
                         f"[{job_id}] Freeze requested by tool: "
                         f"{freeze_req.get('freeze_type')}"
@@ -3464,9 +5241,75 @@ def create_audited_tool_node(
                 except Exception as e:
                     logger.error(f"[{job_id}] Failed to process freeze request: {e}")
 
+        # Wall-clock durability floor. todo_complete is the primary commit
+        # trigger, but it is anti-correlated with need: an agent stuck on one
+        # long todo never calls it, so a todo-only policy goes silent exactly
+        # when an observer most needs to see movement. This is the backstop —
+        # and it stays cheap, because the committer checks elapsed time locally
+        # before touching git at all.
+        if tool_context is not None:
+            _committer = getattr(tool_context, "progress_committer", None)
+            if _committer is not None:
+                _committer.on_turn()
+
+        # Steering lane B: deliver queued (non-urgent) replies at the agent's
+        # natural break. Lane A (urgent guidance) does not come through here —
+        # it re-renders every turn in execute() and is unaffected.
+        if tool_context is not None:
+            try:
+                _deliver_queued_replies(job_id, tool_context, config, result)
+            except Exception as e:
+                logger.warning(f"[{job_id}] Queued-reply delivery failed: {e}")
+
+        # Instruction enforcement receipts are semantic process state for a
+        # stateless worker: a batch can rotate after read_file and before the
+        # gated tool call. Checkpoint only those configured instruction reads,
+        # never ordinary read-before-write authorization. The successor
+        # validates content/phase/turn freshness before restoring them.
+        if tool_context is not None and tool_context._stateless_worker:
+            result["instruction_read_receipts"] = (
+                tool_context.export_instruction_read_receipts()
+            )
+
+        # Finalization-decision mirror (journal-before-observe step 3, vault
+        # issues/job_finalization_decisions_held_only_in_process_memory.md):
+        # the module dicts are populated only AFTER the orchestrator durably
+        # committed the decision, so mirroring them into checkpointed state
+        # here means any checkpoint that contains the tool result also
+        # contains the decision — a restart can no longer separate them.
+        # Riding the node's own update (instead of a Command return from
+        # inside the tool) keeps this wrapper's result post-processing intact
+        # and gives the mirror single-writer semantics per super-step, so no
+        # append reducer is needed. Re-asserted on every batch on purpose:
+        # after resume hydration re-seeds the cache, the next batch restores
+        # the state mirror too.
+        result.update(_decision_state_mirror(job_id))
+
         return result
 
     return audited_tools
+
+
+def _decision_state_mirror(job_id: str) -> Dict[str, Any]:
+    """State updates mirroring any journaled finalization decision.
+
+    Reads the process caches that ``job_complete`` / the verdict tools
+    populate only after their durable write succeeded. Returns ``{}`` when no
+    decision exists, so callers can merge unconditionally.
+    """
+    from .tools.core.job import get_final_phase_data
+    from .tools.evaluation.evaluation_tools import get_verdict_data
+
+    updates: Dict[str, Any] = {}
+    final_decision = get_final_phase_data(job_id)
+    verdict_decision = get_verdict_data(job_id)
+    if final_decision:
+        updates["completion_decision"] = final_decision
+    if verdict_decision:
+        updates["verdict_decision"] = verdict_decision
+    if updates:
+        updates["is_final_phase"] = True
+    return updates
 
 
 # =============================================================================
@@ -3546,26 +5389,40 @@ def build_phase_alternation_graph(
         message_count_min_tokens=config.limits.message_count_min_tokens,
         keep_recent_messages=config.context_management.keep_recent_messages,
         keep_recent_tool_results=config.context_management.keep_recent_tool_results,
-        # Safety layer constants
+        keep_window_max_tool_result_chars=config.context_management.keep_window_max_tool_result_chars,
+        # Safety layer constant (summarization budgets are computed at call
+        # time from the aux model's window — src/core/summarizer.py)
         model_max_context_tokens=config.limits.model_max_context_tokens,
-        summarization_safe_limit=config.limits.summarization_safe_limit,
-        summarization_chunk_size=config.limits.summarization_chunk_size,
+        # Per-family image-token estimator config (matrix settings.image_tokens).
+        image_tokens=config.limits.image_tokens,
     )
     strategic_config = config.llm.get_phase_config("strategic")
     tactical_config = config.llm.get_phase_config("tactical")
-    summarization_config = config.llm.get_phase_config("summarization")
     context_mgr = ContextManager(
         config=context_config,
         model=config.llm.model,
         strategic_model=strategic_config.model,
         tactical_model=tactical_config.model,
-        summarization_timeout=summarization_config.timeout
-        or config.llm.timeout
-        or 600.0,
+        summarization_call_timeout=config.auxiliary.summarization_call_timeout,
     )
 
-    # Create retry manager for LLM call retries
-    retry_manager = ToolRetryManager(max_retries=config.limits.tool_retry_count)
+    # Compaction progress for worker agents goes to the log (persistent
+    # sessions broadcast SSE frames instead — persistent_app wires its own).
+    async def _log_compaction_progress(event: str, params: Dict[str, Any]) -> None:
+        if event == "compaction.progress":
+            logger.info(
+                f"[compaction] pass {params.get('pass')}/{params.get('n_passes')} "
+                f"(messages {params.get('first_msg')}-{params.get('last_msg')}, "
+                f"{params.get('in_tokens')} tok in, attempt {params.get('attempt')})"
+            )
+        else:
+            logger.info(f"[compaction] {event}: {params}")
+
+    context_mgr.set_progress_callback(_log_compaction_progress)
+
+    # Create retry manager for LLM call retries (Tier-1 in-process fast retries;
+    # exhaustion triggers the Tier-2 pause+backoff freeze in the execute node).
+    retry_manager = ToolRetryManager(max_retries=config.limits.llm_inproc_retries)
 
     # Load summarization prompt (use summarization model for matrix resolution)
     summarization_config = config.llm.get_phase_config("summarization")
@@ -3582,6 +5439,12 @@ def build_phase_alternation_graph(
         config, "memory_assembler", model=aux_model
     )
     curation_prompt = load_auxiliary_prompt(config, "curation", model=aux_model)
+    knowledge_assembler_prompt = load_auxiliary_prompt(
+        config, "knowledge_assembler", model=aux_model
+    )
+    knowledge_verdict_prompt = load_auxiliary_prompt(
+        config, "knowledge_verdict", model=aux_model
+    )
 
     # workspace_template is no longer used — workspace.md replaced by
     # project knowledge base + memory system. Parameter kept for backward compat.
@@ -3591,10 +5454,63 @@ def build_phase_alternation_graph(
         from src.services.auxiliary import AuxiliaryLLM
 
         raw_llm = summarization_llm or strategic_llm_with_tools
-        auxiliary_llm = AuxiliaryLLM(llm=raw_llm)
+        aux_settings = resolve_model_settings(aux_model, config._deployment_dir)
+        aux_structured_output_method = aux_settings.get(
+            "structured_output_method", "json_schema"
+        )
+        # Fallback summarizer is the main/summarization LLM → its window is
+        # the main working window.
+        auxiliary_llm = AuxiliaryLLM(
+            llm=raw_llm,
+            max_context_tokens=config.limits.model_max_context_tokens,
+            structured_output_method=aux_structured_output_method,
+        )
 
     # Extract RecallStore for memory injection and free sources
     recall_store = tool_context.recall_store if tool_context else None
+
+    # MemoryManager seam (memory overhaul Phase 1, knowledge-base/knowledge/features/
+    # agent_memory_overhaul.md §5). Constructed only behind
+    # memory.manager.enabled; while None, every legacy direct-store path
+    # below runs unchanged (pinned by the equivalence suites). Named
+    # memory_service because memory_manager is taken by the vestigial
+    # workspace.md MemoryManager above. Bind failures (unknown plugin
+    # name in memory.pipeline) raise here — a misconfigured cutover must
+    # fail at setup, not limp silently on the legacy path.
+    memory_service = None
+    if config.memory.manager_enabled:
+        from src.services.memory import MemoryManager as MemorySeamManager
+        from src.services.memory import MemoryRuntime
+
+        memory_service = MemorySeamManager.from_config(
+            config.memory,
+            MemoryRuntime(
+                recall_store=recall_store,
+                # Same gate as the legacy execute block: knowledge needs
+                # both the store and the graph connection.
+                knowledge_store=(
+                    tool_context.knowledge_store
+                    if tool_context and tool_context.has_knowledge()
+                    else None
+                ),
+                auxiliary_llm=auxiliary_llm,
+                memory_config=config.memory,
+                auxiliary_config=config.auxiliary,
+                extraction_prompt=memory_extraction_prompt,
+                assembler_prompt=memory_assembler_prompt,
+                job_id=tool_context.job_id if tool_context else None,
+                project_id=tool_context.project_id if tool_context else None,
+                project_ids=list(tool_context.project_ids) if tool_context else [],
+                retrieval_timeout=None,  # worker path runs unbounded (legacy)
+            ),
+        )
+
+    # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4). Wired onto
+    # the store independently of the manager cutover — it's a write-path change
+    # behind memory.ingestion.enabled, used by both the legacy and seam writers.
+    from src.services.memory.ingestion import maybe_attach_ingestion_verdict
+
+    maybe_attach_ingestion_verdict(recall_store, auxiliary_llm, config.memory)
 
     # Create graph
     workflow = StateGraph(UniversalAgentState)
@@ -3635,8 +5551,11 @@ def build_phase_alternation_graph(
         memory_assembler_prompt=memory_assembler_prompt,
         tool_context=tool_context,
         tool_names=_tool_names,
+        memory_service=memory_service,
     )
-    check_todos = create_check_todos_node(todo_manager, config, tool_names=_tool_names)
+    check_todos = create_check_todos_node(
+        todo_manager, config, tool_names=_tool_names, tool_context=tool_context
+    )
     archive_phase = create_archive_phase_node(
         todo_manager,
         plan_manager,
@@ -3650,6 +5569,9 @@ def build_phase_alternation_graph(
         workspace_manager=workspace,
         memory_extraction_prompt=memory_extraction_prompt,
         curation_prompt=curation_prompt,
+        knowledge_assembler_prompt=knowledge_assembler_prompt,
+        knowledge_verdict_prompt=knowledge_verdict_prompt,
+        memory_service=memory_service,
     )
 
     handle_transition = create_handle_transition_node(
@@ -3660,6 +5582,7 @@ def build_phase_alternation_graph(
         max_todos=config.phase_settings.max_todos,
         postgres_db=postgres_db,
         tool_names=_tool_names,
+        tool_context=tool_context,
     )
 
     check_goal = create_check_goal_node(plan_manager, workspace, config, todo_manager)
@@ -3668,6 +5591,7 @@ def build_phase_alternation_graph(
         config,
         recall_store=recall_store,
         tool_context=tool_context,
+        memory_service=memory_service,
     )
 
     # Add nodes to graph
@@ -3681,6 +5605,7 @@ def build_phase_alternation_graph(
     workflow.add_node("archive_phase", archive_phase)
     workflow.add_node("handle_transition", handle_transition)
     workflow.add_node("check_goal", check_goal)
+    workflow.add_node("checkpoint_completion_report", checkpoint_completion_report)
 
     logger.info("Building phase alternation graph")
 
@@ -3746,11 +5671,21 @@ def build_phase_alternation_graph(
         else "execute",
         {
             "execute": "execute",
-            "end": END,
+            "end": "checkpoint_completion_report",
         },
     )
+    workflow.add_edge("checkpoint_completion_report", END)
 
-    return workflow.compile(checkpointer=checkpointer)
+    compiled = workflow.compile(checkpointer=checkpointer)
+    # Expose the memory seam on the compiled graph so the worker run loop can
+    # drain in-flight capture_nowait tasks (the chunked pre_compaction
+    # extraction) at job-end before the process moves on — OQ-C,
+    # knowledge-history/done/memory_extraction_before_compaction.md §8. The builder's
+    # return type is pinned (deprecated wrapper + multiple callers), so the
+    # manager rides on the graph object rather than the signature. None when the
+    # manager cutover flag is off.
+    compiled._srw_memory_service = memory_service
+    return compiled
 
 
 # Backward compatibility alias

@@ -2,14 +2,15 @@
 
 The token is signed by the orchestrator (HS256, shared secret) and validated
 by the agent pod on the `/ws/chat` upgrade. Claims are deliberately narrow:
-`sub` (user ID), `tid` (thread ID), short `exp` (default 60 s).
+`sub` (user ID), `tid` (thread ID), `sif` (the non-secret exact-session
+identity fingerprint), and short `exp` (default 60 s).
 
 This is **not** the same credential as the BFF cookie or API token — those
 authenticate user→orchestrator. This authenticates orchestrator→pod for a
 specific session handshake, so we can hand the pod a narrowly-scoped trust
 without giving it the BFF signing key.
 
-See `docs/features/direct_session_websockets.md` §Component details.
+See `knowledge-base/knowledge/features/direct_session_websockets.md` §Component details.
 """
 
 from __future__ import annotations
@@ -37,13 +38,27 @@ class SessionTokenService:
         self._secret = secret
         self._ttl = int(ttl_seconds)
 
-    def mint(self, user_id: str, thread_id: str) -> tuple[str, int]:
+    def mint(
+        self,
+        user_id: str,
+        thread_id: str,
+        *,
+        session_identity_fingerprint: str,
+    ) -> tuple[str, int]:
         """Return ``(token, absolute_expiry_unix_ts)``."""
+        fingerprint = str(session_identity_fingerprint or "")
+        if not (
+            fingerprint.startswith("sha256:")
+            and len(fingerprint) == 71
+            and all(char in "0123456789abcdef" for char in fingerprint[7:])
+        ):
+            raise ValueError("Session token requires an exact identity fingerprint")
         now = int(time.time())
         exp = now + self._ttl
         claims = {
             "sub": str(user_id),
             "tid": str(thread_id),
+            "sif": fingerprint,
             "aud": self._AUDIENCE,
             "iat": now,
             "exp": exp,
@@ -62,7 +77,7 @@ class SessionTokenService:
                 audience=self._AUDIENCE,
                 leeway=2,  # 2s tolerance for clock skew between orchestrator and pod
                 options={
-                    "require": ["exp", "iat", "aud", "sub", "tid"],
+                    "require": ["exp", "iat", "aud", "sub", "tid", "sif"],
                     "verify_signature": True,
                     "verify_exp": True,
                     "verify_iat": True,

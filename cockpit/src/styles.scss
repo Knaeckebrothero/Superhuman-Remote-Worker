@@ -5,6 +5,10 @@
 @use 'styles/themes/themes' as theme;
 @use 'styles/themes/shape-overrides';
 @use 'styles/code-highlight';     // Global PrismJS token theme for <markdown> code blocks
+@use 'styles/katex';              // Global presentation tweaks for KaTeX math in <markdown>
+@use 'styles/canvas-content';     // Sanitized Dynamic Canvas markdown typography
+@use 'styles/external-image';     // Inert click-to-load cards in untrusted Markdown
+@use 'styles/chat-queued';        // Retry/discard affordances on a stalled chat send
 
 // --- Theme classes (body-class swap) ---
 // Default look = senate (dark). <body class="theme-senate"> applies these tokens.
@@ -26,6 +30,13 @@ body {
   height: 100%;
   width: 100%;
   overflow: hidden;
+
+  // App shell, not a document: kill double-tap-to-zoom (and the legacy 300ms
+  // tap delay) everywhere, including Safari tabs that ignore the viewport
+  // meta's zoom lock. Pinch-zoom prevention itself comes from the meta in
+  // index.html; zoom gestures check the whole ancestor chain, so setting this
+  // on the root covers every element despite touch-action not inheriting.
+  touch-action: manipulation;
   background: var(--app-bg);
   color: var(--text-primary);
   font-family: v.$font-family-base;
@@ -66,6 +77,27 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--surface-2);
+}
+
+// Standard scrollbar properties (Firefox + Chromium 121+). Both are inherited,
+// so this one declaration themes every scrollbar in the app. When a browser
+// honours these it IGNORES the ::-webkit-scrollbar rules above — those remain
+// only as a fallback for Safari / older Chromium. Without this block Firefox
+// showed the unstyled OS scrollbar, and any element that sets `scrollbar-width`
+// (e.g. .messages) dropped the webkit theme on Chromium too, rendering the
+// default light-grey bar.
+html {
+  scrollbar-width: thin;
+  scrollbar-color: var(--surface-1) var(--panel-bg);
+}
+
+// Android renders styled scrollbars as permanent (no overlay auto-hide), so
+// every scrollable pane grows a full-height themed track column. Keep the
+// thumb as the affordance but drop the track so it stops reading as chrome.
+@media (max-width: v.$breakpoint-md) {
+  html {
+    scrollbar-color: var(--surface-1) transparent;
+  }
 }
 
 // --- Focus indicators (keyboard navigation) ---

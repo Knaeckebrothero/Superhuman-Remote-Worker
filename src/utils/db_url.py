@@ -30,6 +30,13 @@ def build_postgres_url(
     sourced). Username and password are URL-quoted with ``safe=""`` so
     ``/``, ``@`` and ``:`` round-trip through ``urlsplit`` correctly.
 
+    ``<prefix>_SSLMODE`` and ``<prefix>_SSLROOTCERT``, when set, are appended
+    as libpq query parameters. asyncpg accepts ``disable``, ``allow``,
+    ``prefer``, ``require``, ``verify-ca`` and ``verify-full``; with none set
+    it defaults to ``prefer`` (encrypted if offered, never verified). They are
+    NOT appended to a ``fallback_env`` DSN, which may carry its own query
+    string.
+
     Falls back to ``$<fallback_env>`` if user+password aren't both set,
     so a stack still running on the old layout keeps working.
 
@@ -42,10 +49,57 @@ def build_postgres_url(
         port = os.getenv(f"{prefix}_PORT") or str(default_port)
         db = os.getenv(f"{prefix}_DB", default_db)
         if host and db:
-            return (
+            dsn = (
                 f"postgresql://{quote(user, safe='')}:"
                 f"{quote(password, safe='')}@{host}:{port}/{db}"
             )
+            # TLS is expressed as libpq query parameters, which asyncpg parses.
+            # Appended ONLY here: a fallback DSN may already carry its own query
+            # string, and merging the two is a footgun for no benefit.
+            params = []
+            sslmode = os.getenv(f"{prefix}_SSLMODE")
+            if sslmode:
+                params.append(f"sslmode={quote(sslmode, safe='')}")
+            sslrootcert = os.getenv(f"{prefix}_SSLROOTCERT")
+            if sslrootcert:
+                params.append(f"sslrootcert={quote(sslrootcert, safe='')}")
+            if params:
+                dsn = f"{dsn}?{'&'.join(params)}"
+            return dsn
     if fallback_env:
         return os.getenv(fallback_env)
     return None
+
+
+def checkpointer_backend() -> str:
+    """Which LangGraph checkpointer the worker uses: ``postgres`` (shared,
+    cross-pod resume) or ``sqlite`` (legacy pod-local). Default ``sqlite`` for a
+    safe, flag-gated rollout."""
+    return os.getenv("CHECKPOINTER_BACKEND", "sqlite").strip().lower()
+
+
+def resolve_checkpoint_url() -> Optional[str]:
+    """Resolve the Postgres checkpoint DSN.
+
+    Prefers a dedicated store — a full ``CHECKPOINT_DB_URL`` DSN, then discrete
+    ``CHECKPOINT_*`` parts — and falls back to the app DB (``POSTGRES_*`` /
+    ``DATABASE_URL``). Returns ``None`` if nothing is configured.
+    """
+    return (
+        os.getenv("CHECKPOINT_DB_URL")
+        or build_postgres_url("CHECKPOINT")
+        or build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")
+    )
+
+
+def resolve_fenced_checkpoint_url() -> Optional[str]:
+    """Resolve the only valid DSN for lease-fenced worker checkpoints.
+
+    The fenced saver locks ``run_queue`` and writes the LangGraph checkpoint
+    in one transaction. Both tables must therefore be in the authoritative
+    application Postgres database. A dedicated checkpoint database remains
+    supported for pinned workers, but stateless workers deliberately ignore
+    it instead of fencing against a missing or non-authoritative queue copy.
+    """
+
+    return build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")

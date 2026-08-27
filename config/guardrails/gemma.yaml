@@ -39,6 +39,7 @@ tool_examples:
         <|tool_call>call:git_show{stat_only:true}<tool_call|>                                         # latest commit, file list only
         <|tool_call>call:git_show{commit_ref:<|"|>HEAD~3<|"|>}<tool_call|>                            # commit from 3 commits ago
         <|tool_call>call:git_show{commit_ref:<|"|>phase-1-tactical-complete<|"|>}<tool_call|>         # tagged commit
+        <|tool_call>call:git_show{commit_ref:<|"|>5e08d4fa<|"|>,repo:<|"|>KurortEngine<|"|>}<tool_call|>  # commit in an ATTACHED repository
 
   git_diff: |-
     Examples:
@@ -83,15 +84,15 @@ tool_examples:
   # ----- src/tools/shell/shell_tools.py -----
   run_command: |-
     Examples:
-        <|tool_call>call:run_command{command:<|"|>pytest tests/ -x<|"|>}<tool_call|>
-        <|tool_call>call:run_command{command:<|"|>git diff HEAD~1<|"|>,tail:100}<tool_call|>
-        <|tool_call>call:run_command{command:<|"|>npm run build<|"|>,timeout:300}<tool_call|>
+        <|tool_call>call:run_command{command:<|"|>pytest tests/ -x<|"|>,working_dir:<|"|>.<|"|>}<tool_call|>
+        <|tool_call>call:run_command{command:<|"|>git diff HEAD~1<|"|>,working_dir:<|"|>.<|"|>,tail:100}<tool_call|>
+        <|tool_call>call:run_command{command:<|"|>npm run build<|"|>,working_dir:<|"|>.<|"|>,timeout:300}<tool_call|>
 
   shell_execute: |-
     Examples:
-        <|tool_call>call:shell_execute{command:<|"|>pytest tests/ -x<|"|>}<tool_call|>
-        <|tool_call>call:shell_execute{command:<|"|>npm run dev<|"|>,name:<|"|>dev<|"|>,is_async:true}<tool_call|>
-        <|tool_call>call:shell_execute{command:<|"|>C-c<|"|>,name:<|"|>dev<|"|>,keys:true}<tool_call|>
+        <|tool_call>call:shell_execute{command:<|"|>pytest tests/ -x<|"|>,working_dir:<|"|>.<|"|>}<tool_call|>
+        <|tool_call>call:shell_execute{command:<|"|>npm run dev<|"|>,working_dir:<|"|>.<|"|>,name:<|"|>dev<|"|>,is_async:true}<tool_call|>
+        <|tool_call>call:shell_execute{command:<|"|>C-c<|"|>,working_dir:<|"|>.<|"|>,name:<|"|>dev<|"|>,keys:true}<tool_call|>
 
   shell_read: |-
     Examples:
@@ -202,16 +203,10 @@ nudges:
     Action required: complete the current todo `{todo_id}` now by invoking the `todo_complete` tool.
     The Gemma tool-call format is `<|tool_call>call:fn{{key:<|"|>val<|"|>}}<tool_call|>` — use braces, never parens.
 
-  budget_rewind: |-
-    PHASE BUDGET REACHED: {used}/{cap} tool calls consumed.
-    Stage new todos by invoking the `next_phase_todos` tool. Use the canonical brace format defined in your system prompt — do not type Python-style calls.
-    Before staging:
-      1. Review what worked and what didn't
-      2. Identify root causes for the failures
-      3. Stage smaller, more focused todos
-
+  # See default.yaml: never enumerate the tool surface here — models read such
+  # lists as exhaustive and conclude their other bound tools are gone.
   todo_list_footer: |-
-    Tools available: `todo_complete`, `todo_rewind`, `mark_complete`. Invocations use the canonical Gemma tool-call format from your system prompt: `<|tool_call>call:fn{{...}}<tool_call|>`.
+    Mark each finished task by invoking the `todo_complete` tool with its todo id. This task list is a status reminder, not a tool list — every tool bound in this request stays available. Invocations use the canonical Gemma tool-call format from your system prompt: `<|tool_call>call:fn{{...}}<tool_call|>`.
     Never type tool calls as plain text or with parens.
 
   read_file_required_error: |-

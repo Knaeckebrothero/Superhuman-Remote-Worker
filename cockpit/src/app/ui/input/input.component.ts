@@ -38,6 +38,7 @@ export type InputSize = 'sm' | 'md' | 'lg';
       [attr.aria-invalid]="invalid() || null"
       [attr.autocomplete]="autocomplete() || null"
       [attr.inputmode]="inputmode() || null"
+      [attr.list]="list() || null"
       [attr.data-size]="size()"
       [attr.data-invalid]="invalid() || null"
       (input)="onInput($event)"
@@ -65,6 +66,8 @@ export class AppInputComponent {
   ariaLabel = input<string>('');
   autocomplete = input<string>('');
   inputmode = input<string>('');
+  /** Optional <datalist> id for combobox-style preset suggestions (free entry still allowed). */
+  list = input<string>('');
 
   changed = output<string>();
   focused = output<FocusEvent>();

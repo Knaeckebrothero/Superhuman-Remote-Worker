@@ -30,6 +30,9 @@ export class AdminModelsService {
 
   readonly models = signal<CatalogModel[]>([]);
   readonly families = signal<string[]>([]);
+  /** family key → default context window (from the config matrix). Powers the
+   * context-window field's "family default" placeholder. */
+  readonly familyDefaults = signal<Record<string, number>>({});
   readonly loading = signal(false);
 
   loadModels(): void {
@@ -45,9 +48,14 @@ export class AdminModelsService {
 
   loadFamilies(): void {
     this.http
-      .get<{families: string[]}>(`${this.baseUrl}/admin/families`)
-      .pipe(catchError(() => of({families: [] as string[]})))
-      .subscribe((res) => this.families.set(res.families));
+      .get<{families: string[]; defaults?: Record<string, number>}>(
+        `${this.baseUrl}/admin/families`,
+      )
+      .pipe(catchError(() => of({families: [] as string[], defaults: {}})))
+      .subscribe((res) => {
+        this.families.set(res.families);
+        this.familyDefaults.set(res.defaults ?? {});
+      });
   }
 
   /** Ask the orchestrator's regex matcher which family the given model_id

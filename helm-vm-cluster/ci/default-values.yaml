@@ -1,0 +1,28 @@
+# Minimum values that make helm-vm-cluster render.
+#
+# This chart previously had no ci/ directory at all, so it was never linted,
+# rendered, or kubeconform'd by CI — only packaged. That is why its VM template
+# and helm/'s drifted apart unnoticed (see
+# knowledge-base/knowledge/issues/vm_reliability_assessment.md, P1-10).
+#
+# Everything below is a placeholder chosen only to satisfy a required-value gate.
+# Nothing here is a real endpoint or a real key.
+license:
+  acceptTerms: true
+
+orchestratorId: "ci-render-only"
+
+nats:
+  # Shape mirrors the example in values.yaml. Never dialled during a render.
+  hubUrl: "nats://10.0.50.101:30743"
+
+headscale:
+  url: "https://headscale.ci.invalid"
+  # Name of a pre-existing Secret. Not created and not read during a render;
+  # the gate only requires that exactly one key source is named.
+  apiKeySecret: "ci-render-only-headscale"
+
+ssh:
+  # Dummy key — only needs to be a non-empty, well-shaped string so the
+  # authorized_keys contract assertion has something real to check.
+  publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEYFORCIRENDERONLY00000000000000000 agent@srw"

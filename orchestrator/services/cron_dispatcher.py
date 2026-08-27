@@ -21,7 +21,7 @@ timezone, which is then converted back to UTC for storage. "Every day
 at 09:00 Europe/Berlin" stays at 09:00 local across the spring-forward
 and fall-back transitions.
 
-Spec: docs/features/automations_v0.md §Cron Triggers.
+Spec: knowledge-base/knowledge/features/automations_v0.md §Cron Triggers.
 """
 
 from __future__ import annotations
@@ -130,6 +130,7 @@ async def _process_one_due_automation(db: Any) -> bool:
     back by an unrelated failure.
     """
     pending_disable: dict[str, str] | None = None
+    created_job: dict[str, Any] | None = None
 
     async with db.acquire() as conn:
         async with conn.transaction():
@@ -212,17 +213,57 @@ async def _process_one_due_automation(db: Any) -> bool:
                         job = await create_job_from_automation(
                             db, row, trigger_kind="cron"
                         )
-                        await db.advance_automation_after_fire(
-                            conn,
-                            automation_id,
-                            next_run_at=next_run,
-                            scheduled_for=scheduled_for,
-                            job_id=str(job["id"]),
-                        )
+                        if job is None:
+                            # Archived project: skip this fire without
+                            # touching the automation's enabled state (it
+                            # logs its own reason). Advance the schedule the
+                            # same way the catch-up window does, so the row
+                            # is not re-claimed on every tick forever.
+                            await db.skip_automation_fire(
+                                conn,
+                                automation_id,
+                                next_run_at=next_run,
+                            )
+                        else:
+                            await db.advance_automation_after_fire(
+                                conn,
+                                automation_id,
+                                next_run_at=next_run,
+                                scheduled_for=scheduled_for,
+                                job_id=str(job["id"]),
+                            )
+                            # Capture for post-commit Gitea provisioning — it
+                            # must run OUTSIDE this transaction (see below).
+                            created_job = job
 
-    # Post-commit side effects. Notification failures are logged but never
-    # re-raised — the auto-disable is the user-visible safety signal; the
-    # notification is the prompt.
+    # Post-commit side effects — these MUST run outside the transaction
+    # above. provision_job_repo does external Gitea HTTP, opens its own
+    # postgres_db.acquire(), and schedules a background task; holding the
+    # automation's transaction across that would pin the pooled connection
+    # and the nested acquire() would contend. Best-effort: a Gitea outage
+    # logs and leaves the job repo-less rather than undoing the committed
+    # fire (the job still runs, just without a dedicated repo). This is the
+    # parity fix so cron-spawned jobs get a workspace repo like manual jobs.
+    if created_job is not None:
+        try:
+            from main import gitea_client, main_cloud_router
+            from services.job_provisioning import provision_job_repo
+
+            await provision_job_repo(
+                job_row=created_job,
+                gitea_client=gitea_client,
+                postgres_db=db,
+                main_cloud_router=main_cloud_router,
+            )
+        except Exception:
+            logger.exception(
+                "cron: repo provisioning failed for job %s "
+                "(job will run without a dedicated repo)",
+                created_job.get("id"),
+            )
+
+    # Notification failures are logged but never re-raised — the auto-disable
+    # is the user-visible safety signal; the notification is the prompt.
     if pending_disable is not None:
         await _emit_auto_disable_notification(pending_disable)
 

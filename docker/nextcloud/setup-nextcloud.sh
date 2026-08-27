@@ -8,7 +8,7 @@
 # What this does:
 #   1. OIDC: Registers Keycloak as OpenID Connect provider
 #   2. OIDC: Enables group provisioning with whitelist regex
-#   3. Group Folders: Installs and enables the groupfolders app
+#   3. Group Folders: Installs, updates and enables the groupfolders app
 #   4. Service account: Creates srw-agents group and agent-service user
 #
 # Required environment variables (for OIDC — skip OIDC section if unset):
@@ -95,9 +95,14 @@ fi
 
 # =============================================================================
 # 2. Group Folders app (required for project cloud folders)
+#    app:update matters: app:install is a no-op on an existing install,
+#    and the protected cloud feature refuses to engage RO mounts below
+#    groupfolders 20.1.2 (CVE floor GHSA-2vrq-fhmf-c49m, enforced by
+#    check_version_floors in orchestrator/services/cloud/ro_probe.py).
 # =============================================================================
-echo "[nc-setup] Ensuring groupfolders app is installed..."
+echo "[nc-setup] Ensuring groupfolders app is installed and current..."
 occ app:install groupfolders 2>/dev/null || true
+occ app:update groupfolders 2>&1 || true
 occ app:enable groupfolders 2>/dev/null || true
 
 # =============================================================================

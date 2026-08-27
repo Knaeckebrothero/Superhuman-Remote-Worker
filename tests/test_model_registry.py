@@ -7,7 +7,8 @@ Pins the post-chunk-6 contract:
 - ``family_of`` is a sync prefix-pattern fallback for callers that don't
   have a catalog row in hand.
 - ``UnknownModelError``'s message points operators at the right admin
-  surfaces (Admin → Models, /api/settings/llm-endpoints).
+  surface (Admin → Models, anchored to a system endpoint via Admin →
+  Providers).
 """
 
 from pathlib import Path
@@ -18,6 +19,9 @@ import yaml
 from src.core.model_registry import (
     ModelMeta,
     UnknownModelError,
+    _catalog_row_to_meta,
+    _endpoint_factory_provider,
+    _endpoint_row_to_meta,
     _factory_provider,
     family_of,
     register_catalog_lookup,
@@ -55,6 +59,236 @@ class TestFactoryProviderMapping:
         assert _factory_provider("made-up-provider") == "openai"
 
 
+class TestEndpointFactoryProvider:
+    """_endpoint_factory_provider routes the Codex proxy to the codex factory.
+
+    Endpoint-backed rows are OpenAI-compatible by default, but the system
+    Codex proxy speaks only the Responses API and needs the codex factory's
+    reasoning-summary path. Detected by the seeded ``codex-proxy`` label or a
+    ``codex-proxy`` host in the base_url.
+    """
+
+    def test_codex_proxy_by_label(self):
+        assert (
+            _endpoint_factory_provider("http://anything/v1", "codex-proxy") == "codex"
+        )
+
+    def test_codex_proxy_label_is_case_insensitive(self):
+        assert _endpoint_factory_provider(None, "Codex-Proxy") == "codex"
+
+    def test_codex_proxy_by_base_url_host(self):
+        # The seed always points the endpoint at the ``*-codex-proxy`` service,
+        # so the host carries the signal even if a label isn't supplied.
+        assert _endpoint_factory_provider("http://srw-codex-proxy:8317/v1") == "codex"
+
+    def test_generic_openai_endpoint(self):
+        assert (
+            _endpoint_factory_provider("http://srw-vllm:8000/v1", "gemma") == "openai"
+        )
+
+    def test_none_inputs_default_to_openai(self):
+        assert _endpoint_factory_provider(None, None) == "openai"
+
+
+class TestEndpointMetaProviderResolution:
+    """The endpoint/catalog meta builders carry ``codex`` for the Codex proxy
+    and ``openai`` for everything else — the regression that silently dropped
+    gpt-5.x reasoning was these hardcoding ``provider="openai"``.
+    """
+
+    def test_endpoint_row_codex_proxy(self):
+        row = {
+            "model_id": "gpt-5.5",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "family": "gpt-5",
+        }
+        assert _endpoint_row_to_meta(row, origin="system").provider == "codex"
+
+    def test_endpoint_row_generic_endpoint(self):
+        row = {
+            "model_id": "gemma-4-moe",
+            "base_url": "http://srw-vllm:8000/v1",
+            "label": "homelab",
+            "endpoint_id": "e2",
+        }
+        assert _endpoint_row_to_meta(row, origin="system").provider == "openai"
+
+    def test_catalog_endpoint_row_codex_proxy(self):
+        row = {
+            "provider_kind": "endpoint",
+            "provider_ref": "e1",
+            "model_id": "gpt-5.5",
+            "endpoint_id": "e1",
+            "endpoint_label": "codex-proxy",
+            "endpoint_base_url": "http://srw-codex-proxy:8317/v1",
+            "family": "gpt-5",
+        }
+        assert _catalog_row_to_meta(row).provider == "codex"
+
+    def test_catalog_endpoint_row_generic(self):
+        row = {
+            "provider_kind": "endpoint",
+            "provider_ref": "e2",
+            "model_id": "gemma-4-moe",
+            "endpoint_id": "e2",
+            "endpoint_label": "homelab",
+            "endpoint_base_url": "http://srw-vllm:8000/v1",
+        }
+        assert _catalog_row_to_meta(row).provider == "openai"
+
+
+class TestCodexContextWindowCap:
+    """Models routed onto the ``codex`` factory get their working window clamped
+    to the Codex surface cap (the ChatGPT-OAuth backend caps context ~400K and
+    rejects larger inputs with ``context_too_large``). Keyed on the resolved
+    *provider*, not the family — so the same model over the real API keeps its
+    full window. See knowledge-base/knowledge/issues/codex_proxy_context_window_cap.md.
+    """
+
+    def _codex_endpoint_row(self, context_window):
+        return {
+            "model_id": "gpt-5.6-sol",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "family": "gpt-5.6",
+            "context_window": context_window,
+        }
+
+    def test_null_window_becomes_cap(self):
+        # The live-wedge case: NULL row would otherwise inherit the family's ~1M.
+        meta = _endpoint_row_to_meta(self._codex_endpoint_row(None), origin="system")
+        assert meta.provider == "codex"
+        assert meta.context_window == 400_000
+
+    def test_oversized_window_clamped_to_cap(self):
+        meta = _endpoint_row_to_meta(
+            self._codex_endpoint_row(1_050_000), origin="system"
+        )
+        assert meta.context_window == 400_000
+
+    def test_smaller_window_respected(self):
+        # A deliberately-smaller admin window wins (cost control) — cap is a
+        # ceiling, not a fixed value.
+        meta = _endpoint_row_to_meta(self._codex_endpoint_row(200_000), origin="system")
+        assert meta.context_window == 200_000
+
+    def test_non_codex_window_untouched(self):
+        row = {
+            "model_id": "gemma-4-moe",
+            "base_url": "http://srw-vllm:8000/v1",
+            "label": "homelab",
+            "endpoint_id": "e2",
+            "context_window": 1_050_000,
+        }
+        meta = _endpoint_row_to_meta(row, origin="system")
+        assert meta.provider == "openai"
+        assert meta.context_window == 1_050_000
+
+    def test_catalog_endpoint_codex_row_capped(self):
+        row = {
+            "provider_kind": "endpoint",
+            "provider_ref": "e1",
+            "model_id": "gpt-5.6-sol",
+            "endpoint_id": "e1",
+            "endpoint_label": "codex-proxy",
+            "endpoint_base_url": "http://srw-codex-proxy:8317/v1",
+            "family": "gpt-5.6",
+            "context_window": None,
+        }
+        assert _catalog_row_to_meta(row).context_window == 400_000
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("CODEX_CONTEXT_WINDOW_CAP", "256000")
+        meta = _endpoint_row_to_meta(self._codex_endpoint_row(None), origin="system")
+        assert meta.context_window == 256_000
+
+    def test_env_zero_disables_clamp(self, monkeypatch):
+        # Kill-switch for the day OpenAI ships 1M-for-Codex: fall back to the
+        # model's own window (None here → inherit family default downstream).
+        monkeypatch.setenv("CODEX_CONTEXT_WINDOW_CAP", "0")
+        meta = _endpoint_row_to_meta(
+            self._codex_endpoint_row(1_050_000), origin="system"
+        )
+        assert meta.context_window == 1_050_000
+
+    def test_malformed_env_falls_back_to_default(self, monkeypatch):
+        # A typo must not silently un-cap and re-wedge sessions.
+        monkeypatch.setenv("CODEX_CONTEXT_WINDOW_CAP", "banana")
+        meta = _endpoint_row_to_meta(self._codex_endpoint_row(None), origin="system")
+        assert meta.context_window == 400_000
+
+    def test_null_window_on_sub_cap_family_uses_family_window(self):
+        """A NULL catalog window must not INFLATE a family whose true window is
+        below the cap. The cap is a ceiling, never a floor.
+
+        Regression: job 9a99f433 (2026-07-23). ``gpt-5.3-codex-spark`` is a
+        distilled 128K model; its catalog row had ``context_window = NULL`` so
+        the clamp handed back the 400K cap. That value is injected at dispatch
+        into ``llm.model_max_context_tokens``, where it is *truthy* — so
+        ``loader._apply_settings_matrix`` never fell back to the family matrix's
+        correct 128000 and derived a 320K compaction threshold. Context sailed to
+        ~124K un-compacted and the next turn hard-400'd ``context_too_large``.
+        """
+        row = {
+            "model_id": "gpt-5.3-codex-spark",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "family": "codex-spark",
+            "context_window": None,
+        }
+        meta = _endpoint_row_to_meta(row, origin="system")
+        assert meta.provider == "codex"
+        assert meta.context_window == 128_000
+
+    def test_null_window_on_sub_cap_family_catalog_row(self):
+        # Production shape: catalog row (provider_kind='endpoint') on the codex
+        # proxy — how gpt-5.3-codex-spark is actually stored.
+        row = {
+            "provider_kind": "endpoint",
+            "provider_ref": "e1",
+            "model_id": "gpt-5.3-codex-spark",
+            "endpoint_id": "e1",
+            "endpoint_label": "codex-proxy",
+            "endpoint_base_url": "http://srw-codex-proxy:8317/v1",
+            "family": "codex-spark",
+            "context_window": None,
+        }
+        assert _catalog_row_to_meta(row).context_window == 128_000
+
+    def test_sub_cap_family_still_clamped_by_smaller_env_cap(self, monkeypatch):
+        # The family window is itself subject to the cap — a lowered env cap
+        # below the family's true window still wins.
+        monkeypatch.setenv("CODEX_CONTEXT_WINDOW_CAP", "64000")
+        row = {
+            "model_id": "gpt-5.3-codex-spark",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "family": "codex-spark",
+            "context_window": None,
+        }
+        assert _endpoint_row_to_meta(row, origin="system").context_window == 64_000
+
+    def test_unknown_family_null_window_uses_matrix_default(self):
+        # An unrecognised model resolves to the matrix ``default`` family, whose
+        # declared window (128000) is what loader._apply_settings_matrix would
+        # derive on its own. Registry and matrix now agree instead of the
+        # registry overriding it with the cap — and erring small is the safe
+        # direction for a model whose real window nobody has declared.
+        row = {
+            "model_id": "some-unheard-of-model",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "context_window": None,
+        }
+        assert _endpoint_row_to_meta(row, origin="system").context_window == 128_000
+
+
 class TestFamilyOf:
     """family_of() — sync prefix-pattern fallback for callers without a row."""
 
@@ -78,6 +312,19 @@ class TestFamilyOf:
     def test_codex_spark_beats_codex(self):
         assert family_of("gpt-5.3-codex-spark") == "codex-spark"
 
+    def test_gpt_5_6_tiers(self):
+        assert family_of("gpt-5.6-sol") == "gpt-5.6"
+        assert family_of("gpt-5.6-terra") == "gpt-5.6"
+        assert family_of("openai/gpt-5.6-luna") == "gpt-5.6"
+        assert family_of("codex/gpt-5.6-sol") == "gpt-5.6"
+
+    def test_gpt_5_6_codex_stays_codex(self):
+        # Codex checks keep precedence: a future 5.6 codex variant is `codex`.
+        assert family_of("gpt-5.6-codex") == "codex"
+
+    def test_gpt_5_5_stays_gpt_5(self):
+        assert family_of("gpt-5.5") == "gpt-5"
+
     def test_minimax_m2_stays_minimax(self):
         # M2.x must NOT be captured by the new minimax-m3 branch.
         assert family_of("minimax-m2.7") == "minimax"
@@ -93,6 +340,23 @@ class TestFamilyOf:
 
     def test_unknown_returns_default(self):
         assert family_of("totally-unknown-model") == "default"
+
+    def test_glm(self):
+        # GLM-5.2 (Zhipu, OpenRouter). Substring match covers every transport
+        # form: bare, vendor-prefixed, and openrouter-prefixed.
+        assert family_of("glm-5.2") == "glm"
+        assert family_of("z-ai/glm-5.2") == "glm"
+        assert family_of("openrouter/z-ai/glm-5.2") == "glm"
+
+    def test_mistral(self):
+        # Mistral 3 family + specialists. Native api.mistral.ai serves bare ids;
+        # the openrouter/ prefix recurses on the trailing segment.
+        assert family_of("mistral-large-latest") == "mistral"
+        assert family_of("mistral-medium-latest") == "mistral"
+        assert family_of("mistral-small-latest") == "mistral"
+        assert family_of("codestral-latest") == "mistral"
+        assert family_of("ministral-3-8b") == "mistral"
+        assert family_of("openrouter/mistralai/mistral-large") == "mistral"
 
 
 class TestUnknownModels:
@@ -123,7 +387,7 @@ class TestUnknownModels:
             await resolve_model("never-heard-of")
         msg = str(exc_info.value)
         assert "Admin → Models" in msg or "Admin -> Models" in msg
-        assert "/api/settings/llm-endpoints" in msg
+        assert "system endpoint" in msg
 
     @pytest.mark.asyncio
     async def test_empty_id_raises(self):

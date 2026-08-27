@@ -23,6 +23,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from vm.controller.lifecycle_auth import sign_payload
+
 # ---------------------------------------------------------------------------
 # Project root on sys.path (conftest.py also does this, belt-and-suspenders)
 # ---------------------------------------------------------------------------
@@ -52,6 +54,15 @@ _mock_k8s_client = types.ModuleType("kubernetes.client")
 _mock_k8s_config = types.ModuleType("kubernetes.config")
 _mock_k8s_exc = types.ModuleType("kubernetes.client.exceptions")
 
+LIFECYCLE_SECRET = b"controller-test-lifecycle-secret-at-least-32-bytes"
+PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
+
+
+def test_controller_dockerfile_packages_lifecycle_auth_module() -> None:
+    dockerfile = (project_root / "vm/controller/Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY controller.py headscale_client.py lifecycle_auth.py ./" in dockerfile
+
 
 class _FakeApiException(Exception):
     """Stand-in for kubernetes.client.exceptions.ApiException."""
@@ -65,13 +76,36 @@ class _FakeApiException(Exception):
 _mock_k8s_exc.ApiException = _FakeApiException  # type: ignore[attr-defined]
 _mock_k8s_client.exceptions = _mock_k8s_exc  # type: ignore[attr-defined]
 _mock_k8s_client.CustomObjectsApi = MagicMock  # type: ignore[attr-defined]
+_mock_k8s_client.CoreV1Api = MagicMock  # type: ignore[attr-defined]
+_mock_k8s_client.CoordinationV1Api = MagicMock  # type: ignore[attr-defined]
 _mock_k8s.client = _mock_k8s_client  # type: ignore[attr-defined]
 _mock_k8s.config = _mock_k8s_config  # type: ignore[attr-defined]
 _mock_k8s_config.load_incluster_config = MagicMock()  # type: ignore[attr-defined]
-sys.modules["kubernetes"] = _mock_k8s
-sys.modules["kubernetes.client"] = _mock_k8s_client
-sys.modules["kubernetes.config"] = _mock_k8s_config
-sys.modules["kubernetes.client.exceptions"] = _mock_k8s_exc
+
+_K8S_STUB_MODULES = {
+    "kubernetes": _mock_k8s,
+    "kubernetes.client": _mock_k8s_client,
+    "kubernetes.config": _mock_k8s_config,
+    "kubernetes.client.exceptions": _mock_k8s_exc,
+}
+# Whatever was there before us — the real client is a declared orchestrator
+# dependency, so on a full-suite run this is usually the genuine package.
+_REAL_K8S_MODULES = {name: sys.modules.get(name) for name in _K8S_STUB_MODULES}
+
+
+def _install_k8s_stubs() -> None:
+    sys.modules.update(_K8S_STUB_MODULES)
+
+
+def _restore_k8s_modules() -> None:
+    for name, real in _REAL_K8S_MODULES.items():
+        if real is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = real
+
+
+_install_k8s_stubs()
 
 # --- nats -------------------------------------------------------------------
 _mock_nats = types.ModuleType("nats")
@@ -82,11 +116,373 @@ sys.modules.setdefault("nats", _mock_nats)
 # NOW import the controller — the mocked modules make this succeed
 # ---------------------------------------------------------------------------
 from vm.controller.controller import (  # noqa: E402
+    CDI_PLURAL,
     KUBEVIRT_GROUP,
     KUBEVIRT_PLURAL,
     KUBEVIRT_VERSION,
+    LIFECYCLE_NONCE_GC_PAGE_LIMIT,
+    VM_NAMESPACE,
     VMController,
 )
+
+_restore_k8s_modules()
+
+
+class TestSameClusterContracts:
+    def test_render_injects_placement_after_yaml_parse(self):
+        ctrl = _make_controller(headscale_available=False)
+        with (
+            patch(
+                "vm.controller.controller.VM_NODE_SELECTOR",
+                {"srw.io/vm-node": "true"},
+            ),
+            patch(
+                "vm.controller.controller.VM_TOLERATIONS",
+                [{"key": "srw.io/vm-node", "operator": "Exists"}],
+            ),
+        ):
+            manifest = ctrl.render_template(SAMPLE_JOB_CONFIG)
+
+        vmi_spec = manifest["spec"]["template"]["spec"]
+        assert vmi_spec["nodeSelector"] == {"srw.io/vm-node": "true"}
+        assert vmi_spec["tolerations"] == [
+            {"key": "srw.io/vm-node", "operator": "Exists"}
+        ]
+
+    def test_payload_network_tier_overrides_env_default(self):
+        """The per-project tier sent by the orchestrator beats the chart default."""
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = "tier=${NETWORK_TIER}\n"
+        config = {**SAMPLE_JOB_CONFIG, "network_tier": "home-allowed"}
+        with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
+            manifest = ctrl.render_template(config)
+        assert manifest.pop("_srwCloudInitUserData") == "tier=home-allowed\n"
+
+    def test_env_default_network_tier_applies_when_payload_omits_it(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = "tier=${NETWORK_TIER}\n"
+        config = {k: v for k, v in SAMPLE_JOB_CONFIG.items() if k != "network_tier"}
+        with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", "internet-only"):
+            manifest = ctrl.render_template(config)
+        assert manifest.pop("_srwCloudInitUserData") == "tier=internet-only\n"
+
+    def test_payload_network_tier_is_validated_when_env_default_is_empty(self):
+        ctrl = _make_controller(headscale_available=False)
+        config = {**SAMPLE_JOB_CONFIG, "network_tier": "NOT_VALID"}
+        with patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", ""):
+            with pytest.raises(ValueError, match="network_tier"):
+                ctrl.render_template(config)
+
+    def test_cloud_init_receives_guest_token_url_and_tier(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = (
+            "token=${VM_AUTH_TOKEN}\nurl=${ORCHESTRATOR_URL}\ntier=${NETWORK_TIER}\n"
+        )
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+            "orchestrator_url": "http://payload-orchestrator:8085",
+            "network_tier": "home-allowed",
+        }
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm.controller.controller.ORCHESTRATOR_URL", ""),
+            patch("vm.controller.controller.VM_DEFAULT_NETWORK_TIER", ""),
+        ):
+            manifest = ctrl.render_template(config)
+
+        rendered = manifest.pop("_srwCloudInitUserData")
+        assert "url=http://payload-orchestrator:8085" in rendered
+        assert "tier=home-allowed" in rendered
+        assert "token=" in rendered
+        assert len(rendered.splitlines()[0].removeprefix("token=")) == 64
+
+    @pytest.mark.asyncio
+    async def test_capacity_gate_reports_live_vm_count(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.k8s_client.list_namespaced_custom_object.return_value = {
+            "items": [
+                {"metadata": {"name": "agent-vm-one"}},
+                {"metadata": {"name": "not-managed"}},
+                {
+                    "metadata": {
+                        "name": "agent-vm-deleting",
+                        "deletionTimestamp": "now",
+                    }
+                },
+            ]
+        }
+        with patch("vm.controller.controller.VM_MAX_CONCURRENT", 1):
+            result = await ctrl._capacity_wait("agent-vm-two")
+
+        assert result == {
+            "status": "waiting_capacity",
+            "running_vms": 1,
+            "max_concurrent_vms": 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_concurrent_creates_cannot_oversubscribe_capacity(self, monkeypatch):
+        ctrl = _make_controller(headscale_available=False)
+        live_names: list[str] = []
+        list_call = ctrl.k8s_client.list_namespaced_custom_object
+        create_call = ctrl.k8s_client.create_namespaced_custom_object
+
+        async def _interleaving_to_thread(func, /, *args, **kwargs):
+            if func is list_call:
+                return {"items": [{"metadata": {"name": name}} for name in live_names]}
+            if func is create_call:
+                # Give the competing task a chance to count before admission.
+                # The controller-wide lock must prevent it from doing so.
+                await asyncio.sleep(0)
+                admitted = func(*args, **kwargs)
+                live_names.append(kwargs["body"]["metadata"]["name"])
+                return admitted
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _interleaving_to_thread)
+        first = {**SAMPLE_JOB_CONFIG, "job_id": "capacity-one"}
+        second = {**SAMPLE_JOB_CONFIG, "job_id": "capacity-two"}
+        with patch("vm.controller.controller.VM_MAX_CONCURRENT", 1):
+            results = await asyncio.gather(
+                ctrl._do_create(first), ctrl._do_create(second)
+            )
+
+        assert sorted(result["status"] for result in results) == [
+            "created",
+            "waiting_capacity",
+        ]
+        assert create_call.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cloud_init_secret_create_and_delete_calls_core_api(self):
+        ctrl = _make_controller(headscale_available=False)
+        await ctrl._ensure_cloud_init_secret(
+            job_id=SAMPLE_JOB_CONFIG["job_id"],
+            owner_kind="job",
+            generation=PROVISION_GENERATION,
+            user_data="#cloud-config\n",
+        )
+        body = ctrl.core_api.create_namespaced_secret.call_args.kwargs["body"]
+        assert body["stringData"] == {"userdata": "#cloud-config\n"}
+        assert (
+            body["metadata"]["labels"]["srw.io/owner-id"] == SAMPLE_JOB_CONFIG["job_id"]
+        )
+
+        await ctrl._delete_cloud_init_secret(SAMPLE_JOB_CONFIG["job_id"])
+        ctrl.core_api.delete_namespaced_secret.assert_called_once_with(
+            name=f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-cloudinit",
+            namespace=VM_NAMESPACE,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cloud_init_secret_409_owner_or_generation_mismatch_raises(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.core_api.create_namespaced_secret.side_effect = _FakeApiException(
+            status=409, body="already exists"
+        )
+        ctrl.core_api.read_namespaced_secret.return_value = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(
+                labels={
+                    "srw.io/owner-kind": "thread",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+                annotations={
+                    "srw.io/provision-generation": (
+                        "00000000-0000-4000-8000-000000000099"
+                    )
+                },
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="another VM generation"):
+            await ctrl._ensure_cloud_init_secret(
+                job_id=SAMPLE_JOB_CONFIG["job_id"],
+                owner_kind="job",
+                generation=PROVISION_GENERATION,
+                user_data="#cloud-config\n",
+            )
+
+    @pytest.mark.asyncio
+    async def test_cloud_init_secret_is_created_before_vm_and_owned_after_admission(
+        self,
+    ):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = (
+            "#cloud-config\nssh=${SSH_AUTHORIZED_KEY}\ntoken=${VM_AUTH_TOKEN}\n"
+        )
+        events: list[str] = []
+        original_admit = ctrl.k8s_client.create_namespaced_custom_object.side_effect
+
+        def _create_secret(**_kwargs):
+            events.append("secret-create")
+
+        def _create_vm(**kwargs):
+            events.append("vm-create")
+            return original_admit(**kwargs)
+
+        def _patch_secret(**_kwargs):
+            events.append("secret-owner-patch")
+
+        ctrl.core_api.create_namespaced_secret.side_effect = _create_secret
+        ctrl.k8s_client.create_namespaced_custom_object.side_effect = _create_vm
+        ctrl.core_api.patch_namespaced_secret.side_effect = _patch_secret
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+
+        with (
+            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch.dict(
+                "vm.controller.controller.os.environ",
+                {"SSH_AUTHORIZED_KEY": "ssh-ed25519 AAAAtest"},
+            ),
+        ):
+            result = await ctrl._do_create(config)
+
+        assert result["status"] == "created"
+        assert events == ["secret-create", "vm-create", "secret-owner-patch"]
+        vm_body = ctrl.k8s_client.create_namespaced_custom_object.call_args.kwargs[
+            "body"
+        ]
+        assert "_srwCloudInitUserData" not in vm_body
+        owner = ctrl.core_api.patch_namespaced_secret.call_args.kwargs["body"][
+            "metadata"
+        ]["ownerReferences"][0]
+        assert owner == {
+            "apiVersion": "kubevirt.io/v1",
+            "kind": "VirtualMachine",
+            "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+            "uid": "admitted-vm-uid-001",
+            "controller": True,
+            "blockOwnerDeletion": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_empty_rendered_ssh_authorized_key(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = "key=${SSH_AUTHORIZED_KEY}\n"
+        with (
+            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
+            patch.dict(
+                "vm.controller.controller.os.environ",
+                {"SSH_AUTHORIZED_KEY": ""},
+            ),
+            pytest.raises(ValueError, match="SSH_AUTHORIZED_KEY must be non-empty"),
+        ):
+            await ctrl._do_create(SAMPLE_JOB_CONFIG)
+
+        ctrl.core_api.create_namespaced_secret.assert_not_called()
+        ctrl.k8s_client.create_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_vm_create_deletes_new_cloud_init_secret(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.cloud_init_text = (
+            "#cloud-config\nssh=${SSH_AUTHORIZED_KEY}\ntoken=${VM_AUTH_TOKEN}\n"
+        )
+        ctrl.k8s_client.create_namespaced_custom_object.side_effect = _FakeApiException(
+            status=409, body="VirtualMachine is being deleted"
+        )
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+
+        with (
+            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch.dict(
+                "vm.controller.controller.os.environ",
+                {"SSH_AUTHORIZED_KEY": "ssh-ed25519 AAAAtest"},
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(_FakeApiException),
+        ):
+            await ctrl._do_create(config)
+
+        ctrl.core_api.delete_namespaced_secret.assert_called_once_with(
+            name=f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-cloudinit",
+            namespace=VM_NAMESPACE,
+        )
+
+    @pytest.mark.asyncio
+    async def test_vm_409_other_provision_generation_raises(self):
+        ctrl = _make_controller(headscale_available=False)
+        ctrl.k8s_client.create_namespaced_custom_object.side_effect = _FakeApiException(
+            status=409, body="already exists"
+        )
+        ctrl.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+                "uid": "different-generation-vm",
+                "annotations": {
+                    "srw.io/provision-generation": (
+                        "00000000-0000-4000-8000-000000000099"
+                    )
+                },
+            }
+        }
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+
+        with (
+            patch("vm.controller.controller.VM_MAX_CONCURRENT", 0),
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            pytest.raises(RuntimeError, match="another provision generation"),
+        ):
+            await ctrl._do_create(config)
+
+    @pytest.mark.asyncio
+    async def test_status_returns_vmi_pod_ip_and_active_pod_uid(self):
+        ctrl = _make_controller(headscale_available=False)
+        job_id = SAMPLE_JOB_CONFIG["job_id"]
+
+        def _get(**kwargs):
+            if kwargs["plural"] == "virtualmachineinstances":
+                return {
+                    "status": {
+                        "interfaces": [{"ipAddress": "10.42.1.23"}],
+                        "activePods": {"launcher-pod-uid": "node-a"},
+                    }
+                }
+            return {
+                "metadata": {"name": f"agent-vm-{job_id}"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "printableStatus": "Running",
+                },
+            }
+
+        ctrl.k8s_client.get_namespaced_custom_object.side_effect = _get
+        result = await ctrl._do_status(job_id)
+
+        assert result["ready"] is True
+        assert result["pod_ip"] == "10.42.1.23"
+        assert result["active_pod_uid"] == "launcher-pod-uid"
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _kubernetes_stubs_live_for_this_module():
+    """Keep the stubs installed only while THIS module's tests run.
+
+    The controller imports ``kubernetes`` lazily inside its methods (``init_k8s``
+    and every ``except ApiException`` site), so the stubs must be live during the
+    tests — but leaving them in ``sys.modules`` for the whole session shadowed the
+    real client for everyone else, and the stub is missing attributes the real one
+    has (``load_kube_config``, ``CoreV1Api``). That broke
+    ``tests/test_infrastructure_metering_collector_runtime.py`` on full-suite runs.
+    """
+
+    _install_k8s_stubs()
+    try:
+        yield
+    finally:
+        _restore_k8s_modules()
 
 
 # =============================================================================
@@ -148,7 +544,6 @@ SAMPLE_JOB_CONFIG = {
     "description": "Build the feature module",
 }
 
-
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -178,6 +573,8 @@ def make_nats_msg_raw(raw_bytes: bytes, reply: str | None = None) -> MagicMock:
 def _make_headscale_mock(available: bool = True):
     hs = MagicMock()
     hs.is_available = available
+    hs.is_ready = available
+    hs.last_error = None
     hs.init = AsyncMock()
     hs.close = AsyncMock()
     if available:
@@ -205,6 +602,42 @@ def _make_controller(headscale_available: bool = True) -> VMController:
 
     # Mock K8s client
     ctrl.k8s_client = MagicMock()
+    ctrl.core_api = MagicMock()
+    ctrl.coordination_api = MagicMock()
+    ctrl.coordination_api.create_namespaced_lease.return_value = {}
+    ctrl.coordination_api.list_namespaced_lease.return_value = {"items": []}
+
+    def _read_pvc(**kwargs):
+        name = kwargs["name"]
+        owner_id = name[len("agent-vm-") : -len("-rootdisk")]
+        owner_kind = "thread" if owner_id.startswith("thread-") else "job"
+        return types.SimpleNamespace(
+            metadata=types.SimpleNamespace(
+                name=name,
+                uid=f"root-pvc-uid-{owner_id}",
+                labels={
+                    "srw.io/owner-kind": owner_kind,
+                    "srw.io/owner-id": owner_id,
+                },
+            )
+        )
+
+    ctrl.core_api.read_namespaced_persistent_volume_claim.side_effect = _read_pvc
+
+    def _admit_object(**kwargs):
+        body = kwargs.get("body") or {}
+        metadata = dict(body.get("metadata") or {})
+        if kwargs.get("plural") == KUBEVIRT_PLURAL:
+            metadata["uid"] = "admitted-vm-uid-001"
+        return {**body, "metadata": metadata}
+
+    ctrl.k8s_client.create_namespaced_custom_object.side_effect = _admit_object
+    ctrl.k8s_client.get_namespaced_custom_object.return_value = {
+        "metadata": {
+            "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+            "uid": "existing-vm-uid-002",
+        }
+    }
 
     ctrl.http_runner = None
 
@@ -223,6 +656,16 @@ def _scoped_orchestrator_id():
     """
     with patch("vm.controller.controller.ORCHESTRATOR_ID", "test-oid"):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _run_sync_kubernetes_mocks_inline(monkeypatch):
+    """Keep MagicMock K8s calls deterministic while production uses to_thread."""
+
+    async def _inline(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline)
 
 
 @pytest.fixture
@@ -304,6 +747,19 @@ class TestRenderTemplate:
 
         assert result["metadata"]["name"] == f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}"
         assert result["metadata"]["labels"]["job-id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert result["metadata"]["labels"]["srw.io/owner-kind"] == "job"
+        assert (
+            result["metadata"]["labels"]["srw.io/owner-id"]
+            == SAMPLE_JOB_CONFIG["job_id"]
+        )
+        assert result["spec"]["template"]["metadata"]["labels"] == {
+            "srw.io/owner-kind": "job",
+            "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+        }
+        assert result["spec"]["dataVolumeTemplates"][0]["metadata"]["labels"] == {
+            "srw.io/owner-kind": "job",
+            "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+        }
 
         spec = result["spec"]["template"]["spec"]
         assert spec["domain"]["cpu"]["cores"] == 4
@@ -344,14 +800,14 @@ class TestRenderTemplate:
         )
 
     def test_render_default_agent_config(self, controller):
-        """agent_config defaults to 'defaults' when not specified."""
+        """agent_config defaults to 'worker_base' when not specified."""
         config = {"job_id": "test-id"}
         result = controller.render_template(config)
 
         user_data = result["spec"]["template"]["spec"]["volumes"][1][
             "cloudInitNoCloud"
         ]["userData"]
-        assert "AGENT_CONFIG=defaults" in user_data
+        assert "AGENT_CONFIG=worker_base" in user_data
 
     def test_render_empty_tailscale_key(self, controller):
         """Empty tailscale auth key results in empty placeholder."""
@@ -441,6 +897,25 @@ class TestRenderTemplate:
         assert isinstance(cores, int)
         assert cores == 8
 
+    def test_render_stamps_thread_owner_on_vm_vmi_and_data_volume(self, controller):
+        config = {**SAMPLE_JOB_CONFIG, "job_id": "thread-123", "entity_type": "thread"}
+
+        result = controller.render_template(config)
+
+        for labels in (
+            result["metadata"]["labels"],
+            result["spec"]["template"]["metadata"]["labels"],
+            result["spec"]["dataVolumeTemplates"][0]["metadata"]["labels"],
+        ):
+            assert labels["srw.io/owner-kind"] == "thread"
+            assert labels["srw.io/owner-id"] == "thread-123"
+
+    def test_render_rejects_unknown_owner_kind(self, controller):
+        config = {**SAMPLE_JOB_CONFIG, "entity_type": "customer"}
+
+        with pytest.raises(ValueError, match="entity_type"):
+            controller.render_template(config)
+
 
 # =============================================================================
 # Tests: init_k8s()
@@ -492,6 +967,46 @@ class TestInitK8s:
             ctrl.init_k8s()
 
         assert ctrl.k8s_client is mock_api
+
+    def test_init_k8s_sets_core_api_for_pvc_identity(self):
+        ctrl = _make_controller()
+        ctrl.core_api = None
+
+        mock_core_api = MagicMock()
+        mock_client = MagicMock()
+        mock_client.CoreV1Api.return_value = mock_core_api
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "kubernetes": MagicMock(client=mock_client, config=MagicMock()),
+                "kubernetes.client": mock_client,
+                "kubernetes.config": MagicMock(),
+            },
+        ):
+            ctrl.init_k8s()
+
+        assert ctrl.core_api is mock_core_api
+
+    def test_init_k8s_sets_coordination_api_for_durable_replay_claims(self):
+        ctrl = _make_controller()
+        ctrl.coordination_api = None
+
+        mock_coordination_api = MagicMock()
+        mock_client = MagicMock()
+        mock_client.CoordinationV1Api.return_value = mock_coordination_api
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "kubernetes": MagicMock(client=mock_client, config=MagicMock()),
+                "kubernetes.client": mock_client,
+                "kubernetes.config": MagicMock(),
+            },
+        ):
+            ctrl.init_k8s()
+
+        assert ctrl.coordination_api is mock_coordination_api
 
 
 # =============================================================================
@@ -592,6 +1107,32 @@ class TestHandleCreate:
         payload = json.loads(raw.decode())
         assert payload["status"] == "created"
         assert payload["job_id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert payload["vm_uid"] == "admitted-vm-uid-001"
+        assert payload["rootdisk_pvc_uid"] == (
+            f"root-pvc-uid-{SAMPLE_JOB_CONFIG['job_id']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_omits_unattested_rootdisk_pvc_uid(self, controller):
+        controller.core_api.read_namespaced_persistent_volume_claim.return_value = (
+            types.SimpleNamespace(
+                metadata=types.SimpleNamespace(
+                    name="agent-vm-spoofed-rootdisk",
+                    uid="spoofed-pvc-uid",
+                    labels={
+                        "srw.io/owner-kind": "job",
+                        "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                    },
+                )
+            )
+        )
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = None
+
+        with patch("vm.controller.controller.VM_ROOTDISK_PVC_UID_ATTEMPTS", 1):
+            result = await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert result["status"] == "created"
+        assert "rootdisk_pvc_uid" not in result
 
     @pytest.mark.asyncio
     async def test_create_vm_generates_headscale_key(self, controller):
@@ -618,15 +1159,38 @@ class TestHandleCreate:
         assert payload["status"] == "created"
 
     @pytest.mark.asyncio
-    async def test_create_vm_headscale_key_failure(self, controller):
-        """VM creation continues when Headscale key generation returns None."""
+    async def test_create_vm_defers_when_headscale_key_unavailable(self, controller):
+        """No key → defer the create instead of building an unreachable VM.
+
+        Regression for the 2026-07-17/07-25 outage: a VM built without a
+        tailnet pre-auth key boots and heartbeats but can never be reached
+        over SSH, so it silently burned the whole 3 × 10 min provisioning
+        budget before failing the job. See knowledge-base/knowledge/issues/
+        vm_controller_headscale_latch_kills_provisioning.md.
+        """
         controller.headscale.create_auth_key = AsyncMock(return_value=None)
+        controller.headscale.last_error = "ConnectError: connection refused"
         msg = make_nats_msg(SAMPLE_JOB_CONFIG)
         await controller.handle_create(msg)
 
-        controller.k8s_client.create_namespaced_custom_object.assert_called_once()
+        controller.k8s_client.create_namespaced_custom_object.assert_not_called()
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
-        assert payload["status"] == "created"
+        assert payload["status"] == "waiting_headscale"
+        assert payload["job_id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert "connection refused" in payload["headscale_error"]
+
+    @pytest.mark.asyncio
+    async def test_create_vm_defers_without_last_error(self, controller):
+        """Deferral still carries a usable reason when last_error is unset."""
+        controller.headscale.create_auth_key = AsyncMock(return_value=None)
+        controller.headscale.last_error = None
+        msg = make_nats_msg(SAMPLE_JOB_CONFIG)
+        await controller.handle_create(msg)
+
+        controller.k8s_client.create_namespaced_custom_object.assert_not_called()
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "waiting_headscale"
+        assert payload["headscale_error"]
 
     @pytest.mark.asyncio
     async def test_create_vm_renders_manifest_correctly(self, controller):
@@ -706,8 +1270,14 @@ class TestHandleCreate:
         assert payload["status"] == "failed"
 
     @pytest.mark.asyncio
-    async def test_create_vm_409_not_being_deleted_raises_immediately(self, controller):
-        """409 without 'is being deleted' body raises immediately (no retry)."""
+    async def test_create_vm_409_already_exists_is_idempotent_success(self, controller):
+        """Plain 409 AlreadyExists is idempotent success, not a failure.
+
+        The VM name is agent-vm-<job_id>, so an existing live VM IS this
+        job's VM (a duplicate/racing create lost to one that succeeded).
+        Propagating the 409 as 'failed' parked two healthy loop jobs — see
+        knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md §B.
+        """
         conflict = _FakeApiException(status=409, body="already exists")
 
         controller.k8s_client.create_namespaced_custom_object.side_effect = conflict
@@ -716,10 +1286,34 @@ class TestHandleCreate:
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             await controller.handle_create(msg)
 
-        # No sleep = no retry
+        # No sleep = no retry loop; single create call
         mock_sleep.assert_not_awaited()
+        assert controller.k8s_client.create_namespaced_custom_object.call_count == 1
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "created"
+        assert payload["vm_name"] == f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}"
+        assert payload["vm_uid"] == "existing-vm-uid-002"
+        controller.k8s_client.get_namespaced_custom_object.assert_called_once_with(
+            group=KUBEVIRT_GROUP,
+            version=KUBEVIRT_VERSION,
+            namespace=VM_NAMESPACE,
+            plural=KUBEVIRT_PLURAL,
+            name=f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_vm_without_admitted_uid_fails_closed(self, controller):
+        controller.k8s_client.create_namespaced_custom_object.side_effect = None
+        controller.k8s_client.create_namespaced_custom_object.return_value = {}
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {"name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}"}
+        }
+
+        await controller.handle_create(make_nats_msg(SAMPLE_JOB_CONFIG))
+
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
         assert payload["status"] == "failed"
+        assert "metadata.uid" in payload["error"]
 
     @pytest.mark.asyncio
     async def test_create_vm_malformed_json(self, controller):
@@ -803,7 +1397,11 @@ class TestHandleDelete:
         msg = make_nats_msg({"job_id": job_id})
         await controller.handle_delete(msg)
 
-        kw = controller.k8s_client.delete_namespaced_custom_object.call_args[1]
+        # A terminal delete now touches two resources (VM, then the rootdisk
+        # DataVolume) — pick out the VM call.
+        kw = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, KUBEVIRT_PLURAL
+        )[0].kwargs
         assert kw["name"] == f"agent-vm-{job_id}"
         assert kw["group"] == "kubevirt.io"
         assert kw["version"] == "v1"
@@ -831,7 +1429,15 @@ class TestHandleDelete:
         await controller_no_headscale.handle_delete(msg)
 
         controller_no_headscale.headscale.delete_node.assert_not_awaited()
-        controller_no_headscale.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        assert (
+            len(
+                _calls_for(
+                    controller_no_headscale.k8s_client.delete_namespaced_custom_object,
+                    KUBEVIRT_PLURAL,
+                )
+            )
+            == 1
+        )
 
     @pytest.mark.asyncio
     async def test_delete_vm_already_gone_404(self, controller):
@@ -914,7 +1520,9 @@ class TestHandleDelete:
         msg = make_nats_msg({"job_id": "hs-fail-ok"})
         await controller.handle_delete(msg)
 
-        controller.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        assert _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, KUBEVIRT_PLURAL
+        )
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
         assert payload["status"] == "deleted"
 
@@ -925,7 +1533,9 @@ class TestHandleDelete:
         msg = make_nats_msg({"job_id": job_id})
         await controller.handle_delete(msg)
 
-        kw = controller.k8s_client.delete_namespaced_custom_object.call_args[1]
+        kw = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, KUBEVIRT_PLURAL
+        )[0].kwargs
         assert kw["name"] == f"agent-vm-{job_id}"
 
 
@@ -1124,11 +1734,16 @@ class TestHandleStatusQuery:
         msg = make_nats_msg({"job_id": job_id}, reply="reply.test")
         await controller.handle_status_query(msg)
 
-        kw = controller.k8s_client.get_namespaced_custom_object.call_args[1]
-        assert kw["group"] == "kubevirt.io"
-        assert kw["version"] == "v1"
-        assert kw["plural"] == "virtualmachines"
-        assert kw["name"] == f"agent-vm-{job_id}"
+        calls = controller.k8s_client.get_namespaced_custom_object.call_args_list
+        coordinates = {
+            (call.kwargs["group"], call.kwargs["version"], call.kwargs["plural"])
+            for call in calls
+        }
+        assert coordinates == {
+            ("kubevirt.io", "v1", "virtualmachines"),
+            ("kubevirt.io", "v1", "virtualmachineinstances"),
+        }
+        assert {call.kwargs["name"] for call in calls} == {f"agent-vm-{job_id}"}
 
     @pytest.mark.asyncio
     async def test_status_query_with_extra_fields(self, controller):
@@ -1145,6 +1760,110 @@ class TestHandleStatusQuery:
 
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
         assert payload["job_id"] == "extra-fields"
+
+
+# =============================================================================
+# Tests: handle_list() / http_list() — orphan-sweep inventory
+# =============================================================================
+
+
+class TestHandleList:
+    """vm.lifecycle.list request/reply — inventory for the VM orphan sweep."""
+
+    @staticmethod
+    def _wire_vms(controller, items):
+        controller.k8s_client.list_namespaced_custom_object.return_value = {
+            "items": items
+        }
+
+    @staticmethod
+    def _vm_item(name: str, created: str = "2026-07-09T10:00:00Z", phase="Running"):
+        return {
+            "metadata": {"name": name, "creationTimestamp": created},
+            "status": {"printableStatus": phase},
+        }
+
+    @pytest.mark.asyncio
+    async def test_lists_agent_vms_only(self, controller):
+        """Golden DataVolume names and foreign objects are filtered out."""
+        self._wire_vms(
+            controller,
+            [
+                self._vm_item("agent-vm-job-uuid-1"),
+                self._vm_item("agent-vm-golden-abc123"),  # golden — excluded
+                self._vm_item("some-other-vm"),  # foreign — excluded
+            ],
+        )
+        msg = make_nats_msg({"orchestrator_id": "test"}, reply="reply.inbox.list")
+        await controller.handle_list(msg)
+
+        subject, raw = controller.nc.publish.call_args[0]
+        assert subject == "reply.inbox.list"
+        payload = json.loads(raw.decode())
+        assert len(payload["vms"]) == 1
+        vm = payload["vms"][0]
+        assert vm["vm_name"] == "agent-vm-job-uuid-1"
+        assert vm["entity_id"] == "job-uuid-1"
+        assert vm["created_at"] == "2026-07-09T10:00:00Z"
+        assert vm["phase"] == "Running"
+
+    @pytest.mark.asyncio
+    async def test_empty_cluster_replies_empty_list(self, controller):
+        self._wire_vms(controller, [])
+        msg = make_nats_msg({}, reply="reply.inbox.empty")
+        await controller.handle_list(msg)
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload == {"vms": []}
+
+    @pytest.mark.asyncio
+    async def test_k8s_error_replies_list_failed(self, controller):
+        controller.k8s_client.list_namespaced_custom_object.side_effect = RuntimeError(
+            "api down"
+        )
+        msg = make_nats_msg({}, reply="reply.inbox.err")
+        await controller.handle_list(msg)
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "list_failed"
+        assert "vms" not in payload
+
+    @pytest.mark.asyncio
+    async def test_no_reply_subject_publishes_nothing(self, controller):
+        """A list is only meaningful request/reply — no status fallback."""
+        self._wire_vms(controller, [self._vm_item("agent-vm-x")])
+        msg = make_nats_msg({}, reply=None)
+        await controller.handle_list(msg)
+        controller.nc.publish.assert_not_called()
+
+
+class TestHttpList:
+    """GET /vms — same inventory over the HTTP transport."""
+
+    @pytest.mark.asyncio
+    async def test_http_list_returns_vms(self, controller):
+        controller.k8s_client.list_namespaced_custom_object.return_value = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": "agent-vm-j1",
+                        "creationTimestamp": "2026-07-09T09:00:00Z",
+                    },
+                    "status": {"printableStatus": "Running"},
+                }
+            ]
+        }
+        resp = await controller.http_list(MagicMock())
+        assert resp.status == 200
+        payload = json.loads(resp.body.decode())
+        assert payload["vms"][0]["entity_id"] == "j1"
+
+    @pytest.mark.asyncio
+    async def test_http_list_k8s_error_500s(self, controller):
+        controller.k8s_client.list_namespaced_custom_object.side_effect = RuntimeError(
+            "api down"
+        )
+        resp = await controller.http_list(MagicMock())
+        assert resp.status == 500
+        assert json.loads(resp.body.decode())["status"] == "list_failed"
 
 
 # =============================================================================
@@ -1540,7 +2259,16 @@ class TestEdgeCases:
         await controller.handle_delete(make_nats_msg({"job_id": job_id}))
 
         controller.k8s_client.create_namespaced_custom_object.assert_called_once()
-        controller.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        # VM object once; the second delete call is the rootdisk purge.
+        assert (
+            len(
+                _calls_for(
+                    controller.k8s_client.delete_namespaced_custom_object,
+                    KUBEVIRT_PLURAL,
+                )
+            )
+            == 1
+        )
 
         # Last status should be "deleted"
         last_payload = json.loads(controller.nc.publish.call_args[0][1].decode())
@@ -1642,3 +2370,1414 @@ class TestModuleConstants:
         from vm.controller.controller import NATS_URL
 
         assert "nats://" in NATS_URL
+
+
+# =============================================================================
+# Tests: golden-image cloning
+# (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md)
+# =============================================================================
+
+from vm.controller.controller import _golden_name  # noqa: E402
+
+
+class TestGoldenName:
+    """Deterministic, content-keyed golden PVC names."""
+
+    def test_deterministic_and_prefixed(self):
+        n = _golden_name("ghcr.io/x/agent-vm-base:sha-abc")
+        assert n == _golden_name("ghcr.io/x/agent-vm-base:sha-abc")
+        assert n.startswith("agent-vm-golden-")
+        assert len(n) == len("agent-vm-golden-") + 12
+
+    def test_differs_per_image_digest(self):
+        assert _golden_name("img:sha-a") != _golden_name("img:sha-b")
+
+
+class TestApplyCloneSource:
+    """Rendered VM manifest → rootdisk clones the golden PVC instead of import."""
+
+    def test_swaps_registry_for_pvc_clone(self, controller):
+        manifest = controller.render_template(SAMPLE_JOB_CONFIG, "")
+        controller._apply_clone_source(manifest, "agent-vm-golden-deadbeef")
+        dv = manifest["spec"]["dataVolumeTemplates"][0]["spec"]
+        assert dv["source"] == {"pvc": {"name": "agent-vm-golden-deadbeef"}}
+        assert "registry" not in dv["source"]
+        # same namespace → no namespace key (avoids cross-ns clone RBAC)
+        assert "namespace" not in dv["source"]["pvc"]
+        # clone target must match the golden's Filesystem volumeMode
+        assert dv["storage"]["volumeMode"] == "Filesystem"
+
+
+class TestEnsureGolden:
+    """The golden ensure state machine, against the CDI DataVolume resource."""
+
+    @staticmethod
+    def _get(c):
+        return c.k8s_client.get_namespaced_custom_object
+
+    @staticmethod
+    def _create(c):
+        return c.k8s_client.create_namespaced_custom_object
+
+    @pytest.mark.asyncio
+    async def test_succeeded_fast_path_no_create(self, controller):
+        self._get(controller).return_value = {"status": {"phase": "Succeeded"}}
+        name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        self._create(controller).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_creates_then_waits_succeeded(self, controller):
+        self._get(controller).side_effect = [
+            _FakeApiException(status=404),
+            {"status": {"phase": "Succeeded"}},
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        create = self._create(controller)
+        create.assert_called_once()
+        kwargs = create.call_args.kwargs
+        assert kwargs["group"] == "cdi.kubevirt.io"
+        assert kwargs["version"] == "v1beta1"
+        assert kwargs["plural"] == "datavolumes"
+        # golden manifest: explicit spec.pvc + Filesystem + bind-immediate + keep-handle
+        body = kwargs["body"]
+        assert body["spec"]["pvc"]["volumeMode"] == "Filesystem"
+        assert body["spec"]["pvc"]["accessModes"] == ["ReadWriteOnce"]
+        ann = body["metadata"]["annotations"]
+        assert ann["cdi.kubevirt.io/storage.bind.immediate.requested"] == "true"
+        assert ann["cdi.kubevirt.io/storage.deleteAfterCompletion"] == "false"
+
+    @pytest.mark.asyncio
+    async def test_failed_golden_is_recreated(self, controller):
+        self._get(controller).side_effect = [
+            {"status": {"phase": "Failed"}},
+            {"status": {"phase": "Succeeded"}},
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        controller.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        self._create(controller).assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_importing_waits_without_creating(self, controller):
+        self._get(controller).side_effect = [
+            {"status": {"phase": "ImportInProgress"}},
+            {"status": {"phase": "Succeeded"}},
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        self._create(controller).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_409_is_the_lock_then_waits(self, controller):
+        self._get(controller).side_effect = [
+            _FakeApiException(status=404),
+            {"status": {"phase": "Succeeded"}},
+        ]
+        self._create(controller).side_effect = _FakeApiException(status=409)
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            name = await controller._ensure_golden("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+
+    @pytest.mark.asyncio
+    async def test_create_failure_returns_none_for_fallback(self, controller):
+        self._get(controller).side_effect = [_FakeApiException(status=404)]
+        self._create(controller).side_effect = _FakeApiException(status=500)
+        name = await controller._ensure_golden("img:sha-a")
+        assert name is None
+
+
+class TestGoldenStateNowait:
+    """Non-blocking golden check for the create path.
+
+    Unlike _ensure_golden (kept for pre-warm), this must NEVER sleep waiting
+    for CDI: a create handler blocked for a cold import (~30 min) outlives
+    every orchestrator budget and races later creates into 409 collisions —
+    see knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md.
+    """
+
+    @staticmethod
+    def _get(c):
+        return c.k8s_client.get_namespaced_custom_object
+
+    @staticmethod
+    def _create(c):
+        return c.k8s_client.create_namespaced_custom_object
+
+    @pytest.mark.asyncio
+    async def test_succeeded_returns_name_no_waiting(self, controller):
+        self._get(controller).return_value = {"status": {"phase": "Succeeded"}}
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        assert waiting is None
+        self._create(controller).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_importing_returns_waiting_without_sleeping(self, controller):
+        self._get(controller).return_value = {
+            "status": {"phase": "ImportInProgress", "progress": "68.19%"}
+        }
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            name, waiting = await controller._golden_state_nowait("img:sha-a")
+        mock_sleep.assert_not_awaited()
+        assert name is None
+        assert waiting == {
+            "golden": _golden_name("img:sha-a"),
+            "golden_phase": "ImportInProgress",
+            "golden_progress": "68.19%",
+        }
+        self._create(controller).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_creates_dv_and_returns_waiting(self, controller):
+        self._get(controller).side_effect = _FakeApiException(status=404)
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name is None
+        assert waiting["golden"] == _golden_name("img:sha-a")
+        assert waiting["golden_phase"] == "Pending"
+        create = self._create(controller)
+        create.assert_called_once()
+        assert create.call_args.kwargs["group"] == "cdi.kubevirt.io"
+
+    @pytest.mark.asyncio
+    async def test_absent_create_409_racer_still_waits(self, controller):
+        self._get(controller).side_effect = _FakeApiException(status=404)
+        self._create(controller).side_effect = _FakeApiException(status=409)
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name is None
+        assert waiting is not None
+
+    @pytest.mark.asyncio
+    async def test_absent_create_error_falls_back_to_registry(self, controller):
+        self._get(controller).side_effect = _FakeApiException(status=404)
+        self._create(controller).side_effect = _FakeApiException(status=500)
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name is None
+        assert waiting is None
+
+    @pytest.mark.asyncio
+    async def test_failed_golden_recreated_then_waits(self, controller):
+        self._get(controller).return_value = {"status": {"phase": "Failed"}}
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name is None
+        assert waiting is not None
+        controller.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        self._create(controller).assert_called_once()
+
+
+class TestDoCreateWaitingGolden:
+    """_do_create defers (no VM, no Headscale key) while the golden imports."""
+
+    @pytest.mark.asyncio
+    async def test_importing_golden_defers_vm_create(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "status": {"phase": "ImportInProgress", "progress": "42.0%"}
+        }
+        msg = make_nats_msg(SAMPLE_JOB_CONFIG)
+        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
+            await controller.handle_create(msg)
+
+        # No VM object, no Headscale key minted per poll
+        controller.k8s_client.create_namespaced_custom_object.assert_not_called()
+        controller.headscale.create_auth_key.assert_not_awaited()
+
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "waiting_golden"
+        assert payload["job_id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert payload["golden_progress"] == "42.0%"
+        assert payload["golden"].startswith("agent-vm-golden-")
+
+    @pytest.mark.asyncio
+    async def test_succeeded_golden_creates_vm_with_clone_source(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "status": {"phase": "Succeeded"}
+        }
+        msg = make_nats_msg(SAMPLE_JOB_CONFIG)
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+        ):
+            await controller.handle_create(msg)
+
+        create = controller.k8s_client.create_namespaced_custom_object
+        create.assert_called_once()
+        body = create.call_args.kwargs["body"]
+        dv = body["spec"]["dataVolumeTemplates"][0]["spec"]
+        assert "pvc" in dv["source"]  # clone, not registry import
+
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "created"
+
+    @pytest.mark.asyncio
+    async def test_golden_infra_error_falls_back_to_registry_create(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = (
+            _FakeApiException(status=404)
+        )
+        # golden DV create rejected (CDI infra down) → registry fallback;
+        # VM create (2nd create call) succeeds.
+        controller.k8s_client.create_namespaced_custom_object.side_effect = [
+            _FakeApiException(status=500),
+            {
+                "metadata": {
+                    "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+                    "uid": "registry-fallback-vm-uid",
+                }
+            },
+        ]
+        msg = make_nats_msg(SAMPLE_JOB_CONFIG)
+        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
+            await controller.handle_create(msg)
+
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "created"
+
+
+class TestGcGoldens:
+    """Keep the newest N; never GC the current, in-use, or too-young goldens."""
+
+    @pytest.mark.asyncio
+    async def test_keeps_newest_skips_current_and_in_use(self, controller):
+        imgs = {k: f"img:sha-{k}" for k in ("new", "b", "c", "old")}
+        ts = {
+            "new": "2026-01-04T00:00:00Z",
+            "b": "2026-01-03T00:00:00Z",
+            "c": "2026-01-02T00:00:00Z",
+            "old": "2026-01-01T00:00:00Z",
+        }
+        goldens = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": _golden_name(imgs[k]),
+                        "creationTimestamp": ts[k],
+                        "labels": {"srw.io/golden-image": "x"},
+                    }
+                }
+                for k in ("new", "b", "c", "old")
+            ]
+        }
+        vms = {
+            "items": [
+                {
+                    "spec": {
+                        "dataVolumeTemplates": [
+                            {
+                                "spec": {
+                                    "source": {"pvc": {"name": _golden_name(imgs["b"])}}
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        controller.k8s_client.list_namespaced_custom_object.side_effect = [goldens, vms]
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_KEEP", 1),
+            patch("vm.controller.controller.VM_GOLDEN_GC_MIN_AGE_MINUTES", 0),
+        ):
+            await controller._gc_goldens(imgs["c"])  # current image = c
+        deletes = controller.k8s_client.delete_namespaced_custom_object
+        # keep newest 1 (new); b is in-use, c is current → only old is GC'd.
+        deleted = [call.kwargs["name"] for call in deletes.call_args_list]
+        assert deleted == [_golden_name(imgs["old"])]
+
+    @pytest.mark.asyncio
+    async def test_noop_when_at_or_below_keep(self, controller):
+        goldens = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": "g1",
+                        "creationTimestamp": "2026-01-01T00:00:00Z",
+                    }
+                }
+            ]
+        }
+        controller.k8s_client.list_namespaced_custom_object.side_effect = [goldens]
+        with patch("vm.controller.controller.VM_GOLDEN_KEEP", 3):
+            await controller._gc_goldens("img:sha-a")
+        controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+
+class TestDoCreateGoldenIntegration:
+    """_do_create wires the clone in when enabled; byte-identical when off."""
+
+    @pytest.mark.asyncio
+    async def test_enabled_applies_clone_source(self, controller):
+        controller._golden_state_nowait = AsyncMock(
+            return_value=("agent-vm-golden-abc123def456", None)
+        )
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+        body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[
+            "body"
+        ]
+        src = body["spec"]["dataVolumeTemplates"][0]["spec"]["source"]
+        assert src == {"pvc": {"name": "agent-vm-golden-abc123def456"}}
+
+    @pytest.mark.asyncio
+    async def test_disabled_keeps_registry_source(self, controller):
+        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", False):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+        body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[
+            "body"
+        ]
+        src = body["spec"]["dataVolumeTemplates"][0]["spec"]["source"]
+        assert "registry" in src
+        assert "pvc" not in src
+
+    @pytest.mark.asyncio
+    async def test_golden_failure_falls_back_to_registry(self, controller):
+        controller._golden_state_nowait = AsyncMock(return_value=(None, None))
+        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+        body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[
+            "body"
+        ]
+        src = body["spec"]["dataVolumeTemplates"][0]["spec"]["source"]
+        assert "registry" in src
+        assert "pvc" not in src
+
+
+# =============================================================================
+# Tests: persistent rootdisk — Phase 0
+# (knowledge-base/knowledge/features/vm_persistent_rootdisk.md D1 + D2's controller half)
+# =============================================================================
+
+from vm.controller.controller import _rootdisk_name  # noqa: E402
+
+
+def _calls_for(mock, plural: str) -> list:
+    """Filter a k8s CustomObjectsApi mock's calls down to one resource kind.
+
+    ``k8s_client`` is one MagicMock serving both VirtualMachines and
+    DataVolumes, so every assertion has to say which it means.
+    """
+    return [c for c in mock.call_args_list if c.kwargs.get("plural") == plural]
+
+
+def _dv_create_body(controller) -> dict:
+    calls = _calls_for(
+        controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+    )
+    assert calls, "no DataVolume was created"
+    return calls[-1].kwargs["body"]
+
+
+def _vm_create_body(controller) -> dict:
+    calls = _calls_for(
+        controller.k8s_client.create_namespaced_custom_object, KUBEVIRT_PLURAL
+    )
+    assert calls, "no VirtualMachine was created"
+    return calls[-1].kwargs["body"]
+
+
+def _dv_phase(phase: str | None):
+    """side_effect for get_namespaced_custom_object: one DV in ``phase``.
+
+    ``None`` means 404 (absent).
+    """
+
+    def _get(**kwargs):
+        if kwargs.get("plural") == KUBEVIRT_PLURAL:
+            return {
+                "metadata": {
+                    "name": kwargs.get("name"),
+                    "uid": "persistent-rootdisk-vm-uid",
+                }
+            }
+        if phase is None:
+            raise _FakeApiException(status=404)
+        return {"metadata": {"name": kwargs.get("name")}, "status": {"phase": phase}}
+
+    return _get
+
+
+class TestRootdiskName:
+    """The standalone DV keeps the exact name the VM template already uses,
+    so ``volumes[].dataVolume.name`` needs no change."""
+
+    def test_matches_template_name(self):
+        assert _rootdisk_name("abc-123") == "agent-vm-abc-123-rootdisk"
+
+    def test_is_entity_agnostic(self):
+        # The controller never learns whether an id is a job or a thread; VM
+        # names are agent-vm-<id> for both, so rootdisks are too.
+        assert _rootdisk_name("thread-uuid") == "agent-vm-thread-uuid-rootdisk"
+
+
+class TestPersistentRootdiskDisabled:
+    """Flag OFF → today's rendering, byte-identical. No DV, no extra calls."""
+
+    @pytest.mark.asyncio
+    async def test_manifest_keeps_data_volume_templates(self, controller):
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", False):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+        body = _vm_create_body(controller)
+        assert "dataVolumeTemplates" in body["spec"]
+        assert not _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+        )
+
+
+class TestPersistentRootdiskEnabled:
+    """Flag ON → the rootdisk becomes a standalone DataVolume the VM does not
+    own, so it survives VM deletion and is reattached by name on recreate."""
+
+    @pytest.mark.asyncio
+    async def test_data_volume_templates_popped_volumes_untouched(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        body = _vm_create_body(controller)
+        assert "dataVolumeTemplates" not in body["spec"]
+        # The by-name reference is the whole trick — it must be untouched.
+        volumes = body["spec"]["template"]["spec"]["volumes"]
+        rootvol = next(v for v in volumes if v["name"] == "rootdisk")
+        assert rootvol["dataVolume"]["name"] == _rootdisk_name(
+            SAMPLE_JOB_CONFIG["job_id"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_standalone_dv_created_with_the_template_spec(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        assert dv["kind"] == "DataVolume"
+        assert dv["metadata"]["name"] == _rootdisk_name(SAMPLE_JOB_CONFIG["job_id"])
+        assert dv["metadata"]["namespace"] == VM_NAMESPACE
+        # Labels drive the GC sweep and the orphan backstop.
+        assert dv["metadata"]["labels"]["srw.io/rootdisk"] == "true"
+        assert dv["metadata"]["labels"]["job-id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert dv["metadata"]["labels"]["srw.io/owner-kind"] == "job"
+        assert (
+            dv["metadata"]["labels"]["srw.io/owner-id"] == SAMPLE_JOB_CONFIG["job_id"]
+        )
+        # Spec is the template's own — same size, storage class, source.
+        assert dv["spec"]["storage"]["storageClassName"]
+        assert "registry" in dv["spec"]["source"]
+        # No bind.immediate: the clone target must stay WaitForFirstConsumer so
+        # it binds on the VM's node (same rule as the golden work).
+        annotations = dv["metadata"].get("annotations", {})
+        assert "cdi.kubevirt.io/storage.bind.immediate.requested" not in annotations
+
+    @pytest.mark.asyncio
+    async def test_thread_rootdisk_carries_thread_owner_identity(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        config = {**SAMPLE_JOB_CONFIG, "job_id": "thread-123", "entity_type": "thread"}
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(config)
+
+        labels = _dv_create_body(controller)["metadata"]["labels"]
+        assert labels["srw.io/owner-kind"] == "thread"
+        assert labels["srw.io/owner-id"] == "thread-123"
+
+    @pytest.mark.asyncio
+    async def test_golden_clone_source_carries_into_the_standalone_dv(self, controller):
+        """Ordering guard: the clone mutation must be applied BEFORE the pop,
+        or a golden-enabled create would silently import from the registry."""
+        controller._golden_state_nowait = AsyncMock(
+            return_value=("agent-vm-golden-abc123def456", None)
+        )
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+            patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        # namespace is added on the way out — see TestRootdiskCloneSourceNamespace.
+        assert dv["spec"]["source"]["pvc"]["name"] == "agent-vm-golden-abc123def456"
+        assert dv["spec"]["storage"]["volumeMode"] == "Filesystem"
+
+    @pytest.mark.asyncio
+    async def test_succeeded_rootdisk_is_reattached_without_a_clone(self, controller):
+        """The recovery path: disk already exists → skip creation entirely."""
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
+            "Succeeded"
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert not _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+        )
+        # ...and the VM still gets built, pointing at the existing disk.
+        body = _vm_create_body(controller)
+        assert "dataVolumeTemplates" not in body["spec"]
+
+    @pytest.mark.asyncio
+    async def test_failed_rootdisk_is_deleted_and_recreated(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
+            "Failed"
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        deletes = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        assert [c.kwargs["name"] for c in deletes] == [
+            _rootdisk_name(SAMPLE_JOB_CONFIG["job_id"])
+        ]
+        assert _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_in_progress_rootdisk_is_adopted(self, controller):
+        """A racing create is already building it; KubeVirt gates VMI start on
+        DV readiness, so adopting is safe and a second create would 409."""
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
+            "CloneScheduled"
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert not _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+        )
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        assert _vm_create_body(controller)
+
+    @pytest.mark.asyncio
+    async def test_dv_create_409_is_adopted(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+
+        def _create(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                raise _FakeApiException(status=409, body="already exists")
+            return MagicMock()
+
+        controller.k8s_client.create_namespaced_custom_object.side_effect = _create
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            result = await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert result["status"] == "created"
+
+    @pytest.mark.asyncio
+    async def test_dv_create_failure_fails_the_create_loudly(self, controller):
+        """No silent fallback to the templated disk — that would quietly
+        reintroduce the cascade-delete this feature exists to remove."""
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+
+        def _create(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                raise _FakeApiException(status=500, body="quota exceeded")
+            return MagicMock()
+
+        controller.k8s_client.create_namespaced_custom_object.side_effect = _create
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            with pytest.raises(_FakeApiException):
+                await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert not _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, KUBEVIRT_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_template_without_data_volume_templates_refuses(self, controller):
+        controller.template_text = SAMPLE_TEMPLATE.replace(
+            "  dataVolumeTemplates:", "  x-dataVolumeTemplates:"
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            with pytest.raises(RuntimeError, match="no dataVolumeTemplates"):
+                await controller._do_create(SAMPLE_JOB_CONFIG)
+
+
+class TestDeletePurgeIntent:
+    """``purge_disk`` decides whether a delete is terminal (disk + Headscale
+    node go) or a recreate is expected (both are kept — D2/D3)."""
+
+    @pytest.mark.asyncio
+    async def test_default_purges_disk_and_headscale_node(self, controller):
+        """An orchestrator that never sends the field gets today's semantics."""
+        result = await controller._do_delete("job-1")
+
+        deletes = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        assert [c.kwargs["name"] for c in deletes] == [_rootdisk_name("job-1")]
+        controller.headscale.delete_node.assert_awaited_once_with("job-1")
+        assert result["rootdisk"] == "purged"
+
+    @pytest.mark.asyncio
+    async def test_keep_leaves_disk_and_headscale_node(self, controller):
+        """The recovery case. The node must stay: the reused disk still holds
+        /var/lib/tailscale state for it, so deleting it would leave the
+        recovered VM reconnecting as a dead node."""
+        result = await controller._do_delete("job-1", purge_disk=False)
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        controller.headscale.delete_node.assert_not_awaited()
+        assert result["rootdisk"] == "kept"
+        # The VM object itself still goes.
+        assert _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, KUBEVIRT_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_purge_failure_is_non_fatal(self, controller):
+        def _delete(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                raise _FakeApiException(status=500, body="boom")
+            return MagicMock()
+
+        controller.k8s_client.delete_namespaced_custom_object.side_effect = _delete
+        result = await controller._do_delete("job-1")
+        assert result["status"] == "deleted"
+
+    @pytest.mark.asyncio
+    async def test_handle_delete_passes_purge_intent_through(self, controller):
+        msg = make_nats_msg({"job_id": "job-1", "purge_disk": False})
+        await controller.handle_delete(msg)
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["rootdisk"] == "kept"
+
+    @pytest.mark.asyncio
+    async def test_handle_delete_defaults_to_purge(self, controller):
+        await controller.handle_delete(make_nats_msg({"job_id": "job-1"}))
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["rootdisk"] == "purged"
+
+    @pytest.mark.asyncio
+    async def test_http_delete_reads_purge_disk_query_param(self, controller):
+        request = MagicMock()
+        request.match_info = {"job_id": "job-1"}
+        request.query = {"purge_disk": "false"}
+
+        with patch.object(controller, "_do_delete", AsyncMock()) as do_delete:
+            do_delete.return_value = {"job_id": "job-1", "status": "deleted"}
+            await controller.http_delete(request)
+
+        do_delete.assert_awaited_once_with(
+            "job-1", purge_disk=False, provision_generation=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_http_delete_defaults_to_purge(self, controller):
+        request = MagicMock()
+        request.match_info = {"job_id": "job-1"}
+        request.query = {}
+
+        with patch.object(controller, "_do_delete", AsyncMock()) as do_delete:
+            do_delete.return_value = {"job_id": "job-1", "status": "deleted"}
+            await controller.http_delete(request)
+
+        do_delete.assert_awaited_once_with(
+            "job-1", purge_disk=True, provision_generation=None
+        )
+
+
+class TestGcRootdisks:
+    """Layer 3 of the rootdisk GC — the orphan net for disks whose entity row
+    the orchestrator no longer knows (a dev DB reset, a deleted row). Off by
+    default: it cannot consult the DB, so it cannot tell a leaked disk from a
+    long-suspended session's workspace."""
+
+    def _dv(self, name: str, age_h: float):
+        from datetime import datetime, timedelta, timezone
+
+        ts = datetime.now(timezone.utc) - timedelta(hours=age_h)
+        return {
+            "metadata": {
+                "name": name,
+                "labels": {"srw.io/rootdisk": "true"},
+                "creationTimestamp": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        }
+
+    def _wire(self, controller, dvs, vm_names):
+        def _list(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                return {"items": dvs}
+            return {"items": [{"metadata": {"name": n}} for n in vm_names]}
+
+        controller.k8s_client.list_namespaced_custom_object.side_effect = _list
+
+    @pytest.mark.asyncio
+    async def test_old_orphan_is_deleted(self, controller):
+        self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 100)], [])
+        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        deletes = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        assert [c.kwargs["name"] for c in deletes] == ["agent-vm-j1-rootdisk"]
+
+    @pytest.mark.asyncio
+    async def test_disk_with_a_live_vm_is_spared(self, controller):
+        """A recovery in flight: the disk is old, but its VM is back."""
+        self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 100)], ["agent-vm-j1"])
+        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_young_orphan_is_spared(self, controller):
+        """A kept disk is SUPPOSED to outlive its VM during a recovery."""
+        self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 1)], [])
+        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_vm_list_failure_deletes_nothing(self, controller):
+        """Without the VM list every disk looks orphaned — bail, don't guess."""
+
+        def _list(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                return {"items": [self._dv("agent-vm-j1-rootdisk", 100)]}
+            raise _FakeApiException(status=500)
+
+        controller.k8s_client.list_namespaced_custom_object.side_effect = _list
+        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_does_not_run_it_when_disabled(self, controller):
+        controller._gc_rootdisks_safe = AsyncMock()
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with (
+            patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True),
+            patch("vm.controller.controller.VM_ROOTDISK_GC_ENABLED", False),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        controller._gc_rootdisks_safe.assert_not_called()
+
+
+class TestRootdiskCloneSourceNamespace:
+    """A templated DataVolume may omit spec.source.pvc.namespace — CDI defaults
+    it from the owning VM. A STANDALONE one may not: the CDI webhook rejects it
+    with 422 'spec.source.pvc.namespace: Required value'.
+
+    Live-gate finding 2026-07-29 (job a43bfb73): every VM create failed the
+    moment the flag was flipped. Unit tests could not have caught it — the k8s
+    mock accepts any body — so this test pins the shape the API demands.
+    """
+
+    @pytest.mark.asyncio
+    async def test_clone_source_carries_an_explicit_namespace(self, controller):
+        controller._golden_state_nowait = AsyncMock(
+            return_value=("agent-vm-golden-abc123def456", None)
+        )
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+            patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        assert dv["spec"]["source"]["pvc"] == {
+            "name": "agent-vm-golden-abc123def456",
+            # Same namespace as the target, so no cross-namespace clone RBAC is
+            # involved — it just has to be stated.
+            "namespace": VM_NAMESPACE,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_namespace_is_left_alone(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        controller.template_text = SAMPLE_TEMPLATE.replace(
+            "        source:\n          registry:\n            url: docker://${VM_IMAGE}",
+            "        source:\n          pvc:\n            name: some-golden\n"
+            "            namespace: other-ns",
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        assert dv["spec"]["source"]["pvc"]["namespace"] == "other-ns"
+
+    @pytest.mark.asyncio
+    async def test_registry_source_is_untouched(self, controller):
+        """No golden → registry import, which has no namespace concept."""
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        assert "registry" in dv["spec"]["source"]
+        assert "pvc" not in dv["spec"]["source"]
+
+
+class TestLifecycleAuthenticationReplayGuard:
+    @pytest.mark.asyncio
+    async def test_duplicate_mutating_request_is_rejected(self, controller):
+        controller._do_create = AsyncMock(
+            return_value={
+                "job_id": SAMPLE_JOB_CONFIG["job_id"],
+                "status": "created",
+                "provision_generation": PROVISION_GENERATION,
+            }
+        )
+        controller.nc = AsyncMock()
+        payload = sign_payload(
+            {
+                **SAMPLE_JOB_CONFIG,
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        msg = MagicMock(data=json.dumps(payload).encode())
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            await controller.handle_create(msg)
+            await controller.handle_create(msg)
+
+        controller._do_create.assert_awaited_once()
+        controller.nc.publish.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_old_create_replay_after_delete_is_rejected(self, controller):
+        controller._do_create = AsyncMock(
+            return_value={
+                "job_id": SAMPLE_JOB_CONFIG["job_id"],
+                "status": "created",
+                "provision_generation": PROVISION_GENERATION,
+            }
+        )
+        controller._do_delete = AsyncMock(
+            return_value={
+                "job_id": SAMPLE_JOB_CONFIG["job_id"],
+                "status": "deleted",
+                "provision_generation": PROVISION_GENERATION,
+            }
+        )
+        controller.nc = AsyncMock()
+        create_payload = sign_payload(
+            {
+                **SAMPLE_JOB_CONFIG,
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        delete_payload = sign_payload(
+            {
+                "job_id": SAMPLE_JOB_CONFIG["job_id"],
+                "purge_disk": True,
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="delete",
+            secret=LIFECYCLE_SECRET,
+        )
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            await controller.handle_create(
+                MagicMock(data=json.dumps(create_payload).encode())
+            )
+            await controller.handle_delete(
+                MagicMock(data=json.dumps(delete_payload).encode())
+            )
+            await controller.handle_create(
+                MagicMock(data=json.dumps(create_payload).encode())
+            )
+
+        controller._do_create.assert_awaited_once()
+        controller._do_delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_replay_is_rejected_after_controller_restart(self):
+        claimed: set[str] = set()
+
+        def _claim(*, body, **_kwargs):
+            name = body["metadata"]["name"]
+            if name in claimed:
+                raise _FakeApiException(status=409, body="already claimed")
+            claimed.add(name)
+            return body
+
+        first = _make_controller()
+        restarted = _make_controller()
+        durable_api = MagicMock()
+        durable_api.create_namespaced_lease.side_effect = _claim
+        first.coordination_api = durable_api
+        restarted.coordination_api = durable_api
+        first._do_create = AsyncMock(
+            return_value={"job_id": "restart-replay", "status": "created"}
+        )
+        restarted._do_create = AsyncMock(
+            return_value={"job_id": "restart-replay", "status": "created"}
+        )
+        payload = sign_payload(
+            {
+                **SAMPLE_JOB_CONFIG,
+                "job_id": "restart-replay",
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        message = MagicMock(data=json.dumps(payload).encode())
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            await first.handle_create(message)
+            await restarted.handle_create(message)
+
+        first._do_create.assert_awaited_once()
+        restarted._do_create.assert_not_awaited()
+        assert durable_api.create_namespaced_lease.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_nonce_store_rbac_failure_rejects_mutation(self, controller):
+        controller.coordination_api.create_namespaced_lease.side_effect = (
+            _FakeApiException(status=403, body="forbidden")
+        )
+        controller._do_delete = AsyncMock()
+        payload = sign_payload(
+            {
+                "job_id": "forbidden-delete",
+                "purge_disk": True,
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="delete",
+            secret=LIFECYCLE_SECRET,
+        )
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            await controller.handle_delete(MagicMock(data=json.dumps(payload).encode()))
+
+        controller._do_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_expired_nonce_leases_are_garbage_collected(self, controller):
+        from datetime import datetime, timedelta, timezone
+
+        old = datetime.now(timezone.utc) - timedelta(hours=1)
+        fresh = datetime.now(timezone.utc)
+        controller.coordination_api.list_namespaced_lease.return_value = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": "srw-vm-lifecycle-old",
+                        "creationTimestamp": old.isoformat(),
+                    }
+                },
+                {
+                    "metadata": {
+                        "name": "srw-vm-lifecycle-fresh",
+                        "creationTimestamp": fresh.isoformat(),
+                    }
+                },
+            ]
+        }
+
+        assert await controller._gc_expired_lifecycle_nonces(now=fresh)
+
+        assert (
+            controller.coordination_api.list_namespaced_lease.call_args.kwargs["limit"]
+            == LIFECYCLE_NONCE_GC_PAGE_LIMIT
+        )
+        controller.coordination_api.delete_namespaced_lease.assert_called_once()
+        assert (
+            controller.coordination_api.delete_namespaced_lease.call_args.kwargs["name"]
+            == "srw-vm-lifecycle-old"
+        )
+
+    @pytest.mark.asyncio
+    async def test_nonce_gc_bounds_list_page_and_deletions(self, controller):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        expired = now - timedelta(hours=1)
+        controller.coordination_api.list_namespaced_lease.return_value = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": f"srw-vm-lifecycle-expired-{index}",
+                        "creationTimestamp": expired.isoformat(),
+                    }
+                }
+                for index in range(10)
+            ]
+        }
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_NONCE_GC_PAGE_LIMIT", 3),
+            patch("vm.controller.controller.LIFECYCLE_NONCE_GC_DELETE_LIMIT", 2),
+        ):
+            assert await controller._gc_expired_lifecycle_nonces(now=now)
+
+        assert (
+            controller.coordination_api.list_namespaced_lease.call_args.kwargs["limit"]
+            == 3
+        )
+        assert controller.coordination_api.delete_namespaced_lease.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_nonce_gc_rotates_through_bounded_pages(self, controller):
+        from datetime import datetime, timezone
+
+        controller.coordination_api.list_namespaced_lease.side_effect = [
+            {"metadata": {"continue": "next-page"}, "items": []},
+            {"metadata": {}, "items": []},
+        ]
+
+        assert await controller._gc_expired_lifecycle_nonces(
+            now=datetime.now(timezone.utc)
+        )
+        assert controller._lifecycle_nonce_gc_continue == "next-page"
+        assert await controller._gc_expired_lifecycle_nonces(
+            now=datetime.now(timezone.utc)
+        )
+        assert controller._lifecycle_nonce_gc_continue is None
+
+        calls = controller.coordination_api.list_namespaced_lease.call_args_list
+        assert "_continue" not in calls[0].kwargs
+        assert calls[1].kwargs["_continue"] == "next-page"
+
+    @pytest.mark.asyncio
+    async def test_nonce_gc_resets_expired_continue_token(self, controller):
+        from datetime import datetime, timezone
+
+        controller._lifecycle_nonce_gc_continue = "expired-page"
+        controller.coordination_api.list_namespaced_lease.side_effect = (
+            _FakeApiException(status=410, body="continue token expired")
+        )
+
+        assert await controller._gc_expired_lifecycle_nonces(
+            now=datetime.now(timezone.utc)
+        )
+        assert controller._lifecycle_nonce_gc_continue is None
+
+    @pytest.mark.asyncio
+    async def test_post_claim_failure_requires_fresh_signed_request(self, controller):
+        claimed: set[str] = set()
+
+        def _claim(*, body, **_kwargs):
+            name = body["metadata"]["name"]
+            if name in claimed:
+                raise _FakeApiException(status=409, body="already claimed")
+            claimed.add(name)
+            return body
+
+        controller.coordination_api.create_namespaced_lease.side_effect = _claim
+        controller.coordination_api.list_namespaced_lease.side_effect = [
+            _FakeApiException(status=500, body="temporary list failure"),
+            {"metadata": {}, "items": []},
+        ]
+        unsigned = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+        first = sign_payload(
+            unsigned,
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        fresh = sign_payload(
+            unsigned,
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        assert (
+            first["_lifecycle_auth"]["request_id"]
+            != fresh["_lifecycle_auth"]["request_id"]
+        )
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm.controller.controller.LIFECYCLE_NONCE_GC_INTERVAL", 1),
+        ):
+            assert not await controller._verify_lifecycle_request(
+                first, "create", mutating=True
+            )
+            assert not await controller._verify_lifecycle_request(
+                first, "create", mutating=True
+            )
+            assert await controller._verify_lifecycle_request(
+                fresh, "create", mutating=True
+            )
+
+
+class TestLifecycleIdentityGeneration:
+    @pytest.mark.asyncio
+    async def test_status_recovers_rootdisk_uid_that_missed_create_wait(
+        self, controller
+    ):
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+        read_pvc = (
+            controller.core_api.read_namespaced_persistent_volume_claim.side_effect
+        )
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = (
+            _FakeApiException(status=404, body="not admitted yet")
+        )
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm.controller.controller.VM_ROOTDISK_PVC_UID_ATTEMPTS", 1),
+        ):
+            created = await controller._do_create(config)
+
+        assert "rootdisk_pvc_uid" not in created
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = (
+            read_pvc
+        )
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+                "uid": "admitted-vm-uid-001",
+                "annotations": {
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                },
+                "labels": {
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+            },
+            "status": {"printableStatus": "Running"},
+        }
+
+        status = await controller._do_status(SAMPLE_JOB_CONFIG["job_id"])
+
+        assert status["vm_uid"] == "admitted-vm-uid-001"
+        assert status["provision_generation"] == PROVISION_GENERATION
+        assert status["rootdisk_pvc_uid"] == (
+            f"root-pvc-uid-{SAMPLE_JOB_CONFIG['job_id']}"
+        )
+        assert "rootdisk_identity_known" not in status
+
+    @pytest.mark.asyncio
+    async def test_exact_absence_status_opt_in_adds_rootdisk_identity_evidence(
+        self, controller
+    ):
+        job_id = SAMPLE_JOB_CONFIG["job_id"]
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{job_id}",
+                "uid": "admitted-vm-uid-001",
+                "annotations": {
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                },
+            },
+            "status": {"printableStatus": "Running"},
+        }
+
+        status = await controller._do_status(
+            job_id,
+            PROVISION_GENERATION,
+            exact_absence=True,
+        )
+
+        assert status["rootdisk_identity_known"] is True
+        assert status["rootdisk_pvc_uid"] == f"root-pvc-uid-{job_id}"
+
+    @pytest.mark.asyncio
+    async def test_authenticated_delete_uses_admitted_uid_precondition(
+        self, controller
+    ):
+        job_id = "generation-delete"
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{job_id}",
+                "uid": "generation-delete-vm-uid",
+                "annotations": {
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                },
+            }
+        }
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            result = await controller._do_delete(
+                job_id, provision_generation=PROVISION_GENERATION
+            )
+
+        vm_delete = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object,
+            KUBEVIRT_PLURAL,
+        )[0]
+        assert vm_delete.kwargs["body"]["preconditions"] == {
+            "uid": "generation-delete-vm-uid"
+        }
+        assert result["provision_generation"] == PROVISION_GENERATION
+        assert result["generation_evidence"] == "admitted-vm-metadata"
+
+    @pytest.mark.asyncio
+    async def test_authenticated_delete_rejects_generation_mismatch(self, controller):
+        job_id = "generation-reused"
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{job_id}",
+                "uid": "replacement-vm-uid",
+                "annotations": {
+                    "srw.io/provision-generation": (
+                        "00000000-0000-4000-8000-000000000099"
+                    ),
+                },
+            }
+        }
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            pytest.raises(RuntimeError, match="another provision generation"),
+        ):
+            await controller._do_delete(
+                job_id, provision_generation=PROVISION_GENERATION
+            )
+
+        controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_captured_delete_response_loss_converges_when_vm_and_disk_absent(
+        self, controller
+    ):
+        def _missing(**_kwargs):
+            raise _FakeApiException(status=404, body="gone")
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _missing
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = (
+            _FakeApiException(status=404, body="gone")
+        )
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            result = await controller._do_delete(
+                "response-lost",
+                provision_generation=PROVISION_GENERATION,
+                expected_vm_uid="old-vm-uid",
+                expected_rootdisk_pvc_uid="old-root-uid",
+            )
+
+        assert result["status"] == "deleted"
+        assert result["generation_evidence"] == "request-echo-vm-absent"
+        controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_vm_with_replacement_rootdisk_uid_is_superseded(
+        self, controller
+    ):
+        def _get(**kwargs):
+            if kwargs.get("plural") == KUBEVIRT_PLURAL:
+                raise _FakeApiException(status=404, body="gone")
+            return None
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _get
+        controller.core_api.read_namespaced_persistent_volume_claim.return_value = (
+            types.SimpleNamespace(
+                metadata=types.SimpleNamespace(
+                    name=_rootdisk_name("replacement-disk"),
+                    uid="replacement-root-uid",
+                    labels={
+                        "srw.io/owner-kind": "job",
+                        "srw.io/owner-id": "replacement-disk",
+                    },
+                )
+            )
+        )
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = None
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            pytest.raises(RuntimeError, match="superseded rootdisk PVC UID"),
+        ):
+            await controller._do_delete(
+                "replacement-disk",
+                provision_generation=PROVISION_GENERATION,
+                expected_vm_uid="old-vm-uid",
+                expected_rootdisk_pvc_uid="old-root-uid",
+            )
+
+        controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_uid_precondition_conflict_never_purges_replacement_disk(
+        self, controller
+    ):
+        job_id = "uid-race"
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{job_id}",
+                "uid": "old-vm-uid",
+                "annotations": {
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                },
+            }
+        }
+        controller.k8s_client.delete_namespaced_custom_object.side_effect = (
+            _FakeApiException(status=409, body="UID precondition failed")
+        )
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            pytest.raises(_FakeApiException),
+        ):
+            await controller._do_delete(
+                job_id, provision_generation=PROVISION_GENERATION
+            )
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_and_delete_for_same_entity_are_serialized(self, controller):
+        create_entered = asyncio.Event()
+        release_create = asyncio.Event()
+        delete_entered = asyncio.Event()
+
+        async def _create(_config):
+            create_entered.set()
+            await release_create.wait()
+            return {"job_id": "locked", "status": "created"}
+
+        async def _delete(_job_id, **_kwargs):
+            delete_entered.set()
+            return {"job_id": "locked", "status": "deleted"}
+
+        controller._do_create_serialized = AsyncMock(side_effect=_create)
+        controller._do_delete_serialized = AsyncMock(side_effect=_delete)
+        create_task = asyncio.create_task(controller._do_create({"job_id": "locked"}))
+        await create_entered.wait()
+        delete_task = asyncio.create_task(controller._do_delete("locked"))
+        await asyncio.sleep(0)
+        assert not delete_entered.is_set()
+
+        release_create.set()
+        await asyncio.gather(create_task, delete_task)
+        assert delete_entered.is_set()

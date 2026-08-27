@@ -1,0 +1,90 @@
+[
+  {
+    "question_id": "tiny_single_1",
+    "question_type": "single-session-user",
+    "question": "What breed is the user's dog and what is its name?",
+    "answer": "A corgi named Pixel.",
+    "question_date": "2023/05/20 (Sat) 10:00",
+    "haystack_dates": [
+      "2023/05/01 (Mon) 09:00",
+      "2023/05/05 (Fri) 18:30",
+      "2023/05/10 (Wed) 14:15"
+    ],
+    "haystack_session_ids": ["s1_groceries", "s2_dog", "s3_workout"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "Can you help me plan a grocery list for the week?"},
+        {"role": "assistant", "content": "Sure! What meals are you planning?"},
+        {"role": "user", "content": "Mostly pasta dishes and salads."},
+        {"role": "assistant", "content": "Then you'll want pasta, tomatoes, olive oil, greens, and parmesan."}
+      ],
+      [
+        {"role": "user", "content": "I just adopted a corgi puppy! I named him Pixel.", "has_answer": true},
+        {"role": "assistant", "content": "Congratulations on adopting Pixel! Corgis are wonderful companions."},
+        {"role": "user", "content": "Any tips for the first week?"},
+        {"role": "assistant", "content": "Set a routine early: consistent feeding times, short play sessions, and crate training at night."}
+      ],
+      [
+        {"role": "user", "content": "Design a 20 minute morning workout for me."},
+        {"role": "assistant", "content": "Here's one: 5 minutes warm-up, 10 minutes circuit of squats, push-ups and planks, 5 minutes stretching."}
+      ]
+    ],
+    "answer_session_ids": ["s2_dog"]
+  },
+  {
+    "question_id": "tiny_multi_1",
+    "question_type": "multi-session",
+    "question": "Where is the user traveling and in which month is the trip now scheduled?",
+    "answer": "Lisbon, in October.",
+    "question_date": "2023/06/15 (Thu) 11:00",
+    "haystack_dates": [
+      "2023/06/01 (Thu) 08:00",
+      "2023/06/03 (Sat) 16:45",
+      "2023/06/08 (Thu) 19:20",
+      "2023/06/12 (Mon) 12:05"
+    ],
+    "haystack_session_ids": ["s1_trip_book", "s2_recipes", "s3_trip_move", "s4_email"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "I booked flights to Lisbon for the second week of September!", "has_answer": true},
+        {"role": "assistant", "content": "Exciting! Lisbon in September is lovely — mild weather and fewer crowds."}
+      ],
+      [
+        {"role": "user", "content": "Give me a quick recipe for vegetarian chili."},
+        {"role": "assistant", "content": "Saute onion and garlic, add beans, tomatoes, corn and chili spices, simmer 25 minutes."}
+      ],
+      [
+        {"role": "user", "content": "Bad news, work moved my deadline, so I pushed the Lisbon trip to October.", "has_answer": true},
+        {"role": "assistant", "content": "October works well too — book the Alfama walking tour early, it fills up."}
+      ],
+      [
+        {"role": "user", "content": "Draft a short email declining a meeting invite politely."},
+        {"role": "assistant", "content": "Subject: Re: Meeting — Thanks for the invite; unfortunately I can't make it this time. Could we catch up async instead?"}
+      ]
+    ],
+    "answer_session_ids": ["s1_trip_book", "s3_trip_move"]
+  },
+  {
+    "question_id": "tiny_cat_1_abs",
+    "question_type": "single-session-user",
+    "question": "What is the name of the user's cat?",
+    "answer": "The user never mentioned having a cat.",
+    "question_date": "2023/05/21 (Sun) 09:30",
+    "haystack_dates": [
+      "2023/05/02 (Tue) 10:00",
+      "2023/05/06 (Sat) 17:00"
+    ],
+    "haystack_session_ids": ["s1_books", "s2_plants"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "Recommend me three science fiction novels."},
+        {"role": "assistant", "content": "Try Dune, A Fire Upon the Deep, and The Left Hand of Darkness."}
+      ],
+      [
+        {"role": "user", "content": "My monstera's leaves are turning yellow, what's wrong?"},
+        {"role": "assistant", "content": "Usually overwatering — let the topsoil dry out between waterings and check the pot drains."}
+      ]
+    ],
+    "answer_session_ids": []
+  }
+]

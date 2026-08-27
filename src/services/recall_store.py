@@ -3,7 +3,7 @@
 Provides hybrid search (dense vector + sparse keyword + recency) over
 agent memories stored in PostgreSQL with pgvector.
 
-See docs/features/memory_light.md for full architecture.
+See knowledge-base/knowledge/features/memory_light.md for full architecture.
 
 Usage:
     ```python
@@ -33,6 +33,7 @@ Usage:
     ```
 """
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -40,6 +41,41 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Mirrors the ``valid_memory_type`` CHECK constraint in
+# orchestrator/database/vector_schema.sql. Held as a Python constant so the two
+# cannot drift silently, and so an out-of-set value is COERCED rather than
+# raising CheckViolationError and discarding the whole memory.
+#
+# ``memory_type`` is LLM-authored (the extractor's ``mem.type``), so it is
+# untrusted input: job c6dd288d lost an extraction to
+# ``CheckViolationError: valid_memory_type`` on the value "factial" — a typo for
+# "factual". knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md
+# (Defect 7).
+#
+# Deliberately NOT fuzzy nearest-match: "factial" is obviously "factual", but
+# nearest-match could silently mis-file a genuinely wrong type. A known default
+# plus a loud log keeps the mistake visible.
+VALID_MEMORY_TYPES = frozenset(
+    {"factual", "procedural", "error_solution", "vocabulary", "relational"}
+)
+DEFAULT_MEMORY_TYPE = "factual"
+
+
+def coerce_memory_type(memory_type: Optional[str]) -> str:
+    """Return a constraint-safe ``memory_type``, logging any substitution."""
+    if memory_type in VALID_MEMORY_TYPES:
+        return memory_type
+    logger.warning(
+        "Invalid memory_type %r coerced to %r (valid: %s) — the memory is kept; "
+        "before this guard the CHECK constraint discarded the whole row",
+        memory_type,
+        DEFAULT_MEMORY_TYPE,
+        ", ".join(sorted(VALID_MEMORY_TYPES)),
+    )
+    return DEFAULT_MEMORY_TYPE
+
 
 # English stopwords — small hardcoded set for keyword extraction
 _STOPWORDS = frozenset(
@@ -183,6 +219,16 @@ class MemoryRecord:
     remaining_turns: Optional[int] = None
     created_at: Optional[datetime] = None
     last_accessed: Optional[datetime] = None
+    # Bi-temporal supersede (overhaul Phase 4, migration vector/0006).
+    # valid_to IS NULL == currently valid == served by default retrieval.
+    valid_from: Optional[datetime] = None
+    valid_to: Optional[datetime] = None
+    superseded_at: Optional[datetime] = None
+    superseded_by: Optional[uuid.UUID] = None
+    # Transient: populated by similarity searches (find_similar_many), not a
+    # stored column. Lets the ingestion adjudicator see how close each
+    # neighbour is.
+    similarity: Optional[float] = None
 
     @classmethod
     def from_row(cls, row: Dict[str, Any]) -> "MemoryRecord":
@@ -206,7 +252,59 @@ class MemoryRecord:
             remaining_turns=row.get("remaining_turns"),
             created_at=row.get("created_at"),
             last_accessed=row.get("last_accessed"),
+            valid_from=row.get("valid_from"),
+            valid_to=row.get("valid_to"),
+            superseded_at=row.get("superseded_at"),
+            superseded_by=row.get("superseded_by"),
+            similarity=row.get("similarity"),
         )
+
+
+# Sleep between access-stat write retries after a deadlock. Module-level so
+# tests can zero it; length bounds the retry count (len + 1 attempts total).
+_ACCESS_STAT_RETRY_DELAYS = (0.05, 0.15)
+
+
+def _is_deadlock(exc: BaseException) -> bool:
+    """Match asyncpg's DeadlockDetectedError without importing asyncpg."""
+    return type(exc).__name__ == "DeadlockDetectedError"
+
+
+class MemoryHealth:
+    """Process-wide counters for contained memory-store failures.
+
+    Concurrent same-project jobs deadlock on the shared memory rows (138
+    contained retrieval deadlocks in one five-job batch — see
+    knowledge-base/knowledge/issues/project_scoped_memory_deadlocks_under_parallel_jobs.md).
+    Containment keeps the jobs alive but was visible only in pod logs; these
+    counters ride the agent heartbeat into ``agents.metadata`` so contained
+    degradation reaches operator telemetry. Counting only — never control flow.
+    """
+
+    _KINDS = (
+        "ttl_decrement_deadlock",
+        "access_stats_deadlock",
+        "access_stats_error",
+        "retrieval_deadlock",
+    )
+
+    def __init__(self) -> None:
+        self._counts: Dict[str, int] = dict.fromkeys(self._KINDS, 0)
+
+    def increment(self, kind: str) -> None:
+        self._counts[kind] = self._counts.get(kind, 0) + 1
+
+    def snapshot(self) -> Optional[Dict[str, int]]:
+        """Nonzero counters only; None when all zero (healthy = no payload)."""
+        counts = {kind: n for kind, n in self._counts.items() if n}
+        return counts or None
+
+    def reset(self) -> None:
+        """Zero all counters (tests)."""
+        self._counts = dict.fromkeys(self._KINDS, 0)
+
+
+memory_health = MemoryHealth()
 
 
 class RecallStore:
@@ -231,6 +329,7 @@ class RecallStore:
         project_id: Optional[uuid.UUID] = None,
         project_ids: Optional[List[uuid.UUID]] = None,
         archiver=None,
+        strict_writes: bool = False,
     ):
         """Initialize RecallStore.
 
@@ -243,6 +342,11 @@ class RecallStore:
             project_id: Optional project UUID for project-scoped memory sharing
             project_ids: Optional list of project UUIDs for multi-project sessions
             archiver: Optional LLMArchiver for audit logging
+            strict_writes: Propagate auxiliary sub-write failures instead of
+                containing them. Intended for callers that wrap the complete
+                memory mutation in their own transaction (for example the
+                stateless-session destination ledger); defaults to the legacy
+                best-effort behavior everywhere else.
         """
         self.db = db
         self.embedding_service = embedding_service
@@ -251,27 +355,40 @@ class RecallStore:
         self.project_id = project_id
         self.project_ids = project_ids or ([project_id] if project_id else [])
         self._archiver = archiver
+        self.strict_writes = bool(strict_writes)
         self.project_scoped = (
             getattr(config, "project_scoped", False) if config else False
         )
+        # Ingestion-verdict adjudicator (overhaul Phase 4). Late-bound by
+        # src.services.memory.ingestion.maybe_attach_ingestion_verdict at the
+        # manager-construction sites when memory.ingestion.enabled. While None
+        # (the default everywhere today), store() keeps the legacy cosine-0.85
+        # dedup-merge byte-for-byte — the equivalence suites pin that path.
+        self.ingestion_verdict = None
 
         # Config defaults (matches MemoryConfig dataclass)
         self.dedup_threshold = 0.85
         self.importance_threshold = 0.3
-        self.dense_results = 5
-        self.sparse_results = 5
-        self.recent_results = 3
         self.budget_tokens = 10000
         self.max_memories_per_injection = 150
         self.retrieval_importance_floor = 0.4
         self.default_ttl = 10
+        # Write-time importance gate (overhaul Phase 4). True = legacy floor;
+        # memory.extraction.write_gate: false drops it (completeness over
+        # precision — relevance is gated at retrieval instead).
+        self.write_gate = True
+        # Pre-insert dedup re-check threshold (memory-extraction Slice 0). The
+        # verdict path re-runs the neighbour lookup at this high cosine floor
+        # immediately before an ADD insert; a twin that appeared *since* the
+        # first check (the dual-trigger race, §4.7) downgrades the ADD to a
+        # NOOP+bump. High by design — only a near-identical concurrent write
+        # should collapse; genuinely distinct neighbours the verdict already
+        # cleared for ADD must not be re-bumped.
+        self.recheck_threshold = 0.9
 
         if config is not None:
             self.dedup_threshold = getattr(config, "dedup_threshold", 0.85)
             self.importance_threshold = getattr(config, "importance_threshold", 0.3)
-            self.dense_results = getattr(config, "dense_results", 5)
-            self.sparse_results = getattr(config, "sparse_results", 5)
-            self.recent_results = getattr(config, "recent_results", 3)
             self.budget_tokens = getattr(config, "budget_tokens", 10000)
             self.max_memories_per_injection = getattr(
                 config, "max_memories_per_injection", 150
@@ -280,6 +397,10 @@ class RecallStore:
                 config, "retrieval_importance_floor", 0.4
             )
             self.default_ttl = getattr(config, "default_ttl", 10)
+            self.recheck_threshold = getattr(config, "recheck_threshold", 0.9)
+            _ext = getattr(config, "extraction", None)
+            if _ext is not None:
+                self.write_gate = getattr(_ext, "write_gate", True)
 
     @property
     def _scope_filter(self):
@@ -342,7 +463,7 @@ class RecallStore:
         Returns:
             UUID of stored/updated memory, or None if below importance threshold
         """
-        if importance < self.importance_threshold:
+        if self.write_gate and importance < self.importance_threshold:
             logger.debug(
                 f"Memory below importance threshold ({importance} < "
                 f"{self.importance_threshold}), skipping"
@@ -352,52 +473,86 @@ class RecallStore:
         # Generate embedding
         embedding = await self.embedding_service.embed(content)
 
-        # Check for duplicates
+        # Ingestion-verdict write path (overhaul Phase 4): aux-LLM adjudication
+        # + bi-temporal supersede, replacing the cosine dedup-merge below. Only
+        # active when a verdict service is wired (memory.ingestion.enabled);
+        # otherwise the legacy path runs byte-for-byte (equivalence suites).
+        if self.ingestion_verdict is not None:
+            return await self._store_with_verdict(
+                embedding=embedding,
+                content=content,
+                summary=summary,
+                keywords=keywords,
+                importance=importance,
+                memory_type=memory_type,
+                source=source,
+                source_turn_start=source_turn_start,
+                source_turn_end=source_turn_end,
+                source_phase=source_phase,
+                token_count=token_count,
+                remaining_turns=remaining_turns,
+                retrieval_messages=retrieval_messages,
+            )
+
+        # Legacy dedup: a near-duplicate (cosine > dedup_threshold) bumps the
+        # existing row in place instead of inserting a new one.
         existing = await self.find_similar(embedding, self.dedup_threshold)
         if existing:
             logger.debug(
                 f"Dedup: updating existing memory {existing.id} instead of creating new"
             )
-            ttl = remaining_turns if remaining_turns is not None else self.default_ttl
-            await self.db.execute(
-                """
-                UPDATE memories
-                SET access_count = access_count + 1,
-                    last_accessed = CURRENT_TIMESTAMP,
-                    importance = GREATEST(importance, $1),
-                    remaining_turns = GREATEST(COALESCE(remaining_turns, 0), $3)
-                WHERE id = $2
-                """,
-                importance,
+            return await self._bump_existing(
                 existing.id,
-                ttl,
+                importance,
+                remaining_turns,
+                source,
+                similarity=existing.similarity,
             )
-            if self._archiver:
-                self._archiver.audit_step(
-                    job_id=str(self.job_id),
-                    agent_type=self.agent_id or "",
-                    step_type="memory_dedup",
-                    node_name="recall_store",
-                    iteration=0,
-                    data={
-                        "existing_id": str(existing.id),
-                        "source": source,
-                        "similarity": round(existing.similarity, 3)
-                        if hasattr(existing, "similarity")
-                        else None,
-                    },
-                )
-            return existing.id
 
-        # Estimate token count if not provided
+        return await self._insert(
+            embedding=embedding,
+            content=content,
+            summary=summary,
+            keywords=keywords,
+            importance=importance,
+            memory_type=memory_type,
+            source=source,
+            source_turn_start=source_turn_start,
+            source_turn_end=source_turn_end,
+            source_phase=source_phase,
+            token_count=token_count,
+            remaining_turns=remaining_turns,
+            retrieval_messages=retrieval_messages,
+        )
+
+    async def _insert(
+        self,
+        *,
+        embedding: List[float],
+        content: str,
+        summary: Optional[str] = None,
+        keywords: Optional[List[str]] = None,
+        importance: float = 0.5,
+        memory_type: str = "factual",
+        source: str = "observer",
+        source_turn_start: Optional[int] = None,
+        source_turn_end: Optional[int] = None,
+        source_phase: Optional[int] = None,
+        token_count: Optional[int] = None,
+        remaining_turns: Optional[int] = None,
+        retrieval_messages: Optional[List[str]] = None,
+    ) -> Optional[uuid.UUID]:
+        """INSERT a new memory row — the shared tail of every ADD path."""
+        # Estimate token count if not provided (~4 chars per token)
         if token_count is None:
-            # Rough estimate: ~4 chars per token
             token_count = len(content) // 4
 
-        # Default TTL
         ttl = remaining_turns if remaining_turns is not None else self.default_ttl
 
-        # Build tsvector for sparse search
+        # Single funnel for all three store paths — coerce here so no caller can
+        # bypass the CHECK constraint guard. (Defect 7)
+        memory_type = coerce_memory_type(memory_type)
+
         keywords_list = keywords or []
         keywords_text = " ".join(keywords_list) + " " + content
 
@@ -444,6 +599,8 @@ class RecallStore:
                     f"Stored {rm_count} retrieval messages for memory {mem_id}"
                 )
             except Exception as e:
+                if self.strict_writes:
+                    raise
                 logger.warning(f"Failed to store retrieval messages for {mem_id}: {e}")
 
         logger.debug(
@@ -466,6 +623,242 @@ class RecallStore:
                 },
             )
         return mem_id
+
+    async def _bump_existing(
+        self,
+        existing_id: uuid.UUID,
+        importance: float,
+        remaining_turns: Optional[int],
+        source: str,
+        similarity: Optional[float] = None,
+    ) -> uuid.UUID:
+        """Bump an existing memory in place (legacy dedup hit / verdict NOOP)."""
+        ttl = remaining_turns if remaining_turns is not None else self.default_ttl
+        await self.db.execute(
+            """
+            UPDATE memories
+            SET access_count = access_count + 1,
+                last_accessed = CURRENT_TIMESTAMP,
+                importance = GREATEST(importance, $1),
+                remaining_turns = GREATEST(COALESCE(remaining_turns, 0), $3)
+            WHERE id = $2
+            """,
+            importance,
+            existing_id,
+            ttl,
+        )
+        if self._archiver:
+            self._archiver.audit_step(
+                job_id=str(self.job_id),
+                agent_type=self.agent_id or "",
+                step_type="memory_dedup",
+                node_name="recall_store",
+                iteration=0,
+                data={
+                    "existing_id": str(existing_id),
+                    "source": source,
+                    "similarity": (
+                        round(similarity, 3) if similarity is not None else None
+                    ),
+                },
+            )
+        return existing_id
+
+    async def _store_with_verdict(
+        self,
+        *,
+        embedding: List[float],
+        content: str,
+        summary: Optional[str],
+        keywords: Optional[List[str]],
+        importance: float,
+        memory_type: str,
+        source: str,
+        source_turn_start: Optional[int],
+        source_turn_end: Optional[int],
+        source_phase: Optional[int],
+        token_count: Optional[int],
+        remaining_turns: Optional[int],
+        retrieval_messages: Optional[List[str]],
+    ) -> Optional[uuid.UUID]:
+        """Adjudicate a candidate against neighbours, then ADD/NOOP/UPDATE/MERGE.
+
+        Cost guard: the verdict LLM is consulted only when a neighbour scores at
+        or above the service's review_floor. No near-duplicate → straight ADD,
+        zero LLM calls.
+        """
+        svc = self.ingestion_verdict
+
+        def _add():
+            return self._insert(
+                embedding=embedding,
+                content=content,
+                summary=summary,
+                keywords=keywords,
+                importance=importance,
+                memory_type=memory_type,
+                source=source,
+                source_turn_start=source_turn_start,
+                source_turn_end=source_turn_end,
+                source_phase=source_phase,
+                token_count=token_count,
+                remaining_turns=remaining_turns,
+                retrieval_messages=retrieval_messages,
+            )
+
+        async def _add_guarded(exclude):
+            """ADD terminal with a pre-insert dedup re-check (§4.7 race guard).
+
+            Between the first neighbour lookup and this insert, a concurrent
+            writer (the async interval extractor vs this boundary flush) can
+            commit the same fact, so both find no dup and both ADD. Re-run the
+            lookup at ``recheck_threshold`` immediately before inserting, reusing
+            the already-computed embedding (a cheap SELECT, no re-embed). A twin
+            that appeared *since* the first check — i.e. one not in ``exclude``,
+            the set of neighbours the verdict already cleared for ADD — bumps
+            instead of inserting. Excluding the adjudicated set keeps the guard
+            from second-guessing an explicit ADD verdict, so a non-racing write
+            sees the same state twice and behaves exactly as before.
+            """
+            twin = await self._recheck_twin(embedding, exclude)
+            if twin is not None:
+                self._audit_verdict("NOOP", [twin.id], None, "recheck-twin")
+                return await self._bump_existing(
+                    twin.id, importance, remaining_turns, source, twin.similarity
+                )
+            return await _add()
+
+        try:
+            similar = await self.find_similar_many(
+                embedding, k=svc.top_k, min_similarity=svc.review_floor
+            )
+        except Exception as e:
+            if self.strict_writes:
+                raise
+            logger.warning(
+                "Ingestion verdict: neighbour lookup failed (%s: %s); ADD",
+                type(e).__name__,
+                e,
+            )
+            return await _add_guarded(frozenset())
+
+        existing_ids = {r.id for r in similar}
+
+        # Cost guard: nothing close enough to adjudicate → new fact, just ADD
+        # (still race-guarded: a concurrent identical write may have committed).
+        if not similar:
+            return await _add_guarded(existing_ids)
+
+        verdict = await svc.adjudicate(
+            content=content,
+            summary=summary,
+            keywords=keywords,
+            similar=similar,
+        )
+        action = (getattr(verdict, "action", "ADD") or "ADD").strip().upper()
+        reason = getattr(verdict, "reason", "") or ""
+
+        targets = []
+        for idx in getattr(verdict, "target_indices", None) or []:
+            if isinstance(idx, int) and 1 <= idx <= len(similar):
+                targets.append(similar[idx - 1])
+
+        if action == "NOOP":
+            target = targets[0] if targets else similar[0]
+            self._audit_verdict("NOOP", [target.id], None, reason)
+            return await self._bump_existing(
+                target.id, importance, remaining_turns, source, target.similarity
+            )
+
+        if action in ("UPDATE", "MERGE"):
+            retire = [t.id for t in targets]
+            if not retire:
+                # UPDATE/MERGE must name the rows it supersedes; a verdict that
+                # names none is malformed. Degrade to a conservative ADD rather
+                # than guess a row to retire — wrongly retiring loses a fact,
+                # keeping both only costs a (downstream-gated) duplicate.
+                self._audit_verdict("ADD", [], None, f"{action}-without-targets→ADD")
+                return await _add_guarded(existing_ids)
+            if action == "MERGE":
+                merged = (getattr(verdict, "merged_content", None) or "").strip()
+                if merged and merged != content:
+                    new_emb = await self.embedding_service.embed(merged)
+                    new_id = await self._insert(
+                        embedding=new_emb,
+                        content=merged,
+                        summary=summary,
+                        keywords=keywords,
+                        importance=importance,
+                        memory_type=memory_type,
+                        source=source,
+                        source_turn_start=source_turn_start,
+                        source_turn_end=source_turn_end,
+                        source_phase=source_phase,
+                        token_count=None,  # re-estimate from merged content
+                        remaining_turns=remaining_turns,
+                        retrieval_messages=retrieval_messages,
+                    )
+                else:
+                    new_id = await _add()
+            else:
+                new_id = await _add()
+            if new_id:
+                await self.supersede(retire, new_id)
+                self._audit_verdict(action, retire, new_id, reason)
+            return new_id
+
+        # ADD and any unrecognized action → conservative ADD (race-guarded).
+        self._audit_verdict("ADD", [], None, reason)
+        return await _add_guarded(existing_ids)
+
+    async def _recheck_twin(self, embedding, exclude):
+        """Re-run the neighbour lookup just before an ADD insert (§4.7 race guard).
+
+        Reuses ``embedding`` (no re-embed) to find the closest currently-valid
+        neighbour at or above ``recheck_threshold`` whose id is **not** in
+        ``exclude`` (the neighbours the verdict already adjudicated). A hit is a
+        twin that a concurrent writer committed since the first check; the caller
+        bumps it instead of inserting a duplicate. Best-effort — a lookup failure
+        returns ``None`` so the ADD still proceeds (never lose a write to the
+        guard).
+        """
+        try:
+            neighbours = await self.find_similar_many(
+                embedding,
+                k=len(exclude) + 1,
+                min_similarity=self.recheck_threshold,
+            )
+        except Exception as e:
+            if self.strict_writes:
+                raise
+            logger.debug(
+                "Pre-insert dedup re-check failed (%s: %s); proceeding with ADD",
+                type(e).__name__,
+                e,
+            )
+            return None
+        for rec in neighbours:
+            if rec.id not in exclude:
+                return rec
+        return None
+
+    def _audit_verdict(self, action, target_ids, new_id, reason):
+        """Audit an ingestion verdict (no-op without an archiver)."""
+        if not self._archiver:
+            return
+        self._archiver.audit_step(
+            job_id=str(self.job_id),
+            agent_type=self.agent_id or "",
+            step_type="memory_verdict",
+            node_name="recall_store",
+            iteration=0,
+            data={
+                "action": action,
+                "retired": [str(t) for t in target_ids],
+                "new_id": str(new_id) if new_id else None,
+                "reason": reason[:200],
+            },
+        )
 
     async def store_retrieval_messages(
         self,
@@ -490,6 +883,10 @@ class RecallStore:
 
         # Batch embed all messages in one API call
         embeddings = await self.embedding_service.embed_batch(messages)
+        if self.strict_writes and len(embeddings) != len(messages):
+            raise RuntimeError(
+                "retrieval-message embedding count does not match input count"
+            )
 
         stored = 0
         for msg, emb in zip(messages, embeddings):
@@ -505,6 +902,8 @@ class RecallStore:
                 )
                 stored += 1
             except Exception as e:
+                if self.strict_writes:
+                    raise
                 logger.warning(
                     f"Failed to store retrieval message for {memory_id}: {e}"
                 )
@@ -538,6 +937,7 @@ class RecallStore:
             FROM memories
             WHERE {scope_clause}
               AND embedding IS NOT NULL
+              AND valid_to IS NULL
               AND 1 - (embedding <=> $1) > $3
             ORDER BY similarity DESC
             LIMIT 1
@@ -551,117 +951,70 @@ class RecallStore:
             return MemoryRecord.from_row(dict(row))
         return None
 
-    # =========================================================================
-    # Retrieval
-    # =========================================================================
-
-    async def search_dense(
+    async def find_similar_many(
         self,
         embedding: List[float],
-        limit: Optional[int] = None,
+        k: int = 5,
+        min_similarity: float = 0.6,
     ) -> List[MemoryRecord]:
-        """Search memories by dense vector similarity.
+        """Return the top-``k`` currently-valid neighbours above ``min_similarity``.
 
-        Args:
-            embedding: Query embedding vector
-            limit: Max results (default: self.dense_results)
-
-        Returns:
-            List of matching MemoryRecord objects
+        Feeds the ingestion adjudicator (overhaul Phase 4). Only currently-valid
+        rows (``valid_to IS NULL``) are candidates — a verdict never compares a
+        new fact against an already-retired one. Each returned record carries a
+        transient ``.similarity``.
         """
-        limit = limit or self.dense_results
-
-        scope_clause, scope_val = self._scope_where(1)
+        scope_clause, scope_val = self._scope_where(2)
         rows = await self.db.fetch(
             f"""
-            SELECT *
+            SELECT *, 1 - (embedding <=> $1) AS similarity
             FROM memories
-            WHERE {scope_clause} AND embedding IS NOT NULL
-            ORDER BY embedding <=> $2
-            LIMIT $3
+            WHERE {scope_clause}
+              AND embedding IS NOT NULL
+              AND valid_to IS NULL
+              AND 1 - (embedding <=> $1) >= $3
+            ORDER BY similarity DESC
+            LIMIT $4
             """,
-            scope_val,
             embedding,
-            limit,
-        )
-
-        # Update access tracking
-        if rows:
-            ids = [row["id"] for row in rows]
-            await self.db.execute(
-                """
-                UPDATE memories
-                SET access_count = access_count + 1,
-                    last_accessed = CURRENT_TIMESTAMP
-                WHERE id = ANY($1)
-                """,
-                ids,
-            )
-
-        return [MemoryRecord.from_row(dict(row)) for row in rows]
-
-    async def search_sparse(
-        self,
-        query_text: str,
-        limit: Optional[int] = None,
-    ) -> List[MemoryRecord]:
-        """Search memories by keyword/full-text search.
-
-        Args:
-            query_text: Text query for tsquery matching
-            limit: Max results (default: self.sparse_results)
-
-        Returns:
-            List of matching MemoryRecord objects
-        """
-        limit = limit or self.sparse_results
-
-        scope_clause, scope_val = self._scope_where(1)
-        rows = await self.db.fetch(
-            f"""
-            SELECT *,
-                   ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $2)) AS rank
-            FROM memories
-            WHERE {scope_clause}
-              AND sparse_keywords @@ websearch_to_tsquery('english', $2)
-            ORDER BY rank DESC
-            LIMIT $3
-            """,
             scope_val,
-            query_text,
-            limit,
+            min_similarity,
+            k,
         )
-
         return [MemoryRecord.from_row(dict(row)) for row in rows]
 
-    async def get_recent(
+    async def supersede(
         self,
-        limit: Optional[int] = None,
-    ) -> List[MemoryRecord]:
-        """Get most recently created memories.
+        old_ids: List[uuid.UUID],
+        new_id: uuid.UUID,
+    ) -> int:
+        """Retire memories ``old_ids``, pointing them at their replacement.
 
-        Args:
-            limit: Max results (default: self.recent_results)
-
-        Returns:
-            List of MemoryRecord objects ordered by creation time
+        Sets the bi-temporal markers (``valid_to``/``superseded_at`` = now,
+        ``superseded_by`` = ``new_id``) and zeroes any TTL so a retired pinned
+        memory stops being injected. Idempotent: already-retired rows
+        (``valid_to IS NOT NULL``) are skipped. Returns the number retired.
         """
-        limit = limit or self.recent_results
-
-        scope_clause, scope_val = self._scope_where(1)
-        rows = await self.db.fetch(
-            f"""
-            SELECT *
-            FROM memories
-            WHERE {scope_clause}
-            ORDER BY created_at DESC
-            LIMIT $2
+        if not old_ids:
+            return 0
+        result = await self.db.execute(
+            """
+            UPDATE memories
+            SET valid_to = CURRENT_TIMESTAMP,
+                superseded_at = CURRENT_TIMESTAMP,
+                superseded_by = $2,
+                remaining_turns = 0
+            WHERE id = ANY($1) AND valid_to IS NULL
             """,
-            scope_val,
-            limit,
+            old_ids,
+            new_id,
         )
-
-        return [MemoryRecord.from_row(dict(row)) for row in rows]
+        try:
+            count = int(str(result).split()[-1])
+        except (ValueError, IndexError):
+            count = 0
+        logger.debug(f"Superseded {count} memory(ies) → {new_id}")
+        return count
 
     # =========================================================================
     # TTL Management
@@ -681,7 +1034,7 @@ class RecallStore:
             f"""
             SELECT *
             FROM memories
-            WHERE {scope_clause} AND remaining_turns > 0
+            WHERE {scope_clause} AND remaining_turns > 0 AND valid_to IS NULL
             ORDER BY importance DESC
             """,
             scope_val,
@@ -693,22 +1046,38 @@ class RecallStore:
 
         Called once per turn in the execute node, before memory retrieval.
 
+        Locks the target rows in id order before updating: concurrent
+        same-project consumers otherwise acquire the overlapping tuple locks
+        in divergent orders and deadlock. A residual DeadlockDetectedError is
+        counted for telemetry and re-raised — callers already contain it.
+
         Returns:
             Number of memories whose TTL was decremented
         """
         scope_clause, scope_val = self._scope_where(1)
-        result = await self.db.fetchval(
-            f"""
-            WITH updated AS (
-                UPDATE memories
-                SET remaining_turns = remaining_turns - 1
-                WHERE {scope_clause} AND remaining_turns > 0
-                RETURNING id
+        try:
+            result = await self.db.fetchval(
+                f"""
+                WITH target AS (
+                    SELECT id FROM memories
+                    WHERE {scope_clause} AND remaining_turns > 0 AND valid_to IS NULL
+                    ORDER BY id
+                    FOR UPDATE
+                ), updated AS (
+                    UPDATE memories m
+                    SET remaining_turns = m.remaining_turns - 1
+                    FROM target t
+                    WHERE m.id = t.id
+                    RETURNING m.id
+                )
+                SELECT COUNT(*) FROM updated
+                """,
+                scope_val,
             )
-            SELECT COUNT(*) FROM updated
-            """,
-            scope_val,
-        )
+        except Exception as e:
+            if _is_deadlock(e):
+                memory_health.increment("ttl_decrement_deadlock")
+            raise
         return result or 0
 
     async def boost_ttl(self, memory_id: uuid.UUID, turns: int) -> bool:
@@ -804,38 +1173,54 @@ class RecallStore:
             func_name = "memory_hybrid_search"
             scope_val = self.job_id
 
-        rows = await self.db.fetch(
-            f"""
-            SELECT * FROM {func_name}(
-                $1, $2, $3, $4, $5, $6, $7, importance_floor => $8
-            )
-            """,
-            query_text,
-            query_embedding,
-            scope_val,
-            match_count,
-            dense_weight,
-            sparse_weight,
-            recency_weight,
-            importance_floor,
-        )
-
-        # Update access tracking and reset TTL for accessed memories
-        if rows:
-            ids = [row["id"] for row in rows]
-            await self.db.execute(
-                """
-                UPDATE memories
-                SET access_count = access_count + 1,
-                    last_accessed = CURRENT_TIMESTAMP,
-                    remaining_turns = GREATEST(
-                        COALESCE(remaining_turns, 0), $2
-                    )
-                WHERE id = ANY($1)
+        try:
+            rows = await self.db.fetch(
+                f"""
+                SELECT * FROM {func_name}(
+                    $1, $2, $3, $4, $5, $6, $7, importance_floor => $8
+                )
                 """,
-                ids,
-                self.default_ttl,
+                query_text,
+                query_embedding,
+                scope_val,
+                match_count,
+                dense_weight,
+                sparse_weight,
+                recency_weight,
+                importance_floor,
             )
+        except Exception as e:
+            if _is_deadlock(e):
+                memory_health.increment("retrieval_deadlock")
+            raise
+
+        # Update access tracking. This deliberately does NOT re-arm
+        # remaining_turns any more.
+        #
+        # It used to also set `remaining_turns = GREATEST(COALESCE(
+        # remaining_turns, 0), default_ttl)`, which re-pinned every row this
+        # search FETCHED — up to match_count (= max_memories_per_injection,
+        # 150) rows per turn — while decrement_ttl only ticks -1 per turn. A
+        # memory therefore expired only if it stayed out of the top-150 for 10
+        # consecutive turns, so one retrieval stream sustained ~150 x 10 =
+        # ~1,500 permanently-pinned rows, and concurrent jobs sharing a
+        # project scope stacked on top (one project reached ~2,400).
+        #
+        # Worse, the re-arm fired on rows FETCHED, not rows INJECTED: retrieve()
+        # fills the budget from the pinned tier first, then still runs this
+        # search and re-pins all 150 candidates before the budget loop discards
+        # most of them. Rows the model never saw came back pinned, growing the
+        # pinned tier, which ate more budget, which discarded more
+        # freshly-pinned candidates — a self-sustaining ratchet that starved
+        # relevance retrieval entirely (get_ttl_active is injected first, so
+        # once it fills the budget, hybrid search results never reach the LLM).
+        #
+        # All three runtimes (worker, session, MemoryManager) funnel through
+        # this one seam, so this covers every path. Pinning is now what its
+        # docstring claims: set at write, or by an explicit boost_ttl, decayed
+        # once per turn.
+        if rows:
+            await self._record_access_stats([row["id"] for row in rows])
 
         results = [MemoryRecord.from_row(dict(row)) for row in rows]
 
@@ -853,6 +1238,54 @@ class RecallStore:
             )
 
         return results
+
+    async def _record_access_stats(self, ids: List[Any]) -> None:
+        """Best-effort access_count/last_accessed bump for retrieved rows.
+
+        Sorted ids feeding an id-ordered FOR UPDATE lock CTE keep concurrent
+        consumers' lock acquisition aligned; a residual DeadlockDetectedError
+        gets a bounded retry (one attempt per _ACCESS_STAT_RETRY_DELAYS entry).
+        Every failure is contained and counted — losing one access-stat update
+        is better than losing the retrieval it annotates.
+        """
+        ordered = sorted(ids)
+        attempts = len(_ACCESS_STAT_RETRY_DELAYS) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                await self.db.execute(
+                    """
+                    WITH target AS (
+                        SELECT id FROM memories
+                        WHERE id = ANY($1)
+                        ORDER BY id
+                        FOR UPDATE
+                    )
+                    UPDATE memories m
+                    SET access_count = m.access_count + 1,
+                        last_accessed = CURRENT_TIMESTAMP
+                    FROM target t
+                    WHERE m.id = t.id
+                    """,
+                    ordered,
+                )
+                return
+            except Exception as e:
+                if _is_deadlock(e):
+                    memory_health.increment("access_stats_deadlock")
+                    if attempt < attempts:
+                        await asyncio.sleep(_ACCESS_STAT_RETRY_DELAYS[attempt - 1])
+                        continue
+                else:
+                    memory_health.increment("access_stats_error")
+                logger.warning(
+                    "Memory access-stat write failed (contained, attempt %d/%d): "
+                    "%s: %s",
+                    attempt,
+                    attempts,
+                    type(e).__name__,
+                    e,
+                )
+                return
 
     async def retrieve(
         self,
@@ -1037,7 +1470,9 @@ class RecallStore:
                 COUNT(*) FILTER (WHERE source = 'phase_archive') AS from_phase_archive,
                 COUNT(*) FILTER (WHERE source = 'tool_error') AS from_tool_error,
                 AVG(importance) AS avg_importance,
-                COUNT(*) FILTER (WHERE remaining_turns > 0) AS ttl_active
+                COUNT(*) FILTER (WHERE remaining_turns > 0 AND valid_to IS NULL) AS ttl_active,
+                COUNT(*) FILTER (WHERE valid_to IS NULL) AS current,
+                COUNT(*) FILTER (WHERE valid_to IS NOT NULL) AS superseded
             FROM memories
             WHERE {scope_clause}
             """,

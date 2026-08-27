@@ -96,23 +96,37 @@ build {
 
   # Daemon + sudo-gate files. Packer's `sources` uploads multiple files in
   # one SCP session, saving SSH-handshake overhead.
+  #
+  # browser-exec, check-browser-stream.py, and assert-browser-stack.sh are
+  # deliberately sourced from ../ (docker/) rather than copied into files/:
+  # they are the exact same files the container workspace ships
+  # (docker/Dockerfile.workspace). A copy under files/ would reintroduce the
+  # hand-maintained duplication that let the VM image ship for ~5 weeks without
+  # browser-exec at all — a working Chromium no agent could reach. See
+  # knowledge-base/knowledge/issues/vm_workspace_missing_browser_exec.md.
   provisioner "file" {
     sources = [
       "files/management-daemon.py",
       "files/management-daemon.service",
       "files/code-server-config.yaml",
+      "files/code-server.service",
       "files/sudo-gated.service",
       "files/sudo-gated.socket",
       "files/sudo-gated-config.yaml",
       "files/sudo-gate.conf",
       "files/sudo_gate.so",
+      "../browser-exec",
+      "../check-browser-stream.py",
+      "../assert-browser-stack.sh",
+      # VM-only, unlike its browser sibling: the sandbox tier cannot run
+      # containers at all, so there is no twin image to keep in step.
+      "../assert-container-stack.sh",
     ]
     destination = "/tmp/"
   }
 
   # sudo-gated-bin needs a rename to /tmp/sudo-gated, so it stays separate.
-  # CI creates an empty placeholder if the binary isn't available;
-  # provision-stage2.sh skips installation when the placeholder is empty.
+  # CI requires this file and the plugin artifact to be non-empty.
   provisioner "file" {
     source      = "files/sudo-gated-bin"
     destination = "/tmp/sudo-gated"
@@ -128,7 +142,18 @@ build {
 
   # Final cleanup: removes packer user, runs cloud-init clean, truncates
   # machine-id, disables sshd PasswordAuthentication, then shuts down.
+  #
+  # cleanup.sh deletes the packer user + sudoers and ends in `shutdown -P now`
+  # inside one sudo block (shutdown_command is empty above), so shutdown MUST
+  # stay in-script — Packer can't SSH back as the deleted packer user. These
+  # two flags stop Packer racing the poweroff to `rm` its temp script, which
+  # intermittently fails with "Error removing temporary script: connection
+  # refused".
+  #   expect_disconnect: the SSH drop on shutdown is expected, not an error.
+  #   skip_clean:        don't reconnect to delete the temp script.
   provisioner "shell" {
-    script = "scripts/cleanup.sh"
+    script            = "scripts/cleanup.sh"
+    expect_disconnect = true
+    skip_clean        = true
   }
 }

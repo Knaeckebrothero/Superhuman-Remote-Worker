@@ -1,20 +1,17 @@
-import {inject, Injectable, signal} from '@angular/core';
-import {HttpClient} from '@angular/common/http';
-import {catchError, Observable, of, tap} from 'rxjs';
+import { inject, Injectable, signal } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { catchError, Observable, of, tap } from 'rxjs';
 import {
   ApiKeyEntry,
   ApiKeySetRequest,
   CodexStatus,
-  LlmEndpoint,
-  LlmEndpointCreateRequest,
-  LlmEndpointTestResult,
-  LlmEndpointUpdateRequest,
+  CodexUsage,
   ResolvedDefaults,
   UserSettings,
 } from '../models/api.model';
-import {environment} from '../environment';
-import {AdminProvidersService} from './admin-providers.service';
-import {ReadinessService} from './readiness.service';
+import { environment } from '../environment';
+import { AdminProvidersService } from './admin-providers.service';
+import { ReadinessService } from './readiness.service';
 
 @Injectable({ providedIn: 'root' })
 export class SettingsService {
@@ -25,9 +22,6 @@ export class SettingsService {
 
   /** Current user's API keys (prefix only, no full keys). */
   readonly apiKeys = signal<ApiKeyEntry[]>([]);
-
-  /** Current user's registered LLM endpoints with nested models. */
-  readonly llmEndpoints = signal<LlmEndpoint[]>([]);
 
   /** Current user's preference settings (user overrides only). */
   readonly preferences = signal<UserSettings>({});
@@ -54,40 +48,6 @@ export class SettingsService {
     return this.http
       .delete<{ status: string }>(`${this.baseUrl}/settings/api-keys/${provider}`)
       .pipe(tap(() => this.loadApiKeys()));
-  }
-
-  // ── User LLM Endpoints ────────────────────────────────────────────
-
-  loadLlmEndpoints(): void {
-    this.http
-      .get<LlmEndpoint[]>(`${this.baseUrl}/settings/llm-endpoints`)
-      .pipe(catchError(() => of([])))
-      .subscribe((endpoints) => this.llmEndpoints.set(endpoints));
-  }
-
-  createLlmEndpoint(body: LlmEndpointCreateRequest): Observable<LlmEndpoint> {
-    return this.http
-      .post<LlmEndpoint>(`${this.baseUrl}/settings/llm-endpoints`, body)
-      .pipe(tap(() => this.loadLlmEndpoints()));
-  }
-
-  updateLlmEndpoint(endpointId: string, body: LlmEndpointUpdateRequest): Observable<LlmEndpoint> {
-    return this.http
-      .patch<LlmEndpoint>(`${this.baseUrl}/settings/llm-endpoints/${endpointId}`, body)
-      .pipe(tap(() => this.loadLlmEndpoints()));
-  }
-
-  deleteLlmEndpoint(endpointId: string): Observable<{ status: string }> {
-    return this.http
-      .delete<{ status: string }>(`${this.baseUrl}/settings/llm-endpoints/${endpointId}`)
-      .pipe(tap(() => this.loadLlmEndpoints()));
-  }
-
-  testLlmEndpoint(endpointId: string): Observable<LlmEndpointTestResult> {
-    return this.http.post<LlmEndpointTestResult>(
-      `${this.baseUrl}/settings/llm-endpoints/${endpointId}/test`,
-      {},
-    );
   }
 
   // ── User Preferences ──────────────────────────────────────────────
@@ -118,14 +78,21 @@ export class SettingsService {
       .pipe(catchError(() => of([])));
   }
 
-  setProjectApiKey(projectId: string, provider: string, body: ApiKeySetRequest): Observable<ApiKeyEntry> {
-    return this.http
-      .put<ApiKeyEntry>(`${this.baseUrl}/projects/${projectId}/api-keys/${provider}`, body);
+  setProjectApiKey(
+    projectId: string,
+    provider: string,
+    body: ApiKeySetRequest,
+  ): Observable<ApiKeyEntry> {
+    return this.http.put<ApiKeyEntry>(
+      `${this.baseUrl}/projects/${projectId}/api-keys/${provider}`,
+      body,
+    );
   }
 
   deleteProjectApiKey(projectId: string, provider: string): Observable<{ status: string }> {
-    return this.http
-      .delete<{ status: string }>(`${this.baseUrl}/projects/${projectId}/api-keys/${provider}`);
+    return this.http.delete<{ status: string }>(
+      `${this.baseUrl}/projects/${projectId}/api-keys/${provider}`,
+    );
   }
 
   // ── Codex Proxy (Admin) ───────────────────────────────────────
@@ -133,7 +100,9 @@ export class SettingsService {
   getCodexStatus(): Observable<CodexStatus> {
     return this.http
       .get<CodexStatus>(`${this.baseUrl}/codex/status`)
-      .pipe(catchError(() => of({ connected: false, accounts: [], model_count: 0 })));
+      .pipe(
+        catchError(() => of({ connected: false, reachable: false, accounts: [], model_count: 0 })),
+      );
   }
 
   getCodexModels(): Observable<{ models: string[] }> {
@@ -142,14 +111,22 @@ export class SettingsService {
       .pipe(catchError(() => of({ models: [] })));
   }
 
-  startCodexLogin(): Observable<{ auth_url: string; state: string }> {
+  /** Codex subscription 5h + weekly rate-limit windows (admin-only). Degrades to
+   * `available: false` on any error so the card just hides the bars. */
+  getCodexUsage(): Observable<CodexUsage> {
     return this.http
-      .post<{ auth_url: string; state: string }>(`${this.baseUrl}/codex/login`, {});
+      .get<CodexUsage>(`${this.baseUrl}/codex/usage`)
+      .pipe(catchError(() => of({ available: false } as CodexUsage)));
+  }
+
+  startCodexLogin(): Observable<{ auth_url: string; state: string }> {
+    return this.http.post<{ auth_url: string; state: string }>(`${this.baseUrl}/codex/login`, {});
   }
 
   pollCodexLogin(state: string): Observable<{ status: string }> {
-    return this.http
-      .get<{ status: string }>(`${this.baseUrl}/codex/login/poll`, { params: { state } });
+    return this.http.get<{ status: string }>(`${this.baseUrl}/codex/login/poll`, {
+      params: { state },
+    });
   }
 
   completeCodexLogin(callbackUrl: string): Observable<Record<string, unknown>> {
@@ -214,6 +191,7 @@ export class SettingsService {
 
 export interface MainCloudEffectiveConfig {
   backend_id: string;
+  backend_instance_id?: string | null;
   is_initialized: boolean;
   is_configured: boolean;
   base_url?: string | null;
@@ -237,11 +215,17 @@ export interface MainCloudOverlay {
 export interface MainCloudSecretProvenance {
   env_var: string;
   set: boolean;
-  length: number;
 }
 
 export interface MainCloudSettingsResponse {
   effective: MainCloudEffectiveConfig;
+  activation_revision: number;
+  backend_instance: {
+    id: string;
+    routing_sha256: string;
+    installation_proof_sha256: string;
+    secret_revision: number;
+  } | null;
   overlay: MainCloudOverlay;
   secrets: Record<string, MainCloudSecretProvenance>;
   allowed_backends: string[];
@@ -250,11 +234,14 @@ export interface MainCloudSettingsResponse {
 export interface MainCloudSettingsRequest {
   value: Record<string, unknown>;
   credentials_ref: string | null;
+  expected_activation_revision?: number;
 }
 
 export interface MainCloudPutResponse {
   status: string;
   backend_id: string;
+  backend_instance_id: string;
+  activation_revision: number;
   reloaded: boolean;
 }
 

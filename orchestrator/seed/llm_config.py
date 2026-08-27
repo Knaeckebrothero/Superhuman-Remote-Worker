@@ -106,6 +106,24 @@ SEEDED_FROM_TAG = "helm:llm.seed"
 # matches on this exact string.
 CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
 
+# ElevenLabs TTS provider, auto-wired from the deployment-wide ELEVENLABS_API_KEY
+# secret (see knowledge-base/knowledge/features/tts_vendor_providers.md). Like the codex proxy, the
+# key in the secret is all it takes — no manual Admin step.
+ELEVENLABS_ENDPOINT_LABEL = "ElevenLabs"
+ELEVENLABS_TTS_MODEL_ID = "eleven_multilingual_v2"
+# Placeholder base_url: ElevenLabs is NOT OpenAI-compatible, so the TTS adapter
+# (services/tts.py) targets ElevenLabs' fixed API URL and ignores this. The
+# endpoint row exists only to anchor the catalog model to a transport.
+_ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
+# Sarah — one of the standard "premade" voices ElevenLabs ships in every
+# account's voice list, so read-aloud works out of the box, including on the
+# free tier. (The legacy default, Rachel `21m00Tcm4TlvDq8ikWAM`, was moved to
+# the shared Voice Library, which free-tier keys cannot synthesize via the API —
+# it 402s with "Free users cannot use library voices".) Users override this via
+# the Settings voice picker (default_tts_voice) or the account-voice picker
+# (Phase 5).
+ELEVENLABS_DEFAULT_VOICE = "EXAVITQu4vr4xnSDxMaL"
+
 # Fallback used when CODEX_PROXY_URL is unset. Mirrors the runtime fallback
 # in ``orchestrator.main._get_codex_subscription_models`` so login flows that
 # work without the env var also wire up a transport row.
@@ -528,6 +546,69 @@ async def ensure_codex_proxy_endpoint(
         logger.exception("ensure_codex_proxy_endpoint: seed run failed")
         return False
     return CODEX_PROXY_ENDPOINT_LABEL in report.endpoints_seeded
+
+
+async def ensure_elevenlabs_tts_endpoint(db: PostgresDB) -> bool:
+    """Ensure the ElevenLabs TTS model is registered when ``ELEVENLABS_API_KEY``
+    is set — the read-aloud provider then appears in the picker with no manual
+    Admin step, exactly like the codex proxy.
+
+    Design (knowledge-base/knowledge/features/tts_vendor_providers.md): the env secret is the single
+    source of truth for the key. The endpoint row is stored **without** a key
+    (``api_key=None``) purely to anchor the catalog model; the TTS adapter reads
+    ``ELEVENLABS_API_KEY`` from the environment at synth time, so rotating the
+    secret takes effect with no DB write. The catalog row's
+    ``params_json.provider`` routes synthesis to the ElevenLabs adapter (the
+    model-id sniff would too) and seeds a default voice so playback works out of
+    the box.
+
+    Idempotent — a re-run finds the existing endpoint by label and the model row
+    is inserted ``ON CONFLICT DO NOTHING`` (admin edits survive). Best-effort:
+    failures are logged, never raised, so a wiring hiccup can't abort startup.
+
+    Returns True if a new model row was created.
+    """
+    if not os.environ.get("ELEVENLABS_API_KEY"):
+        return False
+    try:
+        endpoint_id: str | None = None
+        for row in await db.list_system_llm_endpoints():
+            if row.get("label") == ELEVENLABS_ENDPOINT_LABEL:
+                endpoint_id = str(row["id"])
+                break
+        if endpoint_id is None:
+            created = await db.create_system_llm_endpoint(
+                label=ELEVENLABS_ENDPOINT_LABEL,
+                base_url=_ELEVENLABS_BASE_URL,
+                api_key=None,  # env is the source of truth; adapter reads it
+                key_prefix=None,
+            )
+            endpoint_id = str(created["id"])
+        inserted = await db.create_model(
+            provider_kind="endpoint",
+            provider_ref=endpoint_id,
+            model_id=ELEVENLABS_TTS_MODEL_ID,
+            display_label="ElevenLabs Multilingual v2",
+            capabilities=["tts"],
+            family="elevenlabs",
+            params_json={
+                "provider": "elevenlabs",
+                "voice": ELEVENLABS_DEFAULT_VOICE,
+            },
+            enabled=True,
+            seeded_from="env:ELEVENLABS_API_KEY",
+            on_conflict_do_nothing=True,
+        )
+        if inserted is not None:
+            logger.info(
+                "ensure_elevenlabs_tts_endpoint: registered %s under endpoint %s",
+                ELEVENLABS_TTS_MODEL_ID,
+                endpoint_id,
+            )
+        return inserted is not None
+    except Exception:
+        logger.exception("ensure_elevenlabs_tts_endpoint: wiring failed")
+        return False
 
 
 async def run(payload_path: Path) -> SeedReport:

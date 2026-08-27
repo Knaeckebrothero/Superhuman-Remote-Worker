@@ -4,7 +4,7 @@ Wraps Neo4jDB with knowledge-specific operations: create/read/update notes,
 manage relationships, graph traversal queries. This is the system-level
 Neo4j connection (not the external datasource connector).
 
-See docs/features/project_knowledge_base.md for full architecture.
+See knowledge-base/knowledge/features/project_knowledge_base.md for full architecture.
 
 Usage:
     ```python
@@ -55,10 +55,31 @@ NOTE_TYPES = frozenset(
         "state",
         "retrospective",
         "datasource",
+        # Backlog ticket types (knowledge-base/knowledge/superpowers/specs/
+        # 2026-07-26-project-backlog-pipeline-design.md). These carry no TTL —
+        # KB_TTL_BY_NOTE_TYPE's default of None already covers them, so a
+        # backlog entry never expires on a clock.
+        "feature",
+        "issue",
+        "idea",
+        # Officer types (knowledge-base/knowledge/features/centurion.md §5, vector/0015). 'charter'
+        # is the project's pinned commander's-intent note — one ACTIVE charter
+        # per project, write-gated to sessions (Legate/officer hands; workers
+        # are refused in kb_write). 'report' is a worker recon deliverable —
+        # provenance rides job_id; reports inform, never steer.
+        "charter",
+        "report",
     }
 )
 
 NOTE_STATUSES = frozenset({"active", "resolved", "superseded", "archived"})
+
+# Backlog priority. A LABEL, never a contract: it orders the list agents are
+# shown and nothing in the engine may gate, refuse, or reorder work on it.
+# Stored as a rank so ordering is an index scan rather than a CASE.
+PRIORITY_RANKS: dict[str, int] = {"high": 0, "normal": 1, "low": 2}
+PRIORITY_WORDS: dict[int, str] = {0: "high", 1: "normal", 2: "low"}
+DEFAULT_PRIORITY_RANK = 1
 
 CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
 
@@ -141,6 +162,7 @@ class KnowledgeGraphDB:
         phase: Optional[int] = None,
         retrieval_messages: Optional[List[str]] = None,
         links: Optional[List[Dict[str, str]]] = None,
+        note_id: Optional[str] = None,
     ) -> str:
         """Create a new knowledge note in Neo4j.
 
@@ -156,6 +178,9 @@ class KnowledgeGraphDB:
             phase: Phase number when created
             retrieval_messages: Synthetic queries for retrieval
             links: List of {"target": slug, "type": RELATIONSHIP_TYPE}
+            note_id: Server-derived canonical slug. When provided, creation is
+                idempotent for that exact note instead of deriving a second
+                collision suffix in the projection.
 
         Returns:
             The note's slug ID
@@ -172,17 +197,31 @@ class KnowledgeGraphDB:
                 f"Invalid confidence: {confidence}. Must be one of {CONFIDENCE_LEVELS}"
             )
 
-        slug = slugify(title)
+        slug = note_id or slugify(title)
         if not slug:
             slug = f"note-{secrets.token_hex(4)}"
 
-        # Check for slug collision and append suffix if needed
+        # Check for slug collision and append a suffix if needed. The suffix is
+        # a deterministic content hash (not a random token) so identical
+        # re-writes converge to the same slug instead of forking a fresh note
+        # every time — the run-8 twin-file problem (vault features/ §11.1).
         existing = self._db.execute_query(
             "MATCH (n:Note {project_id: $pid, id: $id}) RETURN n.id",
             {"pid": project_id, "id": slug},
         )
+        if existing and note_id is not None:
+            return slug
         if existing:
-            slug = f"{slug}-{secrets.token_hex(3)}"
+            digest = hashlib.sha256(content.encode()).hexdigest()[:6]
+            slug = f"{slug}-{digest}"
+            # Idempotent: if the suffixed slug is already present (same title +
+            # content written before), return it rather than duplicating a node.
+            dup = self._db.execute_query(
+                "MATCH (n:Note {project_id: $pid, id: $id}) RETURN n.id",
+                {"pid": project_id, "id": slug},
+            )
+            if dup:
+                return slug
 
         now = datetime.now(timezone.utc).isoformat()
 
@@ -420,6 +459,7 @@ class KnowledgeGraphDB:
         confidence: Optional[str] = None,
         add_tags: Optional[List[str]] = None,
         add_links: Optional[List[Dict[str, str]]] = None,
+        remove_tags: Optional[List[str]] = None,
     ) -> bool:
         """Update an existing note.
 
@@ -432,6 +472,13 @@ class KnowledgeGraphDB:
             confidence: New confidence
             add_tags: Additional tags
             add_links: Additional relationships
+            remove_tags: Tags to detach. Removal exists because tags became
+                dispatch state, not just labels: a ``ready`` tag that can only
+                be added is a one-way door, and a ticket whose category
+                changes would otherwise match two pools at once
+                (knowledge-base/knowledge/features/officer_backlog_pools.md §4). Detaching the
+                ``:TAGGED`` edge leaves the ``:Tag`` node — it is shared across
+                the project's notes and may still have other holders.
 
         Returns:
             True if note was found and updated
@@ -474,6 +521,19 @@ class KnowledgeGraphDB:
             """,
             params,
         )
+
+        # Remove before add, so a caller that does both in one call (a category
+        # change: drop category:researcher, add category:executor) cannot have
+        # the removal undo the addition when the two lists overlap.
+        for tag in remove_tags or []:
+            self._db.execute_write(
+                """
+                MATCH (n:Note {project_id: $pid, id: $nid})-[r:TAGGED]->
+                      (t:Tag {name: $tag, project_id: $pid})
+                DELETE r
+                """,
+                {"pid": project_id, "nid": note_id, "tag": tag.lower()},
+            )
 
         # Add new tags
         for tag in add_tags or []:

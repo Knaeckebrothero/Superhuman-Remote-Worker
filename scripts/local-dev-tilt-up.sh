@@ -14,7 +14,7 @@
 # Idempotent: re-runs are safe. Use it to bring a stopped cluster back up
 # or after `k3d cluster delete`.
 #
-# Prereq: `tilt` binary on PATH. See docs/features/tilt_inner_loop_dev.md
+# Prereq: `tilt` binary on PATH. See knowledge-base/knowledge/features/tilt_inner_loop_dev.md
 # §Prerequisites for the install commands.
 # =============================================================================
 set -euo pipefail
@@ -25,6 +25,7 @@ cd "$REPO_ROOT"
 
 NAMESPACE="${NAMESPACE:-srw}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-k3d-srw}"
+CLUSTER_NAME="${CLUSTER_NAME:-srw}"
 VALUES_LOCAL="$REPO_ROOT/deployment/values-local.yaml"
 
 log()  { printf '\033[1;34m[tilt-bootstrap]\033[0m %s\n' "$*"; }
@@ -34,7 +35,9 @@ die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- 0. Tilt-specific prereq -------------------------------------------------
 command -v tilt >/dev/null \
-  || die "tilt not on PATH — install per docs/features/tilt_inner_loop_dev.md"
+  || die "tilt not on PATH — install per knowledge-base/knowledge/features/tilt_inner_loop_dev.md"
+helm upgrade --help 2>/dev/null | grep -F -- '--take-ownership' >/dev/null \
+  || die "helm lacks --take-ownership — install a current Helm 3 release before using Tilt Force Update"
 
 # --- 1. Base bootstrap -------------------------------------------------------
 log "running base bootstrap (cluster + cert-manager + namespace + vm-ssh-key)"
@@ -69,7 +72,7 @@ elif [[ -f "$VALUES_LOCAL" ]] && grep -q 'auth.localhost' "$VALUES_LOCAL"; then
   fi
 elif [[ ! -f "$VALUES_LOCAL" ]]; then
   log "values-local.yaml not found — copy from the example then re-run this script:"
-  log "  cp deployment/values-local.example.yaml deployment/values-local.yaml"
+  log "  cp deployment/values-local.yaml.example deployment/values-local.yaml"
   log "  \$EDITOR deployment/values-local.yaml   # paste at least one LLM key"
   die "create values-local.yaml first"
 fi

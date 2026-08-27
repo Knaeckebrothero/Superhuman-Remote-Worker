@@ -2,7 +2,7 @@
 
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -10,11 +10,13 @@ from src.tools.research.papers import (
     DOI_PATTERN,
     ARXIV_PATTERN,
     _detect_identifier_type,
-    _is_remote_workspace,
-    _get_local_documents_dir,
+    _search_semantic_scholar,
+    _store_download_in_workspace,
     _transfer_to_workspace,
-    _maybe_transfer,
     create_paper_tools,
+)
+from src.tools.research.utils.semantic_scholar_client import (
+    SemanticScholarProviderError,
 )
 from src.tools.research.utils.paper_types import (
     AccessStatus,
@@ -117,6 +119,24 @@ class TestSearchPapers:
         assert "Semantic Scholar Results" in result
 
     @pytest.mark.asyncio
+    async def test_semantic_scholar_auth_failure_is_actionable(self):
+        error = SemanticScholarProviderError(
+            "Semantic Scholar authentication failed (HTTP 403): rotate credential.",
+            category="authentication",
+            status_code=403,
+            retryable=False,
+        )
+        with patch(
+            "src.tools.research.utils.semantic_scholar_client.search_semantic_scholar",
+            new_callable=AsyncMock,
+            side_effect=error,
+        ):
+            result = await _search_semantic_scholar("test", 10)
+
+        assert "authentication failed (HTTP 403)" in result
+        assert "rotate credential" in result
+
+    @pytest.mark.asyncio
     async def test_search_unknown_source(self, mock_tool_context):
         tools = create_paper_tools(mock_tool_context)
         search_papers = next(t for t in tools if t.name == "search_papers")
@@ -157,6 +177,7 @@ class TestDownloadPaper:
             source=PaperSource.ARXIV,
             paper=sample_paper,
         )
+        mock_result.path.write_bytes(b"%PDF test")
 
         with patch(
             "src.tools.research.papers._try_arxiv_download",
@@ -190,6 +211,7 @@ class TestDownloadPaper:
             source=PaperSource.UNPAYWALL,
             paper=paper,
         )
+        mock_result.path.write_bytes(b"%PDF test")
 
         with (
             patch(
@@ -226,11 +248,6 @@ class TestDownloadPaper:
                 new_callable=AsyncMock,
                 return_value=DownloadResult(success=False, error="Not found"),
             ),
-            patch(
-                "src.tools.research.papers._try_browser_download",
-                new_callable=AsyncMock,
-                return_value=None,
-            ),
         ):
             result = await download_paper.ainvoke(
                 {"identifier": "10.1038/test", "identifier_type": "doi"}
@@ -262,11 +279,6 @@ class TestDownloadPaper:
                     paper=paywalled_paper,
                 ),
             ),
-            patch(
-                "src.tools.research.papers._try_browser_download",
-                new_callable=AsyncMock,
-                return_value=None,
-            ),
         ):
             result = await download_paper.ainvoke(
                 {"identifier": "10.1016/test", "identifier_type": "doi"}
@@ -288,6 +300,7 @@ class TestDownloadPaper:
             source=PaperSource.ARXIV,
             paper=sample_paper,
         )
+        mock_result.path.write_bytes(b"%PDF test")
 
         with patch(
             "src.tools.research.papers._try_arxiv_download",
@@ -299,60 +312,6 @@ class TestDownloadPaper:
             )
 
         assert "Downloaded" in result
-
-    @pytest.mark.asyncio
-    async def test_download_browser_fallback(self, mock_tool_context):
-        tools = create_paper_tools(mock_tool_context)
-        download_paper = next(t for t in tools if t.name == "download_paper")
-
-        with (
-            patch(
-                "src.tools.research.papers._try_unpaywall_download",
-                new_callable=AsyncMock,
-                return_value=DownloadResult(success=False, error="No OA"),
-            ),
-            patch(
-                "src.tools.research.papers._try_browser_download",
-                new_callable=AsyncMock,
-                return_value="Downloaded via browser: test.pdf\nPath: /tmp/test.pdf\nSize: 1,234 bytes",
-            ),
-        ):
-            result = await download_paper.ainvoke(
-                {
-                    "identifier": "10.1038/test",
-                    "identifier_type": "doi",
-                    "use_browser_fallback": True,
-                }
-            )
-
-        assert "browser" in result.lower()
-
-    @pytest.mark.asyncio
-    async def test_download_browser_fallback_disabled(self, mock_tool_context):
-        tools = create_paper_tools(mock_tool_context)
-        download_paper = next(t for t in tools if t.name == "download_paper")
-
-        with (
-            patch(
-                "src.tools.research.papers._try_unpaywall_download",
-                new_callable=AsyncMock,
-                return_value=DownloadResult(success=False, error="No OA"),
-            ),
-            patch(
-                "src.tools.research.papers._try_browser_download",
-                new_callable=AsyncMock,
-            ) as mock_browser,
-        ):
-            result = await download_paper.ainvoke(
-                {
-                    "identifier": "10.1038/test",
-                    "identifier_type": "doi",
-                    "use_browser_fallback": False,
-                }
-            )
-
-        mock_browser.assert_not_called()
-        assert "Could not download" in result
 
 
 class TestGetPaperInfo:
@@ -394,6 +353,37 @@ class TestGetPaperInfo:
         assert "Arxiv Paper" in result
 
     @pytest.mark.asyncio
+    async def test_auth_failure_is_disclosed_while_arxiv_fallback_runs(
+        self, mock_tool_context
+    ):
+        tools = create_paper_tools(mock_tool_context)
+        get_paper_info = next(t for t in tools if t.name == "get_paper_info")
+        error = SemanticScholarProviderError(
+            "Semantic Scholar authentication failed (HTTP 403): rotate credential.",
+            category="authentication",
+            status_code=403,
+            retryable=False,
+        )
+
+        with (
+            patch(
+                "src.tools.research.papers._get_semantic_scholar_info",
+                new_callable=AsyncMock,
+                side_effect=error,
+            ),
+            patch(
+                "src.tools.research.papers._get_arxiv_info",
+                new_callable=AsyncMock,
+                return_value="Paper: Arxiv Paper\narXiv: 1706.03762",
+            ),
+        ):
+            result = await get_paper_info.ainvoke({"identifier": "1706.03762"})
+
+        assert "authentication failed (HTTP 403)" in result
+        assert "Using arXiv metadata fallback" in result
+        assert "Paper: Arxiv Paper" in result
+
+    @pytest.mark.asyncio
     async def test_get_info_not_found(self, mock_tool_context):
         tools = create_paper_tools(mock_tool_context)
         get_paper_info = next(t for t in tools if t.name == "get_paper_info")
@@ -432,49 +422,7 @@ class TestPaperToolsMetadata:
             assert "tactical" in meta["phases"], f"{name} not in tactical phase"
 
 
-# ── Remote workspace awareness tests ─────────────────────────────────
-
-
-class TestIsRemoteWorkspace:
-    """Tests for _is_remote_workspace detection."""
-
-    def test_remote_when_backend_has_host(self, mock_remote_tool_context):
-        assert _is_remote_workspace(mock_remote_tool_context) is True
-
-    def test_local_when_backend_has_no_host(self, mock_tool_context):
-        assert _is_remote_workspace(mock_tool_context) is False
-
-    def test_local_when_no_workspace(self):
-        ctx = MagicMock()
-        ctx.has_workspace.return_value = False
-        assert _is_remote_workspace(ctx) is False
-
-
-class TestGetLocalDocumentsDir:
-    """Tests for _get_local_documents_dir — always returns a local path."""
-
-    def test_local_workspace_returns_workspace_path(
-        self, mock_tool_context, temp_docs_dir
-    ):
-        mock_tool_context.workspace_manager.get_path.return_value = (
-            temp_docs_dir / "documents"
-        )
-        result = _get_local_documents_dir(mock_tool_context)
-        assert str(temp_docs_dir) in str(result)
-
-    def test_remote_workspace_returns_temp_dir(self, mock_remote_tool_context):
-        result = _get_local_documents_dir(mock_remote_tool_context)
-        # Must be a real local path, not the remote path
-        assert result.exists()
-        assert "agent-host" not in str(result)
-        # Clean up
-        result.rmdir()
-
-    def test_no_workspace_returns_fallback(self):
-        ctx = MagicMock()
-        ctx.has_workspace.return_value = False
-        result = _get_local_documents_dir(ctx)
-        assert result == Path("./downloads")
+# ── Backend staging tests ─────────────────────────────────────────────
 
 
 class TestTransferToWorkspace:
@@ -499,16 +447,20 @@ class TestTransferToWorkspace:
             local_path.unlink(missing_ok=True)
 
 
-class TestMaybeTransfer:
-    """Tests for _maybe_transfer — conditional transfer."""
+class TestStoreDownloadInWorkspace:
+    """Every completed download is written through the backend."""
 
-    def test_local_mode_returns_local_path(self, mock_tool_context, temp_docs_dir):
+    def test_hostless_backend_still_receives_file(
+        self, mock_tool_context, temp_docs_dir
+    ):
+        backend = mock_tool_context.workspace_manager.backend
         local_file = temp_docs_dir / "test.pdf"
         local_file.write_bytes(b"test")
-        result = _maybe_transfer(mock_tool_context, False, local_file)
-        assert result == str(local_file)
+        result = _store_download_in_workspace(mock_tool_context, local_file)
+        assert result == "documents/test.pdf"
+        backend.write_file.assert_called_once_with("documents/test.pdf", b"test")
 
-    def test_remote_mode_transfers_and_returns_relative(self, mock_remote_tool_context):
+    def test_remote_backend_receives_file(self, mock_remote_tool_context):
         backend = mock_remote_tool_context.workspace_manager.backend
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
@@ -516,14 +468,14 @@ class TestMaybeTransfer:
             local_path = Path(f.name)
 
         try:
-            result = _maybe_transfer(mock_remote_tool_context, True, local_path)
+            result = _store_download_in_workspace(mock_remote_tool_context, local_path)
             assert result == f"documents/{local_path.name}"
             backend.write_file.assert_called_once()
         finally:
             local_path.unlink(missing_ok=True)
 
     def test_none_path_returns_empty(self, mock_tool_context):
-        assert _maybe_transfer(mock_tool_context, False, None) == ""
+        assert _store_download_in_workspace(mock_tool_context, None) == ""
 
 
 class TestDownloadPaperRemote:

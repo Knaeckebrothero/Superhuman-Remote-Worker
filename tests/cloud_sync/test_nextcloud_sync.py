@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
-
 import pytest
 
 from src.services.cloud_sync.nextcloud_sync import NextcloudWorkspaceSync
@@ -17,6 +15,8 @@ class _FakeWebDavClient:
         self.uploads: list[dict] = []
         self.mkdirs: list[str] = []
         self.downloads: list[dict] = []
+        self.deletes: list[str] = []
+        self.delete_error: Exception | None = None
         self.list_returns: list = []
 
     def upload_sync(self, **kwargs):
@@ -28,6 +28,11 @@ class _FakeWebDavClient:
     def download_sync(self, **kwargs):
         self.downloads.append(kwargs)
 
+    def clean(self, path):
+        self.deletes.append(path)
+        if self.delete_error is not None:
+            raise self.delete_error
+
     def list(self, _path, get_info=False):
         return self.list_returns
 
@@ -35,10 +40,7 @@ class _FakeWebDavClient:
 @pytest.fixture
 def fake_client_factory(monkeypatch):
     fake = _FakeWebDavClient()
-    monkeypatch.setattr(
-        "webdav3.client.Client",
-        MagicMock(return_value=fake),
-    )
+    monkeypatch.setattr(NextcloudWorkspaceSync, "_get_client", lambda _self: fake)
     return fake
 
 
@@ -106,3 +108,29 @@ async def test_download_delegates(tmp_path: Path, fake_client_factory):
     assert fake_client_factory.downloads == [
         {"remote_path": "a.txt", "local_path": "/tmp/out.txt"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_generation_delete_is_idempotent_when_resource_already_missing(
+    tmp_path: Path, fake_client_factory
+):
+    class RemoteResourceNotFound(Exception):
+        pass
+
+    fake_client_factory.delete_error = RemoteResourceNotFound("already gone")
+    sync = NextcloudWorkspaceSync(
+        tmp_path,
+        webdav_url="http://nc/remote.php/dav/files/agent/sess/",
+        webdav_user="agent",
+        webdav_password="pw",
+    )
+    before_write_calls = 0
+
+    async def before_write():
+        nonlocal before_write_calls
+        before_write_calls += 1
+
+    await sync._delete_remote_file("deleted.txt", before_write=before_write)
+
+    assert fake_client_factory.deletes == ["deleted.txt"]
+    assert before_write_calls == 1

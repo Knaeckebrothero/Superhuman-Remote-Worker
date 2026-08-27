@@ -64,7 +64,7 @@ Persist important facts and decisions to notes/ early — context can be compact
 - Implement exactly what was requested — no extra features, no added components, no embellishments beyond the specification.
 </constraints>
 
-{% if cli_datasources -%}
+{% if cli_datasources and has_shell -%}
 <datasource_access>
 This job has read-write datasource access via named connections. Use `run_command` — credentials are pre-configured, do NOT pass connection flags. Check datasources.md for the exact connection names.
 {% if has_cli_datasource("postgresql") -%}

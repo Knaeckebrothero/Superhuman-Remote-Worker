@@ -1,3 +1,5 @@
+import type { WorkspaceContractProjection } from './api.model';
+
 /**
  * Audit step types from MongoDB agent_audit collection.
  */
@@ -63,6 +65,11 @@ export interface AuditErrorInfo {
  */
 export interface AuditEntry {
   _id: string;
+  /**
+   * Transitional: the Postgres audit store sends an integer `id`; the Mongo
+   * store sends a string `_id`. ApiService normalizes both into `_id` (string).
+   */
+  id?: number | string;
   job_id: string;
   step_number: number;
   step_type: AuditStepType;
@@ -100,10 +107,13 @@ export interface JobSummary {
   id: string;
   description: string;
   status: string;
+  completion_outcome_kind?: 'blocked_undelivered' | null;
   config_name?: string;
   user_id?: string | null;
   project_id?: string | null;
+  project_name?: string | null;
   parent_job_id?: string | null;
+  error_message?: string | null;
   creation_order?: number | null;
   repo_name?: string | null;
   branch_name?: string | null;
@@ -113,4 +123,108 @@ export interface JobSummary {
   snapshot_status?: string | null;
   /** Mode B export marker — set when "Export to shared folder" succeeds. */
   exported_at?: string | null;
+  /**
+   * Backend-resolved browser URL of that export folder (the stored handle is
+   * opaque, so only the orchestrator can build it). Drives the "Open cloud
+   * folder" button that replaces "Export to cloud" once `exported_at` is set;
+   * null when the cloud backend is down, in which case the row falls back to a
+   * plain "Exported" badge.
+   */
+  exported_folder_url?: string | null;
+  /**
+   * Backend-computed cloud-review routing (job_cloud_export.md). `'open_folder'`
+   * (loose / default-project / no-cloud-folder jobs) shows the "Open cloud
+   * folder" button; `'diff'` jobs route to the Mode A diff-review instead.
+   */
+  cloud_review_mode?: 'diff' | 'open_folder' | null;
+  /**
+   * True while a sudo/VM-upgrade approval request is open for this job — the
+   * job is blocked on a human decision in the inbox, not resumable (Resume
+   * would reconnect nothing; the decision drives the job).
+   */
+  pending_approval?: boolean;
+  /** Newest open request id, for the inbox deep-link (`/inbox?sudo=<id>`). */
+  pending_approval_request_id?: string | null;
+  /** Where the job came from: user|session|automation|loop|officer|subjob|lifecycle|bench. */
+  origin?: string;
+  /**
+   * The display root this row belongs to. The server pages over display
+   * roots — a matching job whose parent does not match — and sends each
+   * root's matching children along with it, so a tree is never split across
+   * pages and the page size always counts whole trees.
+   */
+  display_root_id?: string;
+  /** True when this row IS its display root, false when it is a child of one. */
+  is_display_root?: boolean;
+  /**
+   * How many jobs hang under this one in the database — the UNFILTERED tree.
+   *
+   * Deliberately not the number of child rows the list is showing. Those two
+   * disagree by design: the default `origin` filter hides every subjob, so the
+   * rendered child count is 0 on every row and cannot distinguish a job with no
+   * children from one whose children are merely filtered out. This is the count
+   * that tells a reader there is something under here worth opening.
+   */
+  subjob_count?: number;
+  /** Safe requested/assigned/effective workspace tier observation. */
+  workspace_contract?: WorkspaceContractProjection;
 }
+
+/**
+ * One page of `/api/jobs`, matching the server envelope.
+ *
+ * `total` is exact up to a server-side cap and `null` when the caller opted
+ * out with `include_total=false`; `total_is_capped` says which. `has_more` is
+ * exact either way — the server fetches one row past the page rather than
+ * comparing against `total`.
+ */
+export interface JobListPage {
+  jobs: JobSummary[];
+  total: number | null;
+  total_is_capped: boolean;
+  has_more: boolean;
+  limit: number;
+  offset: number;
+  /**
+   * Creation-time watermark that froze this result window. Pass it back on
+   * later pages, or rows inserted meanwhile shift the offset underneath the
+   * user and rows are skipped or repeated.
+   */
+  as_of?: string;
+  /**
+   * What the server actually applied, including its own defaults. Drives the
+   * applied-filter tokens, so a hidden row is never hidden silently.
+   */
+  filters?: JobListFilters;
+}
+
+export interface JobListFilters {
+  status?: string[];
+  project_id?: string[];
+  has_project?: boolean | null;
+  include_archived_projects?: boolean;
+  search?: string | null;
+  user_id?: string | null;
+}
+
+/**
+ * REST query params for `/api/jobs` and `/api/stats/jobs`, in wire shape.
+ *
+ * Snake_case and array-valued because that is what the API takes — repeated
+ * keys for multi-values. `job-filters.ts` is the single place that maps
+ * filter state onto this; nothing else should re-derive it.
+ */
+export type JobListParams = Record<
+  string,
+  string | number | boolean | readonly string[] | null | undefined
+>;
+
+/** What `getJobsPage()` yields when the request fails. */
+export const EMPTY_JOB_LIST_PAGE: JobListPage = {
+  jobs: [],
+  total: 0,
+  total_is_capped: false,
+  has_more: false,
+  limit: 0,
+  offset: 0,
+};

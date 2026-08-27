@@ -90,6 +90,22 @@ Usage: {{ include "srwvm.imageTag" (dict "tag" .Values.image.vmController.tag "c
 {{- end }}
 
 {{/*
+Database-free remote collectors reuse the independently-built orchestrator
+image. Never infer that component's identity from this chart's AppVersion.
+Validation requires an explicit tag or digest whenever the collector is enabled;
+a real digest takes precedence over the display/update tag, matching the main
+chart's first-party image-reference contract.
+*/}}
+{{- define "srwvm.imageRef" -}}
+{{- $digest := default "" .image.digest -}}
+{{- if $digest -}}
+{{- printf "%s@%s" .image.repository $digest -}}
+{{- else -}}
+{{- printf "%s:%s" .image.repository .image.tag -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Default VM image — defaults to ghcr.io/.../agent-vm-base:v<chart.AppVersion>
 when .Values.vmController.defaultVmImage is empty.
 */}}

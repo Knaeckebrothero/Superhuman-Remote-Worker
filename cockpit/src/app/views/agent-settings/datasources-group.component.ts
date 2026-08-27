@@ -1,8 +1,128 @@
-import {Component, computed, input, output, signal} from '@angular/core';
+import {Component, computed, effect, inject, input, output, signal} from '@angular/core';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
-import {Datasource, DatasourceType} from '../../core/models/api.model';
+import {ApiService} from '../../core/services/api.service';
+import {
+  Datasource,
+  DatasourceIndexStatus,
+  DatasourceType,
+} from '../../core/models/api.model';
+
+/** A user's explicit picker selection, tagged with the datasource-set identity
+ *  it was made against (so a stale tag falls back to the default). */
+export type DatasourceSelection = {
+  key: string;
+  ids: Set<string>;
+  /** IDs the user explicitly toggled. Untouched IDs follow current server
+   * defaults when eligibility refreshes. Optional for legacy callers/tests. */
+  touched?: Set<string>;
+} | null;
+
+export function isRepositoryDatasource(type: DatasourceType | string): boolean {
+  return (type || '').toString().toLowerCase() === 'repository';
+}
+
+/** Stable identity of a datasource set (order-independent). */
+export function datasourceSetKey(datasources: {id: string}[]): string {
+  return datasources
+    .map(d => d.id)
+    .sort()
+    .join(',');
+}
+
+/** Active selection: the user's tagged choice, or the default when the
+ *  selection is untouched (null) or stale (made against a different datasource
+ *  set). The default is the server-computed `default_selected` set — except
+ *  when `defaultIds` is provided (live mode: the session's currently attached
+ *  set, possibly empty). */
+export function activeDatasourceIds(
+  datasources: Array<{id: string; default_selected?: boolean}>,
+  selection: DatasourceSelection,
+  defaultIds?: Set<string> | null,
+  serverDefaultsEnabled = false,
+): Set<string> {
+  const defaults = defaultIds !== undefined && defaultIds !== null
+    ? new Set(datasources.filter(d => defaultIds.has(d.id)).map(d => d.id))
+    : serverDefaultsEnabled
+      ? new Set(datasources.filter(d => d.default_selected === true).map(d => d.id))
+      : new Set<string>();
+  if (!selection) return defaults;
+
+  // Old exact-set selections remain supported. New selections carry `touched`
+  // and reconcile per id so adding/removing one eligible connector does not
+  // wipe every deliberate choice.
+  if (!selection.touched) {
+    return selection.key === datasourceSetKey(datasources)
+      ? new Set(datasources.filter(d => selection.ids.has(d.id)).map(d => d.id))
+      : defaults;
+  }
+  const active = new Set(defaults);
+  for (const ds of datasources) {
+    if (!selection.touched.has(ds.id)) continue;
+    if (selection.ids.has(ds.id)) active.add(ds.id);
+    else active.delete(ds.id);
+  }
+  return active;
+}
+
+/** Number of selected/unselected choices that differ from the current
+ * server-computed default. This is what the Settings badge should count. */
+export function datasourceSelectionDifferenceCount(
+  datasources: Array<{id: string; default_selected?: boolean}>,
+  selection: DatasourceSelection,
+  defaultIds?: Set<string> | null,
+  serverDefaultsEnabled = false,
+): number {
+  const active = activeDatasourceIds(
+    datasources, selection, defaultIds, serverDefaultsEnabled,
+  );
+  const defaults = defaultIds !== undefined && defaultIds !== null
+    ? new Set(datasources.filter(d => defaultIds.has(d.id)).map(d => d.id))
+    : serverDefaultsEnabled
+      ? new Set(datasources.filter(d => d.default_selected === true).map(d => d.id))
+      : new Set<string>();
+  return datasources.filter(d => active.has(d.id) !== defaults.has(d.id)).length;
+}
+
+/** Selected datasource IDs to submit: the active set, minus clone-based
+ *  repository sources disabled by a lite backend and stale ids. Centrally
+ *  indexed `kb` datasources remain available on every tier. */
+export function selectedDatasourceIds(
+  datasources: Datasource[],
+  selection: DatasourceSelection,
+  isLiteBackend: boolean,
+  defaultIds?: Set<string> | null,
+  serverDefaultsEnabled = false,
+): string[] {
+  const active = activeDatasourceIds(
+    datasources, selection, defaultIds, serverDefaultsEnabled,
+  );
+  return datasources
+    .filter(d => active.has(d.id) && !(isLiteBackend && isRepositoryDatasource(d.type)))
+    .map(d => d.id);
+}
+
+/** True when every selectable datasource (i.e. not lite-excluded and not
+ *  locked) is selected. */
+export function allDatasourcesSelected(
+  datasources: Datasource[],
+  selection: DatasourceSelection,
+  isLiteBackend: boolean,
+  defaultIds?: Set<string> | null,
+  lockedIds?: string[],
+  serverDefaultsEnabled = false,
+): boolean {
+  const locked = new Set(lockedIds ?? []);
+  const selectable = datasources.filter(
+    d => !(isLiteBackend && isRepositoryDatasource(d.type)) && !locked.has(d.id),
+  );
+  if (selectable.length === 0) return false;
+  const active = activeDatasourceIds(
+    datasources, selection, defaultIds, serverDefaultsEnabled,
+  );
+  return selectable.every(d => active.has(d.id));
+}
 
 /**
  * Datasource checkbox list. Hidden entirely when no datasources are available.
@@ -14,38 +134,95 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
   template: `
     @if (!loading() && datasources().length > 0) {
       <div class="settings-group">
-        <div class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</div>
+        <div class="group-header">
+          <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
+          <button
+            type="button"
+            class="select-all-btn"
+            (click)="toggleAll()"
+            [disabled]="disabled() || error() || selectableDatasources().length === 0"
+          >{{ (allSelected() ? 'agentSettings.common.deselectAll' : 'agentSettings.common.selectAll') | transloco }}</button>
+        </div>
         <div class="ds-picker">
           @for (ds of datasources(); track ds.id) {
             <label
               class="ds-option"
-              [class.selected]="selectedIds().has(ds.id)"
+              [class.selected]="isChecked(ds)"
+              [class.ds-disabled]="isLiteExcluded(ds) || isLocked(ds)"
             >
               <input
                 type="checkbox"
-                [checked]="selectedIds().has(ds.id)"
+                [checked]="isChecked(ds)"
                 (change)="toggle(ds.id)"
-                [disabled]="disabled()"
+                [disabled]="disabled() || error() || isLiteExcluded(ds) || isLocked(ds)"
               >
               <app-icon size="md" class="ds-type-icon" [class]="'ds-type-' + ds.type">{{ getTypeIcon(ds.type) }}</app-icon>
               <span class="ds-info">
-                <span class="ds-name">{{ ds.name }}</span>
-                @if (ds.description) {
+                <span class="ds-name">
+                  @if (ds.unavailable) {
+                    {{ 'agentSettings.datasources.unavailableName' | transloco }}
+                  } @else {
+                    {{ ds.name }}
+                  }
+                </span>
+                @if (isLiteExcluded(ds)) {
+                  <span class="ds-desc">Requires a sandbox or VM workspace</span>
+                } @else if (ds.unavailable) {
+                  <span class="ds-desc">{{ 'agentSettings.datasources.unavailableLive' | transloco }}</span>
+                } @else if (isLocked(ds)) {
+                  <span class="ds-desc">{{ 'agentSettings.datasources.lockedLive' | transloco }}</span>
+                } @else if (ds.description) {
                   <span class="ds-desc">{{ ds.description }}</span>
                 }
+                @if (isNotReady(ds)) {
+                  <span class="ds-indexing">
+                    {{ 'agentSettings.datasources.notReady' | transloco }}
+                  </span>
+                }
               </span>
-              <span class="ds-type-badge">{{ ds.type }}</span>
+              <span class="ds-type-badge" [class.ds-rw-badge]="ds.unavailable">
+                {{ (ds.unavailable ? 'agentSettings.datasources.unavailableBadge' : 'datasources.filter.' + ds.type) | transloco }}
+              </span>
+              @if (ds.is_global) {
+                <span class="ds-type-badge" [class.ds-rw-badge]="ds.read_only === false">
+                  {{ (ds.read_only === false
+                    ? 'datasources.table.badgeRw'
+                    : 'datasources.table.badgeRo') | transloco }}
+                </span>
+              }
             </label>
           }
         </div>
+        @if (error()) {
+          <div class="ds-error" role="alert">
+            <span>{{ 'agentSettings.datasources.loadFailed' | transloco }}</span>
+            <button type="button" class="select-all-btn" (click)="retry.emit()">
+              {{ 'agentSettings.datasources.retry' | transloco }}
+            </button>
+          </div>
+        }
       </div>
     } @else if (loading()) {
       <div class="settings-group">
-        <div class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</div>
+        <div class="group-header">
+          <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
+        </div>
         <div class="ds-loading">
           <app-spinner size="sm" />
 
           {{ 'agentSettings.datasources.loading' | transloco }}
+        </div>
+      </div>
+    } @else if (error()) {
+      <div class="settings-group">
+        <div class="group-header">
+          <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
+        </div>
+        <div class="ds-error" role="alert">
+          <span>{{ 'agentSettings.datasources.loadFailed' | transloco }}</span>
+          <button type="button" class="select-all-btn" (click)="retry.emit()">
+            {{ 'agentSettings.datasources.retry' | transloco }}
+          </button>
         </div>
       </div>
     }
@@ -54,15 +231,41 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
     .settings-group {
       margin-bottom: 20px;
     }
+    .group-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
+    }
     .group-label {
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
       color: var(--text-muted, var(--text-muted));
-      margin-bottom: 12px;
-      padding-bottom: 6px;
-      border-bottom: 1px solid var(--border-color, var(--surface-0));
+    }
+    .select-all-btn {
+      flex-shrink: 0;
+      background: none;
+      border: none;
+      padding: 0;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--accent-color, var(--accent-color));
+    }
+    .select-all-btn:hover:not(:disabled) {
+      text-decoration: underline;
+    }
+    .select-all-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
     }
     .ds-picker {
       display: flex;
@@ -84,6 +287,10 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
     .ds-option.selected {
       background: color-mix(in srgb, var(--accent-color) 20%, transparent);
     }
+    .ds-option.ds-disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
     .ds-option input[type="checkbox"] {
       accent-color: var(--accent-color, var(--accent-color));
       flex-shrink: 0;
@@ -96,6 +303,7 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
     .ds-type-neo4j { color: var(--success); }
     .ds-type-mongodb { color: var(--alert); }
     .ds-type-webdav { color: var(--info); }
+    .ds-type-kb { color: var(--accent-color); }
     .ds-info {
       display: flex;
       flex-direction: column;
@@ -115,6 +323,11 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .ds-indexing {
+      font-size: 11px;
+      color: var(--warning, var(--text-muted));
+      white-space: normal;
+    }
     .ds-type-badge {
       font-size: 10px;
       font-weight: 500;
@@ -126,6 +339,11 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
       color: var(--text-muted, var(--text-muted));
       flex-shrink: 0;
     }
+    /* Public read-write chip — warning tone so attachers see write access. */
+    .ds-rw-badge {
+      color: var(--warning, var(--text-primary));
+      background: var(--warning-tint, rgba(255, 255, 255, 0.06));
+    }
     .ds-loading {
       display: flex;
       align-items: center;
@@ -134,29 +352,167 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
       color: var(--text-muted, var(--text-muted));
       padding: 8px 0;
     }
+    .ds-error {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 10px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      color: var(--danger);
+      font-size: 12px;
+    }
   `],
 })
 export class DatasourcesGroupComponent {
+  // Optional so the picker still renders in bare unit tests without an injector.
+  private readonly api = inject(ApiService, {optional: true});
+
   datasources = input<Datasource[]>([]);
   loading = input(false);
+  error = input(false);
   disabled = input(false);
+  /** Stable identity of the selected project set / execution context. */
+  contextKey = input('standalone');
+  /**
+   * When a lite workspace backend (virtual/none) is selected, clone-based
+   * repository datasources are unavailable. `kb` repositories are indexed by
+   * the orchestrator, so they remain selectable.
+   */
+  isLiteBackend = input(false);
+  /**
+   * Default selection when the user hasn't touched the picker (live mode:
+   * the session's currently attached set — possibly empty). Null keeps the
+   * create-flow server `default_selected` set.
+   */
+  initialSelectedIds = input<string[] | null>(null);
+  /** Rollout gate for create-flow `default_selected`. Explicit live-session
+   * arrays remain authoritative regardless of this flag. */
+  datasourceDefaultsEnabled = input(false);
+  /**
+   * Entries rendered but frozen at their current state (live mode: kb-type
+   * datasources — their knowledge bindings only rewire on attach, so live
+   * changes are out of scope; live_session_settings.md Slice B).
+   */
+  lockedIds = input<string[]>([]);
 
   change = output<void>();
+  retry = output<void>();
 
-  readonly selectedIds = signal<Set<string>>(new Set());
+  // The user's explicit selections are kept per execution context. Untouched
+  // rows follow the server-computed default while deliberate choices survive
+  // eligibility refreshes within that context.
+  private readonly selections = signal<Record<string, NonNullable<DatasourceSelection>>>({});
+  private readonly selection = computed<DatasourceSelection>(() =>
+    this.selections()[this.contextKey()] ?? null,
+  );
 
-  readonly modifiedCount = computed(() => this.selectedIds().size);
+  /** Central index status per KB datasource id (for the still-indexing warning). */
+  readonly indexStatuses = signal<Record<string, DatasourceIndexStatus>>({});
+
+  constructor() {
+    // Fetch central index status for KB rows so the picker can warn when a
+    // selected knowledge base isn't fully indexed yet. Re-runs when the eligible
+    // list changes (e.g. project switch); the signal write lands in the async
+    // HTTP callback, never synchronously inside the effect.
+    effect(() => {
+      for (const ds of this.datasources()) {
+        if (ds.type === 'kb') this.loadIndexStatus(ds.id);
+      }
+    });
+  }
+
+  readonly modifiedCount = computed(() =>
+    datasourceSelectionDifferenceCount(
+      this.datasources(), this.selection(), this.defaultIds(),
+      this.datasourceDefaultsEnabled(),
+    ),
+  );
+
+  private defaultIds(): Set<string> | null {
+    const init = this.initialSelectedIds();
+    return init === null ? null : new Set(init);
+  }
+
+  /** Datasources the user can actually toggle (not lite-excluded, not locked). */
+  readonly selectableDatasources = computed<Datasource[]>(() =>
+    this.datasources().filter(ds => !this.isLiteExcluded(ds) && !this.isLocked(ds))
+  );
+
+  /** True when every selectable datasource is currently checked. */
+  readonly allSelected = computed(() =>
+    allDatasourcesSelected(
+      this.datasources(),
+      this.selection(),
+      this.isLiteBackend(),
+      this.defaultIds(),
+      this.lockedIds(),
+      this.datasourceDefaultsEnabled(),
+    )
+  );
+
+  /** A repository datasource can't be used under a lite backend. */
+  isLiteExcluded(ds: Datasource): boolean {
+    return this.isLiteBackend() && isRepositoryDatasource(ds.type);
+  }
+
+  /** Frozen at its current state — rendered, never toggleable. */
+  isLocked(ds: Datasource): boolean {
+    return this.lockedIds().includes(ds.id);
+  }
+
+  isChecked(ds: Datasource): boolean {
+    return (
+      !this.isLiteExcluded(ds) &&
+      activeDatasourceIds(
+        this.datasources(), this.selection(), this.defaultIds(),
+        this.datasourceDefaultsEnabled(),
+      ).has(ds.id)
+    );
+  }
 
   toggle(id: string): void {
-    this.selectedIds.update(current => {
-      const next = new Set(current);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
-      return next;
+    if (this.lockedIds().includes(id)) return;
+    const next = new Set(
+      activeDatasourceIds(
+        this.datasources(), this.selection(), this.defaultIds(),
+        this.datasourceDefaultsEnabled(),
+      ),
+    );
+    if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+    const touched = new Set(this.selection()?.touched ?? []);
+    touched.add(id);
+    this.setCurrentSelection({
+      key: datasourceSetKey(this.datasources()),
+      ids: next,
+      touched,
     });
+    this.change.emit();
+  }
+
+  /** Check every selectable datasource, or clear them all if already all on.
+   *  Locked entries keep their current state either way. */
+  toggleAll(): void {
+    const selectAll = !this.allSelected();
+    const active = activeDatasourceIds(
+      this.datasources(), this.selection(), this.defaultIds(),
+      this.datasourceDefaultsEnabled(),
+    );
+    const lockedKept = this.datasources()
+      .filter(d => this.isLocked(d) && active.has(d.id))
+      .map(d => d.id);
+    const ids = selectAll
+      ? new Set([...this.selectableDatasources().map(d => d.id), ...lockedKept])
+      : new Set(lockedKept);
+    const touched = new Set(
+      this.selectableDatasources().map(d => d.id),
+    );
+    this.setCurrentSelection({key: datasourceSetKey(this.datasources()), ids, touched});
     this.change.emit();
   }
 
@@ -166,16 +522,50 @@ export class DatasourcesGroupComponent {
       neo4j: 'hub',
       mongodb: 'eco',
       webdav: 'cloud',
+      email: 'mail',
+      kb: 'menu_book',
     };
     return icons[type] || 'storage';
   }
 
-  /** Return selected datasource IDs. */
+  /**
+   * Selected datasource IDs, excluding clone-based repository sources disabled
+   * by a lite backend and any ids not in the current datasource set.
+   */
   getSelectedIds(): string[] {
-    return Array.from(this.selectedIds());
+    return selectedDatasourceIds(
+      this.datasources(),
+      this.selection(),
+      this.isLiteBackend(),
+      this.defaultIds(),
+      this.datasourceDefaultsEnabled(),
+    );
+  }
+
+  private loadIndexStatus(id: string): void {
+    this.api?.getDatasourceIndexStatus(id).subscribe((status) => {
+      if (!status) return;
+      this.indexStatuses.update((m) => ({...m, [id]: status}));
+    });
+  }
+
+  /** True when a KB datasource is in the index but not fully `ready` yet. */
+  isNotReady(ds: Datasource): boolean {
+    if (ds.type !== 'kb') return false;
+    const status = this.indexStatuses()[ds.id]?.status;
+    return !!status && status !== 'ready';
   }
 
   resetAll(): void {
-    this.selectedIds.set(new Set());
+    // A parent form reset can change the context key in the same turn. Clear
+    // every cached context so returning to the default project cannot revive
+    // an earlier touched selection.
+    this.selections.set({});
+    this.change.emit();
+  }
+
+  private setCurrentSelection(selection: NonNullable<DatasourceSelection>): void {
+    const contextKey = this.contextKey();
+    this.selections.update(all => ({...all, [contextKey]: selection}));
   }
 }

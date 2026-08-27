@@ -45,3 +45,10 @@
     cursor: not-allowed;
   }
 }
+
+@media (max-width: 768px) {
+  // Larger tap target on touch screens — the tab was only ~22px tall.
+  :host {
+    min-height: 44px;
+  }
+}

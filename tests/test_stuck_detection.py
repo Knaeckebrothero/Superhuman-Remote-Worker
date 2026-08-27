@@ -5,15 +5,17 @@ covering: fingerprint-based loop warnings (soft, never blocking),
 progress tracking, category failure logging, stuck detection with
 reflection/freeze, hard caps, and tool-not-found enrichment.
 
-See docs/features/stuck_agent_recovery.md for the full design.
+See knowledge-base/knowledge/features/stuck_agent_recovery.md for the full design.
 """
 
+import asyncio
 import json
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock, call, patch
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage, SystemMessage
@@ -25,7 +27,9 @@ if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
 from src.graph import create_audited_tool_node  # noqa: E402
-from src.core.loader import LimitsConfig  # noqa: E402
+from src.core.loader import InstructionFileEntry, LimitsConfig  # noqa: E402
+from src.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
+from src.tools.context import ToolContext  # noqa: E402
 
 
 # =============================================================================
@@ -126,6 +130,89 @@ def mock_tool_node():
     """Create a mock ToolNode that returns configurable results."""
     mock = AsyncMock()
     return mock
+
+
+@pytest.mark.asyncio
+async def test_stateless_tool_batch_checkpoints_instruction_read_receipt(config):
+    entry = InstructionFileEntry(
+        trigger="before_tool:todo_complete",
+        skill="verify-before-done",
+        phases=["tactical"],
+        read_scope="phase",
+        max_read_age_turns=20,
+    )
+    context = ToolContext()
+    context._stateless_worker = True
+    context._instruction_files = [entry]
+    context.set_current_phase("tactical", phase_number=1, turn_count=4)
+    context.record_file_read(entry.path, "checkpoint this exact guide")
+    fake_read = MagicMock()
+    fake_read.name = "read_file"
+
+    with patch("src.graph.ToolNode") as mock_tool_node_class:
+        tool_node = AsyncMock()
+        tool_node.ainvoke.return_value = {
+            "messages": [make_tool_result("read_file", "guide", "call-read")]
+        }
+        mock_tool_node_class.return_value = tool_node
+        audited = create_audited_tool_node(
+            [fake_read],
+            config,
+            tool_context=context,
+        )
+        result = await audited(
+            make_state(
+                [make_tool_call("read_file", {"path": entry.path}, "call-read")],
+                phase_number=1,
+                is_strategic=False,
+            )
+        )
+
+    assert result["instruction_read_receipts"] == (
+        context.export_instruction_read_receipts()
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_tools_resume_restores_phase_before_instruction_gate(config):
+    entry = InstructionFileEntry(
+        trigger="before_tool:todo_complete",
+        skill="verify-before-done",
+        phases=["tactical"],
+        read_scope="phase",
+        max_read_age_turns=20,
+    )
+    context = ToolContext()
+    context._instruction_files = [entry]
+    # A fresh successor context has no phase, so phase-filtered bindings are
+    # intentionally not evaluated until the resumed graph node supplies it.
+    assert context.check_tool_enforcement("todo_complete") is None
+    fake_read = MagicMock()
+    fake_read.name = "read_file"
+
+    with patch("src.graph.ToolNode") as mock_tool_node_class:
+        tool_node = AsyncMock()
+        tool_node.ainvoke.return_value = {
+            "messages": [make_tool_result("read_file", "ok", "call-read")]
+        }
+        mock_tool_node_class.return_value = tool_node
+        audited = create_audited_tool_node(
+            [fake_read],
+            config,
+            tool_context=context,
+        )
+        state = make_state(
+            [make_tool_call("read_file", {"path": "notes.md"}, "call-read")],
+            phase_number=3,
+            is_strategic=False,
+        )
+        state["turn_count"] = 12
+        await audited(state)
+
+    assert context._current_phase == "tactical"
+    assert context._current_phase_number == 3
+    assert context._current_turn_count == 12
+    assert context.check_tool_enforcement("todo_complete") is not None
 
 
 # =============================================================================
@@ -529,7 +616,42 @@ class TestStuckDetectionEscalation:
             ]
             assert len(sys_msgs) == 1
             assert "OBSERVATION:" in sys_msgs[0].content
-            assert not result.get("should_stop", False)
+
+
+class TestProgressHeartbeatMarker:
+    """Tests for heartbeat-facing graph-progress signaling."""
+
+    @pytest.mark.asyncio
+    async def test_graph_progress_increments_on_each_batch(self, config):
+        """Each executed tool batch increments graph-progress by one."""
+        fake_tool = MagicMock()
+        fake_tool.name = "read_file"
+        tool_context = ToolContext()
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node(
+                [fake_tool], config, tool_context=tool_context
+            )
+
+            assert tool_context.get_graph_progress() == 0
+
+            state = make_state(
+                [make_tool_call("read_file", {"path": "a.txt"}, "call_a")]
+            )
+            await audited(state)
+            assert tool_context.get_graph_progress() == 1
+
+            state = make_state(
+                [make_tool_call("read_file", {"path": "b.txt"}, "call_b")]
+            )
+            await audited(state)
+            assert tool_context.get_graph_progress() == 2
 
 
 # =============================================================================
@@ -537,13 +659,19 @@ class TestStuckDetectionEscalation:
 # =============================================================================
 
 
-class TestHardCap:
-    """Tests for the hard budget cap per phase."""
+class TestBudgetCaps:
+    """Tests for the tool-call budgets.
+
+    The per-phase cap is now OFF by default and the JOB cap is the real
+    backstop — bounding a phase stopped bounding a job once phases got large
+    (it reset at every boundary). Exceeding either freezes; the old tactical
+    branch instead called ``archive_with_failure_note``, which wrote every todo
+    — completed ones included — into a failure archive and emptied the list.
+    """
 
     @pytest.mark.asyncio
-    async def test_hard_cap_rewinds_tactical_phase(self):
-        """Exceeding hard cap in tactical phase should rewind, not freeze."""
-        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=5))
+    async def test_job_cap_freezes_without_destroying_todos(self):
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_job=5))
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
@@ -562,72 +690,27 @@ class TestHardCap:
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
             )
             MockToolNode.return_value = mock_tn
-
             audited = create_audited_tool_node([fake_tool], cfg, tool_context=mock_ctx)
 
-            # 5 calls: within cap
             for i in range(5):
                 state = make_state(
                     [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")]
                 )
-                result = await audited(state)
-                assert not result.get("should_stop", False)
+                assert not (await audited(state)).get("should_stop", False)
 
-            # 6th call: exceeds cap — should rewind, NOT freeze
             state = make_state([make_tool_call("read_file", {"path": "f_6"}, "call_6")])
             result = await audited(state)
-            assert not result.get("should_stop", False)
-            # Should have rewind message
-            sys_msgs = [
-                m for m in result.get("messages", []) if isinstance(m, SystemMessage)
-            ]
-            assert len(sys_msgs) == 1
-            assert "PHASE BUDGET" in sys_msgs[0].content
-            assert "next_phase_todos" in sys_msgs[0].content
-            # Todos should have been archived
-            mock_todo.archive_with_failure_note.assert_called_once()
+
+        assert result.get("should_stop") is True
+        assert result["freeze_data"]["freeze_type"] == "budget_exceeded"
+        assert result["freeze_data"]["budget_scope"] == "job"
+        # The regression this replaced: todos must survive.
+        mock_todo.archive_with_failure_note.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_hard_cap_freezes_strategic_phase(self):
-        """Exceeding hard cap in strategic phase should freeze."""
-        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=5))
-        fake_tool = MagicMock()
-        fake_tool.name = "read_file"
-
-        mock_ws = MagicMock()
-        mock_ws.git_manager = MagicMock()
-        mock_ws.git_manager.is_active = False
-        mock_ctx = MagicMock()
-        mock_ctx.workspace_manager = mock_ws
-        mock_ctx.consume_freeze_request.return_value = None
-        mock_ctx.drain_pending_memories.return_value = []
-
-        with patch("src.graph.ToolNode") as MockToolNode:
-            mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(
-                return_value={"messages": [make_tool_result("read_file", "ok")]}
-            )
-            MockToolNode.return_value = mock_tn
-
-            audited = create_audited_tool_node([fake_tool], cfg, tool_context=mock_ctx)
-
-            # 6 calls in strategic phase: exceeds cap
-            for i in range(6):
-                state = make_state(
-                    [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")],
-                    is_strategic=True,
-                )
-                result = await audited(state)
-
-            assert result.get("should_stop") is True
-            msgs = result.get("messages", [])
-            assert any("phase frozen" in m.content.lower() for m in msgs)
-            assert any(isinstance(m, ToolMessage) for m in msgs)
-
-    @pytest.mark.asyncio
-    async def test_hard_cap_resets_on_phase_change(self):
-        """Hard cap counter should reset when phase changes."""
-        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=5))
+    async def test_job_cap_does_not_reset_on_phase_change(self):
+        """The whole point — a per-phase counter never bounded the job."""
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_job=6))
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
@@ -637,25 +720,88 @@ class TestHardCap:
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
             )
             MockToolNode.return_value = mock_tn
-
             audited = create_audited_tool_node([fake_tool], cfg)
 
-            # Phase 1: use 4 of 5 budget
             for i in range(4):
-                state = make_state(
-                    [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")],
-                    phase_number=1,
+                await audited(
+                    make_state(
+                        [make_tool_call("read_file", {"path": f"f_{i}"}, f"c{i}")],
+                        phase_number=1,
+                    )
                 )
-                await audited(state)
+            # New phase: the phase counter resets, the job counter must not.
+            results = []
+            for i in range(3):
+                results.append(
+                    await audited(
+                        make_state(
+                            [make_tool_call("read_file", {"path": f"g_{i}"}, f"g{i}")],
+                            phase_number=2,
+                        )
+                    )
+                )
 
-            # Phase 2: counter resets, can do 5 more
-            for i in range(5):
-                state = make_state(
-                    [make_tool_call("read_file", {"path": f"g_{i}"}, f"call_g{i}")],
-                    phase_number=2,
+        assert results[-1].get("should_stop") is True
+        assert results[-1]["freeze_data"]["budget_scope"] == "job"
+
+    @pytest.mark.asyncio
+    async def test_job_cap_zero_disables_the_stop(self):
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_job=0))
+        fake_tool = MagicMock()
+        fake_tool.name = "read_file"
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node([fake_tool], cfg)
+
+            for i in range(40):
+                result = await audited(
+                    make_state(
+                        [make_tool_call("read_file", {"path": f"f_{i}"}, f"c{i}")]
+                    )
                 )
-                result = await audited(state)
                 assert not result.get("should_stop", False)
+
+    @pytest.mark.asyncio
+    async def test_phase_cap_still_honoured_when_set(self):
+        """Back-compat: an operator who deliberately sets one still gets it."""
+        cfg = FakeConfig(
+            limits=LimitsConfig(max_tool_calls_per_phase=5, max_tool_calls_per_job=0)
+        )
+        fake_tool = MagicMock()
+        fake_tool.name = "read_file"
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node([fake_tool], cfg)
+
+            for i in range(5):
+                await audited(
+                    make_state(
+                        [make_tool_call("read_file", {"path": f"f_{i}"}, f"c{i}")]
+                    )
+                )
+            result = await audited(
+                make_state([make_tool_call("read_file", {"path": "f6"}, "c6")])
+            )
+
+        assert result.get("should_stop") is True
+        assert result["freeze_data"]["budget_scope"] == "phase"
+
+    @pytest.mark.asyncio
+    async def test_phase_cap_off_by_default(self):
+        """The default config must not stop a long single phase."""
+        cfg = FakeConfig(limits=LimitsConfig())
+        assert cfg.limits.max_tool_calls_per_phase == 0
+        assert cfg.limits.max_tool_calls_per_job == 5000
 
 
 # =============================================================================
@@ -805,6 +951,195 @@ class TestCategoryFailureTracking:
                 assert any("not configured" in (m.content or "") for m in tool_msgs)
 
 
+class TestToolNodeTimeoutEscalation:
+    """Tests for audited tool-node timeout behavior and reconnect/failure handoff."""
+
+    @pytest.mark.asyncio
+    async def test_tool_node_timeout_reconnects_and_returns_error_once(self):
+        """A first timeout disconnects and reconnects, then returns timeout errors."""
+
+        fake_tool = MagicMock()
+        fake_tool.name = "search_files"
+
+        cfg = FakeConfig(
+            limits=LimitsConfig(
+                tool_category_timeouts={"default": 1},
+            )
+        )
+
+        async def slow_ainvoke(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [make_tool_result("search_files", "ok", "call_t")]}
+
+        backend = MagicMock()
+        ctx = MagicMock()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        ctx.consume_freeze_request.return_value = None
+        ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = slow_ainvoke
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=ctx)
+            start = time.perf_counter()
+            result = await audited(
+                make_state(
+                    [make_tool_call("search_files", {"query": "needle"}, "call_t")]
+                )
+            )
+            elapsed = time.perf_counter() - start
+
+        msgs = [m for m in result.get("messages", []) if isinstance(m, ToolMessage)]
+        assert len(msgs) == 1
+        assert "timed out" in (msgs[0].content or "").lower()
+        assert elapsed >= 1.0
+        assert elapsed < 2.0
+        assert backend.method_calls == [
+            call.shell_reset_after_timeout(),
+            call.disconnect(),
+            call.connect(),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tool_node_timeout_repeated_raises_workspace_unavailable(self):
+        """A second timeout without recovery raises WorkspaceUnavailableError."""
+
+        fake_tool = MagicMock()
+        fake_tool.name = "search_files"
+
+        cfg = FakeConfig(
+            limits=LimitsConfig(
+                tool_category_timeouts={"default": 1},
+            )
+        )
+
+        async def slow_ainvoke(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [make_tool_result("search_files", "ok", "call_t")]}
+
+        backend = MagicMock()
+        ctx = MagicMock()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        ctx.consume_freeze_request.return_value = None
+        ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = slow_ainvoke
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=ctx)
+            await audited(
+                make_state(
+                    [make_tool_call("search_files", {"query": "needle"}, "call_t")]
+                )
+            )
+
+            with pytest.raises(WorkspaceUnavailableError):
+                await audited(
+                    make_state(
+                        [make_tool_call("search_files", {"query": "needle"}, "call_t2")]
+                    )
+                )
+
+        assert backend.shell_reset_after_timeout.call_count == 1
+        assert backend.disconnect.call_count == 1
+        assert backend.connect.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_tool_node_timeout_reconnect_failure_raises_workspace_unavailable(
+        self,
+    ):
+        """If reconnect fails, timeout escalates immediately to WorkspaceUnavailableError."""
+
+        fake_tool = MagicMock()
+        fake_tool.name = "search_files"
+
+        cfg = FakeConfig(
+            limits=LimitsConfig(
+                tool_category_timeouts={"default": 1},
+            )
+        )
+
+        async def slow_ainvoke(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [make_tool_result("search_files", "ok", "call_t")]}
+
+        backend = MagicMock()
+        backend.connect.side_effect = RuntimeError("can't connect")
+        ctx = MagicMock()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        ctx.consume_freeze_request.return_value = None
+        ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = slow_ainvoke
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=ctx)
+            with pytest.raises(WorkspaceUnavailableError):
+                await audited(
+                    make_state(
+                        [make_tool_call("search_files", {"query": "needle"}, "call_t")]
+                    )
+                )
+
+        assert backend.method_calls == [
+            call.shell_reset_after_timeout(),
+            call.disconnect(),
+            call.connect(),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tool_node_timeout_reset_failure_never_reconnects(self):
+        """An unproven shell reset must stop recovery before transport reuse."""
+
+        fake_tool = MagicMock()
+        fake_tool.name = "run_command"
+        cfg = FakeConfig(
+            limits=LimitsConfig(
+                tool_category_timeouts={"default": 1},
+            )
+        )
+
+        async def slow_ainvoke(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [make_tool_result("run_command", "ok", "call_t")]}
+
+        backend = MagicMock()
+        backend.shell_reset_after_timeout.side_effect = RuntimeError("fence moved")
+        ctx = MagicMock()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        ctx.consume_freeze_request.return_value = None
+        ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = slow_ainvoke
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=ctx)
+            with pytest.raises(WorkspaceUnavailableError):
+                await audited(
+                    make_state(
+                        [
+                            make_tool_call(
+                                "run_command",
+                                {"command": "sleep 5"},
+                                "call_t",
+                            )
+                        ]
+                    )
+                )
+
+        backend.shell_reset_after_timeout.assert_called_once_with()
+        backend.disconnect.assert_not_called()
+        backend.connect.assert_not_called()
+
+
 # =============================================================================
 # Test: Structured freeze payload
 # =============================================================================
@@ -897,20 +1232,20 @@ class TestFreezePayload:
 
 
 # =============================================================================
-# Test: todo_rewind resets loop detection
+# Test: request_replan resets loop detection
 # =============================================================================
 
 
-class TestTodoRewindReset:
-    """Tests for todo_rewind resetting loop detection state."""
+class TestRequestReplanReset:
+    """Tests for request_replan resetting loop detection state."""
 
     @pytest.mark.asyncio
     async def test_rewind_clears_loop_state(self, config):
-        """Successful todo_rewind should reset loop detection state."""
+        """A successful request_replan should reset loop detection state."""
         fake_tool = MagicMock()
         fake_tool.name = "some_tool"
         fake_rewind = MagicMock()
-        fake_rewind.name = "todo_rewind"
+        fake_rewind.name = "request_replan"
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
@@ -931,15 +1266,19 @@ class TestTodoRewindReset:
                 return_value={
                     "messages": [
                         make_tool_result(
-                            "todo_rewind",
-                            "Archived 5 todos. To recover...",
+                            "request_replan",
+                            "Replan requested. Progress kept...",
                             "call_rw",
                         )
                     ]
                 }
             )
             state = make_state(
-                [make_tool_call("todo_rewind", {"issue": "approach broken"}, "call_rw")]
+                [
+                    make_tool_call(
+                        "request_replan", {"reason": "approach broken"}, "call_rw"
+                    )
+                ]
             )
             await audited(state)
 
@@ -957,11 +1296,11 @@ class TestTodoRewindReset:
 
     @pytest.mark.asyncio
     async def test_failed_rewind_does_not_reset(self, config):
-        """A failed todo_rewind should NOT reset loop detection state."""
+        """A failed request_replan should NOT reset loop detection state."""
         fake_tool = MagicMock()
         fake_tool.name = "some_tool"
         fake_rewind = MagicMock()
-        fake_rewind.name = "todo_rewind"
+        fake_rewind.name = "request_replan"
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
@@ -982,7 +1321,7 @@ class TestTodoRewindReset:
                 return_value={
                     "messages": [
                         make_tool_result(
-                            "todo_rewind",
+                            "request_replan",
                             "Error: You must provide an 'issue' describing why",
                             "call_rw",
                         )
@@ -990,7 +1329,7 @@ class TestTodoRewindReset:
                 }
             )
             state = make_state(
-                [make_tool_call("todo_rewind", {"issue": ""}, "call_rw")]
+                [make_tool_call("request_replan", {"reason": ""}, "call_rw")]
             )
             await audited(state)
 
@@ -1088,9 +1427,9 @@ class TestPhaseGate:
 
     @pytest.mark.asyncio
     async def test_tactical_only_tool_rejected_in_strategic(self, config):
-        """todo_rewind (tactical-only) is rejected in strategic phase."""
+        """request_replan (tactical-only) is rejected in strategic phase."""
         fake_tool = MagicMock()
-        fake_tool.name = "todo_rewind"
+        fake_tool.name = "request_replan"
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
@@ -1099,7 +1438,7 @@ class TestPhaseGate:
             audited = create_audited_tool_node([fake_tool], config)
 
             state = make_state(
-                [make_tool_call("todo_rewind", {"issue": "stuck"}, "call_rw")],
+                [make_tool_call("request_replan", {"reason": "stuck"}, "call_rw")],
                 is_strategic=True,
             )
             result = await audited(state)
@@ -1144,7 +1483,14 @@ class TestPhaseGate:
 
     @pytest.mark.asyncio
     async def test_batch_rejected_when_any_call_violates(self, config):
-        """If any tool call in a batch violates phase, entire batch is rejected."""
+        """If any tool call in a batch violates phase, entire batch is rejected.
+
+        Only the violating call may be told it is phase-illegal. The
+        co-batched phase-legal call gets an honest "not executed, re-issue"
+        message — the old wording told legal tools they were unavailable,
+        teaching models their tool surface was unreliable (job edd06963
+        "stale palette" belief spiral).
+        """
         fake_read = MagicMock()
         fake_read.name = "read_file"  # both phases
         fake_jc = MagicMock()
@@ -1168,8 +1514,22 @@ class TestPhaseGate:
             msgs = result.get("messages", [])
             tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
 
-            # Both calls get error responses (entire batch rejected)
+            # Both calls get responses (entire batch rejected)
             assert len(tool_msgs) == 2
+            by_id = {m.tool_call_id: m for m in tool_msgs}
+
+            # Violating call: the real phase error
+            assert (
+                "'job_complete' is not available in the tactical phase"
+                in by_id["call_jc"].content
+            )
+            # Legal call: must NOT be told it is phase-illegal
+            assert "'read_file' is not available" not in by_id["call_rf"].content
+            assert "Not executed" in by_id["call_rf"].content
+            assert "IS available" in by_id["call_rf"].content
+            assert "'job_complete'" in by_id["call_rf"].content
+            assert "Re-issue" in by_id["call_rf"].content
+
             mock_tn.ainvoke.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1201,3 +1561,180 @@ class TestPhaseGate:
                     m for m in result.get("messages", []) if isinstance(m, ToolMessage)
                 ]
                 assert tool_msgs[0].content == "content"
+
+
+# =============================================================================
+# Test: Act-ratio tripwire (process-artifact-only streaks)
+# =============================================================================
+
+
+class TestActRatioTripwire:
+    """N consecutive process-artifact-only tool actions inject a one-line
+    "stop planning" nudge; any concrete action resets the counter."""
+
+    def _make_audited(self, threshold=3):
+        cfg = FakeConfig(limits=LimitsConfig(act_ratio_nudge_threshold=threshold))
+        fake_tools = []
+        for name in ["read_file", "edit_file", "write_file", "todo_list", "web_search"]:
+            t = MagicMock()
+            t.name = name
+            fake_tools.append(t)
+        patcher = patch("src.graph.ToolNode")
+        MockToolNode = patcher.start()
+        mock_tn = AsyncMock()
+        MockToolNode.return_value = mock_tn
+        audited = create_audited_tool_node(fake_tools, cfg)
+        return audited, mock_tn, patcher
+
+    @staticmethod
+    def _act_nudges(result):
+        return [
+            m
+            for m in result.get("messages", [])
+            if isinstance(m, SystemMessage) and "Stop planning" in m.content
+        ]
+
+    async def _run_call(self, audited, mock_tn, name, args, call_id):
+        mock_tn.ainvoke = AsyncMock(
+            return_value={"messages": [make_tool_result(name, "ok", call_id)]}
+        )
+        state = make_state([make_tool_call(name, args, call_id)])
+        return await audited(state)
+
+    @pytest.mark.asyncio
+    async def test_nudge_fires_after_n_process_only_actions(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            process_calls = [
+                ("read_file", {"path": "todos.yaml"}),
+                ("edit_file", {"path": "plan.md", "old_string": "a"}),
+                ("write_file", {"path": "archive/phase_2_retrospective.md"}),
+            ]
+            for i, (name, args) in enumerate(process_calls):
+                result = await self._run_call(audited, mock_tn, name, args, f"c_{i}")
+                if i < 2:
+                    assert self._act_nudges(result) == []
+            nudges = self._act_nudges(result)
+            assert len(nudges) == 1
+            assert "3 steps" in nudges[0].content
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_concrete_action_resets_counter(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            await self._run_call(
+                audited, mock_tn, "read_file", {"path": "plan.md"}, "c0"
+            )
+            await self._run_call(
+                audited, mock_tn, "edit_file", {"path": "todos.yaml"}, "c1"
+            )
+            # Concrete target -> reset
+            result = await self._run_call(
+                audited, mock_tn, "write_file", {"path": "output/report.md"}, "c2"
+            )
+            assert self._act_nudges(result) == []
+            # Two more process actions: streak is 2, still under threshold
+            await self._run_call(
+                audited, mock_tn, "read_file", {"path": "plan.md"}, "c3"
+            )
+            result = await self._run_call(
+                audited,
+                mock_tn,
+                "edit_file",
+                {"path": "plan.md", "old_string": "x"},
+                "c4",
+            )
+            assert self._act_nudges(result) == []
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_no_target_tool_resets_counter(self):
+        """Tools without file targets (e.g. web_search) count as concrete."""
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            await self._run_call(
+                audited, mock_tn, "read_file", {"path": "plan.md"}, "c0"
+            )
+            await self._run_call(
+                audited,
+                mock_tn,
+                "edit_file",
+                {"path": "plan.md", "old_string": "x"},
+                "c1",
+            )
+            result = await self._run_call(
+                audited, mock_tn, "web_search", {"query": "topic"}, "c2"
+            )
+            assert self._act_nudges(result) == []
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_todo_state_tools_count_as_process(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            for i in range(2):
+                result = await self._run_call(
+                    audited, mock_tn, "todo_list", {}, f"t{i}"
+                )
+                assert self._act_nudges(result) == []
+            result = await self._run_call(
+                audited, mock_tn, "read_file", {"path": "todos.yaml"}, "t2"
+            )
+            assert len(self._act_nudges(result)) == 1
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_rearms_after_firing(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=2)
+        try:
+            await self._run_call(audited, mock_tn, "todo_list", {}, "a0")
+            result = await self._run_call(audited, mock_tn, "todo_list", {}, "a1")
+            assert len(self._act_nudges(result)) == 1
+            # Counter re-armed: two more process actions fire again
+            await self._run_call(audited, mock_tn, "todo_list", {}, "a2")
+            result = await self._run_call(audited, mock_tn, "todo_list", {}, "a3")
+            assert len(self._act_nudges(result)) == 1
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_zero_threshold_disables(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=0)
+        try:
+            result = None
+            for i in range(8):
+                result = await self._run_call(
+                    audited, mock_tn, "read_file", {"path": "todos.yaml"}, f"z{i}"
+                )
+            assert self._act_nudges(result) == []
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_on_phase_change(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            for i in range(2):
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [make_tool_result("todo_list", "ok", f"p{i}")]
+                    }
+                )
+                state = make_state(
+                    [make_tool_call("todo_list", {}, f"p{i}")], phase_number=1
+                )
+                await audited(state)
+            # Phase flips: streak resets, so one more process call stays quiet
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("todo_list", "ok", "p9")]}
+            )
+            state = make_state([make_tool_call("todo_list", {}, "p9")], phase_number=2)
+            result = await audited(state)
+            assert self._act_nudges(result) == []
+        finally:
+            patcher.stop()

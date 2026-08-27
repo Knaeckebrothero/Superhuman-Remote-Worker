@@ -4,16 +4,35 @@ Provides a container for dependencies that tools need access to,
 such as workspace managers, database connections, and configuration.
 """
 
+import asyncio
 import hashlib
 import logging
-import os
+import posixpath
 import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Set,
+)
 from urllib.parse import urlparse
 
+from ..core.datasource_catalog import DATASOURCE_TYPES
+from ..core.product_capabilities import (
+    ComponentProvenance,
+    ProductComponent,
+    ProvenanceStatus,
+)
 from ..core.workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -21,6 +40,124 @@ logger = logging.getLogger(__name__)
 # Avoid circular imports with TYPE_CHECKING
 if TYPE_CHECKING:
     from ..database.postgres_db import PostgresDB
+    from ..services.knowledge.bindings import KnowledgeBinding
+
+
+WorkspaceBackendId = Literal["sandbox", "vm", "virtual", "none"]
+EmailAccessTier = Literal["read", "read_write", "draft", "send"]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRuntimeFacts:
+    """One immutable, redacted observation of a persistent session runtime.
+
+    The capability tool consumes this object instead of inspecting mutable
+    attach payloads or live connection objects during a model call. It carries
+    only public aggregate facts: no datasource/resource names or IDs,
+    accounts, folders, credentials, hosts, URLs, project IDs, or mount paths.
+    Replacing the reference on ``ToolContext`` is the atomic publication step.
+    """
+
+    observed_at: datetime
+    backend_id: WorkspaceBackendId | None
+    backend_supports_shell: bool
+    backend_supports_file_tools: bool
+    backend_supports_canvas_presentation: bool
+    backend_supports_canvas_live_apps: bool
+    backend_supports_shared_browser: bool
+    attached_datasource_types: tuple[str, ...] = ()
+    email_access_tier: EmailAccessTier | None = None
+    email_connection_failed: bool = False
+    email_direct_send_enabled: bool = False
+    knowledge_binding_available: bool = False
+    knowledge_store_available: bool = False
+    memory_available: bool = False
+    cloud_mount_active: bool = False
+    protected_cloud_active: bool = False
+    loaded_tool_names: tuple[str, ...] = ()
+    runtime_component_provenance: tuple[
+        tuple[ProductComponent, ComponentProvenance], ...
+    ] = ()
+
+    def __post_init__(self) -> None:
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("SessionRuntimeFacts.observed_at must be timezone-aware")
+        object.__setattr__(
+            self,
+            "observed_at",
+            self.observed_at.astimezone(timezone.utc),
+        )
+
+        if self.backend_id not in {None, "sandbox", "vm", "virtual", "none"}:
+            raise ValueError("SessionRuntimeFacts contains an unknown backend ID")
+        if self.email_access_tier not in {
+            None,
+            "read",
+            "read_write",
+            "draft",
+            "send",
+        }:
+            raise ValueError("SessionRuntimeFacts contains an unknown email tier")
+
+        datasource_types = tuple(sorted(set(self.attached_datasource_types)))
+        if any(item not in DATASOURCE_TYPES for item in datasource_types):
+            raise ValueError("SessionRuntimeFacts contains an unknown datasource type")
+        object.__setattr__(self, "attached_datasource_types", datasource_types)
+
+        tool_names = tuple(sorted(set(self.loaded_tool_names)))
+        if any(
+            not isinstance(name, str)
+            or not name
+            or len(name) > 120
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}", name) is None
+            for name in tool_names
+        ):
+            raise ValueError("SessionRuntimeFacts contains an invalid tool name")
+        object.__setattr__(self, "loaded_tool_names", tool_names)
+
+        allowed_components = {
+            ProductComponent.AGENT,
+            ProductComponent.GUIDE,
+            ProductComponent.WORKSPACE,
+        }
+        component_provenance: dict[ProductComponent, ComponentProvenance] = {}
+        for item in self.runtime_component_provenance:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError(
+                    "SessionRuntimeFacts contains invalid component provenance"
+                )
+            component, provenance = item
+            if (
+                component not in allowed_components
+                or not isinstance(provenance, ComponentProvenance)
+                or provenance.provenance_status is ProvenanceStatus.VERIFIED
+                or component in component_provenance
+            ):
+                raise ValueError(
+                    "SessionRuntimeFacts contains invalid component provenance"
+                )
+            component_provenance[component] = provenance
+        object.__setattr__(
+            self,
+            "runtime_component_provenance",
+            tuple(sorted(component_provenance.items(), key=lambda item: item[0].value)),
+        )
+
+        email_attached = "email" in datasource_types
+        if email_attached and self.email_access_tier is None:
+            raise ValueError("attached email requires an effective access tier")
+        if self.email_access_tier is not None and not email_attached:
+            raise ValueError("email_access_tier requires an attached email datasource")
+        if self.email_connection_failed and not email_attached:
+            raise ValueError(
+                "email_connection_failed requires an attached email datasource"
+            )
+        if self.email_direct_send_enabled and not email_attached:
+            raise ValueError(
+                "email_direct_send_enabled requires an attached email datasource"
+            )
+        if self.protected_cloud_active and not self.cloud_mount_active:
+            raise ValueError("protected cloud requires an active cloud mount")
 
 
 @dataclass
@@ -61,6 +198,28 @@ class ToolContext:
         None  # TodoManager, imported later to avoid circular deps
     )
     postgres_db: Optional["PostgresDB"] = None
+    vector_db: Optional["PostgresDB"] = (
+        None  # Vector-store pool (srw_vector) — citations live here, NOT in
+        # postgres_db (the main app DB). Injected from agent.vector_conn.
+    )
+    verify_aux: Optional[Any] = (
+        None  # AuxiliaryLLM for citation verification (Phase 2). When set,
+        # cite_* schedules async verdict write-back; None = verification off.
+    )
+    verify_citation_prompt: Optional[str] = (
+        None  # Matrix-resolved citation-verification system prompt.
+    )
+    citation_verdict_callback: Optional[Callable[[int, str], None]] = (
+        None  # (citation_id, status) listener fired when a background
+        # verification lands a verdict. Persistent sessions wire this to a
+        # WS/SSE broadcast (live citations-panel update); worker jobs leave it
+        # None. Threaded to CitationEngine(on_verdict=...).
+    )
+    canvas_event_callback: Optional[Callable[[str, Dict[str, Any]], Any]] = (
+        None  # (method, params) post-commit Canvas invalidation hook. Persistent
+        # sessions wire this to their ordered _broadcast path; worker jobs leave
+        # it unset. REST state remains authoritative if the callback fails.
+    )
     datasources: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
     _job_id: Optional[str] = None  # Direct job_id override
@@ -68,19 +227,57 @@ class ToolContext:
     _source_registry: Dict[str, int] = field(
         default_factory=dict
     )  # path/url -> source_id
+    _cloud_anchors: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict
+    )  # resolved local path -> cloud snapshot-anchor (Phase 3, D7): the
+    # drift fingerprint (etag, file_sha256) + best-effort live pointer
+    # (backend, path, webdav_url) captured when a cloud file is read, so
+    # cite_* can persist it onto the source's metadata.cloud block.
+    _cloud_anchor_write_locks: Dict[str, asyncio.Lock] = field(
+        default_factory=dict
+    )  # Per-canonical-path serialization for the workspace write + durable
+    # anchor update. Without this, concurrent downloads to the same target can
+    # leave bytes from one source paired with the other source's provenance.
+    cloud_anchor_persist_callback: Optional[
+        Callable[[str, Dict[str, Any]], Awaitable[None]]
+    ] = (
+        None  # Persistent sessions bind this to a per-thread Postgres upsert.
+        # Pinned workers and focused tests may leave it unset and retain the
+        # historical claim-local anchor cache.
+    )
     _inaccessible_sources: Dict[str, str] = field(
         default_factory=dict
     )  # url -> error message
     _recent_reads: Deque[str] = field(
         default_factory=lambda: deque(maxlen=10)
     )  # Recently read file paths
+    _pinned_reads: Set[str] = field(
+        default_factory=set
+    )  # Instruction-file paths, exempt from FIFO eviction. The path remains
+    # known after one read; phase/freshness-scoped gates separately validate
+    # _instruction_read_stamps and may still re-arm. Write authorization
+    # (recent_read_matches) deliberately does not consult this set.
+    _recent_read_versions: Dict[str, str] = field(
+        default_factory=dict
+    )  # Optional sha256 of the full text bytes observed for a recent path
+    _instruction_read_stamps: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict
+    )  # path -> LLM turn + concrete phase instance at the most recent read
     _current_phase: Optional[str] = None
+    _current_phase_number: Optional[int] = None
+    _current_turn_count: int = 0
     _llm_config: Optional[Any] = None  # LLMConfig for phase-aware multimodal
     _instruction_files: List[Any] = field(
         default_factory=list
     )  # List[InstructionFileEntry]
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
     shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
+    progress_committer: Optional[Any] = (
+        None  # ProgressCommitter (src/core/progress_commit.py). Shared by the
+        # todo_complete tool and the graph's turn loop so both triggers use one
+        # push clock. Left None for persistent sessions, which already commit
+        # and push per turn (src/persistent_graph.py:949).
+    )
     session_task_manager: Optional[Any] = (
         None  # SessionTaskManager (persistent session todos)
     )
@@ -88,23 +285,54 @@ class ToolContext:
         None  # KnowledgeGraphDB (system Neo4j for knowledge base)
     )
     knowledge_store: Optional[Any] = None  # KnowledgeStore (pgvector search index)
+    knowledge_bindings: List["KnowledgeBinding"] = field(
+        default_factory=list
+    )  # Native + selected external OKF KB scopes
+    runtime_actor: Optional[Any] = (
+        None  # Hidden server-derived RuntimeActorContext; never a tool argument
+    )
     _project_id: Optional[str] = None  # Project UUID for knowledge scoping
     _project_ids: List[str] = field(
         default_factory=list
     )  # Multi-project UUIDs for persistent sessions
+    _graph_progress: int = 0
     _pending_memories: List[Dict[str, Any]] = field(
         default_factory=list
     )  # Sync-safe memory queue
     _freeze_request: Optional[Dict[str, Any]] = (
         None  # Tool-requested job freeze (blocking send_message)
     )
+    _officer_sleep_request: Optional[Dict[str, Any]] = (
+        None  # Officer sleep tool parked a wake request (centurion sessions)
+    )
+    _replan_request: Optional[str] = (
+        None  # Reason string parked by request_replan: the tactical phase has
+        # learned something that changes the approach and wants the strategic
+        # phase early. Consumed by check_todos, which ends the phase. Note this
+        # is the ONLY way to leave a tactical phase without completing every
+        # todo, so it is also the only in-flight adaptation path once phases
+        # get large.
+    )
+    _reply_drain_requested: bool = (
+        False  # A todo just completed — a natural break at which to deliver
+        # queued (non-urgent) replies. Set by todo_complete, consumed by
+        # audited_tools. Replaces the tactical->strategic boundary as the
+        # drain point, which stops firing often enough as phases grow.
+    )
+    _delivered_reply_keys: Set[str] = field(
+        default_factory=set
+    )  # Content keys of queued replies already appended to the conversation.
+    # Pinned workers use this process-locally while their ack is in flight.
+    # Stateless workers hydrate it from checkpointed delivered_reply_keys.
+    _stateless_worker: bool = False
+    _worker_lease_token: Optional[int] = None
     _snapshot_callback: Optional[Any] = (
         None  # Callable[[str], None] — pre-write file snapshot for undo
     )
     orchestrator_client: Optional[Any] = None  # OrchestratorClient for delegation
     _thread_id: Optional[str] = (
         None  # Persistent-session thread UUID. Set by persistent_session so
-        # session-spawned worker jobs (create_worker_job) can carry the
+        # session-spawned worker jobs (create_job) can carry the
         # session's thread back to the orchestrator, which derives the
         # owning user_id + project_id and applies their model preferences
         # during dispatch. Unset in worker-job mode.
@@ -122,10 +350,17 @@ class ToolContext:
     _job_metadata: Dict[str, Any] = field(
         default_factory=dict
     )  # job_id, project_id, priority, config_name, repo_name
-    _browser_session: Optional[Any] = (
-        None  # browser_use.BrowserSession (local/dev mode)
+    _resolved_tool_names: List[str] = field(
+        default_factory=list
+    )  # Parent's actually-loaded tool names, stashed post-load so the light
+    # spawn_subagent backend can build a reader inheriting them (minus the
+    # delegation category). Empty until _setup_job_tools finishes loading.
+    session_runtime_facts: Optional[SessionRuntimeFacts] = (
+        None  # Atomically replaced redacted persistent-session observation.
+        # Worker jobs and sessions still setting up/tearing down leave it None.
     )
-    _browser_started: bool = False  # Whether Chromium has been started
+    _limits: Optional[Any] = None  # Parent LimitsConfig — used to build the
+    # light-subagent reader LLM (create_llm(subagent_cfg, limits=...)).
 
     def __post_init__(self):
         """Validate context after initialization."""
@@ -199,6 +434,19 @@ class ToolContext:
         """
         return self.datasources.get(ds_type)
 
+    def next_graph_progress(self) -> int:
+        """Advance and return the graph-progress marker.
+
+        This marker is emitted in heartbeat metrics and used by the orchestrator
+        to detect a worker that is heartbeating but not advancing graph work.
+        """
+        self._graph_progress += 1
+        return self._graph_progress
+
+    def get_graph_progress(self) -> int:
+        """Return the current graph-progress marker."""
+        return self._graph_progress
+
     def has_git(self) -> bool:
         """Check if git manager is available and active.
 
@@ -215,8 +463,15 @@ class ToolContext:
         return self.shell_manager is not None
 
     def has_knowledge(self) -> bool:
-        """Check if knowledge base (Neo4j + pgvector) is available."""
-        return self.knowledge_graph is not None and self.knowledge_store is not None
+        """Check if the knowledge base is available.
+
+        Neo4j is OPTIONAL (OKF slice-3 PR4c): the pgvector store is canonical for
+        retrieval and the OKF files for content, so the KB works graph-less — the
+        graph-shaped tools degrade honestly (see ``create_kb_tools``). Only the
+        store is required. On a Neo4j-enabled deployment both are present and the
+        full graph path runs unchanged.
+        """
+        return self.knowledge_store is not None
 
     @property
     def project_id(self) -> Optional[str]:
@@ -244,6 +499,29 @@ class ToolContext:
         self._project_id = value[0] if value else None
 
     @property
+    def kb_ids(self) -> List[str]:
+        """Authorized KB ids, falling back to legacy project scoping."""
+        if self.knowledge_bindings:
+            return [str(binding.kb_id) for binding in self.knowledge_bindings]
+        return list(self.project_ids)
+
+    def knowledge_binding(self, selector: str) -> Optional["KnowledgeBinding"]:
+        """Resolve a KB alias or UUID inside the authorized binding set."""
+        needle = str(selector or "").strip().lower()
+        for binding in self.knowledge_bindings:
+            if binding.alias.lower() == needle or str(binding.kb_id).lower() == needle:
+                return binding
+        return None
+
+    @property
+    def writable_knowledge_binding(self) -> Optional["KnowledgeBinding"]:
+        """The native write target; external Slice 4 bindings are read-only."""
+        for binding in self.knowledge_bindings:
+            if binding.writable:
+                return binding
+        return None
+
+    @property
     def db(self) -> Optional["PostgresDB"]:
         """Get PostgresDB instance.
 
@@ -265,51 +543,178 @@ class ToolContext:
         return self.config.get(key, default)
 
     def get_citation_engine(self) -> Any:
-        """Lazily initialize and return CitationEngine.
+        """Lazily construct the CitationEngine bound to SRW's vector pool.
 
-        Creates a CitationEngine instance on first call, reuses it afterwards.
-        Uses multi-agent mode (PostgreSQL); the DSN is composed at runtime
-        from CITATION_POSTGRES_* env vars (with fallback to legacy URL envs).
-
-        Returns:
-            CitationEngine instance
+        The engine is async and performs all I/O on the shared vector-store
+        pool (``srw_vector``, ``self.vector_db``); construction itself does no
+        I/O, so this stays synchronous. Returns a cached instance.
 
         Raises:
-            ImportError: If citation_engine package is not installed
+            ImportError: If the citation_engine package is not importable.
+            RuntimeError: If no vector-store pool is attached.
         """
         if self.citation_engine is None:
-            from citation_engine import CitationEngine, CitationContext
+            from src.citation_engine import CitationContext, CitationEngine
 
-            from src.utils.db_url import build_postgres_url
+            if self.vector_db is None:
+                raise RuntimeError(
+                    "Citations require the vector store (srw_vector); no vector "
+                    "pool is attached (VECTOR_POSTGRES_* unset)."
+                )
 
             # Create context for audit trails using job_id as session
             ctx = CitationContext(
                 session_id=self.job_id or "unknown",
                 agent_id=self.config.get("agent_id", "unknown"),
             )
-
-            db_url = (
-                build_postgres_url("CITATION_POSTGRES", fallback_env="CITATION_DB_URL")
-                or build_postgres_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
-                or build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")
-            )
             self.citation_engine = CitationEngine(
-                mode="multi-agent", context=ctx, db_url=db_url
+                db=self.vector_db,
+                context=ctx,
+                verify_aux=self.verify_aux,
+                verify_prompt=self.verify_citation_prompt,
+                on_verdict=self.citation_verdict_callback,
             )
-            self.citation_engine._connect()
 
         return self.citation_engine
 
-    def get_or_register_doc_source(
-        self, file_path: str, name: Optional[str] = None
+    def _normalize_anchor_key(self, path: str) -> str:
+        """Normalize a local or workspace-relative citation path."""
+        if self.workspace_manager is not None:
+            return self.workspace_manager.workspace_relative_path(path)
+        try:
+            candidate = Path(path)
+            if candidate.is_absolute():
+                return str(candidate.resolve())
+            # Workspace paths are POSIX-like on every backend, including flat
+            # object-store keys. Do not anchor them to this pod's cwd.
+            return posixpath.normpath(path)
+        except (OSError, ValueError, RuntimeError):
+            return str(path)
+
+    def record_cloud_anchor(self, file_path: str, anchor: Dict[str, Any]) -> None:
+        """Stash a cloud snapshot-anchor for a downloaded file (Phase 3, D7).
+
+        Called by cloud read tools (e.g. ``webdav_read``) once a file lands in
+        the workspace, so a later ``cite_*`` on that path can persist the anchor
+        onto the source's ``metadata.cloud`` block. The key may be a real local
+        path or a workspace-relative backend path; producers and consumers use
+        the same normalized identity.
+        """
+        if not file_path or not anchor:
+            return
+        self._cloud_anchors[self._normalize_anchor_key(file_path)] = anchor
+
+    def get_cloud_anchor(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Return the stashed cloud anchor for a local or workspace path."""
+        if not file_path:
+            return None
+        return self._cloud_anchors.get(self._normalize_anchor_key(file_path))
+
+    def cloud_anchor_write_lock(self, file_path: str) -> asyncio.Lock:
+        """Return the claim-local lock for one canonical workspace path.
+
+        Datasource tools hold this across both the backend write and
+        ``persist_cloud_anchor``. ``ToolContext`` is event-loop-local, so lock
+        creation cannot interleave before the dictionary entry is published.
+        """
+
+        workspace_path = self._normalize_anchor_key(file_path)
+        lock = self._cloud_anchor_write_locks.get(workspace_path)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cloud_anchor_write_locks[workspace_path] = lock
+        return lock
+
+    async def persist_cloud_anchor(
+        self,
+        file_path: str,
+        anchor: Dict[str, Any],
+    ) -> None:
+        """Record an anchor locally and await its optional durable sink.
+
+        The callback seam lets persistent sessions bind a thread-scoped
+        Postgres upsert without coupling datasource tools to the database.
+        Callback errors propagate: a configured durable lane must not report a
+        successful cloud read while silently dropping its provenance anchor.
+        """
+        workspace_path = self._normalize_anchor_key(file_path)
+        self.record_cloud_anchor(workspace_path, anchor)
+        callback = self.cloud_anchor_persist_callback
+        if callback is not None:
+            await callback(workspace_path, anchor)
+
+    async def snapshot_cloud_source_bytes(
+        self, file_path: str, anchor: Dict[str, Any]
+    ) -> Optional[str]:
+        """Persist a cited cloud file's original bytes to the snapshot store (D7).
+
+        The agent holds no blob-store credentials, so the bytes are round-tripped
+        through the orchestrator (``OrchestratorClient.save_citation_snapshot`` →
+        ``POST /api/citations/snapshot``), which returns a content-addressed
+        ``snapshot_blob_key``. The key is written back onto ``anchor`` in place so
+        a re-cite of the same file doesn't re-upload, and so the source is
+        registered with the key already present (Phase 3b).
+
+        ``file_path`` may be a local path or a workspace-relative backend path.
+        The latter is materialized with ``WorkspaceManager.local_copy`` before
+        byte access. Best-effort: returns the key, or ``None`` when there's no
+        orchestrator client, the file can't be read, or the upload fails — the
+        extracted-text copy remains the citation's verification anchor either
+        way.
+        """
+        if anchor.get("snapshot_blob_key"):
+            return anchor["snapshot_blob_key"]
+        client = self.orchestrator_client
+        if client is None:
+            return None
+
+        def _read_bytes() -> bytes:
+            if self.workspace_manager is not None:
+                # Workspace identity is authoritative whenever a workspace is
+                # bound.  A same-named file in the agent CWD/image must never
+                # substitute for remote/virtual workspace bytes.
+                workspace_path = self.workspace_manager.workspace_relative_path(
+                    file_path
+                )
+                with self.workspace_manager.local_copy(workspace_path) as local_path:
+                    return local_path.read_bytes()
+            return Path(file_path).read_bytes()
+
+        try:
+            data = await asyncio.to_thread(_read_bytes)
+        except Exception as e:
+            logger.debug("Cloud snapshot read failed for %s: %s", file_path, e)
+            return None
+        content_type = anchor.get("content_type") or "application/octet-stream"
+        try:
+            key = await client.save_citation_snapshot(data, content_type=content_type)
+        except Exception as e:  # never let a snapshot upload break citation creation
+            logger.debug("Cloud snapshot upload failed for %s: %s", file_path, e)
+            return None
+        if key:
+            anchor["snapshot_blob_key"] = key
+        return key
+
+    async def get_or_register_doc_source(
+        self,
+        file_path: str,
+        name: Optional[str] = None,
+        cloud_metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Get cached source_id or register new document source.
 
         Checks the source registry first to avoid re-registering the same document.
 
+        When the document was read from a user's cloud, ``cloud_metadata`` (the
+        snapshot-anchor: drift fingerprint + best-effort live pointer) is stored
+        on the new source's ``metadata.cloud`` block (Phase 3, D7). If not passed
+        explicitly, any anchor previously stashed for this path via
+        ``record_cloud_anchor`` is used.
+
         Args:
             file_path: Path to the document file
             name: Optional human-readable name for the source
+            cloud_metadata: Optional cloud snapshot-anchor to persist on the source
 
         Returns:
             source_id for use in citations
@@ -317,15 +722,35 @@ class ToolContext:
         Raises:
             FileNotFoundError: If document doesn't exist
         """
-        if file_path in self._source_registry:
-            return self._source_registry[file_path]
+        source_key = self._normalize_anchor_key(file_path)
+        if source_key in self._source_registry:
+            return self._source_registry[source_key]
+
+        if cloud_metadata is None:
+            cloud_metadata = self.get_cloud_anchor(source_key)
+
+        metadata = {"cloud": cloud_metadata} if cloud_metadata else None
 
         engine = self.get_citation_engine()
-        source = engine.add_doc_source(file_path, name=name)
-        self._source_registry[file_path] = source.id
+        # The engine performs local filesystem I/O, while this value identifies
+        # a workspace object.  Always materialize through the workspace backend:
+        # host ``os.path.exists`` is not a locality signal and a CWD/image decoy
+        # with the same relative name must not replace remote/virtual bytes.
+        if self.workspace_manager is not None:
+            with self.workspace_manager.local_copy(source_key) as local_path:
+                source = await engine.add_doc_source(
+                    str(local_path),
+                    name=name or posixpath.basename(source_key),
+                    metadata=metadata,
+                )
+        else:
+            source = await engine.add_doc_source(
+                file_path, name=name, metadata=metadata
+            )
+        self._source_registry[source_key] = source.id
         return source.id
 
-    def get_or_register_web_source(
+    async def get_or_register_web_source(
         self, url: str, name: Optional[str] = None
     ) -> tuple[int, Optional[str]]:
         """Get cached source_id or register new web source.
@@ -348,7 +773,7 @@ class ToolContext:
             return source_id, fetch_error
 
         engine = self.get_citation_engine()
-        source = engine.add_web_source(url, name=name)
+        source = await engine.add_web_source(url, name=name)
         self._source_registry[url] = source.id
 
         # Check if content was actually fetched
@@ -498,36 +923,139 @@ class ToolContext:
         self._freeze_request = None
         return req
 
-    def close_citation_engine(self) -> None:
-        """Close CitationEngine connection if open.
+    def request_replan(self, reason: str) -> None:
+        """Ask for the strategic phase early, without discarding todo state.
 
-        Should be called when the tool context is being disposed of
-        to properly clean up database connections.
+        Called from ``request_replan``. Sync-safe; consumed by ``check_todos``.
+        """
+        self._replan_request = reason
+
+    def consume_replan_request(self) -> Optional[str]:
+        """Return and clear any pending replan request."""
+        reason = self._replan_request
+        self._replan_request = None
+        return reason
+
+    def request_reply_drain(self) -> None:
+        """Mark a natural break at which queued replies may be delivered.
+
+        Called from ``todo_complete``: a finished todo is the break the old
+        ``next_strategic_phase`` default was really trying to express — finish
+        the current unit of work, then read your mail. Sync-safe.
+        """
+        self._reply_drain_requested = True
+
+    def consume_reply_drain(self) -> bool:
+        """Return and clear the natural-break flag.
+
+        Called from the async audited_tools node after tool execution.
+        """
+        requested = self._reply_drain_requested
+        self._reply_drain_requested = False
+        return requested
+
+    def request_officer_sleep(self, sleep_data: Dict[str, Any]) -> None:
+        """Record the officer sleep tool's wake request (sync-safe).
+
+        The turn loop PEEKS this after the tool batch to end the turn instead
+        of paying another LLM iteration; the transport CONSUMES it at park
+        time to file the durable wake with the orchestrator
+        (knowledge-base/knowledge/features/centurion.md §4).
+        """
+        self._officer_sleep_request = sleep_data
+
+    def peek_officer_sleep(self) -> Optional[Dict[str, Any]]:
+        """Non-destructive read of a pending officer sleep request."""
+        return self._officer_sleep_request
+
+    def consume_officer_sleep(self) -> Optional[Dict[str, Any]]:
+        """Return and clear any pending officer sleep request."""
+        req = self._officer_sleep_request
+        self._officer_sleep_request = None
+        return req
+
+    def close_citation_engine(self) -> None:
+        """Drop the cached CitationEngine reference.
+
+        The engine no longer owns a DB connection — it borrows the agent's
+        shared vector pool (``vector_db``), which the agent closes on shutdown.
+        So there is nothing to close here; just release the reference and clear
+        the per-job source cache.
         """
         if self.citation_engine is not None:
-            self.citation_engine.close()
             self.citation_engine = None
             self._source_registry.clear()
 
-    def record_file_read(self, path: str) -> None:
-        """Record that a file was read. Uses normalized path.
+    def record_file_read(self, path: str, content: str | bytes | None = None) -> None:
+        """Record that a file was read, optionally with its full-text version.
 
         This is called by read_file to track which files have been recently
         accessed. The tracking window is limited to the last N reads (default 10).
+        Callers that only need path-based instruction enforcement may omit
+        ``content``; text ``read_file`` calls pass the complete bytes so later
+        writes can detect an out-of-band change even if an invalidation event
+        was missed.
 
         Args:
             path: Path to the file that was read
+            content: Complete text content observed by the reader, when available
         """
         normalized = path.lstrip("/").strip()
+        content_version = None
+        if content is not None:
+            raw = content.encode("utf-8") if isinstance(content, str) else content
+            content_version = "sha256:" + hashlib.sha256(raw).hexdigest()
+        # Instruction files are pinned: unrelated reads must not make a
+        # job-scoped gate look unread merely because the 10-entry FIFO cycled.
+        # Phase/freshness-scoped gates use the independent stamp below.
+        if self._is_instruction_path(normalized):
+            self._pinned_reads.add(normalized)
+            stamp: Dict[str, Any] = {
+                "phase": self._current_phase,
+                "phase_number": self._current_phase_number,
+                "turn_count": self._current_turn_count,
+            }
+            if content_version is not None:
+                stamp["content_version"] = content_version
+            self._instruction_read_stamps[normalized] = stamp
+        evicted = None
         # Remove if already present (we'll re-add at the end)
         if normalized in self._recent_reads:
             self._recent_reads.remove(normalized)
+        elif (
+            self._recent_reads.maxlen is not None
+            and self._recent_reads.maxlen > 0
+            and len(self._recent_reads) >= self._recent_reads.maxlen
+        ):
+            evicted = self._recent_reads[0]
         self._recent_reads.append(normalized)
+        if evicted is not None:
+            self._recent_read_versions.pop(evicted, None)
+        if normalized not in self._recent_reads:
+            # A deque configured with maxlen=0 cannot retain path or version.
+            self._recent_read_versions.pop(normalized, None)
+        elif content is None:
+            # Preserve the legacy path-only contract for instruction files and
+            # other callers that do not have authoritative full text.
+            self._recent_read_versions.pop(normalized, None)
+        else:
+            self._recent_read_versions[normalized] = content_version
+
+    def _is_instruction_path(self, normalized: str) -> bool:
+        """Whether a normalized path is a configured instruction file."""
+        for entry in self._instruction_files:
+            entry_path = (getattr(entry, "path", "") or "").lstrip("/").strip()
+            if entry_path and entry_path == normalized:
+                return True
+        return False
 
     def was_recently_read(self, path: str) -> bool:
         """Check if file was read within the tracking window.
 
-        Used by edit_file and write_file to enforce read-before-write discipline.
+        Used by edit_file and write_file to enforce read-before-write
+        discipline. Instruction files stay present once pinned regardless of
+        how many reads followed. Binding-specific phase/freshness checks happen
+        separately in instruction_read_is_valid().
 
         Args:
             path: Path to check
@@ -536,7 +1064,143 @@ class ToolContext:
             True if the file was recently read, False otherwise
         """
         normalized = path.lstrip("/").strip()
-        return normalized in self._recent_reads
+        return normalized in self._recent_reads or normalized in self._pinned_reads
+
+    def recent_read_matches(self, path: str, content: str | bytes) -> bool:
+        """Check path recency and any recorded full-text content version.
+
+        Path-only records deliberately remain visible to
+        :meth:`was_recently_read` for instruction-file enforcement, but cannot
+        authorize a text write. ``read_file`` must have recorded a version and
+        the current full text must still match it.
+        """
+
+        normalized = path.lstrip("/").strip()
+        if normalized not in self._recent_reads:
+            return False
+        expected = self._recent_read_versions.get(normalized)
+        if expected is None:
+            return False
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        current = "sha256:" + hashlib.sha256(raw).hexdigest()
+        return current == expected
+
+    def invalidate_recent_read(self, path: str) -> bool:
+        """Forget a file read after an out-of-band user edit.
+
+        Returns whether the normalized path was present. Keeping this as a
+        public ToolContext operation prevents transports from mutating the
+        private deque and makes read-before-write enforcement immediately
+        require a fresh agent read.
+        """
+
+        normalized = path.lstrip("/").strip()
+        present = normalized in self._recent_reads or normalized in self._pinned_reads
+        if normalized in self._recent_reads:
+            self._recent_reads.remove(normalized)
+        self._pinned_reads.discard(normalized)
+        self._recent_read_versions.pop(normalized, None)
+        self._instruction_read_stamps.pop(normalized, None)
+        return present
+
+    def export_instruction_read_receipts(self) -> Dict[str, Dict[str, Any]]:
+        """Return safe instruction-read receipts for a worker checkpoint.
+
+        Only configured instruction paths are exported. Ordinary recent-file
+        reads and their write-authorizing versions remain claim-local: carrying
+        those across a handoff could authorize a stale edit. The optional
+        content version here is used solely to reject a receipt when the
+        instruction changed between images/claims.
+        """
+
+        receipts: Dict[str, Dict[str, Any]] = {}
+        for path, stamp in self._instruction_read_stamps.items():
+            if path not in self._pinned_reads or not self._is_instruction_path(path):
+                continue
+            receipt: Dict[str, Any] = {
+                "phase": stamp.get("phase"),
+                "phase_number": stamp.get("phase_number"),
+                "turn_count": int(stamp.get("turn_count") or 0),
+            }
+            content_version = stamp.get("content_version")
+            if content_version:
+                receipt["content_version"] = content_version
+            receipts[path] = receipt
+        return receipts
+
+    def restore_instruction_read_receipts(self, value: Any) -> int:
+        """Hydrate checkpointed instruction receipts into this claim.
+
+        Invalid paths/shapes and receipts for changed instruction content are
+        ignored fail-closed. This restores only enforcement visibility and its
+        phase/turn stamp; it never restores ``_recent_reads`` or
+        ``_recent_read_versions``, so read-before-write authorization cannot
+        cross a worker lease.
+        """
+
+        if not isinstance(value, dict):
+            return 0
+
+        configured_paths = {
+            (getattr(entry, "path", "") or "").lstrip("/").strip()
+            for entry in self._instruction_files
+        }
+        configured_paths.discard("")
+        for path in configured_paths:
+            if path in self._recent_reads:
+                self._recent_reads.remove(path)
+            self._pinned_reads.discard(path)
+            self._recent_read_versions.pop(path, None)
+            self._instruction_read_stamps.pop(path, None)
+
+        restored = 0
+        for raw_path, raw_receipt in value.items():
+            path = str(raw_path or "").lstrip("/").strip()
+            if path not in configured_paths or not isinstance(raw_receipt, dict):
+                continue
+            phase = raw_receipt.get("phase")
+            phase_number = raw_receipt.get("phase_number")
+            turn_count = raw_receipt.get("turn_count")
+            if phase is not None and not isinstance(phase, str):
+                continue
+            if phase_number is not None and (
+                isinstance(phase_number, bool) or not isinstance(phase_number, int)
+            ):
+                continue
+            if (
+                isinstance(turn_count, bool)
+                or not isinstance(turn_count, int)
+                or turn_count < 0
+            ):
+                continue
+
+            content_version = raw_receipt.get("content_version")
+            if content_version is not None:
+                if not (
+                    isinstance(content_version, str)
+                    and content_version.startswith("sha256:")
+                ):
+                    continue
+                try:
+                    content = self.workspace_manager.read_file(path)
+                except Exception:
+                    continue
+                raw = content.encode("utf-8") if isinstance(content, str) else content
+                current_version = "sha256:" + hashlib.sha256(raw).hexdigest()
+                if current_version != content_version:
+                    continue
+
+            self._pinned_reads.add(path)
+            stamp: Dict[str, Any] = {
+                "phase": phase,
+                "phase_number": phase_number,
+                "turn_count": turn_count,
+            }
+            if content_version is not None:
+                stamp["content_version"] = content_version
+            self._instruction_read_stamps[path] = stamp
+            restored += 1
+        return restored
 
     def get_read_tracking_limit(self) -> int:
         """Get the tracking window size from config or default.
@@ -545,6 +1209,52 @@ class ToolContext:
             Number of recent reads to track (default 10)
         """
         return self.get_config("read_tracking_limit", 10)
+
+    def instruction_entry_applies(self, entry: Any) -> bool:
+        """Whether an enforced binding applies in the current phase kind."""
+        phases = getattr(entry, "phases", None)
+        return not phases or self._current_phase in phases
+
+    def instruction_read_is_valid(self, entry: Any) -> bool:
+        """Whether an instruction read satisfies one enforced binding.
+
+        Ordinary bindings retain the historical job-scoped pin. Bindings may
+        additionally require a read in the current concrete phase instance and
+        may expire after a bounded number of LLM turns.
+        """
+        path = (entry.path or "").lstrip("/").strip()
+        if not self.was_recently_read(path):
+            return False
+
+        read_scope = getattr(entry, "read_scope", "job")
+        max_age = getattr(entry, "max_read_age_turns", None)
+        if read_scope == "job" and max_age is None:
+            return True
+
+        stamp = self._instruction_read_stamps.get(path)
+        if stamp is None:
+            return False
+        if read_scope == "phase" and (
+            stamp.get("phase") != self._current_phase
+            or stamp.get("phase_number") != self._current_phase_number
+        ):
+            return False
+        if max_age is not None:
+            age = self._current_turn_count - int(stamp.get("turn_count", 0))
+            if age < 0 or age > max_age:
+                return False
+        return True
+
+    def get_enforcement_entries(self, tool_name: str) -> List[Any]:
+        """Get active enforced instruction bindings for a tool."""
+        return [
+            entry
+            for entry in self._instruction_files
+            if entry.enforce
+            and entry.trigger_type == "before_tool"
+            and entry.trigger_target == tool_name
+            and self.instruction_entry_applies(entry)
+        ]
 
     def get_enforcement_files(self, tool_name: str) -> List[str]:
         """Get instruction files that must be read before using a tool.
@@ -558,15 +1268,7 @@ class ToolContext:
         Returns:
             List of workspace-relative file paths that must be read first
         """
-        required = []
-        for entry in self._instruction_files:
-            if (
-                entry.enforce
-                and entry.trigger_type == "before_tool"
-                and entry.trigger_target == tool_name
-            ):
-                required.append(entry.file)
-        return required
+        return [entry.path for entry in self.get_enforcement_entries(tool_name)]
 
     def check_tool_enforcement(self, tool_name: str) -> Optional[str]:
         """Check if a tool's instruction file enforcement requirements are met.
@@ -580,24 +1282,25 @@ class ToolContext:
         Returns:
             Error message string if enforcement fails, None if OK
         """
-        required_files = self.get_enforcement_files(tool_name)
-        for file_path in required_files:
-            if not self.was_recently_read(file_path):
+        for entry in self.get_enforcement_entries(tool_name):
+            if not self.instruction_read_is_valid(entry):
                 from src.services.guardrails import format_nudge
 
                 model = self._llm_config.model if self._llm_config is not None else None
                 return format_nudge(
                     "read_file_required_error",
                     model=model,
-                    file_path=file_path,
+                    file_path=entry.path,
                     tool_name=tool_name,
                 )
         return None
 
     def get_phase_instruction_files(self, phase: str) -> List[Any]:
-        """Get instruction files triggered by a phase transition.
+        """Get instruction files eligible for once-only phase-start delivery.
 
-        Returns entries with trigger type 'phase' matching the given phase.
+        Returns ``phase_start`` entries plus the legacy ``phase`` alias. The
+        graph's checkpoint ledger suppresses subsequent delivery in the same
+        concrete phase instance.
 
         Args:
             phase: Phase name ('strategic' or 'tactical')
@@ -608,16 +1311,27 @@ class ToolContext:
         return [
             entry
             for entry in self._instruction_files
-            if entry.trigger_type == "phase" and entry.trigger_target == phase
+            if entry.trigger_type in {"phase", "phase_start"}
+            and entry.trigger_target == phase
         ]
 
-    def set_current_phase(self, phase: str) -> None:
-        """Set the current execution phase for phase-aware behavior.
+    def set_current_phase(
+        self,
+        phase: str,
+        phase_number: Optional[int] = None,
+        turn_count: Optional[int] = None,
+    ) -> None:
+        """Set the current execution position for phase-aware behavior.
 
         Args:
             phase: Phase name ("strategic" or "tactical")
+            phase_number: Concrete phase-instance number, when available
+            turn_count: Current checkpointed LLM-turn counter, when available
         """
         self._current_phase = phase
+        self._current_phase_number = phase_number
+        if turn_count is not None:
+            self._current_turn_count = turn_count
 
     def get_phase_multimodal(self) -> bool:
         """Get the effective multimodal setting for the current phase.
@@ -654,82 +1368,50 @@ class ToolContext:
         snapshot_cfg = browser_cfg.get("snapshot", {})
         return snapshot_cfg.get("max_dom_chars", 40000)
 
-    async def get_browser_session(self) -> Any:
-        """Lazy-start a local (in-process) Chromium and return a BrowserSession.
-
-        Local/dev mode only — remote workspaces drive the browser through
-        ``browser_exec()`` (the workspace-side browser-exec daemon) so CDP
-        never crosses the pod boundary. On subsequent calls, health-checks
-        the existing session and restarts if needed.
-
-        Returns:
-            browser_use.BrowserSession instance
-        """
-        from browser_use import BrowserSession
-
-        # Return existing healthy session
-        if self._browser_session is not None:
-            try:
-                # Quick health check — get current page URL
-                await self._browser_session.get_current_page_url()
-                return self._browser_session
-            except Exception:
-                logger.warning("Browser session unhealthy, restarting")
-                await self._close_browser_session()
-
-        browser_cfg = self.config.get("browser", {})
-        persistence_cfg = browser_cfg.get("persistence", {})
-
-        # Resolve user_data_dir
-        user_data_dir = persistence_cfg.get("user_data_dir", ".browser-profile")
-        if self.has_workspace():
-            from pathlib import Path
-
-            ws_root = self.workspace_manager.get_path("")
-            user_data_dir = str(Path(ws_root) / user_data_dir)
-
-        headless_env = os.getenv("BROWSER_HEADLESS", "").lower()
-        if headless_env in ("true", "1", "yes"):
-            headless = True
-        elif headless_env in ("false", "0", "no"):
-            headless = False
-        else:
-            headless = browser_cfg.get("headless", True)
-
-        kwargs = {
-            "headless": headless,
-            "user_data_dir": user_data_dir,
-        }
-
-        # Local in-process launch only. Remote workspaces never reach here —
-        # the direct browser tools route to browser_exec() instead.
-        session = BrowserSession(**kwargs)
-        await session.start()
-        self._browser_session = session
-        self._browser_started = True
-        logger.info("Browser session started")
-        return session
-
     async def browser_exec(self, action: str, **args: Any) -> Dict[str, Any]:
         """Run one browser action on the workspace via the browser-exec helper.
 
-        Drives Chromium on the workspace over SSH (``exec_command``) rather
-        than speaking CDP across the pod boundary. The workspace daemon holds
-        the persistent session so element refs survive between calls. Returns
-        the parsed JSON result, or an ``{"error": ...}`` dict on any failure.
+        Drives Chromium on the workspace over SSH rather than speaking CDP
+        across the pod boundary. The workspace daemon holds the persistent
+        session so element refs survive between calls. Stateless workspaces
+        route the command through the same exact-claim resource fence as other
+        workspace-resident daemons; the base implementation preserves the
+        historical unfenced behavior for pinned/custom backends. Returns the
+        parsed JSON result, or an ``{"error": ...}`` dict on any failure.
 
-        See docs/features/browser_workspace_executor.md.
+        See knowledge-base/knowledge/features/browser_workspace_executor.md.
         """
         import asyncio
         import json as _json
         import shlex
 
+        if not self.has_workspace():
+            return {
+                "error": (
+                    "browser tools require a workspace running the "
+                    "browser-exec daemon; no workspace backend is attached"
+                )
+            }
+
         backend = self.workspace_manager.backend
         payload = _json.dumps(args)
         cmd = f"browser-exec {shlex.quote(action)} --json {shlex.quote(payload)}"
         try:
-            # exec_command is blocking SSH; keep the event loop responsive.
-            out = await asyncio.to_thread(backend.exec_command, cmd, 200)
+            # Workspace command execution is blocking; keep the event loop
+            # responsive.  Every production WorkspaceBackend exposes the
+            # claim-resource seam.  The callable fallback retains support for
+            # older/custom duck-typed backends without silently bypassing the
+            # stateless RemoteBackend fence.
+            claim_exec = getattr(backend, "exec_claim_resource", None)
+            if callable(claim_exec):
+                out = await asyncio.to_thread(
+                    claim_exec,
+                    cmd,
+                    200,
+                    operation=f"browser-exec {action}",
+                )
+            else:
+                out = await asyncio.to_thread(backend.exec_command, cmd, 200)
         except Exception as e:
             return {"error": f"browser-exec call failed: {e}"}
 
@@ -742,54 +1424,26 @@ class ToolContext:
         except Exception:
             return {"error": f"browser-exec returned non-JSON: {out[:500]}"}
 
-    async def _close_browser_session(self) -> None:
-        """Close the local in-process browser session (dev mode)."""
-        if self._browser_session is not None:
-            try:
-                await self._browser_session.stop()
-            except Exception:
-                pass
-            self._browser_session = None
+    async def close_browser(self, *, strict: bool = False) -> None:
+        """Shut down the workspace browser-exec daemon.
 
-    async def close_browser(self) -> None:
-        """Kill Chromium and cleanup. Called on job/session end."""
-        # Local in-process session (dev mode).
-        await self._close_browser_session()
-
-        # Remote: tell the workspace browser-exec daemon to shut down.
-        from .research.browser import _is_remote_browser
-
-        if _is_remote_browser(self):
-            try:
-                await self.browser_exec("shutdown")
-            except Exception as e:
-                logger.debug(f"browser-exec shutdown failed: {e}")
-
-        self._browser_started = False
-        logger.info("Browser cleaned up")
-
-    async def export_browser_state(self) -> None:
-        """Export browser storage state for crash recovery.
-
-        Called at phase boundaries when persistence.export_state_on_phase
-        is true. Saves cookies/localStorage to the workspace.
+        Normal tool cleanup retains the historical best-effort behavior.
+        Terminal stateless retirement passes ``strict=True`` and requires the
+        workspace client to attest that its daemon and exact-profile Chromium
+        processes are absent before snapshot/release may continue.
         """
-        browser_cfg = self.config.get("browser", {})
-        persistence_cfg = browser_cfg.get("persistence", {})
-        if not persistence_cfg.get("export_state_on_phase", True):
+        if not self.has_workspace():
             return
-        if self._browser_session is None:
-            return
-
         try:
-            if self.has_workspace():
-                from pathlib import Path
-
-                ws_root = self.workspace_manager.get_path("")
-                state_path = str(
-                    Path(ws_root) / ".browser-profile" / "storage_state.json"
-                )
-                await self._browser_session.export_storage_state(output_path=state_path)
-                logger.debug(f"Exported browser state to {state_path}")
+            result = await self.browser_exec("shutdown")
+            if strict and (
+                not isinstance(result, dict)
+                or result.get("ok") is not True
+                or result.get("shutdown_complete") is not True
+            ):
+                raise RuntimeError("browser-exec shutdown was not acknowledged")
         except Exception as e:
-            logger.debug(f"Could not export browser state: {e}")
+            if strict:
+                raise
+            logger.debug(f"browser-exec shutdown failed: {e}")
+        logger.info("Browser cleaned up")

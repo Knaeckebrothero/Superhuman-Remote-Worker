@@ -5,7 +5,13 @@
 # stays reproducible and off the advisory. See top-level requirements.txt for detail.
 fastapi>=0.115.0,!=0.136.3
 uvicorn[standard]>=0.34.0
+h11>=0.16.0
 asyncpg>=0.30.0
+# pgvector registers the asyncpg vector codec (postgres.py connection init).
+# Without it the registration silently no-ops and every orchestrator-side
+# vector-column write fails ("expected str, got list") — the KB reindexer's
+# chunk inserts were the first such writes (slice 3; live-diagnosed 2026-07-05).
+pgvector>=0.2.0
 motor>=3.3.0
 python-dotenv>=1.0.0
 anthropic>=0.39.0
@@ -38,6 +44,19 @@ boto3>=1.35.0
 # (services/thread_uploads.py). Without it, POST /api/persistent/threads/{id}/uploads
 # fails with HTTP 503 "paramiko is not installed on the orchestrator".
 paramiko>=3.4.0
+# Dynamic Canvas workspace-file gateway. AsyncSSH provides the bounded,
+# host-key-pinned SFTP client; python-magic + libmagic and Pillow validate the
+# bytes before the Cockpit is allowed to select a renderer.
+asyncssh>=2.21.0
+python-magic>=0.4.27
+Pillow>=10.4.0
+# Remote-image fetch pipeline (services/remote_image.py) — needs aiohttp's
+# AbstractResolver to pin DNS and block SSRF into link-local/private ranges,
+# which httpx doesn't expose. This is a top-level import in a module main.py
+# imports unconditionally, so without it the orchestrator image doesn't boot at
+# all (ModuleNotFoundError at startup). The root requirements.txt has aiohttp
+# for the agent; the orchestrator image installs THIS file, so it needs its own.
+aiohttp>=3.9.0
 # Cron expression parsing for the automations dispatcher
 # (services/cron_dispatcher.py). Pairs with zoneinfo (stdlib) for
 # DST-aware next-fire-time computation against IANA-named timezones.

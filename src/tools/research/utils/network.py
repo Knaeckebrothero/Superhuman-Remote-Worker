@@ -102,7 +102,7 @@ class ProxyConfig:
     def from_config(cls, config: Dict[str, Any]) -> "ProxyConfig":
         """Load proxy config from agent config dict.
 
-        Expected format (from defaults.yaml research.proxy section):
+        Expected format (from worker_base.yaml research.proxy section):
             proxy:
               enabled: true
               type: socks5
@@ -148,28 +148,6 @@ class ProxyConfig:
         if self.password:
             proxy["password"] = self.password
         return proxy
-
-    def to_browser_use_proxy(self) -> Optional[Any]:
-        """Convert to browser-use ProxySettings format.
-
-        Returns:
-            browser_use ProxySettings instance, or None if no proxy.
-        """
-        if not self.is_configured:
-            return None
-
-        try:
-            from browser_use.browser.profile import ProxySettings
-
-            kwargs: Dict[str, str] = {"server": self.url}
-            if self.username:
-                kwargs["username"] = self.username
-            if self.password:
-                kwargs["password"] = self.password
-            return ProxySettings(**kwargs)
-        except ImportError:
-            logger.debug("browser-use not installed, cannot create ProxySettings")
-            return None
 
     def to_aiohttp_connector(self) -> Optional[Any]:
         """Create an aiohttp-socks ProxyConnector for this proxy config.

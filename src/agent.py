@@ -14,31 +14,38 @@ Key Features:
 
 import asyncio
 import logging
+import math
 import os
-import shutil
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
 import yaml
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from .core.loader import (
     AgentConfig,
     LLMConfig,
     load_agent_config,
+    load_config_from_resolved,
     create_llm,
-    load_instructions,
     get_all_tool_names,
     resolve_config_path,
     resolve_model_settings,
+    resolve_phase_model_budget,
+    supports_parallel_tool_calls,
 )
-from .core.loader import get_project_root
+from .core.loader import (
+    CONTEXT_THRESHOLD_FRACTION,
+    MESSAGE_COUNT_MIN_FRACTION,
+    get_project_root,
+)
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.state import UniversalAgentState, create_initial_state
 from .core.workspace import (
@@ -46,13 +53,145 @@ from .core.workspace import (
     WorkspaceManagerConfig,
     get_checkpoints_path,
 )
-from .graph import build_phase_alternation_graph, run_graph_with_streaming
-from .managers import TodoManager
-from .tools import ToolContext, load_tools, apply_instruction_enforcement
-from .tools.description_manager import (
-    generate_workspace_tool_docs,
-    apply_description_overrides,
+from .core.workspace_backend import WorkspaceUnavailableError
+from .graph import (
+    WORKER_BATCH_MIN_WALL_SECONDS,
+    build_phase_alternation_graph,
+    hydrate_todo_manager_from_state,
+    run_graph_with_streaming,
 )
+from .managers import TodoManager
+from .shared.job_freeze_types import AUTO_CONTINUE_FREEZE_TYPES
+from .tools import ToolContext, load_tools, apply_instruction_enforcement
+from .tools.description_manager import apply_description_overrides
+from .utils.db_url import (
+    checkpointer_backend,
+    resolve_checkpoint_url,
+    resolve_fenced_checkpoint_url,
+)
+
+# Set True once per agent process after the Postgres checkpoint schema has been
+# ensured. AsyncPostgresSaver.setup() is idempotent, but there's no need to run
+# it on every job.
+_PG_CHECKPOINT_SCHEMA_READY = False
+
+
+def _stateless_worker_remote_authority(
+    metadata: Dict[str, Any], worker_lease_token: Optional[int]
+) -> Dict[str, Any]:
+    """Build RemoteBackend authority kwargs for a leased worker claim."""
+
+    if worker_lease_token is None:
+        return {}
+    fields = {
+        "workspace_generation": metadata.get("workspace_generation"),
+        "runtime_incarnation": metadata.get("workspace_runtime_incarnation"),
+        "expected_host_key_fingerprint": metadata.get(
+            "workspace_ssh_host_key_fingerprint"
+        ),
+        "workspace_owner_kind": metadata.get("workspace_owner_kind"),
+        "workspace_owner_id": metadata.get("workspace_owner_id"),
+    }
+    if any(
+        not isinstance(value, str) or not value.strip() for value in fields.values()
+    ):
+        raise WorkspaceUnavailableError(
+            "A stateless worker claim requires an orchestrator-attested workspace "
+            "owner, backing, runtime incarnation, and SSH host identity"
+        )
+    if fields["workspace_owner_kind"] != "job":
+        raise WorkspaceUnavailableError(
+            "A stateless worker claim requires a job-owned workspace authority"
+        )
+    return fields  # RemoteBackend performs canonical UUID/fingerprint validation.
+
+
+# >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
+# knowledge-history/done/codex_stream_disconnect_shape_nudge.md
+# Injected as a user turn when the orchestrator has seen N byte-identical
+# upstream rejections of the SAME payload. Its only job is to make the next
+# request differ, so the wording is secondary to its existence — but it has
+# three jobs beyond that, and each earns its line:
+#   1. It must not read as a real instruction, or the agent re-plans.
+#   2. It must not imply the agent erred (it did not — openai/codex#9995).
+#   3. It must say NOTHING WAS LOST. The freeze point is side-effect-clean (the
+#      LLM call failed, so the tools node never ran), but an agent that is not
+#      told so will burn a turn on git_status/read_file re-verifying a workspace
+#      that never changed.
+# Formatted like _format_delegation_results (## heading + prose) — the other
+# message this codebase injects into a running conversation.
+_SHAPE_NUDGE_TEXT = (
+    "## Transport Notice\n"
+    "\n"
+    "The model provider closed the response stream on the previous request — "
+    "repeatedly, and identically each time. This is a known fault on their "
+    "side. It is not a problem with your work, your plan, or your last tool "
+    "call.\n"
+    "\n"
+    "Nothing was lost. The failure happened before the model replied, so no "
+    "tool ran and no file, commit, or todo changed. The workspace is exactly "
+    "as you left it — there is nothing to verify or repair.\n"
+    "\n"
+    "This message exists only so the retried request is no longer "
+    "byte-identical to the one being rejected. Ignore it and carry on exactly "
+    "where you left off: do not restart, re-plan, redo completed work, or "
+    "reply to this message."
+)
+
+
+def _merge_worker_resume_updates(
+    target: Dict[str, Any], incoming: Dict[str, Any]
+) -> None:
+    """Merge staged resume state without clobbering reducer-backed messages."""
+
+    prior_messages = list(target.get("messages") or [])
+    incoming_messages = list(incoming.get("messages") or [])
+    target.update(incoming)
+    if prior_messages or incoming_messages:
+        target["messages"] = [*prior_messages, *incoming_messages]
+
+
+def _valid_worker_batch_arm(values: Dict[str, Any]) -> bool:
+    """Whether a pending update checkpoint carries a complete arm envelope."""
+
+    fields = {
+        "worker_batch_started_at",
+        "worker_batch_start_iteration",
+        "worker_batch_target_wall_seconds",
+        "worker_batch_min_wall_seconds",
+        "worker_batch_iteration_cap",
+    }
+    if not fields.issubset(values):
+        return False
+
+    started_at = values.get("worker_batch_started_at")
+    start_iteration = values.get("worker_batch_start_iteration")
+    target = values.get("worker_batch_target_wall_seconds")
+    floor = values.get("worker_batch_min_wall_seconds")
+    cap = values.get("worker_batch_iteration_cap")
+    numeric_values = (started_at, target, floor)
+    if any(isinstance(value, bool) for value in numeric_values):
+        return False
+    try:
+        started_at_value, target_value, floor_value = map(float, numeric_values)
+    except (TypeError, ValueError):
+        return False
+    finite_values = (
+        started_at_value,
+        target_value,
+        floor_value,
+    )
+    if not all(math.isfinite(value) for value in finite_values):
+        return False
+    if started_at_value <= 0 or target_value <= 0 or floor_value < 0:
+        return False
+    if isinstance(start_iteration, bool) or not isinstance(start_iteration, int):
+        return False
+    if cap is not None and (
+        isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0
+    ):
+        return False
+    return True
 
 
 class _AiosqliteConnectionWrapper:
@@ -114,6 +253,72 @@ def _format_delegation_results(delegation_results: list) -> str:
     return "\n".join(lines)
 
 
+# The branch a job's work belongs on when the job row carries no explicit
+# ``branch_name``. NULL does not mean "any branch is fine" — it means the job
+# lives on the repo's default branch, which is exactly how every *reader*
+# resolves it (``job.get("branch_name") or "main"`` in
+# orchestrator/services/diff_source.py, deliverable_gate.py, ide_session.py,
+# job_cloud_baseline.py and orchestrator/main.py).
+DEFAULT_JOB_BRANCH = "main"
+
+
+def ensure_job_branch(
+    git_mgr,
+    metadata: Optional[Dict[str, Any]],
+    job_id: str = "",
+    create: bool = False,
+):
+    """Put a re-attached working tree back on the branch this job owns.
+
+    Only the paths that attach to a *pre-existing* tree need this. A fresh
+    clone already lands on the branch it was told to check out, but a workspace
+    that is re-attached (PVC reattach) or resumed in place keeps whatever branch
+    the previous occupant left checked out — and the previous occupant may have
+    been a *subjob*. Critic/scholar subjobs run on
+    ``subjob/<short_id>/<config>`` branches (orchestrator/services/
+    job_provisioning.py:164), so a parent resumed after one of them can silently
+    continue on the subjob's branch. Its commits then push to that branch and
+    ``main`` never advances, while every reader (critic, cockpit, MCP,
+    ``get_workspace_file``, and any later re-clone) still reads ``main`` and
+    correctly reports the work missing.
+
+    See knowledge-history/done/resumed_job_inherits_subjob_git_branch.md — job
+    6df02f64, where a ``## Sources`` append was committed and pushed to
+    ``subjob/50dee4ae/critic`` and was never visible on ``main``.
+
+    Never raises: a workspace we cannot re-point is still usable, and failing
+    the job over it would be worse than the drift. Failures are logged at
+    WARNING because this whole bug class is defined by its silence.
+
+    Returns:
+        The branch the tree is on afterwards, or None if it could not be read.
+    """
+    if git_mgr is None:
+        return None
+
+    # A NULL branch_name is the *standalone job* case, not an opt-out: that job
+    # owns the default branch. Treating it as "leave the tree wherever it is" is
+    # what let a parent inherit a critic subjob's branch.
+    expected = (metadata or {}).get("branch_name") or DEFAULT_JOB_BRANCH
+
+    try:
+        current = git_mgr.current_branch()
+        if current == expected:
+            return current
+        if not git_mgr.checkout_branch(expected, create=create):
+            logger.warning(
+                f"[{job_id}] Resume: could not switch workspace from branch "
+                f"{current!r} to {expected!r} — commits will land on {current!r} "
+                f"and {expected!r} will not advance"
+            )
+            return current
+        logger.info(f"[{job_id}] Switched to expected branch: {expected}")
+        return expected
+    except Exception as e:  # noqa: BLE001 - never fail a resume over branch drift
+        logger.warning(f"[{job_id}] Resume: branch ensure failed: {e}")
+        return None
+
+
 class UniversalAgent:
     """
     Configurable autonomous agent using workspace-centric architecture.
@@ -150,8 +355,22 @@ class UniversalAgent:
         self._llm_with_tools: Optional[BaseChatModel] = None
         self._tools: Optional[List] = None
         self._graph = None
-        self._checkpointer: Optional[AsyncSqliteSaver] = None
-        self._checkpoint_conn: Optional[aiosqlite.Connection] = None
+        self._checkpointer: Optional[BaseCheckpointSaver] = None
+        self._checkpoint_conn: Optional[Any] = None
+        # Non-None only while the stateless worker driver owns an immutable
+        # worker_batch lease.  The saver and remote shell both bind to it.
+        self._worker_lease_token: Optional[int] = None
+        self._defer_job_cleanup = False
+        self._worker_checkpoint_post_commit = None
+        self._worker_env_restore: Dict[str, Optional[str]] = {}
+        # A durable completion accept closes run_queue before its background
+        # finalizer has chosen the job disposition.  During that gap the
+        # worker must make every local tool inert while retaining the exact
+        # shell/backend handles needed to enact a later terminal outcome.
+        self._worker_finalization_held = False
+        self._worker_finalization_backend: Any | None = None
+        self._worker_terminal_shell_cleanup: Callable[[], None] | None = None
+        self._worker_shell_admission_retired = False
 
         # Phase-specific LLMs (created if phase overrides configured)
         self._strategic_llm: Optional[BaseChatModel] = None
@@ -163,6 +382,13 @@ class UniversalAgent:
         # Auxiliary LLM for support tasks (summarization, memory extraction, curation)
         self._auxiliary_llm = None
 
+        # Citation verification (Phase 2): an AuxiliaryLLM on the citation model
+        # (dedicated CITATION_LLM model, or the auxiliary model fallback) + the
+        # matrix-resolved prompt. Threaded onto ToolContext so the citation
+        # engine schedules async verdict write-back.
+        self._citation_verify_aux = None
+        self._citation_verification_prompt = ""
+
         # Tool context (for phase-aware behavior)
         self._tool_context: Optional[ToolContext] = None
 
@@ -171,6 +397,20 @@ class UniversalAgent:
         self._todo_manager: Optional[TodoManager] = None
         self._current_job_id: Optional[str] = None
         self._job_metadata: Optional[Dict[str, Any]] = None
+        # Upload-sourced instructions.md content, resolved eagerly by
+        # _resolve_uploaded_instructions() because a virtual-file provider's
+        # read() is synchronous and the download is not. None means "no
+        # upload for this job" (or not yet resolved) — the instructions
+        # provider then falls back to inline metadata, then the template.
+        self._resolved_instructions_md: Optional[str] = None
+        # Agent-authored workspace files (path → content) that a pod re-provision
+        # would drop (bound skills). Re-asserted on SSH reconnect via
+        # RemoteBackend's on_reconnect hook. See
+        # knowledge-base/knowledge/issues/reviewing_parent_pod_reaped_under_critic.md (Issue 4).
+        # instructions.md / task_brief.md used to be re-asserted here too, but
+        # a virtual file cannot be lost, so re-assertion narrows to genuinely
+        # seeded real files (knowledge-base/knowledge/features/virtual_directories.md).
+        self._agent_seed_files: Dict[str, str] = {}
         self._datasource_connections: Dict[str, Any] = {}
         self._datasource_clients: Dict[
             str, Any
@@ -232,6 +472,34 @@ class UniversalAgent:
         config = load_agent_config(resolved_path, deployment_dir)
         return cls(config, postgres_conn)
 
+    @classmethod
+    def from_resolved(
+        cls,
+        resolved_config: dict,
+        postgres_conn: Optional[Any] = None,
+    ) -> "UniversalAgent":
+        """Create an agent from an orchestrator-resolved config blob.
+
+        The blob (``serialize_resolved_config`` shape) is already fully merged
+        and frozen by the orchestrator — bundled base + expert + override layers
+        + settings matrix, with resolved prompts/instructions inline. No disk or
+        DB resolution happens here: ``load_config_from_resolved`` hydrates the
+        ``AgentConfig`` and seeds ``config.extra['_resolved_prompts'/
+        '_resolved_instructions']`` so the render path uses the frozen text (and
+        fences a DB persona via the ``_persona_source`` marker). This supersedes
+        agent-side resolution (Decision 6); ``from_config`` remains the fallback
+        when no blob is delivered.
+
+        Args:
+            resolved_config: Resolved config blob from the orchestrator.
+            postgres_conn: Optional PostgreSQL connection.
+
+        Returns:
+            UniversalAgent instance
+        """
+        config = load_config_from_resolved(resolved_config)
+        return cls(config, postgres_conn)
+
     async def initialize(self) -> None:
         """
         Initialize the agent and its components.
@@ -272,6 +540,8 @@ class UniversalAgent:
         """
         llm_config = self.config.llm
         limits = self.config.limits
+        # Reset each call (idempotent across boot-time + per-job recreation).
+        self._model_config_warnings: List[str] = []
 
         if llm_config.has_phase_overrides():
             # Create phase-specific LLMs
@@ -279,8 +549,80 @@ class UniversalAgent:
             tactical_config = llm_config.get_phase_config("tactical")
             summarization_config = llm_config.get_phase_config("summarization")
 
+            # Phase models resolve their OWN family params + window instead of
+            # inheriting the base/primary slot (gemma by default). The shared
+            # context budget is the min of the two phase windows (single shared
+            # history). See knowledge-history/done/context_budget_uses_base_model_not_phase_models.md.
+            # NOTE: this overwrites the matrix/DB-derived `limits` window leaves —
+            # the phase-min is authoritative for a job whose inference models are
+            # the phase models, so it supersedes any base-family admin override.
+            budget = resolve_phase_model_budget(
+                base_model=llm_config.model,
+                strategic_override=llm_config.strategic,
+                tactical_override=llm_config.tactical,
+                summarization_override=llm_config.summarization,
+                deployment_dir=self.config._deployment_dir,
+            )
+            effective_multimodal = budget["effective_multimodal"]
+
+            # Overlay own-family params + own window + reconciled multimodal onto
+            # each OVERRIDDEN phase's (distinct) config. MUST run before the `==`
+            # reuse comparisons below so same-family phases still dedupe and
+            # cross-family ones correctly diverge. Phases without an override
+            # share `self.config.llm` (get_phase_config returns self) and are left
+            # untouched here — they genuinely run the base model + base params.
+            _phase_cfgs = {
+                "strategic": strategic_config,
+                "tactical": tactical_config,
+                "summarization": summarization_config,
+            }
+            for _phase, _vals in budget["params"].items():
+                _cfg = _phase_cfgs[_phase]
+                for _k, _v in _vals.items():
+                    setattr(_cfg, _k, _v)
+                _win = budget["windows"].get(_phase)
+                if _win:
+                    # Own window so the HTTP-layer 413 preflight uses the model's
+                    # TRUE window, not the inherited base 131072.
+                    _cfg.model_max_context_tokens = int(_win)
+                _cfg.multimodal = effective_multimodal
+
+            # Reconcile multimodal on the PERSISTENT config so the per-tool image
+            # gate (get_phase_multimodal -> self.config.llm.get_phase_config) and
+            # the client flag agree: a non-multimodal phase model can never be
+            # handed an image the other phase left on the shared history.
+            llm_config.multimodal = effective_multimodal
+            for _ov in (
+                llm_config.strategic,
+                llm_config.tactical,
+                llm_config.summarization,
+            ):
+                if _ov is not None and _ov.multimodal is not None:
+                    _ov.multimodal = effective_multimodal
+
+            # Raise the shared compaction budget to the phase min (escapes the
+            # gemma-derived 131072 cap). `limits` is self.config.limits — mutating
+            # it in place is seen by create_llm below and the ContextManager built
+            # later in build_phase_alternation_graph.
+            _min = budget["min_window"]
+            if _min:
+                limits.model_max_context_tokens = int(_min)
+                limits.context_threshold_tokens = int(_min * CONTEXT_THRESHOLD_FRACTION)
+                limits.message_count_min_tokens = int(_min * MESSAGE_COUNT_MIN_FRACTION)
+
+            # Surface mismatch warnings (backend: log + frozen-config blob).
+            self._model_config_warnings = [m for _lvl, m in budget["warnings"]]
+            for _lvl, _msg in budget["warnings"]:
+                (logger.warning if _lvl == "warning" else logger.info)(
+                    f"Phase model config: {_msg}"
+                )
+
             self._strategic_llm = create_llm(strategic_config, limits=limits)
-            logger.info(f"Created strategic LLM: {strategic_config.model}")
+            logger.info(
+                f"Created strategic LLM: {strategic_config.model} "
+                f"(window={strategic_config.model_max_context_tokens}, "
+                f"budget={limits.model_max_context_tokens})"
+            )
 
             # Optimization: reuse LLM if fully identical config (not just model name)
             if tactical_config == strategic_config:
@@ -327,19 +669,53 @@ class UniversalAgent:
 
         # Create AuxiliaryLLM for support tasks (summarization, memory, curation)
         self._initialize_auxiliary_llm(llm_config, limits)
+        # Citation verifier (Phase 2) — built on the aux LLM, so after it.
+        self._initialize_citation_verifier(limits)
 
     def _initialize_auxiliary_llm(self, llm_config, limits) -> None:
         """Create the AuxiliaryLLM instance for support tasks.
 
         Uses auxiliary.model/base_url if configured, otherwise falls back
         to the summarization LLM (which itself falls back to strategic LLM).
+
+        Rebuild-safe: ``_setup_job_workspace`` recreates the phase LLMs for
+        every dispatched job (credential-injected ``config_override`` makes the
+        config dirty; the frozen-blob branch recreates too), which lands HERE
+        and used to replace ``self._auxiliary_llm`` with a fresh instance whose
+        ``set_job_context`` wiring was lost. process_job wires the archiver
+        BEFORE that rebuild, so every worker aux call (memory extraction,
+        assembly, the rest) ran with ``_archiver=None`` — real provider spend
+        with no ``llm_requests`` row and no metering. Found by the lane-ab-01
+        bench: pinned jobs stored observer memories with zero audited
+        extraction calls. Any rebuild must therefore carry the previous
+        instance's job wiring forward; ``_wire_aux_job_context`` below does.
         """
         from src.services.auxiliary import AuxiliaryLLM
 
+        _prev_aux = self._auxiliary_llm
+
         aux_config = self.config.auxiliary
+        # The summarizer's budgeting authority: the aux model's own window when
+        # a dedicated model is configured, else the main working window (the
+        # fallback summarizer IS the main/summarization LLM there). See
+        # knowledge-base/knowledge/features/context_summarization_rework.md (S1).
+        main_window = getattr(limits, "model_max_context_tokens", None)
+        summarization_config = llm_config.get_phase_config("summarization")
+        summarization_settings = resolve_model_settings(
+            summarization_config.model, self.config._deployment_dir
+        )
+        summarization_structured_output_method = summarization_settings.get(
+            "structured_output_method", "json_schema"
+        )
+
         if not aux_config.enabled:
             # Wrap summarization LLM as fallback even when auxiliary is disabled
-            self._auxiliary_llm = AuxiliaryLLM(llm=self._summarization_llm)
+            self._auxiliary_llm = AuxiliaryLLM(
+                llm=self._summarization_llm,
+                max_context_tokens=main_window,
+                structured_output_method=summarization_structured_output_method,
+            )
+            self._wire_aux_job_context(_prev_aux, self._auxiliary_llm)
             logger.info("AuxiliaryLLM disabled, using summarization LLM as fallback")
             return
 
@@ -354,36 +730,160 @@ class UniversalAgent:
                 model=aux_config.model,
                 base_url=aux_config.base_url,
                 api_key=aux_config.api_key,
+                provider=aux_config.provider,
                 temperature=aux_config.temperature,
                 top_p=model_settings.get("top_p"),
                 top_k=model_settings.get("top_k"),
                 model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+                extra_body=model_settings.get("extra_body"),
                 max_retries=1,
             )
             aux_llm = create_llm(aux_llm_config, limits=limits)
+            aux_window = aux_llm_config.model_max_context_tokens or main_window
+            # Drop-in fallback for a dead/unreachable dedicated aux model: the
+            # summarization LLM (main working model). Keeps compaction + memory
+            # alive instead of crashing the job when the aux endpoint fails.
+            aux_fallback = self._summarization_llm
+            aux_fallback_method = summarization_structured_output_method
             logger.info(
                 f"Created auxiliary LLM: {aux_config.model}"
                 f" (settings matrix: top_p={aux_llm_config.top_p},"
                 f" top_k={aux_llm_config.top_k},"
                 f" max_ctx={aux_llm_config.model_max_context_tokens})"
             )
+            aux_structured_output_method = model_settings.get(
+                "structured_output_method", "json_schema"
+            )
         else:
             # Reuse summarization LLM (which is already the best fallback chain)
             aux_llm = self._summarization_llm
+            aux_window = main_window
+            # aux already IS the main model — nothing to fall back to.
+            aux_fallback = None
+            aux_fallback_method = None
+            aux_structured_output_method = summarization_structured_output_method
             logger.info("AuxiliaryLLM: reusing summarization LLM")
 
         self._auxiliary_llm = AuxiliaryLLM(
             llm=aux_llm,
             max_iterations=aux_config.max_iterations,
             timeout=aux_config.timeout,
+            max_context_tokens=aux_window,
+            fallback_llm=aux_fallback,
+            structured_output_method=aux_structured_output_method,
+            fallback_structured_output_method=aux_fallback_method,
         )
+        self._wire_aux_job_context(_prev_aux, self._auxiliary_llm)
+
+    @staticmethod
+    def _wire_aux_job_context(prev, new) -> None:
+        """Copy a mid-job archiver wiring from a replaced AuxiliaryLLM.
+
+        No-op at boot (no previous instance / no wiring yet). During a per-job
+        LLM rebuild the previous instance carries the archiver + job identity
+        that ``process_job`` wired before the rebuild; without this copy the
+        replacement silently drops every auxiliary call from the audit trail
+        and the cost pipeline (both read ``llm_requests``).
+        """
+        if prev is None or new is None or prev is new:
+            return
+        archiver = getattr(prev, "_archiver", None)
+        job_id = getattr(prev, "_job_id", None)
+        if archiver is None or not job_id:
+            return
+        new.set_job_context(
+            archiver=archiver,
+            job_id=job_id,
+            agent_type=getattr(prev, "_agent_type", None) or "",
+        )
+
+    def _initialize_citation_verifier(self, limits) -> None:
+        """Build the citation-verification AuxiliaryLLM (D6) + load its prompt.
+
+        Uses a dedicated citation model when one is dispatched
+        (``CITATION_LLM_MODEL`` — set by the orchestrator from the per-job
+        override / Admin default), else reuses the auxiliary model. Gated by
+        ``auxiliary.tasks.verify_citations``. The citation engine schedules
+        verification as a background ``AuxiliaryLLM`` chain task (async,
+        eventually-consistent).
+        """
+        import os
+
+        from src.services.auxiliary import AuxiliaryLLM
+
+        aux_cfg = self.config.auxiliary
+        _prev_verify = self._citation_verify_aux
+        task_cfg = aux_cfg.tasks.get("verify_citations")
+        if not aux_cfg.enabled or task_cfg is None or not task_cfg.enabled:
+            self._citation_verify_aux = None
+            logger.info(
+                "Citation verification disabled (auxiliary.tasks.verify_citations)"
+            )
+            return
+
+        citation_model = os.getenv("CITATION_LLM_MODEL")
+        if citation_model and self._auxiliary_llm is not None:
+            # Dedicated citation model (D6) — resolve its family settings matrix.
+            model_settings = resolve_model_settings(
+                citation_model, self.config._deployment_dir
+            )
+            verify_cfg = LLMConfig(
+                model=citation_model,
+                base_url=os.getenv("CITATION_LLM_BASE_URL")
+                or os.getenv("CITATION_LLM_URL"),
+                api_key=os.getenv("CITATION_LLM_API_KEY")
+                or os.getenv("OPENAI_API_KEY"),
+                temperature=0.0,
+                top_p=model_settings.get("top_p"),
+                top_k=model_settings.get("top_k"),
+                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+                extra_body=model_settings.get("extra_body"),
+                max_retries=1,
+            )
+            try:
+                verify_llm = create_llm(verify_cfg, limits=limits)
+                self._citation_verify_aux = AuxiliaryLLM(
+                    llm=verify_llm,
+                    structured_output_method=model_settings.get(
+                        "structured_output_method", "json_schema"
+                    ),
+                    timeout=aux_cfg.timeout,
+                    max_context_tokens=verify_cfg.model_max_context_tokens,
+                )
+                # Same mid-job rebuild hazard as _initialize_auxiliary_llm.
+                self._wire_aux_job_context(_prev_verify, self._citation_verify_aux)
+                prompt_model = citation_model
+                logger.info(f"Citation verifier: dedicated model {citation_model}")
+            except Exception as e:
+                logger.warning(
+                    f"Could not build dedicated citation model '{citation_model}' "
+                    f"({e}); falling back to the auxiliary model"
+                )
+                self._citation_verify_aux = self._auxiliary_llm
+                prompt_model = aux_cfg.model or self.config.llm.model
+        else:
+            # Fall back to the auxiliary model.
+            self._citation_verify_aux = self._auxiliary_llm
+            prompt_model = aux_cfg.model or self.config.llm.model
+            logger.info("Citation verifier: reusing auxiliary model")
+
+        # Resolve the verification prompt via the matrix (model-family aware).
+        try:
+            from src.core.loader import load_auxiliary_prompt
+
+            self._citation_verification_prompt = load_auxiliary_prompt(
+                self.config, "citation_verification", model=prompt_model or ""
+            )
+        except Exception as e:
+            logger.warning(f"Could not load citation_verification prompt: {e}")
+            self._citation_verification_prompt = ""
 
     async def _setup_connections(self) -> None:
         """Set up required database connections.
 
         Falls back to environment variables for configuration.
         External datasources (Neo4j, MongoDB, etc.) are resolved per-job
-        via the datasource connector system — see docs/datasources.md.
+        via the datasource connector system — see knowledge-base/knowledge/datasources.md.
         """
         from src.utils.db_url import build_postgres_url
 
@@ -426,8 +926,17 @@ class UniversalAgent:
         stream: bool = False,
         resume: bool = False,
         feedback: Optional[str] = None,
+        feedback_reason: Optional[str] = None,
         original_config_name: Optional[str] = None,
         previous_status: Optional[str] = None,
+        worker_lease_token: Optional[int] = None,
+        worker_batch_target_wall_seconds: Optional[float] = None,
+        worker_batch_min_wall_seconds: Optional[float] = None,
+        worker_batch_iteration_cap: Optional[int] = None,
+        worker_resume_id: Optional[str] = None,
+        worker_retry_exhausted: bool = False,
+        defer_cleanup: bool = False,
+        worker_checkpoint_post_commit=None,
     ) -> Dict[str, Any]:
         """Process a single job.
 
@@ -440,6 +949,8 @@ class UniversalAgent:
             stream: If True, return an async iterator of state updates
             resume: If True, resume from last completed phase snapshot
             feedback: Optional feedback message to inject when resuming a frozen job
+            feedback_reason: Why the job was resumed with feedback (rendered in
+                the [FEEDBACK_RESUME] banner; None -> honest generic fallback)
             original_config_name: Original config name used when job was created
                 (for legacy checkpoint lookup when resuming old jobs)
             previous_status: Job status before resume. Graceful stops (cancelled,
@@ -461,14 +972,49 @@ class UniversalAgent:
         if not self._initialized:
             await self.initialize()
 
+        stateless_worker = worker_lease_token is not None
+        if stateless_worker:
+            if int(worker_lease_token) <= 0:
+                raise ValueError("worker_lease_token must be positive")
+            if (
+                getattr(self, "_worker_finalization_held", False)
+                or getattr(self, "_worker_finalization_backend", None) is not None
+                or getattr(self, "_worker_terminal_shell_cleanup", None) is not None
+            ):
+                raise RuntimeError(
+                    "A new worker claim cannot replace a finalization-pending hold"
+                )
+            if (
+                worker_batch_target_wall_seconds is None
+                or float(worker_batch_target_wall_seconds) <= 0
+            ):
+                raise ValueError("worker batch target must be positive")
+            self._worker_lease_token = int(worker_lease_token)
+            self._defer_job_cleanup = bool(defer_cleanup)
+            self._worker_checkpoint_post_commit = worker_checkpoint_post_commit
+            self._worker_shell_admission_retired = False
+        else:
+            self._worker_lease_token = None
+            self._defer_job_cleanup = False
+            self._worker_checkpoint_post_commit = None
+
         # Reset config to base snapshot before applying per-job overrides
         self.config = self._base_config
 
         self._current_job_id = job_id
         self._job_metadata = metadata or {}
+        if stateless_worker:
+            self._capture_worker_environment(self._job_metadata)
         self._datasource_connections = {}
         self._datasource_clients = {}
         logger.info(f"Processing job {job_id}")
+
+        # JobResumeRequest ships no description/deliverables/kickoff, so a
+        # resumed job would serve an empty virtual task_brief.md for the rest
+        # of its life. Backfill from the orchestrator/DB before the brief
+        # provider registers (fresh_job_dispatched_as_resume_skips_seeding.md).
+        if resume and not self._job_metadata.get("description"):
+            await self._hydrate_job_brief(job_id)
 
         # Wire archiver + job context into AuxiliaryLLM for auxiliary call logging
         if self._auxiliary_llm:
@@ -479,6 +1025,17 @@ class UniversalAgent:
                 job_id=job_id,
                 agent_type=self.config.agent_id,
             )
+            # The dedicated citation verifier (if distinct) needs the same
+            # archiver/job context so its calls land in the debug view.
+            if (
+                self._citation_verify_aux is not None
+                and self._citation_verify_aux is not self._auxiliary_llm
+            ):
+                self._citation_verify_aux.set_job_context(
+                    archiver=_get_archiver_for_aux(),
+                    job_id=job_id,
+                    agent_type=self.config.agent_id,
+                )
 
         try:
             # Create workspace for this job
@@ -488,27 +1045,84 @@ class UniversalAgent:
                 job_id, metadata, resume=resume
             )
 
-            # Handle frozen job resume
+            # Retired framework bookkeeping from P1-C/F13. Old job branches,
+            # inherited project snapshots, and resumed workspaces may still
+            # carry this tracked file. Remove it before the model receives its
+            # workspace so a stale boundary snapshot cannot masquerade as live
+            # deliverable state. The contract itself remains in task_brief.md;
+            # job_complete and the orchestrator gate validate the real files.
+            self._remove_legacy_manifest_status(job_id)
+
+            # Handle frozen job resume. Backend-aware check: a local Path.exists()
+            # never sees the marker on remote workspaces.
             if resume:
-                frozen_path = self._workspace_manager.get_path("output/job_frozen.json")
-                if frozen_path.exists():
+                if self._workspace_manager.exists("output/job_frozen.json"):
                     logger.info(f"Resuming frozen job {job_id}")
                     # Remove the frozen marker so the graph can continue
-                    frozen_path.unlink()
+                    self._workspace_manager.delete_file("output/job_frozen.json")
                     logger.info("Removed job_frozen.json to allow continuation")
                     # NOTE: Status is set to 'processing' by the orchestrator
                     # when it dispatches/resumes the job — no DB write needed here.
 
             # Load tools for this job
             await self._setup_job_tools()
+            if self._tool_context is not None:
+                self._tool_context._stateless_worker = stateless_worker
+                self._tool_context._worker_lease_token = (
+                    int(worker_lease_token) if stateless_worker else None
+                )
 
-            # Create checkpointer for this job (enables resume after crash)
-            checkpoint_path = self._get_checkpoint_path(job_id)
-            self._checkpoint_conn = await aiosqlite.connect(checkpoint_path)
-            # Wrap connection to add is_alive() for langgraph-checkpoint-sqlite 3.x compatibility
-            wrapped_conn = _AiosqliteConnectionWrapper(self._checkpoint_conn)
-            self._checkpointer = AsyncSqliteSaver(wrapped_conn)
-            logger.info(f"Checkpointer initialized at {checkpoint_path}")
+            # Phase 0: commit + push the fully seeded workspace so the job's
+            # inputs (instructions, brief, documents, README) are visible in
+            # the repo before the first phase archive commit.
+            if not resume:
+                self._commit_workspace_seed(job_id)
+
+            # Fail-closed guard: a memory-required job must not run "blind" if its
+            # embedding-backed stores failed to initialize (e.g. the dispatch
+            # dropped EMBEDDING_API_KEY). Pause for bounded re-dispatch — the
+            # orchestrator caps retries then fails — instead of silently running
+            # with memory + KB disabled. See
+            # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md.
+            _has_kb_scope = bool(
+                getattr(getattr(self, "_tool_context", None), "knowledge_bindings", [])
+            )
+            _memory_missing = getattr(self, "_memory_degraded", False) or (
+                _has_kb_scope and getattr(self, "_kb_degraded", False)
+            )
+            if self.config.memory.required and _memory_missing:
+                logger.error(
+                    f"[{job_id}] memory.required=true but the embedding-backed "
+                    f"stores failed to initialize "
+                    f"(memory_degraded={getattr(self, '_memory_degraded', False)}, "
+                    f"kb_degraded={getattr(self, '_kb_degraded', False)}) — pausing "
+                    f"for re-dispatch instead of running without memory/KB"
+                )
+                if not getattr(self, "_defer_job_cleanup", False):
+                    self._cleanup_shell_manager()
+                    self._close_datasource_connections()
+                    await self._cleanup_checkpointer()
+                    self._current_job_id = None
+                freeze_state = {
+                    "job_id": job_id,
+                    "should_stop": True,
+                    "freeze_data": {
+                        "freeze_type": "memory_unavailable",
+                        "reason": (
+                            "Embedding service unavailable at startup — memory "
+                            "(RecallStore)/KB failed to initialize and this job "
+                            "requires memory (memory.required=true). Check the "
+                            "embedding model/endpoint (Admin → Models)."
+                        ),
+                    },
+                }
+                if stream:
+                    return self._yield_error_state(freeze_state)
+                return freeze_state
+
+            # Create checkpointer for this job (enables resume after crash, and
+            # — with CHECKPOINTER_BACKEND=postgres — cross-pod resume).
+            await self._make_checkpointer(job_id)
 
             # Create snapshot manager for phase recovery
             # Pass workspace backend so snapshots are extracted from VM to pod-local storage
@@ -557,7 +1171,30 @@ class UniversalAgent:
                 "waiting",
             }
             graph_input = None
-            if resume:
+            worker_terminal_state: Optional[Dict[str, Any]] = None
+            if stateless_worker:
+                # Shared Postgres is the canonical crash/rotation lane.  Never
+                # rewind a stateless worker through the pod-local phase snapshot
+                # fallback, including prior_status='processing' steals.
+                checkpoint_state = await self._graph.aget_state(thread_config)
+                if checkpoint_state and checkpoint_state.values:
+                    graph_input = None
+                    resume = True
+                    logger.info(
+                        "[%s] Stateless worker resuming canonical Postgres checkpoint",
+                        job_id,
+                    )
+                else:
+                    graph_input = create_initial_state(
+                        job_id=job_id,
+                        workspace_path=str(self._workspace_manager.path),
+                        metadata=updated_metadata,
+                    )
+                    logger.info(
+                        "[%s] Stateless worker found no checkpoint; starting fresh",
+                        job_id,
+                    )
+            elif resume:
                 is_graceful = previous_status in GRACEFUL_STOP_STATUSES
                 if is_graceful:
                     logger.info(
@@ -620,46 +1257,204 @@ class UniversalAgent:
                     metadata=updated_metadata,
                 )
 
-            # Inject feedback into graph state via aupdate_state
-            # This sets resume_feedback so route_entry routes to restore_from_feedback
-            if resume and feedback and graph_input is None:
-                await self._graph.aupdate_state(
-                    thread_config,
-                    {
-                        "resume_feedback": feedback,
-                        "should_stop": False,
-                        "goal_achieved": False,
-                        "is_final_phase": False,
-                    },
-                    as_node="__start__",
+            if resume and graph_input is not None:
+                # Every lookup failed: resume=True with nothing to resume from.
+                await self._note_resume_without_checkpoint(job_id, previous_status)
+
+            checkpoint_values: Dict[str, Any] = {}
+            if resume and graph_input is None:
+                # Process-local TodoManager state is not reconstructed by
+                # LangGraph itself.  A mid-loop checkpoint can resume at its
+                # pending next node and bypass route_entry/restore_todo_state,
+                # so hydrate it explicitly on every resume.
+                snapshot = await self._graph.aget_state(thread_config)
+                values = snapshot.values or {}
+                checkpoint_values = dict(values)
+                if hydrate_todo_manager_from_state(self._todo_manager, values):
+                    logger.info(
+                        "[%s] Hydrated TodoManager before checkpoint resume",
+                        job_id,
+                    )
+                delivered_reply_keys = values.get("delivered_reply_keys") or []
+                if (
+                    stateless_worker
+                    and self._tool_context is not None
+                    and isinstance(delivered_reply_keys, list)
+                ):
+                    self._tool_context._delivered_reply_keys = {
+                        str(key) for key in delivered_reply_keys if key is not None
+                    }
+                if stateless_worker and self._tool_context is not None:
+                    restored_instruction_reads = self._restore_worker_instruction_reads(
+                        values
+                    )
+                    if restored_instruction_reads:
+                        logger.info(
+                            "[%s] Restored %d checkpointed instruction-read receipt(s)",
+                            job_id,
+                            restored_instruction_reads,
+                        )
+                if stateless_worker and self._worker_checkpoint_post_commit:
+                    checkpoint_id = ""
+                    snapshot_config = getattr(snapshot, "config", None)
+                    if isinstance(snapshot_config, dict):
+                        configurable = snapshot_config.get("configurable")
+                        if isinstance(configurable, dict):
+                            checkpoint_id = str(configurable.get("checkpoint_id") or "")
+                    try:
+                        await self._worker_checkpoint_post_commit.reconcile_values(
+                            values,
+                            checkpoint_id=checkpoint_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[%s] Claim-time steering ack reconciliation failed; "
+                            "a later checkpoint/claim will retry",
+                            job_id,
+                            exc_info=True,
+                        )
+
+            # Stateless routing and batch arming must be one durable update.
+            # A second LangGraph update can consume the pending task selected
+            # by feedback/delegation/auto-continue before any node runs.
+            worker_resume_updates: Dict[str, Any] = {}
+            worker_resume_as_node: Optional[str] = None
+
+            # Inject feedback into graph state via aupdate_state. This sets
+            # resume_feedback so route_entry routes to restore_from_feedback.
+            if resume and feedback and (graph_input is None or stateless_worker):
+                selected_node = await self._inject_resume_feedback(
+                    job_id=job_id,
+                    stateless_worker=stateless_worker,
+                    graph_input=graph_input,
+                    thread_config=thread_config,
+                    checkpoint_values=checkpoint_values,
+                    feedback=feedback,
+                    feedback_reason=feedback_reason,
+                    metadata=updated_metadata,
+                    deferred_updates=(
+                        worker_resume_updates
+                        if stateless_worker and graph_input is None
+                        else None
+                    ),
                 )
-                logger.info("Injected feedback into graph state via aupdate_state")
+                if selected_node is not None:
+                    worker_resume_as_node = selected_node
 
             # Inject delegation results into graph state when resuming from waiting
             delegation_results = (updated_metadata or {}).get("delegation_results")
-            if resume and delegation_results and graph_input is None:
-                from langchain_core.messages import HumanMessage
+            if (
+                resume
+                and delegation_results
+                and (graph_input is None or stateless_worker)
+            ):
+                selected_node = await self._inject_delegation_results(
+                    job_id=job_id,
+                    stateless_worker=stateless_worker,
+                    graph_input=graph_input,
+                    thread_config=thread_config,
+                    checkpoint_values=checkpoint_values,
+                    delegation_results=delegation_results,
+                    metadata=updated_metadata,
+                    deferred_updates=(
+                        worker_resume_updates
+                        if stateless_worker and graph_input is None
+                        else None
+                    ),
+                )
+                if selected_node is not None:
+                    # Retain today's ordering: delegation is applied after
+                    # feedback and therefore selects the final resume route.
+                    worker_resume_as_node = selected_node
+            # Auto-continue resume (version_upgrade / llm_unavailable / memory /
+            # workspace-upgrade): a graceful re-dispatch with NO feedback and NO
+            # delegation. The prior in-graph freeze persisted should_stop=True +
+            # freeze_data in the checkpoint and the run reached END. ainvoke(None)
+            # on an ended thread with should_stop=True runs ZERO nodes and returns
+            # the terminal frozen state — so restore_todo_state (which clears the
+            # stop flags on resume) never runs and the job re-freezes forever with
+            # no progress. Pinned clears the terminal envelope here. Stateless
+            # stages its clear + optional shape nudge so _arm_worker_batch can
+            # commit clear + nudge + arm in ONE START update. Scoped to
+            # auto-continue freeze types so human-review stops are untouched. See
+            # knowledge-base/knowledge/issues/version_upgrade_drain_livelock.md.
+            if (
+                resume
+                and graph_input is None
+                and not feedback
+                and not delegation_results
+            ):
+                selected_node = await self._prepare_auto_continue_resume(
+                    job_id=job_id,
+                    thread_config=thread_config,
+                    updated_metadata=updated_metadata,
+                    stateless_worker=stateless_worker,
+                    deferred_updates=(
+                        worker_resume_updates
+                        if stateless_worker and graph_input is None
+                        else None
+                    ),
+                )
+                if selected_node is not None:
+                    worker_resume_as_node = selected_node
 
-                results_msg = _format_delegation_results(delegation_results)
-                await self._graph.aupdate_state(
-                    thread_config,
-                    {
-                        "messages": [HumanMessage(content=results_msg)],
-                        "should_stop": False,
-                        "goal_achieved": False,
-                    },
-                    as_node="restore_todo_state",
+            if stateless_worker:
+                # Arm last, after feedback/delegation/auto-continue has chosen
+                # the resume frontier.  A plain state update on a mid-loop
+                # checkpoint must preserve its pending next node; START is
+                # reserved for a clean END re-entry below.
+                worker_terminal_state = await self._arm_worker_batch(
+                    job_id=job_id,
+                    graph_input=graph_input,
+                    thread_config=thread_config,
+                    target_wall_seconds=worker_batch_target_wall_seconds,
+                    min_wall_seconds=worker_batch_min_wall_seconds,
+                    iteration_cap=worker_batch_iteration_cap,
+                    resume_id=worker_resume_id,
+                    retry_exhausted=worker_retry_exhausted,
+                    resume_updates=worker_resume_updates,
+                    resume_as_node=worker_resume_as_node,
                 )
-                logger.info(
-                    f"Injected delegation results into graph state "
-                    f"({len(delegation_results)} children)"
-                )
+
+            # Durable-first resume hydration (journal-before-observe):
+            # a restarted process lost the in-memory completion decision, so
+            # re-seed the cache from the journaled record. Never on feedback
+            # resumes — those demand new work and the decision is void (the
+            # orchestrator also drops it in queue_job_for_resume). Never on
+            # fresh dispatches — a fresh run must not inherit a stale
+            # decision and insta-finalize. Non-fatal: without it the
+            # checkpointed state mirror and the model's own re-issued
+            # job_complete (idempotent) still recover.
+            if resume and not feedback and self._orchestrator_client:
+                try:
+                    decision = (
+                        await self._orchestrator_client.fetch_completion_decision(
+                            job_id
+                        )
+                    )
+                    if decision:
+                        from .tools.core.job import seed_final_phase_data
+
+                        seed_final_phase_data(job_id, decision)
+                except Exception as e:
+                    logger.warning(
+                        f"[{job_id}] Completion-decision hydration failed "
+                        f"(non-fatal, state mirror still applies): {e}"
+                    )
 
             if stream:
+                if worker_terminal_state is not None:
+                    # An error-release after a failed terminal HTTP report
+                    # reclaims an already-ended checkpoint.  LangGraph emits
+                    # zero stream items for ainvoke(None) at END, so surface
+                    # the durable values once without re-running any node.
+                    return self._yield_error_state(worker_terminal_state)
                 # For streaming, cleanup happens inside the generator
                 return self._process_job_streaming(graph_input, thread_config)
             else:
                 try:
+                    if worker_terminal_state is not None:
+                        return worker_terminal_state
                     final_state = await self._graph.ainvoke(
                         graph_input,
                         config=thread_config,
@@ -667,35 +1462,36 @@ class UniversalAgent:
                     self._jobs_processed += 1
                     return dict(final_state)
                 finally:
-                    self._current_job_id = None
-                    self._cleanup_shell_manager()
-                    self._close_datasource_connections()
-                    await self._cleanup_checkpointer()
+                    if not getattr(self, "_defer_job_cleanup", False):
+                        self._current_job_id = None
+                        self._cleanup_shell_manager()
+                        self._close_datasource_connections()
+                        await self._cleanup_checkpointer()
 
         except Exception as e:
-            # Detect workspace unavailable errors (VM connection lost)
-            from .core.workspace_backend import WorkspaceUnavailableError
+            from .core.workspace_backend import completion_error_payload
 
-            is_vm_error = isinstance(e, WorkspaceUnavailableError)
-
-            if is_vm_error:
+            error = completion_error_payload(e)["error"]
+            if error["type"] == "workspace_unavailable":
                 logger.error(
-                    f"Job {job_id}: VM workspace unavailable — will request recovery: {e}"
+                    f"Job {job_id}: workspace unavailable — will request recovery: {e}"
+                )
+            elif error["type"] == "workspace_authentication":
+                logger.error(
+                    f"Job {job_id}: workspace authentication failed "
+                    f"(non-retryable): {e}"
                 )
             else:
                 logger.error(f"Job {job_id} failed: {e}", exc_info=True)
 
-            self._cleanup_shell_manager()
-            self._close_datasource_connections()
-            await self._cleanup_checkpointer()
-            self._current_job_id = None
+            if not getattr(self, "_defer_job_cleanup", False):
+                self._cleanup_shell_manager()
+                self._close_datasource_connections()
+                await self._cleanup_checkpointer()
+                self._current_job_id = None
             error_state = {
                 "job_id": job_id,
-                "error": {
-                    "message": str(e),
-                    "type": "workspace_unavailable" if is_vm_error else "job_error",
-                    "recoverable": is_vm_error,
-                },
+                "error": error,
                 "should_stop": True,
             }
             if stream:
@@ -703,24 +1499,857 @@ class UniversalAgent:
                 return self._yield_error_state(error_state)
             return error_state
 
+    def _restore_worker_instruction_reads(self, values: Dict[str, Any]) -> int:
+        """Restore only checkpoint-safe instruction receipts for this claim."""
+
+        if self._tool_context is None:
+            return 0
+        return self._tool_context.restore_instruction_read_receipts(
+            values.get("instruction_read_receipts")
+        )
+
+    async def _prepare_auto_continue_resume(
+        self,
+        *,
+        job_id: str,
+        thread_config: Dict[str, Any],
+        updated_metadata: Optional[Dict[str, Any]],
+        stateless_worker: bool,
+        deferred_updates: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Prepare an ended machine stop for resume.
+
+        Pinned retains its historical updates. A checkpoint-backed stateless
+        caller stages its terminal clear and optional shape nudge so batch
+        arming can join the same START update.
+        """
+
+        try:
+            snapshot = await self._graph.aget_state(thread_config)
+            values = snapshot.values or {}
+            frozen = values.get("freeze_data") or {}
+            freeze_type = (
+                frozen.get("freeze_type") if isinstance(frozen, dict) else None
+            )
+            if not (
+                values.get("should_stop") and freeze_type in AUTO_CONTINUE_FREEZE_TYPES
+            ):
+                return None
+
+            outage_meta = (updated_metadata or {}).get("llm_outage")
+            pending_shape_nudge = bool(
+                isinstance(outage_meta, dict) and outage_meta.get("pending_shape_nudge")
+            )
+            clear_updates: Dict[str, Any] = {
+                "should_stop": False,
+                "goal_achieved": False,
+                "is_final_phase": False,
+                "freeze_data": None,
+                "error": None,
+                "client_report_id": None,
+                "completion_report_payload": None,
+            }
+            if stateless_worker and pending_shape_nudge:
+                from langchain_core.messages import HumanMessage
+
+                clear_updates["messages"] = [HumanMessage(content=_SHAPE_NUDGE_TEXT)]
+            if stateless_worker and deferred_updates is not None:
+                _merge_worker_resume_updates(deferred_updates, clear_updates)
+                logger.info(
+                    "[%s] Staged auto-continue resume (%s) for atomic "
+                    "stateless resume + arm",
+                    job_id,
+                    freeze_type,
+                )
+                if pending_shape_nudge:
+                    logger.warning(
+                        "[%s] Staged request-shape nudge for the stateless "
+                        "auto-continue + arm update",
+                        job_id,
+                    )
+                return "__start__"
+
+            await self._graph.aupdate_state(
+                thread_config,
+                clear_updates,
+                as_node="__start__",
+            )
+            logger.info(
+                "[%s] Auto-continue resume (%s) — cleared terminal stop "
+                "flags so the graph re-enters and resumes from its checkpoint",
+                job_id,
+                freeze_type,
+            )
+            if stateless_worker:
+                if pending_shape_nudge:
+                    logger.warning(
+                        "[%s] Injected request-shape nudge in the stateless "
+                        "auto-continue START update",
+                        job_id,
+                    )
+                return None
+            # >>> TEMPORARY QUICKFIX — remove with the upstream fix.
+            # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
+            if pending_shape_nudge:
+                from langchain_core.messages import HumanMessage
+
+                await self._graph.aupdate_state(
+                    thread_config,
+                    {"messages": [HumanMessage(content=_SHAPE_NUDGE_TEXT)]},
+                    as_node="__start__",
+                )
+                logger.warning(
+                    "[%s] Injected request-shape nudge — the previous payload "
+                    "was rejected upstream on every retry; appending a turn "
+                    "to change it",
+                    job_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to clear stop flags on auto-continue resume "
+                "(job may re-freeze without progress): %s",
+                job_id,
+                exc,
+            )
+        return None
+
+    async def _inject_resume_feedback(
+        self,
+        *,
+        job_id: str,
+        stateless_worker: bool,
+        graph_input: Optional[UniversalAgentState],
+        thread_config: Dict[str, Any],
+        checkpoint_values: Dict[str, Any],
+        feedback: str,
+        feedback_reason: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        deferred_updates: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Inject one exact feedback generation before resumed graph work.
+
+        A stateless resume may legitimately have no checkpoint yet (for
+        example, a pre-graph failure). In that case the first fenced
+        checkpoint must contain both the feedback and its delivery key; an
+        ``aupdate_state`` is impossible because the thread does not exist.
+        """
+        from src.shared.job_steering import context_delivery_key
+
+        feedback_key = context_delivery_key(
+            "feedback",
+            feedback,
+            delivery_id=(metadata or {}).get("queued_feedback_delivery_id"),
+            companion=feedback_reason,
+        )
+        delivered_feedback_keys = {
+            str(value)
+            for value in checkpoint_values.get("delivered_feedback_keys") or []
+            if value is not None
+        }
+        if stateless_worker and feedback_key in delivered_feedback_keys:
+            logger.info(
+                "[%s] Suppressed checkpointed feedback generation %s",
+                job_id,
+                feedback_key,
+            )
+            return None
+
+        feedback_update: Dict[str, Any] = {
+            "should_stop": False,
+            "goal_achieved": False,
+            "is_final_phase": False,
+            # A feedback resume voids any journaled finalization decision from
+            # the previous round (restore_from_feedback clears process caches).
+            "completion_decision": None,
+            "verdict_decision": None,
+            "client_report_id": None,
+            "completion_report_payload": None,
+        }
+        if stateless_worker:
+            feedback_update["delivered_feedback_keys"] = sorted(
+                delivered_feedback_keys | {feedback_key}
+            )
+        if graph_input is None:
+            feedback_update.update(
+                {
+                    "resume_feedback": feedback,
+                    "resume_reason": feedback_reason,
+                }
+            )
+            if deferred_updates is not None:
+                _merge_worker_resume_updates(deferred_updates, feedback_update)
+                logger.info(
+                    "[%s] Staged feedback for atomic stateless resume + arm",
+                    job_id,
+                )
+            else:
+                await self._graph.aupdate_state(
+                    thread_config,
+                    feedback_update,
+                    as_node="__start__",
+                )
+                logger.info("Injected feedback into graph state via aupdate_state")
+        else:
+            # A no-checkpoint resume is still the job's first initialization.
+            # Setting resume_feedback would route around init_workspace and
+            # init_strategic_todos, losing the original task and its initial
+            # todo plan. Keep the fresh route and add feedback as a
+            # supplemental durable HumanMessage instead.
+            from langchain_core.messages import HumanMessage
+
+            reason = (feedback_reason or "").strip() or (
+                "This job was resumed with feedback from its operator."
+            )
+            existing_messages = list(graph_input.get("messages") or [])
+            feedback_message = HumanMessage(
+                content=(
+                    f"[FEEDBACK_RESUME] {reason}\n\n"
+                    f"## Feedback\n\n{feedback}\n\n"
+                    "Apply this feedback while initializing and carrying out "
+                    "the original task below."
+                )
+            )
+            graph_input.update(feedback_update)
+            graph_input["messages"] = [*existing_messages, feedback_message]
+            logger.info(
+                "[%s] Added feedback to fresh stateless initialization input",
+                job_id,
+            )
+        checkpoint_values.update(feedback_update)
+        return (
+            "__start__"
+            if graph_input is None and deferred_updates is not None
+            else None
+        )
+
+    async def _inject_delegation_results(
+        self,
+        *,
+        job_id: str,
+        stateless_worker: bool,
+        graph_input: Optional[UniversalAgentState],
+        thread_config: Dict[str, Any],
+        checkpoint_values: Dict[str, Any],
+        delegation_results: list,
+        metadata: Optional[Dict[str, Any]],
+        deferred_updates: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Inject one exact delegation generation on checkpoint or fresh input."""
+        from langchain_core.messages import HumanMessage
+        from src.shared.job_steering import context_delivery_key
+
+        delegation_key = context_delivery_key(
+            "delegation",
+            delegation_results,
+            delivery_id=(metadata or {}).get("delegation_results_delivery_id"),
+        )
+        delivered_delegation_keys = {
+            str(value)
+            for value in checkpoint_values.get("delivered_delegation_keys") or []
+            if value is not None
+        }
+        if stateless_worker and delegation_key in delivered_delegation_keys:
+            logger.info(
+                "[%s] Suppressed checkpointed delegation generation %s",
+                job_id,
+                delegation_key,
+            )
+            return None
+
+        result_message = HumanMessage(
+            content=_format_delegation_results(delegation_results)
+        )
+        delegation_update: Dict[str, Any] = {
+            "messages": [result_message],
+            "should_stop": False,
+            "goal_achieved": False,
+            "client_report_id": None,
+            "completion_report_payload": None,
+        }
+        if stateless_worker:
+            delegation_update["delivered_delegation_keys"] = sorted(
+                delivered_delegation_keys | {delegation_key}
+            )
+        if graph_input is None:
+            if deferred_updates is not None:
+                _merge_worker_resume_updates(deferred_updates, delegation_update)
+                logger.info(
+                    "[%s] Staged delegation results for atomic stateless resume + arm",
+                    job_id,
+                )
+            else:
+                await self._graph.aupdate_state(
+                    thread_config,
+                    delegation_update,
+                    as_node="restore_todo_state",
+                )
+        else:
+            existing_messages = list(graph_input.get("messages") or [])
+            graph_input.update(delegation_update)
+            graph_input["messages"] = [*existing_messages, result_message]
+        checkpoint_values.update(delegation_update)
+        logger.info(
+            "Injected delegation results into graph state (%d children)",
+            len(delegation_results),
+        )
+        return (
+            "restore_todo_state"
+            if graph_input is None and deferred_updates is not None
+            else None
+        )
+
+    async def _arm_worker_batch(
+        self,
+        *,
+        job_id: str,
+        graph_input: Optional[UniversalAgentState],
+        thread_config: Dict[str, Any],
+        target_wall_seconds: Optional[float],
+        min_wall_seconds: Optional[float],
+        iteration_cap: Optional[int],
+        resume_id: Optional[str] = None,
+        retry_exhausted: bool = False,
+        resume_updates: Optional[Dict[str, Any]] = None,
+        resume_as_node: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically route and arm a claim, or adopt a durable prior arm."""
+
+        target = float(target_wall_seconds or 0)
+        if not math.isfinite(target) or target <= 0:
+            raise ValueError("worker batch target must be a positive finite number")
+        floor = (
+            WORKER_BATCH_MIN_WALL_SECONDS
+            if min_wall_seconds is None
+            else float(min_wall_seconds)
+        )
+        if not math.isfinite(floor) or floor < 0:
+            raise ValueError("worker batch floor must be a finite non-negative number")
+        cap = None
+        if iteration_cap is not None:
+            if isinstance(iteration_cap, bool) or int(iteration_cap) <= 0:
+                raise ValueError("worker batch iteration cap must be positive")
+            cap = int(iteration_cap)
+
+        values: Dict[str, Any]
+        snapshot = None
+        if graph_input is None:
+            snapshot = await self._graph.aget_state(thread_config)
+            values = dict(snapshot.values or {})
+        else:
+            values = graph_input
+        iteration = values.get("iteration", 0)
+        if isinstance(iteration, bool) or not isinstance(iteration, int):
+            try:
+                iteration = int(iteration)
+            except (TypeError, ValueError):
+                iteration = 0
+
+        updates: Dict[str, Any] = {
+            "worker_batch_started_at": time.time(),
+            "worker_batch_start_iteration": iteration,
+            "worker_batch_target_wall_seconds": target,
+            "worker_batch_min_wall_seconds": floor,
+            "worker_batch_iteration_cap": cap,
+        }
+        if resume_updates:
+            _merge_worker_resume_updates(updates, resume_updates)
+        resume_route_pending = bool(resume_updates and resume_as_node)
+        applied_resume_id = values.get("worker_resume_id")
+        resume_intent_pending = bool(
+            resume_id and str(resume_id) != str(applied_resume_id or "")
+        )
+        if resume_intent_pending:
+            updates["worker_resume_id"] = str(resume_id)
+        frozen = values.get("freeze_data") or {}
+        freeze_type = frozen.get("freeze_type") if isinstance(frozen, dict) else None
+        error = values.get("error")
+        recoverable_error = bool(
+            isinstance(error, dict) and error.get("recoverable") is True
+        )
+        pending_frontier = bool(snapshot is not None and tuple(snapshot.next or ()))
+        ended = bool(snapshot is not None and not pending_frontier)
+        snapshot_metadata = getattr(snapshot, "metadata", None)
+        checkpoint_source = (
+            snapshot_metadata.get("source")
+            if isinstance(snapshot_metadata, dict)
+            else None
+        )
+        human_freeze = bool(
+            freeze_type and freeze_type not in AUTO_CONTINUE_FREEZE_TYPES
+        )
+        recoverable_end = bool(
+            ended
+            and not human_freeze
+            and (recoverable_error or freeze_type in AUTO_CONTINUE_FREEZE_TYPES)
+        )
+        if retry_exhausted:
+            if ended and values.get("should_stop") and not recoverable_end:
+                logger.info(
+                    "[%s] Worker retry budget exhausted, but canonical "
+                    "checkpoint is terminal/human END; re-reporting it unchanged",
+                    job_id,
+                )
+                return values
+            # The last real attempt has already been spent. Surface a
+            # recoverable driver envelope to the caller, which converts it to
+            # the factual non-recoverable worker_retry_exhausted report. Do not
+            # mutate the checkpoint or execute another graph node.
+            logger.error(
+                "[%s] Worker retry budget exhausted before a terminal/human "
+                "checkpoint; suppressing further graph work",
+                job_id,
+            )
+            return {
+                "job_id": job_id,
+                "should_stop": True,
+                "goal_achieved": False,
+                "error": {
+                    "type": "worker_retry_budget_exhausted",
+                    "recoverable": True,
+                    "message": "worker queue retry budget exhausted",
+                },
+            }
+
+        if (
+            pending_frontier
+            and checkpoint_source == "update"
+            and _valid_worker_batch_arm(values)
+            and not resume_updates
+            and not resume_intent_pending
+        ):
+            # A predecessor durably committed route + arm and died before the
+            # graph consumed the selected task. Reuse that exact envelope.
+            # Any second update here can erase the frontier; a Command(update)
+            # is also unsafe if a prior invocation already wrote this step.
+            logger.info(
+                "[%s] Adopted pending stateless resume frontier with durable "
+                "worker arm; checkpoint update skipped",
+                job_id,
+            )
+            return None
+        clean_end_reentry = bool(
+            ended
+            and (
+                resume_route_pending
+                or (
+                    values.get("should_stop")
+                    and (
+                        freeze_type in AUTO_CONTINUE_FREEZE_TYPES
+                        or recoverable_error
+                        or resume_intent_pending
+                    )
+                )
+            )
+        )
+        if clean_end_reentry:
+            # Batch/outage/recoverable stops are machine continuations on this
+            # lane. Clear their END envelope and route through START exactly
+            # once. Human-facing and terminal END checkpoints are untouched;
+            # the driver re-reports them rather than re-running the graph.
+            updates.update(
+                {
+                    "freeze_data": None,
+                    "should_stop": False,
+                    "goal_achieved": False,
+                    "is_final_phase": False,
+                    "error": None,
+                    "client_report_id": None,
+                    "completion_report_payload": None,
+                }
+            )
+
+        if graph_input is not None:
+            graph_input.update(updates)
+        elif ended and not clean_end_reentry and not resume_route_pending:
+            logger.info(
+                "[%s] Worker checkpoint is a terminal/human END; leaving it "
+                "unchanged for report retry",
+                job_id,
+            )
+            return values
+        elif resume_route_pending or clean_end_reentry or resume_intent_pending:
+            selected_node = resume_as_node if resume_route_pending else "__start__"
+            await self._graph.aupdate_state(
+                thread_config,
+                updates,
+                as_node=selected_node,
+            )
+        elif pending_frontier and checkpoint_source == "loop":
+            # A loop checkpoint records the node that produced this frontier,
+            # so LangGraph can infer the same node for this single arm update.
+            await self._graph.aupdate_state(thread_config, updates)
+        elif pending_frontier:
+            logger.error(
+                "[%s] Refusing to arm an unadoptable pending update frontier "
+                "(source=%s); releasing without mutating its selected task",
+                job_id,
+                checkpoint_source,
+            )
+            return {
+                "job_id": job_id,
+                "should_stop": True,
+                "goal_achieved": False,
+                "error": {
+                    "type": "worker_resume_frontier_unarmed",
+                    "recoverable": True,
+                    "message": (
+                        "pending worker resume frontier has no valid durable batch arm"
+                    ),
+                },
+            }
+        else:
+            await self._graph.aupdate_state(thread_config, updates)
+        logger.info(
+            "[%s] Armed worker batch: target=%.3fs floor=%.3fs "
+            "start_iteration=%d iteration_cap=%s",
+            job_id,
+            target,
+            floor,
+            iteration,
+            cap,
+        )
+        return None
+
+    async def _make_checkpointer(self, job_id: str) -> None:
+        """Create the LangGraph checkpointer for this job per CHECKPOINTER_BACKEND.
+
+        Sets self._checkpointer and self._checkpoint_conn. backend='postgres'
+        stores graph state in shared Postgres (keyed by thread_id=job_id) so a
+        resume on any pod reads it via the graph's aget_state — fixing cross-pod
+        cold-starts. Default 'sqlite' keeps the legacy pod-local checkpoint.
+        """
+        backend = checkpointer_backend()
+        if self._worker_lease_token is not None:
+            if backend != "postgres":
+                raise RuntimeError(
+                    "Stateless workers require CHECKPOINTER_BACKEND=postgres"
+                )
+            from .core.fenced_checkpointer import make_fenced_checkpointer
+
+            url = resolve_fenced_checkpoint_url()
+            if not url:
+                raise RuntimeError(
+                    "Stateless worker checkpoints require the authoritative "
+                    "application Postgres URL (POSTGRES_* or DATABASE_URL)"
+                )
+            self._checkpoint_conn = None
+            self._checkpointer = await make_fenced_checkpointer(
+                url,
+                unit_id=job_id,
+                lease_token=self._worker_lease_token,
+                post_commit=self._worker_checkpoint_post_commit,
+            )
+            logger.info(
+                "Checkpointer initialized (fenced postgres, thread_id=%s token=%d)",
+                job_id,
+                self._worker_lease_token,
+            )
+            return
+        if backend == "postgres":
+            from psycopg import AsyncConnection
+            from psycopg.rows import dict_row
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            url = resolve_checkpoint_url()
+            if not url:
+                raise RuntimeError(
+                    "CHECKPOINTER_BACKEND=postgres but no checkpoint DB URL "
+                    "configured (set CHECKPOINT_DB_URL, CHECKPOINT_*, or "
+                    "POSTGRES_*/DATABASE_URL)."
+                )
+            conn = await AsyncConnection.connect(
+                url, autocommit=True, prepare_threshold=0, row_factory=dict_row
+            )
+            self._checkpoint_conn = conn
+            self._checkpointer = AsyncPostgresSaver(conn)
+            await self._ensure_pg_checkpoint_schema()
+            logger.info("Checkpointer initialized (postgres, thread_id=%s)", job_id)
+        else:
+            checkpoint_path = self._get_checkpoint_path(job_id)
+            self._checkpoint_conn = await aiosqlite.connect(checkpoint_path)
+            # Wrap to add is_alive() for langgraph-checkpoint-sqlite 3.x.
+            wrapped_conn = _AiosqliteConnectionWrapper(self._checkpoint_conn)
+            self._checkpointer = AsyncSqliteSaver(wrapped_conn)
+            logger.info(f"Checkpointer initialized at {checkpoint_path}")
+
+    async def _ensure_pg_checkpoint_schema(self) -> None:
+        """Run AsyncPostgresSaver.setup() once per process (idempotent DDL)."""
+        global _PG_CHECKPOINT_SCHEMA_READY
+        if _PG_CHECKPOINT_SCHEMA_READY:
+            return
+        await self._checkpointer.setup()
+        _PG_CHECKPOINT_SCHEMA_READY = True
+        logger.info("Postgres checkpoint schema ensured")
+
     async def _cleanup_checkpointer(self) -> None:
         """Clean up checkpointer connection."""
-        if self._checkpoint_conn:
+        checkpoint_conn = getattr(self, "_checkpoint_conn", None)
+        if checkpoint_conn:
             try:
-                await self._checkpoint_conn.close()
+                await checkpoint_conn.close()
             except Exception as e:
                 logger.warning(f"Error closing checkpointer connection: {e}")
-            self._checkpoint_conn = None
-            self._checkpointer = None
+        # Fenced worker savers borrow from a lifespan-owned process pool and
+        # therefore have no per-job connection to close.  Dropping the saver is
+        # still required so a stale immutable token cannot be reused.
+        self._checkpoint_conn = None
+        self._checkpointer = None
 
     def _cleanup_shell_manager(self) -> None:
         """Clean up ShellManager (kill tmux session)."""
-        if self._shell_manager:
+        if getattr(self, "_shell_manager", None):
             try:
                 self._shell_manager.cleanup()
             except Exception:
-                pass
+                # Terminal job disposition may already have deleted a root
+                # workspace, and terminal rows are not reclaimable for another
+                # cleanup attempt. Keep teardown best-effort; Kubernetes exact-
+                # UID deletion owns root process death. Shared workspaces still
+                # use the child-shell-only retirement command below this seam.
+                logger.warning(
+                    "ShellManager cleanup was not acknowledged", exc_info=True
+                )
             self._shell_manager = None
+
+    def _capture_worker_environment(self, metadata: Dict[str, Any]) -> None:
+        """Snapshot every per-job env key before this worker can overwrite it.
+
+        A stateless process serves unrelated jobs sequentially.  Config
+        ``env_keys`` are intentionally open-ended, while managed datasource
+        CLIs populate a small fixed set.  Recording the pre-claim values lets
+        teardown restore the pod baseline instead of leaking one tenant's
+        credentials into the next claim.
+        """
+
+        self._restore_worker_environment()
+        env_keys = (metadata.get("config_override") or {}).get("env_keys")
+        if not env_keys:
+            env_keys = ((metadata.get("resolved_config") or {}).get("agent") or {}).get(
+                "env_keys"
+            )
+        keys = set(env_keys) if isinstance(env_keys, dict) else set()
+        datasource_env = {
+            "postgresql": {"PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"},
+            "neo4j": {"NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"},
+            "mongodb": {"MONGOSH_URI"},
+        }
+        for datasource in metadata.get("datasources") or []:
+            if isinstance(datasource, dict):
+                keys.update(datasource_env.get(str(datasource.get("type")), set()))
+        self._worker_env_restore = {key: os.environ.get(key) for key in keys}
+
+    def _restore_worker_environment(self) -> None:
+        restore = getattr(self, "_worker_env_restore", {})
+        self._worker_env_restore = {}
+        for key, value in restore.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if restore:
+            # Both embedding service variants cache clients derived from env.
+            # Resetting them after the values are restored prevents a secret
+            # surviving through a singleton even though os.environ is clean.
+            try:
+                import src.services.embedding_service as embedding_service
+
+                embedding_service._embedding_service = None
+                embedding_service._kb_embedding_service = None
+                embedding_service._kb_embedding_profile = None
+            except Exception:
+                logger.debug("Worker embedding singleton scrub failed", exc_info=True)
+
+    def _worker_workspace_backend(self) -> Any | None:
+        """Return the exact backend retained for this worker disposition."""
+
+        retained = getattr(self, "_worker_finalization_backend", None)
+        if retained is not None:
+            return retained
+        workspace_manager = getattr(self, "_workspace_manager", None)
+        if workspace_manager is None:
+            return None
+        try:
+            from .core.virtual_dirs import unwrap_backend
+
+            return unwrap_backend(workspace_manager.backend)
+        except Exception:
+            logger.debug("Could not unwrap worker workspace backend", exc_info=True)
+            return None
+
+    def _retire_worker_shell_admission(self, backend: Any | None) -> None:
+        """Close local tmux admission once, retaining terminal cleanup power."""
+
+        if backend is None or getattr(self, "_worker_shell_admission_retired", False):
+            return
+        retire_shell_owner = getattr(backend, "retire_shell_owner", None)
+        if retire_shell_owner is None:
+            self._worker_shell_admission_retired = True
+            return
+        try:
+            # Cancelled synchronous work may still hold this object, but can
+            # no longer submit tmux I/O after this returns.  RemoteBackend's
+            # terminal shell_cleanup deliberately remains available after the
+            # local admission bit is retired.
+            retire_shell_owner()
+        except Exception:
+            logger.warning("Worker shell admission retirement failed", exc_info=True)
+        else:
+            self._worker_shell_admission_retired = True
+
+    async def _scrub_worker_claim_locals(self) -> None:
+        """Remove tenant-local state without deciding the remote shell fate."""
+
+        tool_context = getattr(self, "_tool_context", None)
+        if tool_context is not None:
+            tool_context.shell_manager = None
+            tool_context.citation_verdict_callback = None
+
+        if getattr(self, "_doc_registration_task", None) is not None:
+            task = self._doc_registration_task
+            self._doc_registration_task = None
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(
+                    "Worker document registration cleanup failed", exc_info=True
+                )
+
+        # Legacy/unit-test ``__new__`` instances may predate optional
+        # datasource attributes.  Full initialized workers always take the
+        # production cleanup path; sparse instances still get an idempotent
+        # hold instead of failing before admission is closed.
+        if all(
+            hasattr(self, name)
+            for name in (
+                "_knowledge_graph",
+                "_datasource_connections",
+                "_datasource_clients",
+                "_datasource_files_manifest",
+            )
+        ):
+            self._close_datasource_connections()
+        await self._cleanup_checkpointer()
+        self._restore_worker_environment()
+
+        # Keep only the exact job id/token for bounded hold logging and the
+        # separately retained shell/backend handles.  Graph, tool, todo,
+        # credential and checkpoint state must not survive while this shared
+        # executor waits for an orchestrator outcome.
+        self._job_metadata = None
+        self._todo_manager = None
+        self._tool_context = None
+        self._tools = None
+        self._graph = None
+        self._worker_checkpoint_post_commit = None
+        self._defer_job_cleanup = False
+
+    async def hold_worker_finalization(self) -> None:
+        """Enter the inert, bounded hold after durable completion acceptance.
+
+        This is deliberately not ``cleanup_worker_claim(preserve_shell=True)``:
+        that handoff drops terminal cleanup authority.  The hold drains and
+        retires the original backend plus all tenant state, retaining only a
+        cleanup-only clone with the exact immutable runtime fence.  A later
+        :meth:`cleanup_worker_claim` performs the one final disposition.
+        """
+
+        if getattr(self, "_worker_finalization_held", False):
+            return
+        backend = self._worker_workspace_backend()
+        self._worker_finalization_backend = backend
+        self._retire_worker_shell_admission(backend)
+
+        # Retain only a cleanup-only clone carrying immutable workspace/job/
+        # runtime/token authority.  The original backend is then fully retired,
+        # which drains admitted resource/SFTP calls and prevents cancelled
+        # worker threads from reconnecting after the B4 acceptance boundary.
+        if getattr(self, "_shell_manager", None) is not None:
+            make_cleanup = getattr(
+                backend, "make_terminal_shell_cleanup_capability", None
+            )
+            if make_cleanup is None:
+                raise RuntimeError(
+                    "Finalization hold requires a cleanup-only shell capability"
+                )
+            self._worker_terminal_shell_cleanup = make_cleanup()
+        retire = getattr(backend, "retire", None) if backend else None
+        if retire is not None:
+            await asyncio.to_thread(retire)
+        await self._scrub_worker_claim_locals()
+        self._workspace_manager = None
+        self._shell_manager = None
+        self._worker_finalization_held = True
+
+    async def cleanup_worker_claim(self, *, preserve_shell: bool) -> None:
+        """Retire all claim-local runtime state under the driver's disposition.
+
+        ``preserve_shell=True`` is used for rotation, retry and lease handoff:
+        it closes this Python owner's admission and SSH transport without
+        killing the durable workspace tmux session.  A genuine terminal stop
+        passes ``False`` and keeps the historical destructive shell cleanup.
+        """
+
+        backend = self._worker_workspace_backend()
+        backend_already_retired = bool(
+            getattr(self, "_worker_finalization_held", False)
+            and backend is getattr(self, "_worker_finalization_backend", None)
+        )
+        self._retire_worker_shell_admission(backend)
+
+        terminal_cleanup = getattr(self, "_worker_terminal_shell_cleanup", None)
+        if terminal_cleanup is not None:
+            if not preserve_shell:
+                try:
+                    await asyncio.to_thread(terminal_cleanup)
+                except Exception:
+                    logger.warning(
+                        "Worker terminal shell retirement was not acknowledged",
+                        exc_info=True,
+                    )
+            self._worker_terminal_shell_cleanup = None
+            self._shell_manager = None
+        elif preserve_shell:
+            if getattr(self, "_shell_manager", None) is not None:
+                logger.info(
+                    "Preserving remote shell for worker handoff: job=%s token=%s",
+                    self._current_job_id,
+                    self._worker_lease_token,
+                )
+            self._shell_manager = None
+        else:
+            self._cleanup_shell_manager()
+
+        await self._scrub_worker_claim_locals()
+
+        if backend is not None and not backend_already_retired:
+            retire = getattr(backend, "retire", None)
+            disconnect = getattr(backend, "disconnect", None)
+            try:
+                if retire is not None:
+                    await asyncio.to_thread(retire)
+                elif disconnect is not None:
+                    await asyncio.to_thread(disconnect)
+            except Exception:
+                logger.warning("Worker backend retirement failed", exc_info=True)
+
+        self._current_job_id = None
+        self._job_metadata = None
+        self._workspace_manager = None
+        self._todo_manager = None
+        self._tool_context = None
+        self._tools = None
+        self._graph = None
+        self._worker_lease_token = None
+        self._worker_checkpoint_post_commit = None
+        self._defer_job_cleanup = False
+        self._worker_finalization_held = False
+        self._worker_finalization_backend = None
+        self._worker_terminal_shell_cleanup = None
+        self._worker_shell_admission_retired = False
 
     async def _yield_error_state(
         self, error_state: Dict[str, Any]
@@ -738,20 +2367,350 @@ class UniversalAgent:
         Args:
             graph_input: Initial state for new jobs, or None to resume from checkpoint
             config: LangGraph config with thread_id
+
+        If a run ends with a ``workspace_upgrade_required`` freeze (target
+        ``sandbox``), the job is upgraded IN PROCESS — provision → seed → swap →
+        retool → rebuild graph — and the same graph is re-streamed from the local
+        checkpoint with shell/git now available, mirroring the session live swap
+        (workspace_tier_upgrade.md §4.3 W1). No re-dispatch, no checkpoint move.
+        On upgrade failure the freeze is surfaced unchanged so the orchestrator
+        pauses the job.
         """
         try:
-            async for state in run_graph_with_streaming(
-                self._graph, graph_input, config
-            ):
-                yield state
+            # At most one in-process upgrade per run: virtual → sandbox flips the
+            # backend to supports_shell=True, after which the request tool drops
+            # out and the supports_shell guard below short-circuits anyway.
+            upgraded = False
+            while True:
+                final_state: Optional[Dict[str, Any]] = None
+                async for state in run_graph_with_streaming(
+                    self._graph, graph_input, config
+                ):
+                    final_state = state
+                    yield state
+
+                freeze = (final_state or {}).get("freeze_data") or {}
+                wants_upgrade = (
+                    not upgraded
+                    and isinstance(freeze, dict)
+                    and freeze.get("freeze_type") == "workspace_upgrade_required"
+                    and (freeze.get("target_tier") or "sandbox") == "sandbox"
+                    and self._workspace_manager is not None
+                    and not getattr(
+                        self._workspace_manager.backend, "supports_shell", False
+                    )
+                )
+                if not wants_upgrade:
+                    break
+
+                upgraded = True
+                ok = await self._perform_inprocess_workspace_upgrade(
+                    freeze.get("target_tier") or "sandbox"
+                )
+                if not ok:
+                    # Provision/seed failed — surface the freeze unchanged; the
+                    # orchestrator routes it (pauses the job for re-dispatch).
+                    break
+
+                # Prime the rebuilt graph to resume from the local checkpoint
+                # (the proven feedback-resume pattern): clear the stale freeze +
+                # stop flags as a __start__ update, then re-stream with no input
+                # so route_entry → restore_todo_state continues the loop with
+                # shell/git now available. restore_todo_state also clears
+                # should_stop/goal_achieved; clearing freeze_data here keeps the
+                # stale upgrade-freeze from reaching the orchestrator on real
+                # completion.
+                await self._graph.aupdate_state(
+                    config,
+                    {
+                        "freeze_data": None,
+                        "should_stop": False,
+                        "goal_achieved": False,
+                        "client_report_id": None,
+                        "completion_report_payload": None,
+                    },
+                    as_node="__start__",
+                )
+                graph_input = None
 
             self._jobs_processed += 1
+        except Exception as e:
+            # Mirror the non-streaming handler: classify the failure and yield
+            # a TYPED error state instead of letting the exception escape the
+            # generator. An escaping exception lands in the app-layer's generic
+            # `except Exception`, which reports `{"error": {"message": ...}}` —
+            # stripping the `workspace_unavailable` type the orchestrator's
+            # recovery arm routes on, so a dead-workspace job hard-fails (and
+            # its VM is torn down) instead of pause → reprovision → resume.
+            # knowledge-base/knowledge/issues/streaming_strips_workspace_unavailable_type.md
+            from .core.workspace_backend import completion_error_payload
+
+            job_id = self._current_job_id
+            error = completion_error_payload(e)["error"]
+            if error["type"] == "workspace_unavailable":
+                logger.error(
+                    f"Job {job_id}: workspace unavailable mid-stream — "
+                    f"will request recovery: {e}"
+                )
+            elif error["type"] == "workspace_authentication":
+                logger.error(
+                    f"Job {job_id}: workspace authentication failed mid-stream "
+                    f"(non-retryable): {e}"
+                )
+            else:
+                logger.error(f"Job {job_id} failed mid-stream: {e}", exc_info=True)
+            yield {
+                "job_id": job_id,
+                "error": error,
+                "should_stop": True,
+            }
         finally:
-            # Clean up after streaming completes (or errors)
-            self._current_job_id = None
-            self._cleanup_shell_manager()
-            self._close_datasource_connections()
-            await self._cleanup_checkpointer()
+            # Drain in-flight memory captures (the fire-and-forget pre_compaction
+            # extraction scheduled via capture_nowait) BEFORE tearing down
+            # connections, so a compaction on the last LLM call before freeze
+            # still persists. Bounded by the aux call timeout — a hung endpoint
+            # must never wedge job completion (OQ-C,
+            # memory_extraction_before_compaction.md §8).
+            mgr = getattr(self._graph, "_srw_memory_service", None)
+            if mgr is not None:
+                try:
+                    aux_timeout = getattr(self._auxiliary_llm, "timeout", None)
+                    drained = await mgr.drain_background(timeout=aux_timeout or 60.0)
+                    if drained:
+                        logger.info(
+                            f"[{self._current_job_id}] Drained {drained} in-flight "
+                            f"memory task(s) at job-end"
+                        )
+                except Exception as e:
+                    logger.debug(f"Memory drain at job-end failed (non-fatal): {e}")
+
+            # Worker claims defer teardown until their driver classifies the
+            # exit (rotation/lease loss preserves tmux; genuine end destroys
+            # it).  Every other caller keeps the historical eager cleanup.
+            if not getattr(self, "_defer_job_cleanup", False):
+                self._current_job_id = None
+                self._cleanup_shell_manager()
+                self._close_datasource_connections()
+                await self._cleanup_checkpointer()
+
+    async def _poll_job_workspace_ready(
+        self, job_id: str, timeout: int = 300, poll_interval: float = 2.0
+    ) -> Optional[Dict[str, Any]]:
+        """Poll the orchestrator for a running job's upgraded-workspace readiness.
+
+        The worker analogue of ``persistent_app._poll_workspace_ready`` (sandbox
+        only — the worker MVP upgrades ``virtual → sandbox``; ``vm`` is the
+        operator-gated re-dispatch path). Returns the
+        ``{"backend":"sandbox","remote":{...}}`` block, or None on
+        timeout/failure (workspace_tier_upgrade.md §4.3 W1).
+        """
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ws = await self._orchestrator_client.get_job_workspace_status(job_id)
+            if not ws:
+                return None
+            # SSH key: orchestrator sends the path it resolved; fall back to the
+            # K8s default secret mount.
+            ssh_key = ws.get("ssh_key_path") or "/run/secrets/vm-ssh-key"
+            status = ws.get("status", "none")
+            if status == "ready" and ws.get("pod_ip"):
+                return {
+                    "backend": "sandbox",
+                    "remote": {
+                        "host": ws["pod_ip"],
+                        "port": ws.get("pod_port") or 30022,
+                        "username": "agent-host",
+                        "key_path": ssh_key,
+                        "workspace_path": "/home/agent-host/workspace",
+                    },
+                }
+            if status == "failed":
+                # Keep internal readiness payloads out of logs.  They can gain
+                # server-owned transport material as provisioning evolves;
+                # the stable status is all this poller needs to report.
+                logger.warning(
+                    "[%s] Workspace provisioning failed (status=%s)",
+                    job_id,
+                    status,
+                )
+                return None
+            if status == "none":
+                # No workspace_container recorded — nothing is provisioning.
+                return None
+            # Still pending/creating/created — wait and poll again.
+            await asyncio.sleep(poll_interval)
+
+        logger.warning(
+            f"[{job_id}] Workspace upgrade polling timed out after {timeout}s"
+        )
+        return None
+
+    async def _perform_inprocess_workspace_upgrade(self, target_tier: str) -> bool:
+        """Upgrade a running lite (``virtual``/``none``) job to a real ``sandbox``
+        workspace IN PROCESS, mirroring the session live swap
+        (workspace_tier_upgrade.md §4.3 W1).
+
+        Provision via the orchestrator → poll → connect a sandbox
+        ``RemoteBackend`` → seed the still-live virtual files into it (both
+        backends live) → swap the ``WorkspaceManager`` backend → re-derive
+        tools/shell → rebuild the graph on the SAME checkpointer. The caller then
+        re-streams the graph from the checkpoint.
+
+        Returns True on success (graph rebuilt, ready to resume on the new
+        backend); False on any failure (the caller surfaces the freeze so the
+        orchestrator pauses the job). ``config_override`` / ``resolved_config``
+        are deliberately NOT rewritten (frozen at first dispatch, §4.1) — the
+        swap is in-process and ephemeral.
+        """
+        job_id = self._current_job_id
+        # The REAL backend, not the overlay: swap_backend() rebinds the overlay
+        # in place, so an overlay reference held across the swap would resolve
+        # to the NEW backend — and `old_backend.disconnect()` below would tear
+        # down the workspace we just upgraded onto. Unwrapping also keeps the
+        # seed copy on the real filesystem (no virtual files materialized into
+        # the sandbox).
+        from .core.virtual_dirs import unwrap_backend
+
+        old_backend = (
+            unwrap_backend(self._workspace_manager.backend)
+            if self._workspace_manager
+            else None
+        )
+        if old_backend is None:
+            return False
+        # Guard: already a real (shell-capable) workspace — nothing to upgrade.
+        if getattr(old_backend, "supports_shell", False):
+            return True
+        if not self._orchestrator_client:
+            logger.warning(
+                f"[{job_id}] Workspace upgrade requested but no orchestrator "
+                f"client — cannot provision; surfacing freeze"
+            )
+            return False
+
+        logger.info(
+            f"[{job_id}] In-process workspace upgrade requested → {target_tier}"
+        )
+
+        # 1. Provision (server-side grant-gated, fail-closed). The job stays
+        #    'processing' — no pause, no re-dispatch.
+        try:
+            ok = await self._orchestrator_client.request_job_workspace_upgrade(
+                job_id, target_tier
+            )
+        except Exception as e:
+            logger.error(f"[{job_id}] Workspace upgrade provision request errored: {e}")
+            return False
+        if not ok:
+            logger.warning(
+                f"[{job_id}] Workspace upgrade refused or failed at the orchestrator"
+            )
+            return False
+
+        # 2. Poll for the ready connection block.
+        ws_config = await self._poll_job_workspace_ready(job_id, timeout=300)
+        if not ws_config or not ws_config.get("remote"):
+            logger.warning(
+                f"[{job_id}] Upgraded workspace did not become ready in time"
+            )
+            return False
+
+        # 3. Build + connect the new sandbox backend. Connect BEFORE the seed so
+        #    BOTH backends are live for the copy (mirrors the session handler).
+        try:
+            from .core.backends.remote import RemoteBackend
+
+            remote = ws_config["remote"]
+            shell_config = self.config.extra.get("shell", {})
+            new_backend = RemoteBackend(
+                host=remote["host"],
+                port=remote.get("port", 22),
+                username=remote.get("username", "agent-host"),
+                key_path=remote.get("key_path"),
+                workspace_path=remote.get(
+                    "workspace_path", "/home/agent-host/workspace"
+                ),
+                job_id=job_id,
+                scrollback_limit=shell_config.get("scrollback_limit", 5000),
+                default_timeout=shell_config.get("default_timeout", 120),
+                max_tabs=shell_config.get("max_tabs", 15),
+                blocked_commands=shell_config.get("blocked_commands"),
+                connect_timeout=remote.get("connect_timeout", 30),
+                max_retries=remote.get("max_retries", 5),
+                retry_timeouts_as_booting=remote.get(
+                    "retry_timeouts_as_booting", False
+                ),
+                # sandbox keeps the sudo gate ("freeze") so its sudo→VM
+                # escalation path still fires; only a vm target would set "allow".
+                sudo_action=shell_config.get("sudo_action", "freeze"),
+                sudo_block_message=shell_config.get("sudo_block_message"),
+            )
+            await asyncio.to_thread(new_backend.connect)
+        except Exception as e:
+            logger.error(f"[{job_id}] Failed to connect upgraded backend: {e}")
+            return False
+
+        # 4. Seed virtual → sandbox (both live), verify-before-flip.
+        try:
+            from .core.backends.seed import seed_workspace
+
+            n = await asyncio.to_thread(seed_workspace, old_backend, new_backend)
+            logger.info(f"[{job_id}] Seeded {n} file(s) into upgraded workspace")
+        except Exception as e:
+            logger.error(f"[{job_id}] Workspace seed failed: {e}")
+            try:
+                await asyncio.to_thread(new_backend.disconnect)
+            except Exception:
+                pass
+            return False
+
+        # 5. Swap the backend on the WorkspaceManager, drop the old virtual one.
+        #    swap_backend() (not `_backend = ...`) so the virtual overlay is
+        #    rebound onto the new backend and the already-registered providers
+        #    keep serving — a direct assignment unwraps the overlay and every
+        #    virtual path, deferred-tool docs included, 404s from here on.
+        self._workspace_manager.swap_backend(new_backend)
+        try:
+            await asyncio.to_thread(old_backend.disconnect)
+        except Exception:
+            pass
+        # Remove the stale freeze marker the graph wrote on freeze (seeded
+        # across): the job continues in-process, it is NOT frozen for the
+        # orchestrator.
+        try:
+            if new_backend.exists("output/job_frozen.json"):
+                new_backend.delete_file("output/job_frozen.json")
+        except Exception:
+            pass
+
+        # 6. Re-derive tools + shell manager for the new (shell-capable) backend.
+        self._cleanup_shell_manager()
+        await self._setup_job_tools()
+
+        # 7. Rebuild the graph with the new tools/LLMs/tool_context but the SAME
+        #    checkpointer, so the re-invoke resumes from the local checkpoint.
+        snapshot_manager = PhaseSnapshotManager(job_id, workspace_backend=new_backend)
+        self._graph = build_phase_alternation_graph(
+            strategic_llm_with_tools=self._strategic_llm_with_tools,
+            tactical_llm_with_tools=self._tactical_llm_with_tools,
+            tools=self._tools,
+            config=self.config,
+            workspace=self._workspace_manager,
+            todo_manager=self._todo_manager,
+            workspace_template="",
+            checkpointer=self._checkpointer,
+            auxiliary_llm=self._auxiliary_llm,
+            snapshot_manager=snapshot_manager,
+            tool_context=self._tool_context,
+            postgres_db=self.postgres_conn,
+        )
+        logger.info(
+            f"[{job_id}] Workspace upgraded to {target_tier}; graph rebuilt with "
+            f"shell/git tools — resuming in process"
+        )
+        return True
 
     def _load_workspace_template(self) -> str:
         """Load the workspace.md template for the nested loop graph.
@@ -774,49 +2733,27 @@ class UniversalAgent:
         return resolver.load("workspace_template")
 
     def _inject_repo_context_to_workspace(self, git_url: str, git_branch: str) -> None:
-        """Append repository (workspace git) context to datasources.md after clone.
+        """Append safe workspace Git guidance to datasources.md after clone.
 
-        This gives the agent a persistent reference for the git remote URL,
-        branch, and Gitea API endpoint so it can push and create PRs. The
-        system prompts point the agent at datasources.md for connection details.
+        Repository transport is server-owned. The model needs the branch and
+        ordinary ``origin`` workflow, not endpoint/authentication coordinates.
         """
-        from urllib.parse import urlparse
-
-        parsed = urlparse(git_url)
-        # Gitea API base: scheme://host/api/v1
-        gitea_api_base = f"{parsed.scheme}://{parsed.hostname}"
-        if parsed.port:
-            gitea_api_base += f":{parsed.port}"
-        gitea_api_base += "/api/v1"
-
-        # Repo path: strip .git suffix and leading slash
-        repo_path = parsed.path.rstrip("/")
-        if repo_path.endswith(".git"):
-            repo_path = repo_path[:-4]
-        repo_path = repo_path.lstrip("/")
-        # owner/repo
-        owner_repo = repo_path  # e.g. "user/my-repo"
+        del git_url
 
         section = f"""
 
 ## Repository Context
 
-- **Remote URL**: `{git_url}` (credentials embedded — use for push)
 - **Branch**: `{git_branch}`
-- **Gitea API**: `{gitea_api_base}`
-- **Repo path**: `{owner_repo}`
+- **Remote**: `origin` (preconfigured with repository-scoped write authority)
 
-### Push & PR Workflow
+### Push Workflow
 
 ```bash
-# Push (credentials are in the remote URL)
 git push origin {git_branch}
-
-# Create PR via Gitea API
-curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"title": "PR_TITLE", "head": "{git_branch}", "base": "main", "body": "PR_DESCRIPTION"}}'
 ```
+
+Do not replace `origin`; its authority is selected and installed by the server.
 """
         try:
             try:
@@ -827,6 +2764,181 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             logger.info("Injected repository context into datasources.md")
         except Exception as e:
             logger.warning(f"Failed to inject repo context into datasources.md: {e}")
+
+    async def _resolve_uploaded_instructions(
+        self, metadata: Dict[str, Any]
+    ) -> Optional[str]:
+        """Resolve upload-sourced instructions.md content (async I/O).
+
+        A virtual file's read() is synchronous, so the upload source (HTTP
+        download via the orchestrator, with a local ``uploads/<id>`` fallback)
+        must be resolved eagerly, here, rather than lazily inside the
+        provider. Inline instructions need no such care — the provider reads
+        ``metadata["instructions"]`` live at serve time.
+
+        Returns:
+            The resolved content, or None when there is no upload id or the
+            upload could not be found by either path (the caller's template
+            fallback then applies).
+        """
+        # Priority inline > upload (mirrors the deleted if/elif): don't pay for
+        # a download — HTTP round-trip plus a local glob — when inline content
+        # will win anyway.
+        if (metadata.get("instructions") or "").strip():
+            return None
+
+        instr_upload_id = metadata.get("instructions_upload_id")
+        if not instr_upload_id:
+            return None
+
+        from .core.workspace import get_workspace_base_path
+        import tempfile
+
+        instructions_written = False
+        resolved_content: Optional[str] = None
+
+        # Try HTTP download first
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            downloaded_files = await self._download_upload_files(
+                instr_upload_id, temp_path, logger
+            )
+
+            if downloaded_files:
+                # Find the instructions file from downloaded files
+                instr_files = list(temp_path.glob("*.md")) + list(
+                    temp_path.glob("*.txt")
+                )
+                if instr_files:
+                    uploaded_instr_path = instr_files[0]
+                    resolved_content = uploaded_instr_path.read_text(encoding="utf-8")
+                    logger.info(
+                        f"Copied uploaded instructions (HTTP): {uploaded_instr_path.name}"
+                    )
+                    instructions_written = True
+
+        # Fall back to local filesystem
+        if not instructions_written:
+            instr_uploads_dir = get_workspace_base_path() / "uploads" / instr_upload_id
+
+            if instr_uploads_dir.exists():
+                # Find the instructions file (.md or .txt)
+                instr_files = list(instr_uploads_dir.glob("*.md")) + list(
+                    instr_uploads_dir.glob("*.txt")
+                )
+                if instr_files:
+                    uploaded_instr_path = instr_files[0]
+                    resolved_content = uploaded_instr_path.read_text(encoding="utf-8")
+                    logger.info(
+                        f"Copied uploaded instructions (local): {uploaded_instr_path.name}"
+                    )
+                    instructions_written = True
+                else:
+                    logger.warning(
+                        f"No .md/.txt files found in instructions upload: {instr_upload_id}"
+                    )
+            else:
+                logger.warning(
+                    f"Instructions upload directory not found: {instr_uploads_dir}"
+                )
+
+        # instructions_written stays False here only when both sources failed;
+        # resolved_content is already None in that case (the caller's template
+        # fallback then applies).
+        return resolved_content
+
+    def _reseed_from_snapshot_if_fresh(self, job_id: str, workspace_backend) -> bool:
+        """Restore the last phase snapshot onto a workspace that lost its content.
+
+        Only for a genuinely fresh workspace. ``recover_to_phase`` overwrites
+        ``checkpoint.db``, ``plan.md``, ``todos.yaml`` and ``archive/``
+        (``src/core/phase_snapshot.py``), so firing it on a same-pod resume
+        (cooldown pause/resume, freeze-continue, outage-sweeper redispatch)
+        silently rewinds the job to the last phase boundary. The seeded-content
+        marker is what distinguishes the two; probing a *virtual* file would
+        answer "unseeded" on every resume and rewind every one of them.
+
+        Extracted from ``_setup_job_workspace`` so the decision is testable on
+        its own. Never raises.
+
+        Returns:
+            True when a snapshot was pushed onto the workspace.
+        """
+        try:
+            from .core.backends.seed import workspace_is_seeded
+
+            if workspace_is_seeded(workspace_backend):
+                return False
+
+            logger.info(
+                f"VM workspace is fresh — seeding from last snapshot for job {job_id}"
+            )
+            from .core.phase_snapshot import PhaseSnapshotManager
+
+            recovery_mgr = PhaseSnapshotManager(
+                job_id, workspace_backend=workspace_backend
+            )
+            latest = recovery_mgr.get_latest_snapshot()
+            if not latest:
+                logger.warning("No snapshots available to seed VM workspace")
+                return False
+
+            # Ensure base directories exist on VM
+            for subdir in self.config.workspace.structure:
+                try:
+                    workspace_backend.mkdir(subdir.rstrip("/"))
+                except Exception:
+                    pass
+            # Push snapshot files to VM
+            recovery_mgr.recover_to_phase(
+                latest.phase_number,
+                workspace_manager=self._workspace_manager,
+            )
+            logger.info(
+                f"Seeded VM workspace from phase {latest.phase_number} snapshot"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"VM workspace seeding failed: {e}")
+            return False
+
+    async def _hydrate_dispatched_config(
+        self,
+        job_id: str,
+        metadata: Dict[str, Any],
+        *,
+        resume: bool,
+    ) -> bool:
+        """Hydrate the authoritative config snapshot for one dispatch.
+
+        An in-flight orchestrator blob wins over the database snapshot because
+        it contains credentials re-injected specifically for this delivery.
+        Older orchestrators omit the field, preserving the existing resume
+        fallback to the write-once database snapshot (and then local config).
+        """
+        delivered = metadata.get("resolved_config")
+        if delivered:
+            self.config = load_config_from_resolved(delivered)
+            logger.info(f"Hydrated orchestrator-resolved config for job {job_id}")
+            return True
+
+        if resume and self.postgres_conn:
+            try:
+                import uuid as _uuid
+
+                resolved = await self.postgres_conn.jobs.get_resolved_config(
+                    _uuid.UUID(job_id)
+                )
+                if resolved:
+                    self.config = load_config_from_resolved(resolved)
+                    logger.info(f"Loaded frozen config for resumed job {job_id}")
+                    return True
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load frozen config, falling back to disk: {e}"
+                )
+
+        return False
 
     async def _setup_job_workspace(
         self,
@@ -853,32 +2965,46 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             Updated metadata with workspace-relative paths
         """
         metadata = metadata or {}
+        # This internal bearer must not survive into graph/checkpoint metadata.
+        # Pop it before config resolution, logging, or any early-return branch.
+        managed_repository_credentials = metadata.pop(
+            "managed_repository_credentials", None
+        )
+        # Fresh capture per job: files we write on top of the pod's git clone,
+        # re-asserted if a pod re-provision drops them (see the reconnect hook).
+        self._agent_seed_files = {}
 
-        # On resume: try to load frozen config from JSONB (prevents config drift).
-        # NOTE: serialize_resolved_config strips api_key from agent.llm before
-        # storage, so the loaded config has llm.api_key=None. The orchestrator's
-        # resume dispatch re-injects credentials into metadata.config_override
-        # (see _inject_dispatch_credentials), which the override block below
-        # layers on top — so we deliberately defer _create_phase_llms() until
-        # after that merge happens at line ~1014 instead of recreating LLMs
-        # twice with a half-built config.
-        _config_from_db = False
-        if resume and self.postgres_conn:
-            try:
-                from .core.loader import load_config_from_resolved
-                import uuid as _uuid
+        # Resolve upload-sourced instructions.md eagerly, once, before any of
+        # the branches below (fresh init, resume-with-existing-workspace,
+        # pod-handoff clone, PVC reattach) can return early. Every one of
+        # those branches leads to _deploy_instruction_files() registering a
+        # virtual instructions.md provider that reads
+        # self._resolved_instructions_md — a virtual file persists nothing
+        # between runs, so a resumed job whose instructions came from an
+        # upload would otherwise silently fall back to the template on
+        # whichever branch happened to fire. `metadata` is read-only with
+        # respect to these keys for the rest of this function (verified: only
+        # `updated_metadata`, a separate copy, is mutated below), so resolving
+        # here is equivalent to resolving in each branch — just impossible to
+        # accidentally miss one. Cheap when there is no upload (the helper
+        # returns immediately); non-fatal on failure (falls through to
+        # inline/template).
+        try:
+            self._resolved_instructions_md = await self._resolve_uploaded_instructions(
+                metadata
+            )
+        except Exception as e:
+            logger.warning(f"Instructions upload resolution failed (non-fatal): {e}")
+            self._resolved_instructions_md = None
 
-                resolved = await self.postgres_conn.jobs.get_resolved_config(
-                    _uuid.UUID(job_id)
-                )
-                if resolved:
-                    self.config = load_config_from_resolved(resolved)
-                    _config_from_db = True
-                    logger.info(f"Loaded frozen config for resumed job {job_id}")
-            except Exception as e:
-                logger.warning(
-                    f"Failed to load frozen config, falling back to disk: {e}"
-                )
+        # A delivered blob is already fully merged, credential-injected, and
+        # frozen by the orchestrator. It must win over the secret-free database
+        # snapshot on resume; otherwise config_override=None would leave the
+        # hydrated LLM without the credentials carried by the delivery blob.
+        # Absent blob -> the historical DB/local fallback remains unchanged.
+        _config_from_db = await self._hydrate_dispatched_config(
+            job_id, metadata, resume=resume
+        )
 
         # Handle expert config name - load the named config (tools, prompts, workspace settings)
         # This must happen before config_upload_id and config_override so those can further override
@@ -999,9 +3125,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 deep_merge,
                 load_agent_config_from_dict,
             )
+            from .core.tool_policy import normalize_tool_policy
             import dataclasses
 
-            config_override = metadata["config_override"]
+            # Non-hydrated dispatch delivers the request-layer override raw, so
+            # the agent is where its tool policy has to be resolved. (On the
+            # orchestrator-resolved path config_override is None and the blob
+            # already carries canonical lists.)
+            config_override = normalize_tool_policy(metadata["config_override"])
             logger.info(
                 f"Applying inline config override: {list(config_override.keys())}"
             )
@@ -1026,14 +3157,41 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             )
             logger.info("Applied inline config overrides")
 
-        # Apply env_keys overrides (user/project API keys for non-LLM providers)
+        # Apply env_keys overrides (user/project API keys for non-LLM providers).
+        # In the blob-delivery path the orchestrator sends config_override=None and
+        # carries the credentials inside resolved_config.agent.env_keys (via
+        # inject_blob_credentials). Fall back to the blob so embedding / vision /
+        # whisper / tts / citation keys still reach os.environ — otherwise the
+        # embedding-backed memory + KB silently fail for every blob-delivered job.
+        # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
         env_keys = (metadata.get("config_override") or {}).get("env_keys")
-        if env_keys:
-            import os as _os
+        if not env_keys:
+            env_keys = ((metadata.get("resolved_config") or {}).get("agent") or {}).get(
+                "env_keys"
+            )
+        # KB embedding transport is authoritative per dispatch. Pool/loop agents
+        # can process a later job after the system profile changes (or a job with
+        # no knowledge scope), so clear every old field before applying the new
+        # in-flight block. Otherwise an omitted BASE_URL/API_KEY can survive and
+        # pair a new model with the previous endpoint/credential.
+        import os as _os
+        from src.services.embedding_service import (
+            KB_EMBEDDING_ENV_KEYS,
+            apply_kb_embedding_env,
+        )
 
+        apply_kb_embedding_env(env_keys)
+        if env_keys:
             for k, v in env_keys.items():
-                _os.environ[k] = v
-            logger.info(f"Applied {len(env_keys)} env key override(s)")
+                if k not in KB_EMBEDDING_ENV_KEYS:
+                    _os.environ[k] = v
+            # Log the key NAMES (never values) so a missing credential — e.g.
+            # EMBEDDING_API_KEY, which silently disables memory + KB — is
+            # greppable in the agent log.
+            logger.info(
+                f"Applied {len(env_keys)} env key override(s): "
+                f"{sorted(env_keys.keys())}"
+            )
 
         # Recreate LLMs if config was modified for this job. On resume we
         # always recreate when frozen config was loaded — frozen config has
@@ -1093,6 +3251,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 resolved = serialize_resolved_config(
                     self.config, model=self.config.llm.model
                 )
+                # Backend warning surface: mismatch notes from phase-model
+                # reconciliation (mixed family/window/multimodal). Extra top-level
+                # key — load_config_from_resolved only reads resolved["agent"], so
+                # this is ignored on reload.
+                warnings_list = getattr(self, "_model_config_warnings", [])
+                if warnings_list:
+                    resolved["model_config_warnings"] = warnings_list
                 await self.postgres_conn.jobs.store_resolved_config(
                     _uuid.UUID(job_id), resolved
                 )
@@ -1100,48 +3265,152 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Failed to freeze resolved config: {e}")
 
-        # Create workspace backend. The agent never operates on its own
-        # filesystem — backend must be "sandbox" or "vm" with SSH credentials
-        # provided by the orchestrator at dispatch time.
-        if self.config.workspace.backend not in ("sandbox", "vm"):
+        # Create workspace backend. The no-workspace tiers (virtual/none) run
+        # with no workspace pod — build the lite backend directly. Otherwise
+        # the agent never operates on its own filesystem: sandbox/vm require
+        # SSH credentials injected by the orchestrator at dispatch time.
+        from .core.backends.factory import LITE_BACKENDS, create_lite_backend
+
+        if (
+            self._worker_lease_token is not None
+            and self.config.workspace.backend != "sandbox"
+        ):
             raise RuntimeError(
-                f"Unsupported workspace.backend={self.config.workspace.backend!r}. "
-                f"The agent requires backend='sandbox' or 'vm' with SSH "
-                f"credentials injected by the orchestrator."
-            )
-        if not self.config.workspace.remote:
-            raise RuntimeError(
-                f"workspace.backend={self.config.workspace.backend!r} but no "
-                f"workspace.remote config was provided. The orchestrator must "
-                f"inject SSH credentials pointing at a provisioned workspace "
-                f"container or VM."
+                "The stateless worker lane admits Kubernetes-pod sandbox "
+                "workspaces only; VM and lite jobs remain pinned"
             )
 
-        try:
-            from .core.backends.remote import RemoteBackend
+        if self.config.workspace.backend in LITE_BACKENDS:
+            try:
+                workspace_backend = create_lite_backend(
+                    self.config.workspace, job_id=job_id
+                )
+                workspace_backend.connect()
+                logger.info(
+                    "Lite workspace backend ready (backend=%s, no workspace pod)",
+                    self.config.workspace.backend,
+                )
+            except Exception as e:
+                logger.error(f"Failed to create lite backend: {e}")
+                raise
+        else:
+            if self.config.workspace.backend not in ("sandbox", "vm"):
+                raise RuntimeError(
+                    f"Unsupported workspace.backend={self.config.workspace.backend!r}. "
+                    f"The agent requires backend='sandbox' or 'vm' with SSH "
+                    f"credentials injected by the orchestrator."
+                )
+            if not self.config.workspace.remote:
+                raise RuntimeError(
+                    f"workspace.backend={self.config.workspace.backend!r} but no "
+                    f"workspace.remote config was provided. The orchestrator must "
+                    f"inject SSH credentials pointing at a provisioned workspace "
+                    f"container or VM."
+                )
 
-            remote_cfg = self.config.workspace.remote
-            shell_config = self.config.extra.get("shell", {})
-            workspace_backend = RemoteBackend(
-                host=remote_cfg["host"],
-                port=remote_cfg.get("port", 22),
-                username=remote_cfg.get("username", "agent-host"),
-                key_path=remote_cfg.get("key_path"),
-                workspace_path=remote_cfg.get(
-                    "workspace_path", "/home/agent-host/workspace"
-                ),
-                job_id=job_id,
-                scrollback_limit=shell_config.get("scrollback_limit", 5000),
-                default_timeout=shell_config.get("default_timeout", 120),
-                max_tabs=shell_config.get("max_tabs", 15),
-                blocked_commands=shell_config.get("blocked_commands"),
-                sudo_action=shell_config.get("sudo_action", "freeze"),
+            try:
+                from .core.backends.remote import RemoteBackend
+
+                remote_cfg = self.config.workspace.remote
+                shell_config = self.config.extra.get("shell", {})
+                worker_remote_authority = _stateless_worker_remote_authority(
+                    metadata,
+                    self._worker_lease_token,
+                )
+                workspace_backend = RemoteBackend(
+                    host=remote_cfg["host"],
+                    port=remote_cfg.get("port", 22),
+                    username=remote_cfg.get("username", "agent-host"),
+                    key_path=remote_cfg.get("key_path"),
+                    workspace_path=remote_cfg.get(
+                        "workspace_path", "/home/agent-host/workspace"
+                    ),
+                    job_id=job_id,
+                    scrollback_limit=shell_config.get("scrollback_limit", 5000),
+                    default_timeout=shell_config.get("default_timeout", 120),
+                    max_tabs=shell_config.get("max_tabs", 15),
+                    blocked_commands=shell_config.get("blocked_commands"),
+                    connect_timeout=remote_cfg.get("connect_timeout", 30),
+                    max_retries=remote_cfg.get("max_retries", 5),
+                    retry_timeouts_as_booting=remote_cfg.get(
+                        "retry_timeouts_as_booting", False
+                    ),
+                    sudo_action=shell_config.get("sudo_action", "freeze"),
+                    sudo_block_message=shell_config.get("sudo_block_message"),
+                    **worker_remote_authority,
+                )
+                if self._worker_lease_token is not None:
+                    workspace_backend.set_shell_owner_token(self._worker_lease_token)
+                workspace_backend.connect()
+                if self._worker_lease_token is not None:
+                    # Eager promotion fences a predecessor even when this batch
+                    # happens to be LLM-only and never opens a shell tool.
+                    workspace_backend.claim_shell_owner()
+                logger.info(
+                    f"Remote workspace backend connected to {remote_cfg['host']}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to create remote backend: {e}")
+                raise
+
+        from .core.managed_repository import (
+            ManagedRepositoryMaterializationError,
+            materialize_managed_repository_credentials,
+            repository_url_has_credentials,
+        )
+        from urllib.parse import urlparse
+
+        runtime_repository_urls = materialize_managed_repository_credentials(
+            managed_repository_credentials, workspace_backend
+        )
+        del managed_repository_credentials
+        primary_url = metadata.get("git_remote_url")
+        if repository_url_has_credentials(primary_url):
+            raise ManagedRepositoryMaterializationError(
+                "credentialed_managed_repository_url_refused"
             )
-            workspace_backend.connect()
-            logger.info(f"Remote workspace backend connected to {remote_cfg['host']}")
-        except Exception as e:
-            logger.error(f"Failed to create remote backend: {e}")
-            raise
+        if primary_url:
+            primary_name = (
+                urlparse(str(primary_url))
+                .path.rstrip("/")
+                .rsplit("/", 1)[-1]
+                .removesuffix(".git")
+            )
+            if str(primary_url).startswith("ssh://srw-repo-"):
+                if primary_name not in runtime_repository_urls:
+                    raise ManagedRepositoryMaterializationError(
+                        "managed_repository_transport_mismatch"
+                    )
+                metadata["git_remote_url"] = runtime_repository_urls[primary_name]
+        rendered_repositories: list[dict[str, Any]] = []
+        for raw_repository in metadata.get("repositories") or []:
+            repository = dict(raw_repository)
+            repo_url = repository.get("repo_url")
+            if repository.get("is_managed") and repository_url_has_credentials(
+                repo_url
+            ):
+                raise ManagedRepositoryMaterializationError(
+                    "credentialed_managed_repository_url_refused"
+                )
+            if repository.get("is_managed"):
+                repo_name = str(repository.get("name") or "")
+                role = str(repository.get("role") or "")
+                runtime_url = runtime_repository_urls.get(repo_name)
+                if runtime_url is not None:
+                    repository["repo_url"] = runtime_url
+                elif role not in {"knowledge", "jobs"}:
+                    # Source/reference repositories are cloned into the agent
+                    # workspace, so a managed row without its exact scoped
+                    # runtime authority must fail closed. Knowledge and the
+                    # project jobs ledger are server-side planes that
+                    # WorkspaceManager deliberately does not clone.
+                    raise ManagedRepositoryMaterializationError(
+                        "managed_repository_transport_mismatch"
+                    )
+                repository["credentials"] = None
+            rendered_repositories.append(repository)
+        if rendered_repositories:
+            metadata["repositories"] = rendered_repositories
 
         # Worktree creation: subjobs on shared VM/container get a git worktree
         # instead of a full clone. The worktree is created on the remote machine.
@@ -1178,11 +3447,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 metadata.pop("worktree_path", None)
 
         # Create workspace manager
+        # Lite tiers (virtual/none) have no git: their backend storage is not
+        # the local anchor path git would track, and git needs a shell they
+        # lack (no_workspace_agent_mode.md §8). Force versioning off regardless
+        # of the resolved config so a virtual/none job never attempts git init.
+        _git_versioning = self.config.workspace.git_versioning and (
+            self.config.workspace.backend not in LITE_BACKENDS
+        )
         self._workspace_manager = WorkspaceManager(
             job_id=job_id,
             config=WorkspaceManagerConfig(
                 structure=self.config.workspace.structure,
-                git_versioning=self.config.workspace.git_versioning,
+                git_versioning=_git_versioning,
                 git_remote_url=metadata.get("git_remote_url"),
                 branch_name=metadata.get("branch_name"),
                 repositories=metadata.get("repositories"),
@@ -1190,45 +3466,119 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             backend=workspace_backend,
         )
 
+        # Re-seed agent-authored files after a pod tear-down + re-provision. The
+        # pod comes back with its git clone (instructions.md, tools/) but not the
+        # files the agent wrote on top (task_brief.md, bound skills); a genuine
+        # SSH reconnect fires this hook, which restores whatever is now absent
+        # from self._agent_seed_files (populated by the seed tail below and
+        # _deploy_instruction_files). Read at fire time, so ordering is fine.
+        # Lite/virtual backends have no pod to lose and lack the hook.
+        if hasattr(workspace_backend, "set_reconnect_hook"):
+            from .core.backends.seed import reseed_missing_files
+
+            workspace_backend.set_reconnect_hook(
+                lambda b=workspace_backend: reseed_missing_files(
+                    b, self._agent_seed_files
+                )
+            )
+
         # VM recovery: seed fresh VM workspace from last snapshot if needed
+        _seeded_from_snapshot = False
         if resume and workspace_backend and workspace_backend.supports_shell:
-            try:
-                if not workspace_backend.exists("task_brief.md"):
-                    logger.info(
-                        f"VM workspace is fresh — seeding from last snapshot for job {job_id}"
-                    )
-                    from .core.phase_snapshot import PhaseSnapshotManager
+            _seeded_from_snapshot = self._reseed_from_snapshot_if_fresh(
+                job_id, workspace_backend
+            )
 
-                    recovery_mgr = PhaseSnapshotManager(
-                        job_id, workspace_backend=workspace_backend
-                    )
-                    latest = recovery_mgr.get_latest_snapshot()
-                    if latest:
-                        # Ensure base directories exist on VM
-                        for subdir in self.config.workspace.structure:
-                            try:
-                                workspace_backend.mkdir(subdir.rstrip("/"))
-                            except Exception:
-                                pass
-                        # Push snapshot files to VM
-                        recovery_mgr.recover_to_phase(
-                            latest.phase_number,
-                            workspace_manager=self._workspace_manager,
-                        )
-                        logger.info(
-                            f"Seeded VM workspace from phase {latest.phase_number} snapshot"
-                        )
-                    else:
-                        logger.warning("No snapshots available to seed VM workspace")
-            except Exception as e:
-                logger.warning(f"VM workspace seeding failed: {e}")
-
-        # Pod handoff: clone workspace from Gitea if resuming on a new pod
+        # G2: reattached remote workspace (PVC reattach on crash-recovery). The
+        # working tree already lives on the REMOTE backend root, so the
+        # local-path gates below would miss it and clone/initialize() would
+        # `rm -rf {backend.root}/*` (core/workspace.py:295/313) — wiping the
+        # volume we just got back. Detect a real working tree on the backend
+        # (`.git`; a fresh/empty PVC has none, so first dispatch still
+        # initializes) and PRESERVE it: attach a git handle to the existing repo
+        # — no clone, no rm -rf — then resume on the intact files. Gated on
+        # `resume`, so any content present belongs to THIS job's continuation
+        # (PVCs are owner-keyed by UUID).
+        # See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G2 / Phase 2).
+        _reattached = False
         if (
             resume
-            and not self._workspace_manager.path.exists()
-            and metadata.get("git_remote_url")
+            and workspace_backend
+            and getattr(workspace_backend, "supports_shell", False)
         ):
+            try:
+                _reattached = workspace_backend.exists(".git")
+            except Exception as e:
+                logger.warning(f"Reattach probe failed for job {job_id}: {e}")
+                _reattached = False
+        if _reattached:
+            logger.info(
+                f"Reattached workspace detected for job {job_id} — preserving "
+                f"existing files (no clone, no re-init)"
+            )
+            if _git_versioning and self._workspace_manager.git_manager is None:
+                from .managers.git_manager import GitManager
+
+                # Attach a handle to the existing remote repo. No clone (the dir
+                # is non-empty); the repo's own git config persists on the PVC.
+                git_mgr = GitManager(
+                    self._workspace_manager.path, backend=workspace_backend
+                )
+                self._workspace_manager._git_manager = git_mgr
+                self._workspace_manager._initialized = True
+                if metadata.get("git_remote_url"):
+                    git_mgr.add_remote("origin", metadata["git_remote_url"])
+            # Re-point the tree at the branch this job owns — whether the handle
+            # was just attached above or one already existed. A re-attached PVC
+            # keeps whatever branch its previous occupant (possibly a subjob)
+            # left checked out.
+            ensure_job_branch(self._workspace_manager.git_manager, metadata, job_id)
+            # instructions.md is virtual (knowledge-base/knowledge/features/virtual_directories.md)
+            # and cannot go missing, so the old "rewrite if vanished" guard is
+            # gone; the upload source (if any) was already resolved at the top
+            # of this function, before this branch could return early.
+            self._todo_manager = TodoManager(
+                workspace=self._workspace_manager,
+                min_todos=self.config.phase_settings.min_todos,
+                max_todos=self.config.phase_settings.max_todos,
+                model_name=self.config.llm.model,
+            )
+            logger.info(f"[{job_id}] workspace_init_path=reattach")
+            logger.debug(
+                f"Resumed job {job_id} on reattached workspace at "
+                f"{workspace_backend.root}"
+            )
+            return metadata or {}
+
+        def _backend_has(rel: str) -> bool:
+            """Probe the REAL workspace backend, treating failures as absent.
+
+            Bypasses the virtual overlay on purpose: instructions.md and
+            task_brief.md are virtual and always "exist", so probing through
+            the overlay would report every fresh pod as seeded. The question
+            here is strictly "did real seeded content survive?".
+
+            The gates below used local ``Path.exists()`` checks, which are
+            always False for a remote workspace — pod handoff degenerated to
+            "always try the clone" and the resume-existing branch was dead
+            code, letting content-bearing git-less workspaces fall through to
+            initialize()'s ``rm -rf``.
+            """
+            from .core.backends.overlay import unwrap_backend
+
+            probe = unwrap_backend(self._workspace_manager.backend)
+            try:
+                return probe.exists(rel)
+            except Exception as e:
+                logger.warning(f"Workspace probe for {rel!r} failed: {e}")
+                return False
+
+        from .core.backends.seed import mark_workspace_seeded, workspace_is_seeded
+
+        # Pod handoff: clone workspace from Gitea if resuming on a new pod
+        # (no git working tree yet — G2 above already preserved and returned
+        # for any tree that has one).
+        if resume and metadata.get("git_remote_url") and not _backend_has(".git"):
             from .managers.git_manager import GitManager
 
             logger.info(f"Pod handoff: cloning workspace for job {job_id}")
@@ -1238,10 +3588,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 backend=self._workspace_manager.backend,
             )
             if git_mgr:
-                # Checkout the correct branch for project jobs
-                branch = metadata.get("branch_name")
-                if branch:
-                    git_mgr.checkout_branch(branch)
+                # Land on the branch this job owns. `create=True` because the
+                # clone has the remote: provisioning logs a failed branch
+                # creation but still writes `branch_name` to the DB
+                # (services/job_provisioning.py:167-188), so the DB can name a
+                # branch Gitea lacks. A plain checkout returns False silently
+                # there, leaving the tree on the clone default — work lands on
+                # `main` while every reader resolves `job/<short_id>`. Creating
+                # it locally lets the first push publish it, which is what
+                # WorkspaceManager already does (core/workspace.py:550, :641).
+                ensure_job_branch(git_mgr, metadata, job_id, create=True)
 
                 self._workspace_manager._git_manager = git_mgr
                 self._workspace_manager._initialized = True
@@ -1252,26 +3608,33 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
                 self._todo_manager = TodoManager(
                     workspace=self._workspace_manager,
+                    min_todos=self.config.phase_settings.min_todos,
+                    max_todos=self.config.phase_settings.max_todos,
                     model_name=self.config.llm.model,
                 )
+                logger.info(f"[{job_id}] workspace_init_path=clone")
                 logger.info(f"Pod handoff complete for job {job_id}")
                 return metadata or {}
             logger.warning(
                 f"Pod handoff clone failed for job {job_id}, falling through to normal init"
             )
 
-        # Check if resuming an existing workspace
-        if resume and self._workspace_manager.path.exists():
+        # Check if resuming an existing workspace. Content probe via the real
+        # backend (the seeded-content marker — the same probe the VM snapshot
+        # seeding uses): preserves a seeded-but-git-less workspace instead of
+        # letting the fresh-init path below wipe it with initialize()'s
+        # `rm -rf`. Probing a virtual file instead would answer "unseeded"
+        # forever and wipe every git-less resume.
+        if resume and workspace_is_seeded(self._workspace_manager.backend):
+            logger.info(
+                f"[{job_id}] workspace_init_path="
+                f"{'snapshot' if _seeded_from_snapshot else 'existing'}"
+            )
             logger.info(f"Resuming job {job_id} with existing workspace")
-            # Verify workspace has required files
-            instructions_path = self._workspace_manager.path / "instructions.md"
-            if not instructions_path.exists():
-                # Only write instructions if missing
-                instructions = load_instructions(
-                    self.config, model=self.config.llm.model
-                )
-                self._workspace_manager.write_file("instructions.md", instructions)
-                logger.debug("Wrote missing instructions.md to workspace")
+            # instructions.md is virtual (knowledge-base/knowledge/features/virtual_directories.md)
+            # and cannot go missing; the upload source (if any) was already
+            # resolved at the top of this function, before this branch could
+            # return early.
 
             # Initialize git manager if git versioning is enabled (safe on existing repos)
             if (
@@ -1287,17 +3650,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     "origin", metadata["git_remote_url"]
                 )
 
-            # Ensure correct branch for project jobs
-            if metadata.get("branch_name") and self._workspace_manager.git_manager:
-                current = self._workspace_manager.git_manager.current_branch()
-                expected = metadata["branch_name"]
-                if current != expected:
-                    self._workspace_manager.git_manager.checkout_branch(expected)
-                    logger.info(f"Switched to expected branch: {expected}")
+            # Ensure the tree is on the branch this job owns (not whatever a
+            # previous occupant — e.g. a critic subjob — left checked out).
+            ensure_job_branch(self._workspace_manager.git_manager, metadata, job_id)
 
             # Create todo manager for this workspace
             self._todo_manager = TodoManager(
                 workspace=self._workspace_manager,
+                min_todos=self.config.phase_settings.min_todos,
+                max_todos=self.config.phase_settings.max_todos,
                 model_name=self.config.llm.model,
             )
 
@@ -1305,89 +3666,42 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             return metadata or {}
 
         # Initialize workspace (creates directories)
+        if resume:
+            # Every resume source struck out: no reattached tree, no job-repo
+            # clone (git_remote_url absent or clone failed), no snapshot.
+            # Loudly distinguishable from a legitimate first dispatch —
+            # knowledge-base/knowledge/issues/resume_fresh_workspace_no_clone_fallback.md.
+            logger.warning(
+                f"[{job_id}] workspace_init_path=blank — resume found no "
+                f"reattached tree, no clonable job repo, and no phase "
+                f"snapshot; starting from an empty workspace"
+            )
         if metadata.get("repositories"):
             self._workspace_manager.initialize_project_workspace()
         else:
             self._workspace_manager.initialize()
 
-        # Copy instructions to workspace (priority: inline > upload > template)
-        if metadata.get("instructions"):
-            # Use inline instructions (from job creation form or builder)
-            self._workspace_manager.write_file(
-                "instructions.md", metadata["instructions"]
-            )
-            logger.info("Using inline instructions from job metadata")
-        elif metadata.get("instructions_upload_id"):
-            # Use uploaded instructions
-            instr_upload_id = metadata["instructions_upload_id"]
-            from .core.workspace import get_workspace_base_path
-            import tempfile
+        # instructions.md / task_brief.md are virtual
+        # (knowledge-base/knowledge/features/virtual_directories.md): served live by providers
+        # registered in _deploy_instruction_files(), never written here.
+        # Priority for instructions.md is inline > upload > template — inline
+        # is read live from metadata at serve time, and the upload source (if
+        # any) was already resolved at the top of this function.
 
-            instructions_written = False
+        # Seeded-content marker, written exactly where the real task_brief.md
+        # used to be: on the fresh-init path, after every resume branch has
+        # returned. It is what the two probes above read, so it must mean "this
+        # workspace was seeded for this job", not "a process booted".
+        mark_workspace_seeded(self._workspace_manager.backend)
 
-            # Try HTTP download first
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
-                downloaded_files = await self._download_upload_files(
-                    instr_upload_id, temp_path, logger
-                )
-
-                if downloaded_files:
-                    # Find the instructions file from downloaded files
-                    instr_files = list(temp_path.glob("*.md")) + list(
-                        temp_path.glob("*.txt")
-                    )
-                    if instr_files:
-                        uploaded_instr_path = instr_files[0]
-                        content = uploaded_instr_path.read_text(encoding="utf-8")
-                        self._workspace_manager.write_file("instructions.md", content)
-                        logger.info(
-                            f"Copied uploaded instructions (HTTP): {uploaded_instr_path.name}"
-                        )
-                        instructions_written = True
-
-            # Fall back to local filesystem
-            if not instructions_written:
-                instr_uploads_dir = (
-                    get_workspace_base_path() / "uploads" / instr_upload_id
-                )
-
-                if instr_uploads_dir.exists():
-                    # Find the instructions file (.md or .txt)
-                    instr_files = list(instr_uploads_dir.glob("*.md")) + list(
-                        instr_uploads_dir.glob("*.txt")
-                    )
-                    if instr_files:
-                        uploaded_instr_path = instr_files[0]
-                        content = uploaded_instr_path.read_text(encoding="utf-8")
-                        self._workspace_manager.write_file("instructions.md", content)
-                        logger.info(
-                            f"Copied uploaded instructions (local): {uploaded_instr_path.name}"
-                        )
-                        instructions_written = True
-                    else:
-                        logger.warning(
-                            f"No .md/.txt files found in instructions upload: {instr_upload_id}"
-                        )
-                else:
-                    logger.warning(
-                        f"Instructions upload directory not found: {instr_uploads_dir}"
-                    )
-
-            # Fall back to template if upload failed
-            if not instructions_written:
-                pass  # Template-based fallback handled by _deploy_instruction_files()
-        else:
-            pass  # Template-based instructions handled by _deploy_instruction_files()
-
-        # Write task brief to workspace (description + optional kickoff message)
-        description = metadata.get("description", "")
-        kickoff_message = metadata.get("kickoff_message", "")
-        brief_parts = [f"# Task Brief\n\n## Description\n\n{description}"]
-        if kickoff_message:
-            brief_parts.append(f"\n\n## Kickoff Message\n\n{kickoff_message}")
-        self._workspace_manager.write_file("task_brief.md", "".join(brief_parts))
-        logger.debug("Wrote task_brief.md to workspace")
+        # Give the repo a meaningful landing page: replace the Gitea auto-init
+        # stub README (or write one when absent) with the job description.
+        # Project jobs and subjobs run on branches of shared repos whose README
+        # belongs to the project — a real README is never touched.
+        try:
+            self._write_job_readme(job_id, metadata)
+        except Exception as e:
+            logger.warning(f"Failed to write job README (non-fatal): {e}")
 
         # Process initial_files from config (templates seeded into the workspace)
         if self.config.workspace.initial_files:
@@ -1636,11 +3950,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(
             workspace=self._workspace_manager,
+            min_todos=self.config.phase_settings.min_todos,
+            max_todos=self.config.phase_settings.max_todos,
             model_name=self.config.llm.model,
         )
 
-        # Instruction files (todo_guide.md, instruction_files, template-based instructions.md)
-        # are deployed in _deploy_instruction_files() after tools are loaded, so that
+        # Instruction files (bound skills like todo-guide, instruction_files, template-based
+        # instructions.md) are deployed in _deploy_instruction_files() after tools are loaded, so that
         # Jinja2 conditionals can reference which tools are actually available.
 
         logger.debug(f"Workspace created at {self._workspace_manager.path}")
@@ -1658,6 +3974,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         """
         # Process datasources from job metadata (sent by orchestrator)
         from src.core.datasource_setup import (
+            clone_repository_datasources,
             inject_datasource_index,
             process_credential_files,
             process_datasources,
@@ -1667,14 +3984,51 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self._job_metadata.get("datasources", []) if self._job_metadata else []
         )
         ws = self._workspace_manager
-        workspace_dir = getattr(ws, "workspace_dir", None) or os.getcwd()
+
+        # Repository datasources clone onto the workspace backend — never
+        # locally in the agent pod (the subprocess git-clone branch was
+        # removed; see knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
+        repo_datasources = [ds for ds in ds_configs if ds.get("type") == "repository"]
+        kb_datasources = [ds for ds in ds_configs if ds.get("type") == "kb"]
+        non_repo_datasources = [
+            ds for ds in ds_configs if ds.get("type") not in ("repository", "kb")
+        ]
 
         datasources_dict, client_registry, cli_ds_types = process_datasources(
-            ds_configs, workspace_dir=workspace_dir
+            non_repo_datasources
         )
         # Track connections for cleanup
         self._datasource_connections.update(datasources_dict)
         self._datasource_clients.update(client_registry)
+
+        from .tools.registry import register_mcp_tools
+
+        # Discovery must finish before rendering datasources.md and loading
+        # tools. MCPManager degrades individual server failures internally.
+        mcp_manager = datasources_dict.get("mcp")
+        if mcp_manager is not None:
+            try:
+                await mcp_manager.connect_all()
+            except Exception as e:
+                logger.warning(
+                    "Unexpected MCP discovery failure (%s); continuing without MCP",
+                    type(e).__name__,
+                )
+            try:
+                register_mcp_tools(mcp_manager)
+                mcp_manager.annotate_configs()
+            except Exception as e:
+                logger.warning(
+                    "Could not register MCP tools (%s); continuing without MCP",
+                    type(e).__name__,
+                )
+        else:
+            # Loop-mode workers are process-reused; do not retain the prior
+            # job's dynamic registry entries.
+            register_mcp_tools(None)
+
+        if repo_datasources:
+            clone_repository_datasources(repo_datasources, ws)
 
         # Materialize credential files (kubeconfig, ssh_key, generic_file).
         # Tracked in a manifest so _close_datasource_connections() can undo it.
@@ -1696,6 +4050,17 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             **self.config.extra,
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,  # For vision-aware file reading
+            # Lets bulk readers cap a single tool result relative to the main
+            # model's window (session_silent_failure_audit.md #5).
+            "model_max_context_tokens": self.config.limits.model_max_context_tokens,
+            # Per-family page-render DPI (None -> renderer default 150).
+            "pdf_render_dpi": getattr(self.config.limits, "pdf_render_dpi", None),
+            # Delegation tools read their settings from this plain dict
+            # (delegate_work's enabled/timeout checks, spawn_subagent's
+            # mode/light backend selection). "delegation" is a parsed/known
+            # config field, so it is NOT part of config.extra — inject the
+            # typed config back in explicitly or the tools see an empty dict.
+            "delegation": asdict(self.config.delegation),
         }
         # Build job metadata for delegation tool access
         job_metadata = {
@@ -1708,25 +4073,68 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "repo_name": (self._job_metadata or {}).get("repo_name"),
         }
 
+        from src.services.knowledge.bindings import build_knowledge_bindings
+        from src.shared.runtime_actor import RuntimeActorContext
+
+        raw_project_id = (
+            self._job_metadata.get("project_id") if self._job_metadata else None
+        )
+        native_project_ids = [str(raw_project_id)] if raw_project_id else []
+        runtime_actor = RuntimeActorContext.from_payload(
+            self._job_metadata.get("runtime_actor") if self._job_metadata else None
+        )
+        knowledge_bindings = build_knowledge_bindings(
+            project_ids=native_project_ids,
+            datasources=kb_datasources,
+            runtime_actor=runtime_actor,
+        )
+
         context = ToolContext(
             workspace_manager=self._workspace_manager,
             todo_manager=self._todo_manager,
             postgres_db=self.postgres_conn,
+            vector_db=getattr(self, "vector_conn", None),
+            verify_aux=self._citation_verify_aux,
+            verify_citation_prompt=self._citation_verification_prompt,
             datasources=datasources_dict,
             config=tool_config,
             _job_id=self._current_job_id,
             _llm_config=self.config.llm,
             _instruction_files=self.config.instruction_files,
+            knowledge_bindings=knowledge_bindings,
+            runtime_actor=runtime_actor,
             orchestrator_client=self._orchestrator_client,
             _job_metadata=job_metadata,
         )
+        context.project_ids = native_project_ids
+
+        # Progress durability. Phase boundaries used to be the only thing that
+        # pushed the workspace to its remote, which made every external view of
+        # a running job as stale as the last boundary. Wire the committer here,
+        # where the workspace and config are both resolved, so the todo tool and
+        # the turn loop share one push clock.
+        try:
+            from src.core.progress_commit import ProgressCommitter
+
+            _limits = self.config.limits
+            _ws = self._workspace_manager
+            context.progress_committer = ProgressCommitter(
+                # Resolved per call, not captured: a workspace re-init or tier
+                # upgrade swaps the GitManager out from under us mid-job.
+                lambda: _ws.git_manager,
+                job_id=self._current_job_id or "unknown",
+                push_interval=_limits.progress_push_interval_seconds,
+                wip_after=_limits.progress_wip_commit_after_seconds,
+            )
+        except Exception as e:
+            logger.warning(f"ProgressCommitter unavailable (non-fatal): {e}")
+
         self._tool_context = context
 
-        # Initialize ShellManager for persistent terminal sessions
+        # Initialize ShellManager for persistent terminal sessions. Shells run
+        # only on the workspace — there is no local (in-pod) tmux fallback.
         ws_backend = self._workspace_manager.backend
-        use_remote_shell = getattr(ws_backend, "supports_shell", False)
-
-        if use_remote_shell or shutil.which("tmux"):
+        if getattr(ws_backend, "supports_shell", False):
             try:
                 from src.tools.shell.shell_manager import ShellManager
 
@@ -1745,8 +4153,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     sandbox_cwd=str(self._workspace_manager.path)
                     if shell_config.get("sandbox", True)
                     else None,
-                    backend=ws_backend if use_remote_shell else None,
+                    backend=ws_backend,
                     sudo_action=sudo_action,
+                    sudo_block_message=shell_config.get("sudo_block_message"),
                 )
                 context.shell_manager = shell_manager
                 self._shell_manager = shell_manager
@@ -1754,9 +4163,17 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Failed to initialize ShellManager (non-fatal): {e}")
         else:
-            logger.debug("tmux not found — shell tools disabled")
+            logger.info(
+                "Workspace backend does not support shell — shell tools "
+                "disabled (no local fallback)"
+            )
 
-        # Initialize RecallStore for Memory Light (if enabled)
+        # Initialize RecallStore for Memory Light (if enabled). These flags let
+        # the process_job guard fail-closed (pause for re-dispatch) when a
+        # memory-required job loses its embedding-backed stores. See
+        # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md.
+        self._memory_degraded = False
+        self._kb_degraded = False
         if self.config.memory.enabled:
             try:
                 from src.services.embedding_service import get_embedding_service
@@ -1796,40 +4213,65 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 # Memory extraction is now handled by AuxiliaryLLM in the graph
                 # (see extract_and_store_memories in src/services/auxiliary.py)
 
-            except Exception as e:
-                logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
+                # B4 guard: background-probe the endpoint's dimensionality so
+                # a misconfigured provider surfaces as one ERROR at init
+                # instead of a swallowed WARNING per write.
+                asyncio.create_task(embedding_service.verify_dimensions())
 
-        # Initialize KnowledgeGraphDB + KnowledgeStore for project knowledge base
-        project_id = (
-            self._job_metadata.get("project_id") if self._job_metadata else None
+            except Exception as e:
+                self._memory_degraded = True
+                _provider = os.environ.get("EMBEDDING_PROVIDER", "local")
+                _model = os.environ.get("EMBEDDING_MODEL", "unknown")
+                from src.core.archiver import audit_unavailable as _audit_unavailable
+
+                _audit_unavailable(
+                    job_id=self._current_job_id,
+                    agent_type=self.config.agent_id,
+                    step_type="memory_unavailable",
+                    component="RecallStore",
+                    error=e,
+                    node_name="setup_job_tools",
+                    extra={
+                        "embedding_provider": _provider,
+                        "embedding_model": _model,
+                    },
+                )
+                logger.warning(
+                    f"Failed to initialize RecallStore (non-fatal): {e} "
+                    f"[embedding_provider={_provider}, model={_model}]"
+                )
+
+        # Initialize the pgvector KnowledgeStore independently from the optional
+        # Neo4j Graph tier. Retrieval/read tools only require the store.
+        if knowledge_bindings:
+            self._setup_job_knowledge(
+                context, str(raw_project_id) if raw_project_id else None
+            )
+
+        # Load tools from registry, gated by what the workspace backend can
+        # actually support (no_workspace_agent_mode.md §3.2/§7): the lite tiers
+        # declare supports_shell=False so shell/browser/git are dropped, and
+        # none's ScratchBackend (supports_file_tools=False) also drops the file
+        # tools — enforcement-by-construction, independent of the config lists.
+        from .tools.registry import expand_tool_wildcards, filter_tools_by_backend
+
+        tool_names = expand_tool_wildcards(get_all_tool_names(self.config))
+        tool_names = filter_tools_by_backend(
+            tool_names, self._workspace_manager.backend
         )
-        if project_id:
-            try:
-                from src.services.knowledge_graph import KnowledgeGraphDB
-                from src.services.knowledge_store import KnowledgeStore
-                from src.services.embedding_service import get_embedding_service
 
-                kg = KnowledgeGraphDB()
-                if kg.connect():
-                    embedding_service = get_embedding_service()
-                    ks = KnowledgeStore(
-                        db=self.vector_conn,
-                        embedding_service=embedding_service,
-                    )
-                    context.knowledge_graph = kg
-                    context.knowledge_store = ks
-                    context.project_id = str(project_id)
-                    self._knowledge_graph = kg  # Track for cleanup
-                    logger.info(f"Knowledge base initialized for project {project_id}")
-                else:
-                    logger.warning(
-                        "Failed to connect to Neo4j — inline curation disabled"
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to initialize knowledge base (non-fatal): {e}")
-
-        # Load tools from registry
-        tool_names = get_all_tool_names(self.config)
+        # Expose the in-process upgrade control tool ONLY on a lite (no-shell)
+        # backend — the W1 trigger (workspace_tier_upgrade.md §4.3): a lite worker
+        # that needs a real environment calls request_workspace_upgrade, which
+        # sets a workspace_upgrade_required freeze the agent intercepts and
+        # upgrades in place. Mirrors the session path
+        # (persistent_session._load_tools_for_backend); it isn't in any config's
+        # tool list, so without this a lite job could never request an upgrade.
+        # After a virtual→sandbox swap supports_shell=True, so the re-derive on
+        # the new backend drops it (nothing left to upgrade to).
+        if not getattr(self._workspace_manager.backend, "supports_shell", False):
+            if "request_workspace_upgrade" not in tool_names:
+                tool_names.append("request_workspace_upgrade")
 
         try:
             self._tools = load_tools(tool_names, context)
@@ -1846,16 +4288,79 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             self._tools = implemented_tools
 
-        # Generate tool documentation in workspace (before overrides so full docstrings are captured)
-        tools_dir = self._workspace_manager.get_path("tools")
+        # Tool docs are a virtual directory (knowledge-base/knowledge/features/virtual_directories.md):
+        # served from the live tool list, never written to the workspace.
+        from .core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir
 
-        def _write_tool_doc(rel_path: str, content: str) -> None:
-            self._workspace_manager.write_file(f"tools/{rel_path}", content)
+        # CRITICAL: hold the PRE-override tool objects. Further down,
+        # `self._tools = apply_description_overrides(self._tools)` rebinds the
+        # attribute to copies whose deferred-tool descriptions are short
+        # blurbs. A provider reading `self._tools` at call time would render
+        # those blurbs into tools/<name>.md and defeat the whole deferred-tool
+        # design (short in context, FULL on disk). apply_description_overrides
+        # returns copies, so the originals this list holds stay full.
+        self._full_description_tools = self._tools
+        self._workspace_manager.register_virtual_provider(
+            ToolsProvider(lambda: self._full_description_tools)
+        )
+        if self._workspace_manager.virtual_overlay is not None:
+            sweep_legacy_tools_dir(self._workspace_manager.virtual_overlay.inner)
+
+        # contacts/ is virtual and project-scoped (knowledge-history/done/contacts_registry.md).
+        # Only registered when the job has a project — without one, `contacts/`
+        # is never reserved and the path falls through to the real filesystem.
+        # `os` is already imported at module level (line 17) — a local re-import
+        # here would shadow it for this whole method and break the earlier
+        # os.environ.get() calls above (ruff F823).
+        import httpx
+
+        from .core.virtual_dirs import ContactsProvider
+
+        orchestrator_url = os.getenv("ORCHESTRATOR_URL", "").rstrip("/")
+        job_id = self._current_job_id
+        if orchestrator_url and job_id and raw_project_id:
+
+            def _fetch_contacts():
+                response = httpx.get(
+                    f"{orchestrator_url}/api/contacts/internal/list",
+                    params={"job_id": job_id},
+                    headers={"X-Internal-Key": os.getenv("MCP_INTERNAL_KEY", "")},
+                    timeout=3.0,
+                )
+                response.raise_for_status()
+                return response.json().get("contacts", [])
+
+            self._workspace_manager.register_virtual_provider(
+                ContactsProvider(_fetch_contacts)
+            )
 
         loaded_tool_names = [t.name for t in self._tools]
-        generate_workspace_tool_docs(
-            loaded_tool_names, tools_dir, tools=self._tools, write_fn=_write_tool_doc
+
+        # Stash the resolved tool list + limits so the light spawn_subagent
+        # backend can build a reader that inherits the parent's tools (minus the
+        # delegation category) and the reader LLM. Read at spawn time — the
+        # spawn_subagent factory already ran during load_tools() above but its
+        # closure reads these lazily. (context is self._tool_context here.)
+        context._resolved_tool_names = loaded_tool_names
+        context._limits = self.config.limits
+
+        # Capability-scoped bundled skills are resolved only after the final
+        # backend gate. In particular, worker jobs must never advertise or
+        # materialize present-with-canvas because Canvas is session-only.
+        from .core.skill_resolution import scope_skills_for_tools
+
+        skill_catalog = self.config.extra.get(
+            "_unscoped_resolved_skills",
+            self.config.extra.get("_resolved_skills", {}),
         )
+        self.config.extra = {
+            **self.config.extra,
+            "_unscoped_resolved_skills": skill_catalog,
+            "_resolved_skills": scope_skills_for_tools(
+                skill_catalog, loaded_tool_names
+            ),
+        }
+        context.config["_resolved_skills"] = self.config.extra["_resolved_skills"]
 
         # Deploy instruction files with Jinja2 rendering (after tools loaded)
         self._deploy_instruction_files(loaded_tool_names)
@@ -1869,11 +4374,24 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Configure parallel tool calls from config (defaults to False to prevent
         # overwhelming the agent loop with 20+ simultaneous tool calls).
-        # OpenAI o-series reasoning models don't support this parameter.
-        bind_kwargs = {}
-        model_name = (self.config.llm.model or "").lower()
-        if not model_name.startswith(("o1", "o3", "o4")):
-            bind_kwargs["parallel_tool_calls"] = self.config.llm.parallel_tool_calls
+        # parallel_tool_calls is an OpenAI Chat Completions param — suppressed
+        # for providers/models that reject it (Google GenAI's GenerateContentConfig,
+        # OpenAI o-series). Strategic and tactical phases can use different
+        # providers, so gate each phase independently.
+        strategic_cfg = self.config.llm.get_phase_config("strategic")
+        tactical_cfg = self.config.llm.get_phase_config("tactical")
+
+        strategic_bind_kwargs = {}
+        if supports_parallel_tool_calls(strategic_cfg.provider, strategic_cfg.model):
+            strategic_bind_kwargs["parallel_tool_calls"] = (
+                strategic_cfg.parallel_tool_calls
+            )
+
+        tactical_bind_kwargs = {}
+        if supports_parallel_tool_calls(tactical_cfg.provider, tactical_cfg.model):
+            tactical_bind_kwargs["parallel_tool_calls"] = (
+                tactical_cfg.parallel_tool_calls
+            )
 
         # Phase-filter tools: each LLM only sees tools declared for its phase.
         # The ToolNode keeps the full list (LLM schema binding is primary enforcement).
@@ -1890,7 +4408,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Inject family-specific Examples blocks into tool descriptions before
         # binding. This is where the model first sees the tool catalog and
-        # decides on a wire format — see docs/design/guardrails_matrix.md.
+        # decides on a wire format — see knowledge-base/knowledge/design/guardrails_matrix.md.
         from src.services.guardrails import apply_guardrails_to_tools
 
         strategic_tools = apply_guardrails_to_tools(
@@ -1901,10 +4419,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         )
 
         self._strategic_llm_with_tools = self._strategic_llm.bind_tools(
-            strategic_tools, **bind_kwargs
+            strategic_tools, **strategic_bind_kwargs
         )
         self._tactical_llm_with_tools = self._tactical_llm.bind_tools(
-            tactical_tools, **bind_kwargs
+            tactical_tools, **tactical_bind_kwargs
         )
 
         # Keep _llm_with_tools for backwards compatibility
@@ -1920,6 +4438,225 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self._register_initial_documents_background(context)
         )
 
+    def _setup_job_knowledge(
+        self, context: ToolContext, project_id: Optional[str]
+    ) -> None:
+        """Attach the required vector store and optional Graph tier to a job."""
+        if project_id:
+            context.project_id = project_id
+
+        try:
+            if self.vector_conn is None:
+                raise RuntimeError("Vector database connection is unavailable")
+
+            from src.services.embedding_service import get_kb_embedding_service
+            from src.services.knowledge_store import KnowledgeStore
+
+            embedding_service = get_kb_embedding_service()
+            context.knowledge_store = KnowledgeStore(
+                db=self.vector_conn,
+                embedding_service=embedding_service,
+            )
+            logger.info(
+                "Knowledge store initialized for %d KB binding(s)",
+                len(getattr(context, "knowledge_bindings", []) or [])
+                or (1 if project_id else 0),
+            )
+        except Exception as e:
+            self._kb_degraded = True
+            from src.core.archiver import audit_unavailable as _audit_unavailable
+
+            _audit_unavailable(
+                job_id=self._current_job_id,
+                agent_type=self.config.agent_id,
+                step_type="kb_unavailable",
+                component="KnowledgeStore",
+                error=e,
+                node_name="setup_job_tools",
+                extra={
+                    "project_id": project_id,
+                    "kb_ids": getattr(
+                        context, "kb_ids", [project_id] if project_id else []
+                    ),
+                    "embedding_provider": os.environ.get(
+                        "KB_EMBEDDING_PROVIDER",
+                        os.environ.get("EMBEDDING_PROVIDER", "local"),
+                    ),
+                },
+            )
+            logger.warning(
+                f"Failed to initialize knowledge store (non-fatal): {e} "
+                f"[embedding_provider="
+                f"{os.environ.get('KB_EMBEDDING_PROVIDER', os.environ.get('EMBEDDING_PROVIDER', 'local'))}]"
+            )
+
+        if not project_id:
+            return
+
+        try:
+            from src.services.knowledge_graph import KnowledgeGraphDB
+
+            kg = KnowledgeGraphDB()
+            if kg.connect():
+                context.knowledge_graph = kg
+                self._knowledge_graph = kg  # Track for cleanup
+                logger.info(
+                    f"Knowledge Graph tier initialized for project {project_id}"
+                )
+            else:
+                logger.warning("Failed to connect to Neo4j — Graph tier disabled")
+        except Exception as e:
+            # Neo4j is optional: do not mark vector search/read as degraded.
+            logger.warning(f"Failed to initialize Neo4j Graph tier (non-fatal): {e}")
+
+    # Gitea auto-inits per-job repos with a stub README of the form
+    # "# job-xxxxxxxx\n\nWorkspace for job-xxxxxxxx"; anything else is a real
+    # README that must not be replaced.
+    _GITEA_STUB_README_MARKER = "Workspace for job-"
+
+    def _write_job_readme(self, job_id: str, metadata: Dict[str, Any]) -> None:
+        """Write a human-readable README.md for per-job workspace repos.
+
+        Replaces the Gitea auto-init stub (or creates a README when absent)
+        with the job description, so the repo landing page describes the job
+        instead of just naming its id. Shared-repo READMEs (project jobs,
+        subjobs) never match the stub pattern and are left untouched.
+        """
+        ws = self._workspace_manager
+        if ws.exists("README.md"):
+            existing = ws.read_file("README.md").strip()
+            is_stub = (
+                existing.startswith("# job-")
+                and self._GITEA_STUB_README_MARKER in existing
+                and len(existing) < 300
+            )
+            if not is_stub:
+                return
+        description = (metadata.get("description") or "").strip()
+        config_name = metadata.get("config_name") or "worker_base"
+        lines = [f"# Job {job_id[:8]}", ""]
+        if description:
+            lines += [description, ""]
+        lines += [
+            "---",
+            "",
+            f"Workspace repository for job `{job_id}` (config: `{config_name}`).",
+            "See `instructions.md` for the task instructions and `task_brief.md` "
+            "for the brief.",
+            "",
+        ]
+        content = "\n".join(lines)
+        ws.write_file("README.md", content)
+        self._agent_seed_files["README.md"] = content
+        logger.debug("Wrote job README.md to workspace")
+
+    async def _hydrate_job_brief(self, job_id: str) -> None:
+        """Backfill description/required_deliverables/kickoff_message.
+
+        ``JobResumeRequest`` carries none of them, so a resumed job would
+        serve an empty virtual ``task_brief.md`` for the rest of its life.
+        Sources: orchestrator internal ``/brief`` endpoint first, the agent's
+        own DB handle second; both non-fatal. Never overwrites fields the
+        dispatch already provided.
+        knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md
+        """
+        row = None
+        if self._orchestrator_client:
+            try:
+                row = await self._orchestrator_client.get_job_brief(job_id)
+            except Exception as e:
+                logger.warning(
+                    f"[{job_id}] brief hydration via orchestrator failed: {e}"
+                )
+        if not row and self.postgres_conn:
+            try:
+                import json as _json
+                import uuid as _uuid
+
+                job = await self.postgres_conn.jobs.get(_uuid.UUID(job_id))
+                ctx = (job or {}).get("context") or {}
+                if isinstance(ctx, str):
+                    ctx = _json.loads(ctx)
+                row = {
+                    "description": (job or {}).get("description"),
+                    "required_deliverables": ctx.get("required_deliverables"),
+                    "kickoff_message": ctx.get("kickoff_message"),
+                }
+            except Exception as e:
+                logger.warning(f"[{job_id}] brief hydration via DB failed: {e}")
+        keys = ("description", "required_deliverables", "kickoff_message")
+        if not row or not any(row.get(k) for k in keys):
+            logger.error(
+                f"[{job_id}] resume: task brief could not be hydrated — the "
+                f"virtual task_brief.md will serve empty"
+            )
+            return
+        if self._job_metadata is None:
+            self._job_metadata = {}
+        for key in keys:
+            if row.get(key) and not self._job_metadata.get(key):
+                self._job_metadata[key] = row[key]
+        logger.info(
+            f"[{job_id}] hydrated task brief on resume "
+            f"(description={len(row.get('description') or '')} chars)"
+        )
+
+    async def _note_resume_without_checkpoint(
+        self, job_id: str, previous_status: Optional[str]
+    ) -> None:
+        """Tripwire: ``resume=True`` but no checkpoint or snapshot was found.
+
+        The orchestrator routed a job with nothing to resume down the
+        ``/job/resume`` lane — almost always a never-started job (that lane
+        ships no brief fields). Fall toward fresh seeding: backfill the brief
+        and commit the Phase-0 seed the fresh path would have committed.
+        knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md
+        """
+        logger.error(
+            f"[{job_id}] resume=True but no checkpoint or snapshot was found "
+            f"(previous_status={previous_status!r}) — treating as a fresh "
+            f"start; the job was probably dispatched down the wrong lane"
+        )
+        await self._hydrate_job_brief(job_id)
+        self._commit_workspace_seed(job_id)
+
+    def _commit_workspace_seed(self, job_id: str) -> None:
+        """Commit and push the seeded workspace as the Phase 0 baseline.
+
+        Runs after all seeding (instructions, task brief, documents, README,
+        bound skills) so the job's inputs are visible in the repo immediately,
+        instead of first appearing in the phase 1 archive commit.
+        """
+        git_mgr = (
+            self._workspace_manager.git_manager if self._workspace_manager else None
+        )
+        if not git_mgr or not git_mgr.is_active:
+            return
+        try:
+            committed = git_mgr.commit(
+                "[Phase 0 Seed] Workspace seeded: instructions and input files",
+                allow_empty=False,
+            )
+            if committed:
+                git_mgr.push()
+        except Exception as e:
+            logger.warning(f"[{job_id}] Phase 0 seed commit failed (non-fatal): {e}")
+
+    def _remove_legacy_manifest_status(self, job_id: str) -> None:
+        """Remove the retired agent-visible phase-boundary status file.
+
+        Existing repositories and resumed workspaces may contain a tracked copy
+        created by older workers. Cleanup is best-effort: inability to delete
+        obsolete observability data must not prevent the job from starting.
+        """
+        path = "output/manifest_status.json"
+        try:
+            if self._workspace_manager and self._workspace_manager.exists(path):
+                self._workspace_manager.delete_file(path)
+                logger.info(f"[{job_id}] Removed retired workspace file {path}")
+        except Exception as e:
+            logger.warning(f"[{job_id}] Could not remove retired file {path}: {e}")
+
     def _deploy_instruction_files(self, loaded_tool_names: List[str]) -> None:
         """Deploy instruction files to workspace with Jinja2 rendering.
 
@@ -1927,39 +4664,79 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         ``{% if has_tool("kb_write") %}`` resolve correctly.
 
         Deploys:
-        - instructions.md (from template, only if not already written from upload/inline)
-        - todo_guide.md (via instruction matrix)
-        - Additional instruction_files from config
+        - instructions.md / task_brief.md as virtual providers (served live,
+          never written — see knowledge-base/knowledge/features/virtual_directories.md)
+        - Additional instruction_files from config (literal files + bound skills)
+        - In-scope skill directories (Slice 2)
         """
         from .core.loader import (
-            InstructionMatrixResolver,
             FileResolver,
             render_instruction_content,
             load_instructions,
         )
-        from .core.model_registry import family_of
 
-        # instructions.md — only deploy template if not already present (upload/inline)
-        instructions_path = self._workspace_manager.get_path("instructions.md")
-        if not instructions_path.exists():
-            instructions = load_instructions(self.config, model=self.config.llm.model)
-            instructions = render_instruction_content(instructions, loaded_tool_names)
-            self._workspace_manager.write_file("instructions.md", instructions)
-            logger.debug("Deployed template-based instructions.md to workspace")
+        # instructions.md / task_brief.md are virtual
+        # (knowledge-base/knowledge/features/virtual_directories.md): served from the job record or
+        # the rendered template, never written to the workspace. This deletes
+        # the exists()-probe precedence dance and the "rewrite if it vanished"
+        # repair path — a virtual file cannot go missing.
+        from .core.virtual_dirs import build_instruction_providers
+        from .core.deliverables import format_deliverable_contract_block
 
-        # todo_guide.md — via instruction matrix
-        model_family = family_of(self.config.llm.model)
-        instr_resolver = InstructionMatrixResolver(
-            self.config._deployment_dir, model_family
+        # Providers read self._job_metadata LIVE (not a bound alias): resume
+        # hydration may replace or backfill it after these closures are
+        # registered, and a stale alias would serve an empty brief forever
+        # (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+        def _uploaded_instructions():
+            # Priority inline > upload (the template is the caller's fallback).
+            # Inline is read live so it survives the resume path; upload content
+            # was resolved eagerly at boot because its I/O is async.
+            inline = (self._job_metadata or {}).get("instructions")
+            if inline and inline.strip():
+                return inline
+            return self._resolved_instructions_md
+
+        def _rendered_template():
+            content = load_instructions(self.config, model=self.config.llm.model)
+            return render_instruction_content(content, loaded_tool_names)
+
+        def _task_brief():
+            meta = self._job_metadata or {}
+            description = meta.get("description", "")
+            kickoff_message = meta.get("kickoff_message", "")
+            parts = [f"# Task Brief\n\n## Description\n\n{description}"]
+            if kickoff_message:
+                parts.append(f"\n\n## Kickoff Message\n\n{kickoff_message}")
+            # Deliverable contract (P1-C): render the job's required_deliverables
+            # manifest as an explicit block — workers can't be held to a floor
+            # they were never shown. Empty string when the job has no manifest.
+            contract_block = format_deliverable_contract_block(
+                meta.get("required_deliverables")
+            )
+            if contract_block:
+                parts.append(contract_block)
+            return "".join(parts)
+
+        instruction_providers = build_instruction_providers(
+            uploaded=_uploaded_instructions,
+            template=_rendered_template,
+            brief=_task_brief,
         )
-        try:
-            resolved = self.config.extra.get("_resolved_instructions", {})
-            todo_guide = resolved.get("todo_guide") or instr_resolver.load("todo_guide")
-            todo_guide = render_instruction_content(todo_guide, loaded_tool_names)
-            self._workspace_manager.write_file("todo_guide.md", todo_guide)
-            logger.debug("Deployed todo_guide.md to workspace")
-        except FileNotFoundError:
-            logger.warning("todo_guide.md not found via instruction matrix")
+        for provider in instruction_providers:
+            self._workspace_manager.register_virtual_provider(provider)
+
+        # There is deliberately no materialize-to-disk fallback here. Writing
+        # these two into the workspace root is what dropped a critic's brief
+        # into the root its TARGET reads from, on every subjob that inherits
+        # its parent's workspace
+        # (knowledge-history/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md).
+        # The fallback existed to stop an agent booting with no task; graph.py
+        # now refuses to start when both briefs resolve empty, which covers
+        # every cause rather than the single one this branch handled.
+
+        # todo_guide is now the bundled "todo-guide" skill, bound via instruction_files
+        # (before_tool:next_phase_todos) and materialized in the loop below — no matrix
+        # special-case. See knowledge-base/knowledge/features/agent_skills.md (Slice 3).
 
         # Additional instruction files (config-driven)
         if self.config.instruction_files:
@@ -1969,10 +4746,30 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 framework_dir=templates_dir,
             )
             resolved_instructions = self.config.extra.get("_resolved_instructions", {})
+            deployed_paths: set[str] = set()
             for entry in self.config.instruction_files:
+                if entry.path in deployed_paths:
+                    continue
                 try:
-                    # Skip todo_guide.md — already handled above via matrix
-                    if entry.file == "todo_guide.md":
+                    if entry.skill:
+                        # Bound skill: content from the (flag-independent) instructions
+                        # channel, written to skills/<skill>/SKILL.md. The catalog
+                        # materialization path (Slice 2) is filtered out for bound
+                        # skills, so this is the single delivery path.
+                        content = resolved_instructions.get(entry.skill)
+                        if not content:
+                            logger.warning(
+                                f"Bound skill content missing from blob: {entry.skill}"
+                            )
+                            continue
+                        content = render_instruction_content(content, loaded_tool_names)
+                        parent_dir = str(Path(entry.path).parent)
+                        if parent_dir and parent_dir != ".":
+                            self._workspace_manager.backend.mkdir(parent_dir)
+                        self._workspace_manager.write_file(entry.path, content)
+                        self._agent_seed_files[entry.path] = content
+                        deployed_paths.add(entry.path)
+                        logger.debug(f"Deployed bound skill to workspace: {entry.path}")
                         continue
                     # Check resolved config first (resumed jobs)
                     basename = Path(entry.file).stem
@@ -1985,43 +4782,48 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     if parent_dir and parent_dir != ".":
                         self._workspace_manager.backend.mkdir(parent_dir)
                     self._workspace_manager.write_file(entry.file, content)
+                    deployed_paths.add(entry.path)
                     logger.debug(
                         f"Deployed instruction file to workspace: {entry.file}"
                     )
                 except FileNotFoundError:
                     logger.warning(f"Instruction file not found: {entry.file}")
 
+        # Skill directories (Slice 2): materialize in-scope skills into
+        # skills/<name>/<path> so use_skill (L2) and read_file/run_command (L3)
+        # can reach them. Same write_file/mkdir path as instruction files.
+        from .core.skill_resolution import skill_files_to_workspace
+
+        skills_files = self.config.extra.get("_resolved_skills", {}).get("files", {})
+        for ws_path, content in skill_files_to_workspace(skills_files).items():
+            parent_dir = str(Path(ws_path).parent)
+            if parent_dir and parent_dir != ".":
+                self._workspace_manager.backend.mkdir(parent_dir)
+            self._workspace_manager.write_file(ws_path, content)
+            logger.debug(f"Deployed skill file to workspace: {ws_path}")
+
     async def _register_initial_documents_background(
         self, context: "ToolContext"
     ) -> None:
-        """Background async wrapper for parallel document registration.
-
-        Runs the synchronous _register_initial_documents in a thread executor
-        so the agent's ReAct loop can start immediately.
-
-        Args:
-            context: ToolContext with workspace and citation engine
-        """
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._register_initial_documents, context)
-
-    def _register_initial_documents(self, context: "ToolContext") -> None:
         """Register input documents in documents/ as CitationEngine sources.
 
         Scans the documents/ directory for supported file types and registers
-        each as a source in parallel using ThreadPoolExecutor, enabling hybrid
-        vector search via search_library.
-        Skips documents/external/ (web content registered separately).
+        each as a source concurrently on the agent's shared async vector pool,
+        enabling hybrid vector search via search_library. Skips
+        documents/external/ (web content is registered separately by the
+        research tools).
 
-        Each worker thread creates its own CitationEngine instance for thread
-        safety (the shared context.citation_engine uses a single DB connection).
-
-        Non-fatal: failures are logged but do not block job execution.
+        Runs as a background task so the agent's ReAct loop starts immediately.
+        Concurrency is bounded by a semaphore (the pool + embedding endpoint do
+        the rest). Non-fatal: failures are logged but never block the job.
 
         Args:
-            context: ToolContext with workspace and citation engine
+            context: ToolContext with the workspace + vector pool.
         """
         if not context.has_workspace():
+            return
+        if context.vector_db is None:
+            logger.debug("No vector pool attached; skipping document auto-registration")
             return
 
         SUPPORTED_EXTENSIONS = {
@@ -2040,28 +4842,27 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         }
 
         try:
-            docs_path = context.workspace_manager.get_path("documents")
-            if not docs_path.exists():
+            ws = context.workspace_manager
+            # Walk via the backend: a local Path.exists()/rglob() never sees a
+            # remote workspace, which silently disabled auto-registration on
+            # every remote-backend job. Off the event loop — SFTP descent isn't
+            # the "quick local walk" this used to be.
+            if not await asyncio.to_thread(ws.exists, "documents"):
                 return
 
-            # Collect eligible files
-            files: List[Tuple[Path, str]] = []
-            for file_path in sorted(docs_path.rglob("*")):
-                if not file_path.is_file():
-                    continue
-
+            files: List[Tuple[str, str]] = []
+            for rel_path in await asyncio.to_thread(ws.backend.walk, "documents"):
                 # Skip documents/external/ (web content, registered by research tools)
-                try:
-                    file_path.relative_to(docs_path / "external")
-                    continue
-                except ValueError:
-                    pass  # Not under external/, proceed
-
-                # Filter to supported extensions
-                if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                if rel_path.startswith("documents/external/"):
                     continue
 
-                files.append((file_path, file_path.name))
+                if Path(rel_path).suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+
+                # Workspace-relative path: matches the registry key the citation
+                # tools use, and get_or_register_doc_source materializes a local
+                # copy for the engine when the backend is remote.
+                files.append((rel_path, Path(rel_path).name))
 
             if not files:
                 return
@@ -2071,35 +4872,28 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 f"Starting background registration of {len(files)} document(s)..."
             )
 
-            # Process in parallel — each thread gets its own CitationEngine
-            max_workers = min(len(files), 4)
-            results: List[Optional[Tuple[str, int]]] = []
+            # Register concurrently on the shared vector pool. The engine borrows
+            # the pool (no per-instance connection), so a single context-owned
+            # engine is reused across all files; get_or_register_doc_source
+            # populates context._source_registry as it goes.
+            sem = asyncio.Semaphore(4)
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._process_single_document,
-                        file_path,
-                        name,
-                        context,
-                    )
-                    for file_path, name in files
-                ]
-                for future in futures:
-                    results.append(future.result())
+            async def _register(rel_path: str, name: str) -> bool:
+                async with sem:
+                    try:
+                        await context.get_or_register_doc_source(rel_path, name=name)
+                        return True
+                    except Exception as e:
+                        logger.debug(f"Could not register document {name}: {e}")
+                        return False
 
-            # Update source registry from results (single-threaded, no race)
-            registered_count = 0
-            for result in results:
-                if result is not None:
-                    file_path_str, source_id = result
-                    context._source_registry[file_path_str] = source_id
-                    registered_count += 1
+            results = await asyncio.gather(*(_register(fp, name) for fp, name in files))
+            registered_count = sum(1 for ok in results if ok)
 
             elapsed = time.monotonic() - start_time
             if registered_count > 0:
                 logger.info(
-                    f"Registered {registered_count} document(s) in {elapsed:.1f}s (parallel)"
+                    f"Registered {registered_count} document(s) in {elapsed:.1f}s (async pool)"
                 )
 
         except Exception as e:
@@ -2107,56 +4901,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 f"Auto-registration of input documents failed (non-fatal): {e}"
             )
 
-    def _process_single_document(
-        self,
-        file_path: Path,
-        name: str,
-        context: "ToolContext",
-    ) -> Optional[Tuple[str, int]]:
-        """Process a single document in a worker thread.
-
-        Creates an independent CitationEngine instance with its own DB
-        connection for thread safety.
-
-        Args:
-            file_path: Absolute path to the document file
-            name: Human-readable name for the source
-            context: ToolContext (used only for job_id and agent_id)
-
-        Returns:
-            Tuple of (file_path_str, source_id) on success, None on failure
-        """
-        engine = None
-        try:
-            from citation_engine import CitationEngine, CitationContext
-
-            ctx = CitationContext(
-                session_id=context.job_id or "unknown",
-                agent_id=context.config.get("agent_id", "unknown"),
-            )
-            engine = CitationEngine(mode="multi-agent", context=ctx)
-            engine._connect()
-
-            source = engine.add_doc_source(str(file_path), name=name)
-            return (str(file_path), source.id)
-
-        except Exception as e:
-            logger.debug(f"Could not register document {name}: {e}")
-            return None
-        finally:
-            if engine is not None:
-                try:
-                    engine.close()
-                except Exception:
-                    pass
-
     def _inject_datasource_index(self, ds_configs: list) -> None:
-        """Inject a compact datasource index into datasources.md.
+        """Inject a compact connector index into the compatibility file datasources.md.
 
-        This ensures the agent always knows what datasources are available,
+        This ensures the agent always knows what connectors are available,
         even before KB retrieval fires. Full details are in the knowledge base.
         """
-        lines = ["\n\n## Available Datasources\n"]
+        lines = ["\n\n## Available Connectors\n"]
         for ds in ds_configs:
             ds_type = ds.get("type", "unknown")
             name = ds.get("name", "Unnamed")
@@ -2190,10 +4941,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 "datasources.md", existing + "\n".join(lines)
             )
             logger.info(
-                f"Injected datasource index ({len(ds_configs)} entries) into datasources.md"
+                f"Injected connector index ({len(ds_configs)} entries) into datasources.md"
             )
         except Exception as e:
-            logger.warning(f"Failed to inject datasource index: {e}")
+            logger.warning(f"Failed to inject connector index: {e}")
 
     @staticmethod
     def _format_rw_cli_block(name: str, ds_type: str) -> str:
@@ -2228,82 +4979,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             ds_type,
             f"- **{name}** ({ds_type}, read-write) — CLI via env vars",
         )
-
-    def _setup_repository_datasource(self, ds: Dict[str, Any]) -> None:
-        """Clone a repository into the workspace and configure git credentials.
-
-        The agent never sees raw tokens/SSH keys — credentials are
-        configured transparently via git credential helpers or SSH config.
-        """
-        import re
-        import subprocess
-
-        repo_url = ds.get("connection_url", "")
-        creds = ds.get("credentials") or {}
-        name = re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
-        branch = ds.get("default_branch")
-
-        # Determine workspace path
-        ws = self._workspace_manager
-        workspace_dir = getattr(ws, "workspace_dir", None) or os.getcwd()
-        repos_dir = os.path.join(workspace_dir, "repos")
-        os.makedirs(repos_dir, exist_ok=True)
-        clone_path = os.path.join(repos_dir, name)
-
-        if os.path.exists(clone_path):
-            logger.info(f"Repository already exists at {clone_path}, skipping clone")
-            return
-
-        auth_method = creds.get("auth_method", "token")
-
-        if auth_method == "ssh":
-            # Write SSH key and configure
-            ssh_dir = os.path.expanduser("~/.ssh")
-            os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-            key_file = os.path.join(ssh_dir, f"repo_{name}")
-            with open(key_file, "w") as f:
-                f.write(creds.get("ssh_key", ""))
-            os.chmod(key_file, 0o600)
-
-            # Parse host from SSH URL
-            from urllib.parse import urlparse
-
-            parsed = urlparse(repo_url)
-            host = parsed.hostname or "github.com"
-
-            config_path = os.path.join(ssh_dir, "config")
-            with open(config_path, "a") as f:
-                f.write(
-                    f"\nHost {host}\n  IdentityFile {key_file}\n  StrictHostKeyChecking accept-new\n"
-                )
-
-        elif auth_method == "token" and creds.get("token"):
-            # Configure git credential helper
-            cred_file = os.path.expanduser("~/.git-credentials")
-            from urllib.parse import urlparse
-
-            parsed = urlparse(repo_url)
-            host = parsed.hostname or "github.com"
-            scheme = parsed.scheme or "https"
-            cred_line = f"{scheme}://oauth2:{creds['token']}@{host}"
-            with open(cred_file, "a") as f:
-                f.write(cred_line + "\n")
-            os.chmod(cred_file, 0o600)
-            subprocess.run(
-                ["git", "config", "--global", "credential.helper", "store"],
-                check=False,
-                capture_output=True,
-            )
-
-        # Clone
-        cmd = ["git", "clone", repo_url, clone_path]
-        if branch:
-            cmd.extend(["--branch", branch])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            logger.warning(f"Git clone failed: {result.stderr}")
-            raise RuntimeError(f"Failed to clone repository: {result.stderr}")
-        logger.info(f"Cloned repository to {clone_path}")
 
     def _inject_typed_env_vars(self, ds_type: str, ds: Dict[str, Any]) -> None:
         """Inject well-known environment variables for managed connector CLI access."""
@@ -2909,6 +5584,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         aux_llm = getattr(self, "_auxiliary_llm", None)
         aux_health = aux_llm.health.snapshot() if aux_llm is not None else None
 
+        # Embedding-path health (B4): degraded == dimension mismatch latched.
+        from src.services.embedding_service import peek_embedding_service
+        from src.tools.research.utils.provider_health import (
+            get_paper_provider_health,
+        )
+
+        emb_service = peek_embedding_service()
+
         return {
             "agent_id": self.config.agent_id,
             "display_name": self.config.display_name,
@@ -2924,4 +5607,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 "model": self.config.llm.model,
             },
             "auxiliary": aux_health,
+            "embedding": emb_service.health_snapshot()
+            if emb_service is not None
+            else None,
+            # Local arXiv compatibility plus the latest real Semantic Scholar
+            # result. This snapshot never triggers provider I/O and contains
+            # credential presence only, so heartbeat/status polling stays cheap
+            # and secret-free. Deployment acceptance can populate it with
+            # ``python -m src.tools.research.utils.provider_health`` inside the
+            # worker image.
+            "research_providers": get_paper_provider_health(),
         }

@@ -35,7 +35,7 @@
   font-weight: 600;
 }
 
-// Mono — code, tool args, debug surfaces. Theme-invariant.
+// Mono — code, tool args, workbench surfaces. Theme-invariant.
 @mixin mono {
   font-family: var(--font-mono);
 }

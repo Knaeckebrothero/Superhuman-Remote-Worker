@@ -33,6 +33,8 @@ env:
   # this for production tags; YAML expressions can't lowercase, so we hardcode.
   # Update this if the repo is renamed.
   REPO_LOWER: knaeckebrothero/uni-projekt-graph-rag
+  SRW_SOURCE_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -54,18 +56,111 @@ jobs:
         run: ruff format --check src/ orchestrator/ tests/
       - name: Verify Playwright pin consistency
         run: |
+          # The agent image has no Playwright; the pin only feeds the
+          # workspace/VM builds (.playwright-version is the source of truth,
+          # passed as a build-arg). Guard the two fallback copies against drift.
           PIN=$(tr -d '[:space:]' < .playwright-version)
           test -n "$PIN" || { echo "::error::.playwright-version is empty"; exit 1; }
-          grep -q "^playwright==${PIN}\b" requirements.txt \
-            || { echo "::error::playwright pin in requirements.txt does not match .playwright-version (${PIN})"; exit 1; }
+          grep -q "^ARG PLAYWRIGHT_VERSION=${PIN}$" docker/Dockerfile.workspace \
+            || { echo "::error::ARG PLAYWRIGHT_VERSION default in docker/Dockerfile.workspace does not match .playwright-version (${PIN})"; exit 1; }
+          grep -q "^PLAYWRIGHT_VERSION=${PIN}$" .env.example \
+            || { echo "::error::PLAYWRIGHT_VERSION in .env.example does not match .playwright-version (${PIN})"; exit 1; }
+
+  # ---------------------------------------------------------------------------
+  # Chart correctness gates (Phase 1) — render matrix + schema validation.
+  # Full-power branch: always runs, every step is a hard gate.
+  #
+  # The installer-* scenarios are the self-host config generator's verbatim
+  # output. The generator moved to the private srw-cloud repo on 2026-08-15;
+  # these fixtures are the half of the contract that stays here, so a chart
+  # change that breaks the installer fails in the repo that caused it rather
+  # than days later in srw-cloud's CI. Regenerate them from that repo's
+  # www/test/generator.drift.test.mjs CASES if the generator changes.
+  # ---------------------------------------------------------------------------
+  chart-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - test
+          - customer-external
+          - eval
+          - vm
+          - vm-external
+          - installer-evaluation
+          - installer-production
+          - installer-production-vms
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
           version: v3.17.0
-      - name: Helm lint (home cluster scenario)
-        run: helm lint helm/ -f helm/ci/test-values.yaml
-      - name: Helm lint (customer external-services scenario)
-        run: helm lint helm/ -f helm/ci/customer-external-values.yaml
+
+      - name: Build Helm dependencies
+        run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
+          helm dependency build helm/
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      - name: Helm lint (${{ matrix.scenario }})
+        run: helm lint helm/ -f helm/ci/${{ matrix.scenario }}-values.yaml
+
+      - name: Render + kubeconform (${{ matrix.scenario }})
+        run: |
+          helm template srw helm/ -f helm/ci/${{ matrix.scenario }}-values.yaml \
+            | kubeconform \
+                -kubernetes-version 1.28.0 \
+                -ignore-missing-schemas \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                -summary
+
+      - name: Verify chart-created Secret contract
+        if: matrix.scenario == 'eval'
+        run: bash scripts/check-chart-created-secret.sh
+
+  # ---------------------------------------------------------------------------
+  # Schema negative test — proves values.schema.json rejects bad input. A
+  # deliberately-invalid values file MUST make `helm template` fail. Hard gate.
+  # ---------------------------------------------------------------------------
+  chart-schema-negative:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Build Helm dependencies
+        run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
+          helm dependency build helm/
+
+      - name: Assert invalid values are rejected by the schema
+        run: |
+          if helm template srw helm/ -f helm/ci/invalid-values.yaml >/dev/null 2>&1; then
+            echo "::error::helm/ci/invalid-values.yaml rendered successfully — values.schema.json is not rejecting it. The schema has stopped validating."
+            exit 1
+          fi
+          echo "OK: invalid-values.yaml was correctly rejected by values.schema.json"
 
   # ---------------------------------------------------------------------------
   # CodeQL — static analysis for security vulnerabilities
@@ -140,10 +235,10 @@ jobs:
         #   the affected server binary isn't shipped by our images.
         # PYSEC-2025-183 (pyjwt): disputed; the "weak encryption" claim depends on
         #   caller-chosen key length, which is enforced by Keycloak in our deployment.
-        # PYSEC-2025-189..197, 210, PYSEC-2026-139 (torch): all require loading an
-        #   attacker-supplied checkpoint or running torch.jit on attacker code. Agents
-        #   only pull torch transitively via sentence-transformers against pinned,
-        #   vetted embedding models. Most have no fix released.
+        # PYSEC-2025-189..197, 210, PYSEC-2026-139, CVE-2025-3000 (torch): all require
+        #   loading an attacker-supplied checkpoint or running torch.jit on attacker
+        #   code. Agents only pull torch transitively via sentence-transformers against
+        #   pinned, vetted embedding models. Most have no fix released.
         # PYSEC-2025-211..218 (transformers): deserialization of untrusted model files
         #   (X-CLIP, GLM4, Perceiver, Transformer-XL, megatron_gpt2, SEW/SEW-D/HuBERT
         #   convert_config). Same threat model — we don't convert or load attacker-
@@ -174,6 +269,7 @@ jobs:
           --ignore-vuln PYSEC-2025-197
           --ignore-vuln PYSEC-2025-210
           --ignore-vuln PYSEC-2026-139
+          --ignore-vuln CVE-2025-3000
           --ignore-vuln PYSEC-2025-211
           --ignore-vuln PYSEC-2025-212
           --ignore-vuln PYSEC-2025-213
@@ -184,10 +280,27 @@ jobs:
           --ignore-vuln PYSEC-2025-218
       - name: Audit npm dependencies
         working-directory: cockpit
+        # lodash-es 4.17.23 is the latest release; no fix available.
+        # Transitive via mermaid → langium → chevrotain → lodash-es.
+        # GHSA-r5fr-rjxr-66jc: Code Injection via _.template (high)
+        # GHSA-f23m-r3pf-42rh: Prototype Pollution via _.unset/_.omit (moderate)
+        #
+        # esbuild 0.27.3 is exact-pinned by @angular/build@21; vite pins ^0.27,
+        # so the patched 0.28.1 is unreachable without breaking the Angular 21
+        # toolchain. Neither advisory applies to our usage (npm/Linux build, no
+        # dev server exposed). Ignoring esbuild's advisories propagates up the
+        # via-chain to vite → @vitejs/plugin-basic-ssl → @angular/build.
+        # GHSA-gv7w-rqvm-qjhr: RCE via the esbuild Deno module + NPM_CONFIG_REGISTRY
+        #   (Deno-only loader — unused here) (high)
+        # GHSA-g7r4-m6w7-qqqr: arbitrary file read in the dev server on Windows
+        #   (dev-server + Windows only; CI/prod run `ng build` on Linux) (high)
         run: |
           npm audit --json | python3 -c "
           import json, sys
-          IGNORE_ADVISORIES = {'GHSA-r5fr-rjxr-66jc', 'GHSA-f23m-r3pf-42rh'}
+          IGNORE_ADVISORIES = {
+              'GHSA-r5fr-rjxr-66jc', 'GHSA-f23m-r3pf-42rh',
+              'GHSA-gv7w-rqvm-qjhr', 'GHSA-g7r4-m6w7-qqqr',
+          }
           data = json.load(sys.stdin)
           vulns = data.get('vulnerabilities', {})
 
@@ -225,6 +338,24 @@ jobs:
           print('npm audit passed (ignored advisories: ' + ', '.join(IGNORE_ADVISORIES) + ')')
           "
 
+      # --- Third-party license policy gate (blocking) -----------------------
+      # Fails the release if a bundled dependency carries a denied license
+      # (GPL/AGPL/SSPL/BSL/...). Server images the chart pulls (Neo4j/Postgres/
+      # Mongo) are out of scope — we reference, not convey them — but their
+      # bundled *client drivers* (neo4j/psycopg/pymongo) ARE covered. Lives in
+      # this already-required job so it gates every build without per-job edits.
+      # The committed THIRD_PARTY_LICENSES.md is regenerated upstream on develop.
+      # Source of truth: scripts/check_licenses.py.
+      - name: Install license tooling + full bundled dep set
+        run: >-
+          uv pip install --system pip-licenses
+          -r orchestrator/requirements.txt
+          -r orchestrator/mcp/requirements.txt
+      - name: Check third-party licenses
+        # Python: installed metadata via pip-licenses. Frontend: read straight
+        # from cockpit/package-lock.json (no npm install / node_modules needed).
+        run: python scripts/check_licenses.py --check
+
   # ---------------------------------------------------------------------------
   # Python tests — always run on main (not change-based)
   # ---------------------------------------------------------------------------
@@ -240,20 +371,59 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+      # The chart render contract tests in tests/test_canvas_slice3_infra.py
+      # shell out to `helm template`. ubuntu-latest ships Helm, so their
+      # `which("helm")` skip guard never fires here; without the subchart
+      # vendored they fail on the Collabora dependency instead of skipping.
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+      - name: Build Helm dependencies
+        run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
+          helm dependency build helm/
       - name: Install dependencies
-        run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt pytest pytest-asyncio
+        run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+      # Keep tests from the same file on one worker so file-local fixture/order
+      # assumptions remain intact. The runner caps worker count and also scales
+      # down automatically on smaller GitHub-hosted runners.
       - name: Run tests
-        run: pytest tests/ -x -q --tb=short
+        run: ./scripts/pytest-fast.sh
 
   # ---------------------------------------------------------------------------
-  # Cockpit (Angular) tests — always run on main
+  # Cockpit unit + production-browser conformance tests — always run on main
   # ---------------------------------------------------------------------------
   test-cockpit:
     needs: [lint]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The engines and every system library they need are baked into this image
+    # at /ms-playwright. The step this replaces (`playwright install --with-deps
+    # chromium firefox webkit`) pulled 181 apt packages / 114 MB from
+    # azure.archive.ubuntu.com on every run. That normally cost ~35 s, but a
+    # degraded mirror on 2026-08-18 stretched it to 18m40s and killed the job on
+    # its wall clock. On main that blocks resolve-version and every image build,
+    # so keep the engines off apt entirely.
+    # PLAYWRIGHT_VERSION must match this tag; the guard step below enforces it.
+    container:
+      image: mcr.microsoft.com/playwright:v1.59.0-noble
+    env:
+      PLAYWRIGHT_VERSION: 1.59.0
+      # A container job runs as root with HOME=/github/home, a runner-owned
+      # bind mount (pwuser inside this image). Firefox refuses to launch when
+      # $HOME belongs to another user ("Running Nightly as root in a regular
+      # user's session is not supported"), so all 11 firefox specs died at
+      # browser launch on the first cockpit push after the image switch, while
+      # chromium and webkit passed. /root is owned by the user this job
+      # actually runs as. This is Playwright's documented workaround; drop it
+      # only if the job stops running as root.
+      HOME: /root
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      # The image ships Node 24; pin to 22 so unit tests, the production build,
+      # and the conformance run all use the same Node as every other job.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -262,12 +432,50 @@ jobs:
       - name: Install dependencies
         working-directory: cockpit
         run: npm ci
+      # Engines come from the image, so a @playwright/test bump that forgets the
+      # container tag would otherwise surface minutes later as a confusing
+      # "Executable doesn't exist". Bump the tag and PLAYWRIGHT_VERSION together.
+      - name: Verify Playwright matches the container image
+        working-directory: cockpit
+        run: |
+          HAVE=$(node -p "require('@playwright/test/package.json').version")
+          if [ "$HAVE" != "$PLAYWRIGHT_VERSION" ]; then
+            echo "::error::@playwright/test is $HAVE but this job runs mcr.microsoft.com/playwright:v$PLAYWRIGHT_VERSION-noble."
+            echo "::error::Bump the container image tag and PLAYWRIGHT_VERSION in this workflow to v$HAVE-noble."
+            exit 1
+          fi
+          echo "Playwright $HAVE matches the container image."
       - name: Check i18n parity
         working-directory: cockpit
         run: npm run i18n:check
+      # Step-level caps so a hung step names itself instead of silently eating
+      # the job budget. Healthy times are ~70 s / ~25 s / ~75 s.
       - name: Run tests
         working-directory: cockpit
+        timeout-minutes: 10
         run: npm test
+      - name: Build production Cockpit
+        working-directory: cockpit
+        timeout-minutes: 10
+        run: npm run build
+      - name: Run Dynamic Canvas browser conformance
+        working-directory: cockpit
+        timeout-minutes: 10
+        run: npm run test:e2e:canvas:no-build
+      - name: Run protected-cloud review browser gate
+        working-directory: cockpit
+        timeout-minutes: 10
+        run: npm run test:e2e:cloud-review:no-build
+      - name: Upload browser gate reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cockpit-browser-reports-main-${{ github.run_attempt }}
+          path: |
+            cockpit/playwright-report/
+            cockpit/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Auto patch-bump version from last git v-tag
@@ -331,6 +539,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
+        # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
+        # runners do not need it, and the heavy variants below delete
+        # /opt/hostedtoolcache, which is where setup-* install. Guarded rather
+        # than deleted so the hosted fallback (gh variable delete CI_RUNNER_LABEL)
+        # still works.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
       - uses: docker/setup-buildx-action@v3
@@ -362,12 +576,22 @@ jobs:
           file: ./docker/Dockerfile.agent
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=agent
           provenance: false
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-main
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
           build-args: |
             BUILD_SHA=${{ steps.short_sha.outputs.sha }}
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
 
   build-orchestrator:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
@@ -412,8 +636,19 @@ jobs:
           file: ./docker/Dockerfile.orchestrator
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=orchestrator
           provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-main
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
@@ -460,8 +695,19 @@ jobs:
           file: ./docker/Dockerfile.cockpit
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=cockpit
           provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-main
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
@@ -508,8 +754,19 @@ jobs:
           file: ./docker/Dockerfile.mcp
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=mcp
           provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-main
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
@@ -559,9 +816,19 @@ jobs:
           file: ./docker/Dockerfile.workspace
           build-args: |
             PLAYWRIGHT_VERSION=${{ steps.pw.outputs.version }}
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=workspace
           provenance: false
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
@@ -585,7 +852,7 @@ jobs:
       - name: Build sudo-gated (Go daemon)
         working-directory: vm/sudo-daemon
         run: |
-          go mod tidy
+          go mod verify
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
             -ldflags "-s -w -X main.version=sha-${GITHUB_SHA::7}" \
             -o sudo-gated ./cmd/sudo-gated/
@@ -609,19 +876,21 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Stage 1: heavy, stable provisioning. On main, runs on push only — PR
-  # validation re-uses the existing GHCR :latest stage1 image, which makes PRs
-  # to main much faster (only stage2 rebuilds). Cron refresh runs in
+  # validation re-uses a published stage1 image, which makes PRs to main much
+  # faster (only stage2 rebuilds). Direct develop promotions use develop's
+  # :experimental image below; other PRs use :latest. Cron refresh runs in
   # stage1-rebuild.yml so the baseline never drifts more than a week.
   # ---------------------------------------------------------------------------
   build-agent-vm-base-stage1:
-    needs: [lint, dependency-audit, test-python, test-cockpit]
+    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
       github.event_name == 'push' &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       needs.test-python.result == 'success' &&
-      needs.test-cockpit.result == 'success'
+      needs.test-cockpit.result == 'success' &&
+      needs.resolve-version.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -630,6 +899,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
+        # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
+        # runners do not need it, and the heavy variants below delete
+        # /opt/hostedtoolcache, which is where setup-* install. Guarded rather
+        # than deleted so the hosted fallback (gh variable delete CI_RUNNER_LABEL)
+        # still works.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/share/chromium \
@@ -638,12 +913,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
-      - name: Enable KVM
+      - name: Enable KVM (hosted runner udev rule)
+        # Hosted runners ship /dev/kvm as root:kvm with no world access, so this
+        # udev rule is how the runner user reaches it. Inside a container there is
+        # no udevd: the rule file goes nowhere and `udevadm control` fails. There,
+        # access comes from the pod spec instead — privileged + a /dev/kvm
+        # CharDevice hostPath, see HomeLab deployments_managed/arc-runners-kvm/.
+        # (Measured on node4: /dev/kvm is gid 36, mode 0666.)
+        if: runner.environment == 'github-hosted'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
+      - name: Verify KVM is usable
+        # Runs on BOTH runner types, unconditionally. stage1.pkr.hcl and
+        # stage2.pkr.hcl set accelerator = "kvm", and without acceleration packer
+        # does not fail — it silently falls back to TCG and burns the entire
+        # 75-90 minute timeout. Fail in five seconds instead.
+        #
+        # KVM_GET_API_VERSION = _IO(KVMIO=0xAE, 0) = 0xAE00. Opening the device
+        # and getting an answer proves the permissions AND that the host kernel's
+        # KVM subsystem is reachable from in here, which `ls` alone does not.
+        run: |
+          set -euo pipefail
           ls -la /dev/kvm
+          id
+          python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
       - uses: hashicorp/setup-packer@main
         with:
           version: latest
@@ -693,16 +989,22 @@ jobs:
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1" | tr '[:upper:]' '[:lower:]')
           TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:latest")
-          BUILD_ARGS=()
+          BUILD_ARGS=(
+            --build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"
+            --build-arg "SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}"
+            --build-arg "SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}"
+            --build-arg "SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}"
+          )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk-stage1 .
           for T in "${TAGS[@]}"; do docker push "$T"; done
           printf 'Pushed stage1:\n'; printf '  %s\n' "${TAGS[@]}"
 
   # ---------------------------------------------------------------------------
-  # Stage 2: light per-commit layer. Pulls the stage1 containerDisk from GHCR
-  # (skipped on PRs — uses existing :latest), extracts the qcow2, and layers
-  # stage2 on top via stage2.pkr.hcl. ~5-10 min wall-clock.
+  # Stage 2: light per-commit layer. Pulls the stage1 containerDisk from GHCR,
+  # extracts the qcow2, and layers stage2 on top via stage2.pkr.hcl. PRs normally
+  # use :latest; a direct develop -> main promotion uses develop's :experimental
+  # base so new stage1 dependencies can pass validation before main publishes them.
   # ---------------------------------------------------------------------------
   build-agent-vm-base:
     needs: [lint, dependency-audit, test-python, test-cockpit, build-sudo-gate, resolve-version, build-agent-vm-base-stage1]
@@ -732,26 +1034,27 @@ jobs:
         with:
           name: sudo-gate-binaries
           path: docker/agent-vm-base/files/
-        continue-on-error: true
       - name: Prepare sudo gate binaries for Packer
         working-directory: docker/agent-vm-base
+        # upload-artifact@v4 roots the archive at the LONGEST COMMON ANCESTOR
+        # of its paths (vm/), so the artifact extracts as sudo-daemon/... and
+        # sudo-plugin/... — no vm/ prefix. This step checked files/vm/... and
+        # silently shipped empty placeholders (VM images had no sudo gate).
         run: |
-          if [ -f files/vm/sudo-daemon/sudo-gated ]; then
-            mv files/vm/sudo-daemon/sudo-gated files/sudo-gated-bin
-            echo "sudo-gated binary ready ($(wc -c < files/sudo-gated-bin) bytes)"
-          else
-            touch files/sudo-gated-bin
-            echo "sudo-gated binary not available — creating empty placeholder"
-          fi
-          if [ -f files/vm/sudo-plugin/sudo_gate.so ]; then
-            mv files/vm/sudo-plugin/sudo_gate.so files/sudo_gate.so
-            echo "sudo_gate.so ready ($(wc -c < files/sudo_gate.so) bytes)"
-          else
-            touch files/sudo_gate.so
-            echo "sudo_gate.so not available — creating empty placeholder"
-          fi
+          mv files/sudo-daemon/sudo-gated files/sudo-gated-bin
+          mv files/sudo-plugin/sudo_gate.so files/sudo_gate.so
+          test -s files/sudo-gated-bin || { echo "::error::sudo-gated artifact is empty"; exit 1; }
+          test -s files/sudo_gate.so || { echo "::error::sudo_gate.so artifact is empty"; exit 1; }
+          echo "sudo-gated binary ready ($(wc -c < files/sudo-gated-bin) bytes)"
+          echo "sudo_gate.so ready ($(wc -c < files/sudo_gate.so) bytes)"
           ls -la files/
       - name: Free disk space
+        # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
+        # runners do not need it, and the heavy variants below delete
+        # /opt/hostedtoolcache, which is where setup-* install. Guarded rather
+        # than deleted so the hosted fallback (gh variable delete CI_RUNNER_LABEL)
+        # still works.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/share/chromium \
@@ -760,12 +1063,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
-      - name: Enable KVM
+      - name: Enable KVM (hosted runner udev rule)
+        # Hosted runners ship /dev/kvm as root:kvm with no world access, so this
+        # udev rule is how the runner user reaches it. Inside a container there is
+        # no udevd: the rule file goes nowhere and `udevadm control` fails. There,
+        # access comes from the pod spec instead — privileged + a /dev/kvm
+        # CharDevice hostPath, see HomeLab deployments_managed/arc-runners-kvm/.
+        # (Measured on node4: /dev/kvm is gid 36, mode 0666.)
+        if: runner.environment == 'github-hosted'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
+      - name: Verify KVM is usable
+        # Runs on BOTH runner types, unconditionally. stage1.pkr.hcl and
+        # stage2.pkr.hcl set accelerator = "kvm", and without acceleration packer
+        # does not fail — it silently falls back to TCG and burns the entire
+        # 75-90 minute timeout. Fail in five seconds instead.
+        #
+        # KVM_GET_API_VERSION = _IO(KVMIO=0xAE, 0) = 0xAE00. Opening the device
+        # and getting an answer proves the permissions AND that the host kernel's
+        # KVM subsystem is reachable from in here, which `ls` alone does not.
+        run: |
+          set -euo pipefail
           ls -la /dev/kvm
+          id
+          python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
       - uses: hashicorp/setup-packer@main
         with:
           version: latest
@@ -779,8 +1103,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull stage1 containerDisk and extract qcow2
         working-directory: docker/agent-vm-base
+        env:
+          STAGE1_TAG: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'develop' && 'experimental' || 'latest' }}
         run: |
-          STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:latest" | tr '[:upper:]' '[:lower:]')
+          STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:${STAGE1_TAG}" | tr '[:upper:]' '[:lower:]')
+          echo "Using stage1 tag: ${STAGE1_TAG}"
           docker pull "$STAGE1_IMAGE"
           # FROM scratch images have no shell so a real CMD doesn't matter — we
           # never start the container, just create-then-cp.
@@ -814,7 +1141,12 @@ jobs:
           else
             TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:latest" "${IMAGE}:${{ needs.resolve-version.outputs.tag }}")
           fi
-          BUILD_ARGS=()
+          BUILD_ARGS=(
+            --build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"
+            --build-arg "SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}"
+            --build-arg "SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}"
+            --build-arg "SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}"
+          )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk .
           if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -867,8 +1199,19 @@ jobs:
           file: ./vm/controller/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=vm-controller
           provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-main
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
@@ -878,7 +1221,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-chart:
     name: Package and publish Helm chart
-    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-agent-vm-base]
+    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-agent-vm-base, chart-test]
     if: >-
       always() && !cancelled() &&
       github.event_name == 'push' &&
@@ -888,7 +1231,8 @@ jobs:
       needs.build-cockpit.result == 'success' &&
       needs.build-mcp.result == 'success' &&
       needs.build-agent-vm-base.result == 'success' &&
-      !contains(needs.build-workspace.result, 'failure')
+      !contains(needs.build-workspace.result, 'failure') &&
+      needs.chart-test.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -902,8 +1246,27 @@ jobs:
         uses: azure/setup-helm@v4
         with:
           version: v3.17.0
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+      - name: Stamp release component provenance
+        env:
+          RELEASE_VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          yq -i '.provenance.releaseVersion = strenv(RELEASE_VERSION)' helm/values.yaml
+          for component in orchestrator agent cockpit mcp workspace; do
+            export component
+            yq -i '
+              .provenance.components[strenv(component)].sourceRevision = strenv(GITHUB_SHA) |
+              .provenance.components[strenv(component)].releaseVersion = strenv(RELEASE_VERSION)
+            ' helm/values.yaml
+          done
       - name: Package both charts
         run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
+          helm dependency build helm/
           mkdir -p dist
           for chart_dir in helm helm-vm-cluster; do
             helm package "${chart_dir}/" \

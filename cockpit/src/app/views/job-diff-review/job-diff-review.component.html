@@ -1,204 +1,540 @@
-<div class="diff-review">
-  <header class="diff-review__header">
-    <span class="diff-review__title">{{ 'jobDiffReview.title' | transloco }}</span>
-    @if (!loadingDiff() && hasFiles()) {
-      <span class="diff-review__subtitle">
-        @if (fileCount() === 1) {
-          {{ 'jobDiffReview.subtitleSingular' | transloco: {count: fileCount()} }}
+<div
+  class="review"
+  [attr.data-context]="context()"
+  [attr.data-compact]="compact() ? 'true' : null"
+  [attr.aria-busy]="busy() ? 'true' : null"
+>
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <header class="review__head">
+    <div class="review__identity">
+      <!-- Visually hidden on a phone: the dialog's own title already says
+           what this surface is, and three stacked lines of chrome above a
+           360px-wide viewer cost more than they explain. The text stays for
+           assistive tech. -->
+      <p class="review__eyebrow">
+        <app-icon size="sm" class="review__eyebrow-icon" aria-hidden="true">shield</app-icon>
+        {{ (showReceipt() ? ck('eyebrowResolved') : ck('eyebrow')) | transloco }}
+      </p>
+      <h2 class="review__title" [id]="uid + '-heading'">
+        @if (subject(); as s) {
+          {{ s }}
         } @else {
-          {{ 'jobDiffReview.subtitle' | transloco: {count: fileCount()} }}
+          {{ ck('titleFallback') | transloco }}
         }
-      </span>
-    }
+      </h2>
+      @if (loadState() === 'ready' && !showReceipt()) {
+        <p class="review__subtitle">
+          @if (fileCount() === 1) {
+            {{ ck('subtitleSingular') | transloco: {count: fileCount()} }}
+          } @else {
+            {{ ck('subtitle') | transloco: {count: fileCount()} }}
+          }
+        </p>
+      }
+    </div>
+
+    <div class="review__head-side">
+      @if (loadState() === 'ready' && hasFiles() && !showReceipt()) {
+        <ul class="review__tallies" [attr.aria-label]="'jobDiffReview.meta.talliesLabel' | transloco">
+          <li class="review__tally" data-status="added">
+            <span class="review__tally-count">{{ tallies().added }}</span>
+            <span class="review__tally-label">{{ 'jobDiffReview.fileTree.statusAdded' | transloco }}</span>
+          </li>
+          <li class="review__tally" data-status="modified">
+            <span class="review__tally-count">{{ tallies().modified }}</span>
+            <span class="review__tally-label">{{ 'jobDiffReview.fileTree.statusModified' | transloco }}</span>
+          </li>
+          <li class="review__tally" data-status="deleted">
+            <span class="review__tally-count">{{ tallies().deleted }}</span>
+            <span class="review__tally-label">{{ 'jobDiffReview.fileTree.statusDeleted' | transloco }}</span>
+          </li>
+        </ul>
+      }
+      <!-- PC-19: only rendered when the resolved link provably names the same
+           mount the summary reports as protected. Never a guess. -->
+      @if (folderLink(); as link) {
+        <a
+          class="review__folder-link"
+          [href]="link.url"
+          target="_blank"
+          rel="noopener noreferrer"
+          [attr.aria-label]="'jobDiffReview.meta.openFolderFor' | transloco: {name: link.name}"
+        >
+          <app-icon size="sm" aria-hidden="true">folder_open</app-icon>
+          {{ 'jobDiffReview.meta.openFolder' | transloco }}
+          <app-icon size="sm" aria-hidden="true">open_in_new</app-icon>
+        </a>
+      }
+    </div>
   </header>
 
-  @if (loadingDiff()) {
-    <div class="diff-review__loading">
-      <app-spinner size="lg" tone="accent" />
-      <span>{{ 'jobDiffReview.loading' | transloco }}</span>
-    </div>
-  } @else if (!summary() || !hasFiles()) {
-    <div class="diff-review__empty">
-      <span>{{ 'jobDiffReview.empty' | transloco }}</span>
-    </div>
-  } @else {
-    @if (conflict(); as c) {
-      <div class="diff-review__banner diff-review__banner--conflict" role="alert">
-        <div class="diff-review__banner-body">
-          <strong>{{ 'jobDiffReview.conflict.title' | transloco }}</strong>
-          <p>{{ 'jobDiffReview.conflict.body' | transloco }}</p>
-          <ul class="diff-review__diverged">
-            @for (entry of c.diverged; track entry.path) {
-              <li>
-                <code>{{ entry.path }}</code>
-                <app-badge tone="warning" size="sm">{{ conflictLabel(entry.kind) }}</app-badge>
-              </li>
-            }
-          </ul>
-        </div>
-        <app-button variant="ghost" size="sm" (clicked)="dismissConflict()">
-          {{ 'jobDiffReview.conflict.dismiss' | transloco }}
+  <!-- Mount, epoch, staged time, baseline. Kept available at every size but
+       folded into a disclosure so it costs one line on a phone instead of
+       four. Open by default on a desktop, where the room exists. -->
+  @if (loadState() === 'ready' && hasDetails()) {
+    <details class="review__tech" [open]="!compact()">
+      <summary class="review__tech-summary">{{ 'jobDiffReview.meta.detailsLabel' | transloco }}</summary>
+      <ul class="review__meta">
+        @if (stagedAt(); as staged) {
+          <li>
+            <span class="review__meta-key">{{ 'jobDiffReview.meta.staged' | transloco }}</span>
+            <span [attr.title]="staged">{{ formatStagedAt(staged) }}</span>
+          </li>
+        }
+        @if (mountPath(); as mount) {
+          <li>
+            <span class="review__meta-key">{{ 'jobDiffReview.meta.mount' | transloco }}</span>
+            <span class="review__mono">{{ mount }}</span>
+          </li>
+        }
+        @if (epoch() !== null) {
+          <li>
+            <span class="review__meta-key">{{ 'jobDiffReview.meta.epoch' | transloco }}</span>
+            <span class="review__mono">{{ epoch() }}</span>
+          </li>
+        }
+        @if (commitRange(); as range) {
+          <li>
+            <span class="review__meta-key">{{ 'jobDiffReview.meta.baseline' | transloco }}</span>
+            <span class="review__mono">{{ range }}</span>
+          </li>
+        }
+      </ul>
+    </details>
+  }
+
+  <!-- Async transitions reach assistive tech here; the visual equivalent is
+       the spinner / notice each branch renders. -->
+  <p class="review__sr-status" role="status" aria-live="polite">
+    @if (liveMessage(); as msg) {
+      {{ msg.key | transloco: msg.params }}
+    }
+  </p>
+
+  <!-- ── Body ───────────────────────────────────────────────────────────── -->
+  @switch (loadState()) {
+    @case ('loading') {
+      <div class="review__state">
+        <app-spinner size="lg" tone="accent" [ariaLabel]="'jobDiffReview.loading' | transloco" />
+        <p>{{ 'jobDiffReview.loading' | transloco }}</p>
+      </div>
+    }
+
+    @case ('forbidden') {
+      <div class="review__state review__state--blocked">
+        <app-icon size="lg" aria-hidden="true">lock</app-icon>
+        <h3>{{ 'jobDiffReview.forbidden.title' | transloco }}</h3>
+        <p>{{ ck('forbiddenBody') | transloco }}</p>
+      </div>
+    }
+
+    @case ('unavailable') {
+      <div class="review__state review__state--blocked">
+        <app-icon size="lg" aria-hidden="true">help</app-icon>
+        <h3>{{ ck('unavailableTitle') | transloco }}</h3>
+        <p>{{ ck('unavailableBody') | transloco }}</p>
+      </div>
+    }
+
+    @case ('failed') {
+      <div class="review__state review__state--blocked" role="alert">
+        <app-icon size="lg" aria-hidden="true">cloud_off</app-icon>
+        <h3>{{ 'jobDiffReview.loadFailed.title' | transloco }}</h3>
+        <p>{{ loadError() }}</p>
+        <app-button variant="secondary" size="sm" (clicked)="reload()">
+          {{ 'jobDiffReview.loadFailed.retry' | transloco }}
         </app-button>
       </div>
     }
 
-    @if (partial(); as p) {
-      <div class="diff-review__banner diff-review__banner--partial" role="alert">
-        <div class="diff-review__banner-body">
-          <strong>{{ 'jobDiffReview.partial.title' | transloco }}</strong>
-          <p>
-            {{
-              'jobDiffReview.partial.body'
-                | transloco: {applied: p.applied, deleted: p.deleted, count: p.errors.length}
-            }}
-          </p>
-          <ul class="diff-review__diverged">
-            @for (err of p.errors; track err) {
-              <li><code>{{ err }}</code></li>
+    @case ('ready') {
+      @if (showReceipt(); as r) {
+        <!-- Terminal state. Not a toast: PC-20's owner lost a 34-second
+             apply's outcome to a four-second toast and a session that ended
+             underneath it. This stays until dismissed. -->
+        <div class="review__state review__state--receipt" [attr.data-decision]="r.decision">
+          <app-icon size="lg" aria-hidden="true">
+            {{ r.decision === 'applied' ? 'cloud_done' : 'undo' }}
+          </app-icon>
+          <h3>
+            {{ (r.decision === 'applied' ? ck('receiptAppliedTitle') : ck('receiptRejectedTitle')) | transloco }}
+          </h3>
+          @if (r.decision === 'applied') {
+            <p>
+              {{ ck('receiptAppliedBody') | transloco: {applied: r.applied, deleted: r.deleted} }}
+            </p>
+          } @else {
+            <p>{{ ck('receiptRejectedBody') | transloco }}</p>
+          }
+          <dl class="review__receipt-facts">
+            <div>
+              <dt>{{ 'jobDiffReview.receipt.at' | transloco }}</dt>
+              <dd>{{ formatStagedAt(r.at) }}</dd>
+            </div>
+            <!-- Session only. A job diff has no epoch, and the receipt used to
+                 print a fabricated "0" for it. -->
+            @if (context() === 'session' && r.epoch !== null) {
+              <div>
+                <dt>{{ 'jobDiffReview.meta.epoch' | transloco }}</dt>
+                <dd class="review__mono">{{ r.epoch }}</dd>
+              </div>
+              <div>
+                <dt>{{ 'jobDiffReview.receipt.overlayReset' | transloco }}</dt>
+                <dd>
+                  {{ (r.overlayReset ? 'jobDiffReview.receipt.overlayResetYes' : 'jobDiffReview.receipt.overlayResetNo') | transloco }}
+                </dd>
+              </div>
             }
-          </ul>
+          </dl>
+          @if (context() === 'session' && !r.overlayReset) {
+            <p class="review__receipt-warning" role="alert">
+              {{ 'jobDiffReview.receipt.overlayWarning' | transloco }}
+            </p>
+          }
+          <!-- Only claimed when a write to localStorage actually succeeded:
+               job context has no thread key to store under, and a private
+               window throws on the attempt. -->
+          @if (receiptStored()) {
+            <p class="review__receipt-provenance">
+              {{ 'jobDiffReview.receipt.localOnly' | transloco }}
+            </p>
+          }
         </div>
-      </div>
-    }
+      } @else if (!hasFiles()) {
+        <div class="review__state">
+          <app-icon size="lg" aria-hidden="true">check_circle</app-icon>
+          <h3>{{ ck('emptyTitle') | transloco }}</h3>
+          <p>{{ ck('emptyBody') | transloco }}</p>
+        </div>
+      } @else {
+        <!-- Notices sit between the header and the panes so they can never be
+             scrolled past while the decision controls stay reachable. They
+             are bounded and scroll internally — an eight-path conflict used
+             to consume the whole viewer on a phone. -->
+        @if (conflict(); as c) {
+          <div class="review__notice review__notice--conflict" role="alert">
+            <app-icon size="sm" class="review__notice-icon" aria-hidden="true">warning</app-icon>
+            <div class="review__notice-body">
+              <strong>{{ 'jobDiffReview.conflict.title' | transloco }}</strong>
+              <p>{{ ck('conflictBody') | transloco }}</p>
+              <ul class="review__notice-list">
+                @for (entry of c.diverged; track entry.path) {
+                  <li>
+                    <code>{{ entry.path }}</code>
+                    <span class="review__notice-kind">{{ conflictLabel(entry.kind) }}</span>
+                  </li>
+                }
+              </ul>
+            </div>
+            <!-- Re-check, not Dismiss. Dismiss used to re-arm an apply the
+                 backend will refuse again; reloading is the only client action
+                 that can actually clear the divergence. -->
+            <app-button variant="secondary" size="sm" (clicked)="reload()">
+              {{ 'jobDiffReview.conflict.recheck' | transloco }}
+            </app-button>
+          </div>
+        }
 
-    <div class="diff-review__layout">
-      <aside class="diff-review__tree">
-        <div class="diff-review__tree-header">
-          {{ 'jobDiffReview.fileTree.header' | transloco }}
-        </div>
-        <ul class="diff-review__tree-list">
-          @for (entry of summary()!.files; track entry.path) {
-            <li>
+        @if (partial(); as p) {
+          <div class="review__notice review__notice--partial" role="alert">
+            <app-icon size="sm" class="review__notice-icon" aria-hidden="true">error</app-icon>
+            <div class="review__notice-body">
+              <strong>{{ 'jobDiffReview.partial.title' | transloco }}</strong>
+              <p>
+                @if (p.errors.length === 1) {
+                  {{ ck('partialBodySingular') | transloco: {applied: p.applied, deleted: p.deleted, count: p.errors.length} }}
+                } @else {
+                  {{ ck('partialBody') | transloco: {applied: p.applied, deleted: p.deleted, count: p.errors.length} }}
+                }
+              </p>
+              <ul class="review__notice-list">
+                @for (err of p.errors; track err) {
+                  <li><code>{{ err }}</code></li>
+                }
+              </ul>
+            </div>
+          </div>
+        }
+
+        <div class="review__body">
+          <!-- File list: a listbox, not 40 tab stops. -->
+          <div class="review__files">
+            @if (compact()) {
+              <!-- Phones get a disclosure instead of a permanent list: at
+                   375×667 a always-open chooser left the viewer ~79px, which
+                   is not a review. Picking a file collapses it again. -->
               <button
                 type="button"
-                class="diff-review__tree-item"
-                [class.is-active]="selectedPath() === entry.path"
-                (click)="selectFile(entry)"
+                class="review__files-toggle"
+                [attr.aria-expanded]="filesExpanded()"
+                [attr.aria-controls]="uid + '-file-list'"
+                (click)="toggleFiles()"
               >
-                <span
-                  class="diff-review__status-glyph"
-                  [attr.data-status]="entry.status"
-                  [attr.aria-label]="
-                    entry.status === 'added'
-                      ? ('jobDiffReview.fileTree.statusAdded' | transloco)
-                      : entry.status === 'modified'
-                        ? ('jobDiffReview.fileTree.statusModified' | transloco)
-                        : ('jobDiffReview.fileTree.statusDeleted' | transloco)
-                  "
-                >{{ statusGlyph(entry.status) }}</span>
-                <span class="diff-review__tree-path">{{ entry.path }}</span>
+                <app-icon size="sm" aria-hidden="true">
+                  {{ filesExpanded() ? 'expand_less' : 'expand_more' }}
+                </app-icon>
+                <span class="review__files-toggle-label">
+                  @if (selectedIndex() > 0) {
+                    {{ 'jobDiffReview.fileTree.chooser' | transloco: {index: selectedIndex(), total: fileCount()} }}
+                  } @else {
+                    {{ 'jobDiffReview.fileTree.chooserEmpty' | transloco: {total: fileCount()} }}
+                  }
+                </span>
+                @if (selectedPath(); as path) {
+                  <span class="review__files-toggle-path">{{ path }}</span>
+                }
               </button>
-            </li>
-          }
-        </ul>
-      </aside>
+            } @else {
+              <h3 class="review__files-head">
+                {{ 'jobDiffReview.fileTree.header' | transloco }}
+              </h3>
+            }
+            @if (filesVisible()) {
+              <ul
+                class="review__file-list"
+                [id]="uid + '-file-list'"
+                role="listbox"
+                [attr.aria-label]="'jobDiffReview.fileTree.header' | transloco"
+                (keydown)="onListKeydown($event)"
+              >
+                @for (entry of files(); track entry.path) {
+                  <li
+                    #fileOption
+                    class="review__file"
+                    role="option"
+                    [class.is-selected]="selectedPath() === entry.path"
+                    [attr.data-status]="entry.status"
+                    [attr.aria-selected]="selectedPath() === entry.path"
+                    [attr.aria-controls]="uid + '-viewer'"
+                    [attr.tabindex]="rovingPath() === entry.path ? 0 : -1"
+                    (click)="chooseFile(entry)"
+                    (keydown.enter)="chooseFile(entry)"
+                    (keydown.space)="chooseFile(entry); $event.preventDefault()"
+                  >
+                    <!-- role="img" so the status word actually reaches AT: an
+                         aria-label on a bare span is ignored, which is why
+                         "Added"/"Modified"/"Deleted" never used to be announced. -->
+                    <span
+                      class="review__file-glyph"
+                      role="img"
+                      [attr.data-status]="entry.status"
+                      [attr.aria-label]="statusLabelKey(entry.status) | transloco"
+                    >{{ statusGlyph(entry.status) }}</span>
+                    <span class="review__file-path" [attr.title]="entry.path">{{ entry.path }}</span>
+                  </li>
+                }
+              </ul>
+            }
+          </div>
 
-      <section class="diff-review__viewer">
-        @if (!selectedPath()) {
-          <div class="diff-review__viewer-empty">
-            {{ 'jobDiffReview.viewer.selectPrompt' | transloco }}
-          </div>
-        } @else if (loadingFile()) {
-          <div class="diff-review__viewer-empty">
-            <app-spinner size="md" />
-            <span>{{ 'jobDiffReview.viewer.loadingFile' | transloco }}</span>
-          </div>
-        } @else if (fileLoadFailed()) {
-          <div class="diff-review__viewer-empty">
-            {{ 'jobDiffReview.viewer.loadFailed' | transloco }}
-          </div>
-        } @else if (selectedFile(); as f) {
-          @if (f.status === 'deleted') {
-            <div class="diff-review__viewer-note">
-              {{ 'jobDiffReview.viewer.deletedNote' | transloco }}
-            </div>
-          } @else if (f.status === 'added') {
-            <div class="diff-review__viewer-note">
-              {{ 'jobDiffReview.viewer.addedNote' | transloco }}
-            </div>
-          }
-          @if (monacoFailed()) {
-            <div class="diff-review__monaco-fallback">
-              <p class="diff-review__viewer-note">
-                {{ 'jobDiffReview.viewer.monacoUnavailable' | transloco }}
-              </p>
-              <div class="diff-review__fallback-grid">
-                <div>
-                  <h4>{{ 'jobDiffReview.viewer.labelOriginal' | transloco }}</h4>
-                  <pre>{{ f.old_content ?? '' }}</pre>
-                </div>
-                <div>
-                  <h4>{{ 'jobDiffReview.viewer.labelChanged' | transloco }}</h4>
-                  <pre>{{ f.new_content ?? '' }}</pre>
-                </div>
+          <!-- Selected-file review area. -->
+          <section
+            class="review__viewer"
+            [id]="uid + '-viewer'"
+            role="region"
+            [attr.aria-label]="selectedPath() ?? ('jobDiffReview.viewer.regionLabel' | transloco)"
+          >
+            @if (selectedEntry(); as entry) {
+              <div class="review__viewer-head">
+                <span
+                  class="review__status-pill"
+                  [attr.data-status]="entry.status"
+                >{{ statusLabelKey(entry.status) | transloco }}</span>
+                <span class="review__viewer-path" [attr.title]="entry.path">{{ entry.path }}</span>
+                @if (fileState() === 'ready' && !isBinary()) {
+                  <!-- Direction is stated, not implied by column order alone. -->
+                  <span class="review__direction">
+                    <span class="review__direction-old">{{ ck('directionOld') | transloco }}</span>
+                    <app-icon size="sm" aria-hidden="true">arrow_forward</app-icon>
+                    <span class="review__direction-new">{{ ck('directionNew') | transloco }}</span>
+                  </span>
+                }
               </div>
-            </div>
-          } @else {
-            <div #diffContainer class="diff-review__monaco"></div>
-          }
-        }
-      </section>
-    </div>
+            }
 
-    <footer class="diff-review__actions">
-      <app-button
-        variant="secondary"
-        [disabled]="rejecting() || accepting()"
-        [loading]="rejecting()"
-        (clicked)="onRejectClick()"
-      >
-        {{
-          (rejecting()
-            ? 'jobDiffReview.actions.rejecting'
-            : 'jobDiffReview.actions.reject') | transloco
-        }}
-      </app-button>
-      <app-button
-        variant="success"
-        [disabled]="!!conflict() || accepting() || rejecting()"
-        [loading]="accepting()"
-        (clicked)="onAcceptClick()"
-      >
-        {{
-          (accepting()
-            ? 'jobDiffReview.actions.accepting'
-            : 'jobDiffReview.actions.accept') | transloco
-        }}
-      </app-button>
-    </footer>
+            @switch (fileState()) {
+              @case ('idle') {
+                <div class="review__state review__state--inline">
+                  <p>{{ 'jobDiffReview.viewer.selectPrompt' | transloco }}</p>
+                </div>
+              }
+              @case ('loading') {
+                <div class="review__state review__state--inline">
+                  <app-spinner size="md" [ariaLabel]="'jobDiffReview.viewer.loadingFile' | transloco" />
+                  <p>{{ 'jobDiffReview.viewer.loadingFile' | transloco }}</p>
+                </div>
+              }
+              @case ('missing') {
+                <div class="review__state review__state--inline" role="alert">
+                  <app-icon size="lg" aria-hidden="true">history</app-icon>
+                  <h3>{{ 'jobDiffReview.viewer.missingTitle' | transloco }}</h3>
+                  <!-- One 404 covers three situations; the backend tags two of
+                       them and the third gets copy true for all of them. -->
+                  <p>{{ missingBodyKey() | transloco }}</p>
+                  <app-button variant="secondary" size="sm" (clicked)="reload()">
+                    {{ 'jobDiffReview.viewer.reloadReview' | transloco }}
+                  </app-button>
+                </div>
+              }
+              @case ('failed') {
+                <div class="review__state review__state--inline" role="alert">
+                  <app-icon size="lg" aria-hidden="true">cloud_off</app-icon>
+                  <h3>{{ 'jobDiffReview.viewer.loadFailed' | transloco }}</h3>
+                  <p>{{ fileError() }}</p>
+                  <!-- retrySelectedFile, not selectFile: the same-path guard
+                       made the old handler a no-op, so this button did
+                       nothing at all. -->
+                  <app-button variant="secondary" size="sm" (clicked)="retrySelectedFile()">
+                    {{ 'jobDiffReview.loadFailed.retry' | transloco }}
+                  </app-button>
+                </div>
+              }
+              @case ('ready') {
+                @if (selectedFile(); as f) {
+                  @if (f.status === 'deleted') {
+                    <p class="review__viewer-note" data-tone="danger">
+                      {{ ck('deletedNote') | transloco }}
+                    </p>
+                  } @else if (f.status === 'added') {
+                    <p class="review__viewer-note" data-tone="success">
+                      {{ ck('addedNote') | transloco }}
+                    </p>
+                  }
+
+                  @if (isBinary()) {
+                    <!-- No detected binary reaches a text editor. There is
+                         also no open/download action: the per-file endpoint
+                         returns decoded strings and nulls the content for
+                         binary members, so nothing here could produce a
+                         faithful file. See the design note §6. -->
+                    <div class="review__state review__state--inline review__binary">
+                      <app-icon size="lg" aria-hidden="true">description</app-icon>
+                      <h3>{{ 'jobDiffReview.viewer.binaryTitle' | transloco }}</h3>
+                      <dl class="review__receipt-facts">
+                        <div>
+                          <dt>{{ 'jobDiffReview.viewer.binaryType' | transloco }}</dt>
+                          <dd>{{ ('jobDiffReview.viewer.binaryKind.' + binaryKind()) | transloco }}</dd>
+                        </div>
+                        <div>
+                          <dt>{{ 'jobDiffReview.viewer.binaryStatus' | transloco }}</dt>
+                          <dd>{{ statusLabelKey(f.status) | transloco }}</dd>
+                        </div>
+                      </dl>
+                      <p>{{ ck('binaryBody') | transloco }}</p>
+                      <p class="review__muted">{{ 'jobDiffReview.viewer.binaryNoDownload' | transloco }}</p>
+                    </div>
+                  } @else if (monacoFailed()) {
+                    <div class="review__fallback">
+                      <p class="review__viewer-note">
+                        {{ 'jobDiffReview.viewer.monacoUnavailable' | transloco }}
+                      </p>
+                      <div class="review__fallback-grid">
+                        <div>
+                          <h3>{{ ck('directionOld') | transloco }}</h3>
+                          <pre tabindex="0">{{ f.old_content ?? '' }}</pre>
+                        </div>
+                        <div>
+                          <h3>{{ ck('directionNew') | transloco }}</h3>
+                          <pre tabindex="0">{{ f.new_content ?? '' }}</pre>
+                        </div>
+                      </div>
+                    </div>
+                  } @else {
+                    <div #diffContainer class="review__monaco"></div>
+                  }
+                }
+              }
+            }
+          </section>
+        </div>
+      }
+    }
   }
 
-  <app-dialog
-    [open]="showAcceptConfirm()"
-    (openChange)="showAcceptConfirm.set($event)"
-    [title]="'jobDiffReview.actions.confirmAcceptTitle' | transloco"
-    size="sm"
-  >
-    <p>{{ 'jobDiffReview.actions.confirmAcceptBody' | transloco: {count: fileCount()} }}</p>
-    <ng-container appDialogActions>
-      <app-button variant="ghost" (clicked)="showAcceptConfirm.set(false)">
-        {{ 'jobDiffReview.actions.cancel' | transloco }}
-      </app-button>
-      <app-button variant="success" (clicked)="confirmAccept()">
-        {{ 'jobDiffReview.actions.confirm' | transloco }}
-      </app-button>
-    </ng-container>
-  </app-dialog>
-
-  <app-dialog
-    [open]="showRejectConfirm()"
-    (openChange)="showRejectConfirm.set($event)"
-    [title]="'jobDiffReview.actions.confirmRejectTitle' | transloco"
-    size="sm"
-  >
-    <p>{{ 'jobDiffReview.actions.confirmRejectBody' | transloco }}</p>
-    <ng-container appDialogActions>
-      <app-button variant="ghost" (clicked)="showRejectConfirm.set(false)">
-        {{ 'jobDiffReview.actions.cancel' | transloco }}
-      </app-button>
-      <app-button variant="danger" (clicked)="confirmReject()">
-        {{ 'jobDiffReview.actions.confirm' | transloco }}
-      </app-button>
-    </ng-container>
-  </app-dialog>
+  <!-- ── Decision bar ───────────────────────────────────────────────────── -->
+  @if (loadState() === 'ready') {
+    <footer class="review__decision">
+      @if (submitting(); as running) {
+        <!-- An explicit, persistent progress state. The confirmation branch
+             unmounts the moment confirm is pressed, so the only thing a
+             sighted user saw during the observed 34-second apply was two
+             disabled buttons — indistinguishable from a frozen page. -->
+        <!-- No role="status" here: `announce()` already put the same
+             transition into the surface's one polite live region, and the
+             spinner carries its own role. A third announcer just repeats. -->
+        <p class="review__decision-copy review__decision-copy--running">
+          <app-spinner size="sm" tone="accent" />
+          <span>
+            <strong>{{ (running === 'apply' ? ck('applyingLabel') : ck('rejectingLabel')) | transloco }}</strong>
+            <span class="review__decision-sub">{{ 'jobDiffReview.progress.keepOpen' | transloco }}</span>
+          </span>
+        </p>
+      } @else if (showReceipt()) {
+        <p class="review__decision-copy">{{ 'jobDiffReview.receipt.doneHint' | transloco }}</p>
+        <div class="review__decision-actions">
+          <app-button variant="primary" (clicked)="onDone()">
+            {{ 'jobDiffReview.actions.done' | transloco }}
+          </app-button>
+        </div>
+      } @else if (hasFiles()) {
+        @if (pendingDecision() === 'apply') {
+          <p class="review__decision-copy review__decision-copy--armed" role="alert">
+            <app-icon size="sm" aria-hidden="true">priority_high</app-icon>
+            @if (fileCount() === 1) {
+              {{ ck('applyConfirmBodySingular') | transloco: {count: fileCount(), mount: subject()} }}
+            } @else {
+              {{ ck('applyConfirmBody') | transloco: {count: fileCount(), mount: subject()} }}
+            }
+          </p>
+          <div class="review__decision-actions">
+            <app-button variant="ghost" (clicked)="cancelDecision()">
+              {{ 'jobDiffReview.actions.cancel' | transloco }}
+            </app-button>
+            <app-button variant="primary" data-decision-confirm (clicked)="confirmDecision()">
+              {{ ck('applyConfirmLabel') | transloco }}
+            </app-button>
+          </div>
+        } @else if (pendingDecision() === 'reject') {
+          <p class="review__decision-copy review__decision-copy--armed" role="alert">
+            <app-icon size="sm" aria-hidden="true">priority_high</app-icon>
+            @if (fileCount() === 1) {
+              {{ ck('rejectConfirmBodySingular') | transloco: {count: fileCount()} }}
+            } @else {
+              {{ ck('rejectConfirmBody') | transloco: {count: fileCount()} }}
+            }
+          </p>
+          <div class="review__decision-actions">
+            <app-button variant="ghost" (clicked)="cancelDecision()">
+              {{ 'jobDiffReview.actions.cancel' | transloco }}
+            </app-button>
+            <app-button variant="warning" data-decision-confirm (clicked)="confirmDecision()">
+              {{ ck('rejectConfirmLabel') | transloco }}
+            </app-button>
+          </div>
+        } @else {
+          @if (decisionError(); as err) {
+            <p class="review__decision-copy review__decision-copy--error" role="alert">
+              <app-icon size="sm" aria-hidden="true">error</app-icon>
+              <span>{{ err }}</span>
+            </p>
+          } @else {
+            <p class="review__decision-copy">{{ ck('decisionHint') | transloco }}</p>
+          }
+          <div class="review__decision-actions">
+            <app-button variant="secondary" data-decision="reject" (clicked)="arm('reject')">
+              {{ ck('rejectLabel') | transloco }}
+            </app-button>
+            <app-button
+              variant="primary"
+              data-decision="apply"
+              [disabled]="!!conflict()"
+              (clicked)="arm('apply')"
+            >
+              {{ ck('applyLabel') | transloco }}
+            </app-button>
+          </div>
+        }
+      }
+    </footer>
+  }
 </div>

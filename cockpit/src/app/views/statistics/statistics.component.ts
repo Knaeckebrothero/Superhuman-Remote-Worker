@@ -1,4 +1,5 @@
 import { Component, inject, signal, OnInit, OnDestroy } from '@angular/core';
+import { TranslocoPipe } from '@jsverse/transloco';
 import { ApiService } from '../../core/services/api.service';
 import {
   JobStatistics,
@@ -13,6 +14,7 @@ import {
 @Component({
   selector: 'app-statistics',
   standalone: true,
+  imports: [TranslocoPipe],
   template: `
     <div class="statistics-container">
       <div class="header-bar">
@@ -51,6 +53,10 @@ import {
               <div class="metric-card status-cancelled">
                 <span class="metric-value">{{ jobStats()!.cancelled }}</span>
                 <span class="metric-label">Cancelled</span>
+              </div>
+              <div class="metric-card status-blocked">
+                <span class="metric-value">{{ jobStats()!.blocked_undelivered ?? 0 }}</span>
+                <span class="metric-label">{{ 'jobs.status.blocked_undelivered' | transloco }}</span>
               </div>
             </div>
           } @else {
@@ -95,6 +101,7 @@ import {
                 <span class="col-num">Created</span>
                 <span class="col-num">Completed</span>
                 <span class="col-num">Failed</span>
+                <span class="col-num">{{ 'jobs.status.blocked_undelivered' | transloco }}</span>
               </div>
               @for (day of dailyStats(); track day.date) {
                 <div class="daily-row">
@@ -102,6 +109,7 @@ import {
                   <span class="col-num created">{{ day.jobs_created }}</span>
                   <span class="col-num completed">{{ day.jobs_completed }}</span>
                   <span class="col-num failed">{{ day.jobs_failed }}</span>
+                  <span class="col-num blocked">{{ day.jobs_blocked_undelivered ?? 0 }}</span>
                 </div>
               }
             </div>
@@ -114,6 +122,20 @@ import {
         <div class="stats-section">
           <h3 class="section-title">
             Stuck Jobs
+            @if (stuckThresholdMinutes() !== null) {
+              <span class="policy-note">{{
+                'statistics.stuckPolicy'
+                  | transloco
+                    : {
+                        threshold: stuckThresholdMinutes(),
+                        source:
+                          ('statistics.thresholdSource.' + stuckThresholdSource()
+                            | transloco),
+                      }
+              }}</span>
+            } @else {
+              <span class="policy-note">{{ 'statistics.policyUnavailable' | transloco }}</span>
+            }
             @if (stuckJobs().length > 0) {
               <span class="alert-badge">{{ stuckJobs().length }}</span>
             }
@@ -130,7 +152,18 @@ import {
                   </div>
                   <div class="stuck-reason">{{ job.stuck_reason }}</div>
                   <div class="stuck-meta">
-                    Last update: {{ formatTimestamp(job.updated_at) }}
+                    {{
+                      'statistics.livenessState.' + (job.state ?? 'unavailable') | transloco
+                    }}
+                    ·
+                    @if (job.last_activity_at) {
+                      {{
+                        'statistics.lastActivity'
+                          | transloco: { time: formatTimestamp(job.last_activity_at) }
+                      }}
+                    } @else {
+                      {{ 'statistics.activityUnavailable' | transloco }}
+                    }
                   </div>
                 </div>
               }
@@ -166,7 +199,7 @@ import {
         align-items: center;
         justify-content: space-between;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -219,9 +252,15 @@ import {
         padding: 2px 8px;
         border-radius: var(--radius-pill);
         background: var(--danger);
-        color: var(--on-danger, var(--timeline-bg, #11111b));
+        color: var(--on-danger, var(--timeline-bg));
         font-size: 11px;
         font-weight: 600;
+      }
+
+      .policy-note {
+        color: var(--text-muted, var(--text-muted));
+        font-size: 10px;
+        font-weight: 400;
       }
 
       .loading-placeholder {
@@ -267,6 +306,7 @@ import {
       .metric-card.status-completed .metric-value { color: var(--success); }
       .metric-card.status-failed .metric-value { color: var(--danger); }
       .metric-card.status-cancelled .metric-value { color: var(--text-muted); }
+      .metric-card.status-blocked .metric-value { color: var(--warning); }
 
       .metric-card.agent-ready .metric-value { color: var(--success); }
       .metric-card.agent-working .metric-value { color: var(--warning); }
@@ -311,6 +351,7 @@ import {
       .col-num.created { color: var(--info); }
       .col-num.completed { color: var(--success); }
       .col-num.failed { color: var(--danger); }
+      .col-num.blocked { color: var(--warning); }
 
       /* Stuck Jobs */
       .stuck-list {
@@ -384,6 +425,10 @@ export class StatisticsComponent implements OnInit, OnDestroy {
   readonly agentStats = signal<AgentStatistics | null>(null);
   readonly dailyStats = signal<DailyStatistics[]>([]);
   readonly stuckJobs = signal<StuckJob[]>([]);
+  readonly stuckThresholdMinutes = signal<number | null>(null);
+  readonly stuckThresholdSource = signal<
+    'deployment_default' | 'request_override' | 'unavailable'
+  >('unavailable');
   readonly isLoading = signal(false);
 
   private refreshInterval: ReturnType<typeof setInterval> | null = null;
@@ -418,8 +463,10 @@ export class StatisticsComponent implements OnInit, OnDestroy {
       this.dailyStats.set(stats);
     });
 
-    this.api.getStuckJobs(60).subscribe((jobs) => {
-      this.stuckJobs.set(jobs);
+    this.api.getStuckJobs().subscribe((result) => {
+      this.stuckJobs.set(result.jobs);
+      this.stuckThresholdMinutes.set(result.threshold_minutes);
+      this.stuckThresholdSource.set(result.threshold_source);
       this.isLoading.set(false);
     });
   }

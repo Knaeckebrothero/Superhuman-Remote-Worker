@@ -12,7 +12,7 @@ Probe execution protocol:
    - **By-design** — observed behavior matches stated intent. Record in `notes/by_design.md` and move on.
    - **Ambiguous** — behavior is surprising but contract is silent or contradictory. File as a finding with confidence LOW and a clarifying-question section.
    - **No-go** — probe could not be executed (missing dep, env mismatch). Record the blocker; do not file.
-5. For confirmed bugs and ambiguous cases, save the reproduction to `output/repros/NNN_slug.{sh,py,sql,md}` and the finding to `output/findings/NNN_slug.md`. Use the same NNN for both.
+5. For confirmed bugs and ambiguous cases, save the reproduction to `output/repros/NNN_slug.sh` (or a `.py` / `.sql` / `.md` file, whichever fits) and the finding to `output/findings/NNN_slug.md`. Use the same NNN for both.
 6. Self-check before moving on: can a developer take this finding alone, no other context, and reproduce the bug? If no, the reproduction is incomplete — fix it before proceeding.
 
 Reproduction quality rules:

@@ -5,8 +5,8 @@ Provides PostgreSQL operations:
 - Schema inspection (tables, columns, types, constraints)
 - SQL statement execution (INSERT, UPDATE, DELETE, DDL)
 
-These tools are injected automatically when a PostgreSQL datasource is
-attached to a job. See docs/datasources.md.
+These tools are injected automatically when a PostgreSQL connector is
+attached to a job. See knowledge-base/knowledge/datasources.md.
 """
 
 import json
@@ -26,28 +26,28 @@ SQL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "sql_query": {
         "module": "sql.postgresql",
         "function": "sql_query",
-        "description": "Execute a read-only SQL query against the PostgreSQL datasource",
+        "description": "Execute a read-only SQL query against the PostgreSQL connector",
         "category": "sql",
         "defer_to_workspace": True,
-        "short_description": "Execute read-only SQL query against PostgreSQL datasource.",
+        "short_description": "Execute a read-only SQL query against PostgreSQL.",
         "phases": ["tactical"],
     },
     "sql_schema": {
         "module": "sql.postgresql",
         "function": "sql_schema",
-        "description": "Inspect the PostgreSQL datasource schema (tables, columns, types)",
+        "description": "Inspect the PostgreSQL connector schema (tables, columns, types)",
         "category": "sql",
         "defer_to_workspace": True,
-        "short_description": "Inspect PostgreSQL datasource schema (tables, columns, types).",
+        "short_description": "Inspect the PostgreSQL schema (tables, columns, types).",
         "phases": ["tactical"],
     },
     "sql_execute": {
         "module": "sql.postgresql",
         "function": "sql_execute",
-        "description": "Execute a write SQL statement (INSERT, UPDATE, DELETE, DDL) against the PostgreSQL datasource",
+        "description": "Execute a write SQL statement (INSERT, UPDATE, DELETE, DDL) against the PostgreSQL connector",
         "category": "sql",
         "defer_to_workspace": True,
-        "short_description": "Execute write SQL (INSERT/UPDATE/DELETE/DDL) against PostgreSQL datasource.",
+        "short_description": "Execute write SQL (INSERT/UPDATE/DELETE/DDL) against PostgreSQL.",
         "phases": ["tactical"],
     },
 }
@@ -57,21 +57,21 @@ def create_postgresql_tools(context: ToolContext) -> List[Any]:
     """Create PostgreSQL tools with injected context.
 
     Args:
-        context: ToolContext with dependencies (must include postgresql datasource)
+        context: ToolContext with dependencies (must include a PostgreSQL connector)
 
     Returns:
         List of LangChain tool functions
 
     Raises:
-        ValueError: If PostgreSQL datasource not available in context
+        ValueError: If a PostgreSQL connector is not available in context
     """
     conn = context.get_datasource("postgresql")
     if not conn:
-        raise ValueError("PostgreSQL datasource not available in context")
+        raise ValueError("PostgreSQL connector not available in context")
 
     @tool
     def sql_query(query: str) -> str:
-        """Execute a read-only SQL query against the PostgreSQL datasource.
+        """Execute a read-only SQL query against the PostgreSQL connector.
 
         Args:
             query: A valid SQL SELECT query

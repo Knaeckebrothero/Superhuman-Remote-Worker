@@ -8,7 +8,9 @@ actually delete pods rather than flicker a status field nothing reads.
 """
 
 from contextlib import asynccontextmanager
+import json
 from unittest.mock import AsyncMock, patch
+from uuid import UUID
 
 import pytest
 
@@ -38,6 +40,119 @@ def _make_db_with_mocked_acquire(
 
     db.acquire = fake_acquire
     return db, conn
+
+
+class TestHeartbeatPreservesWarmAttachReservation:
+    """A mixed-version pool heartbeat cannot erase status=session."""
+
+    @pytest.mark.asyncio
+    async def test_bound_session_rejects_ready_heartbeat(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        conn.fetchrow.return_value["thread_id"] = "22222222-2222-2222-2222-222222222222"
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+
+        assert result["effective_status"] == "session"
+        sql = conn.execute.await_args.args[0]
+        assert "status = 'session' AND thread_id IS NOT NULL" in sql
+        assert "= 'ready' THEN 'session'" in sql
+
+    @pytest.mark.asyncio
+    async def test_unbound_session_status_can_return_ready(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        conn.fetchrow.return_value["thread_id"] = None
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+
+        assert result["effective_status"] == "ready"
+
+
+class TestHeartbeatPinnedRuntimeAuthority:
+    """A delayed G1 beat cannot mutate a same-agent G2 binding."""
+
+    @staticmethod
+    def _bind_row(conn, *, generation: str, attach_token: str | None) -> None:
+        conn.fetchrow.return_value.update(
+            {
+                "thread_id": "22222222-2222-2222-2222-222222222222",
+                "execution_lane": "pinned",
+                "thread_runtime_generation": UUID(generation),
+                "thread_runtime_attach_token": (
+                    UUID(attach_token) if attach_token is not None else None
+                ),
+                "runtime_retirement_token": None,
+                "thread_status": "active",
+                "thread_metadata": {"protected_cloud": True},
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_never_updates_liveness_or_metrics(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        self._bind_row(
+            conn,
+            generation="33333333-3333-3333-3333-333333333333",
+            attach_token="44444444-4444-4444-4444-444444444444",
+        )
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="session",
+            metrics={"graph_progress": 9},
+            session_runtime_generation="55555555-5555-5555-5555-555555555555",
+            session_runtime_attach_token="44444444-4444-4444-4444-444444444444",
+        )
+
+        assert result == {
+            "authority_refused": True,
+            "thread_id": "22222222-2222-2222-2222-222222222222",
+        }
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exact_identity_is_rechecked_inside_final_update(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        generation = "33333333-3333-3333-3333-333333333333"
+        token = "44444444-4444-4444-4444-444444444444"
+        self._bind_row(conn, generation=generation, attach_token=token)
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="session",
+            session_runtime_generation=generation,
+            session_runtime_attach_token=token,
+        )
+
+        assert result is not None and not result.get("authority_refused")
+        sql, *params = conn.execute.await_args.args
+        assert "thread.runtime_retirement_token IS NULL" in sql
+        assert "thread.runtime_generation =" in sql
+        assert "thread.runtime_attach_token" in sql
+        assert UUID(generation) in params
+        assert UUID(token) in params
+
+    @pytest.mark.asyncio
+    async def test_protected_runtime_missing_identity_fails_closed(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        self._bind_row(
+            conn,
+            generation="33333333-3333-3333-3333-333333333333",
+            attach_token=None,
+        )
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="session",
+        )
+
+        assert result and result.get("authority_refused") is True
+        conn.execute.assert_not_awaited()
 
 
 class TestHeartbeatPreservesDraining:
@@ -155,6 +270,160 @@ class TestHeartbeatPreservesOffline:
         )
         sql = conn.execute.call_args[0][0]
         assert "WHEN status = 'offline'" in sql
+
+
+class TestHeartbeatAuxDegraded:
+    """aux Phase 2: heartbeat persists the auxiliary-model degraded flag from
+    the AuxHealth summary the agent carries in metrics.aux. See
+    knowledge-base/knowledge/issues/surface_silent_aux_failures.md.
+    """
+
+    @pytest.mark.asyncio
+    async def test_true_sets_column(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            aux_degraded=True,
+        )
+        sql, *params = conn.execute.call_args[0]
+        assert "aux_degraded = " in sql
+        assert any(p is True for p in params)
+
+    @pytest.mark.asyncio
+    async def test_false_clears_column(self):
+        # A recovered agent reports degraded=False — the column must be
+        # actively set false, not left stale at a previous true.
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            aux_degraded=False,
+        )
+        sql, *params = conn.execute.call_args[0]
+        assert "aux_degraded = " in sql
+        assert any(p is False for p in params)
+
+    @pytest.mark.asyncio
+    async def test_none_omits_column(self):
+        # Older agent builds / not-yet-wired aux LLM omit the flag — the
+        # persisted value must be left untouched (no aux_degraded clause).
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            aux_degraded=None,
+        )
+        sql = conn.execute.call_args[0][0]
+        assert "aux_degraded" not in sql
+
+    @pytest.mark.asyncio
+    async def test_param_indices_aligned_with_all_clauses_present(self):
+        # The dynamic param builder must keep $N indices contiguous and
+        # matched to positional args when the metadata merge, the
+        # working→ready last_completed_at clause, and aux_degraded all fire.
+        # This is the index-shuffling hazard the builder replaced.
+        import re
+
+        db, conn = _make_db_with_mocked_acquire(prev_status="working")
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            current_job_id="11111111-1111-1111-1111-111111111111",
+            metrics={"aux": {"degraded": True}},
+            aux_degraded=True,
+        )
+        sql, *params = conn.execute.call_args[0]
+        placeholders = {int(m) for m in re.findall(r"\$(\d+)", sql)}
+        assert placeholders == set(range(1, len(params) + 1))
+        assert "metadata = metadata ||" in sql
+        assert "last_completed_at = CURRENT_TIMESTAMP" in sql
+        assert "aux_degraded = " in sql
+
+
+class TestHeartbeatGraphProgress:
+    """Graph-progress markers in heartbeat metadata are tracked with a timestamp."""
+
+    @pytest.mark.asyncio
+    async def test_graph_progress_changes_writes_seen_at_timestamp(self):
+        db, conn = _make_db_with_mocked_acquire(
+            prev_status="ready",
+            intents={},
+        )
+        conn.fetchrow.return_value["metadata"] = {"graph_progress": 1}
+
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            metrics={"graph_progress": 2},
+        )
+
+        sql, *params = conn.execute.call_args[0]
+        # Graph-progress timestamp is encoded in the payload, not SQL text.
+        metadata_payloads = [
+            json.loads(p)
+            for p in params
+            if isinstance(p, str) and p.startswith("{") and "graph_progress" in p
+        ]
+        assert metadata_payloads, "metadata payload missing"
+        latest = metadata_payloads[-1]
+        assert latest["graph_progress"] == 2
+        assert "graph_progress_seen_at" in latest
+
+    @pytest.mark.asyncio
+    async def test_graph_progress_unchanged_skips_seen_at_timestamp(self):
+        db, conn = _make_db_with_mocked_acquire(
+            prev_status="ready",
+            intents={},
+        )
+        conn.fetchrow.return_value["metadata"] = {"graph_progress": 3}
+
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            metrics={"graph_progress": 3},
+        )
+
+        sql, *params = conn.execute.call_args[0]
+        # The SQL text stays stable; only the payload differs when progress is
+        # unchanged.
+        metadata_payloads = [
+            json.loads(p)
+            for p in params
+            if isinstance(p, str) and p.startswith("{") and "graph_progress" in p
+        ]
+        assert metadata_payloads, "metadata payload missing"
+        latest = metadata_payloads[-1]
+        assert latest["graph_progress"] == 3
+        assert "graph_progress_seen_at" not in latest
+
+
+class TestHeartbeatReturnsBoundThread:
+    """The handler slides a thread-bound runtime-actor grant on liveness, so
+    it needs the agent's bound thread. It rides the row heartbeat already
+    reads, at zero marginal DB cost.
+    knowledge/issues/officer_runtime_grant_expires_after_24h_and_dies_silently.md
+    """
+
+    @pytest.mark.asyncio
+    async def test_bound_thread_is_selected_and_returned(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+        conn.fetchrow.return_value["thread_id"] = "22222222-2222-2222-2222-222222222222"
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        assert result["thread_id"] == "22222222-2222-2222-2222-222222222222"
+        assert "thread_id" in conn.fetchrow.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_thread_id_is_none_for_a_stateless_worker_agent(self):
+        db, _ = _make_db_with_mocked_acquire(prev_status="ready")
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        assert result["thread_id"] is None
 
 
 class TestHeartbeatReturnsIntents:

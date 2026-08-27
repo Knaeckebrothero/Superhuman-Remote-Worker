@@ -340,6 +340,16 @@ class ImapPoller:
             logger.warning(f"IMAP reply: body empty after stripping for {email_msg_id}")
             cleaned_body = body.strip()
 
+        # Atomically claim this email before routing. The early
+        # message_exists_by_email_id() check above is a fast path; this
+        # insert-as-claim is the authority. Without it a concurrent poller in
+        # the transient dual-leader window (leader election has no fencing)
+        # could inject the same reply into the job twice. We claim only here,
+        # once committed to routing, so non-routable ("skipped") emails are not
+        # marked processed and stay eligible for a later retry.
+        if email_msg_id and not await self._db.claim_inbound_email(email_msg_id):
+            return "duplicate"
+
         # Route via the reply handler
         strategy = await self._reply_handler(
             job_id,

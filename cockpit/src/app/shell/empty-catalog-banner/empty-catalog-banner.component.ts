@@ -20,7 +20,7 @@ import {UserService} from '../../core/services/user.service';
         <span class="banner-text">
           @if (isAdmin()) {
             {{ 'emptyCatalog.bannerAdmin' | transloco }}
-            <a routerLink="/admin/llm" class="banner-link">
+            <a routerLink="/admin/models" class="banner-link">
               {{ 'admin.providers.title' | transloco }} →
             </a>
           } @else {
@@ -46,9 +46,9 @@ import {UserService} from '../../core/services/user.service';
       justify-content: space-between;
       gap: 12px;
       padding: 10px 16px;
-      background: rgba(249, 226, 175, 0.12);
-      border-bottom: 1px solid rgba(249, 226, 175, 0.3);
-      color: var(--yellow, #f9e2af);
+      background: color-mix(in srgb, var(--warning) 12%, transparent);
+      border-bottom: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
+      color: var(--warning);
       font-size: 13px;
       line-height: 1.4;
     }

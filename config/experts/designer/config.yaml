@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Designer - UI/UX design and prototyping
-$extends: defaults
+$extends: worker_base
 
 agent_id: designer
 display_name: Designer
@@ -33,8 +33,20 @@ workspace:
 
 instruction_files:
   - file: design_guide.md
-    trigger: phase:tactical
+    trigger: phase_start:tactical
+    enforce: false  # Injected once per concrete tactical phase
+  - skill: verify-before-done
+    trigger: before_tool:todo_complete
     enforce: true
+    phases: [tactical]
+    read_scope: phase
+    max_read_age_turns: 20
+  - skill: verify-before-done
+    trigger: before_tool:job_complete
+    enforce: true
+    phases: [strategic]
+    read_scope: phase
+    max_read_age_turns: 20
 
 tools:
   workspace:
@@ -51,24 +63,23 @@ tools:
     - create_directory
   shell:
     - run_command
+    - cancel_command
     - shell_read
   core:
     - next_phase_todos
     - todo_complete
     - todo_list
-    - todo_rewind
+    - request_replan
     - mark_complete
     - job_complete
   research:
     - web_search
     - extract_webpage
-    - browse_website
-  git:
-    - git_log
-    - git_show
-    - git_diff
-    - git_status
-    - git_tags
+  # git: intentionally absent. This agent has shell tools, and
+  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # whenever shell is present — a shell can run git against ANY repository in
+  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+  # here would advertise tools the pod never binds.
   # Not needed
   delegation: []
   citation: []

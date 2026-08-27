@@ -1,0 +1,50 @@
+{{/*
+One ScheduledBackup per backing-up cluster.
+
+WAL archiving alone restores nothing: point-in-time recovery replays WAL
+FORWARD from a base backup, so without one the archive is unusable.
+*/}}
+{{- if (include "srw.anyDbBacksUp" .) }}
+{{- $schedule := .Values.databases.backup.schedule | toString }}
+{{- if ne (len (splitList " " (trim $schedule))) 6 }}
+{{- fail (printf "databases.backup.schedule must be a six-field cron with SECONDS first (robfig/cron), got %q. The five-field Kubernetes CronJob format is not rejected, it is misparsed -- \"0 2 * * *\" is not 2am. Daily at 02:00 is \"0 0 2 * * *\"." $schedule) }}
+{{- end }}
+{{- $rendered := 0 }}
+{{- range $entry := list
+      (dict "key" "postgres" "component" "postgres")
+      (dict "key" "vector" "component" "pgvector")
+      (dict "key" "audit" "component" "auditdb")
+      (dict "key" "gitea" "component" "giteadb")
+      (dict "key" "keycloak" "component" "keycloakdb") }}
+{{- if (include "srw.dbBacksUp" (dict "context" $ "key" $entry.key)) }}
+{{- if $rendered }}
+---
+{{- end }}
+{{- $rendered = add1 $rendered }}
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ include "srw.fullname" $ }}-{{ $entry.component }}-backup
+  labels:
+    {{- include "srw.componentLabels" (dict "context" $ "component" $entry.component) | nindent 4 }}
+spec:
+  cluster:
+    name: {{ include "srw.fullname" $ }}-{{ $entry.component }}
+  schedule: {{ $schedule | quote }}
+  # Without a base backup the WAL archive restores nothing, so do not wait for
+  # the first scheduled window on a fresh install.
+  immediate: {{ $.Values.databases.backup.immediate }}
+  # A base backup is heavy sequential IO. prefer-standby keeps it off the
+  # primary where a replica exists and falls back to the primary where none
+  # does, so it is correct at every instance count.
+  target: prefer-standby
+  {{- if (include "srw.backupIsObjectStore" $) }}
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+  {{- else }}
+  method: volumeSnapshot
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

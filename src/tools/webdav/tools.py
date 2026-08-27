@@ -9,9 +9,14 @@ Connection is established by datasource_setup.create_datasource_connection()
 and injected via ToolContext.get_datasource("webdav").
 """
 
+import asyncio
+import hashlib
 import logging
-import os
-from typing import Any, Dict, List
+import posixpath
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
@@ -63,14 +68,14 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
     """Create WebDAV tools with injected context.
 
     Args:
-        context: ToolContext with webdav datasource (webdav3.client.Client)
+        context: ToolContext with a WebDAV connector (webdav3.client.Client)
 
     Returns:
         List of LangChain tool functions
     """
     client = context.get_datasource("webdav")
     if not client:
-        raise ValueError("WebDAV datasource not available in context")
+        raise ValueError("WebDAV connector not available in context")
 
     workspace = context.workspace_manager
 
@@ -130,7 +135,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             return f"Error listing {path}: {e}"
 
     @tool
-    def webdav_read(path: str, target: str = "") -> str:
+    async def webdav_read(path: str, target: str = "") -> str:
         """Download a file from WebDAV into the workspace.
 
         Args:
@@ -141,18 +146,52 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             Confirmation with local path, or error message
         """
         try:
-            filename = target or os.path.basename(path.rstrip("/"))
+            filename = target or posixpath.basename(path.rstrip("/"))
             if not filename:
                 return "Error: could not determine filename from path"
 
-            documents_dir = str(workspace.get_path("documents"))
-            os.makedirs(documents_dir, exist_ok=True)
-            local_path = os.path.join(documents_dir, filename)
+            workspace_path = posixpath.join("documents", filename)
+            with tempfile.TemporaryDirectory(prefix="webdav_dl_") as temp_dir:
+                local_path = Path(temp_dir) / Path(filename).name
+                await asyncio.to_thread(
+                    client.download_sync,
+                    remote_path=path,
+                    local_path=str(local_path),
+                )
+                data = await asyncio.to_thread(local_path.read_bytes)
 
-            client.download_sync(remote_path=path, local_path=local_path)
+                # Phase 3 (D7): stash a cloud snapshot-anchor for this file so a
+                # later cite_* persists its drift fingerprint + live pointer onto
+                # the source.
+                try:
+                    anchor = await asyncio.to_thread(
+                        _build_cloud_anchor,
+                        client,
+                        path,
+                        str(local_path),
+                    )
+                except Exception as e:
+                    logger.debug("Could not build cloud anchor for %s: %s", path, e)
+                    anchor = None
 
-            size = os.path.getsize(local_path)
-            return f"Downloaded {path} → documents/{filename} ({_human_size(size)})"
+            # A backend path may be an object key or a path on another pod.
+            # Only the operation-scoped staging path above is local. Keep the
+            # backend write and its provenance update in one per-target
+            # critical section so parallel reads cannot cross their ordering.
+            async with context.cloud_anchor_write_lock(workspace_path):
+                await asyncio.to_thread(
+                    workspace.backend.write_file,
+                    workspace_path,
+                    data,
+                )
+
+                if anchor:
+                    # Persistent sessions bind this seam to a durable
+                    # per-thread upsert. Await it before reporting success so
+                    # provenance cannot silently disappear at the next claim.
+                    await context.persist_cloud_anchor(workspace_path, anchor)
+
+            return f"Downloaded {path} → {workspace_path} ({_human_size(len(data))})"
         except Exception as e:
             return f"Error downloading {path}: {e}"
 
@@ -196,8 +235,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             Confirmation with file size, or error message
         """
         try:
-            local_path = str(workspace.get_path(source))
-            if not os.path.isfile(local_path):
+            if not workspace.backend.is_file(source):
                 return f"Error: file not found in workspace: {source}"
 
             # Create parent directories on WebDAV if needed
@@ -208,8 +246,15 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
                 except Exception:
                     pass  # Directory may already exist
 
-            client.upload_sync(remote_path=remote_path, local_path=local_path)
-            size = os.path.getsize(local_path)
+            # The WebDAV client requires a local filename. Materialize through
+            # the workspace abstraction instead of treating a backend path as
+            # local agent storage.
+            with workspace.local_copy(source) as local_path:
+                client.upload_sync(
+                    remote_path=remote_path,
+                    local_path=str(local_path),
+                )
+                size = local_path.stat().st_size
             return f"Uploaded {source} → {remote_path} ({_human_size(size)})"
         except Exception as e:
             return f"Error uploading {source} to {remote_path}: {e}"
@@ -240,3 +285,63 @@ def _human_size(size_bytes: int) -> str:
             return f"{size_bytes:.1f} {unit}" if unit != "B" else f"{size_bytes} B"
         size_bytes /= 1024
     return f"{size_bytes:.1f} TB"
+
+
+def _webdav_base_url(client: Any) -> str:
+    """Best-effort base URL (hostname) of a webdav3 client.
+
+    webdav3 stows the connection options on ``client.webdav`` (a settings
+    object with a ``hostname`` attribute). Guarded so an internal API change
+    degrades to "no live pointer" rather than raising.
+    """
+    settings = getattr(client, "webdav", None)
+    host = getattr(settings, "hostname", None) if settings is not None else None
+    return str(host) if host else ""
+
+
+def _file_sha256(local_path: str) -> Optional[str]:
+    """SHA-256 of a file's raw bytes, streamed; None on any I/O error."""
+    try:
+        h = hashlib.sha256()
+        with open(local_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError as e:
+        logger.debug("cloud-anchor hash failed for %s: %s", local_path, e)
+        return None
+
+
+def _build_cloud_anchor(
+    client: Any, remote_path: str, local_path: str
+) -> Dict[str, Any]:
+    """Capture a Phase-3 (D7) cloud snapshot-anchor for a downloaded file.
+
+    Best-effort and never raises: returns the drift fingerprint (``etag`` +
+    raw-bytes ``file_sha256``) plus a best-effort live pointer (``backend``,
+    ``path``, ``webdav_url``). A later ``cite_*`` persists this onto the
+    source's ``metadata.cloud`` so the citation records what it actually cited
+    and can be drift-checked / re-fetched on view.
+    """
+    anchor: Dict[str, Any] = {"backend": "webdav", "path": remote_path}
+
+    base = _webdav_base_url(client)
+    if base:
+        anchor["webdav_url"] = base.rstrip("/") + "/" + remote_path.lstrip("/")
+
+    # File metadata via PROPFIND (etag / modified / content_type / size).
+    try:
+        info = client.info(remote_path) or {}
+        for key in ("etag", "modified", "created", "content_type", "size"):
+            val = info.get(key)
+            if val not in (None, ""):
+                anchor[key] = val
+    except Exception as e:  # webdav3 raises assorted client errors
+        logger.debug("cloud-anchor info() failed for %s: %s", remote_path, e)
+
+    file_hash = _file_sha256(local_path)
+    if file_hash:
+        anchor["file_sha256"] = file_hash
+
+    anchor["captured_at"] = datetime.now(timezone.utc).isoformat()
+    return anchor

@@ -1,0 +1,265 @@
+import {inject, Injectable} from '@angular/core';
+import {HttpClient} from '@angular/common/http';
+import {catchError, Observable, of} from 'rxjs';
+import {environment} from '../../environment';
+import {JobArtifactService} from './job-artifact.service';
+import {UserService} from '../user.service';
+
+/** A builder chat message (stored in builder_messages table). */
+export interface BuilderMessage {
+  id: string;
+  session_id: string;
+  role: 'user' | 'assistant';
+  content: string | null;
+  tool_calls: { tool: string; args: Record<string, unknown> }[] | null;
+  steps: { type: string; title: string; content?: string }[] | null;
+  created_at: string;
+}
+
+/** Builder session metadata. */
+export interface BuilderSession {
+  id: string;
+  job_id: string | null;
+  expert_id: string | null;
+  created_at: string;
+  updated_at: string;
+  summary: string | null;
+  title: string | null;
+}
+
+/** A workspace edit proposal from the builder that needs user approval. */
+export interface WorkspaceProposal {
+  tool: string;
+  job_id: string;
+  path: string;
+  operation: 'write' | 'edit';
+  content?: string;
+  old_text?: string;
+  new_text?: string;
+  current_content: string | null;
+}
+
+/** Callback interface for SSE stream events. */
+export interface StreamCallbacks {
+  onToken?: (text: string) => void;
+  onToolCall?: (tool: string, args: Record<string, unknown>) => void;
+  onToolExecuting?: (tool: string, args: Record<string, unknown>) => void;
+  onToolResult?: (tool: string, summary: string, content?: string) => void;
+  onWorkspaceProposal?: (proposal: WorkspaceProposal) => void;
+  onStep?: (type: string, title: string) => void;
+  onDone?: (title?: string) => void;
+  onError?: (message: string) => void;
+}
+
+/**
+ * SSE client for the builder chat endpoint.
+ *
+ * Handles session creation, message sending with SSE streaming,
+ * and message history retrieval. Tool-call events are automatically
+ * forwarded to JobArtifactService.
+ */
+@Injectable({ providedIn: 'root' })
+export class BuilderStreamService {
+  private readonly http = inject(HttpClient);
+  private readonly artifacts = inject(JobArtifactService);
+  private readonly userService = inject(UserService);
+  private readonly baseUrl = environment.apiUrl;
+
+  private abortController: AbortController | null = null;
+
+  /** Create a new builder session. */
+  createSession(expertId?: string): Observable<BuilderSession | null> {
+    return this.http
+      .post<BuilderSession>(`${this.baseUrl}/builder/sessions`, {
+        expert_id: expertId ?? null,
+        user_id: this.userService.currentUserId() ?? null,
+      })
+      .pipe(catchError(() => of(null)));
+  }
+
+  /** Get session details. */
+  getSession(sessionId: string): Observable<BuilderSession | null> {
+    return this.http.get<BuilderSession>(`${this.baseUrl}/builder/sessions/${sessionId}`).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  /** Get message history for a session. */
+  getMessages(sessionId: string): Observable<BuilderMessage[]> {
+    return this.http
+      .get<BuilderMessage[]>(`${this.baseUrl}/builder/sessions/${sessionId}/messages`)
+      .pipe(catchError(() => of([])));
+  }
+
+  /** List sessions for a user (most recent first). */
+  listSessions(userId: string): Observable<BuilderSession[]> {
+    return this.http
+      .get<BuilderSession[]>(`${this.baseUrl}/builder/sessions`, {
+        params: { user_id: userId },
+      })
+      .pipe(catchError(() => of([])));
+  }
+
+  /**
+   * Send a message and stream the AI response via SSE.
+   *
+   * Uses fetch() directly (not HttpClient) because Angular's HttpClient
+   * doesn't support streaming response bodies. The SSE events are parsed
+   * manually from the response stream.
+   *
+   * Tool-call events are automatically applied to JobArtifactService.
+   */
+  async sendMessage(
+    sessionId: string,
+    message: string,
+    callbacks: StreamCallbacks,
+  ): Promise<void> {
+    // Abort any in-flight stream
+    this.abort();
+    this.abortController = new AbortController();
+
+    this.artifacts.streaming.set(true);
+
+    const body: Record<string, unknown> = {
+      message,
+      model: this.artifacts.builderModel(),
+      instructions: this.artifacts.instructions(),
+      config: this.artifacts.config(),
+      description: this.artifacts.description(),
+    };
+    const activeJobId = this.artifacts.activeJobId();
+    if (activeJobId) {
+      body['active_job_id'] = activeJobId;
+    }
+
+    try {
+      // Mirror authInterceptor for raw fetch (which bypasses interceptors):
+      // - credentials: 'include' lets the HttpOnly srw_session cookie ride
+      //   the cross-origin POST to the orchestrator.
+      // - X-CSRF: '1' satisfies orchestrator/security/csrf.py for cookie-
+      //   authenticated state-changing requests.
+      const response = await fetch(
+        `${this.baseUrl}/builder/sessions/${sessionId}/message`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF': '1' },
+          body: JSON.stringify(body),
+          credentials: 'include',
+          signal: this.abortController.signal,
+        },
+      );
+
+      if (!response.ok) {
+        const text = await response.text();
+        callbacks.onError?.(`HTTP ${response.status}: ${text}`);
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        callbacks.onError?.('No response body');
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events from buffer
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? ''; // Keep incomplete line in buffer
+
+        let currentEvent = '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+          } else if (line.startsWith('data: ') && currentEvent) {
+            const dataStr = line.slice(6);
+            try {
+              const data = JSON.parse(dataStr);
+              this.handleEvent(currentEvent, data, callbacks);
+            } catch {
+              // Ignore malformed JSON
+            }
+            currentEvent = '';
+          } else if (line === '') {
+            currentEvent = '';
+          }
+        }
+      }
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        // User-initiated abort, not an error
+        return;
+      }
+      callbacks.onError?.((err as Error).message ?? 'Stream failed');
+    } finally {
+      this.artifacts.streaming.set(false);
+      this.abortController = null;
+    }
+  }
+
+  /** Abort an in-flight stream. */
+  abort(): void {
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+      this.artifacts.streaming.set(false);
+    }
+  }
+
+  private handleEvent(
+    event: string,
+    data: Record<string, unknown>,
+    callbacks: StreamCallbacks,
+  ): void {
+    switch (event) {
+      case 'token':
+        callbacks.onToken?.(data['text'] as string);
+        break;
+
+      case 'tool_call': {
+        const tool = data['tool'] as string;
+        const args = data['args'] as Record<string, unknown>;
+        // Apply to artifact state
+        this.artifacts.applyToolCall(tool, args);
+        // Notify UI
+        callbacks.onToolCall?.(tool, args);
+        break;
+      }
+
+      case 'tool_executing':
+        callbacks.onToolExecuting?.(data['tool'] as string, data['args'] as Record<string, unknown>);
+        break;
+
+      case 'tool_result':
+        callbacks.onToolResult?.(
+          data['tool'] as string,
+          data['summary'] as string,
+          data['content'] as string | undefined,
+        );
+        break;
+
+      case 'workspace_proposal':
+        callbacks.onWorkspaceProposal?.(data as unknown as WorkspaceProposal);
+        break;
+
+      case 'step':
+        callbacks.onStep?.(data['type'] as string, data['title'] as string);
+        break;
+
+      case 'done':
+        callbacks.onDone?.(data['title'] as string | undefined);
+        break;
+
+      case 'error':
+        callbacks.onError?.(data['message'] as string);
+        break;
+    }
+  }
+}

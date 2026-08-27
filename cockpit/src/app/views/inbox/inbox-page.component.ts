@@ -30,6 +30,8 @@ import {AppInputComponent} from '../../ui/input';
 import {AppSelectComponent} from '../../ui/select';
 import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppIconComponent} from '../../ui/icon';
+import {AppCopyFieldComponent} from '../../ui/copy-field';
+import {ExternalImageDirective} from '../../ui/external-image';
 
 interface FrozenJobData {
   freeze_type?: string;
@@ -75,6 +77,7 @@ function relativeTime(iso: string, nowLabel: string): string {
   imports: [
     JsonPipe,
     MarkdownComponent,
+    ExternalImageDirective,
     SidebarToggleComponent,
     TranslocoPipe,
     AppChipComponent,
@@ -87,6 +90,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     AppSelectComponent,
     AppCheckboxComponent,
     AppIconComponent,
+    AppCopyFieldComponent,
   ],
   template: `
     <div class="inbox" (keydown)="onKeydown($event)">
@@ -315,6 +319,13 @@ function relativeTime(iso: string, nowLabel: string): string {
                 }
               </div>
 
+              <div class="detail-ids">
+                @if (selectedItem()!.sudo!.job_id) {
+                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.sudo!.job_id!" />
+                }
+                <app-copy-field [label]="'inbox.detail.requestId' | transloco" [value]="selectedItem()!.sudo!.id" />
+              </div>
+
               @if (selectedItem()!.sudo!.status === 'pending') {
                 @if (selectedItem()!.sudo!.request_type === 'vm_upgrade') {
                   <div class="upgrade-hint">
@@ -398,6 +409,49 @@ function relativeTime(iso: string, nowLabel: string): string {
               </details>
             </div>
 
+          } @else if (selectedItem()!.type === 'message' && selectedItem()!.message?.sessionThreadId) {
+            <!-- ========== SESSION PAGE DETAIL (officer page: no job) ========== -->
+            <!-- Keyed to a persistent session, not a job — there is no thread
+                 to fetch and no job-scoped reply route. The session log is the
+                 working reply channel, so the primary action opens it. -->
+            <div class="detail-content message-detail session-page-detail">
+              <div class="detail-header">
+                <span class="detail-type-badge message">
+                  <app-icon size="sm">campaign</app-icon>
+                  {{ selectedItem()!.message!.subject || ('inbox.messageDetail.messageLabel' | transloco) }}
+                </span>
+                <app-badge tone="accent" size="xs" [uppercase]="true">
+                  {{ 'inbox.messageDetail.sessionPage' | transloco }}
+                </app-badge>
+              </div>
+
+              <div class="detail-ids">
+                <app-copy-field [label]="'inbox.detail.sessionId' | transloco" [value]="selectedItem()!.message!.sessionThreadId!" />
+              </div>
+
+              <div class="thread-body">
+                <div class="msg-bubble msg-outbound">
+                  <div class="msg-header">
+                    <span class="msg-sender">{{ 'inbox.messageDetail.senderAgent' | transloco }}</span>
+                    <span class="msg-time">{{ formatMsgTime(selectedItem()!.timestamp) }}</span>
+                  </div>
+                  <div class="msg-content">
+                    @if (selectedItem()!.message!.lastMessage) {
+                      <markdown [data]="selectedItem()!.message!.lastMessage"></markdown>
+                    } @else {
+                      {{ 'inbox.messageDetail.noMessagesLoaded' | transloco }}
+                    }
+                  </div>
+                </div>
+              </div>
+
+              <div class="action-bar">
+                <app-button variant="primary" size="sm" (clicked)="goToSession(selectedItem()!.message!.sessionThreadId!)">
+                  <app-icon size="sm">open_in_new</app-icon> {{ 'inbox.messageDetail.openSessionLog' | transloco }}
+                </app-button>
+              </div>
+            </div>
+
           } @else if (selectedItem()!.type === 'message' && selectedItem()!.message) {
             <!-- ========== MESSAGE DETAIL ========== -->
             <div class="detail-content message-detail">
@@ -422,9 +476,13 @@ function relativeTime(iso: string, nowLabel: string): string {
                 @if (selectedItem()!.message!.jobDescription) {
                   · {{ selectedItem()!.message!.jobDescription }}
                 }
+              </div>
+
+              <div class="detail-ids">
                 @if (selectedItem()!.jobId) {
-                  · {{ 'inbox.messageDetail.jobPrefix' | transloco }} {{ selectedItem()!.jobId!.slice(0, 8) }}
+                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.jobId!" />
                 }
+                <app-copy-field [label]="'inbox.detail.threadId' | transloco" [value]="selectedItem()!.message!.threadId" />
               </div>
 
               <!-- Thread messages -->
@@ -506,10 +564,12 @@ function relativeTime(iso: string, nowLabel: string): string {
                 <div class="review-job-desc">{{ selectedItem()!.review!.jobDescription }}</div>
                 <div class="review-job-meta">
                   <span>{{ selectedItem()!.review!.configName || ('inbox.reviewDetail.defaultAgent' | transloco) }}</span>
-                  <span>{{ 'inbox.reviewDetail.idPrefix' | transloco }} {{ selectedItem()!.review!.jobId.slice(0, 8) }}</span>
                   @if (frozenData()?.phase_number !== undefined) {
                     <span>{{ 'inbox.reviewDetail.phase' | transloco: {number: frozenData()?.phase_number} }}</span>
                   }
+                </div>
+                <div class="detail-ids">
+                  <app-copy-field [label]="'inbox.detail.jobId' | transloco" [value]="selectedItem()!.review!.jobId" />
                 </div>
               </div>
 
@@ -636,6 +696,11 @@ function relativeTime(iso: string, nowLabel: string): string {
               <h3 class="session-title">{{ selectedItem()!.title }}</h3>
               <div class="session-subtitle">{{ selectedItem()!.subtitle }}</div>
 
+              <div class="detail-ids">
+                <app-copy-field [label]="'inbox.detail.sessionId' | transloco" [value]="selectedItem()!.session!.threadId" />
+                <app-copy-field [label]="'inbox.detail.eventId' | transloco" [value]="selectedItem()!.session!.event.event_id" />
+              </div>
+
               @if (selectedItem()!.session!.event.tool) {
                 <div class="session-section">
                   <span class="meta-label">{{ 'inbox.sessionDetail.tool' | transloco }}</span>
@@ -736,7 +801,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       display: flex;
       flex-direction: column;
       height: 100%;
-      background: var(--app-bg, #1e1e2e);
+      background: var(--app-bg);
     }
 
     /* ===== HEADER ===== */
@@ -777,7 +842,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .chip-count {
       background: var(--accent-color, var(--accent-color));
-      color: var(--on-accent, var(--timeline-bg, #11111b));
+      color: var(--on-accent, var(--timeline-bg));
       font-size: 9px;
       font-weight: 700;
       padding: 0 5px;
@@ -798,7 +863,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       width: 7px;
       height: 7px;
       border-radius: 50%;
-      background: var(--text-muted, #6c7086);
+      background: var(--text-muted);
       transition: background 0.3s;
     }
     .sse-dot.connected { background: var(--success); }
@@ -846,7 +911,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       transition: background 0.1s;
       position: relative;
     }
-    .list-item:hover { background: rgba(49, 50, 68, 0.4); }
+    .list-item:hover { background: color-mix(in srgb, var(--surface-1) 40%, transparent); }
     .list-item.selected { background: var(--surface-0, var(--surface-0)); }
     .list-item.resolved { opacity: 0.55; }
 
@@ -866,7 +931,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       font-size: 18px;
       flex-shrink: 0;
       margin-top: 1px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
     .type-message { color: var(--info); }
     .type-sudo { color: var(--alert); }
@@ -909,14 +974,14 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .item-time {
       font-size: 10px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       flex-shrink: 0;
       font-variant-numeric: tabular-nums;
     }
 
     .item-subtitle {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -948,7 +1013,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .empty-text {
       font-size: 13px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .detail-empty {
@@ -967,12 +1032,12 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .detail-empty-text {
       font-size: 14px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .detail-empty-hint {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       opacity: 0.6;
     }
 
@@ -1022,7 +1087,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
     .session-detail .session-subtitle {
       font-size: 12px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-bottom: 16px;
     }
     .session-detail .session-section {
@@ -1047,6 +1112,13 @@ function relativeTime(iso: string, nowLabel: string): string {
       font-weight: 600;
       font-variant-numeric: tabular-nums;
       margin-left: auto;
+    }
+
+    .detail-ids {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 8px;
     }
 
     /* ===== SUDO DETAIL ===== */
@@ -1077,7 +1149,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
 
     .meta-label {
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       min-width: 40px;
       flex-shrink: 0;
     }
@@ -1115,7 +1187,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       gap: 6px;
       padding: 8px 12px;
       font-size: 12px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       cursor: pointer;
       list-style: none;
     }
@@ -1133,7 +1205,11 @@ function relativeTime(iso: string, nowLabel: string): string {
       border-bottom: 1px solid var(--border-color, var(--surface-0));
       align-items: center;
     }
-    .rule-form app-input { flex: 1; }
+    .rule-form app-input { flex: 1; min-width: 0; }
+    /* Bound the approve/deny <select>: its base-select field is width:100%, so without
+       a definite host width it takes the whole flex row and starves the pattern input
+       down to ~16px (reproduces at every viewport, not just mobile). */
+    .rule-form app-select { flex: 0 0 7.5rem; }
 
     .rule-row {
       display: flex;
@@ -1155,7 +1231,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .thread-meta {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .thread-body {
@@ -1176,7 +1252,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       align-items: center;
       justify-content: center;
       padding: 24px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       font-size: 12px;
     }
 
@@ -1219,7 +1295,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .msg-time {
       font-size: 10px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .msg-content {
@@ -1300,14 +1376,14 @@ function relativeTime(iso: string, nowLabel: string): string {
       display: flex;
       gap: 12px;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-top: 6px;
     }
 
     .review-loading {
       text-align: center;
       padding: 20px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       font-size: 12px;
     }
 
@@ -1322,7 +1398,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .review-summary {
@@ -1445,7 +1521,14 @@ function relativeTime(iso: string, nowLabel: string): string {
       .detail-panel { display: none; }
       .inbox-body.mobile-detail .list-panel { display: none; }
       .inbox-body.mobile-detail .detail-panel { display: block; }
-      .filter-chips { gap: 3px; }
+
+      /* Give the filter chips their own full-width row instead of a ~138px sliver
+         squeezed between the title and the SSE/refresh cluster (which hid 3 of the 5
+         filters behind a scrollbar-less swipe). Title + status stay on row 1; the
+         chips wrap to row 2 and scroll there with ~4 visible at rest. */
+      .inbox-header { flex-wrap: wrap; row-gap: 6px; }
+      .header-right { margin-left: auto; }
+      .filter-chips { gap: 3px; order: 3; flex-basis: 100%; }
     }
   `],
 })

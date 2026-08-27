@@ -9,28 +9,37 @@ langchain-openai>=1.1.12,<2.0  # 1.1.12 ships PR #35281 fix for langchain#34807 
 langchain-anthropic>=0.1.0
 langchain-google-genai>=1.0.0
 langchain-groq>=0.1.0
-langgraph>=0.0.20
+# Exact compatible trio: checkpoints are a cross-pod persisted wire format.
+# 4.1.1 also provides LANGGRAPH_STRICT_MSGPACK for CVE-2025-64439.
+langgraph==1.2.10
+langgraph-checkpoint==4.1.1
 langchain-core>=0.1.0
 langchain-text-splitters>=0.0.1  # For document chunking in document_tools
-langgraph-checkpoint-postgres>=1.0.0
+# Exact pin: checkpoint serialization is shared across rotating worker pods;
+# version drift here is persisted-data drift, not a pod-local implementation detail.
+langgraph-checkpoint-postgres==3.1.1
+mcp>=1.9,<2.0  # MCP client SDK (stdio/streamable-http/sse transports) — spec knowledge-base/knowledge/features/mcp_datasources.md
+langchain-mcp-adapters>=0.1.9,<0.2  # load_mcp_tools: MCP tool -> LangChain BaseTool
 langgraph-checkpoint-sqlite>=2.0.0  # SQLite checkpointer for LangGraph
 aiosqlite>=0.19.0  # Async SQLite driver for LangGraph checkpointing
 psycopg[binary]>=3.1.0
-psycopg2-binary>=2.9.0  # Required by citation engine
+# Direct dependency for the stateless worker driver's process-wide checkpoint pool.
+psycopg-pool==3.3.1
+psycopg2-binary>=2.9.0  # Required by the citation_engine package (Postgres mode)
 langchain-tavily>=0.1.0
-arxiv>=2.1.0
+# Client.results(search) contract; major upgrades require the installed-package
+# contract test in tests/tools/research/test_arxiv_client.py to be reviewed.
+arxiv>=2.1.0,<5.0.0
 aiohttp>=3.9.0
 aiohttp-socks>=0.8.0  # SOCKS5/HTTP proxy for aiohttp (research tools VPN)
-# Browser automation (requires: playwright install chromium)
-browser-use>=0.11.0
-playwright==1.59.0  # Pin source of truth: .playwright-version (also consumed by Packer + Dockerfile.workspace via CI build-args)
 openai>=1.10.0
 pydantic>=2.5.0
 tiktoken>=0.5.0
 streamlit>=1.30.0
 pdfplumber>=0.10.0
 pdf2image>=1.16.0  # PDF page rendering (requires poppler system package)
-Pillow>=10.0.0  # Image handling for document rendering
+Pillow>=10.4.0  # Image handling and Dynamic Canvas image validation
+python-magic>=0.4.27  # Dynamic Canvas MIME validation (host also needs libmagic)
 python-docx>=1.1.0
 docx2txt>=0.8  # Required by langchain Docx2txtLoader
 python-pptx>=0.6.21
@@ -49,6 +58,9 @@ langdetect>=1.0.9
 # picked up automatically. Tighten to `<0.136` if upstream confirms a real compromise.
 fastapi>=0.109.0,!=0.136.3
 uvicorn>=0.27.0
+# Direct, security-patched HTTP/1.1 parser/encoder for the Dynamic Canvas
+# request-scoped SSH proxy transport (also used transitively by Uvicorn).
+h11>=0.16.0
 httpx>=0.26.0
 # Retry primitives for the main-cloud backend layer (transitive via
 # langchain-core today; listed explicitly so cloud/retry.py keeps working
@@ -61,18 +73,19 @@ python-multipart>=0.0.6
 # Optional: MongoDB for LLM request archiving
 pymongo>=4.6.0
 webdavclient3>=3.14.0
+# IMAP client for the email datasource tools (src/tools/email/); SMTP send
+# uses stdlib smtplib. Zero-dependency, Apache-2.0.
+imap-tools>=1.13.0
 # System metrics for agent heartbeats
 psutil>=5.9.0
 # Optional: Claude Code delegation tool (requires Claude Code CLI)
 claude-agent-sdk>=0.1.35
-# Persistent shell sessions (requires tmux system package)
-# Fedora: sudo dnf install tmux
-# Debian/Ubuntu: sudo apt-get install tmux
-libtmux>=0.50.0
 # Template rendering for instruction files (conditional tool references)
 Jinja2>=3.1
 # Remote workspace backend (SSH/SFTP to VM)
 paramiko>=3.4.0
+# Host-key-pinned, bounded SFTP reads for Dynamic Canvas workspace files.
+asyncssh>=2.21.0
 # AES-GCM encryption at rest for stored credentials (user/system API keys,
 # custom LLM endpoint keys). Already a transitive dep via paramiko; listed
 # explicitly so crypto.py keeps working if that changes.
@@ -83,5 +96,8 @@ nats-py>=2.9.0
 # (services/cron_dispatcher.py). Pairs with zoneinfo (stdlib) for
 # DST-aware next-fire-time computation against IANA-named timezones.
 croniter>=2.0.0
-# Citation engine (separate repo):
-citation-engine[full] @ git+https://github.com/Knaeckebrothero/CitationEngine.git
+# Runtime deps of the citation_engine package (src/citation_engine/).
+# Its other deps (beautifulsoup4, langchain-openai/-core, langgraph, tiktoken,
+# httpx, psycopg2-binary, docx2txt, pydantic) are already pinned above.
+pymupdf>=1.23.0
+requests>=2.31.0

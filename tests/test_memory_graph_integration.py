@@ -4,7 +4,7 @@ Tests that the auxiliary LLM memory extraction and recall_store are
 correctly wired into the graph nodes and agent initialization logic.
 
 Migration note: Memory extraction was migrated from MemoryObserver to
-AuxiliaryLLM.chain(ExtractMemoriesTask). See docs/features/auxiliary.md.
+AuxiliaryLLM.chain(ExtractMemoriesTask). See knowledge-base/knowledge/features/auxiliary.md.
 """
 
 from unittest.mock import AsyncMock, MagicMock

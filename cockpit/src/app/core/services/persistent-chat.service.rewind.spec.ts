@@ -1,0 +1,323 @@
+/**
+ * Task 8 — cockpit service surface for session rewind
+ * (knowledge-base/knowledge/features/session_rewind.md).
+ *
+ * rewind()/summarizeUpTo() only touch _sendControl, so this harness skips the
+ * EventSource/WebSocket constructor mocks and connect() flow that
+ * persistent-chat.service.spec.ts / .outbox.spec.ts need: it builds the
+ * service through the same TestBed provider set, then assigns `controlWs`
+ * directly the way "PersistentChatService — control frame delivery across a
+ * reconnect" does in the main spec, and asserts on the mock socket's `send`
+ * calls.
+ */
+import {describe, expect, it, vi} from 'vitest';
+import {signal} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
+import {HttpClient} from '@angular/common/http';
+import {of} from 'rxjs';
+import {TranslocoService} from '@jsverse/transloco';
+import {PersistentChatService} from './persistent-chat.service';
+import {ApiService} from './api.service';
+import {CapabilitiesService} from './capabilities.service';
+import {IndexedDbService} from './indexed-db.service';
+import {NotificationService} from './notification.service';
+import {AppToastService} from '../../ui/toast';
+
+function createService() {
+    const mockHttp: any = {
+        get: vi.fn().mockReturnValue(of({status: 'active', total_turns: 0, messages: [], total: 0})),
+        post: vi.fn().mockReturnValue(of({})),
+        patch: vi.fn().mockReturnValue(of({status: 'updated'})),
+        delete: vi.fn().mockReturnValue(of({})),
+    };
+    const mockApi: any = {
+        uploadOneToThread: vi.fn().mockReturnValue(of({kind: 'done', files: []})),
+        deleteThreadUpload: vi.fn().mockReturnValue(of(undefined)),
+        humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
+    };
+    const mockCache: any = {
+        getThreadCursor: vi.fn().mockResolvedValue(null),
+        setThreadCursor: vi.fn().mockResolvedValue(undefined),
+        deleteThreadCursor: vi.fn().mockResolvedValue(undefined),
+        getThreadMessages: vi.fn().mockResolvedValue([]),
+        getNewestCachedCreatedAt: vi.fn().mockResolvedValue(null),
+        upsertThreadMessages: vi.fn().mockResolvedValue(undefined),
+        clearThreadMessages: vi.fn().mockResolvedValue(undefined),
+    };
+    const mockToast: any = {
+        show: vi.fn(),
+        info: vi.fn(),
+        success: vi.fn(),
+        warning: vi.fn(),
+        danger: vi.fn(),
+        dismiss: vi.fn(),
+        dismissAll: vi.fn(),
+    };
+    const mockNotifications: any = {
+        lifecycleEvent: signal<{thread_id: string; state: string; reason?: string} | null>(null),
+        cloudDiffStagedEvent: signal(null),
+    };
+
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+        providers: [
+            {provide: HttpClient, useValue: mockHttp},
+            {provide: ApiService, useValue: mockApi},
+            {
+                provide: CapabilitiesService,
+                useValue: {
+                    datasourceScopeAutoAttachAvailable: () => true,
+                    datasourceScopeAutoAttachAvailability$: of(true),
+                },
+            },
+            {provide: IndexedDbService, useValue: mockCache},
+            {provide: AppToastService, useValue: mockToast},
+            {provide: NotificationService, useValue: mockNotifications},
+            {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+            PersistentChatService,
+        ],
+    });
+    const service = TestBed.inject(PersistentChatService);
+    return {service, mockHttp, mockCache};
+}
+
+/** A control WebSocket that is already OPEN — _sendControl writes straight
+ *  through it instead of queueing on controlOutbox. */
+function createMockWs() {
+    return {
+        readyState: WebSocket.OPEN,
+        send: vi.fn(),
+        close: vi.fn(),
+        onopen: null,
+        onmessage: null,
+        onclose: null,
+        onerror: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+    } as any;
+}
+
+function framesOn(ws: any): Record<string, unknown>[] {
+    return ws.send.mock.calls.map((c: any) => JSON.parse(c[0]));
+}
+
+describe('PersistentChatService rewind', () => {
+    it('sends a flat rewind frame with a request_id and flags in-flight', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        const requestId = service.rewind('row-1', 'conversation');
+
+        const frame = framesOn(live)[0];
+        expect(frame.method).toBe('rewind');
+        expect(frame.message_id).toBe('row-1');
+        expect(frame.mode).toBe('conversation');
+        expect(frame.request_id).toBe(requestId);
+        expect(frame.params).toBeUndefined();
+        expect(service.rewindInFlight()).toBe(true);
+    });
+
+    it('summarizeUpTo rides the compact verb with a boundary', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.summarizeUpTo('row-2');
+
+        const frame = framesOn(live)[0];
+        expect(frame.method).toBe('compact');
+        expect(frame.boundary_message_id).toBe('row-2');
+    });
+});
+
+/**
+ * Fix 6 (final review): rewind must never ride _sendControl's
+ * queue-and-replay fallback. Other control verbs are fine to queue while the
+ * socket reconnects, but a queued rewind could fire against a session the
+ * user resumed much later for an unrelated reason — destructive verbs must
+ * be sent now or refused, never deferred.
+ */
+describe('PersistentChatService — rewind refuses to queue when the control WS is down', () => {
+    it('controlWs = null: no frame queued on controlOutbox, flag stays false, error is set', () => {
+        const {service} = createService();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = null;
+
+        const requestId = service.rewind('row-1', 'conversation');
+
+        expect(requestId).toBeTruthy();
+        expect((service as any).controlOutbox).toEqual([]);
+        expect(service.rewindInFlight()).toBe(false);
+        expect(service.error()).toBe(
+            'Session connection is down — reconnect before rewinding',
+        );
+    });
+
+    it('controlWs present but not OPEN (e.g. CONNECTING): same refusal, no queueing', () => {
+        const {service} = createService();
+        service.threadId.set('thread-rw');
+        const connecting = createMockWs();
+        connecting.readyState = WebSocket.CONNECTING;
+        (service as any).controlWs = connecting;
+
+        service.rewind('row-1', 'both');
+
+        expect(connecting.send).not.toHaveBeenCalled();
+        expect((service as any).controlOutbox).toEqual([]);
+        expect(service.rewindInFlight()).toBe(false);
+        expect(service.error()).toBe(
+            'Session connection is down — reconnect before rewinding',
+        );
+    });
+
+    it('does not arm the ack-fallback timer on refusal (nothing to disarm later)', async () => {
+        vi.useFakeTimers();
+        try {
+            const {service} = createService();
+            service.threadId.set('thread-rw');
+            (service as any).controlWs = null;
+
+            service.rewind('row-1', 'conversation');
+
+            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            await vi.advanceTimersByTimeAsync(90_001);
+            expect(warnSpy).not.toHaveBeenCalled();
+            warnSpy.mockRestore();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('a normal open-socket rewind is unaffected: still sends and flags in-flight', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.rewind('row-1', 'conversation');
+
+        expect(live.send).toHaveBeenCalledTimes(1);
+        expect(service.rewindInFlight()).toBe(true);
+        expect(service.error()).toBeNull();
+    });
+});
+
+/**
+ * Fix round 1 (review finding): rewindInFlight used to be set only in
+ * rewind() and cleared only by rewind.ack / rewind.files_restored / a
+ * blanket 'error' — but the ack is WS-direct to the originating socket
+ * only, so a drop/reconnect between send and ack lost it forever, and an
+ * unrelated in-flight error (e.g. a concurrent config.update denial) could
+ * clear it prematurely. Mirrors the file's own interrupt()/
+ * _armInterruptFallback/_clearInterruptFallback self-healing pattern; see
+ * "PersistentChatService — interrupt self-healing" in the main spec for the
+ * precedent this borrows its style from.
+ */
+describe('PersistentChatService — rewind self-healing', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('force-clears rewindInFlight if rewind.ack never arrives (lost/dropped frame)', async () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.rewind('row-1', 'conversation');
+        expect(service.rewindInFlight()).toBe(true);
+
+        // No rewind.ack / rewind.files_restored / matching error arrives —
+        // the fallback fires at REWIND_ACK_TIMEOUT_MS (90s) and un-wedges
+        // the UI rather than leaving "Rewinding…" stuck forever.
+        await vi.advanceTimersByTimeAsync(90_001);
+
+        expect(service.rewindInFlight()).toBe(false);
+    });
+
+    it('does not fire the fallback once rewind.ack has already cleared it', async () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        const requestId = service.rewind('row-1', 'conversation');
+        (service as any)._handleEvent({
+            method: 'rewind.ack',
+            params: {request_id: requestId, message_id: 'row-1', mode: 'conversation'},
+        });
+        expect(service.rewindInFlight()).toBe(false);
+
+        // The ack disarmed the timer — advancing past the deadline must not
+        // resurrect rewindInFlight or throw from a stale callback.
+        await vi.advanceTimersByTimeAsync(90_001);
+        expect(service.rewindInFlight()).toBe(false);
+    });
+
+    it('error only clears rewindInFlight for the matching request_id', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        const requestId = service.rewind('row-1', 'conversation');
+        expect(service.rewindInFlight()).toBe(true);
+
+        // An unrelated in-flight request's error (e.g. a concurrent
+        // config.update denial) must not prematurely re-enable the UI.
+        (service as any)._handleEvent({
+            method: 'error',
+            params: {message: 'denied', request_id: 'unrelated-request'},
+        });
+        expect(service.rewindInFlight()).toBe(true);
+
+        (service as any)._handleEvent({
+            method: 'error',
+            params: {message: 'rewind failed', request_id: requestId},
+        });
+        expect(service.rewindInFlight()).toBe(false);
+    });
+
+    it('an error with no request_id at all leaves rewindInFlight untouched', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.rewind('row-1', 'conversation');
+        (service as any)._handleEvent({method: 'error', params: {message: 'boom'}});
+
+        expect(service.rewindInFlight()).toBe(true);
+    });
+
+    it('disconnect() resets rewindInFlight/rewindPrefill left over from a mid-flight rewind', async () => {
+        // The scenario the Important finding described: a WS drop/reconnect
+        // between send and ack. disconnect() must not leave the flag wedged.
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.rewind('row-1', 'conversation');
+        expect(service.rewindInFlight()).toBe(true);
+
+        service.disconnect();
+
+        expect(service.rewindInFlight()).toBe(false);
+        expect(service.rewindPrefill()).toBeNull();
+
+        // The armed fallback timer was disarmed too — advancing past its
+        // deadline must not warn or touch state again.
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        await vi.advanceTimersByTimeAsync(90_001);
+        expect(warnSpy).not.toHaveBeenCalled();
+        warnSpy.mockRestore();
+    });
+});

@@ -1,6 +1,6 @@
 # Customer deployment example: bring-your-own everything
 # - External Azure AD (or Google Workspace, Okta, etc.) for OIDC
-# - External managed PostgreSQL, MongoDB, Neo4j
+# - External managed PostgreSQL, Neo4j
 # - External git server (e.g., GitHub Enterprise, customer's own Gitea)
 # - No headscale, no admin UIs
 # - Customer manages secrets themselves
@@ -32,20 +32,23 @@ gitea:
   internalUrl: "https://gitea.customer-internal.local"
   externalUrl: "https://gitea.customer-internal.local"
 
-# External databases
+# External databases — postgres/vector take host/port/db PARTS, not a bundled
+# URL: credentials (POSTGRES_USER/POSTGRES_PASSWORD, VECTOR_POSTGRES_*) come
+# from the existingSecret above, and the chart composes the DSN at runtime (see
+# databases.postgres in values.yaml for the rationale).
 databases:
   postgres:
     enabled: true
     internal: false
-    externalUrl: "postgres://app:pw@managed-pg.customer.local:5432/srw"
+    externalHost: "managed-pg.customer.local"
+    externalPort: 5432
+    externalDb: "srw"
   vector:
     enabled: true
     internal: false
-    externalUrl: "postgresql://app:pw@managed-pg.customer.local:5432/srw_vector"
-  mongodb:
-    enabled: true
-    internal: false
-    externalUrl: "mongodb://managed-mongo.customer.local:27017/srw_logs"
+    externalHost: "managed-pg.customer.local"
+    externalPort: 5432
+    externalDb: "srw_vector"
   neo4j:
     enabled: false
 
@@ -70,8 +73,6 @@ s3:
 headscale:
   enabled: false
 pgadmin:
-  enabled: false
-mongoExpress:
   enabled: false
 dozzle:
   enabled: false

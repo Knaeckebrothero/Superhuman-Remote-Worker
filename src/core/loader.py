@@ -4,21 +4,32 @@ Handles loading agent configuration from YAML files and dynamically
 loading the appropriate tools based on configuration.
 """
 
+import copy
+import functools
 import logging
 import os
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, fields as dataclass_fields
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import yaml
 from langchain_core.language_models import BaseChatModel
 
 from src.core.model_registry import family_of
+from src.core.tool_policy import (
+    assert_tool_policy_canonical,
+    normalize_tool_policy,
+)
 from src.llm.reasoning_chat import ReasoningChatOpenAI
 
 logger = logging.getLogger(__name__)
 
 VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
+# Image-quality tiers the agent may receive; resolved to a per-family max edge
+# at the image seam. Kept in sync with src/services/image_downscale.py.
+VALID_IMAGE_QUALITY_TIERS = {"economy", "standard", "high"}
 
 
 # =============================================================================
@@ -26,16 +37,34 @@ VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
 # =============================================================================
 # The context-management `limits` leaves are DERIVED as fixed fractions of a
 # single base context-window number (see _apply_settings_matrix). The base is
-# the admin/catalog per-model window when set (injected at dispatch into
-# llm.model_max_context_tokens), else the family's conservative
-# limits.model_max_context_tokens. Fractions are uniform across families:
-# threshold leaves headroom below the window so the summarizer/response have
-# room to work. Keep these in sync with the hardcoded LimitsConfig /
-# ContextConfig fallback defaults (which are a base=100_000 instance of these).
+# the per-model window when set (Admin → Models `context_window`, injected at
+# dispatch into llm.model_max_context_tokens), else the family's
+# settings.model_max_context_tokens — the model's true max. There is no separate
+# conservative working-window cap; restrict a model by giving it a smaller
+# per-model `context_window`. Fractions are uniform across families: the
+# threshold leaves headroom below the window so the response has room to work.
+# Keep these in sync with the hardcoded LimitsConfig / ContextConfig fallback
+# defaults (which are a base=100_000 instance of these).
+#
+# Deliberately ABSENT: summarization budgets. They were derived here from the
+# MAIN model's window until 2026-06-12, which sent 951k-token payloads to a
+# 131k auxiliary summarizer. They are now computed at call time from the aux
+# model's own window — src/core/summarizer.py,
+# knowledge-base/knowledge/features/context_summarization_rework.md.
 CONTEXT_THRESHOLD_FRACTION = 0.80
-SUMMARIZATION_SAFE_FRACTION = 0.90
-SUMMARIZATION_CHUNK_FRACTION = 0.60
-MESSAGE_COUNT_MIN_FRACTION = 0.40
+# Pinned EQUAL to the threshold fraction on purpose (was 0.40 until 2026-08-11).
+# It floors the alternate message-count summarization trigger
+# (ContextManager.should_summarize), which ORs "many messages" with "at least
+# this many tokens". At 0.40 that branch fired at 40% of the window, so any
+# session past `message_count_threshold` compacted on a lossy summary with 60%
+# of its window still free — a 400k model compacted at 162k. Pinning it to the
+# token gate makes the branch a strict subset of that gate, so it can never be
+# the binding constraint. The trigger it was written for (2026-01-16: hundreds
+# of TINY messages, when windows were 100k) is now covered by provider-anchored
+# token accounting. An operator can still opt back in by setting
+# `limits.message_count_min_tokens` explicitly in config — the derivation only
+# fills leaves the matrix owns.
+MESSAGE_COUNT_MIN_FRACTION = 0.80
 
 
 # =============================================================================
@@ -188,7 +217,7 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
         # {"llm": {"model": "gpt-oss", "temp": 0.0}, "tools": ["c"]}
         ```
     """
-    result = base.copy()
+    result = copy.deepcopy(base)
 
     for key, value in override.items():
         if value is None:
@@ -236,13 +265,20 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
 
     Example:
         ```python
-        # config/my_agent.yaml with $extends: defaults
+        # config/my_agent.yaml with $extends: worker_base
         data = load_and_merge_config("config/my_agent.yaml")
-        # Returns merged defaults + agent overrides
+        # Returns merged worker base + agent overrides
         ```
     """
+    config_path = canonical_config_name(config_path)
     with open(config_path, "r", encoding="utf-8") as f:
         config_data = yaml.safe_load(f)
+
+    # Normalisation seam 1 of 6: every bundled YAML and every link of the
+    # $extends chain. Runs BEFORE the merge because expansion is layer-local —
+    # each layer resolves to list[str] on its own, and deep_merge's "lists
+    # replace, dicts merge" then carries the layer model unmodified.
+    config_data = normalize_tool_policy(config_data)
 
     # Handle $extends inheritance
     if "$extends" in config_data:
@@ -314,7 +350,13 @@ def _load_model_config_matrix_file(path: Path) -> Dict[str, Dict[str, Any]]:
                 continue
             normalized: Dict[str, Any] = {}
             for section, payload in family_block.items():
-                if section in ("prompts", "instructions", "settings", "guardrails"):
+                if section in (
+                    "prompts",
+                    "instructions",
+                    "settings",
+                    "guardrails",
+                    "reasoning",
+                ):
                     if isinstance(payload, dict):
                         normalized[section] = payload
                     else:
@@ -522,6 +564,165 @@ def resolve_model_settings(
     return settings
 
 
+# Inference params that are family-bound and must be resolved per phase model
+# (NOT inherited from the base/primary slot). multimodal is handled separately
+# because it is reconciled to the AND across phases, not taken per-family.
+_PHASE_PARAM_KEYS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "parallel_tool_calls",
+    "extra_body",
+)
+
+
+def resolve_phase_model_budget(
+    *,
+    base_model: str,
+    strategic_override: Optional["PhaseLLMOverride"],
+    tactical_override: Optional["PhaseLLMOverride"],
+    summarization_override: Optional["PhaseLLMOverride"] = None,
+    deployment_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve the shared context budget + per-phase inference params for a
+    two-model (strategic/tactical) worker job.
+
+    Worker jobs run a strategic and a tactical model over ONE shared message
+    history, but historically derived both the global context budget AND the
+    sampling params from the base ``llm.model`` slot (gemma by default) — see
+    knowledge-history/done/context_budget_uses_base_model_not_phase_models.md. This is the
+    pure resolver that replaces that: each phase's params/window/multimodal come
+    from its OWN family (never the base), and the shared budget is the ``min`` of
+    the two phase windows (forced by the single shared history — the smaller
+    model must be able to ingest whatever is there).
+
+    The "effective model" of a phase is ``override.model`` when the phase pins
+    one, else ``base_model`` (a phase with no override genuinely runs the base
+    model, so its window/capability legitimately constrains the shared history).
+
+    Args:
+        base_model: the base ``llm.model`` (used for any phase without a model pin).
+        strategic_override/tactical_override/summarization_override: the phase
+            override objects from ``self.config.llm.{strategic,tactical,summarization}``
+            (``None`` when that phase has no override). Used to detect
+            explicitly-pinned params (which win over the family default) and any
+            dispatch-injected per-model window (``model_max_context_tokens``).
+        deployment_dir: expert dir for per-expert matrix override.
+
+    Returns:
+        ``{
+            "min_window": Optional[int],          # min over strategic+tactical windows
+            "params": {phase: {temperature, top_p, top_k, parallel_tool_calls}},
+                                                   # only for phases WITH an override
+            "windows": {phase: Optional[int]},     # each overridden phase's OWN window
+            "effective_multimodal": bool,          # AND across strategic+tactical
+            "warnings": [(level, message)],        # level in {"warning","info"}
+        }``
+    """
+    _cache: Dict[str, Dict[str, Any]] = {}
+
+    def _family(model: str) -> Dict[str, Any]:
+        if model not in _cache:
+            _cache[model] = resolve_model_settings(model, deployment_dir)
+        return _cache[model]
+
+    def _eff_model(ov: "Optional[PhaseLLMOverride]") -> str:
+        return ov.model if (ov is not None and ov.model) else base_model
+
+    def _window(ov: "Optional[PhaseLLMOverride]") -> Optional[int]:
+        # Dispatch-injected per-model catalog window wins; else the family's
+        # true max. NEVER fall back to the base/limits window here (that is the
+        # bug this resolver fixes).
+        catalog = ov.model_max_context_tokens if ov is not None else None
+        return catalog or _family(_eff_model(ov)).get("model_max_context_tokens")
+
+    def _multimodal(ov: "Optional[PhaseLLMOverride]") -> bool:
+        pinned = ov.multimodal if ov is not None else None
+        if pinned is not None:
+            return bool(pinned)
+        return bool(_family(_eff_model(ov)).get("multimodal", False))
+
+    # --- shared-history budget: min over strategic + tactical ONLY -----------
+    # (summarization sends to the aux/summarizer path, not the shared phase
+    # history, so its window must not cap the main budget.)
+    strat_win = _window(strategic_override)
+    tact_win = _window(tactical_override)
+    windows = [w for w in (strat_win, tact_win) if w]
+    min_window = min(windows) if windows else None
+
+    # --- effective multimodal: AND across strategic + tactical ---------------
+    strat_mm = _multimodal(strategic_override)
+    tact_mm = _multimodal(tactical_override)
+    effective_multimodal = strat_mm and tact_mm
+
+    # --- per-phase inference params + own window (explicit pin wins) ---------
+    # Only phases WITH an override get a (distinct) resolved config we can safely
+    # mutate; a phase with no override genuinely runs the base model and keeps
+    # the base params/window. Each overridden phase's own window must be set on
+    # its client config so the HTTP-layer 413 preflight (``config.model_max_…
+    # or limits``) uses the model's TRUE window, not the inherited base one.
+    params: Dict[str, Dict[str, Any]] = {}
+    windows: Dict[str, Optional[int]] = {}
+    for name, ov in (
+        ("strategic", strategic_override),
+        ("tactical", tactical_override),
+        ("summarization", summarization_override),
+    ):
+        if ov is None:
+            continue  # phase uses the base model + base params; leave untouched
+        fam = _family(_eff_model(ov))
+        params[name] = {
+            k: (getattr(ov, k) if getattr(ov, k) is not None else fam.get(k))
+            for k in _PHASE_PARAM_KEYS
+        }
+        windows[name] = ov.model_max_context_tokens or fam.get(
+            "model_max_context_tokens"
+        )
+
+    # --- warnings ------------------------------------------------------------
+    warnings: List[tuple] = []
+    strat_model, tact_model = (
+        _eff_model(strategic_override),
+        _eff_model(tactical_override),
+    )
+    if strat_win and tact_win and strat_win != tact_win:
+        lo, hi = min(strat_win, tact_win), max(strat_win, tact_win)
+        warnings.append(
+            (
+                "warning" if hi > 2 * lo else "info",
+                f"Phase models have different context windows: "
+                f"strategic={strat_model}({strat_win}), tactical={tact_model}({tact_win}); "
+                f"shared history capped to min={lo}.",
+            )
+        )
+    if family_of(strat_model) != family_of(tact_model):
+        warnings.append(
+            (
+                "info",
+                f"Phase models are different families "
+                f"({family_of(strat_model)} vs {family_of(tact_model)}); "
+                f"each phase uses its own inference params.",
+            )
+        )
+    if strat_mm != tact_mm:
+        warnings.append(
+            (
+                "warning",
+                f"Phase models differ in multimodal capability "
+                f"(strategic={strat_mm}, tactical={tact_mm}); image input disabled "
+                f"for all phases (effective={effective_multimodal}).",
+            )
+        )
+
+    return {
+        "min_window": min_window,
+        "params": params,
+        "windows": windows,
+        "effective_multimodal": effective_multimodal,
+        "warnings": warnings,
+    }
+
+
 def bundled_settings_for_family(family: str, name: str) -> Any:
     """File-resolved settings leaf for <family> (default ⊕ family), ignoring DB
     overrides. ``name`` may be a dotted path into limits (e.g.
@@ -581,40 +782,56 @@ def _apply_settings_matrix(
 
     applied = []
 
-    # Apply flat keys -> data["llm"] (skip "limits" — it's not an LLM param)
+    # Apply flat keys -> data["llm"] (skip any "limits" — never an LLM param)
     for key, value in settings.items():
         if key == "limits":
+            continue
+        if key == "image_tokens":
+            # Per-family image-token estimator config -> limits, not llm:
+            # _parse_llm_config's closed constructor silently drops unknown
+            # keys. See knowledge-history/done/context_token_accounting.md S4.
+            data.setdefault("limits", {})["image_tokens"] = value
+            mode = value.get("mode") if isinstance(value, dict) else value
+            applied.append(f"limits.image_tokens(mode={mode})")
+            continue
+        if key == "pdf_render_dpi":
+            # Per-family page-render DPI -> limits (same closed-constructor
+            # reason as image_tokens). Consumed by the tool layer
+            # (_get_visual_content via ToolContext), not the LLM/ContextManager.
+            data.setdefault("limits", {})["pdf_render_dpi"] = value
+            applied.append(f"limits.pdf_render_dpi={value}")
+            continue
+        if key == "shell_mode":
+            # Per-family DEFAULT agent shell mode -> data["shell"]["mode"] (NOT
+            # llm). Presence-detection is the "human wins" guard: this matrix
+            # runs AFTER every human config layer merges, so only fill when no
+            # human set shell.mode. The stateless floor is the read-sites'
+            # .get("mode", "stateless") (shell_tools.py / loader.get_all_tool_names),
+            # so non-capable families simply omit shell_mode and fall through.
+            if data.get("shell", {}).get("mode") is None:
+                data.setdefault("shell", {})["mode"] = value
+                applied.append(f"shell.mode={value}")
             continue
         if key not in expert_llm_keys:
             data.setdefault("llm", {})[key] = value
             applied.append(f"llm.{key}={value}")
 
-    # Apply limits -> data["limits"] (matrix is sole source of truth)
-    limits_settings = settings.get("limits")
-    if isinstance(limits_settings, dict):
-        for key, value in limits_settings.items():
-            data.setdefault("limits", {})[key] = value
-            applied.append(f"limits.{key}={value}")
-
-    # Derive the working-window limit leaves from a single base context window.
-    # Base = the admin/catalog per-model window when explicitly overridden (it
-    # rides in llm.model_max_context_tokens and survived the flat-key loop above
-    # because it's in expert_llm_keys), else the family's conservative
-    # limits.model_max_context_tokens just applied. Invariant: no base config or
-    # expert YAML sets llm.model_max_context_tokens (see config/defaults.yaml),
-    # so its presence in expert_llm_keys means an explicit per-model override.
-    # Runs last so it is the sole authority for the derived leaves.
-    base = None
-    if "model_max_context_tokens" in expert_llm_keys:
-        base = (data.get("llm") or {}).get("model_max_context_tokens")
-    if not base:  # not overridden, or overridden with a falsy value (0/None)
-        base = (data.get("limits") or {}).get("model_max_context_tokens")
+    # Derive the context-management `limits` leaves from a single base window:
+    #   - the per-model window (Admin → Models `context_window`) when set — it is
+    #     injected at dispatch into llm.model_max_context_tokens and survives the
+    #     flat-key loop above because it's in expert_llm_keys;
+    #   - otherwise the family's settings.model_max_context_tokens (the model's
+    #     true max), which the flat-key loop just wrote into llm.
+    # There is no separate conservative working-window cap — a model runs at its
+    # full declared window unless an admin restricts it with a smaller per-model
+    # `context_window`. Runs last so it is the sole authority for the leaves.
+    base = (data.get("llm") or {}).get("model_max_context_tokens")
+    if not base:  # falsy per-model override (0/None) -> fall back to family max
+        base = settings.get("model_max_context_tokens")
     if base and base > 0:
         lim = data.setdefault("limits", {})
         lim["model_max_context_tokens"] = int(base)
         lim["context_threshold_tokens"] = int(base * CONTEXT_THRESHOLD_FRACTION)
-        lim["summarization_safe_limit"] = int(base * SUMMARIZATION_SAFE_FRACTION)
-        lim["summarization_chunk_size"] = int(base * SUMMARIZATION_CHUNK_FRACTION)
         lim["message_count_min_tokens"] = int(base * MESSAGE_COUNT_MIN_FRACTION)
         applied.append(f"limits<-derived(base={int(base)})")
 
@@ -743,15 +960,46 @@ class FileResolver:
 PromptResolver = FileResolver
 
 
+def _has_shell_tools(tool_set: Set[str]) -> bool:
+    """Whether a real shell-execution tool is actually bound for this agent.
+
+    Derived from ``TOOL_REGISTRY``'s ``category`` rather than a hardcoded name
+    list: the shell tools are mid-rename (one job toolset shared by
+    sessions/MCP/officers, no aliases), and a stale name list here would
+    silently re-open the prompt blocks this gates — the exact failure mode the
+    gate exists to prevent.
+
+    ``grant: "code"`` members of the category are excluded. Those are appended
+    by the agent *after* ``filter_tools_by_backend``, so they are bound on
+    shell-less tiers too — ``srw_cloud_status`` rides in on any active cloud
+    mount. It reports on a mount rather than executing anything, and counting it
+    as proof of a shell would re-open these blocks on precisely the lite-tier
+    sessions they exist to protect.
+    """
+    from src.tools.registry import TOOL_REGISTRY
+
+    for name in tool_set:
+        meta = TOOL_REGISTRY.get(name)
+        if not meta or meta.get("category") != "shell":
+            continue
+        if meta.get("grant") == "code":
+            continue
+        return True
+    return False
+
+
 def render_instruction_content(
     content: str,
     tool_names: List[str],
     cli_datasources: Optional[List[str]] = None,
+    protected_cloud: bool = False,
 ) -> str:
     """Render Jinja2 template markers in instruction file content.
 
     Supports ``{% if has_tool("kb_write") %}`` conditionals,
-    ``{% if cli_datasources %}`` for read-write datasource access, and
+    ``{% if has_shell %}`` for blocks that only make sense with a shell,
+    ``{% if cli_datasources %}`` for read-write datasource access,
+    ``{% if protected_cloud %}`` for the protected-cloud honesty block, and
     ``{{ tools }}`` variable access.  Non-templated content (no ``{%``
     or ``{{`` markers) passes through unchanged with zero overhead.
 
@@ -762,6 +1010,12 @@ def render_instruction_content(
             (e.g. ``["postgresql", "neo4j"]``).  Enables
             ``{% if cli_datasources %}`` and ``has_cli_datasource("postgresql")``
             conditionals in templates.
+        protected_cloud: Whether the session's cloud folder is in F-C1
+            protected mode (writes staged for review, never live-saved).
+            Enables the ``{% if protected_cloud %}`` honesty block that
+            instructs the agent to describe cloud writes as "staged", never
+            "saved"/"uploaded"/"shared". Defaults to False so a non-protected
+            session never sees the block.
 
     Returns:
         Rendered content with conditionals resolved.
@@ -778,8 +1032,10 @@ def render_instruction_content(
     return template.render(
         tools=tool_names,
         has_tool=lambda name: name in tool_set,
+        has_shell=_has_shell_tools(tool_set),
         cli_datasources=list(ds_set),
         has_cli_datasource=lambda ds_type: ds_type in ds_set,
+        protected_cloud=protected_cloud,
     )
 
 
@@ -881,8 +1137,45 @@ class MatrixResolver:
         # Final fallback: hardcoded defaults
         return self.HARDCODED_DEFAULTS.get(entry_type, f"{entry_type}.txt")
 
+    def _resolve_path(self, entry_type: str) -> Path:
+        """Locate the file for ``entry_type`` with **location-primary** precedence.
+
+        An expert (deployment-dir) file always outranks a framework file; within
+        each directory the family-specific name is tried before the base name.
+        Candidate order::
+
+            deployment/<family>  ->  deployment/<base>
+            ->  framework/<family>  ->  framework/<base>
+
+        This is deliberately NOT delegated to ``FileResolver.resolve()`` per
+        name: that helper is name-primary (deployment-then-framework for ONE
+        name), so a framework ``persona_gemma.txt`` would still shadow an
+        expert's own ``persona.txt``. Location must be the outer loop.
+        """
+        family_name = self.resolve_filename(entry_type)
+        base_name = self.HARDCODED_DEFAULTS.get(entry_type, f"{entry_type}.txt")
+        names = [family_name] if family_name == base_name else [family_name, base_name]
+        fr = self._file_resolver
+        for directory in (fr.deployment_dir, fr.framework_dir):
+            if directory is None:
+                continue
+            for name in names:
+                candidate = directory / name
+                if candidate.exists():
+                    logger.debug(
+                        "MatrixResolver(%s) resolved %r -> %s",
+                        self.MATRIX_SUBSECTION,
+                        entry_type,
+                        candidate,
+                    )
+                    return candidate
+        searched = [str(d) for d in (fr.deployment_dir, fr.framework_dir) if d]
+        raise FileNotFoundError(
+            f"Template not found for '{entry_type}' (tried {names} in {searched})"
+        )
+
     def load(self, entry_type: str, *, bundled_only: bool = False) -> str:
-        """Resolve filename and load the content.
+        """Resolve the file (location-primary) and load its content.
 
         When DB-backed config overrides are enabled, an override for
         ``(MATRIX_SUBSECTION, model_family, entry_type)`` is returned before any
@@ -901,13 +1194,15 @@ class MatrixResolver:
             override = _db_lookup(self.MATRIX_SUBSECTION, self.model_family, entry_type)
             if override is not None:
                 return override
-        filename = self.resolve_filename(entry_type)
-        return self._file_resolver.load(filename)
+        return self._resolve_path(entry_type).read_text(encoding="utf-8")
 
     def exists(self, entry_type: str) -> bool:
-        """Check if a type can be resolved and the file exists."""
-        filename = self.resolve_filename(entry_type)
-        return self._file_resolver.exists(filename)
+        """Check if a type resolves to an existing file (location-primary)."""
+        try:
+            self._resolve_path(entry_type)
+            return True
+        except FileNotFoundError:
+            return False
 
 
 class PromptMatrixResolver(MatrixResolver):
@@ -927,6 +1222,9 @@ class PromptMatrixResolver(MatrixResolver):
         "summarization": "summarization_prompt.txt",
         "memory_extraction": "memory_extraction_prompt.txt",
         "curation": "curation_prompt.txt",
+        "knowledge_assembler": "knowledge_assembler_prompt.txt",
+        "knowledge_verdict": "knowledge_verdict_prompt.txt",
+        "citation_verification": "citation_verification_prompt.txt",
     }
 
     # Backward compatibility: expose _prompt_resolver as alias for _file_resolver
@@ -955,32 +1253,83 @@ class InstructionMatrixResolver(MatrixResolver):
         "strategic_todos_transition": "strategic_todos_transition.yaml",
         "strategic_todos_resume": "strategic_todos_resume.yaml",
         "workspace_template": "workspace_template.md",
-        "todo_guide": "todo_guide.md",
     }
 
 
 @dataclass
 class InstructionFileEntry:
-    """An instruction file with trigger conditions for auto-injection.
+    """An instruction file (or bound skill) with a trigger condition.
 
-    Defines when and how an instruction file is delivered to the agent.
+    Defines when and how a Layer-3 artifact is delivered to the agent. The
+    artifact is either a literal instruction ``file`` (workspace-relative path)
+    OR a bundled ``skill`` (resolved to ``skills/<skill>/SKILL.md``) — exactly
+    one. See knowledge-base/knowledge/features/agent_skills.md (Slice 3).
 
     Attributes:
-        file: Workspace-relative path (e.g., "todo_guide.md")
         trigger: Trigger condition string:
             - "before_tool:<tool_name>" — fires when the named tool is called
-            - "phase:strategic" / "phase:tactical" — fires on phase transition
-        enforce: If True, tool rejects until agent reads the file (passive).
-                 If False, system injects content automatically (active).
+            - "phase_start:strategic" / "phase_start:tactical" — injects once
+              when that concrete phase instance begins
+            - legacy "phase:<name>" is a compatibility alias for phase_start
+        file: Workspace-relative path (e.g. "todo_guide.md"). XOR ``skill``.
+        skill: Bundled skill name (e.g. "research-guide"). XOR ``file``;
+               resolves to ``skills/<skill>/SKILL.md`` via ``path``.
+        enforce: If True, tool rejects until agent reads the artifact (passive).
+                 Phase-start bindings are injected once regardless of this flag.
+        phases: Optional phase-kind filter for ``before_tool`` bindings.
+        read_scope: ``job`` keeps a successful instruction read valid for the
+                    worker run; ``phase`` requires a read in the current concrete
+                    phase instance.
+        max_read_age_turns: Optional maximum age of an instruction read in LLM
+                            turns before a ``before_tool`` gate closes again.
     """
 
-    file: str
     trigger: str
+    file: Optional[str] = None
+    skill: Optional[str] = None
     enforce: bool = True
+    phases: Optional[List[str]] = None
+    read_scope: str = "job"
+    max_read_age_turns: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if bool(self.file) == bool(self.skill):
+            raise ValueError(
+                "InstructionFileEntry requires exactly one of 'file' or 'skill' "
+                f"(got file={self.file!r}, skill={self.skill!r})"
+            )
+        if self.phases is not None:
+            if not isinstance(self.phases, list):
+                raise ValueError("InstructionFileEntry phases must be a list")
+            self.phases = [str(phase).strip().lower() for phase in self.phases]
+            invalid_phases = set(self.phases) - {"strategic", "tactical"}
+            if invalid_phases:
+                raise ValueError(
+                    "InstructionFileEntry phases contains invalid values: "
+                    f"{sorted(invalid_phases)}"
+                )
+        if self.read_scope not in {"job", "phase"}:
+            raise ValueError("InstructionFileEntry read_scope must be 'job' or 'phase'")
+        if self.max_read_age_turns is not None and (
+            isinstance(self.max_read_age_turns, bool)
+            or not isinstance(self.max_read_age_turns, int)
+            or self.max_read_age_turns <= 0
+        ):
+            raise ValueError(
+                "InstructionFileEntry max_read_age_turns must be a positive integer"
+            )
+
+    @property
+    def path(self) -> str:
+        """The workspace path this binding resolves to: a skill's SKILL.md when
+        bound to a skill, else the literal instruction-file path."""
+        if self.skill:
+            return f"skills/{self.skill}/SKILL.md"
+        return self.file or ""
 
     @property
     def trigger_type(self) -> str:
-        """Extract trigger type: 'before_tool' or 'phase'."""
+        """Extract trigger type (for example ``before_tool``/``phase_start``)."""
         return self.trigger.split(":")[0]
 
     @property
@@ -1015,6 +1364,9 @@ class PhaseLLMOverride:
     parallel_tool_calls: Optional[bool] = None
     max_output_tokens: Optional[int] = None
     model_max_context_tokens: Optional[int] = None
+    # Provider-specific request-body params (merged into the factory's
+    # extra_body; family settings-matrix `extra_body` resolves here per phase).
+    extra_body: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1022,7 +1374,9 @@ class LLMConfig:
     """LLM configuration with optional phase-specific overrides.
 
     Base fields define the default model. Phase-specific overrides (strategic,
-    tactical, summarization) can specify different models/providers for each phase.
+    tactical, summarization, subagent) can specify different models/providers.
+    strategic/tactical/summarization drive the main graph's phases; `subagent`
+    is the model tier for throwaway light subagents (spawn_subagent).
 
     Example:
         llm:
@@ -1036,6 +1390,8 @@ class LLMConfig:
           summarization:
             model: gpt-4o
             provider: openai
+          subagent:
+            model: claude-haiku-4-5-20251001  # cheap throwaway readers
     """
 
     model: str = "gpt-4o"
@@ -1061,11 +1417,30 @@ class LLMConfig:
     model_max_context_tokens: Optional[int] = (
         None  # Per-model context window limit (falls back to limits.model_max_context_tokens)
     )
+    # Provider-specific request-body params merged into the request's
+    # extra_body (e.g. MiniMax `reasoning_split`). Populated from the family
+    # settings matrix (`settings.extra_body`) or explicit config; declared
+    # values win over factory-computed extra_body entries.
+    extra_body: Optional[Dict[str, Any]] = None
+    # OpenAI cache-routing hint, injected at RUNTIME by callers that own a
+    # stable conversation identity (the session paths pass a per-thread key so
+    # the provider-side prefix cache survives pod rotation on the stateless
+    # lane — stateless_agents.md OQ5). Never set from YAML, and only
+    # transmitted to first-party OpenAI: compatible endpoints (vLLM et al.)
+    # may reject unknown body fields and run their own keyless prefix caches.
+    prompt_cache_key: Optional[str] = None
 
     # Phase-specific overrides (optional)
     strategic: Optional[PhaseLLMOverride] = None
     tactical: Optional[PhaseLLMOverride] = None
     summarization: Optional[PhaseLLMOverride] = None
+    # Model tier for throwaway light subagents spawned via `spawn_subagent`
+    # (delegation.mode: light). Lets a top-tier parent spawn a mid-tier reader
+    # (e.g. opus → sonnet, gpt-5.5 → gpt-5-mini). Resolved lazily by the light
+    # backend via get_phase_config("subagent"); NOT built by the main graph, so
+    # it is intentionally excluded from has_phase_overrides(). Falls back to the
+    # tactical tier (then base) when unset.
+    subagent: Optional[PhaseLLMOverride] = None
 
     def get_phase_config(self, phase: str) -> "LLMConfig":
         """Get effective LLM config for a specific phase.
@@ -1121,6 +1496,9 @@ class LLMConfig:
             model_max_context_tokens=override.model_max_context_tokens
             if override.model_max_context_tokens is not None
             else self.model_max_context_tokens,
+            extra_body=override.extra_body
+            if override.extra_body is not None
+            else self.extra_body,
             # Phase overrides not inherited to resolved config
             strategic=None,
             tactical=None,
@@ -1136,7 +1514,7 @@ class LLMConfig:
 class WorkspaceConfig:
     """Workspace configuration."""
 
-    _VALID_BACKENDS = ("sandbox", "vm")
+    _VALID_BACKENDS = ("sandbox", "vm", "virtual", "none")
     _LEGACY_BACKEND_MAP = {"remote": "sandbox", "container": "sandbox"}
 
     structure: List[str] = field(default_factory=list)
@@ -1144,10 +1522,16 @@ class WorkspaceConfig:
     initial_files: Dict[str, str] = field(default_factory=dict)
     max_read_words: int = 25000  # Maximum word count for file reads
     git_versioning: bool = True  # Enable git versioning for workspace history
-    backend: str = "sandbox"  # "sandbox" (SSH workspace container) or "vm" (KubeVirt VM with sudo gate)
+    # "sandbox"/"vm" → SSH workspace container/VM (RemoteBackend); "virtual" →
+    # object-store file ops, no workspace pod (VirtualWorkspaceBackend); "none"
+    # → no file tools (ScratchBackend). See no_workspace_agent_mode.md §4.
+    backend: str = "sandbox"
     remote: Optional[Dict[str, Any]] = (
         None  # {host, port, username, key_path, workspace_path}
     )
+    # "virtual" tier only: object-store mount specs from dispatch — each a
+    # {name, rclone_spec: {type, config, root}, prefix, access} (§4).
+    mounts: Optional[List[Dict[str, Any]]] = None
 
     def __post_init__(self) -> None:
         # Backward compatibility: translate legacy backend names
@@ -1157,15 +1541,29 @@ class WorkspaceConfig:
         if self.backend not in self._VALID_BACKENDS:
             raise ValueError(
                 f"Invalid workspace.backend={self.backend!r}. "
-                f"Expected one of {self._VALID_BACKENDS}. The agent never "
-                f"operates on its own filesystem — every workspace must live "
-                f"in an isolated SSH-accessible container or VM."
+                f"Expected one of {self._VALID_BACKENDS} (sandbox/vm = isolated "
+                f"SSH workspace; virtual = object-store file ops, no workspace "
+                f"pod; none = no file tools)."
             )
 
 
 @dataclass
 class ToolsConfig:
-    """Tools configuration by category (matches src/tools/ packages)."""
+    """Tools configuration by category (matches src/tools/ packages).
+
+    One field per ``TOOL_REGISTRY`` category, plus ``mcp`` (whose membership is
+    discovered at runtime, so it has no static registry category). The field
+    set is pinned against the registry by
+    ``tests/test_tool_policy.py::TestCategoryVocabularyAgreement`` — it cannot
+    be *derived* at import time because ``src/tools/registry`` imports this
+    module (via ``spawn_subagent``), so the dependency only runs one way.
+
+    Values are canonical ``List[str]``. The authoring vocabulary
+    (``true`` / ``false`` / ``{only}`` / ``{except}``) is resolved to that form
+    upstream by ``src.core.tool_policy.normalize_tool_policy``; a non-list
+    reaching this dataclass is a missed call site and raises rather than
+    silently emptying the group.
+    """
 
     workspace: List[str] = field(default_factory=list)
     core: List[str] = field(default_factory=list)
@@ -1176,13 +1574,74 @@ class ToolsConfig:
     sql: List[str] = field(default_factory=list)
     mongodb: List[str] = field(default_factory=list)
     git: List[str] = field(default_factory=list)
+    # Repository-datasource write tools (repo_commit/push/pull/open_pr).
+    # Distinct from `git`, which is the workspace's own version control:
+    # reusing `git` would strip the workspace git tools whenever no
+    # repository datasource is attached.
+    repo: List[str] = field(default_factory=list)
     shell: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
     knowledge: List[str] = field(default_factory=list)
     webdav: List[str] = field(default_factory=list)
+    email: List[str] = field(default_factory=list)
+    mcp: List[str] = field(default_factory=list)
     communication: List[str] = field(default_factory=list)
     delegation: List[str] = field(default_factory=list)
+    # Descriptor-backed orchestrator job surface. The flat ``orchestrator``
+    # category below remains for non-job application tools.
+    job_control: List[str] = field(default_factory=list)
+    job_inspection: List[str] = field(default_factory=list)
     orchestrator: List[str] = field(default_factory=list)
+    canvas: List[str] = field(default_factory=list)
+    agent_catalog: List[str] = field(default_factory=list)
+    workflows: List[str] = field(default_factory=list)
+    # Catalogue-authoring writes (expert / skill / automation bundle get+set),
+    # split out of `agent_catalog` and `workflows` on 2026-08-03 so those two
+    # groups contain only reads and their `true` expansion is safe by
+    # construction. Gated by the `catalog_authoring` capability grant
+    # (deny-by-default), because these tools create and update rows a user's
+    # other agents then run. Design:
+    # knowledge-base/knowledge/features/agent_authored_catalog_entries.md
+    catalog_authoring: List[str] = field(default_factory=list)
+    # Loop campaign tools (loop_plan). Never listed in bundled configs — the
+    # orchestrator injects `tools.loop` via config_override only for a planner
+    # loop's checkpoint critic (knowledge-base/knowledge/features/loop_campaign_scheduling.md).
+    loop: List[str] = field(default_factory=list)
+    # Registry categories that had no field until 2026-08-02, so a
+    # `tools.product_help:` / `tools.session_task:` key parsed and did nothing.
+    # Both are wholly `grant: "code"` (bound by the persistent-session floors
+    # at src/api/persistent_session.py), so `true` expands to [] and the fields
+    # grant nothing new — `load_tools` already binds their tools when named
+    # under any key, because it groups by registry metadata rather than by the
+    # key a name arrived under. Having the field makes the natural key work and
+    # makes the vocabulary agreement testable.
+    product_help: List[str] = field(default_factory=list)
+    session_task: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # A shell can run git against every repository in the workspace,
+        # including repos/<name>/. The git_* tools now can too (they take
+        # `repo=`), which is exactly why granting both is wrong: two surfaces
+        # answering one question is how job c4849fa1 (2026-08-16) ended up
+        # reading `fatal: bad object` from git_show — then the job's own repo
+        # only — as proof that its attached repository was unusable, while the
+        # files it wanted sat in repos/KurortEngine/.
+        #
+        # Shell wins: it is strictly more capable. Suppressing here rather
+        # than in src/tools/registry keeps
+        # `resolved_config.agent.tools.git` honest: the stored blob and the
+        # creation forms must not advertise tools the pod will never bind.
+        # `repo` is deliberately untouched — repo_* carries the read_only
+        # enforcement on attached datasources, which a shell cannot replace.
+        if self.git and self.shell:
+            logger.debug(
+                "Suppressing %d git tool(s); this agent has shell tools "
+                "(%s), which can run git against any repository in the "
+                "workspace including repos/<name>/.",
+                len(self.git),
+                ", ".join(self.shell),
+            )
+            self.git = []
 
 
 @dataclass
@@ -1203,6 +1662,17 @@ class ResponseValidationConfig:
     max_line_repetitions: int = 10
 
 
+# Default process-artifact patterns for the act-ratio tripwire
+# (limits.process_artifact_patterns). Shared by the LimitsConfig default
+# and the yaml parser fallback.
+DEFAULT_PROCESS_ARTIFACT_PATTERNS = [
+    "todos.yaml",
+    "plan.md",
+    "archive/*",
+    "*retrospective*",
+]
+
+
 @dataclass
 class LimitsConfig:
     """Execution limits configuration."""
@@ -1212,20 +1682,70 @@ class LimitsConfig:
     # derivation; these only fire when a key is wholly absent (test/edge paths).
     context_threshold_tokens: int = 80000  # 100_000 * 0.80
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 40000  # 100_000 * 0.40
+    message_count_min_tokens: int = 80000  # 100_000 * 0.80
     tool_retry_count: int = 3
+    # Tier-1 in-process LLM-invoke retries before the worker freezes the job for
+    # pause+backoff re-dispatch (llm_outage_pause_and_backoff_redispatch.md).
+    llm_inproc_retries: int = 5
     model_max_context_tokens: int = 100000
-    summarization_safe_limit: int = 90000  # 100_000 * 0.90
-    summarization_chunk_size: int = 60000  # 100_000 * 0.60
+    # Per-family image-token estimator config (matrix settings.image_tokens),
+    # routed through limits (not llm — LLMConfig's closed constructor drops
+    # unknown keys). None -> flat fallback. context_token_accounting.md S4.
+    image_tokens: Optional[Dict[str, Any]] = None
+    # Per-family page-render resolution (matrix settings.pdf_render_dpi), routed
+    # through limits like image_tokens. None -> renderer default (150). Read by
+    # the tool layer (_get_visual_content), not ContextManager.
+    pdf_render_dpi: Optional[int] = None
+    # Per-tool-category wall-clock ceilings for audited tool batches in seconds.
+    # Empty maps keep fallback values in graph.py.
+    tool_category_timeouts: Dict[str, int] = field(default_factory=dict)
     response_validation: ResponseValidationConfig = field(
         default_factory=ResponseValidationConfig
     )
     progress_stall_threshold: int = (
         30  # tool calls without progress before nudge reminder
     )
-    max_tool_calls_per_phase: int = (
-        200  # max tool calls per phase before rewind (tactical) or freeze (strategic)
+    # Optional per-phase ceiling. DEFAULT 0 = OFF. This used to be 500 and was
+    # the only stop the worker had, but it is the wrong unit: it resets at every
+    # phase boundary, so with 16 phases it was really an ~8000-call job budget,
+    # and with 3 large phases it would have become ~1500 — a tightening, exactly
+    # backwards for the fewer-larger-phases model. Superseded by
+    # max_tool_calls_per_job; kept so an operator who deliberately wants a
+    # per-phase guard can still set one.
+    max_tool_calls_per_phase: int = 0
+    # Job-level tool-call ceiling — the real backstop, and the only automatic
+    # stop a runaway job has. Nothing else terminates: the progress nudge and
+    # act-ratio tripwire only inject reminders, loop detection only masks tools,
+    # and the orchestrator has no job-duration ceiling. Hitting it freezes with
+    # budget_exceeded, which is NOT in AUTO_REDISPATCH_FREEZE_TYPES, so it parks
+    # for a human instead of looping. 0 disables it entirely — only do that if
+    # something else is watching the spend.
+    max_tool_calls_per_job: int = 5000
+    # Act-ratio tripwire: consecutive tool actions touching ONLY process
+    # artifacts (see process_artifact_patterns) before a "stop planning"
+    # nudge is injected. 0 disables the tripwire.
+    act_ratio_nudge_threshold: int = 6
+    # fnmatch patterns (workspace-relative) that classify a file target as a
+    # process artifact for the act-ratio tripwire.
+    process_artifact_patterns: List[str] = field(
+        default_factory=lambda: list(DEFAULT_PROCESS_ARTIFACT_PATTERNS)
     )
+    # Progress durability (src/core/progress_commit.py). Decouples "what an
+    # outside observer can see" from phase structure, which matters more the
+    # larger tactical phases get. Commits are free and happen per todo; pushes
+    # cost a Gitea round-trip and are throttled to this interval.
+    progress_push_interval_seconds: int = 60
+    # Seconds without any commit before the turn loop commits work in progress.
+    # Covers the case the per-todo trigger cannot: an agent stuck on a single
+    # long todo emits no completions, so it would otherwise go dark exactly
+    # when observers most need to see movement. 0 disables the floor.
+    progress_wip_commit_after_seconds: int = 300
+    # Steering lane B: how long a queued (non-urgent) reply may wait before it
+    # is delivered without a natural break. The break trigger (a completed
+    # todo) is anti-correlated with need — a stuck agent never reaches one —
+    # so this is the floor that stops mail being stranded. 0 disables it,
+    # leaving delivery entirely break-driven.
+    queued_reply_max_wait_seconds: int = 300
 
 
 @dataclass
@@ -1235,6 +1755,7 @@ class ContextManagementConfig:
     compact_on_archive: bool = True
     keep_recent_tool_results: int = 15
     keep_recent_messages: int = 10
+    keep_window_max_tool_result_chars: int = 16000
     summarization_template: str = "summarization_prompt.txt"
     reasoning_level: str = "high"
     max_summary_length: int = 10000
@@ -1244,11 +1765,166 @@ class ContextManagementConfig:
 class PhaseSettings:
     """Phase alternation settings.
 
-    Controls the strategic/tactical phase transitions.
+    Controls the strategic/tactical phase transitions. min/max_todos are
+    the LIVE bounds: agent.py passes them into TodoManager at construction,
+    where stage_tactical_todos enforces them. worker_base.yaml lowers the
+    floor to 2.
     """
 
     min_todos: int = 5  # Minimum todos required for strategic->tactical transition
     max_todos: int = 20  # Maximum todos allowed for strategic->tactical transition
+
+
+@dataclass
+class MemoryPipelineConfig:
+    """Named plugins the MemoryManager binds per stage (memory.pipeline).
+
+    Names resolve against MEMORY_PLUGIN_REGISTRY
+    (src/services/memory/registry.py); an unknown name fails loudly at
+    bind time. Empty lists bind a no-op manager. Defaults stay empty
+    until the Phase-1 transplant registers the current-behaviour plugins
+    (knowledge-base/knowledge/features/agent_memory_overhaul.md §5/§6).
+    """
+
+    retrievers: List[str] = field(default_factory=list)
+    scorers: List[str] = field(default_factory=list)
+    policies: List[str] = field(default_factory=list)
+    writers: List[str] = field(default_factory=list)
+    extensions: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RerankerConfig:
+    """memory.reranker — options for the 'reranker' scorer (overhaul Phase 3).
+
+    Only consulted when ``reranker`` appears in ``memory.pipeline.scorers``.
+    ``base_url``/``api_key`` default to the **embedding** endpoint at bind time
+    (``EMBEDDING_BASE_URL``/``EMBEDDING_API_KEY`` — the same router serves the
+    ``qwen3-reranker-8b`` ``/rerank`` route and ``qwen3-embedding-8b``), so
+    production needs no extra credential plumbing. It does NOT ride the
+    auxiliary model (that coupling crashed startup on OpenRouter auxiliaries;
+    see knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md).
+    """
+
+    model: str = "qwen3-reranker-8b"
+    base_url: Optional[str] = None  # null = EMBEDDING_BASE_URL
+    api_key: Optional[str] = None  # null = EMBEDDING_API_KEY
+    top_k: int = 64  # rerank at most this many candidates per assemble
+    timeout: float = 10.0  # seconds per rerank call
+    # Transient-fault budget (timeouts / connection drops / 5xx): extra
+    # attempts after the first, with exponential backoff from retry_backoff
+    # seconds. Exhausting it degrades that one turn to hybrid order instead
+    # of failing the job (structural 4xx/shape errors stay job-fatal). See
+    # knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md.
+    retries: int = 2
+    retry_backoff: float = 1.0
+    # Keep TTL-pinned items (the recency working set) ahead of the
+    # reranked tail — Phase 3's bounded-core policy revisits pinning
+    # itself; the scorer doesn't change tier semantics.
+    keep_pinned_first: bool = True
+
+
+@dataclass
+class BoundedConfig:
+    """memory.bounded — options for the 'bounded' injection policy.
+
+    Only consulted when ``bounded`` appears in ``memory.pipeline.policies``.
+    Caps the memory-kind items of the assembled payload AFTER scorers run.
+    ``memory.budget_tokens`` trims inside the retriever — in legacy hybrid
+    order, before a reranker can surface the evidence — so post-scorer
+    bounding has to live in the policy stage. At least one cap must be set
+    for the policy to bind.
+    """
+
+    max_items: Optional[int] = None  # keep at most N memory items
+    max_tokens: Optional[int] = None  # keep memory items within this budget
+    # B5: count knowledge-kind items against max_tokens too — one token
+    # budget across the memory + KB blocks (the legacy KB block is uncapped
+    # on every call). max_items stays a memory-count cap; requires
+    # max_tokens to be set.
+    include_knowledge: bool = False
+
+
+@dataclass
+class GateConfig:
+    """memory.gate — options for the 'gate' injection policy (P4).
+
+    Only consulted when ``gate`` appears in ``memory.pipeline.policies``.
+    Drops memory items whose score on ``channel`` falls below the floor:
+    ``threshold`` itself (mode "absolute") or ``threshold × the
+    assemble's top score`` (mode "relative" — the measured
+    recommendation: qwen3-reranker's absolute scale varies by orders of
+    magnitude per query while evidence/distractor separation stays
+    strong, so absolute cutoffs delete weakly-phrased evidence). Items
+    the channel never scored (scorer outage, candidates past the
+    reranker's top_k, a pinned head under keep_pinned_first) pass
+    through ungated, so a failed scorer degrades to the legacy full dump
+    rather than an empty injection. ``threshold`` must be set for the
+    policy to bind.
+    """
+
+    threshold: Optional[float] = None
+    channel: str = "rerank"  # channel_scores key the gate reads
+    mode: str = "absolute"  # absolute | relative (floor = threshold × top)
+
+
+@dataclass
+class IngestionConfig:
+    """memory.ingestion — write-path ingestion verdicts + bi-temporal supersede
+    (overhaul Phase 4, knowledge-base/knowledge/features/agent_memory_overhaul.md §5).
+
+    When ``enabled``, ``RecallStore.store()`` replaces the lossy cosine-0.85
+    dedup-merge with an aux-LLM adjudication: a new candidate is compared
+    against its top-``verdict_top_k`` currently-valid neighbours and the LLM
+    returns ADD / UPDATE / MERGE / NOOP. UPDATE and MERGE retire the
+    superseded rows (set ``valid_to``/``superseded_at``/``superseded_by``) so
+    default retrieval stops serving them — the washing-machine fix (P3).
+
+    Cost guard ("bound verdict calls per write"): the LLM is consulted only
+    when a neighbour scores at/above ``review_floor`` similarity. A genuinely
+    new fact (no near-duplicate) is a straight ADD with zero LLM calls, so
+    verdict calls are bounded to roughly the near-duplicate rate — at most one
+    per stored memory. Default off: it changes what the store keeps, so it is
+    a measured opt-in and ships inert until the harness/soak greenlights it.
+    """
+
+    enabled: bool = False
+    verdict_top_k: int = 5  # neighbours shown to the adjudicator
+    review_floor: float = 0.6  # min cosine similarity that triggers a verdict call
+
+
+@dataclass
+class ExtractionConfig:
+    """memory.extraction — write-path extraction policy (overhaul Phase 4).
+
+    ``write_gate`` keeps the legacy write-time importance floor
+    (``importance < importance_threshold`` → skip). Phase 4 sets it False to
+    follow completeness-over-precision (§4 writers): a fact skipped at write
+    time is unrecoverable, and relevance is now gated at *retrieval* (the
+    reranker + gate), so the write-time floor is redundant. Default True —
+    dropping it is a measured opt-in. Boundary-driven extraction (phase-end,
+    session-end, idle) is already always-on via the registered
+    phase_boundary / teardown writers with the interval extractor as the
+    turn-count fallback, so it needs no separate trigger knob here.
+    """
+
+    write_gate: bool = True
+
+
+@dataclass
+class QueryConfig:
+    """memory.query — retrieval query formation (overhaul §4).
+
+    ``digest`` swaps the legacy per-mode query texts (worker: top todo +
+    phase descriptor; persistent: last user message) for the unified
+    request digest — a recent message window plus the task frame. Default
+    off: it changes what gets embedded/reranked, so it stays a measured
+    opt-in (agent_memory_overhaul.md Phase 3 slice 4).
+    """
+
+    digest: bool = False
+    digest_window: int = 4  # trailing Human/AI messages in the digest
+    digest_max_chars_per_message: int = 500
 
 
 @dataclass
@@ -1257,33 +1933,56 @@ class MemoryConfig:
 
     Controls the memory subsystem that stores and retrieves memories
     from PostgreSQL with hybrid search (dense vector + sparse keyword + recency).
-    See docs/features/memory_light.md for full architecture.
+    See knowledge-base/knowledge/features/memory_light.md for full architecture.
     """
 
     enabled: bool = False
+    # When True, a job/session that needs memory but whose embedding-backed
+    # stores fail to initialize must NOT run blind: the worker agent pauses for
+    # bounded re-dispatch instead of silently degrading (see
+    # knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md).
+    # Default False = degrade-loud (Layer 1 audit only).
+    required: bool = False
     budget_tokens: int = 10000
     max_memories_per_injection: int = 150
     observer_interval: int = 5
     assembler_interval: int = 7
     default_ttl: int = 10
-    observer_model: Optional[str] = None
-    observer_base_url: Optional[str] = None
-    embedding_model: str = "qwen3-embedding-8b"
-    dense_results: int = 30
-    sparse_results: int = 30
-    recent_results: int = 15
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.85
     retrieval_importance_floor: float = 0.4
     project_scoped: bool = True
-    storage: str = "postgres"
+    # MemoryManager seam (memory overhaul Phase 1). manager_enabled is the
+    # cutover guard (memory.manager.enabled): while False the graphs keep
+    # their legacy direct-store paths and the manager is never constructed.
+    manager_enabled: bool = False
+    pipeline: MemoryPipelineConfig = field(default_factory=MemoryPipelineConfig)
+    reranker: RerankerConfig = field(default_factory=RerankerConfig)
+    bounded: BoundedConfig = field(default_factory=BoundedConfig)
+    gate: GateConfig = field(default_factory=GateConfig)
+    query: QueryConfig = field(default_factory=QueryConfig)
+    ingestion: IngestionConfig = field(default_factory=IngestionConfig)
+    extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
 
 
 @dataclass
 class AuxiliaryTaskConfig:
-    """Per-task configuration overrides for auxiliary tasks."""
+    """Per-task configuration overrides for auxiliary tasks.
+
+    ``verdict``/``verdict_top_k``/``review_floor`` are the knowledge-ingestion
+    verdict gate (OKF KB slice 2 PR2) — used only by ``curate_knowledge``. They
+    mirror ``memory.ingestion``: when ``verdict`` is on, each curation candidate
+    is adjudicated against its top-``verdict_top_k`` neighbours (fetched via
+    ``KnowledgeStore.find_similar_many``) before a ``kb_write``/``kb_update``,
+    and the LLM is consulted only when a neighbour scores at/above
+    ``review_floor`` similarity (the cost guard). Default off — a measured
+    opt-in like ``memory.ingestion.enabled``.
+    """
 
     enabled: bool = True
+    verdict: bool = False
+    verdict_top_k: int = 5
+    review_floor: float = 0.6
 
 
 @dataclass
@@ -1292,21 +1991,31 @@ class AuxiliaryConfig:
 
     Controls the AuxiliaryLLM class that handles background tasks like
     memory extraction and knowledge curation using structured output.
-    See docs/features/auxiliary.md for full design.
+    See knowledge-base/knowledge/features/auxiliary.md for full design.
     """
 
     enabled: bool = True
     model: Optional[str] = None  # null = use main LLM
     base_url: Optional[str] = None  # null = use main LLM endpoint
     api_key: Optional[str] = None  # null = use provider env var
+    # Provider slug ("openrouter", "openai", "anthropic", ...). null = let
+    # create_llm auto-detect (openrouter/ prefix) or fall back to openai. Must
+    # be threaded through to create_llm or an OpenRouter aux misroutes to
+    # api.openai.com (knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md).
+    provider: Optional[str] = None
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
-    timeout: float = 120.0  # Seconds per LLM call
+    timeout: float = 120.0  # Seconds per LLM call (quick interactive tasks)
+    # Per fold-call timeout for conversation summarization. Each summarization
+    # pass is one bounded call (src/core/summarizer.py); a hung aux endpoint
+    # costs at most this much per attempt, not a single shared 600s blob.
+    summarization_call_timeout: float = 240.0
     tasks: Dict[str, AuxiliaryTaskConfig] = field(
         default_factory=lambda: {
             "extract_memories": AuxiliaryTaskConfig(enabled=True),
             "curate_knowledge": AuxiliaryTaskConfig(enabled=True),
             "assemble_memories": AuxiliaryTaskConfig(enabled=True),
+            "verify_citations": AuxiliaryTaskConfig(enabled=True),
         }
     )
 
@@ -1339,12 +2048,72 @@ class HeadlessConfig:
 
 
 @dataclass
+class OfficerConfig:
+    """Always-on officer (centurion) behavior for persistent sessions.
+
+    Sourced from the expert config, overridden per thread via
+    threads.metadata.config_override.officer. The enabled flag MUST also be
+    present in thread metadata for orchestrator-side SQL sweeps — expert YAML
+    alone is invisible to them (knowledge-base/knowledge/features/centurion.md §4).
+    """
+
+    enabled: bool = False
+    sleep_min_minutes: int = 5
+    sleep_max_minutes: int = 60
+    max_concurrent_workers: int = 3
+    max_pages_per_day: int = 3
+    max_actions_per_wake: int = 10
+    daily_token_ceiling: int = 0  # 0 = disabled (v1 leans on per-job caps)
+    # Conference embodiment (centurion.md §2/S9): an ordinary interactive
+    # session wearing the officer's identity. enabled stays False on a
+    # conference thread (no sleep tool, no watchdog, normal idle-archive);
+    # this flag only widens identity attachment — charter injection and, on
+    # the orchestrator side, the background officer's hold.
+    conference: bool = False
+
+    @property
+    def backstop_seconds(self) -> int:
+        """Agent-local safety timeout: fires only when the orchestrator's
+        durable timer path failed to deliver a wake (drain/watchdog down
+        while the API is up). Never the primary wake mechanism."""
+        return max(2 * self.sleep_max_minutes, 120) * 60
+
+
+def _parse_officer_config(data: Dict[str, Any]) -> OfficerConfig:
+    """Shared officer-config parser for BOTH loader paths (file + dict).
+
+    One helper by design: parsing in only one path would split file-boot vs
+    dict-boot behavior (centurion_implementation_notes.md, config risks).
+    """
+    officer_data = data.get("officer") or {}
+    sleep_min = int(officer_data.get("sleep_min_minutes") or 5)
+    sleep_max = int(officer_data.get("sleep_max_minutes") or 60)
+    if sleep_min > sleep_max:
+        logger.warning(
+            "officer.sleep_min_minutes (%d) > sleep_max_minutes (%d); clamping",
+            sleep_min,
+            sleep_max,
+        )
+        sleep_min = sleep_max
+    return OfficerConfig(
+        enabled=bool(officer_data.get("enabled", False)),
+        sleep_min_minutes=sleep_min,
+        sleep_max_minutes=sleep_max,
+        max_concurrent_workers=int(officer_data.get("max_concurrent_workers") or 3),
+        max_pages_per_day=int(officer_data.get("max_pages_per_day") or 3),
+        max_actions_per_wake=int(officer_data.get("max_actions_per_wake") or 10),
+        daily_token_ceiling=int(officer_data.get("daily_token_ceiling") or 0),
+        conference=bool(officer_data.get("conference", False)),
+    )
+
+
+@dataclass
 class DelegationConfig:
     """Subagent delegation configuration.
 
     Controls whether agents can spawn child jobs via the delegate_work tool.
     Children branch off the parent workspace and work in parallel via git worktrees.
-    See docs/features/subagent_delegation.md.
+    See knowledge-base/knowledge/features/subagent_delegation.md.
 
     Depth is computed by counting delegation links (creation_order IS NOT NULL)
     in the ancestor chain.  Lifecycle links (scholar/critic with creation_order
@@ -1357,13 +2126,21 @@ class DelegationConfig:
     default_timeout: int = 7200  # 2 hours
     max_timeout: int = 14400  # 4 hours
     allowed_configs: List[str] = field(default_factory=list)  # empty = any
+    # Backend for the shared `spawn_subagent` tool: "heavy" (full child jobs)
+    # or "light" (throwaway in-process readers). Operator-selected, not the
+    # model's choice.
+    mode: str = "heavy"
+    # Light-backend knobs (max_iterations, max_tokens, max_parallel,
+    # allow_writes). Kept as a plain dict — the light factory reads it with
+    # .get() defaults, so unknown/missing keys are fine.
+    light: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class AgentConfig:
     """Complete agent configuration.
 
-    Loaded from YAML configuration file (e.g., defaults.yaml, my_agent.yaml).
+    Loaded from YAML configuration (e.g., worker_base.yaml, my_agent.yaml).
     """
 
     agent_id: str
@@ -1384,7 +2161,12 @@ class AgentConfig:
     delegation: DelegationConfig = field(default_factory=DelegationConfig)
     interactive: InteractiveConfig = field(default_factory=InteractiveConfig)
     headless: HeadlessConfig = field(default_factory=HeadlessConfig)
+    officer: OfficerConfig = field(default_factory=OfficerConfig)
     autonomy: str = "partial"
+    # Image-quality tier the agent receives (economy|standard|high). A
+    # user/session knob (default standard) resolved to a per-family max edge at
+    # the image seam. See knowledge-base/knowledge/issues/session_turn_hard_fails_on_transient_llm_outage.md.
+    image_quality: str = "standard"
 
     # Additional agent-specific config (preserved from JSON)
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -1422,6 +2204,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         parallel_tool_calls=data.get("parallel_tool_calls"),
         max_output_tokens=data.get("max_output_tokens"),
         model_max_context_tokens=data.get("model_max_context_tokens"),
+        extra_body=data.get("extra_body"),
     )
 
 
@@ -1450,10 +2233,12 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         parallel_tool_calls=llm_data.get("parallel_tool_calls", False),
         max_output_tokens=llm_data.get("max_output_tokens"),
         model_max_context_tokens=llm_data.get("model_max_context_tokens"),
+        extra_body=llm_data.get("extra_body"),
         # Phase-specific overrides
         strategic=_parse_phase_override(llm_data.get("strategic")),
         tactical=_parse_phase_override(llm_data.get("tactical")),
         summarization=_parse_phase_override(llm_data.get("summarization")),
+        subagent=_parse_phase_override(llm_data.get("subagent")),
     )
 
 
@@ -1466,24 +2251,100 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     Returns:
         MemoryConfig dataclass
     """
+    manager_data = data.get("manager", {}) or {}
+    if not isinstance(manager_data, dict):
+        # Bool shorthand (`manager: true`), same tolerance as auxiliary tasks
+        manager_data = {"enabled": bool(manager_data)}
+    pipeline_data = data.get("pipeline", {}) or {}
+    pipeline = MemoryPipelineConfig(
+        retrievers=list(pipeline_data.get("retrievers", []) or []),
+        scorers=list(pipeline_data.get("scorers", []) or []),
+        policies=list(pipeline_data.get("policies", []) or []),
+        writers=list(pipeline_data.get("writers", []) or []),
+        extensions=list(pipeline_data.get("extensions", []) or []),
+    )
+    reranker_data = data.get("reranker", {}) or {}
+    reranker = RerankerConfig(
+        model=reranker_data.get("model", "qwen3-reranker-8b"),
+        base_url=reranker_data.get("base_url"),
+        api_key=reranker_data.get("api_key"),
+        top_k=int(reranker_data.get("top_k", 64)),
+        timeout=float(reranker_data.get("timeout", 10.0)),
+        keep_pinned_first=bool(reranker_data.get("keep_pinned_first", True)),
+    )
+    bounded_data = data.get("bounded", {}) or {}
+    bounded = BoundedConfig(
+        max_items=(
+            int(bounded_data["max_items"])
+            if bounded_data.get("max_items") is not None
+            else None
+        ),
+        max_tokens=(
+            int(bounded_data["max_tokens"])
+            if bounded_data.get("max_tokens") is not None
+            else None
+        ),
+        include_knowledge=bool(bounded_data.get("include_knowledge", False)),
+    )
+    gate_data = data.get("gate", {}) or {}
+    gate = GateConfig(
+        threshold=(
+            float(gate_data["threshold"])
+            if gate_data.get("threshold") is not None
+            else None
+        ),
+        channel=str(gate_data.get("channel", "rerank")),
+        mode=str(gate_data.get("mode", "absolute")),
+    )
+    query_data = data.get("query", {}) or {}
+    query = QueryConfig(
+        digest=bool(query_data.get("digest", False)),
+        digest_window=int(query_data.get("digest_window", 4)),
+        digest_max_chars_per_message=int(
+            query_data.get("digest_max_chars_per_message", 500)
+        ),
+    )
+    ingestion_data = data.get("ingestion", {}) or {}
+    if not isinstance(ingestion_data, dict):
+        # Bool shorthand (`ingestion: true`), same tolerance as manager/tasks.
+        ingestion_data = {"enabled": bool(ingestion_data)}
+    ingestion = IngestionConfig(
+        enabled=bool(ingestion_data.get("enabled", False)),
+        verdict_top_k=int(ingestion_data.get("verdict_top_k", 5)),
+        review_floor=float(ingestion_data.get("review_floor", 0.6)),
+    )
+    extraction_data = data.get("extraction", {}) or {}
+    extraction = ExtractionConfig(
+        write_gate=bool(extraction_data.get("write_gate", True)),
+    )
     return MemoryConfig(
         enabled=data.get("enabled", False),
+        required=bool(data.get("required", False)),
         budget_tokens=data.get("budget_tokens", 10000),
         max_memories_per_injection=data.get("max_memories_per_injection", 150),
         observer_interval=data.get("observer_interval", 5),
         assembler_interval=data.get("assembler_interval", 7),
         default_ttl=data.get("default_ttl", 10),
-        observer_model=data.get("observer_model"),
-        observer_base_url=data.get("observer_base_url"),
-        embedding_model=data.get("embedding_model", "qwen3-embedding-8b"),
-        dense_results=data.get("dense_results", 30),
-        sparse_results=data.get("sparse_results", 30),
-        recent_results=data.get("recent_results", 15),
         importance_threshold=data.get("importance_threshold", 0.3),
         dedup_threshold=data.get("dedup_threshold", 0.85),
         retrieval_importance_floor=data.get("retrieval_importance_floor", 0.4),
         project_scoped=data.get("project_scoped", True),
-        storage=data.get("storage", "postgres"),
+        # Accept both shapes: the YAML nesting (`manager.enabled`) and the
+        # flat dataclass field (`manager_enabled`) that dataclasses.asdict()
+        # emits when dispatch paths round-trip a live config through
+        # deep_merge + re-parse (job config_override, session config
+        # assembly, config.update). Without the fallback the cutover flag
+        # silently resets to False on every dispatched job/session.
+        manager_enabled=bool(
+            manager_data.get("enabled", data.get("manager_enabled", False))
+        ),
+        pipeline=pipeline,
+        reranker=reranker,
+        bounded=bounded,
+        gate=gate,
+        query=query,
+        ingestion=ingestion,
+        extraction=extraction,
     )
 
 
@@ -1502,12 +2363,20 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         if isinstance(task_conf, dict):
             tasks[task_name] = AuxiliaryTaskConfig(
                 enabled=task_conf.get("enabled", True),
+                verdict=bool(task_conf.get("verdict", False)),
+                verdict_top_k=int(task_conf.get("verdict_top_k", 5)),
+                review_floor=float(task_conf.get("review_floor", 0.6)),
             )
         else:
             tasks[task_name] = AuxiliaryTaskConfig(enabled=bool(task_conf))
 
     # Ensure defaults for known tasks
-    for default_task in ("extract_memories", "curate_knowledge", "assemble_memories"):
+    for default_task in (
+        "extract_memories",
+        "curate_knowledge",
+        "assemble_memories",
+        "verify_citations",
+    ):
         if default_task not in tasks:
             tasks[default_task] = AuxiliaryTaskConfig(enabled=True)
 
@@ -1516,11 +2385,23 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         model=data.get("model"),
         base_url=data.get("base_url"),
         api_key=data.get("api_key"),
+        provider=data.get("provider"),
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
+        summarization_call_timeout=data.get("summarization_call_timeout", 240.0),
         tasks=tasks,
     )
+
+
+def _parse_process_artifact_patterns(limits_data: Dict[str, Any]) -> List[str]:
+    """Act-ratio pattern list from limits; non-list/empty falls back to default."""
+    raw = limits_data.get("process_artifact_patterns")
+    if isinstance(raw, list):
+        patterns = [str(p).strip() for p in raw if str(p).strip()]
+        if patterns:
+            return patterns
+    return list(DEFAULT_PROCESS_ARTIFACT_PATTERNS)
 
 
 def _parse_response_validation(data: Dict[str, Any]) -> ResponseValidationConfig:
@@ -1563,10 +2444,11 @@ def load_agent_config(
         config = load_agent_config("config/my_agent.yaml")
 
         # Directory config with prompt overrides
-        # config/my_agent/config.yaml with $extends: defaults
+        # config/my_agent/config.yaml with $extends: worker_base
         config = load_agent_config("config/my_agent/config.yaml", "config/my_agent")
         ```
     """
+    config_path = canonical_config_name(config_path)
     config_path_obj = Path(config_path)
 
     if not config_path_obj.exists():
@@ -1575,7 +2457,7 @@ def load_agent_config(
     # Load config with inheritance resolution
     data = load_and_merge_config(config_path)
 
-    # Apply settings matrix: model-family defaults between defaults.yaml and expert config.
+    # Apply settings matrix between the mode base and the expert config.
     # Read the raw expert file to know which llm keys were explicitly set.
     raw_expert_llm_keys = set()
     try:
@@ -1621,9 +2503,13 @@ def load_agent_config(
         git_versioning=workspace_data.get("git_versioning", True),
         backend=workspace_data.get("backend", "sandbox"),
         remote=workspace_data.get("remote"),
+        mounts=workspace_data.get("mounts"),
     )
 
     tools_data = data.get("tools", {})
+    # Last line of defence: the authoring vocabulary must already have been
+    # resolved to lists. A bool arriving here would silently empty the group.
+    assert_tool_policy_canonical(tools_data, where="ToolsConfig")
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
         core=tools_data.get("core", []),
@@ -1634,12 +2520,25 @@ def load_agent_config(
         sql=tools_data.get("sql", []),
         mongodb=tools_data.get("mongodb", []),
         git=tools_data.get("git", []),
+        repo=tools_data.get("repo", []),
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
         webdav=tools_data.get("webdav", []),
+        email=tools_data.get("email", []),
+        mcp=tools_data.get("mcp", []),
+        communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
+        job_control=tools_data.get("job_control", []),
+        job_inspection=tools_data.get("job_inspection", []),
         orchestrator=tools_data.get("orchestrator", []),
+        canvas=tools_data.get("canvas", []),
+        agent_catalog=tools_data.get("agent_catalog", []),
+        workflows=tools_data.get("workflows", []),
+        catalog_authoring=tools_data.get("catalog_authoring", []),
+        loop=tools_data.get("loop", []),
+        product_help=tools_data.get("product_help", []),
+        session_task=tools_data.get("session_task", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1648,19 +2547,41 @@ def load_agent_config(
     )
 
     limits_data = data.get("limits", {})
+    raw_tool_category_timeouts = limits_data.get("tool_category_timeouts", {})
+    tool_category_timeouts: dict[str, int] = {}
+    if isinstance(raw_tool_category_timeouts, dict):
+        tool_category_timeouts = {
+            str(k): int(v)
+            for k, v in raw_tool_category_timeouts.items()
+            if isinstance(v, (int, float)) and int(v) > 0
+        }
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
-        message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 80000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
+        llm_inproc_retries=limits_data.get("llm_inproc_retries", 5),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
-        summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
-        summarization_chunk_size=limits_data.get("summarization_chunk_size", 60000),
+        image_tokens=limits_data.get("image_tokens"),
+        pdf_render_dpi=limits_data.get("pdf_render_dpi"),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
+        tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
-        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 0),
+        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 5000),
+        act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
+        process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
+        progress_push_interval_seconds=limits_data.get(
+            "progress_push_interval_seconds", 60
+        ),
+        progress_wip_commit_after_seconds=limits_data.get(
+            "progress_wip_commit_after_seconds", 300
+        ),
+        queued_reply_max_wait_seconds=limits_data.get(
+            "queued_reply_max_wait_seconds", 300
+        ),
     )
 
     context_data = data.get("context_management", {})
@@ -1668,6 +2589,9 @@ def load_agent_config(
         compact_on_archive=context_data.get("compact_on_archive", True),
         keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
+        keep_window_max_tool_result_chars=context_data.get(
+            "keep_window_max_tool_result_chars", 16000
+        ),
         summarization_template=context_data.get(
             "summarization_template", "summarization_prompt.txt"
         ),
@@ -1691,9 +2615,13 @@ def load_agent_config(
     instruction_files_data = data.get("instruction_files", [])
     instruction_files = [
         InstructionFileEntry(
-            file=entry["file"],
             trigger=entry["trigger"],
+            file=entry.get("file"),
+            skill=entry.get("skill"),
             enforce=entry.get("enforce", True),
+            phases=entry.get("phases"),
+            read_scope=entry.get("read_scope", "job"),
+            max_read_age_turns=entry.get("max_read_age_turns"),
         )
         for entry in instruction_files_data
     ]
@@ -1706,6 +2634,8 @@ def load_agent_config(
         default_timeout=delegation_data.get("default_timeout", 7200),
         max_timeout=delegation_data.get("max_timeout", 14400),
         allowed_configs=delegation_data.get("allowed_configs", []),
+        mode=delegation_data.get("mode", "heavy"),
+        light=delegation_data.get("light", {}) or {},
     )
 
     # Parse autonomy level
@@ -1713,6 +2643,14 @@ def load_agent_config(
     if autonomy not in VALID_AUTONOMY_LEVELS:
         logger.warning(f"Invalid autonomy level '{autonomy}', defaulting to 'partial'")
         autonomy = "partial"
+
+    # Parse image-quality tier (economy|standard|high)
+    image_quality = data.get("image_quality", "standard")
+    if image_quality not in VALID_IMAGE_QUALITY_TIERS:
+        logger.warning(
+            f"Invalid image_quality '{image_quality}', defaulting to 'standard'"
+        )
+        image_quality = "standard"
 
     # Collect extra fields (agent-specific config)
     known_fields = {
@@ -1734,7 +2672,9 @@ def load_agent_config(
         "delegation",
         "interactive",
         "headless",
+        "officer",
         "autonomy",
+        "image_quality",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -1755,6 +2695,9 @@ def load_agent_config(
         ),
     )
 
+    # Parse officer config (centurion — shared helper, both loader paths)
+    officer_config = _parse_officer_config(data)
+
     return AgentConfig(
         agent_id=data["agent_id"],
         display_name=data["display_name"],
@@ -1772,7 +2715,9 @@ def load_agent_config(
         delegation=delegation_config,
         interactive=interactive_config,
         headless=headless_config,
+        officer=officer_config,
         autonomy=autonomy,
+        image_quality=image_quality,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -1822,9 +2767,13 @@ def load_agent_config_from_dict(
         git_versioning=workspace_data.get("git_versioning", True),
         backend=workspace_data.get("backend", "sandbox"),
         remote=workspace_data.get("remote"),
+        mounts=workspace_data.get("mounts"),
     )
 
     tools_data = data.get("tools", {})
+    # Last line of defence: the authoring vocabulary must already have been
+    # resolved to lists. A bool arriving here would silently empty the group.
+    assert_tool_policy_canonical(tools_data, where="ToolsConfig")
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
         core=tools_data.get("core", []),
@@ -1835,12 +2784,25 @@ def load_agent_config_from_dict(
         sql=tools_data.get("sql", []),
         mongodb=tools_data.get("mongodb", []),
         git=tools_data.get("git", []),
+        repo=tools_data.get("repo", []),
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
         webdav=tools_data.get("webdav", []),
+        email=tools_data.get("email", []),
+        mcp=tools_data.get("mcp", []),
+        communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
+        job_control=tools_data.get("job_control", []),
+        job_inspection=tools_data.get("job_inspection", []),
         orchestrator=tools_data.get("orchestrator", []),
+        canvas=tools_data.get("canvas", []),
+        agent_catalog=tools_data.get("agent_catalog", []),
+        workflows=tools_data.get("workflows", []),
+        catalog_authoring=tools_data.get("catalog_authoring", []),
+        loop=tools_data.get("loop", []),
+        product_help=tools_data.get("product_help", []),
+        session_task=tools_data.get("session_task", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1849,19 +2811,41 @@ def load_agent_config_from_dict(
     )
 
     limits_data = data.get("limits", {})
+    raw_tool_category_timeouts = limits_data.get("tool_category_timeouts", {})
+    tool_category_timeouts = {}
+    if isinstance(raw_tool_category_timeouts, dict):
+        tool_category_timeouts = {
+            str(k): int(v)
+            for k, v in raw_tool_category_timeouts.items()
+            if isinstance(v, (int, float)) and int(v) > 0
+        }
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
-        message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 80000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
+        llm_inproc_retries=limits_data.get("llm_inproc_retries", 5),
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
-        summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
-        summarization_chunk_size=limits_data.get("summarization_chunk_size", 60000),
+        image_tokens=limits_data.get("image_tokens"),
+        pdf_render_dpi=limits_data.get("pdf_render_dpi"),
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
+        tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
-        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 0),
+        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 5000),
+        act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
+        process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
+        progress_push_interval_seconds=limits_data.get(
+            "progress_push_interval_seconds", 60
+        ),
+        progress_wip_commit_after_seconds=limits_data.get(
+            "progress_wip_commit_after_seconds", 300
+        ),
+        queued_reply_max_wait_seconds=limits_data.get(
+            "queued_reply_max_wait_seconds", 300
+        ),
     )
 
     context_data = data.get("context_management", {})
@@ -1869,6 +2853,9 @@ def load_agent_config_from_dict(
         compact_on_archive=context_data.get("compact_on_archive", True),
         keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
+        keep_window_max_tool_result_chars=context_data.get(
+            "keep_window_max_tool_result_chars", 16000
+        ),
         summarization_template=context_data.get(
             "summarization_template", "summarization_prompt.txt"
         ),
@@ -1892,9 +2879,13 @@ def load_agent_config_from_dict(
     instruction_files_data = data.get("instruction_files", [])
     instruction_files = [
         InstructionFileEntry(
-            file=entry["file"],
             trigger=entry["trigger"],
+            file=entry.get("file"),
+            skill=entry.get("skill"),
             enforce=entry.get("enforce", True),
+            phases=entry.get("phases"),
+            read_scope=entry.get("read_scope", "job"),
+            max_read_age_turns=entry.get("max_read_age_turns"),
         )
         for entry in instruction_files_data
     ]
@@ -1907,6 +2898,8 @@ def load_agent_config_from_dict(
         default_timeout=delegation_data.get("default_timeout", 7200),
         max_timeout=delegation_data.get("max_timeout", 14400),
         allowed_configs=delegation_data.get("allowed_configs", []),
+        mode=delegation_data.get("mode", "heavy"),
+        light=delegation_data.get("light", {}) or {},
     )
 
     # Parse autonomy level
@@ -1914,6 +2907,14 @@ def load_agent_config_from_dict(
     if autonomy not in VALID_AUTONOMY_LEVELS:
         logger.warning(f"Invalid autonomy level '{autonomy}', defaulting to 'partial'")
         autonomy = "partial"
+
+    # Parse image-quality tier (economy|standard|high)
+    image_quality = data.get("image_quality", "standard")
+    if image_quality not in VALID_IMAGE_QUALITY_TIERS:
+        logger.warning(
+            f"Invalid image_quality '{image_quality}', defaulting to 'standard'"
+        )
+        image_quality = "standard"
 
     # Collect extra fields
     known_fields = {
@@ -1935,9 +2936,30 @@ def load_agent_config_from_dict(
         "delegation",
         "interactive",
         "headless",
+        "officer",
         "autonomy",
+        "image_quality",
+        # Both are emitted by ``dataclasses.asdict(AgentConfig)`` and are
+        # therefore present whenever a caller round-trips a live config (the
+        # session ``config.update`` path does exactly that). Without them here
+        # the comprehension below treats them as ordinary unknown keys: the
+        # whole namespace is re-buried as ``extra["extra"]``, so
+        # ``config.extra["shell"]`` — and every other extra key — vanishes from
+        # the rebuilt config. That is the root cause of
+        # knowledge-base/knowledge/issues/live_config_update_buries_extra_and_empties_the_shell_group.md;
+        # ``_deployment_dir`` is plumbing the caller passes as an argument.
+        "extra",
+        "_deployment_dir",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
+
+    # A serialized ``extra`` sub-dict rehydrates as itself. Top-level unknown
+    # keys still win, preserving the precedence a caller gets today when it
+    # hands us a hand-built dict that spells extras at the top level.
+    nested_extra = data.get("extra")
+    if isinstance(nested_extra, dict):
+        for key, value in nested_extra.items():
+            extra.setdefault(key, value)
 
     # Parse interactive config
     interactive_data = data.get("interactive", {})
@@ -1956,6 +2978,9 @@ def load_agent_config_from_dict(
         ),
     )
 
+    # Parse officer config (centurion — shared helper, both loader paths)
+    officer_config = _parse_officer_config(data)
+
     return AgentConfig(
         agent_id=data["agent_id"],
         display_name=data["display_name"],
@@ -1973,19 +2998,21 @@ def load_agent_config_from_dict(
         delegation=delegation_config,
         interactive=interactive_config,
         headless=headless_config,
+        officer=officer_config,
         autonomy=autonomy,
+        image_quality=image_quality,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
 
 
 def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
-    """Load an uploaded config file and merge with defaults.
+    """Load an uploaded worker config file and merge with worker_base.
 
-    The uploaded config is treated as an override on top of defaults.yaml.
+    The uploaded config is treated as an override on top of worker_base.yaml.
     Uses the same deep_merge semantics as $extends inheritance.
 
-    This enables per-job config customization without modifying the defaults.
+    This enables per-job config customization without modifying the mode base.
 
     Args:
         uploaded_config_path: Path to the uploaded YAML config file
@@ -1999,14 +3026,14 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
         # llm:
         #   temperature: 0.7
         #
-        # Result is defaults.yaml with temperature overridden to 0.7
+        # Result is worker_base.yaml with temperature overridden to 0.7
 
         merged = load_uploaded_config(Path("/workspace/uploads/config_123/agent.yaml"))
         config = load_agent_config_from_dict(merged)
         ```
     """
     # Load defaults first
-    defaults_path, _ = resolve_config_path("defaults")
+    defaults_path, _ = resolve_config_path("worker_base")
     defaults_data = load_and_merge_config(defaults_path)
 
     # Load uploaded config
@@ -2016,6 +3043,10 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
     # Remove $extends if present - we always extend defaults for uploaded configs
     uploaded_data.pop("$extends", None)
     uploaded_data.pop("$comment", None)
+
+    # Normalisation seam 2 of 6: a job's uploaded config is an authored layer
+    # like any other, and this path never goes through load_and_merge_config.
+    uploaded_data = normalize_tool_policy(uploaded_data)
 
     # Merge: defaults as base, uploaded as override
     merged = deep_merge(defaults_data, uploaded_data)
@@ -2034,11 +3065,16 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
 
 
 def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -> str:
-    """Determine how reasoning level is delivered to the model.
+    """Determine how the reasoning *level* is delivered to the model.
 
     - "prompt": Inject `Reasoning: {level}` in system prompt (gpt-oss via vLLM)
-    - "api": Pass as API parameter (OpenAI, OpenRouter native models)
-    - "none": Model doesn't support reasoning level control (Anthropic, Google, Groq)
+    - "api": Pass as an API parameter (effort enum / token budget)
+    - "none": No reasoning-level control we drive here (binary toggle, always-on,
+      or unsupported) — the factory handles toggles directly.
+
+    Derived from the family's ``reasoning`` block in model_config_matrix.yaml
+    (single source of truth — see knowledge-base/knowledge/features/family_centered_reasoning.md).
+    ``explicit_method`` still wins for callers that pin it.
 
     Args:
         model: Model name for family detection
@@ -2050,22 +3086,14 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
     if explicit_method:
         return explicit_method
 
-    family = family_of(model)
-
-    if family == "gpt-oss":
-        return "prompt"
-    if family in (
-        "claude-opus",
-        "claude-sonnet",
-        "claude-haiku",
-        "gemini",
-        "minimax",
-        "minimax-m3",
-        "gemma",
-    ):
-        return "none"
-    # gpt-5, gpt-4o, o-series, deepseek, qwen, llama, default
-    return "api"
+    cap = reasoning_capability(model)
+    method = cap.get("method", "none")
+    if method == "effort_enum":
+        return "prompt" if cap.get("delivery") == "prompt" else "api"
+    if method == "token_budget":
+        return "api"
+    # binary_toggle, always_on, none → no prompt/effort-param delivery
+    return "none"
 
 
 def _should_use_reasoning_summary(model: str) -> bool:
@@ -2082,25 +3110,162 @@ def _should_use_reasoning_summary(model: str) -> bool:
     return any(model_lower.startswith(p) for p in reasoning_prefixes)
 
 
-# Reasoning levels supported by each provider API
+# Reasoning levels assumed for the OpenAI wire when a family declares no usable
+# `options` list (conservative fallback; the matrix `reasoning.options` is the
+# source of truth — see knowledge-history/done/family_centered_reasoning.md).
 _OPENAI_REASONING_LEVELS = {"low", "medium", "high"}
+
+# Known effort levels, weakest → strongest. Clamping walks this ladder downward
+# from an unsupported request (never silently exceeding the asked-for effort),
+# then upward only when nothing below is supported (e.g. `minimal` on a
+# low/medium/high family).
+_EFFORT_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _supported_efforts(cap: Dict[str, Any]) -> set[str]:
+    """Effort values a family accepts, from its matrix ``reasoning.options``.
+
+    Falls back to the conservative OpenAI set when the capability block carries
+    no usable options list (fall-through ``default`` entries, malformed blocks).
+    """
+    options = cap.get("options") if isinstance(cap, dict) else None
+    if isinstance(options, (list, tuple)) and options:
+        return {str(o).lower() for o in options}
+    return set(_OPENAI_REASONING_LEVELS)
 
 
 def _clamp_reasoning_level(level: str, supported: set[str]) -> str:
     """Clamp a reasoning level to the nearest supported value.
 
-    Maps unsupported levels to the closest supported equivalent:
-    - 'minimal' -> 'low'
-    - 'xhigh' -> 'high'
+    Walks ``_EFFORT_LADDER`` downward from the requested level, then upward
+    when nothing below is supported. Unknown values off the ladder fall back
+    to ``high``.
     """
+    level = str(level).lower()
     if level in supported:
         return level
-    mapping = {"minimal": "low", "xhigh": "high"}
-    clamped = mapping.get(level, level)
-    if clamped not in supported:
-        return "high"  # safe fallback
-    logger.debug(f"Clamped reasoning level '{level}' -> '{clamped}' for provider")
-    return clamped
+    if level in _EFFORT_LADDER:
+        idx = _EFFORT_LADDER.index(level)
+        for candidate in reversed(_EFFORT_LADDER[:idx]):
+            if candidate in supported:
+                logger.debug(f"Clamped reasoning level '{level}' -> '{candidate}'")
+                return candidate
+        for candidate in _EFFORT_LADDER[idx + 1 :]:
+            if candidate in supported:
+                logger.debug(f"Clamped reasoning level '{level}' -> '{candidate}'")
+                return candidate
+    logger.debug(f"Unknown reasoning level '{level}' -> 'high' (safe fallback)")
+    return "high"
+
+
+def _set_nested(d: dict, dotted: str, value: Any) -> None:
+    """Set ``d['a']['b'] = value`` for ``dotted='a.b'``, creating intermediate
+    dicts as needed (used to place e.g. chat_template_kwargs.enable_thinking
+    into a request's extra_body)."""
+    parts = dotted.split(".")
+    node = d
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
+
+
+def reasoning_capability(model: str) -> Dict[str, Any]:
+    """Return the ``reasoning`` capability block for a model's family.
+
+    Single source of truth for how a family's reasoning is controlled
+    (``method`` / ``default`` / ``options`` / wire), read from
+    ``config/model_config_matrix.yaml`` (cached). Falls through
+    family → ``default`` → ``{"method": "none"}``.
+
+    ``method`` is one of: ``effort_enum`` (effort levels — ``delivery`` =
+    ``native`` API param or ``prompt`` system-prefix), ``binary_toggle``
+    (on/off via ``toggle_param``), ``token_budget`` (Phase 2),
+    ``always_on`` (cannot disable), or ``none``.
+
+    Deployment-overlay reasoning overrides are not applied yet (v1).
+    See knowledge-base/knowledge/features/family_centered_reasoning.md.
+    """
+    base_path = get_project_root() / "config" / "model_config_matrix.yaml"
+    matrix = _load_model_config_matrix_file(base_path)
+    fam = family_of(model)
+    block = (matrix.get(fam) or {}).get("reasoning")
+    if not isinstance(block, dict):
+        block = (matrix.get("default") or {}).get("reasoning")
+    return block if isinstance(block, dict) else {"method": "none"}
+
+
+def resolve_reasoning_plan(config: "LLMConfig") -> Dict[str, Any]:
+    """Resolve the effective reasoning delivery for a dispatch.
+
+    Combines the family ``reasoning`` capability with the requested
+    ``config.reasoning_level`` and returns
+    ``{"method", "value", "delivery", "cap"}``. ``value`` is the effort string
+    (effort_enum), ``"on"``/``"off"`` (binary_toggle), or ``None`` (no
+    injection). Factories translate this onto their own transport; effort
+    values are still transport-clamped by the factory.
+    """
+    cap = reasoning_capability(config.model)
+    method = cap.get("method", "none")
+    requested = config.reasoning_level
+    req_l = str(requested).lower() if requested is not None else None
+
+    if method == "binary_toggle":
+        if req_l in ("none", "off", "false"):
+            value = "off"
+        elif req_l in ("on", "true"):
+            value = "on"
+        elif req_l is None:
+            value = cap.get("default", "on")
+        else:
+            # An effort-style level (high/medium/low) on a toggle model = ON.
+            value = "on"
+        return {"method": method, "value": value, "delivery": "toggle", "cap": cap}
+
+    if method == "effort_enum":
+        # Inject only when a level is explicitly requested. The family default
+        # is applied by the upstream resolution layer, not re-applied here, so an
+        # unset level stays unset — this preserves the prior factory gate and
+        # keeps non-reasoning fallthrough models from getting an unwanted effort.
+        value = None if (req_l is None or req_l == "none") else requested
+        return {
+            "method": method,
+            "value": value,
+            "delivery": cap.get("delivery", "native"),
+            "cap": cap,
+        }
+
+    # token_budget (Phase 2), always_on, none → nothing to inject in v1.
+    return {"method": method, "value": None, "delivery": None, "cap": cap}
+
+
+def supports_parallel_tool_calls(provider: Optional[str], model: Optional[str]) -> bool:
+    """Whether the bind-time ``parallel_tool_calls`` kwarg may be passed.
+
+    ``parallel_tool_calls`` is an OpenAI Chat Completions parameter. It must NOT
+    be forwarded to providers/models that reject unknown fields:
+
+    - **Google**: ``langchain_google_genai`` threads the kwarg into the GenAI
+      SDK's ``GenerateContentConfig``, a strict Pydantic model
+      (``model_config = {"extra": "forbid"}``). Passing it raises
+      ``1 validation error for GenerateContentConfig / parallel_tool_calls /
+      Extra inputs are not permitted``.
+    - **OpenAI o-series reasoning models** (``o1``/``o3``/``o4``) don't accept
+      the parameter.
+
+    OpenAI-compatible providers (openai, openrouter, codex, groq) and Anthropic
+    accept it, so it is only suppressed for the cases above.
+    """
+    provider = (provider or "").lower()
+    model = (model or "").lower()
+    if provider == "google":
+        return False
+    if model.startswith(("o1", "o3", "o4")):
+        return False
+    return True
 
 
 def create_llm(
@@ -2132,7 +3297,20 @@ def create_llm(
     # endpoint, which is every endpoint case post-chunk-6 (the legacy
     # YAML fallback that distinguished ``anthropic``/``google``/``groq``
     # native is gone; the dispatcher now sets ``provider`` explicitly).
-    provider = config.provider.lower() if config.provider else "openai"
+    if config.provider:
+        provider = config.provider.lower()
+    elif config.model and config.model.lower().startswith("openrouter/"):
+        # Safety net for paths that build an LLMConfig from a model string
+        # without threading ``provider`` (notably the auxiliary rebuilds in
+        # agent.py / persistent_app.py). OpenRouter is the only provider whose
+        # base_url is resolved *from* the provider rather than stored in config,
+        # so a dropped provider silently misroutes its ``sk-or-v1`` key to
+        # api.openai.com → 401. Honour the documented "auto-detect if None"
+        # contract for the one prefix that needs it. See
+        # knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md.
+        provider = "openrouter"
+    else:
+        provider = "openai"
 
     if provider == "anthropic":
         return _create_anthropic_llm(config, limits)
@@ -2142,10 +3320,26 @@ def create_llm(
         return _create_groq_llm(config, limits)
     elif provider == "openrouter":
         return _create_openrouter_llm(config, limits)
+    elif provider == "mistral":
+        return _create_mistral_llm(config, limits)
     elif provider == "codex":
         return _create_codex_llm(config, limits)
     else:
         return _create_openai_llm(config, limits)
+
+
+# Output-token cap policy — see knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md.
+# The legacy hard 16384 starved reasoning models (their reasoning tokens are
+# billed as output and share this budget, so a hard turn truncates mid-thought
+# with finish_reason=length and no answer). The default is raised; safety now
+# comes from the context-aware backstop + an absolute ceiling (the vllm#40080
+# runaway guard moves to the ceiling + §8 detection, not this cap).
+DEFAULT_MAX_OUTPUT_TOKENS = 32768
+ABSOLUTE_MAX_OUTPUT_TOKENS = 131072  # nothing legitimate exceeds 128k in one turn
+MIN_MAX_OUTPUT_TOKENS = 4096
+# context_threshold is a *trigger* input can briefly overshoot before the next
+# compaction; reserve a margin so input + output still fit the window (keep > 0).
+OUTPUT_SAFETY_MARGIN = 4096
 
 
 def _resolve_max_output_tokens(
@@ -2154,27 +3348,90 @@ def _resolve_max_output_tokens(
 ) -> int:
     """Resolve the output token cap for non-Anthropic providers.
 
-    Mirrors the safety pattern in `_create_anthropic_llm`: when the user
-    hasn't set `max_output_tokens` explicitly, derive a sensible cap from
-    the model's declared context window. Without this, vLLM/llama.cpp
-    style endpoints fall back to their server-side default (effectively
-    unbounded for most local servers), and a single runaway generation
-    (e.g. the known gemma4 + xgrammar repetition loop, vllm#40080) can
-    emit millions of tokens of repeated content and poison the next turn.
+    Reasoning tokens are billed as output and share this budget, so the cap
+    must hold reasoning *and* the answer or the model truncates mid-thought
+    (``finish_reason=length`` with empty content). Resolution order:
 
-    Resolution order:
-      1. Explicit ``config.max_output_tokens`` (user / per-job override)
-      2. ``min(16384, ctx // 4)`` when the context window is known
-      3. ``8192`` as last resort
+      1. Explicit ``config.max_output_tokens`` (per-model registry override →
+         family ``settings.max_output_tokens`` → per-job override), else
+         ``DEFAULT_MAX_OUTPUT_TOKENS``.
+      2. Clamp by a *compaction-aligned backstop* so output fits alongside
+         post-compaction input: ``effective_ctx − context_threshold − margin``
+         (``context_threshold`` ≈ ``0.80 × ctx``) ⇒ input + output ≤ ctx, and a
+         smaller admin ``context_window`` cap proportionally shrinks output.
+      3. Clamp by ``ABSOLUTE_MAX_OUTPUT_TOKENS``; the backstop never falls below
+         ``MIN_MAX_OUTPUT_TOKENS``.
     """
-    if config.max_output_tokens is not None:
-        return config.max_output_tokens
+    desired = (
+        config.max_output_tokens
+        if config.max_output_tokens is not None
+        else DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    resolved = min(desired, ABSOLUTE_MAX_OUTPUT_TOKENS)
+
     ctx = config.model_max_context_tokens or (
         limits.model_max_context_tokens if limits else None
     )
     if ctx:
-        return min(16384, ctx // 4)
-    return 8192
+        threshold = (
+            getattr(limits, "context_threshold_tokens", None)
+            if limits is not None
+            else None
+        ) or int(ctx * CONTEXT_THRESHOLD_FRACTION)
+        backstop = max(MIN_MAX_OUTPUT_TOKENS, ctx - threshold - OUTPUT_SAFETY_MARGIN)
+        resolved = min(resolved, backstop)
+
+    return resolved
+
+
+# Timeout must scale with the resolved output cap (§7.2). Output decode is the
+# serial bottleneck, so a generous max_tokens needs a matching wall-clock deadline
+# or a legitimate long reasoning turn dies as "timed out after 600s" instead of
+# finishing — trading length-truncation for a timeout. Scale off the resolved cap
+# at a conservative decode rate (slow providers run ~20-40 tok/s — pick the low end
+# so a slow-but-valid turn isn't killed), floored at the configured base. Bounded
+# implicitly by ABSOLUTE_MAX_OUTPUT_TOKENS (~131072/30 + 60 ≈ 74 min worst case).
+TIMEOUT_DECODE_TOKENS_PER_SEC = 30
+TIMEOUT_BASE_OVERHEAD_SECONDS = 60
+
+
+def _resolve_timeout(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> Optional[float]:
+    """Scale the per-call timeout with the resolved output cap (§7.2).
+
+    Returns None when no base timeout is configured (caller leaves the provider
+    default untouched). Otherwise ``max(base, max_tokens / decode_rate + overhead)``
+    so a large ``max_output_tokens`` turn has wall-clock room to finish while small
+    turns keep the configured base. Static at construction — the LLM is built
+    per-dispatch with the cap known, so no per-call plumbing is needed. See
+    knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md §7.2.
+    """
+    base = config.timeout
+    if base is None:
+        return None
+    max_tokens = _resolve_max_output_tokens(config, limits)
+    needed = max_tokens / TIMEOUT_DECODE_TOKENS_PER_SEC + TIMEOUT_BASE_OVERHEAD_SECONDS
+    return float(round(max(float(base), needed)))
+
+
+def _is_output_truncated(finish_reason: Any) -> bool:
+    """True when a turn hit the output-token cap (a ``length`` finish reason).
+
+    Reasoning tokens share ``max_output_tokens``, so a length-truncated turn can
+    arrive *empty* (reasoning consumed the whole budget before any answer) —
+    distinct from a generic empty response, and it must be surfaced as such
+    rather than retried blindly. Tolerant: a lower-cased substring match covers
+    provider spellings (``length`` / ``max_tokens`` / ``MAX_TOKENS``) and the
+    ``"lengthlength"`` stream-merge doubling (§7.1). Both graphs share this so the
+    detection stays consistent. See
+    knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md §6.
+    """
+    if not finish_reason:
+        return False
+    fr = str(finish_reason).lower()
+    return "length" in fr or "max_tokens" in fr or "max_output" in fr
 
 
 def _create_openai_llm(
@@ -2218,6 +3475,29 @@ def _create_openai_llm(
     # the dispatcher's `_inject_model_credentials` injects its `base_url`.
     base_url = config.base_url
 
+    # Gemini billing differs by endpoint: ai.google.dev bills a small flat per
+    # image (our flat image-token estimate assumes this), while Vertex crop-tiles
+    # ~7x higher — so a Vertex endpoint makes the flat estimate UNDERCOUNT (the
+    # unsafe direction). Surface the resolved endpoint so the assumption stays
+    # observable. See knowledge-base/knowledge/features/multimodal_image_cost_optimization.md §5.
+    if "gemini" in (config.model or "").lower():
+        _gemini_ep = (base_url or "").lower()
+        if "aiplatform" in _gemini_ep or "vertex" in _gemini_ep:
+            logger.warning(
+                "Gemini model %s resolved to a Vertex-style endpoint (%s); the "
+                "flat image-token estimate assumes the ai.google.dev API and "
+                "will UNDERCOUNT Vertex crop-tile billing — revisit the gemini "
+                "family's settings.image_tokens.",
+                config.model,
+                base_url,
+            )
+        else:
+            logger.info(
+                "Gemini model %s image-token endpoint: %s",
+                config.model,
+                base_url or "(provider default)",
+            )
+
     # Build model kwargs
     model_kwargs = {}
     # top_k is non-standard for the OpenAI Chat Completions API. Route it
@@ -2242,16 +3522,48 @@ def _create_openai_llm(
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
 
-    # Reasoning via Chat Completions API (reasoning_effort in model_kwargs).
+    # Reasoning delivery is driven by the family's `reasoning` capability
+    # (model_config_matrix.yaml): effort_enum→reasoning_effort, binary_toggle→
+    # chat_template_kwargs (e.g. gemma's enable_thinking). Effort delivered by
+    # system prompt (gpt-oss), token_budget, always_on and none inject nothing
+    # here. See knowledge-base/knowledge/features/family_centered_reasoning.md.
     reasoning_mode = "none"
-    if config.reasoning_level and config.reasoning_level != "none":
-        level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
+    _rplan = resolve_reasoning_plan(config)
+    if (
+        _rplan["method"] == "effort_enum"
+        and _rplan.get("delivery") == "native"
+        and _rplan.get("value")
+    ):
+        level = _clamp_reasoning_level(
+            _rplan["value"], _supported_efforts(_rplan["cap"])
+        )
         model_kwargs["reasoning_effort"] = level
         reasoning_mode = f"chat_completions(effort={level})"
+    elif _rplan["method"] == "binary_toggle" and _rplan.get("value"):
+        _cap = _rplan["cap"]
+        _param = _cap.get("toggle_param", "chat_template_kwargs.enable_thinking")
+        _tmap = _cap.get("toggle_map") or {"on": True, "off": False}
+        _tval = _tmap.get(_rplan["value"], _rplan["value"] == "on")
+        _set_nested(extra_body, _param, _tval)
+        reasoning_mode = f"chat_template({_param}={_tval})"
+
+    # Declared provider params (family settings-matrix `extra_body`, e.g.
+    # MiniMax `reasoning_split: true` so thinking arrives in reasoning_content/
+    # reasoning_details instead of `<think>` tags inside content). Merged last:
+    # declared values win over factory-computed entries.
+    if config.extra_body:
+        extra_body = deep_merge(extra_body, config.extra_body)
+
+    # Runtime cache-routing hint (see LLMConfig.prompt_cache_key). First-party
+    # OpenAI only: an explicit base_url means an OpenAI-compatible endpoint,
+    # which may reject unknown body fields and prefix-caches without a key.
+    # setdefault so an explicitly declared value keeps winning.
+    if config.prompt_cache_key and (not base_url or "api.openai.com" in base_url):
+        extra_body.setdefault("prompt_cache_key", config.prompt_cache_key)
 
     # Add timeout if specified
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     # Only add base_url if specified
     if base_url:
@@ -2275,6 +3587,13 @@ def _create_openai_llm(
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
+    # Request usage on streamed responses (stream_options.include_usage).
+    # Without it, OpenAI-compatible streaming (vLLM et al.) returns no token
+    # usage at all — the persistent path streams every main call, so turn
+    # metrics / usage.updated frames were empty
+    # (knowledge-base/knowledge/features/context_summarization_rework.md S5; verified on k3d).
+    llm_kwargs["stream_usage"] = True
+
     # Pass KeyRing for automatic key rotation
     llm_kwargs["key_ring"] = key_ring
 
@@ -2283,7 +3602,7 @@ def _create_openai_llm(
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
         f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
-        f"base_url={base_url or 'default'}, timeout={config.timeout}s, "
+        f"base_url={base_url or 'default'}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
     )
@@ -2321,35 +3640,52 @@ def _create_anthropic_llm(
         llm_kwargs["top_k"] = config.top_k
 
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
-    # Anthropic requires max_tokens - use config override or model-aware defaults
-    if config.max_output_tokens is not None:
-        llm_kwargs["max_tokens"] = config.max_output_tokens
-    else:
-        model_lower = config.model.lower()
-        if any(
-            x in model_lower for x in ("opus-4-6", "opus-4-5", "opus-4-1", "opus-4-0")
-        ):
-            llm_kwargs["max_tokens"] = 32000
-        elif any(x in model_lower for x in ("sonnet-4-5", "sonnet-4-0")):
-            llm_kwargs["max_tokens"] = 16384
-        elif config.model_max_context_tokens:
-            llm_kwargs["max_tokens"] = min(8192, config.model_max_context_tokens // 4)
-        elif limits and limits.model_max_context_tokens:
-            llm_kwargs["max_tokens"] = min(8192, limits.model_max_context_tokens // 4)
-        else:
-            llm_kwargs["max_tokens"] = 4096
+    # Anthropic requires max_tokens. Route through the shared resolver so the
+    # family/per-model max_output_tokens, the compaction-aligned backstop, and
+    # the absolute ceiling apply identically across providers (the old
+    # per-model-class ladder pre-dated the reasoning-aware policy; Anthropic
+    # families set their own max_output_tokens in the matrix).
+    llm_kwargs["max_tokens"] = _resolve_max_output_tokens(config, limits)
 
     llm = ChatAnthropic(**llm_kwargs)
 
     logger.info(
         f"Created Anthropic LLM: model={config.model}, temp={config.temperature}, "
-        f"timeout={config.timeout}s, max_retries={config.max_retries}, "
+        f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={llm_kwargs['max_tokens']}"
     )
 
     return llm
+
+
+# gemini-3.x ("thinking" models, incl. 3.5) reason before answering and, at
+# temperature 0.0 (our stack default), reliably fall into a degenerate
+# token-filling loop: they burn the whole ``max_output_tokens`` budget producing
+# reasoning/garbage and return ``finish_reason=MAX_TOKENS`` with EMPTY content.
+# Reproduced live on session 91ae13f5 (temp 0.0 → repeated 16k-token runaways
+# with empty output; temp 1.0 → clean answers; bare prompt thinks ~250 tokens, so
+# the 16k was NOT genuine reasoning) and matches Google staff guidance.
+#
+# The two changes that actually help: floor the temperature off 0.0, and turn on
+# thought capture so a future loop is *visible* instead of silent. We deliberately
+# do NOT force a thinking level (3.5-flash's own default is "medium"; forcing
+# "high" raises latency and loop risk) and do NOT inflate ``max_output_tokens`` (a
+# loop just fills whatever cap it's given — more tokens wasted before the guard
+# fires, not fewer).
+_GEMINI_THINKING_MIN_TEMPERATURE = 1.0
+
+
+def _is_gemini_3_or_later(model: str) -> bool:
+    """Gemini 3.x (incl. 3.5) — the generation with the temp-0 thinking loop."""
+    return "gemini-3" in (model or "").lower().replace("models/", "")
+
+
+def _is_gemini_thinking_model(model: str) -> bool:
+    """Gemini 2.5 and 3.x emit internal reasoning ("thinking" models)."""
+    m = (model or "").lower().replace("models/", "")
+    return "gemini-2.5" in m or "gemini-3" in m
 
 
 def _create_google_llm(
@@ -2382,17 +3718,37 @@ def _create_google_llm(
 
     # Google's timeout parameter name differs
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     # ChatGoogleGenerativeAI uses ``max_output_tokens`` (not ``max_tokens``)
     max_tokens = _resolve_max_output_tokens(config, limits)
     llm_kwargs["max_output_tokens"] = max_tokens
 
+    # Thinking-model handling (see note above the helpers).
+    thinking_mode = "none"
+    if _is_gemini_thinking_model(config.model):
+        # Surface thought summaries: observability (a runaway thinking loop is
+        # visible instead of silent) + UI capture. Thinking depth stays at the
+        # model's own per-model default — we don't force a level.
+        llm_kwargs["include_thoughts"] = True
+        thinking_mode = "include_thoughts"
+        if _is_gemini_3_or_later(config.model):
+            # Floor temperature off 0.0 — the dominant trigger for the degenerate
+            # token-filling loop (empty MAX_TOKENS responses).
+            if (
+                llm_kwargs.get("temperature") is None
+                or llm_kwargs["temperature"] < _GEMINI_THINKING_MIN_TEMPERATURE
+            ):
+                llm_kwargs["temperature"] = _GEMINI_THINKING_MIN_TEMPERATURE
+                thinking_mode += f" temp={_GEMINI_THINKING_MIN_TEMPERATURE}"
+
     llm = ChatGoogleGenerativeAI(**llm_kwargs)
 
     logger.info(
-        f"Created Google LLM: model={config.model}, temp={config.temperature}, "
-        f"timeout={config.timeout}s, max_output_tokens={max_tokens}"
+        f"Created Google LLM: model={config.model}, "
+        f"temp={llm_kwargs.get('temperature')}, "
+        f"timeout={llm_kwargs.get('timeout')}s, max_output_tokens={max_tokens}, "
+        f"thinking={thinking_mode}"
     )
 
     return llm
@@ -2438,7 +3794,7 @@ def _create_groq_llm(
         llm_kwargs["model_kwargs"] = groq_model_kwargs
 
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     # Optional: custom base URL for Groq enterprise/proxy
     if config.base_url:
@@ -2451,7 +3807,7 @@ def _create_groq_llm(
 
     logger.info(
         f"Created Groq LLM: model={model}, temp={config.temperature}, "
-        f"timeout={config.timeout}s, max_retries={config.max_retries}, "
+        f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={max_tokens}"
     )
 
@@ -2513,18 +3869,29 @@ def _create_openrouter_llm(
     # Build model kwargs
     model_kwargs = {}
 
-    # OpenRouter uses nested reasoning object format.
+    # OpenRouter uses a nested reasoning object in the request body.
     # OpenRouter supports all levels (none, minimal, low, medium, high, xhigh) — no clamping needed.
-    # Pass as first-class parameter (not model_kwargs) to avoid LangChain warning.
-    reasoning_kwargs = {}
-    if config.reasoning_level and config.reasoning_level != "none":
-        reasoning_kwargs["reasoning"] = {"effort": config.reasoning_level}
-
-    # top_k must go in extra_body, not model_kwargs — the Responses API
-    # (triggered by reasoning) rejects unknown keyword arguments.
+    # It must travel via extra_body: langchain-openai >= 1.x forwards a
+    # first-class ``reasoning`` field into the Chat Completions payload, and
+    # the OpenAI SDK's typed create() rejects it (TypeError: unexpected
+    # keyword argument 'reasoning'). extra_body merges into the JSON body
+    # without going through the typed signature.
     extra_body = {}
+    _rplan = resolve_reasoning_plan(config)
+    if _rplan["method"] == "effort_enum" and _rplan.get("value"):
+        # OpenRouter supports the full effort set (incl. xhigh) — no clamp.
+        extra_body["reasoning"] = {"effort": _rplan["value"]}
+
+    # top_k is likewise non-standard for the typed Chat Completions signature.
     if config.top_k is not None:
         extra_body["top_k"] = config.top_k
+
+    # Declared provider params (family settings-matrix `extra_body`) — same
+    # merge as the openai factory. OpenRouter passes unknown params through to
+    # the underlying provider (verified harmless for e.g. MiniMax
+    # `reasoning_split`; OpenRouter normalizes reasoning either way).
+    if config.extra_body:
+        extra_body = deep_merge(extra_body, config.extra_body)
 
     # Build kwargs for ReasoningChatOpenAI
     llm_kwargs = {
@@ -2553,13 +3920,11 @@ def _create_openrouter_llm(
         llm_kwargs["default_headers"] = default_headers
 
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
 
-    # Merge reasoning as first-class kwarg and extra_body for provider-specific params
-    llm_kwargs.update(reasoning_kwargs)
     if extra_body:
         llm_kwargs["extra_body"] = extra_body
 
@@ -2574,6 +3939,13 @@ def _create_openrouter_llm(
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
+    # Request usage on streamed responses (stream_options.include_usage).
+    # Without it, OpenAI-compatible streaming (vLLM et al.) returns no token
+    # usage at all — the persistent path streams every main call, so turn
+    # metrics / usage.updated frames were empty
+    # (knowledge-base/knowledge/features/context_summarization_rework.md S5; verified on k3d).
+    llm_kwargs["stream_usage"] = True
+
     # Pass KeyRing for automatic key rotation
     llm_kwargs["key_ring"] = key_ring
 
@@ -2587,9 +3959,88 @@ def _create_openrouter_llm(
     )
     logger.info(
         f"Created OpenRouter LLM: model={model}, temp={config.temperature}, "
-        f"base_url={base_url}, timeout={config.timeout}s, "
+        f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
+    )
+
+    return llm
+
+
+def _create_mistral_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
+    """Create a Mistral AI LLM (native api.mistral.ai, OpenAI-compatible wire).
+
+    First-class provider routed through ReasoningChatOpenAI against Mistral's
+    OpenAI-compatible Chat Completions endpoint — the same strategy as the
+    openrouter/codex factories, so it inherits the reasoning-channel and
+    parallel-tool-call handling without pulling in a separate SDK. Requires
+    MISTRAL_API_KEY (env) or config.api_key.
+
+    Models are bare Mistral ids (mistral-large-latest, mistral-medium-latest,
+    mistral-small-latest, codestral-latest, …). A defensive ``mistral/`` prefix
+    is stripped if present; the API expects the bare id.
+    """
+    api_key = config.api_key or os.getenv("MISTRAL_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "MISTRAL_API_KEY environment variable required for Mistral provider. "
+            "Set it in your environment or provide api_key in config."
+        )
+
+    # Strip a defensive mistral/ prefix — the native API expects bare ids.
+    model = config.model
+    if model.lower().startswith("mistral/"):
+        model = model[len("mistral/") :]
+
+    # Base URL: explicit config wins, otherwise Mistral's API.
+    base_url = config.base_url or "https://api.mistral.ai/v1"
+
+    # top_k is non-standard for the typed Chat Completions signature, so it
+    # rides in extra_body (same treatment as the openrouter factory).
+    extra_body = {}
+    if config.top_k is not None:
+        extra_body["top_k"] = config.top_k
+
+    llm_kwargs = {
+        "model": model,
+        "temperature": config.temperature,
+        "api_key": api_key,
+        "base_url": base_url,
+        "max_retries": config.max_retries,
+        # Mistral's endpoint is Chat Completions, not the Responses API.
+        "use_responses_api": False,
+    }
+    if config.top_p is not None:
+        llm_kwargs["top_p"] = config.top_p
+    if config.timeout is not None:
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
+    if extra_body:
+        llm_kwargs["extra_body"] = extra_body
+
+    max_tokens = _resolve_max_output_tokens(config, limits)
+    llm_kwargs["max_tokens"] = max_tokens
+
+    # Per-model context window for HTTP-layer validation (Layer 0 safety).
+    max_context_tokens = config.model_max_context_tokens or (
+        limits.model_max_context_tokens if limits else None
+    )
+    if max_context_tokens:
+        llm_kwargs["max_context_tokens"] = max_context_tokens
+
+    # Request usage on streamed responses (stream_options.include_usage) so the
+    # persistent path gets turn metrics — same as the openrouter factory.
+    llm_kwargs["stream_usage"] = True
+
+    llm = ReasoningChatOpenAI(**llm_kwargs)
+
+    logger.info(
+        f"Created Mistral LLM: model={model}, temp={config.temperature}, "
+        f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
+        f"max_retries={config.max_retries}, "
+        f"max_context_tokens={max_context_tokens or 'default'}, max_tokens={max_tokens}"
     )
 
     return llm
@@ -2643,11 +4094,13 @@ def _create_codex_llm(
 
     # Build model kwargs
     model_kwargs = {}
-    # top_k is non-standard for the OpenAI Responses API. Route it via
-    # extra_body so the proxy can forward it to the underlying provider.
+    # NOTE: top_k is deliberately NOT forwarded. The Codex proxy speaks ONLY
+    # the OpenAI Responses API, which rejects top_k with 400 "Unsupported
+    # parameter: top_k". The codex lane talks to that endpoint directly to
+    # preserve the Responses-API reasoning summary, so it must self-sanitize. A
+    # stale top_k can reach here from a prior model family (e.g. gemma's top_k=64)
+    # surviving a session model switch to gpt-5.x/codex.
     extra_body: dict = {}
-    if config.top_k is not None:
-        extra_body["top_k"] = config.top_k
 
     # Build kwargs for ReasoningChatOpenAI.
     # The Codex proxy (CLIProxyAPI) only supports the Responses API endpoint
@@ -2665,10 +4118,14 @@ def _create_codex_llm(
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
 
-    # Reasoning via Responses API (required by Codex proxy).
+    # Reasoning via Responses API (required by Codex proxy). Codex models are
+    # effort_enum; driven through the family capability for consistency.
     reasoning_mode = "none"
-    if config.reasoning_level and config.reasoning_level != "none":
-        level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
+    _rplan = resolve_reasoning_plan(config)
+    if _rplan["method"] == "effort_enum" and _rplan.get("value"):
+        level = _clamp_reasoning_level(
+            _rplan["value"], _supported_efforts(_rplan["cap"])
+        )
         if _should_use_reasoning_summary(model):
             llm_kwargs["reasoning"] = {
                 "effort": level,
@@ -2680,7 +4137,7 @@ def _create_codex_llm(
             reasoning_mode = f"chat_completions(effort={level})"
 
     if config.timeout is not None:
-        llm_kwargs["timeout"] = config.timeout
+        llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
@@ -2707,7 +4164,7 @@ def _create_codex_llm(
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
         f"Created Codex LLM: model={model}, temp={config.temperature}, "
-        f"base_url={base_url}, timeout={config.timeout}s, "
+        f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
     )
@@ -2753,6 +4210,127 @@ def load_phase_component(
     """
     prompt_type = "strategic" if is_strategic else "tactical"
     return matrix_resolver.load(prompt_type)
+
+
+# Placeholders the prompt assembler owns and substitutes. Everything else that
+# looks like a brace — CSS in a designer mockup, ``{py,sh,md}`` in a repro-path
+# hint, a JSON example — is literal prose and must survive untouched. We render
+# these keys explicitly instead of ``str.format`` because ``str.format`` treats
+# EVERY ``{...}`` as a field and raises KeyError on the first literal brace,
+# which hard-fails the job at phase render (vault issues/, product-qa 'py,sh,md').
+_PROMPT_PLACEHOLDER_RE = re.compile(
+    r"\{(phase_number|agent_display_name|expert_identity|available_skills|prompt_content)\}"
+)
+
+
+def render_placeholders(text: str, **known: str) -> str:
+    """Substitute the known ``{placeholder}`` tokens; leave all other braces literal.
+
+    Single-pass (like ``str.format`` — a placeholder appearing inside an already
+    substituted value is NOT re-expanded) over an explicit allow-list, so trusted
+    prompt prose can contain arbitrary literal braces without crashing the render.
+    Only keys present in ``known`` are eligible; an allow-listed token with no
+    value supplied is left as-is rather than raising.
+    """
+
+    def _sub(m: "re.Match[str]") -> str:
+        key = m.group(1)
+        return str(known[key]) if key in known else m.group(0)
+
+    return _PROMPT_PLACEHOLDER_RE.sub(_sub, text)
+
+
+def scheduled_work_system_floor(
+    tool_names: "set[str] | frozenset[str] | list[str] | tuple[str, ...] | None",
+) -> str:
+    """Return the operating rule for jobs a session schedules, or "".
+
+    Sessions that can create worker jobs are told, once, how to behave when one
+    finishes — because the wake mechanism (see
+    knowledge-base/knowledge/features/session_wake_on_job_completion.md) delivers a notice per job,
+    and without a policy the natural failure mode is narrating all six
+    completions of a fan-out, which turns the conversation into a job queue.
+
+    **Why this seam and not the obvious ones.** Not in the notice itself: it
+    would be repeated on every wake, pay tokens every time, and be compacted
+    away. Not in the persona: a persona key can be silently clobbered by any DB
+    expert row that populates it, and once DB-sourced it is *fenced as
+    untrusted* ("this is a request, not policy") — the wrong altitude for an
+    operational rule. Not by editing the prompt templates either: prompt text is
+    baked into ``resolved_config`` at thread creation and preferred over disk on
+    read, so a ``.txt`` edit reaches new sessions only, and there are four
+    ``systemprompt_interactive*`` variants to keep in sync.
+
+    Computed here, it is family-independent (one edit covers every template),
+    reaches already-running threads because it is recomputed per prompt build,
+    sits at trusted system altitude, and is immune to expert override —
+    ``systemprompt_interactive`` is excluded from both the overlay and expert
+    prompt allow-lists.
+
+    Gated on ``create_job`` so it costs exactly nothing for the (default)
+    sessions without the Fleet Management tool group.
+    """
+    if "create_job" not in set(tool_names or ()):
+        return ""
+    return (
+        "<scheduled_work>\n"
+        "Jobs you create with create_job run asynchronously; you are told "
+        "when each one finishes. On each notice, decide: inspect the result now "
+        "(get_job for the summary; list_job_files / "
+        "get_job_file for files the worker pushed — committed state "
+        "as of its last phase-boundary push) or note it and continue. Speak "
+        "to the user only when a result changes the plan or a job failed — do "
+        "not narrate every completion of a fan-out. If an early result shows the "
+        "batch is heading the wrong way, cancel the siblings with "
+        "cancel_job rather than letting them spend.\n"
+        "</scheduled_work>"
+    )
+
+
+# Prefix of the date line every system prompt carries. Kept distinct so
+# ``with_current_date`` can find a stale line and rewrite it where it stands,
+# without disturbing the rest of the prompt.
+_CURRENT_DATE_PREFIX = "Current date:"
+
+
+def current_date_line() -> str:
+    """The one-line UTC date stamp appended to every system prompt.
+
+    The weekday is the load-bearing part, not decoration: opening hours,
+    schedules and "is it a business day" questions are unanswerable without it.
+    An agent that cannot resolve "today" reaches for a shell to run ``date`` —
+    and on the lite workspace tiers there is no shell to reach for.
+    """
+    now = datetime.now(timezone.utc)
+    return f"{_CURRENT_DATE_PREFIX} {now:%Y-%m-%d} ({now:%A}, UTC)"
+
+
+def with_current_date(prompt: str) -> str:
+    """Refresh the prompt's current-date line, appending one if absent.
+
+    An existing line is rewritten *in place* rather than moved to the tail: the
+    managed product guide is deliberately the last thing in the interactive
+    prompt (see ``get_phase_system_prompt``), and the per-turn refresh must not
+    displace it.
+
+    Idempotent, which is what makes that refresh cheap — callers re-apply it
+    without tracking whether a date is already there, and an unchanged date
+    returns the original string so the caller's identity check stays cheap too.
+
+    Day granularity rather than clock time is deliberate. The system message is
+    the head of the provider prompt-cache prefix, so a per-turn timestamp would
+    invalidate that cache on every single turn; a date changes at most once per
+    session-day. Agents needing wall-clock precision still have their tools.
+    """
+    fresh = current_date_line()
+    lines = prompt.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith(_CURRENT_DATE_PREFIX):
+            if line == fresh:
+                return prompt
+            lines[i] = fresh
+            return "\n".join(lines)
+    return prompt.rstrip() + "\n\n" + fresh
 
 
 def get_phase_system_prompt(
@@ -2817,19 +4395,47 @@ def get_phase_system_prompt(
                 expert_identity = resolver.load("persona")
             except FileNotFoundError:
                 expert_identity = ""
+        if expert_identity and config.extra.get("_persona_source") == "db":
+            # Untrusted user persona — fence + subordinate below operator policy
+            # (decision 7), never inject at system altitude.
+            from src.core.expert_resolution import fence_persona
+
+            expert_identity = fence_persona(expert_identity)
 
         # Render Jinja2 conditionals
         cli_ds_interactive = config.extra.get("_cli_datasources", [])
+        protected_cloud_interactive = bool(config.extra.get("_protected_cloud"))
         if tool_names is not None:
             template = render_instruction_content(
-                template, tool_names, cli_datasources=cli_ds_interactive
+                template,
+                tool_names,
+                cli_datasources=cli_ds_interactive,
+                protected_cloud=protected_cloud_interactive,
             )
 
-        rendered = template.format(
+        # Slice-2 skills menu (L1): fenced, untrusted user content. Empty when no
+        # in-scope skills (then {available_skills} renders blank).
+        from src.core.expert_resolution import fence_skills_menu
+
+        available_skills = fence_skills_menu(
+            config.extra.get("_resolved_skills", {}).get("menu", [])
+        )
+        rendered = render_placeholders(
+            template,
             agent_display_name=config.display_name,
             expert_identity=expert_identity,
+            available_skills=available_skills,
         )
+        # The managed product guide is runtime-owned policy, not an ordinary
+        # user skill. Model-specific interactive templates may intentionally
+        # omit {available_skills}; inject its trusted reader rule separately so
+        # every live prompt family receives the same current-digest floor.
+        from src.core.skill_resolution import managed_product_guide_system_floor
 
+        product_guide_floor = managed_product_guide_system_floor(
+            config.extra.get("_resolved_skills"),
+            tool_names or [],
+        )
         # Prepend reasoning directive for OSS models
         method = detect_reasoning_method(
             model or config.llm.model, config.llm.reasoning_method
@@ -2837,6 +4443,24 @@ def get_phase_system_prompt(
         if method == "prompt":
             level = config.llm.reasoning_level or "high"
             rendered = f"Reasoning: {level}\n\n{rendered}"
+
+        # How to behave when a job this session scheduled finishes. Same
+        # rationale as the product-guide floor for living here rather than in a
+        # template or persona; see scheduled_work_system_floor. Empty (free) for
+        # sessions without the job tools.
+        scheduled_work_floor = scheduled_work_system_floor(tool_names)
+        if scheduled_work_floor:
+            rendered = f"{rendered}\n\n{scheduled_work_floor}"
+
+        # Stamped before the product-guide floor so the floor stays the tail.
+        # persistent_graph rewrites this line in place on later turns.
+        rendered = with_current_date(rendered)
+
+        # Keep the freshness rule at the end of the trusted system message.
+        # Long resumed histories and tail-injected memory otherwise put many
+        # tokens between this rule and the current turn.
+        if product_guide_floor:
+            rendered = f"{rendered}\n\n{product_guide_floor}"
 
         return rendered
 
@@ -2852,6 +4476,12 @@ def get_phase_system_prompt(
             expert_identity = resolver.load("persona")
         except FileNotFoundError:
             expert_identity = ""
+    if expert_identity and config.extra.get("_persona_source") == "db":
+        # Untrusted user persona — fence + subordinate below operator policy
+        # (decision 7), never inject at system altitude.
+        from src.core.expert_resolution import fence_persona
+
+        expert_identity = fence_persona(expert_identity)
 
     # Load phase component
     prompt_type_key = prompt_type or ("strategic" if is_strategic else "tactical")
@@ -2859,8 +4489,18 @@ def get_phase_system_prompt(
         is_strategic, resolver
     )
 
-    # Render Jinja2 conditionals BEFORE .format() — Python's str.format()
-    # chokes on {%..%} blocks. Jinja2 leaves single-brace placeholders untouched.
+    # Part 2: fence a DB-authored (untrusted) phase directive — brace-safe +
+    # subordinate to system/safety. Only when this segment came from a DB expert
+    # row (_db_prompt_keys); bundled/disk phase prompts stay trusted. Brace-
+    # stripping also stops a DB directive from smuggling our placeholder tokens
+    # (render_placeholders below only substitutes an explicit allow-list anyway).
+    if prompt_type_key in config.extra.get("_db_prompt_keys", ()):
+        from src.core.expert_resolution import fence_phase_directive
+
+        phase_component = fence_phase_directive(phase_component)
+
+    # Render Jinja2 conditionals BEFORE placeholder substitution — Jinja2 owns
+    # {%..%} blocks and leaves single-brace placeholders untouched.
     cli_ds = config.extra.get("_cli_datasources", [])
     if tool_names is not None:
         phase_component = render_instruction_content(
@@ -2870,13 +4510,26 @@ def get_phase_system_prompt(
             base_template, tool_names, cli_datasources=cli_ds
         )
 
-    # Render phase component's {phase_number} placeholder
-    rendered_component = phase_component.format(phase_number=phase_number)
+    # Render the phase component's {phase_number} placeholder. Uses
+    # render_placeholders (NOT str.format) so literal braces in the trusted prose
+    # — repro-path hints, CSS in a mockup — pass through instead of raising.
+    rendered_component = render_placeholders(
+        phase_component, phase_number=str(phase_number)
+    )
 
     # Inject all components and render remaining placeholders
-    rendered = base_template.format(
+    # Slice-2 skills menu (L1): fenced, untrusted user content. Empty when no
+    # in-scope skills (then {available_skills} renders blank).
+    from src.core.expert_resolution import fence_skills_menu
+
+    available_skills = fence_skills_menu(
+        config.extra.get("_resolved_skills", {}).get("menu", [])
+    )
+    rendered = render_placeholders(
+        base_template,
         agent_display_name=config.display_name,
         expert_identity=expert_identity,
+        available_skills=available_skills,
         prompt_content=rendered_component,
     )
 
@@ -2888,7 +4541,7 @@ def get_phase_system_prompt(
         level = config.llm.reasoning_level or "high"
         rendered = f"Reasoning: {level}\n\n{rendered}"
 
-    return rendered
+    return with_current_date(rendered)
 
 
 def load_instructions(config: AgentConfig, model: str = "") -> str:
@@ -2963,6 +4616,14 @@ def load_summarization_prompt(config: AgentConfig, model: str = "") -> str:
     # Check for pre-resolved content (from resolved_config JSONB)
     resolved = config.extra.get("_resolved_prompts", {})
     template = resolved.get("summarization") or ""
+
+    # Part 2: a DB-authored summarization prompt is untrusted user text that flows
+    # through format_map() in the summarizer (auxiliary.py) — escape its braces so
+    # stray '{'/'}' can't raise ValueError. Forgoes {conversation}/
+    # {max_summary_length} substitution (the conversation is delivered as a
+    # separate message regardless). Disk/bundled templates keep their placeholders.
+    if template and "summarization" in config.extra.get("_db_prompt_keys", ()):
+        template = template.replace("{", "{{").replace("}", "}}")
 
     if not template:
         model_family = family_of(model) if model else "default"
@@ -3041,6 +4702,17 @@ def load_auxiliary_prompt(
     return template
 
 
+@functools.lru_cache(maxsize=1)
+def _tools_config_field_names() -> tuple[str, ...]:
+    """Every ``ToolsConfig`` field, in declaration order.
+
+    Declaration order is the order ``get_all_tool_names`` emits categories in,
+    and is preserved so the resolved list is byte-identical to the hand-kept
+    tuple this replaced.
+    """
+    return tuple(f.name for f in dataclass_fields(ToolsConfig))
+
+
 def get_all_tool_names(config: AgentConfig) -> List[str]:
     """Get all tool names from configuration.
 
@@ -3054,24 +4726,22 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
     Returns:
         List of all configured tool names
     """
-    names = (
-        config.tools.workspace
-        + config.tools.core
-        + config.tools.research
-        + config.tools.browser_direct
-        + config.tools.citation
-        + config.tools.graph
-        + config.tools.sql
-        + config.tools.mongodb
-        + config.tools.git
-        + config.tools.shell
-        + config.tools.evaluation
-        + config.tools.knowledge
-        + config.tools.webdav
-        + config.tools.communication
-        + config.tools.delegation
-        + config.tools.orchestrator
-    )
+
+    def _category_names(category: str) -> list[str]:
+        value = getattr(config.tools, category, [])
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return []
+
+    names: list[str] = []
+    # Derived from the dataclass rather than transcribed. A hand-kept tuple was
+    # a third list to drift alongside ToolsConfig and config/schema.json, and
+    # its drift is silent in the worst direction: a field the tuple forgets is
+    # a category that parses, validates and grants nothing.
+    for category in _tools_config_field_names():
+        names.extend(_category_names(category))
 
     # Shell mode aliasing for backward compatibility
     shell_config = config.extra.get("shell", {})
@@ -3088,6 +4758,46 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
     return names
 
 
+_CONFIG_NAME_ALIASES = {
+    # Public compatibility aliases retained across the base-profile rename.
+    "default": "worker_base",
+    "defaults": "worker_base",
+    "persistent_default": "session_base",
+    "persistent_defaults": "session_base",
+}
+
+
+def canonical_config_name(config_name: str) -> str:
+    """Return the canonical logical base name for a legacy selector.
+
+    The aliases are an API compatibility boundary, not duplicate config files:
+    old jobs, threads, CLI commands and expert ``$extends`` values continue to
+    load while every newly persisted root uses ``worker_base``/``session_base``.
+    Explicit non-base paths are left untouched.
+    """
+    if not config_name:
+        return config_name
+    raw = str(config_name)
+    if raw in _CONFIG_NAME_ALIASES:
+        return _CONFIG_NAME_ALIASES[raw]
+    path = Path(raw)
+    if path.name in {
+        "default.yaml",
+        "defaults.yaml",
+        "default.yml",
+        "defaults.yml",
+    }:
+        return str(path.with_name("worker_base" + path.suffix))
+    if path.name in {
+        "persistent_default.yaml",
+        "persistent_defaults.yaml",
+        "persistent_default.yml",
+        "persistent_defaults.yml",
+    }:
+        return str(path.with_name("session_base" + path.suffix))
+    return raw
+
+
 def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     """
     Resolve a config name to a full path and deployment directory.
@@ -3098,7 +4808,7 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     3. config/{name}.yaml (single file config)
 
     Args:
-        config_name: Config name (e.g., "defaults", "my_agent")
+        config_name: Config name (e.g., "worker_base", "my_agent")
                     or full path to config file
 
     Returns:
@@ -3107,6 +4817,8 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
         - deployment_dir: Directory containing deployment files (for prompt resolution)
                          None if using single file config or direct path
     """
+    config_name = canonical_config_name(config_name)
+
     # If it's already a full path or has explicit extension
     if os.path.isabs(config_name) or config_name.endswith((".yaml", ".yml", ".json")):
         return (config_name, None)
@@ -3389,9 +5101,7 @@ def load_strategic_todos_template(
     instruction_type = template_name.replace(".yaml", "")
 
     try:
-        path = resolver._file_resolver.resolve(
-            resolver.resolve_filename(instruction_type)
-        )
+        path = resolver._resolve_path(instruction_type)
         logger.debug(f"Loading strategic todos from: {path}")
         # Render Jinja2 templates before YAML parsing
         if tool_names:
@@ -3634,15 +5344,27 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
             instructions[it] = None
 
     # Also resolve custom instruction files from config.instruction_files
-    # (e.g. research_guide.md) — these aren't in the matrix but need to survive
-    # serialization so resumed/VM jobs can copy them to the workspace.
+    # (e.g. research_guide.md) AND bound skills (skill:) — these aren't in the
+    # matrix but need to survive serialization so resumed/VM jobs (and the
+    # deterministic binding when the skills CATALOG is off) can materialize them.
     if config.instruction_files:
         templates_dir = get_project_root() / "config" / "templates"
         file_resolver = FileResolver(
             deployment_dir=config._deployment_dir,
             framework_dir=templates_dir,
         )
+        skills_root = get_project_root() / "config" / "skills"
         for entry in config.instruction_files:
+            if entry.skill:
+                # Bound skill: freeze SKILL.md keyed by skill name (NOT its "SKILL"
+                # stem). Flag-independent — does not depend on the catalog gather.
+                if entry.skill not in instructions:
+                    skill_md = skills_root / entry.skill / "SKILL.md"
+                    try:
+                        instructions[entry.skill] = skill_md.read_text(encoding="utf-8")
+                    except OSError:
+                        pass  # non-bundled bound skill (out of scope this slice)
+                continue
             basename = Path(entry.file).stem
             if basename not in instructions:
                 try:
@@ -3685,4 +5407,5 @@ def load_config_from_resolved(resolved: dict) -> AgentConfig:
     # Store pre-resolved content for runtime use
     config.extra["_resolved_prompts"] = resolved.get("prompts", {})
     config.extra["_resolved_instructions"] = resolved.get("instructions", {})
+    config.extra["_resolved_skills"] = resolved.get("skills") or {}
     return config

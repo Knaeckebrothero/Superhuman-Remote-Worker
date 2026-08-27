@@ -6,7 +6,7 @@
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--app-bg, #1e1e2e);
+        background: var(--app-bg);
       }
 
       .chat-container {
@@ -64,16 +64,26 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
+        gap: 12px;
         padding: 10px 16px;
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         background: var(--panel-bg);
         flex-shrink: 0;
       }
 
+      // The title yields, the actions don't. `min-width: 0` is load-bearing:
+      // without it this group's automatic minimum is its min-content width, and
+      // because the title is `white-space: nowrap` that min-content IS the whole
+      // title. The group then refuses to shrink at all and shoves .header-right
+      // past the pane edge, where the split area's overflow silently clips it —
+      // the buttons neither move nor resize, they just stop being reachable.
       .header-left {
         display: flex;
         align-items: center;
         gap: 8px;
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
       }
 
       .back-link {
@@ -94,6 +104,10 @@
         font-size: 14px;
         font-weight: 600;
         color: var(--text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
       }
 
       .header-session-id {
@@ -111,7 +125,7 @@
 
       .status-dot.connected { background: var(--success); }
       .status-dot.connecting { background: var(--warning); animation: pulse 1s infinite; }
-      .status-dot.disconnected { background: var(--surface-2, #585b70); }
+      .status-dot.disconnected { background: var(--surface-2); }
       .status-dot.error { background: var(--danger); }
 
       @keyframes pulse {
@@ -194,10 +208,14 @@
         transform: rotate(180deg);
       }
 
+      // Never shrink: a half-width button row is worse than a folded one, and
+      // the component's ResizeObserver folds these into the `⋮` menu once the
+      // title can no longer give up the space (see `headerCompact`).
       .header-right {
         display: flex;
         align-items: center;
         gap: 8px;
+        flex: 0 0 auto;
       }
 
       .settings-btn {
@@ -225,6 +243,13 @@
         gap: 12px;
         align-items: center;
         flex-shrink: 0;
+      }
+
+      // Citations panel hosts its own column layout — drop the settings banner's
+      // centered-flex + inner padding so it controls its own spacing.
+      .citations-panel-wrap {
+        display: block;
+        padding: 0;
       }
       .settings-row {
         display: flex;
@@ -289,11 +314,65 @@
       .messages {
         flex: 1;
         overflow-y: auto;
+        // overflow-y:auto alone computes overflow-x to auto too, so one
+        // too-wide child (an unbreakable token in a thought, an oversized
+        // image) turns the whole pane into a horizontal panner on mobile.
+        // Clamp it: wide content must scroll inside its own box (pre, table,
+        // katex already do) — the pane itself never scrolls sideways.
+        overflow-x: hidden;
         padding: 16px;
         display: flex;
         flex-direction: column;
+        // Suppress browser scroll anchoring: it only compensates for changes
+        // ABOVE the viewport position, so it is not a bottom-pin and cannot do
+        // this job; shipping Safari has no anchoring at all, so JS is required
+        // regardless. Leaving it on would make Chrome/FF double-compensate
+        // against our own pin while Safari compensated once. `none` buys
+        // engine-uniform behaviour. We own the scroll in script (ResizeObserver
+        // + autoScroll).
+        overflow-anchor: none;
+        // Stop scroll chaining into the page; also disables pull-to-refresh on
+        // mobile, which otherwise fires while flicking up through history.
+        overscroll-behavior-y: contain;
+        // Pin explicitly. Nothing sets scroll-behavior in the cockpit today, so
+        // this is a no-op guard against a future global `smooth` silently
+        // animating every pin (CSSOM-View: the scrollTop setter uses the
+        // COMPUTED scroll-behavior). Pins would then chase a moving target
+        // during streaming and never settle. Reserve smooth for jumpToLatest.
+        scroll-behavior: auto;
+        // Scrollbar theming is global (see styles.scss `html` rule); both
+        // scrollbar-width and scrollbar-color inherit, so no local override here.
+      }
+
+      /* Centered reading column. .messages stays full-width (padding + scroll at
+         the pane edge); this wrapper caps prose line length and carries the
+         inter-message gap. flex:1 lets the empty-state center vertically.
+
+         ⚠️ LOAD-BEARING FOR THE SCROLL PIN — do not add `overflow: hidden`,
+         `contain: layout`, or `min-height: 0` to this rule.
+
+         The pin's ResizeObserver watches this element for content growth. That
+         works because `min-height: auto` (the flex default) resolves to the
+         content-based automatic minimum, so the box grows with its content once
+         content exceeds the container. When content is SHORT the box is instead
+         stretched to the container height and appending does not resize it — the
+         RO does not fire — but that is exactly the regime where scrolling is
+         impossible, so the two are mutually exclusive by construction and the
+         missed fire cannot matter.
+
+         Any of the three properties above collapses the automatic minimum to 0.
+         The box then pins at the container height forever, the RO NEVER fires,
+         and content silently clips with no error. See
+         knowledge-base/knowledge/issues/cockpit_session_scroll_pin_misses_late_height_changes.md §8. */
+      .messages-inner {
+        flex: 1;
+        width: 100%;
+        max-width: var(--chat-content-width);
+        margin-inline: auto;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
         gap: 16px;
-        scrollbar-width: thin;
       }
 
       .empty-state {
@@ -376,6 +455,52 @@
 
       .suggestion-text {
         flex: 1;
+      }
+
+      .draft-advanced {
+        margin-top: 26px;
+        font-size: 14px;
+        color: var(--text-muted);
+        text-decoration: underline;
+        text-underline-offset: 3px;
+      }
+
+      .draft-advanced:hover {
+        color: var(--text-primary);
+      }
+
+      .draft-connectors {
+        display: flex;
+        justify-content: center;
+        margin-top: 12px;
+        min-height: 28px;
+      }
+
+      .draft-connectors-toggle,
+      .draft-connectors-state {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 10px;
+        border: 1px solid var(--border-color, var(--surface-1));
+        border-radius: var(--radius-pill, 999px);
+        background: var(--surface-0);
+        color: var(--text-secondary);
+        font-size: 12px;
+      }
+
+      .draft-connectors-toggle { cursor: pointer; }
+      .draft-connectors-toggle input { accent-color: var(--accent-color); }
+      .draft-connectors-error { color: var(--danger); }
+      .draft-connectors-error button {
+        border: 0;
+        padding: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+        text-decoration: underline;
       }
 
       @media (max-width: 600px) {
@@ -511,7 +636,7 @@
       .message {
         display: flex;
         gap: 10px;
-        max-width: 90%;
+        max-width: 100%;
         /* Pin the avatar to the top so it sits beside the first line of a
            tall bubble rather than centering against it (#9). */
         align-items: flex-start;
@@ -520,6 +645,211 @@
       .message-user {
         align-self: flex-end;
         flex-direction: row-reverse;
+      }
+
+      .rewind-btn {
+        opacity: 0;
+        transition: opacity 0.15s ease;
+        background: none;
+        border: none;
+        cursor: pointer;
+        color: var(--text-secondary);
+        padding: 2px;
+        align-self: center;
+
+        &:hover {
+          color: var(--text-primary);
+        }
+      }
+
+      .message-user:hover .rewind-btn,
+      .rewind-btn:focus-visible {
+        opacity: 1;
+      }
+
+      /* ── Rewind dialogs (action sheet + /rewind target picker) ── */
+
+      .rewind-quote {
+        margin: 0 0 6px;
+        padding: 8px 12px;
+        border-left: 3px solid var(--accent-color);
+        background: var(--surface-0);
+        border-radius: var(--radius-control);
+        color: var(--text-secondary);
+        font-style: italic;
+        font-size: 13px;
+        overflow-wrap: anywhere;
+      }
+
+      .rewind-target-meta {
+        margin: 0 0 12px;
+        padding: 0 12px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .rewind-options {
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        overflow: hidden;
+
+        & + .rewind-options {
+          margin-top: 10px;
+        }
+      }
+
+      .rewind-option {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        width: 100%;
+        padding: 10px 12px;
+        background: none;
+        border: none;
+        text-align: left;
+        cursor: pointer;
+        transition: background 0.1s ease;
+        color: var(--text-primary);
+
+        & + .rewind-option {
+          border-top: 1px solid var(--border-color);
+        }
+
+        &:hover:not(:disabled),
+        &:focus-visible {
+          background: var(--surface-0);
+        }
+
+        &:disabled {
+          opacity: 0.5;
+          cursor: default;
+        }
+      }
+
+      .rewind-option-icon {
+        color: var(--text-secondary);
+        margin-top: 1px;
+        flex-shrink: 0;
+      }
+
+      .rewind-option-text {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .rewind-option-title {
+        font-weight: 600;
+        font-size: 13px;
+      }
+
+      .rewind-option-desc {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .rewind-caveat {
+        margin: 10px 0 0;
+        font-size: 11.5px;
+        color: var(--text-muted);
+
+        & + .rewind-caveat {
+          margin-top: 2px;
+        }
+      }
+
+      .rewind-picker {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+
+      .rewind-picker-filter {
+        width: 100%;
+        padding: 8px 10px;
+        margin-bottom: 10px;
+        background: transparent;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        color: var(--text-primary);
+        font-size: 13px;
+        font-family: inherit;
+
+        &:focus {
+          outline: none;
+          border-color: var(--accent-color);
+        }
+
+        &::placeholder {
+          color: var(--text-muted);
+        }
+      }
+
+      .rewind-picker-hint {
+        margin: 0 0 10px;
+        font-size: 13px;
+        color: var(--text-secondary);
+      }
+
+      .rewind-picker-empty {
+        margin: 0;
+        font-size: 13px;
+        color: var(--text-muted);
+      }
+
+      .rewind-picker-list {
+        display: flex;
+        flex-direction: column;
+        max-height: min(55vh, 460px);
+        overflow-y: auto;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+      }
+
+      .rewind-picker-item {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        width: 100%;
+        padding: 8px 12px;
+        background: none;
+        border: none;
+        text-align: left;
+        cursor: pointer;
+        transition: background 0.1s ease;
+
+        & + .rewind-picker-item {
+          border-top: 1px solid var(--border-color);
+        }
+
+        &:hover,
+        &:focus-visible {
+          background: var(--surface-0);
+        }
+      }
+
+      .rewind-picker-time {
+        flex-shrink: 0;
+        min-width: 92px;
+        font-size: 11.5px;
+        color: var(--text-muted);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .rewind-picker-text {
+        flex: 1;
+        min-width: 0;
+        font-size: 13px;
+        line-height: 1.35;
+        color: var(--text-primary);
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        overflow-wrap: anywhere;
       }
 
       .message-assistant, .message-system {
@@ -550,13 +880,18 @@
       }
 
       .message-user .avatar-icon {
-        color: var(--on-accent, var(--timeline-bg, #11111b));
+        color: var(--on-accent, var(--timeline-bg));
       }
 
       .message-body {
-        font-size: 13px;
-        line-height: 1.5;
+        /* 15px default; the per-device text-size preference overrides via the
+           --chat-body-font-size custom property set on .chat-container. */
+        font-size: var(--chat-body-font-size, 15px);
+        line-height: 1.6;
         min-width: 0;
+        /* Long unbroken tokens (URLs, paths, hashes) in rendered markdown must
+           wrap rather than widen the pane — mirrors .user-text's break-word. */
+        overflow-wrap: break-word;
       }
 
       /* User: speech bubble — soft tinted background using the theme's
@@ -568,6 +903,25 @@
         background: var(--user-bubble, var(--surface-0));
         color: var(--user-bubble-text, var(--text-primary));
         border: 1px solid color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
+      }
+
+      /* Queued send (in the outbox, not yet accepted by the server): muted, with
+         a dashed border + clock avatar, so the user can tell it hasn't gone out
+         yet. Clears to the normal style once the flush's POST is accepted. */
+      .message-user.queued {
+        opacity: 0.65;
+
+        .message-body {
+          border-style: dashed;
+        }
+
+        .avatar {
+          background: var(--surface-0);
+        }
+
+        .avatar-icon {
+          color: var(--text-secondary);
+        }
       }
 
       /* Assistant: no bubble — flush text aligned with the avatar gutter. */
@@ -735,194 +1089,16 @@
       .tool-summary-dot.denied { background: var(--danger); }
       .tool-summary-dot.mixed { background: var(--warning); }
 
-      /* Tool detail list (level 2) — F6 card visual */
+      /* Tool detail list — flush-left with the assistant prose. The card's
+         border + fill (Gestalt "common region") already marks it as a distinct
+         action, so no horizontal indent is needed; indenting only some rows
+         would create a ragged left edge that measurably slows scanning. */
 
       .tool-detail-list {
-        padding: 6px 0 4px 20px;
+        padding: 6px 0 4px 0;
         display: flex;
         flex-direction: column;
         gap: 6px;
-      }
-
-      .tool-card {
-        font-size: 11px;
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 0;
-        background: var(--surface-0);
-        overflow: hidden;
-        max-width: min(720px, 100%);
-      }
-
-      .tool-head {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 10px;
-        cursor: pointer;
-        list-style: none;
-        background: var(--panel-bg);
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 11px;
-        color: var(--text-muted);
-      }
-
-      .tool-card[open] > .tool-head {
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-      }
-
-      .tool-head::-webkit-details-marker { display: none; }
-      .tool-head:hover { background: var(--surface-1, rgba(255, 255, 255, 0.04)); }
-
-      .tool-icon {
-        color: var(--accent-color);
-        width: 16px;
-        text-align: center;
-        flex-shrink: 0;
-      }
-
-      .tool-name {
-        color: var(--accent-color);
-        font-weight: 600;
-        flex-shrink: 0;
-      }
-
-      .tool-args {
-        color: var(--text-muted);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        flex: 1;
-        min-width: 0;
-      }
-
-      .tool-status {
-        margin-left: auto;
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.16em;
-        font-size: 9.5px;
-        font-weight: 600;
-        flex-shrink: 0;
-      }
-
-      .tool-status .tool-status-icon { font-size: 13px; }
-
-      .tool-status.status-completed,
-      .tool-status.status-completed .tool-status-icon { color: var(--success); }
-      .tool-status.status-running,
-      .tool-status.status-running .tool-status-icon { color: var(--warning); }
-      .tool-status.status-running .tool-status-icon { animation: spin 0.7s linear infinite; }
-      .tool-status.status-denied,
-      .tool-status.status-denied .tool-status-icon { color: var(--text-muted); }
-      .tool-status.status-pending,
-      .tool-status.status-pending .tool-status-icon { color: var(--text-muted); }
-      .tool-status.status-error,
-      .tool-status.status-error .tool-status-icon { color: var(--danger); }
-
-      /* Error tool card — danger left accent + tinted body so errored calls
-         are visible at a glance, even when the card is collapsed. */
-      .tool-card.tool-error { border-left: 3px solid var(--danger); }
-      .tool-card.tool-error > .tool-head .tool-name { color: var(--danger); }
-      .tool-card.tool-error > .tool-body { background: color-mix(in srgb, var(--danger) 6%, var(--surface-0)); }
-
-      .tool-body {
-        padding: 10px 12px;
-        background: var(--surface-0);
-      }
-
-      .tool-result {
-        margin: 0;
-        padding: 0;
-        background: transparent;
-        font-size: 11px;
-        max-height: 240px;
-        overflow: auto;
-        white-space: pre-wrap;
-        word-break: break-word;
-        font-family: 'JetBrains Mono', monospace;
-        line-height: 1.4;
-        color: var(--text-secondary);
-      }
-
-      /* #7: diff/content view inside an edit_file/write_file tool card.
-         Overrides .tool-body's padding (diff-head/body carry their own). */
-      .tool-diff {
-        padding: 0;
-      }
-
-      .diff-head {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 6px 12px;
-        font-size: 11px;
-        color: var(--text-muted);
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-      }
-
-      .diff-mode-icon {
-        color: var(--accent-color);
-      }
-
-      .diff-mode {
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-      }
-
-      .diff-path {
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-family: 'JetBrains Mono', monospace;
-        color: var(--text-secondary);
-      }
-
-      .diff-body {
-        max-height: 320px;
-        overflow: auto;
-        padding: 4px 0;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 11px;
-        line-height: 1.45;
-      }
-
-      .diff-line {
-        display: flex;
-        padding: 0 8px;
-        white-space: pre-wrap;
-        word-break: break-word;
-      }
-
-      .diff-line .diff-sign {
-        width: 1ch;
-        flex-shrink: 0;
-        opacity: 0.55;
-        user-select: none;
-      }
-
-      .diff-line .diff-text {
-        flex: 1;
-        min-width: 0;
-      }
-
-      .diff-line.add {
-        background: color-mix(in srgb, var(--success) 18%, transparent);
-      }
-
-      .diff-line.del {
-        background: color-mix(in srgb, var(--danger) 18%, transparent);
-      }
-
-      .diff-truncated {
-        padding: 4px 12px;
-        font-size: 11px;
-        font-style: italic;
-        color: var(--text-muted);
       }
 
       /* Inline tool progress (streaming) */
@@ -958,6 +1134,12 @@
         align-items: center;
         gap: 12px;
         padding: 8px 0;
+      }
+
+      /* Mid-turn compaction marker: same divider, tucked into the event flow. */
+      .session-divider.event-compaction {
+        padding: 4px 0;
+        margin: 6px 0 2px;
       }
 
       .divider-line {
@@ -1041,6 +1223,11 @@
         line-height: 1.5;
         color: var(--text-muted);
         white-space: pre-wrap;
+        // Raw reasoning text is full of long unbroken runs (URLs, JSON,
+        // ASCII tables); pre-wrap alone can't break those and the expanded
+        // thought was the widest thing on the phone screen. anywhere also
+        // lets the intrinsic width shrink, unlike break-word.
+        overflow-wrap: anywhere;
         max-height: 300px;
         overflow-y: auto;
       }
@@ -1139,59 +1326,54 @@
 
       .mile-actions {
         display: flex;
+        flex-wrap: wrap;
         gap: 8px;
       }
 
-      .mile-resolved {
-        align-self: flex-start;
-        margin: 6px 0 6px 40px;
-        width: min(720px, calc(100% - 40px));
-        padding: 8px 14px;
+      /* Batch permission card: one row per pending call. Args are wrapped,
+         never clipped to an ellipsis — the whole safety model rests on the
+         user being able to read a destructive command before one click
+         approves every call in the batch. */
+
+      .permission-list {
         display: flex;
-        align-items: center;
-        gap: 10px;
-        background: var(--surface-0);
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-left: 3px solid var(--text-muted);
-        border-radius: 0;
+        flex-direction: column;
+        gap: 6px;
+        margin: 0 0 6px;
+        padding: 0;
+        list-style: none;
+        max-height: 260px;
+        overflow-y: auto;
+      }
+
+      .permission-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
         font-family: 'JetBrains Mono', monospace;
         font-size: 12px;
-        color: var(--text-secondary);
-      }
-
-      .mile-resolved.approved { border-left-color: var(--success); }
-      .mile-resolved.rejected { border-left-color: var(--text-muted); opacity: 0.85; }
-
-      .mile-resolved-icon { font-size: 16px; flex-shrink: 0; color: var(--text-muted); }
-      .mile-resolved.approved .mile-resolved-icon { color: var(--success); }
-      .mile-resolved.rejected .mile-resolved-icon { color: var(--text-muted); }
-
-      .mile-resolved .resolved-label {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
-        font-size: 10px;
-        font-weight: 600;
-        color: var(--text-primary);
-        flex-shrink: 0;
-      }
-
-      .mile-resolved.approved .resolved-label { color: var(--success); }
-
-      .mile-resolved .resolved-title {
-        color: var(--text-primary);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        color: var(--text-muted);
         min-width: 0;
-        flex: 1;
       }
 
-      .mile-resolved .resolved-time {
-        margin-left: auto;
-        font-size: 11px;
+      .permission-row app-icon {
         color: var(--text-muted);
         flex-shrink: 0;
+      }
+
+      .permission-tool {
+        background: transparent;
+        color: var(--accent-color);
+        font-weight: 600;
+        flex-shrink: 0;
+      }
+
+      .permission-args {
+        background: transparent;
+        color: var(--text-muted);
+        white-space: pre-wrap;
+        word-break: break-word;
+        min-width: 0;
       }
 
       .approval-badge {
@@ -1205,11 +1387,6 @@
         text-transform: uppercase;
         letter-spacing: 0.04em;
         flex-shrink: 0;
-      }
-
-      .approval-badge.approval-approved {
-        background: var(--success-tint);
-        color: var(--success);
       }
 
       .approval-badge.approval-denied {
@@ -1421,7 +1598,7 @@
 
       .composer {
         position: relative;
-        max-width: 880px;
+        max-width: var(--chat-content-width);
         margin: 0 auto;
         background: var(--panel-bg);
         border: 1px solid var(--border-color, var(--surface-0));
@@ -1453,6 +1630,7 @@
         line-height: 1.55;
         resize: none;
         display: block;
+        overflow-y: auto;
       }
 
       .chat-input:focus,
@@ -1522,7 +1700,7 @@
         display: grid;
         place-items: center;
         background: var(--accent-color);
-        color: var(--on-accent, var(--timeline-bg, #11111b));
+        color: var(--on-accent, var(--timeline-bg));
         border: 0;
         border-radius: 50%;
         cursor: pointer;
@@ -1708,6 +1886,13 @@
         min-width: 50px;
       }
 
+      .recording-time.near-cap { color: var(--warning); }
+
+      .recording-cap-warning {
+        font-size: 12px;
+        color: var(--warning);
+      }
+
       .recording-dot {
         width: 8px;
         height: 8px;
@@ -1741,7 +1926,7 @@
 
       .recording-btn.confirm {
         background: var(--accent-color);
-        color: var(--on-accent, var(--timeline-bg, #11111b));
+        color: var(--on-accent, var(--timeline-bg));
         border-color: transparent;
       }
 
@@ -1795,11 +1980,6 @@
         background: var(--surface-0);
       }
 
-      /* Mic button styled the same as other ctrl buttons */
-      .ctrl.mic .ctrl-icon {
-        font-size: 16px;
-      }
-
       /* Image preview dialog body */
       .image-preview-img {
         display: block;
@@ -1807,124 +1987,6 @@
         max-height: 70vh;
         margin: 0 auto;
         object-fit: contain;
-      }
-
-      /* Per-message action row (TTS button etc.) */
-      .message-actions {
-        display: flex;
-        gap: 4px;
-        margin-top: 6px;
-        opacity: 0.55;
-        transition: opacity 0.15s ease;
-      }
-
-      .message-actions:hover,
-      .message-actions:focus-within {
-        opacity: 1;
-      }
-
-      .msg-action-btn {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 26px;
-        height: 26px;
-        background: transparent;
-        border: 1px solid transparent;
-        border-radius: var(--radius-control);
-        color: var(--text-muted);
-        cursor: pointer;
-        transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-      }
-
-      .msg-action-btn:hover:not(:disabled) {
-        background: var(--surface-0);
-        color: var(--text-primary);
-        border-color: var(--border-color, var(--surface-0));
-      }
-
-      .msg-action-btn:disabled {
-        cursor: wait;
-      }
-
-      .tts-btn.is-error {
-        color: var(--danger, #c44);
-      }
-
-      /* The read-aloud control is a primary affordance — keep it large and
-         fully visible (not a subtle hover-dimmed action) so it isn't missed. */
-      .tts-btn {
-        width: 44px;
-        height: 44px;
-      }
-
-      .message-actions:has(.tts-btn) {
-        opacity: 1;
-      }
-
-      /* One audio player per section, stacked vertically. color-scheme:dark
-         renders the native controls in dark to fit the theme (vs the default
-         white pill). */
-      .tts-players {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-        margin-top: 6px;
-      }
-
-      .tts-player-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .tts-player {
-        color-scheme: dark;
-        flex: 0 1 320px;
-        height: 32px;
-      }
-
-      .tts-part {
-        font-size: 18px;
-        color: var(--text-muted);
-        white-space: nowrap;
-      }
-
-      /* "Generating part N…" (synthesizing) + "Preparing…" (planning) rows. */
-      .tts-prep,
-      .tts-status {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        font-size: 18px;
-        color: var(--text-muted);
-      }
-
-      .tts-prep {
-        margin-top: 6px;
-      }
-
-      .tts-status {
-        margin-top: 2px;
-      }
-
-      /* Larger spinner for the read-aloud status rows. The shared
-         .action-spinner-sm stays 12px elsewhere (e.g. the transcribe hint). */
-      .tts-prep .action-spinner-sm,
-      .tts-status .action-spinner-sm {
-        width: 22px;
-        height: 22px;
-        border-width: 3px;
-      }
-
-      /* "Spoken version" disclosure — reuses .thinking-block styling; the text
-         is already markdown-stripped prose, so just preserve its line breaks. */
-      .tts-spoken {
-        margin-top: 6px;
-      }
-
-      .tts-spoken .tts-spoken-text {
-        white-space: pre-wrap;
       }
 
       .action-spinner-sm {
@@ -1961,6 +2023,66 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+      }
+
+      /* Send stage: one line naming the phase, one bar for the whole
+         commitment (bytes + POST). Never two bars, never one per file. */
+      .upload-stage {
+        margin-top: 6px;
+      }
+
+      .upload-stage-line {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      /* The percentage lives in the visible label, which updates ~4×/s; this
+         twin carries the coarse phase for the polite region. */
+      .upload-stage-announce {
+        @include m.visually-hidden;
+      }
+
+      .upload-bar {
+        margin-top: 4px;
+        height: 3px;
+        border-radius: var(--radius-pill);
+        overflow: hidden;
+        background: color-mix(in srgb, var(--text-muted) 25%, transparent);
+      }
+
+      .upload-bar-fill {
+        height: 100%;
+        background: var(--accent-color);
+
+        /* Matches the 250ms progress-write throttle, so the fill glides
+           between writes instead of stepping. */
+        transition: width 250ms linear;
+      }
+
+      /* No computable body length — claim no position rather than lie. */
+      .upload-bar.indeterminate .upload-bar-fill {
+        width: 40%;
+        animation: upload-bar-slide 1.2s ease-in-out infinite;
+      }
+
+      @keyframes upload-bar-slide {
+        from { transform: translateX(-100%); }
+        to { transform: translateX(250%); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .upload-bar-fill {
+          transition: none;
+        }
+
+        .upload-bar.indeterminate .upload-bar-fill {
+          width: 100%;
+          animation: none;
+          opacity: 0.5;
+        }
       }
 
       /* Slash command autocomplete */
@@ -2006,6 +2128,27 @@
       }
 
       /* Markdown content styling */
+
+      /* Headings: without rules the UA default applies and a `# Title`
+         renders at 2em (30px) — billboard-sized inside a chat column,
+         comically so at phone width. Em-based so the per-device text-size
+         preference carries through. */
+      .message-body ::ng-deep h1,
+      .message-body ::ng-deep h2,
+      .message-body ::ng-deep h3,
+      .message-body ::ng-deep h4,
+      .message-body ::ng-deep h5,
+      .message-body ::ng-deep h6 {
+        margin: 14px 0 6px;
+        line-height: 1.3;
+      }
+
+      .message-body ::ng-deep h1 { font-size: 1.3em; }
+      .message-body ::ng-deep h2 { font-size: 1.2em; }
+      .message-body ::ng-deep h3 { font-size: 1.1em; }
+      .message-body ::ng-deep h4,
+      .message-body ::ng-deep h5,
+      .message-body ::ng-deep h6 { font-size: 1em; }
 
       .message-body ::ng-deep pre {
         background: var(--panel-bg);
@@ -2117,7 +2260,13 @@
 
       .message-body ::ng-deep table {
         border-collapse: collapse;
-        width: 100%;
+        /* Scroll wide tables inside the reading column instead of letting them
+           push the column (or the page) wider. Block + max-content + overflow
+           is the markdown-table pattern (the renderer doesn't wrap them). */
+        display: block;
+        width: max-content;
+        max-width: 100%;
+        overflow-x: auto;
         margin: 8px 0;
         font-size: 12px;
       }
@@ -2198,11 +2347,74 @@
         border-bottom: 1px dashed var(--info);
       }
 
+      // Inline citation markers — [N] resolved + renumbered by CitationRefDirective.
+      .message-body ::ng-deep sup.citation-ref {
+        color: var(--accent-color);
+        font-weight: 600;
+        padding: 0 1px;
+        cursor: default;
+      }
+      .message-body ::ng-deep sup.citation-ref.resolved {
+        cursor: help;
+      }
+      .message-body ::ng-deep sup.citation-ref.resolved.clickable {
+        cursor: pointer;
+        text-decoration: underline dotted;
+        text-underline-offset: 2px;
+      }
+      // A [N] that wasn't a real citation: render flat, like the literal text.
+      .message-body ::ng-deep sup.citation-ref.unresolved {
+        vertical-align: baseline;
+        font-size: inherit;
+        font-weight: inherit;
+        color: inherit;
+        cursor: default;
+      }
+
       @media (max-width: 768px) {
         .chat-header {
           flex-wrap: wrap;
           gap: 4px;
           padding: 6px 8px;
+        }
+
+        /* Let the title take the available width on one line (it was wrapping
+           to ~3 lines). The 8-char session id is redundant on a phone. */
+        .header-left {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .header-title {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .header-session-id {
+          display: none;
+        }
+
+        /* The dot alone carries connection state; the text label is what
+           pushed the header buttons into each other on a phone. */
+        .status-label {
+          display: none;
+        }
+
+        /* Decorative — the title needs those pixels more. */
+        .header-icon {
+          display: none;
+        }
+
+        .header-right {
+          flex-shrink: 0;
+        }
+
+        /* Badges (model · turn · mode …) keep their width; scroll instead of
+           spilling out of the viewport. */
+        .status-bar {
+          overflow-x: auto;
+          scrollbar-width: none;
+          &::-webkit-scrollbar { display: none; }
         }
 
         .messages {
@@ -2215,6 +2427,17 @@
 
         .chat-input {
           font-size: 16px;
+          // With the keyboard open the layout viewport is ~350-420px tall
+          // (interactive-widget=resizes-content), so a 180px draft box would
+          // leave almost no transcript visible. dvh tracks the shrunk viewport.
+          max-height: min(180px, 30dvh);
+          // Android renders the app's styled (non-overlay) scrollbars, so a
+          // capped draft shows a permanent track inside the box. Touch
+          // scrolling doesn't need the bar.
+          scrollbar-width: none;
+          &::-webkit-scrollbar {
+            display: none;
+          }
         }
 
         .composer-wrap {
@@ -2228,6 +2451,21 @@
 
         .ctrl-label {
           display: none;
+        }
+
+        // Touch targets: the desktop composer controls are 26/30px tall,
+        // well under the ~44px a thumb needs. Labels are hidden above, so
+        // the ctrl buttons become square icon targets.
+        .ctrl {
+          height: 40px;
+          min-width: 40px;
+          justify-content: center;
+          padding: 0;
+        }
+
+        .send {
+          width: 44px;
+          height: 44px;
         }
       }
 
@@ -2330,13 +2568,224 @@
 }
 .tool-group[open] > .tool-group-head .tool-group-chevron { transform: rotate(90deg); }
 
-.tool-group-label { font-weight: 600; color: var(--text-secondary); }
-
-.tool-group-names {
+// The chip's category count line ("24× searches · 6× thoughts"). Truncates
+// rather than wrapping: the chip is a one-row summary of hidden work, and a
+// wrapping chip would defeat the point of folding in the first place. The
+// category count is capped in TS so this rarely bites.
+.tool-group-label {
   @include m.truncate;
   flex: 1;
   min-width: 0;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+// Failures inside a folded run. The chip deliberately does NOT auto-open on
+// failure (a turn-wide chip would dump every card because one call errored) —
+// this badge is what carries it, and a just-failed call is pinned anyway.
+// NOTE: this file sits ~at the 36kB anyComponentStyle budget. Keep additions
+// minimal and do NOT raise the budget — see project_persistent_chat_style_budget.
+.tool-group-failed {
+  flex: none;
   font-size: 11px;
+  color: var(--danger);
 }
 
 .tool-group-body { padding: v.$space-xs; }
+
+// --- Live context-compaction progress block ---------------------------------
+// (knowledge-base/knowledge/features/context_summarization_rework.md S3 — mockup: header with
+// trigger + ctx %, segmented per-pass bar, pass detail line with in→out tokens)
+.compaction-progress {
+  margin: v.$space-sm 0;
+  padding: v.$space-sm v.$space-md;
+  border-left: 3px solid var(--warning, #e0707a);
+  border-radius: var(--radius-surface, 6px);
+  background: color-mix(in srgb, var(--warning, #e0707a) 7%, transparent);
+}
+
+.compaction-header {
+  display: flex;
+  align-items: center;
+  gap: v.$space-xs;
+  font-size: v.$font-size-sm;
+
+  .compaction-title {
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--warning, #e0707a);
+  }
+
+  .compaction-meta { color: var(--text-muted); }
+
+  .compaction-tokens {
+    margin-left: auto;
+    font-family: var(--font-mono, monospace);
+    color: var(--text-secondary);
+  }
+}
+
+.compaction-bar {
+  display: flex;
+  gap: 6px;
+  margin: v.$space-xs 0;
+
+  .compaction-segment {
+    flex: 1;
+    height: 4px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--warning, #e0707a) 22%, transparent);
+    overflow: hidden;
+    position: relative;
+
+    &.done { background: var(--warning, #e0707a); }
+
+    &.active::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: var(--warning, #e0707a);
+      animation: compaction-pulse 1.4s ease-in-out infinite;
+    }
+
+    .compaction-fill {
+      display: block;
+      height: 100%;
+      background: var(--warning, #e0707a);
+      transition: width 300ms ease;
+    }
+  }
+}
+
+@keyframes compaction-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 0.9; }
+}
+
+.compaction-detail {
+  display: flex;
+  align-items: baseline;
+  gap: v.$space-sm;
+  font-size: v.$font-size-sm;
+  color: var(--text-secondary);
+  font-family: var(--font-mono, monospace);
+
+  .compaction-retry { color: var(--warning, #e0707a); margin-left: v.$space-xs; }
+
+  .compaction-reduction {
+    margin-left: auto;
+    color: var(--text-muted);
+  }
+}
+
+// --- Live token usage panel (above composer, right-aligned) -----------------
+// Hierarchy: secondary token chips (input/output/reasoning) on the left; the
+// context-window fill — the actionable metric — promoted to a colour-ramped
+// hero gauge on the right. Aligned to the composer's centered reading column.
+.usage-panel {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: v.$space-md;
+  max-width: var(--chat-content-width);
+  margin: 0 auto 4px;
+  padding: 2px v.$space-sm;
+  font-family: var(--font-mono, monospace);
+
+  // secondary: per-turn token breakdown
+  .usage-tokens {
+    display: inline-flex;
+    align-items: center;
+    gap: v.$space-sm;
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .usage-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: v.$space-xs;
+  }
+
+  .usage-k {
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    font-size: 9.5px;
+  }
+
+  // primary: context-window fill (hero)
+  .usage-ctx {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding-left: v.$space-md;
+    border-left: 1px solid var(--border-color, var(--surface-0));
+  }
+
+  .usage-ctx-label {
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .usage-gauge {
+    display: inline-block;
+    width: 64px;
+    height: 5px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--text-muted) 22%, transparent);
+    overflow: hidden;
+  }
+
+  .usage-gauge-fill {
+    display: block;
+    height: 100%;
+    border-radius: 3px;
+    background: var(--info, #7a9bc6);
+    transition: width 300ms ease, background-color 300ms ease;
+  }
+
+  .usage-ctx-pct {
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--info, #7a9bc6);
+    min-width: 32px;
+    text-align: right;
+  }
+
+  // 3-tier threshold ramp (info → gold → blood) via real theme tokens
+  &.lvl-warn {
+    .usage-gauge-fill { background: var(--warning, #cdab68); }
+    .usage-ctx-pct { color: var(--warning, #cdab68); }
+  }
+
+  &.lvl-danger {
+    .usage-gauge-fill { background: var(--danger, #cc4647); }
+    .usage-ctx-pct { color: var(--danger, #cc4647); }
+  }
+
+  // Phone: even the reduced OUTPUT+CTX line pressed against the viewport
+  // edges. Drop the token counters entirely and let the context gauge — the
+  // one actionable number — stretch across the freed width.
+  @media (max-width: 768px) {
+    .usage-tokens {
+      display: none;
+    }
+
+    .usage-ctx {
+      flex: 1;
+      border-left: 0;
+      padding-left: 0;
+    }
+
+    .usage-gauge {
+      flex: 1;
+      width: auto;
+    }
+  }
+}

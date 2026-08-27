@@ -413,3 +413,108 @@ class TestGitToolsIntegration:
             {"commit_ref": "test-job-phase-1-tactical-complete"}
         )
         assert "todo_2" in show_result  # Last commit before tag
+
+
+# ---------------------------------------------------------------------------
+# Attached repository datasources (repos/<name>/) — see
+# knowledge-base/knowledge/issues/cloned_repo_checkout_cannot_reach_non_default_refs.md
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def attached_repo(tmp_path_factory):
+    """A second independent repo standing in for a cloned repository datasource."""
+    path = tmp_path_factory.mktemp("attached")
+    gm = GitManager(path)
+    gm.init_repository()
+    (path / "theme.md").write_text("rheinland")
+    gm.commit("docs: add theme")
+    return gm
+
+
+@pytest.fixture
+def attached_head(attached_repo):
+    """Full SHA of the attached repo's HEAD — an object the job repo has never seen."""
+    import subprocess
+
+    out = subprocess.run(
+        ["git", "-C", str(attached_repo.workspace_path), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout.strip()
+
+
+@pytest.fixture
+def context_with_attached(context, attached_repo):
+    context.workspace_manager.source_repos = {"KurortEngine": attached_repo}
+    return context
+
+
+@pytest.fixture
+def tools_with_attached(context_with_attached):
+    return create_git_tools(context_with_attached)
+
+
+class TestAttachedRepositoryReads:
+    """The git read tools must be able to address an attached repository.
+
+    Job c4849fa1 (2026-08-16) failed because git_show answered for the job's own
+    repo, returning `fatal: bad object` for a commit that was sitting in
+    repos/KurortEngine/ the whole time.
+    """
+
+    def test_git_show_reads_attached_repo(self, tools_with_attached, attached_head):
+        git_show = get_tool_by_name(tools_with_attached, "git_show")
+        result = git_show.invoke({"commit_ref": attached_head, "repo": "KurortEngine"})
+        assert "bad object" not in result
+        assert "add theme" in result
+
+    def test_unresolvable_ref_points_at_the_attached_repos(
+        self, tools_with_attached, attached_head
+    ):
+        """The whole incident in one assertion: asking the job repo for a commit
+        it cannot have must name the repos that might have it."""
+        git_show = get_tool_by_name(tools_with_attached, "git_show")
+        result = git_show.invoke({"commit_ref": attached_head})
+        assert "KurortEngine" in result
+        assert 'repo="KurortEngine"' in result
+
+    def test_unknown_repo_name_lists_the_valid_ones(self, tools_with_attached):
+        git_show = get_tool_by_name(tools_with_attached, "git_show")
+        result = git_show.invoke({"commit_ref": "HEAD", "repo": "nope"})
+        assert "KurortEngine" in result
+
+    def test_git_log_reads_attached_repo(self, tools_with_attached):
+        git_log = get_tool_by_name(tools_with_attached, "git_log")
+        result = git_log.invoke({"repo": "KurortEngine"})
+        assert "add theme" in result
+
+    def test_git_diff_reads_attached_repo(self, tools_with_attached, attached_repo):
+        (attached_repo.workspace_path / "theme.md").write_text("changed")
+        git_diff = get_tool_by_name(tools_with_attached, "git_diff")
+        result = git_diff.invoke({"repo": "KurortEngine"})
+        assert "changed" in result or "theme.md" in result
+
+    def test_git_status_reads_attached_repo(self, tools_with_attached, attached_repo):
+        (attached_repo.workspace_path / "new.txt").write_text("x")
+        git_status = get_tool_by_name(tools_with_attached, "git_status")
+        result = git_status.invoke({"repo": "KurortEngine"})
+        assert "new.txt" in result
+
+    def test_git_tags_does_not_job_scope_an_attached_repo(self, tools_with_attached):
+        """The {job_id}-phase-* convention is meaningless in someone else's repo."""
+        git_tags = get_tool_by_name(tools_with_attached, "git_tags")
+        result = git_tags.invoke({"pattern": "*", "repo": "KurortEngine"})
+        assert "test-job" not in result
+
+    def test_job_repo_still_the_default(
+        self, tools_with_attached, temp_workspace, context
+    ):
+        """Omitting `repo` must keep reading the job's own workspace repo."""
+        gm = context.workspace_manager.git_manager
+        (temp_workspace / "own.txt").write_text("mine")
+        gm.commit("job repo commit")
+        git_log = get_tool_by_name(tools_with_attached, "git_log")
+        assert "job repo commit" in git_log.invoke({})

@@ -8,11 +8,17 @@ trim_messages, and sanitize_message_history.
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from src.core.loader import (
+    CONTEXT_THRESHOLD_FRACTION,
+    MESSAGE_COUNT_MIN_FRACTION,
+)
 from src.core.context import (
     ContextManager,
     ContextConfig,
+    repair_tool_call_arguments,
     repair_tool_pairing,
     sanitize_message_history,
+    scrub_history_tool_call_arguments,
 )
 
 
@@ -234,6 +240,57 @@ class TestTokenCounting:
         assert mgr.should_summarize(messages) is True
 
 
+class TestMessageCountGateNeverBinds:
+    """Regression: a 400k-window session compacted at 162k (40% of window).
+
+    ``should_summarize`` ORs a token gate (``CONTEXT_THRESHOLD_FRACTION``,
+    0.80 of the window) with a message-count gate floored at
+    ``MESSAGE_COUNT_MIN_FRACTION``. While that floor was 0.40, every session
+    past ``message_count_threshold`` compacted at 40% of the window — half the
+    intended headroom, on a lossy summarize. The floor must never sit below the
+    token gate, so the message-count branch can never be the binding
+    constraint. See knowledge-history/done/ + session 1930dec9 (328 msgs, 162.0k/400.0k).
+    """
+
+    WINDOW = 400_000
+
+    def _mgr(self) -> ContextManager:
+        """A ContextManager wired the way the loader derives a 400k model."""
+        return ContextManager(
+            config=ContextConfig(
+                compaction_threshold_tokens=int(
+                    self.WINDOW * CONTEXT_THRESHOLD_FRACTION
+                ),
+                summarization_threshold_tokens=int(
+                    self.WINDOW * CONTEXT_THRESHOLD_FRACTION
+                ),
+                # config/session_base.yaml + config/worker_base.yaml
+                message_count_threshold=300,
+                message_count_min_tokens=int(self.WINDOW * MESSAGE_COUNT_MIN_FRACTION),
+                model_max_context_tokens=self.WINDOW,
+            )
+        )
+
+    def test_floor_is_not_below_the_token_gate(self):
+        """The derived floor must not undercut the token gate at any window."""
+        assert MESSAGE_COUNT_MIN_FRACTION >= CONTEXT_THRESHOLD_FRACTION
+
+    def test_long_session_below_token_gate_does_not_summarize(self):
+        """328 messages at 162k on a 400k model: 238k of window still free."""
+        mgr = self._mgr()
+        messages = [HumanMessage(content=f"turn {i}") for i in range(328)]
+        # The live trigger anchors on the provider's real input_tokens.
+        mgr.record_provider_usage(162_000)
+        assert mgr.should_summarize(messages) is False
+
+    def test_token_gate_still_fires_on_a_long_session(self):
+        """Neutering the message gate must not disarm the token gate."""
+        mgr = self._mgr()
+        messages = [HumanMessage(content=f"turn {i}") for i in range(328)]
+        mgr.record_provider_usage(int(self.WINDOW * CONTEXT_THRESHOLD_FRACTION) + 1)
+        assert mgr.should_summarize(messages) is True
+
+
 # =============================================================================
 # set_current_phase
 # =============================================================================
@@ -319,7 +376,7 @@ class TestEvidencePreservation:
     """Tests that write-type and error-bearing tool results survive recency
     clearing so the strategic phase audit can cite them verbatim.
 
-    See docs/features/phase_audit_protocol.md.
+    See knowledge-base/knowledge/features/phase_audit_protocol.md.
     """
 
     def test_write_file_result_preserved_when_old(self, mgr):
@@ -355,8 +412,15 @@ class TestEvidencePreservation:
         assert tool_msgs[2].content == "read result 2"
         assert tool_msgs[3].content == "read result 3"
 
-    def test_error_content_preserved_when_old(self, mgr):
-        """Old tool results containing error signals must survive clearing."""
+    def test_error_content_cleared_when_old(self, mgr):
+        """Old tool results containing error signals are cleared like any other.
+
+        Failure-content preservation was removed with the <phase_audit_protocol>
+        that consumed it (4eba5d47): keeping an agent's own stale error traces in
+        context drives the measured self-conditioning effect (arXiv 2509.09677).
+        Recent failures are still visible via the keep_recent window; only ones
+        older than it decay to a placeholder.
+        """
         messages = [
             AIMessage(
                 content="",
@@ -376,14 +440,15 @@ class TestEvidencePreservation:
         result = mgr.clear_old_tool_results(messages, keep_recent=2)
         tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
 
-        # Error message at index 0 preserved, non-error at index 1 cleared
-        assert "ENOENT" in tool_msgs[0].content
+        # Both old results cleared — error content earns no exemption
+        assert tool_msgs[0].content == "[cleared]"
         assert tool_msgs[1].content == "[cleared]"
+        # The recent window still carries failures verbatim
         assert tool_msgs[2].content == "recent 1"
         assert tool_msgs[3].content == "recent 2"
 
-    def test_traceback_content_preserved(self, mgr):
-        """Python traceback text must survive clearing."""
+    def test_traceback_content_cleared_when_old(self, mgr):
+        """Python traceback text outside the recent window is cleared too."""
         traceback_content = (
             'Traceback (most recent call last):\n  File "x.py", line 1\n'
             "ValueError: bad input"
@@ -404,8 +469,9 @@ class TestEvidencePreservation:
         ]
         result = mgr.clear_old_tool_results(messages, keep_recent=1)
         tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
-        assert "Traceback" in tool_msgs[0].content
-        assert "ValueError" in tool_msgs[0].content
+        assert tool_msgs[0].content == "[cleared]"
+        # Tool name survives so the reader still knows what produced it
+        assert tool_msgs[0].name == "run_command"
 
     def test_non_evidence_still_cleared(self, mgr):
         """Ordinary tool results with no evidence markers still get cleared."""
@@ -445,8 +511,12 @@ class TestEvidencePreservation:
         assert tool_msgs[0].content == "[cleared]"
         assert tool_msgs[0].name == "kb_search"
 
-    def test_error_content_not_truncated_when_long(self, mgr):
-        """Long error content must survive length-based truncation too."""
+    def test_error_content_truncated_when_long(self, mgr):
+        """Long error content is truncated like any other long result.
+
+        Side-effect tools (write_file/edit_file/patch_*) keep their exemption —
+        see the next test. Only the failure-content patterns were dropped.
+        """
         long_error = "Error: " + ("x" * 500) + " Exception details"
         messages = [
             AIMessage(
@@ -462,9 +532,9 @@ class TestEvidencePreservation:
         ]
         result = mgr.truncate_long_tool_results(messages)
         tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
-        # The full error content must be intact
-        assert tool_msgs[0].content == long_error
-        assert "TRUNCATED" not in tool_msgs[0].content
+        # Error content earns no length exemption any more
+        assert "TRUNCATED" in tool_msgs[0].content
+        assert len(tool_msgs[0].content) < len(long_error)
 
     def test_write_file_result_not_truncated_when_long(self, mgr):
         """write_file outputs survive length truncation."""
@@ -638,3 +708,223 @@ class TestTrimMessages:
         messages = [HumanMessage(content=f"msg {i}") for i in range(10)]
         mgr.trim_messages(messages, keep_recent=3)
         assert mgr.state.total_messages_trimmed > 0
+
+
+class TestContextConfigDefaults:
+    """ContextConfig defaults include keep-window tool result truncation."""
+
+    def test_keep_window_max_tool_result_chars_default(self):
+        assert ContextConfig().keep_window_max_tool_result_chars == 16000
+
+
+# =============================================================================
+# update_limits — in-place threshold rebind on model hot-swap
+# =============================================================================
+
+
+class TestUpdateLimits:
+    """Model hot-swap rebinds thresholds on the EXISTING manager, preserving
+    accumulated state (knowledge-base/knowledge/issues/
+    session_model_switch_stale_context_manager_empty_response.md)."""
+
+    def test_thresholds_swap_and_state_survives(self):
+        mgr = ContextManager(
+            config=ContextConfig(
+                compaction_threshold_tokens=840_000,
+                summarization_threshold_tokens=840_000,
+                model_max_context_tokens=1_050_000,
+            ),
+            model="gpt-5.5",
+        )
+        # The repro: ~125.7k history anchored from real provider usage on the
+        # big-window model — under its 840k threshold, so no compaction.
+        mgr.record_provider_usage(125_700)
+        mgr.compaction_runs = 3
+        assert mgr.should_summarize([]) is False
+
+        new_cfg = ContextConfig(
+            compaction_threshold_tokens=102_400,
+            summarization_threshold_tokens=102_400,
+            model_max_context_tokens=128_000,
+        )
+        mgr.update_limits(new_cfg, "gpt-5.3-codex-spark")
+
+        assert mgr.config is new_cfg
+        # State survives the swap: the provider anchor makes the very next
+        # should_summarize see the real context size against the new window.
+        assert mgr._state.last_provider_input_tokens == 125_700
+        assert mgr.compaction_runs == 3
+        assert mgr.should_summarize([]) is True
+
+    def test_counter_rebound_to_new_model(self):
+        mgr = ContextManager(config=ContextConfig(), model="gpt-4")
+        old_counter = mgr.token_counter
+        mgr.update_limits(ContextConfig(), "gpt-5.3-codex-spark")
+        assert mgr.token_counter is mgr._default_counter
+        assert mgr.token_counter is not old_counter
+
+
+# =============================================================================
+# repair_tool_call_arguments / scrub_history_tool_call_arguments
+# (knowledge-base/knowledge/features/outbound_message_hygiene.md — the 2026-07-11 `6a186c76`
+#  poisoned-checkpoint incident)
+# =============================================================================
+
+
+def _poisoned_ai_message(
+    raw_args: str, *, call_id: str = "call_bad1", name: str = "file_exists"
+):
+    """AIMessage shaped like incident A: malformed arguments in BOTH
+    invalid_tool_calls (LangChain's parse failure) and the raw
+    additional_kwargs entry that gets re-serialized to the provider."""
+    return AIMessage(
+        content="",
+        invalid_tool_calls=[
+            {
+                "name": name,
+                "args": raw_args,
+                "id": call_id,
+                "error": "Function call arguments were not valid JSON",
+                "type": "invalid_tool_call",
+            }
+        ],
+        additional_kwargs={
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": raw_args},
+                    "index": 0,
+                }
+            ]
+        },
+    )
+
+
+class TestRepairToolCallArguments:
+    def test_wellformed_message_untouched(self):
+        msg = AIMessage(
+            content="hi",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {"path": "a.md"},
+                    "id": "c1",
+                    "type": "tool_call",
+                }
+            ],
+            additional_kwargs={
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "a.md"}',
+                        },
+                    }
+                ]
+            },
+        )
+        out = repair_tool_call_arguments(msg)
+        assert out.tool_calls[0]["args"] == {"path": "a.md"}
+        assert out.content == "hi"
+        assert not out.invalid_tool_calls
+
+    def test_repairable_truncation_promoted_to_tool_call(self):
+        # Mid-string truncation — the closer-unwinding repair path.
+        msg = _poisoned_ai_message('{"path": "archive/phase_1_retro')
+        out = repair_tool_call_arguments(msg)
+        assert out.tool_calls and out.tool_calls[0]["name"] == "file_exists"
+        assert out.tool_calls[0]["args"] == {"path": "archive/phase_1_retro"}
+        assert not out.invalid_tool_calls
+        # Raw entry rewritten to valid JSON — nothing malformed goes back out.
+        import json as _json
+
+        raw = out.additional_kwargs["tool_calls"][0]["function"]["arguments"]
+        assert _json.loads(raw) == {"path": "archive/phase_1_retro"}
+
+    def test_trailing_comma_repaired(self):
+        msg = _poisoned_ai_message('{"path": "a.md",}')
+        out = repair_tool_call_arguments(msg)
+        assert out.tool_calls[0]["args"] == {"path": "a.md"}
+
+    def test_unrepairable_dropped_everywhere_with_note(self):
+        msg = _poisoned_ai_message("not json at all — no braces")
+        out = repair_tool_call_arguments(msg)
+        assert not out.tool_calls
+        assert not out.invalid_tool_calls
+        assert out.additional_kwargs["tool_calls"] == []
+        assert "discarded" in out.content
+        assert "file_exists" in out.content
+
+    def test_raw_only_poison_without_invalid_list(self):
+        # Checkpoint round-trips can lose invalid_tool_calls while the raw
+        # kwargs entry survives — the sweep must still catch it.
+        msg = AIMessage(
+            content="thinking...",
+            additional_kwargs={
+                "tool_calls": [
+                    {
+                        "id": "call_raw1",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "###garbage###",
+                        },
+                    }
+                ]
+            },
+        )
+        out = repair_tool_call_arguments(msg)
+        assert out.additional_kwargs["tool_calls"] == []
+        assert "discarded" in out.content
+
+    def test_good_call_kept_when_sibling_dropped(self):
+        msg = _poisoned_ai_message("no braces here")
+        msg.tool_calls = [
+            {
+                "name": "read_file",
+                "args": {"path": "b.md"},
+                "id": "c_good",
+                "type": "tool_call",
+            }
+        ]
+        msg.additional_kwargs["tool_calls"].append(
+            {
+                "id": "c_good",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "b.md"}'},
+            }
+        )
+        out = repair_tool_call_arguments(msg)
+        assert [tc["id"] for tc in out.tool_calls] == ["c_good"]
+        assert [e["id"] for e in out.additional_kwargs["tool_calls"]] == ["c_good"]
+
+    def test_history_scrub_no_note_on_nonempty_content(self):
+        poisoned = _poisoned_ai_message("no braces")
+        poisoned.content = "some prior visible answer"
+        history = [
+            HumanMessage(content="q"),
+            poisoned,
+            AIMessage(content="later"),
+        ]
+        out = scrub_history_tool_call_arguments(history)
+        assert out[1].additional_kwargs["tool_calls"] == []
+        # note=False: historical content untouched when non-empty
+        assert out[1].content == "some prior visible answer"
+
+    def test_history_scrub_stubs_empty_message(self):
+        history = [_poisoned_ai_message("no braces")]
+        out = scrub_history_tool_call_arguments(history)
+        # Now-empty assistant turn gets a stub so strict providers don't 400.
+        assert out[0].content
+        assert not out[0].tool_calls
+
+    def test_non_ai_messages_untouched(self):
+        history = [
+            HumanMessage(content="q"),
+            ToolMessage(content="r", tool_call_id="x"),
+        ]
+        out = scrub_history_tool_call_arguments(history)
+        assert out[0].content == "q" and out[1].content == "r"

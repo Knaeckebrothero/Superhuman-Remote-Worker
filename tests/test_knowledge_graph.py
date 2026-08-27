@@ -56,7 +56,7 @@ class TestConstants:
     """Tests for module-level constant sets."""
 
     def test_note_types_count(self):
-        assert len(NOTE_TYPES) == 10
+        assert len(NOTE_TYPES) == 15
 
     def test_note_types_members(self):
         expected = {
@@ -70,6 +70,12 @@ class TestConstants:
             "state",
             "retrospective",
             "datasource",
+            "feature",
+            "issue",
+            "idea",
+            # Officer types (centurion.md §5, vector/0015)
+            "charter",
+            "report",
         }
         assert NOTE_TYPES == expected
 
@@ -259,6 +265,48 @@ class TestCreateNote:
         result = kg.create_note("proj-1", "Chose JWT", "decision", "content")
         assert result.startswith("chose-jwt-")
         assert len(result) > len("chose-jwt-")
+
+    def test_collision_suffix_is_deterministic(self):
+        # Same title + same content must converge to the SAME suffixed slug on
+        # repeat, instead of forking with a random suffix each time.
+        kg, mock_db = _make_kg()
+        mock_db.execute_query.side_effect = [
+            [{"n.id": "chose-jwt"}],  # base slug collides
+            [],  # suffixed slug is free
+        ]
+        r1 = kg.create_note("proj-1", "Chose JWT", "decision", "same-body")
+
+        kg2, mock_db2 = _make_kg()
+        mock_db2.execute_query.side_effect = [
+            [{"n.id": "chose-jwt"}],
+            [],
+        ]
+        r2 = kg2.create_note("proj-1", "Chose JWT", "decision", "same-body")
+
+        assert r1.startswith("chose-jwt-")
+        assert r1 == r2  # deterministic across runs
+
+    def test_collision_different_content_diverges(self):
+        # Same title, different content → different suffix (both notes kept).
+        kg, mock_db = _make_kg()
+        mock_db.execute_query.side_effect = [[{"n.id": "t"}], []]
+        r1 = kg.create_note("proj-1", "T", "decision", "body-A")
+        kg2, mock_db2 = _make_kg()
+        mock_db2.execute_query.side_effect = [[{"n.id": "t"}], []]
+        r2 = kg2.create_note("proj-1", "T", "decision", "body-B")
+        assert r1 != r2
+
+    def test_collision_idempotent_when_suffixed_slug_exists(self):
+        # If the deterministic suffixed slug already exists (same title+content
+        # written before), return it — do NOT create a duplicate node.
+        kg, mock_db = _make_kg()
+        mock_db.execute_query.side_effect = [
+            [{"n.id": "chose-jwt"}],  # base slug collides
+            [{"n.id": "chose-jwt-deadbeef"}],  # suffixed slug already present
+        ]
+        result = kg.create_note("proj-1", "Chose JWT", "decision", "same-body")
+        assert result.startswith("chose-jwt-")
+        mock_db.execute_write.assert_not_called()  # idempotent — no new node
 
     def test_creates_note_node(self):
         kg, mock_db = _make_kg()

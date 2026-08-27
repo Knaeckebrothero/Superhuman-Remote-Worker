@@ -1,13 +1,15 @@
 """Tests for Phase 1 database refactoring.
 
-Tests the new PostgresDB, Neo4jDB, and MongoDB classes.
+Tests the new PostgresDB and Neo4jDB classes.
 """
 
-from unittest.mock import patch
+import json
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.database import PostgresDB, Neo4jDB, MongoDB
+from src.database import PostgresDB, Neo4jDB
 
 
 class TestPostgresDB:
@@ -15,7 +17,9 @@ class TestPostgresDB:
 
     def test_init_without_connection_string_uses_env(self):
         """Test that PostgresDB reads from environment."""
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        with patch.dict(
+            "os.environ", {"DATABASE_URL": "postgresql://test"}, clear=True
+        ):
             db = PostgresDB()
             assert db._connection_string == "postgresql://test"
             assert not db.is_connected
@@ -37,10 +41,16 @@ class TestPostgresDB:
 
     def test_namespaces_initialized(self):
         """Test that namespaces are initialized."""
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        with patch.dict(
+            "os.environ", {"DATABASE_URL": "postgresql://test"}, clear=True
+        ):
             db = PostgresDB()
             assert hasattr(db, "jobs")
-            assert hasattr(db, "citations")
+            assert hasattr(db, "config_overrides")
+            # No citations namespace: citations live in the vector store and are
+            # written only through CitationEngine. The old CitationsNamespace
+            # here targeted this app DB, which has no citations table.
+            assert not hasattr(db, "citations")
 
     def test_row_to_dict_with_none(self):
         """Test _row_to_dict handles None."""
@@ -57,19 +67,39 @@ class TestPostgresDB:
 
     @pytest.mark.asyncio
     async def test_connect_disconnect(self):
-        """Test connection lifecycle (requires database)."""
-        # Skip if no DATABASE_URL
-        import os
+        """Test connection lifecycle without reaching an ambient database."""
+        pool = MagicMock()
+        pool.close = AsyncMock()
+        create_pool = AsyncMock(return_value=pool)
 
-        if not os.getenv("DATABASE_URL"):
-            pytest.skip("DATABASE_URL not set")
+        with patch("src.database.postgres_db.asyncpg.create_pool", create_pool):
+            db = PostgresDB(connection_string="postgresql://test")
+            await db.connect()
+            assert db.is_connected
 
-        db = PostgresDB()
-        await db.connect()
-        assert db.is_connected
+            await db.close()
+            assert not db.is_connected
 
-        await db.close()
-        assert not db.is_connected
+        create_pool.assert_awaited_once()
+        pool.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_jobs_merge_context_strips_server_owned_pull_request(self):
+        db = PostgresDB(connection_string="postgresql://test")
+        db.execute = AsyncMock(return_value="UPDATE 1")
+        job_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
+
+        updated = await db.jobs.merge_context(
+            job_id,
+            {"pull_request": {"number": 9, "url": "https://gh/pr/9"}},
+        )
+
+        assert updated is True
+        sql, payload, bound_job_id = db.execute.await_args.args
+        normalized_sql = " ".join(sql.split())
+        assert "COALESCE(context, '{}'::jsonb) || $1::jsonb" in normalized_sql
+        assert json.loads(payload) == {}
+        assert bound_job_id == job_id
 
 
 class TestNeo4jDB:
@@ -85,62 +115,17 @@ class TestNeo4jDB:
 
     def test_connect_disconnect_no_driver(self):
         """Test connection lifecycle without actual Neo4j."""
-        db = Neo4jDB(uri="bolt://nonexistent", username="neo4j", password="test")
-        # Should return False if connection fails
-        result = db.connect()
-        assert isinstance(result, bool)
+        graph_database = MagicMock()
+        graph_database.driver.side_effect = RuntimeError("service unavailable")
+
+        with patch("src.database.neo4j_db.GraphDatabase", graph_database):
+            db = Neo4jDB(uri="bolt://nonexistent", username="neo4j", password="test")
+            # Should return False if connection fails.
+            result = db.connect()
+            assert result is False
 
         db.close()  # Should not raise
         assert not db.is_connected
-
-
-class TestMongoDB:
-    """Test MongoDB class."""
-
-    def test_init_without_url_uses_env(self):
-        """Test that MongoDB reads from environment."""
-        with patch.dict("os.environ", {"MONGODB_URL": "mongodb://test"}):
-            db = MongoDB()
-            assert db._url == "mongodb://test"
-            assert not db.is_connected
-
-    def test_init_without_url_logs_info(self):
-        """Test MongoDB handles missing URL gracefully."""
-        with patch.dict("os.environ", {}, clear=True):
-            import os
-
-            os.environ.pop("MONGODB_URL", None)
-            db = MongoDB()
-            assert db._url is None
-            assert not db.is_connected
-
-    def test_archive_returns_none_when_not_connected(self, monkeypatch):
-        """Test that archive operations return None when unavailable."""
-        monkeypatch.delenv("MONGODB_URL", raising=False)
-        db = MongoDB(url=None)
-
-        result = db.archive_llm_request(
-            job_id="test", agent_type="creator", messages=[], response={}, model="gpt-4"
-        )
-        assert result is None
-
-    def test_audit_returns_none_when_not_connected(self, monkeypatch):
-        """Test that audit operations return None when unavailable."""
-        monkeypatch.delenv("MONGODB_URL", raising=False)
-        db = MongoDB(url=None)
-
-        result = db.audit_tool_call(
-            job_id="test", agent_type="creator", tool_name="test_tool", inputs={}
-        )
-        assert result is None
-
-    def test_get_trail_returns_empty_when_not_connected(self, monkeypatch):
-        """Test that get operations return empty list when unavailable."""
-        monkeypatch.delenv("MONGODB_URL", raising=False)
-        db = MongoDB(url=None)
-
-        result = db.get_job_audit_trail("test")
-        assert result == []
 
 
 class TestDependencyInjection:
@@ -148,7 +133,9 @@ class TestDependencyInjection:
 
     def test_postgres_instance_creation(self):
         """Test PostgresDB instance creation."""
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        with patch.dict(
+            "os.environ", {"DATABASE_URL": "postgresql://test"}, clear=True
+        ):
             db = PostgresDB()
             assert isinstance(db, PostgresDB)
 
@@ -156,11 +143,6 @@ class TestDependencyInjection:
         """Test Neo4jDB instance creation."""
         db = Neo4jDB(uri="bolt://test", username="neo4j", password="test")
         assert isinstance(db, Neo4jDB)
-
-    def test_mongo_instance_creation(self):
-        """Test MongoDB instance creation."""
-        db = MongoDB()
-        assert isinstance(db, MongoDB)
 
 
 class TestBackwardCompatibility:

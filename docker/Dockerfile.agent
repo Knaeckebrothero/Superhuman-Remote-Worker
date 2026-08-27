@@ -38,38 +38,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install CPU-only PyTorch first (separate layer — rarely changes, ~200MB vs ~2GB with CUDA)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
-# Optional: path to local CitationEngine source (for local builds)
-ARG CITATION_ENGINE_PATH=""
-
+# The citation_engine package lives under src/ (src/citation_engine/) and is
+# COPY'd with the rest of src/ below — no separate install. Its runtime deps
+# are in requirements.txt.
 COPY requirements.txt .
-
-# When CITATION_ENGINE_PATH is set, exclude citation-engine from requirements
-# (it will be installed separately from local source below)
-RUN if [ -n "$CITATION_ENGINE_PATH" ]; then \
-      sed '/citation-engine/d' requirements.txt > /tmp/reqs.txt && \
-      pip install --no-cache-dir -r /tmp/reqs.txt; \
-    else \
-      pip install --no-cache-dir -r requirements.txt; \
-    fi
-
-# Copy local CitationEngine when building locally; falls back to copying
-# requirements.txt (harmless no-op) so the COPY never fails in CI/CD builds
-COPY ${CITATION_ENGINE_PATH:-requirements.txt} /tmp/citation_engine_src/
-RUN if [ -n "$CITATION_ENGINE_PATH" ]; then \
-      pip install --no-cache-dir "/tmp/citation_engine_src[full]"; \
-    fi
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Production image
 FROM python:3.11-slim
 
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+
 LABEL maintainer="SRW Team"
 LABEL description="Universal Agent for document processing and requirement validation"
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="agent"
 
 # Create non-root user early so COPY --chown can reference it
 RUN groupadd -r srw && useradd -r -g srw -m srw
 
 # Build SHA for stale-image detection (passed via --build-arg)
 ARG BUILD_SHA=""
+ARG UV_VERSION="0.7.12"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -77,8 +73,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     AGENT_CONFIG=defaults \
     AGENT_PORT=8001 \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
-    BUILD_SHA=${BUILD_SHA}
+    BUILD_SHA=${BUILD_SHA} \
+    SRW_COMPONENT=agent \
+    SRW_SOURCE_REVISION=${SRW_SOURCE_REVISION} \
+    SRW_SOURCE_URL=${SRW_SOURCE_URL} \
+    SRW_RELEASE_VERSION=${SRW_RELEASE_VERSION} \
+    SRW_DOCUMENTATION_URL=${SRW_DOCUMENTATION_URL}
 
 WORKDIR /app
 
@@ -87,8 +87,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
-# Install runtime + dev dependencies
-# The container IS the agent's computer — full toolset available.
+# Install runtime dependencies. Document/media processing runs in-process;
+# code execution (shell, browser) happens on the workspace, not in this pod.
+# rclone is the exception that proves the rule: a fixed-destination typed
+# client (no_workspace_agent_mode.md §3.1) used only by the `virtual` tier's
+# object-store backend. Needs >= 1.59 for `lsjson --stat` (bookworm ships 1.60).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
@@ -97,6 +100,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ripgrep \
     jq \
+    rclone \
     nodejs \
     build-essential \
     cmake \
@@ -113,17 +117,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     zip \
     unzip \
-    tmux \
     && rm -rf /var/lib/apt/lists/*
+
+# MCP stdio runtimes: NodeSource's nodejs package supplies node/npm/npx above;
+# uv supplies the Python server launcher (uvx). Keep uv exact-pinned so an
+# agent-image rebuild cannot silently change subprocess behavior.
+RUN pip install --no-cache-dir "uv==${UV_VERSION}"
 
 # Copy installed packages from builder (system-owned, read-only is fine)
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Install Playwright chromium BEFORE source code (only rebuilds when playwright version changes)
-RUN playwright install --with-deps chromium
+# No browser in the agent image — Chromium lives on the workspace image only
+# (browser-exec daemon). See knowledge-base/knowledge/issues/remove_local_browser_fallback.md.
 
-# Copy source code LAST (changes most frequently, avoids busting playwright cache)
+# Copy source code LAST (changes most frequently)
 COPY --chown=srw:srw src/ ./src/
 COPY --chown=srw:srw config/ ./config/
 COPY --chown=srw:srw agent.py ./

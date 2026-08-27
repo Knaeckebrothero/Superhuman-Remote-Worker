@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=../../schema.json
+# Writer - user-facing prose. The artifact someone reads IS the deliverable.
+$extends: worker_base
+
+agent_id: writer
+display_name: Writer
+description: |
+  Produces the prose a person actually reads: reports, documentation, guides,
+  release notes, and user-visible copy. It is handed the findings — the brief,
+  the knowledge base, cited sources — and turns them into a finished piece for
+  a named reader. An executor, not a researcher: the artifact is the
+  deliverable, and a gap in the source material is reported as unknown rather
+  than filled with plausible prose.
+icon: edit_note
+color: "#cba6f7"
+tags:
+  - writing
+  - documentation
+  - prose
+  - reporting
+
+# No tools override: the base grant is already the right shape for prose —
+# files, the KB and citation suites, and enough web reach to check a claim
+# against the source it came from. Two absences are the point and both are
+# inherited rather than restated: no shell, because nothing here is built or
+# run, and no delegation, because a document has one voice and a fanned-out
+# draft reads like four people wrote it.

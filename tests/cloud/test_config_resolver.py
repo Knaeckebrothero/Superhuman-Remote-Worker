@@ -77,6 +77,17 @@ class TestLoadMainCloudConfigResolverOrder:
         settings = load_main_cloud_config()
         assert isinstance(settings, OpenCloudSettings)
         assert settings.backend_id == "opencloud"
+        # Safe-by-default: TLS verification on rclone mounts stays on.
+        assert settings.mount_insecure_tls is False
+
+    def test_opencloud_mount_insecure_tls_env(self, monkeypatch: pytest.MonkeyPatch):
+        """OPENCLOUD_MOUNT_INSECURE_TLS=true (local k3d) flips the knob."""
+        _clear_cloud_env(monkeypatch)
+        _opencloud_env(monkeypatch)
+        monkeypatch.setenv("OPENCLOUD_MOUNT_INSECURE_TLS", "true")
+        settings = load_main_cloud_config()
+        assert isinstance(settings, OpenCloudSettings)
+        assert settings.mount_insecure_tls is True
 
     def test_legacy_nextcloud_env_routes_to_nextcloud(
         self, monkeypatch: pytest.MonkeyPatch

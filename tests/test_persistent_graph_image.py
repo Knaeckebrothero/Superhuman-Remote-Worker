@@ -30,6 +30,8 @@ from src.persistent_graph import (
     run_persistent_loop,
 )
 from src.services.image_content import IMAGE_DATA_TAG_TEMPLATE
+from src.shared.orch_surface.jobs import JobToolResult, ToolImageAttachment
+from src.tools.orchestrator.jobs import _agent_tool_result
 
 
 # =============================================================================
@@ -63,8 +65,7 @@ def _make_config(**overrides):
     cfg = MagicMock()
     cfg.llm.timeout = overrides.get("llm_timeout", 600)
     cfg.memory.enabled = overrides.get("memory_enabled", False)
-    cfg.memory.extraction_interval = overrides.get("extraction_interval", 5)
-    cfg.memory.extraction_prompt = overrides.get("extraction_prompt", "")
+    cfg.memory.observer_interval = overrides.get("observer_interval", 5)
     cfg.context_management.max_summary_length = 10000
     return cfg
 
@@ -151,6 +152,35 @@ async def _run_one_turn_with_tool(
 
 
 class TestPersistentImagePostProcessor:
+    @pytest.mark.asyncio
+    async def test_officer_evidence_bridge_reaches_provider_as_image_block(self):
+        b64 = _b64("verified-officer-screenshot")
+        bridged = _agent_tool_result(
+            JobToolResult(
+                text="Evidence ev-shot for job j1",
+                image=ToolImageAttachment(
+                    base64_data=b64,
+                    media_type="image/png",
+                ),
+            )
+        )
+        on_tool_result = AsyncMock()
+        messages: list[BaseMessage] = []
+        await _run_one_turn_with_tool(
+            tool_result=bridged,
+            messages=messages,
+            on_tool_result=on_tool_result,
+        )
+        tool_message = next(m for m in messages if isinstance(m, ToolMessage))
+        image_message = next(
+            m
+            for m in messages
+            if isinstance(m, HumanMessage) and isinstance(m.content, list)
+        )
+        assert b64 not in str(tool_message.content)
+        assert b64 not in on_tool_result.await_args.args[1]
+        assert image_message.content[1]["image_url"]["url"].endswith(b64)
+
     @pytest.mark.asyncio
     async def test_image_data_tag_stripped_and_humanmessage_appended(self):
         b64 = _b64("fake-jpeg-bytes")

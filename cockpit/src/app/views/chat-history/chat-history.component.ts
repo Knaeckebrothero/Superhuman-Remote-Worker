@@ -1,28 +1,63 @@
-import { Component, inject, computed, effect, signal, ElementRef, viewChild } from '@angular/core';
+import { Component, inject, computed, effect, signal, untracked } from '@angular/core';
 import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { DataService } from '../../core/services/data.service';
-import { RequestService } from '../../debug/services/request.service';
-import { ChatEntry } from '../../core/models/chat.model';
+import { ChatTraceService } from '../../core/services/chat-trace.service';
+import { RequestService } from '../../workbench/services/request.service';
+import { ChatEntry, ChatInput, ChatToolCall } from '../../core/models/chat.model';
 import { AppButtonComponent } from '../../ui/button';
 import { AppIconButtonComponent } from '../../ui/icon-button';
 import { AppBadgeComponent, type BadgeTone } from '../../ui/badge';
 import { AppSpinnerComponent } from '../../ui/spinner';
 
-/** Parsed shell pane from <open_shells> block */
-interface ShellPane {
-  name: string;
-  type: string;
-  content: string;
-  hasNewOutput: boolean;
-  isIdle: boolean;
+/** Transient-injection tool_call_id prefixes (src/core/*_injection.py).
+ * Legacy chat rows stored the re-injected block verbatim as human/tool
+ * inputs; these markers classify them into the collapsed context strip. */
+const INJECT_PREFIXES = [
+  'instruction_inject_',
+  'memory_inject_',
+  'knowledge_inject_',
+  'citation_feedback_inject_',
+] as const;
+
+/** One collapsed context-strip item (transient injection descriptor). */
+export interface ContextItem {
+  kind: string;
+  label?: string;
+  hash?: string;
+  chars?: number;
+  /** Newer rows store full content only on the turn the block changed. */
+  updated: boolean;
+  key: string;
+  input: ChatInput;
+}
+
+/** Per-turn view model: delta messages split from the injected context frame. */
+export interface TurnVM {
+  entry: ChatEntry;
+  humans: { key: string; input: ChatInput }[];
+  context: ContextItem[];
+}
+
+/** Element shape shared by inputs/response/reasoning for body display. */
+interface Body {
+  content?: string;
+  content_preview?: string;
+  truncated?: boolean;
+  chars?: number;
 }
 
 /**
  * Chat History component that displays a clean sequential view of conversations.
  * Shows input -> response turns in a messenger-style layout.
  *
- * Now uses DataService for index-based filtering.
- * Chat entries are filtered by slider position - shows entries up to sliderIndex.
+ * Pages arrive lean (previews only) from ChatTraceService; expanding a
+ * truncated message, tool result, or context block hydrates the owning turn
+ * via `/chat/entry/{id}` and swaps it into the list in place.
+ *
+ * The transient injection frame (todos, memory, knowledge, instruction files —
+ * re-injected on every request for prompt-cache reasons) is collapsed into a
+ * single context strip per turn instead of rendering as conversation, for both
+ * new-style `type="context"` descriptors and legacy rows storing the raw block.
  */
 @Component({
   selector: 'app-chat-history',
@@ -46,7 +81,7 @@ interface ShellPane {
             size="sm"
             [ariaLabel]="'chatHistory.refresh' | transloco"
             [tooltip]="'chatHistory.refresh' | transloco"
-            (clicked)="data.refresh()"
+            (clicked)="chat.refresh()"
           >
             ↻
           </app-icon-button>
@@ -54,24 +89,24 @@ interface ShellPane {
       </div>
 
       <!-- Loading State -->
-      @if (data.isLoading()) {
+      @if (chat.loading()) {
         <div class="loading-overlay">
           <app-spinner size="lg" tone="accent" />
         </div>
       }
 
       <!-- Error State -->
-      @if (data.error()) {
+      @if (chat.error()) {
         <div class="error-state">
-          <span>{{ data.error() }}</span>
-          <app-button variant="danger" size="sm" (clicked)="data.refresh()">
+          <span>{{ chat.error() }}</span>
+          <app-button variant="danger" size="sm" (clicked)="chat.refresh()">
             {{ 'chatHistory.retry' | transloco }}
           </app-button>
         </div>
       }
 
       <!-- Empty State -->
-      @if (!data.isLoading() && !data.error() && entries().length === 0 && data.currentJobId()) {
+      @if (!chat.loading() && !chat.error() && turns().length === 0 && data.currentJobId()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4AC;</span>
           <span>{{ 'chatHistory.empty.noHistory' | transloco }}</span>
@@ -80,7 +115,7 @@ interface ShellPane {
       }
 
       <!-- No Job Selected -->
-      @if (!data.currentJobId() && !data.isLoading()) {
+      @if (!data.currentJobId() && !chat.loading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
           <span>{{ 'chatHistory.empty.noJob' | transloco }}</span>
@@ -89,130 +124,167 @@ interface ShellPane {
       }
 
       <!-- Chat Messages -->
-      @if (entries().length > 0) {
-        <div class="chat-list" #chatList>
-          @for (entry of entries(); track entry._id; let idx = $index) {
+      @if (turns().length > 0) {
+        <div class="chat-list" (scroll)="onScroll($event)">
+          @for (t of turns(); track t.entry._id; let idx = $index) {
             <div class="chat-turn">
               <!-- Turn Header -->
               <div class="turn-header">
                 <span class="turn-number">#{{ idx + 1 }}</span>
-                <app-badge [tone]="phaseTone(entry.phase)" size="xs" [uppercase]="true">
-                  {{ entry.phase || ('chatHistory.phaseUnknown' | transloco) }}
+                <app-badge [tone]="phaseTone(t.entry.phase)" size="xs" [uppercase]="true">
+                  {{ t.entry.phase || ('chatHistory.phaseUnknown' | transloco) }}
                 </app-badge>
-                <span class="iteration">{{ 'chatHistory.iter' | transloco: {n: entry.iteration} }}</span>
-                @if (entry.latency_ms) {
-                  <span class="latency">{{ formatLatency(entry.latency_ms) }}</span>
+                <span class="iteration">{{ 'chatHistory.iter' | transloco: {n: t.entry.iteration} }}</span>
+                @if (t.entry.latency_ms) {
+                  <span class="latency">{{ formatLatency(t.entry.latency_ms) }}</span>
                 }
-                <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
+                <span class="timestamp">{{ formatTime(t.entry.timestamp) }}</span>
               </div>
 
-              <!-- Human Input Messages only (tool results are shown with tool calls below) -->
-              @for (input of entry.inputs; track $index) {
-                @if (input.type === 'human') {
-                  <div class="message input-message">
-                    <div class="message-header">
-                      <span class="message-type human">&#x1F464; {{ 'chatHistory.human' | transloco }}</span>
-                    </div>
-                    <div class="message-content">{{ input.content_preview || input.content }}</div>
+              <!-- Human input messages (tool results are shown with tool calls below) -->
+              @for (h of t.humans; track h.key) {
+                <div class="message input-message">
+                  <div class="message-header">
+                    <span class="message-type human">&#x1F464; {{ 'chatHistory.human' | transloco }}</span>
                   </div>
-                }
+                  <div class="message-content" [class.expanded]="isExpanded(h.key)">{{ bodyText(h.input, h.key) }}</div>
+                  @if (canExpand(h.input)) {
+                    <button class="expand-btn" (click)="toggleBody(h.key, t.entry._id, h.input)">
+                      {{ expandLabel(h.input, h.key) }}
+                    </button>
+                  }
+                </div>
+              }
+
+              <!-- Injected context frame (todos, memory, knowledge, …) -->
+              @if (t.context.length > 0) {
+                <details class="context-strip">
+                  <summary class="context-header" [title]="'chatHistory.contextHint' | transloco">
+                    <span class="context-icon">&#x29C9;</span>
+                    <span>{{ 'chatHistory.context' | transloco }}</span>
+                    <span class="context-kinds">
+                      @for (c of t.context; track c.key) {
+                        <span class="context-kind">
+                          {{ c.label || c.kind }}@if (c.updated) {<span class="context-updated" [title]="'chatHistory.updated' | transloco">●</span>}
+                        </span>
+                      }
+                    </span>
+                  </summary>
+                  <div class="context-body">
+                    @for (c of t.context; track c.key) {
+                      <div class="context-item">
+                        <div class="context-item-header">
+                          <span class="context-item-kind">{{ c.label || c.kind }}</span>
+                          @if (c.chars != null) {
+                            <span class="context-item-meta">{{ formatSize(c.chars) }}</span>
+                          }
+                          @if (c.hash) {
+                            <span class="context-item-meta">#{{ c.hash }}</span>
+                          }
+                          @if (c.updated) {
+                            <app-badge tone="warning" size="xs" [uppercase]="true">
+                              {{ 'chatHistory.updated' | transloco }}
+                            </app-badge>
+                          }
+                        </div>
+                        <pre class="context-item-content" [class.expanded]="isExpanded(c.key)">{{ bodyText(c.input, c.key) }}</pre>
+                        @if (canExpand(c.input)) {
+                          <button class="expand-btn" (click)="toggleBody(c.key, t.entry._id, c.input)">
+                            {{ expandLabel(c.input, c.key) }}
+                          </button>
+                        }
+                      </div>
+                    }
+                  </div>
+                </details>
               }
 
               <!-- Reasoning (if present) -->
-              @if (entry.reasoning) {
+              @if (t.entry.reasoning; as reasoning) {
                 <details class="reasoning-section">
                   <summary class="reasoning-header">
                     <span class="reasoning-icon">&#x1F9E0;</span>
                     <span>{{ 'chatHistory.reasoning' | transloco }}</span>
                   </summary>
-                  <div class="reasoning-content">{{ entry.reasoning.content_preview || entry.reasoning.content }}</div>
+                  <div class="reasoning-content" [class.expanded]="isExpanded(t.entry._id + ':reason')">{{ bodyText(reasoning, t.entry._id + ':reason') }}</div>
+                  @if (canExpand(reasoning)) {
+                    <button class="expand-btn" (click)="toggleBody(t.entry._id + ':reason', t.entry._id, reasoning)">
+                      {{ expandLabel(reasoning, t.entry._id + ':reason') }}
+                    </button>
+                  }
                 </details>
               }
 
-              <!-- Shell State (if present) -->
-              @if (entry.shell_state) {
-                @let panes = parseShellState(entry.shell_state);
-                @if (panes.length > 0) {
-                  <details class="shell-state-section">
-                    <summary class="shell-state-header">
-                      <span class="shell-icon">&#x1F4BB;</span>
-                      <span>{{ 'chatHistory.shellState' | transloco }}</span>
-                      <span class="shell-pane-count">{{ (panes.length === 1 ? 'chatHistory.paneSingle' : 'chatHistory.panePlural') | transloco: {n: panes.length} }}</span>
-                    </summary>
-                    <div class="shell-widget">
-                      @let activeTab = getSelectedTab(entry._id, panes[0].name);
-                      <div class="shell-tab-bar">
-                        @for (pane of panes; track pane.name) {
-                          <button
-                            class="shell-tab"
-                            [class.active]="activeTab === pane.name"
-                            [class.new-output]="pane.hasNewOutput"
-                            [class.idle]="pane.isIdle"
-                            (click)="selectTab(entry._id, pane.name)"
-                          >
-                            <app-badge [tone]="paneTypeTone(pane.type)" size="xs" [uppercase]="true">
-                              {{ pane.type }}
-                            </app-badge>
-                            <span class="tab-name">{{ pane.name }}</span>
-                            @if (pane.hasNewOutput) {
-                              <app-badge tone="warning" appearance="solid" size="xs" [uppercase]="true">
-                                {{ 'chatHistory.newOutput' | transloco }}
-                              </app-badge>
-                            }
-                            @if (pane.isIdle) {
-                              <span class="idle-badge">{{ 'chatHistory.idle' | transloco }}</span>
-                            }
-                          </button>
-                        }
-                      </div>
-                      <div class="shell-terminal-pane">
-                        @for (pane of panes; track pane.name) {
-                          @if (activeTab === pane.name) {
-                            <pre class="terminal-content">{{ pane.content || ('chatHistory.emptyPane' | transloco) }}</pre>
-                          }
-                        }
-                      </div>
-                    </div>
-                  </details>
-                }
-              }
-
               <!-- Response Message (only show if there's content or tool calls) -->
-              @if (entry.response.content_preview || entry.response.content || (entry.response.tool_calls && entry.response.tool_calls.length > 0)) {
+              @if (t.entry.response.content_preview || t.entry.response.content || (t.entry.response.tool_calls && t.entry.response.tool_calls.length > 0)) {
                 <div class="message response-message">
                   <div class="message-header">
                     <span class="message-type assistant">&#x1F916; {{ 'chatHistory.assistant' | transloco }}</span>
-                    @if (entry.request_id) {
+                    @if (t.entry.request_id) {
                       <span
                         class="request-link"
-                        (click)="onRequestIdClick(entry.request_id)"
+                        (click)="onRequestIdClick(t.entry.request_id)"
                         [title]="'chatHistory.viewRequest' | transloco"
                       >
-                        {{ entry.request_id.slice(0, 8) }}...
+                        {{ t.entry.request_id.slice(0, 8) }}...
                       </span>
                     }
                   </div>
-                  @if (entry.response.content_preview || entry.response.content) {
-                    <div class="message-content">{{ entry.response.content_preview || entry.response.content }}</div>
+                  @if (t.entry.response.content_preview || t.entry.response.content) {
+                    <div class="message-content" [class.expanded]="isExpanded(t.entry._id + ':resp')">{{ bodyText(t.entry.response, t.entry._id + ':resp') }}</div>
+                    @if (canExpand(t.entry.response)) {
+                      <button class="expand-btn" (click)="toggleBody(t.entry._id + ':resp', t.entry._id, t.entry.response)">
+                        {{ expandLabel(t.entry.response, t.entry._id + ':resp') }}
+                      </button>
+                    }
                   }
 
                   <!-- Tool Calls with Results -->
-                  @if (entry.response.tool_calls && entry.response.tool_calls.length > 0) {
+                  @if (t.entry.response.tool_calls && t.entry.response.tool_calls.length > 0) {
                     <div class="tool-calls-section">
-                      @for (tc of entry.response.tool_calls; track tc.id) {
+                      @for (tc of t.entry.response.tool_calls; track tc.id) {
                         <details class="tool-call-item">
                           <summary class="tool-call-header">
                             <span class="tool-icon">&#x1F527;</span>
                             <span class="tool-name">{{ tc.name }}</span>
                             <span class="tool-args-preview">{{ tc.args_preview }}</span>
                           </summary>
-                          <div class="tool-call-result">
-                            @if (getToolResult(idx, tc.id); as result) {
-                              {{ result }}
+                          @if (hasFullArgs(tc)) {
+                            <div class="tool-call-args">
+                              <pre class="tool-args-content" [class.expanded]="isExpanded(t.entry._id + ':args:' + tc.id)">{{ argsText(tc, t.entry._id + ':args:' + tc.id) }}</pre>
+                              <button class="expand-btn" (click)="toggleArgs(t.entry._id, tc)">
+                                {{ argsExpandLabel(tc, t.entry._id + ':args:' + tc.id) }}
+                              </button>
+                            </div>
+                          }
+                          <div class="tool-call-result" [class.expanded]="isExpanded('res:' + tc.id)">
+                            @if (toolResultIndex().get(tc.id); as res) {
+                              {{ bodyText(res.input, 'res:' + tc.id) }}
+                            } @else if (toolResultState(t.entry._id) === 'unloaded') {
+                              @if (chat.loadingMore()) {
+                                <span class="no-result">
+                                  <app-spinner size="sm" tone="accent" />
+                                  {{ 'chatHistory.resultLoading' | transloco }}
+                                </span>
+                              } @else {
+                                <span class="no-result">
+                                  {{ 'chatHistory.resultInLaterTurn' | transloco }}
+                                  <button class="expand-btn" (click)="chat.loadMore()">
+                                    {{ 'chatHistory.resultLoadNext' | transloco }}
+                                  </button>
+                                </span>
+                              }
                             } @else {
-                              <span class="no-result">{{ 'chatHistory.resultPending' | transloco }}</span>
+                              <span class="no-result">{{ 'chatHistory.resultNotRecorded' | transloco }}</span>
                             }
                           </div>
+                          @if (toolResultIndex().get(tc.id); as res) {
+                            @if (canExpand(res.input)) {
+                              <button class="expand-btn" (click)="toggleBody('res:' + tc.id, res.entryId, res.input)">
+                                {{ expandLabel(res.input, 'res:' + tc.id) }}
+                              </button>
+                            }
+                          }
                         </details>
                       }
                     </div>
@@ -224,12 +296,18 @@ interface ShellPane {
         </div>
       }
 
-      <!-- Position indicator -->
-      @if (entries().length > 0) {
+      <!-- Position indicator + load more -->
+      @if (turns().length > 0) {
         <div class="position-bar">
           <span class="position-info">
-            {{ 'chatHistory.showingTurns' | transloco: {n: entries().length} }}
+            {{ 'chatHistory.showingTurns' | transloco: {n: turns().length} }}
+            @if (chat.hasMore()) {<span class="of-total">/ {{ chat.total() }}</span>}
           </span>
+          @if (chat.loadingMore()) {
+            <app-spinner size="sm" tone="accent" />
+          } @else if (chat.hasMore()) {
+            <app-button variant="ghost" size="sm" (clicked)="chat.loadMore()">Load more</app-button>
+          }
         </div>
       }
     </div>
@@ -256,7 +334,7 @@ interface ShellPane {
         align-items: center;
         gap: 8px;
         padding: 8px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -427,6 +505,128 @@ interface ShellPane {
         overflow-y: auto;
       }
 
+      .message-content.expanded {
+        max-height: none;
+      }
+
+      /* Expand / collapse (lazy hydration) */
+      .expand-btn {
+        display: block;
+        width: 100%;
+        padding: 4px 10px;
+        border: none;
+        background: rgba(0, 0, 0, 0.12);
+        color: var(--text-muted, var(--text-muted));
+        font-size: 10px;
+        font-family: 'JetBrains Mono', monospace;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .expand-btn:hover {
+        background: rgba(0, 0, 0, 0.25);
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      /* Injected context strip (transient todos/memory/knowledge frame) */
+      .context-strip {
+        margin: 8px 40px 8px 0;
+        background: color-mix(in srgb, var(--text-muted) 6%, transparent);
+        border-left: 3px solid var(--text-muted, var(--text-muted));
+        border-radius: var(--radius-surface);
+        overflow: hidden;
+        opacity: 0.85;
+      }
+
+      .context-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 10px;
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--text-muted, var(--text-muted));
+        cursor: pointer;
+        user-select: none;
+        background: rgba(0, 0, 0, 0.1);
+      }
+
+      .context-header:hover {
+        background: rgba(0, 0, 0, 0.2);
+      }
+
+      .context-icon {
+        font-size: 12px;
+      }
+
+      .context-kinds {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-family: 'JetBrains Mono', monospace;
+        font-weight: 400;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .context-kind {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+      }
+
+      .context-updated {
+        color: var(--warning);
+        font-size: 8px;
+      }
+
+      .context-body {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .context-item + .context-item {
+        border-top: 1px solid rgba(255, 255, 255, 0.05);
+      }
+
+      .context-item-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px 0;
+        font-size: 10px;
+        color: var(--text-muted, var(--text-muted));
+      }
+
+      .context-item-kind {
+        font-family: 'JetBrains Mono', monospace;
+        font-weight: 600;
+      }
+
+      .context-item-meta {
+        font-family: 'JetBrains Mono', monospace;
+        opacity: 0.7;
+      }
+
+      .context-item-content {
+        margin: 0;
+        padding: 6px 10px 10px;
+        font-size: 11px;
+        line-height: 1.5;
+        font-family: inherit;
+        color: var(--text-muted, var(--text-muted));
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 200px;
+        overflow-y: auto;
+      }
+
+      .context-item-content.expanded {
+        max-height: none;
+        color: var(--text-primary, var(--text-primary));
+      }
+
       /* Tool Calls Section */
       .tool-calls-section {
         border-top: 1px solid rgba(255, 255, 255, 0.05);
@@ -480,6 +680,29 @@ interface ShellPane {
         min-width: 0;
       }
 
+      .tool-call-args {
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        background: rgba(0, 0, 0, 0.12);
+      }
+
+      .tool-args-content {
+        margin: 0;
+        padding: 8px 10px;
+        font-size: 11px;
+        line-height: 1.5;
+        font-family: 'JetBrains Mono', monospace;
+        color: var(--text-muted, var(--text-muted));
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 200px;
+        overflow-y: auto;
+      }
+
+      .tool-args-content.expanded {
+        max-height: none;
+        color: var(--text-primary, var(--text-primary));
+      }
+
       .tool-call-result {
         padding: 10px;
         font-size: 12px;
@@ -492,9 +715,24 @@ interface ShellPane {
         background: rgba(0, 0, 0, 0.05);
       }
 
+      .tool-call-result.expanded {
+        max-height: none;
+      }
+
       .no-result {
         color: var(--text-muted, var(--text-muted));
         font-style: italic;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      /* The inline "Load it" affordance sits on the same baseline as the
+         explanatory text, so it must not inherit the italic run-in style. */
+      .no-result .expand-btn {
+        font-style: normal;
+        margin: 0;
       }
 
       /* Reasoning */
@@ -538,6 +776,10 @@ interface ShellPane {
         overflow-y: auto;
       }
 
+      .reasoning-content.expanded {
+        max-height: none;
+      }
+
       /* Request Link */
       .request-link {
         color: var(--info);
@@ -567,157 +809,84 @@ interface ShellPane {
         font-size: 12px;
         color: var(--text-muted, var(--text-muted));
       }
-
-      /* Shell State Widget */
-      .shell-state-section {
-        margin: 8px 0;
-        background: var(--timeline-bg);
-        border: 1px solid var(--surface-0);
-        border-radius: var(--radius-surface);
-        overflow: hidden;
-      }
-
-      .shell-state-header {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 8px 10px;
-        font-size: 11px;
-        font-weight: 600;
-        color: var(--info);
-        cursor: pointer;
-        user-select: none;
-        background: rgba(0, 0, 0, 0.3);
-      }
-
-      .shell-state-header:hover {
-        background: rgba(0, 0, 0, 0.5);
-      }
-
-      .shell-icon {
-        font-size: 14px;
-      }
-
-      .shell-pane-count {
-        margin-left: auto;
-        font-size: 10px;
-        font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .shell-widget {
-        display: flex;
-        flex-direction: column;
-      }
-
-      .shell-tab-bar {
-        display: flex;
-        gap: 0;
-        background: var(--panel-bg);
-        border-bottom: 1px solid var(--surface-0);
-        overflow-x: auto;
-      }
-
-      .shell-tab {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 6px 12px;
-        border: none;
-        background: transparent;
-        color: var(--text-muted, var(--text-muted));
-        font-size: 11px;
-        font-family: 'JetBrains Mono', monospace;
-        cursor: pointer;
-        white-space: nowrap;
-        border-bottom: 2px solid transparent;
-        transition: all 0.15s ease;
-      }
-
-      .shell-tab:hover {
-        background: rgba(255, 255, 255, 0.05);
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .shell-tab.active {
-        color: var(--info);
-        border-bottom-color: var(--info);
-        background: rgba(148, 226, 213, 0.05);
-      }
-
-      .tab-name {
-        font-weight: 600;
-      }
-
-      .idle-badge {
-        font-size: 9px;
-        color: var(--text-muted, var(--text-muted));
-        font-style: italic;
-      }
-
-      .shell-terminal-pane {
-        background: var(--timeline-bg);
-        min-height: 60px;
-        max-height: 250px;
-        overflow: auto;
-      }
-
-      .terminal-content {
-        margin: 0;
-        padding: 10px 12px;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 11px;
-        line-height: 1.5;
-        color: var(--success);
-        white-space: pre-wrap;
-        word-break: break-word;
-      }
     `,
   ],
 })
 export class ChatHistoryComponent {
   readonly data = inject(DataService);
+  readonly chat = inject(ChatTraceService);
   private readonly requestService = inject(RequestService);
   private readonly transloco = inject(TranslocoService);
 
-  // Reference to the chat list container for auto-scrolling
-  private readonly chatListRef = viewChild<ElementRef<HTMLDivElement>>('chatList');
+  /** Expanded body keys (entry-scoped, see key helpers in the template). */
+  private readonly expanded = signal<Set<string>>(new Set());
 
-  // Track the previous entry count to detect when new entries are added
-  private previousEntryCount = 0;
+  /** Keys with an in-flight hydration (expand fetched the full turn). */
+  private readonly hydrating = signal<Set<string>>(new Set());
 
-  // Track selected tab per chat entry (entry._id -> pane name)
-  private readonly selectedTabs = signal<Map<string, string>>(new Map());
+  /** Per-turn view models: delta messages split from injected context. */
+  readonly turns = computed(() => this.chat.rows().map(splitTurn));
 
-  // Cache parsed shell panes to avoid re-parsing on every change detection
-  private readonly parsedShellCache = new Map<string, ShellPane[]>();
+  /**
+   * tool_call_id -> tool result input across all loaded turns. Results arrive
+   * as the next turn's inputs; indexing the whole loaded window (instead of
+   * peeking at entry idx+1) survives empty-delta turns and page boundaries.
+   */
+  readonly toolResultIndex = computed(() => buildToolResultIndex(this.chat.rows()));
 
-  // Use DataService's visible chat entries (filtered by slider position)
-  readonly entries = computed(() => this.data.visibleChatEntries());
+  /**
+   * Entry id of the last loaded turn — the only turn whose unresolved tool
+   * calls may still be waiting on data. See {@link toolResultState}.
+   */
+  private readonly lastLoadedEntryId = computed(() => {
+    const rows = this.chat.rows();
+    return rows.length > 0 ? rows[rows.length - 1]._id : null;
+  });
 
   // Entry count display
   readonly entryCount = computed(() => {
-    return this.transloco.translate('chatHistory.turnsCount', {n: this.entries().length});
+    return this.transloco.translate('chatHistory.turnsCount', {n: this.turns().length});
   });
 
   constructor() {
-    // Effect to auto-scroll when entries change
+    // Drive the chat panel off the loaded job — the same signal the workbench
+    // dashboard sets on selection (DataService.currentJobId). See
+    // knowledge-base/knowledge/features/debug_audit_view_refactor.md (Phase 2c / P3).
     effect(() => {
-      const entries = this.entries();
-      const currentCount = entries.length;
-      const chatList = this.chatListRef();
-
-      // Scroll to bottom when entries are added (count increased)
-      if (chatList && currentCount > this.previousEntryCount) {
-        // Use requestAnimationFrame to ensure DOM has updated
-        requestAnimationFrame(() => {
-          const el = chatList.nativeElement;
-          el.scrollTop = el.scrollHeight;
-        });
-      }
-
-      this.previousEntryCount = currentCount;
+      const jobId = this.data.currentJobId();
+      untracked(() => this.chat.setJob(jobId));
     });
+  }
+
+  /**
+   * Why a tool call shows no result.
+   *
+   * A turn's tool results are stored as the *next* turn's inputs (the archiver
+   * records the messages that arrived since the last AI message). So an
+   * unresolved call means one of two very different things, and only one of
+   * them is a loading state:
+   *
+   * - `unloaded` — this is the last loaded turn and the job has more, so the
+   *   result lives in a turn we simply haven't fetched. Resolvable.
+   * - `missing` — the following turn IS loaded (or there is no following turn),
+   *   so the result was never recorded. Nothing to wait for. Jobs that ran
+   *   before the archiver delta fix lost every tool result this way; see
+   *   project_chat_history_injection_bloat_lazy_hydration.
+   *
+   * The previous code keyed this off the global `hasMore()` alone, which
+   * mislabeled every never-recorded result in a partially loaded job as
+   * "arrives in a later turn".
+   */
+  toolResultState(entryId: string): ToolResultState {
+    return resolveToolResultState(entryId, this.lastLoadedEntryId(), this.chat.hasMore());
+  }
+
+  /** Near the bottom → fetch the next page (infinite scroll). */
+  onScroll(event: Event): void {
+    const el = event.target as HTMLElement;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 320) {
+      void this.chat.loadMore();
+    }
   }
 
   phaseTone(phase: string | null | undefined): BadgeTone {
@@ -726,19 +895,6 @@ export class ChatHistoryComponent {
         return 'accent';
       case 'tactical':
         return 'success';
-      default:
-        return 'neutral';
-    }
-  }
-
-  paneTypeTone(type: string): BadgeTone {
-    switch (type) {
-      case 'shell':
-        return 'success';
-      case 'claude-code':
-        return 'accent';
-      case 'ssh':
-        return 'info';
       default:
         return 'neutral';
     }
@@ -761,120 +917,214 @@ export class ChatHistoryComponent {
     });
   }
 
+  formatSize(chars: number): string {
+    if (chars >= 1024) {
+      return `${(chars / 1024).toFixed(1)} kB`;
+    }
+    return `${chars} B`;
+  }
+
   onRequestIdClick(requestId: string): void {
     this.requestService.loadRequest(requestId);
   }
 
-  /**
-   * Get the result of a tool call by looking at the next entry's inputs.
-   * Tool results appear as inputs in the following entry with matching tool_call_id.
-   */
-  getToolResult(currentIndex: number, toolCallId: string): string | null {
-    const entries = this.entries();
-    const nextEntry = entries[currentIndex + 1];
-    if (!nextEntry) {
-      return null;
-    }
+  // -- lazy body expansion (lean listing + on-demand hydration) -----------
 
-    const toolResult = nextEntry.inputs.find(
-      input => input.type === 'tool' && input.tool_call_id === toolCallId
+  isExpanded(key: string): boolean {
+    return this.expanded().has(key);
+  }
+
+  /** Body text honoring expansion; falls back to the preview until hydrated. */
+  bodyText(el: Body, key: string): string {
+    if (this.isExpanded(key) && el.content != null) {
+      return el.content;
+    }
+    return el.content_preview ?? el.content ?? '';
+  }
+
+  /** Whether a body has more than its preview (locally or via hydration). */
+  canExpand(el: Body): boolean {
+    return (
+      el.truncated === true ||
+      (el.content != null && el.content_preview != null && el.content !== el.content_preview)
     );
-
-    if (toolResult) {
-      return toolResult.content_preview || toolResult.content;
-    }
-    return null;
   }
 
-  /**
-   * Parse a <terminal_state> block into structured pane objects.
-   * Uses a cache keyed by raw content to avoid re-parsing.
-   *
-   * Format:
-   *   <terminal_state>
-   *   [name] (type)
-   *   [name2] (type2) [NEW OUTPUT]
-   *   </terminal_state>
-   */
-  parseShellState(raw: string): ShellPane[] {
-    const cached = this.parsedShellCache.get(raw);
-    if (cached) return cached;
-
-    const panes: ShellPane[] = [];
-
-    // Strip <terminal_state> wrapper
-    const inner = raw
-      .replace(/<\/?terminal_state>/g, '')
-      .trim();
-
-    if (!inner) {
-      this.parsedShellCache.set(raw, panes);
-      return panes;
+  expandLabel(el: Body, key: string): string {
+    if (this.hydrating().has(key)) {
+      return '…';
     }
-
-    // Split into pane blocks by header lines: [name] (type) ...
-    const headerPattern = /^\[([^\]]+)\]\s+\(([^)]+)\)\s*(.*)$/;
-    const lines = inner.split('\n');
-    let current: { name: string; type: string; flags: string; contentLines: string[] } | null = null;
-
-    for (const line of lines) {
-      const match = line.match(headerPattern);
-      if (match) {
-        // Save previous pane
-        if (current) {
-          panes.push(this.buildPane(current));
-        }
-        current = {
-          name: match[1],
-          type: match[2],
-          flags: match[3].trim(),
-          contentLines: [],
-        };
-      } else if (current) {
-        current.contentLines.push(line);
-      }
+    if (this.isExpanded(key) && el.content != null) {
+      return this.transloco.translate('chatHistory.collapse');
     }
-
-    // Don't forget the last pane
-    if (current) {
-      panes.push(this.buildPane(current));
+    const size = el.chars ?? el.content?.length ?? 0;
+    if (size <= 0) {
+      return this.transloco.translate('chatHistory.showFullNoSize');
     }
-
-    this.parsedShellCache.set(raw, panes);
-    return panes;
-  }
-
-  private buildPane(raw: { name: string; type: string; flags: string; contentLines: string[] }): ShellPane {
-    const hasNewOutput = raw.flags.includes('[NEW OUTPUT]');
-    const idleMatch = raw.flags.match(/idle\s+\d+/);
-    const isIdle = !!idleMatch;
-
-    // Trim trailing empty lines from content
-    const contentLines = [...raw.contentLines];
-    while (contentLines.length > 0 && contentLines[contentLines.length - 1].trim() === '') {
-      contentLines.pop();
-    }
-
-    return {
-      name: raw.name,
-      type: raw.type,
-      content: contentLines.join('\n'),
-      hasNewOutput,
-      isIdle,
-    };
-  }
-
-  /** Get currently selected tab for a chat entry, defaulting to first pane name if provided. */
-  getSelectedTab(entryId: string, fallback: string = ''): string {
-    return this.selectedTabs().get(entryId) || fallback;
-  }
-
-  /** Select a tab for a specific chat entry. */
-  selectTab(entryId: string, paneName: string): void {
-    this.selectedTabs.update(map => {
-      const next = new Map(map);
-      next.set(entryId, paneName);
-      return next;
+    return this.transloco.translate('chatHistory.showFull', {
+      size: this.formatSize(size),
     });
   }
+
+  /** Toggle a body; hydrates the owning turn first when the page was lean. */
+  async toggleBody(key: string, ownerEntryId: string, el: Body): Promise<void> {
+    if (this.isExpanded(key)) {
+      this.expanded.update((s) => {
+        const next = new Set(s);
+        next.delete(key);
+        return next;
+      });
+      return;
+    }
+    this.expanded.update((s) => new Set(s).add(key));
+    if (el.truncated === true && el.content == null) {
+      this.hydrating.update((s) => new Set(s).add(key));
+      try {
+        await this.chat.hydrateEntry(ownerEntryId);
+      } finally {
+        this.hydrating.update((s) => {
+          const next = new Set(s);
+          next.delete(key);
+          return next;
+        });
+      }
+    }
+  }
+
+  // -- tool-call arguments (args beyond the 200-char preview) -------------
+
+  hasFullArgs(tc: ChatToolCall): boolean {
+    return tc.args != null || tc.args_truncated === true;
+  }
+
+  argsText(tc: ChatToolCall, key: string): string {
+    if (this.isExpanded(key) && tc.args != null) {
+      return tc.args;
+    }
+    return tc.args_preview;
+  }
+
+  argsExpandLabel(tc: ChatToolCall, key: string): string {
+    return this.expandLabel(
+      { content: tc.args, content_preview: tc.args_preview, truncated: tc.args_truncated },
+      key,
+    );
+  }
+
+  async toggleArgs(ownerEntryId: string, tc: ChatToolCall): Promise<void> {
+    const key = `${ownerEntryId}:args:${tc.id}`;
+    await this.toggleBody(key, ownerEntryId, {
+      content: tc.args,
+      content_preview: tc.args_preview,
+      truncated: tc.args_truncated,
+    });
+  }
+}
+
+/** Legacy rows: injected knowledge/memory/instruction blocks stored as tool
+ * inputs, recognizable by their synthetic tool_call_id prefix. */
+export function legacyInjectKind(input: ChatInput): string | null {
+  if (input.type !== 'tool' || !input.tool_call_id) {
+    return null;
+  }
+  for (const prefix of INJECT_PREFIXES) {
+    if (input.tool_call_id.startsWith(prefix)) {
+      return prefix.replace(/_inject_$/, '');
+    }
+  }
+  return null;
+}
+
+/** Legacy rows: the transient todo block stored as a human input. */
+export function isLegacyTodosInput(input: ChatInput): boolean {
+  const content = input.content_preview ?? input.content ?? '';
+  return input.type === 'human' && content.startsWith('<active_tasks>');
+}
+
+/** Split one entry's inputs into human delta messages + context items. */
+export function splitTurn(entry: ChatEntry): TurnVM {
+  const humans: TurnVM['humans'] = [];
+  const context: ContextItem[] = [];
+  (entry.inputs ?? []).forEach((input, idx) => {
+    const key = `${entry._id}:in:${idx}`;
+    if (input.type === 'context') {
+      context.push({
+        kind: input.kind || 'context',
+        label: input.label,
+        hash: input.hash,
+        chars: input.chars ?? input.content?.length,
+        // The writer stores full content only on the turn the block changed
+        // (lean pages carry it as a truncated marker instead).
+        updated: input.truncated === true || input.content != null,
+        key,
+        input,
+      });
+      return;
+    }
+    const legacyKind = legacyInjectKind(input);
+    if (legacyKind) {
+      context.push({
+        kind: legacyKind,
+        chars: input.chars ?? input.content?.length,
+        updated: false,
+        key,
+        input,
+      });
+      return;
+    }
+    if (isLegacyTodosInput(input)) {
+      context.push({
+        kind: 'todos',
+        chars: input.chars ?? input.content?.length,
+        updated: false,
+        key,
+        input,
+      });
+      return;
+    }
+    if (input.type === 'human') {
+      humans.push({ key, input });
+    }
+    // Real tool inputs render as the results of the calling turn's tool
+    // calls (via the tool-result index), not as standalone messages.
+  });
+  return { entry, humans, context };
+}
+
+/**
+ * tool_call_id -> tool result input across all loaded turns. Results arrive
+ * as the next turn's inputs; indexing the whole loaded window (instead of
+ * peeking at entry idx+1) survives empty-delta turns and page boundaries.
+ */
+/** Why a tool call has no result — see {@link resolveToolResultState}. */
+export type ToolResultState = 'unloaded' | 'missing';
+
+/**
+ * Classify an unresolved tool call: waiting on data, or never recorded.
+ *
+ * Only the last loaded turn can still be waiting, because results are stored
+ * as the *following* turn's inputs. If the following turn is already loaded
+ * (i.e. this isn't the last row) or the job has no further turns, the result
+ * was never written and no amount of paging will produce it.
+ */
+export function resolveToolResultState(
+  entryId: string,
+  lastLoadedEntryId: string | null,
+  hasMore: boolean,
+): ToolResultState {
+  return entryId === lastLoadedEntryId && hasMore ? 'unloaded' : 'missing';
+}
+
+export function buildToolResultIndex(
+  entries: ChatEntry[],
+): Map<string, { entryId: string; input: ChatInput }> {
+  const map = new Map<string, { entryId: string; input: ChatInput }>();
+  for (const entry of entries) {
+    for (const input of entry.inputs ?? []) {
+      if (input.type === 'tool' && input.tool_call_id && !legacyInjectKind(input)) {
+        map.set(input.tool_call_id, { entryId: entry._id, input });
+      }
+    }
+  }
+  return map;
 }

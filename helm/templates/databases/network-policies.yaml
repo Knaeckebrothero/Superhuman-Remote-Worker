@@ -9,7 +9,7 @@ podSelector-based allow-list below.
 Probes (liveness/readiness) come from the kubelet on the node, which bypasses
 NetworkPolicy entirely — no allowance needed.
 
-Optional admin UIs (pgadmin, mongo-express) are conditionally added to the
+Optional admin UIs (pgadmin) are conditionally added to the
 allow-list when their respective .enabled toggles are set. The short-lived
 llm-seed Job is allowed against the main Postgres so the install can seed
 the model catalog.
@@ -33,9 +33,24 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+        {{- if .Values.canvas.livePreview.viewer.enabled }}
+        # Canvas origin/session authorization and revocation state is stored in
+        # the application database; the internal gateway needs no other DB.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway") | nindent 14 }}
+        {{- end }}
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.agent.stateless.enabled }}
+        # Stateless executor class — deliberately NOT component=agent (that
+        # label pair would put it behind the agent Service/PDB), so it needs
+        # its own ingress allowance.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 14 }}
+        {{- end }}
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "llm-seed") | nindent 14 }}
@@ -44,9 +59,45 @@ spec:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
         {{- end }}
+        {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
+        # CloudNativePG's OWN label, not the chart's component labels: those
+        # are deliberately absent while `migrating` (the legacy Service would
+        # otherwise capture these pods), and this same rule is what lets the
+        # IMPORT read the legacy database. It is also tighter -- only pods of
+        # this one cluster, rather than anything wearing the component label.
+        # Covers both the import job and WAL streaming between instances.
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "srw.fullname" . }}-postgres
+        {{- end }}
       ports:
         - port: 5432
           protocol: TCP
+    {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
+    # The operator polls instance health on the STATUS port (8000), not 5432.
+    # A rule that opens only 5432 leaves the Cluster reporting `Ready=False`
+    # with "unable to receive the status from all the ready instances" while
+    # the database itself serves normally -- and CNPG makes failover and
+    # switchover decisions from that status, so at more than one instance this
+    # is not cosmetic. Observed on srw-postgres and srw-keycloakdb 2026-08-23,
+    # immediately after cutover.
+    #
+    # It only bites at engine `cnpg`: while `migrating` the CNPG pods do not
+    # carry the chart's component labels, so this policy does not select them
+    # at all. That is why a rehearsal cannot surface it.
+    #
+    # Its own rule, deliberately: 8000 stays reachable ONLY from the operator's
+    # namespace, never from the application workloads allowed above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 
@@ -71,26 +122,75 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.agent.stateless.enabled }}
+        # Stateless executor class — see the postgres policy above.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 14 }}
+        {{- end }}
+        {{- if .Values.pgadmin.enabled }}
+        # Optional pgAdmin UI administers all three app DBs.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
+        {{- end }}
+        {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "vector")) }}
+        # CloudNativePG's OWN label, not the chart's component labels: those
+        # are deliberately absent while `migrating` (the legacy Service would
+        # otherwise capture these pods), and this same rule is what lets the
+        # IMPORT read the legacy database. It is also tighter -- only pods of
+        # this one cluster, rather than anything wearing the component label.
+        # Covers both the import job and WAL streaming between instances.
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "srw.fullname" . }}-pgvector
+        {{- end }}
       ports:
         - port: 5432
           protocol: TCP
+    {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "vector")) }}
+    # The operator polls instance health on the STATUS port (8000), not 5432.
+    # A rule that opens only 5432 leaves the Cluster reporting `Ready=False`
+    # with "unable to receive the status from all the ready instances" while
+    # the database itself serves normally -- and CNPG makes failover and
+    # switchover decisions from that status, so at more than one instance this
+    # is not cosmetic. Observed on srw-postgres and srw-keycloakdb 2026-08-23,
+    # immediately after cutover.
+    #
+    # It only bites at engine `cnpg`: while `migrating` the CNPG pods do not
+    # carry the chart's component labels, so this policy does not select them
+    # at all. That is why a rehearsal cannot surface it.
+    #
+    # Its own rule, deliberately: 8000 stays reachable ONLY from the operator's
+    # namespace, never from the application workloads allowed above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 
-{{- if and .Values.databases.mongodb.enabled .Values.databases.mongodb.internal }}
+{{- if and .Values.databases.audit.enabled .Values.databases.audit.internal }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "srw.fullname" . }}-mongodb
+  name: {{ include "srw.fullname" . }}-auditdb
   labels:
-    {{- include "srw.componentLabels" (dict "context" . "component" "mongodb") | nindent 4 }}
+    {{- include "srw.componentLabels" (dict "context" . "component" "auditdb") | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongodb") | nindent 6 }}
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "auditdb") | nindent 6 }}
   policyTypes:
     - Ingress
   ingress:
+    # Reader (orchestrator) + writer (agent pods) — both reach auditdb:5432.
     - from:
         - podSelector:
             matchLabels:
@@ -98,14 +198,57 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
-        {{- if .Values.mongoExpress.enabled }}
+        {{- if .Values.agent.stateless.enabled }}
+        # Stateless executor class — see the postgres policy above.
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongo-express") | nindent 14 }}
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 14 }}
+        {{- end }}
+        {{- if .Values.pgadmin.enabled }}
+        # Optional pgAdmin UI administers all three app DBs.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
+        {{- end }}
+        {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "audit")) }}
+        # CloudNativePG's OWN label, not the chart's component labels: those
+        # are deliberately absent while `migrating` (the legacy Service would
+        # otherwise capture these pods), and this same rule is what lets the
+        # IMPORT read the legacy database. It is also tighter -- only pods of
+        # this one cluster, rather than anything wearing the component label.
+        # Covers both the import job and WAL streaming between instances.
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "srw.fullname" . }}-auditdb
         {{- end }}
       ports:
-        - port: 27017
+        - port: 5432
           protocol: TCP
+    {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "audit")) }}
+    # The operator polls instance health on the STATUS port (8000), not 5432.
+    # A rule that opens only 5432 leaves the Cluster reporting `Ready=False`
+    # with "unable to receive the status from all the ready instances" while
+    # the database itself serves normally -- and CNPG makes failover and
+    # switchover decisions from that status, so at more than one instance this
+    # is not cosmetic. Observed on srw-postgres and srw-keycloakdb 2026-08-23,
+    # immediately after cutover.
+    #
+    # It only bites at engine `cnpg`: while `migrating` the CNPG pods do not
+    # carry the chart's component labels, so this policy does not select them
+    # at all. That is why a rehearsal cannot surface it.
+    #
+    # Its own rule, deliberately: 8000 stays reachable ONLY from the operator's
+    # namespace, never from the application workloads allowed above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 
@@ -130,12 +273,50 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.agent.stateless.enabled }}
+        # Stateless executor class — see the postgres policy above.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 14 }}
+        {{- end }}
       ports:
         - port: 7474
           protocol: TCP
         - port: 7688
           protocol: TCP
         # Bolt also listens on 7687 in some configs; current chart pins 7688.
+    {{- if .Values.databases.neo4j.browser.enabled }}
+    # Neo4j Browser UI reached through the Traefik ingress (home-network LB
+    # only; the browser host is deliberately kept out of the Cloudflare tunnel).
+    # Only the HTTP port is opened to Traefik — Bolt (7688) stays restricted to
+    # the orchestrator/agent pods above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - port: 7474
+          protocol: TCP
+    {{- end }}
+    {{- if and .Values.databases.neo4j.loadBalancer.enabled .Values.databases.neo4j.loadBalancer.allowedClientCIDRs }}
+    # Bolt (7688) reached from the LAN via the MetalLB LoadBalancer, so the
+    # Neo4j Browser SPA (served over Traefik/HTTPS) can open its wss connection
+    # back to the advertised Bolt address. Scoped to the configured client
+    # CIDRs; relies on the Bolt LB running externalTrafficPolicy: Local so the
+    # pod sees the real client source IP. Bolt is authenticated — this gates
+    # reachability, not access.
+    - from:
+        {{- range .Values.databases.neo4j.loadBalancer.allowedClientCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: 7688
+          protocol: TCP
+    {{- end }}
 ---
 {{- end }}
 
@@ -157,7 +338,43 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloak") | nindent 14 }}
+        {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "keycloak")) }}
+        # CloudNativePG's OWN label, not the chart's component labels: those
+        # are deliberately absent while `migrating` (the legacy Service would
+        # otherwise capture these pods), and this same rule is what lets the
+        # IMPORT read the legacy database. It is also tighter -- only pods of
+        # this one cluster, rather than anything wearing the component label.
+        # Covers both the import job and WAL streaming between instances.
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "srw.fullname" . }}-keycloakdb
+        {{- end }}
       ports:
         - port: 5432
           protocol: TCP
+    {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "keycloak")) }}
+    # The operator polls instance health on the STATUS port (8000), not 5432.
+    # A rule that opens only 5432 leaves the Cluster reporting `Ready=False`
+    # with "unable to receive the status from all the ready instances" while
+    # the database itself serves normally -- and CNPG makes failover and
+    # switchover decisions from that status, so at more than one instance this
+    # is not cosmetic. Observed on srw-postgres and srw-keycloakdb 2026-08-23,
+    # immediately after cutover.
+    #
+    # It only bites at engine `cnpg`: while `migrating` the CNPG pods do not
+    # carry the chart's component labels, so this policy does not select them
+    # at all. That is why a rehearsal cannot surface it.
+    #
+    # Its own rule, deliberately: 8000 stays reachable ONLY from the operator's
+    # namespace, never from the application workloads allowed above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+    {{- end }}
 {{- end }}

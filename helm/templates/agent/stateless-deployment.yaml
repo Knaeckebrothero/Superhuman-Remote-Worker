@@ -1,0 +1,226 @@
+{{- if .Values.agent.stateless.enabled }}
+# Stateless executor Deployment — the `agent-stateless` class.
+# (knowledge-base/knowledge/features/stateless_agents.md §5.8 deployment shape, §5.6 threat model;
+# knowledge-base/knowledge/research/stateless_agents/implementation_log.md M5.)
+#
+# A static pool of generic agent processes that PULL work units from the
+# run_queue instead of being provisioned per job/session. Mirrors the
+# AgentProvisioner pod manifest (orchestrator/services/agent_provisioner.py::
+# _build_pod_manifest) so the process boots identically, with these deliberate
+# deltas:
+#
+#   - Runs `--mode stateless ... --loop`: the process outlives any single unit.
+#   - DISTINCT class labels. These pods carry NO
+#     `srw/managed-by: agent-provisioner` (reap_pods / active_count /
+#     lifecycle-reconciler selector), NO `srw/purpose` (reservation-eviction
+#     selector `srw/managed-by=...,srw/purpose=X`), NO `srw/thread-id` /
+#     `srw.io/thread-id` (per-session pod lookup + session-router Service
+#     selectors), and `app.kubernetes.io/component: agent-stateless` — NOT
+#     `agent` — so the agent Service, agent PDB, and the DB NetworkPolicies'
+#     `component: agent` ingress rules never select them. The coexisting
+#     provisioner plane must never manage, count, reap, or route to this
+#     class. DB ingress is granted by the class-specific entries in
+#     databases/network-policies.yaml; egress by the extended podSelector in
+#     agent/network-policy.yaml.
+#   - `/workspace` is a plain emptyDir, NEVER a PVC: the stateless contract is
+#     that the pod holds no durable per-thread state. S1 serves lite/virtual
+#     sessions whose durable state lives in the object store and Postgres.
+#   - No per-session direct-WS identity: SESSION_BOUND_THREAD_ID and
+#     SESSION_JWT_SECRET are deliberately absent. The stateless executor
+#     serves no direct WebSocket — clients authenticate to the orchestrator
+#     only (§5.6); the pod's WS validator fail-closes without them.
+#   - No per-tenant credentials in the pod spec (§5.6): resolved credentials
+#     arrive per-claim from the orchestrator against proof of the current
+#     lease, never as pod env. The shared ConfigMap/Secret below carry only
+#     platform-level configuration, same as every provisioner-built pod.
+#   - No tailscale sidecar: sandbox workspaces are reachable over cluster SSH,
+#     so the platform workspace key is mounted below. VM-mesh units still need
+#     a later Deployment variant (§5.8 capability dimension).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-agent-stateless
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "agent-stateless") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  # envFrom the shared ConfigMap/Secret: roll the pool when platform config
+  # changes, same freshness the provisioner plane gets by recycling pods.
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
+spec:
+  replicas: {{ .Values.agent.stateless.replicas }}
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 8 }}
+        # `app` keys the agent egress NetworkPolicy (agent/network-policy.yaml
+        # matchExpressions — extended with this value when the class is
+        # enabled). Deliberately NOT `srw-agent`: metering's pod classifier
+        # keys dynamic-agent attribution on app=srw-agent and would flag these
+        # pods as identity conflicts; until lease-interval attribution lands
+        # (§7 replacement inventory) the class is shared platform capacity.
+        app: srw-agent-stateless
+        srw/component: agent
+        # Coexistence partition key — dispatch/sweep predicates that become
+        # class-aware during the migration select on this.
+        srw/class: agent-stateless
+    spec:
+      # Deployment pods restart in place (restartPolicy: Always, the
+      # Deployment default) — unlike the provisioner's one-shot Never pods,
+      # the ReplicaSet owns replacement.
+      #
+      # Drain contract (§5.8): preStop = stop claiming → finish the current
+      # turn/batch → release the lease. The executor implements this on
+      # SIGTERM itself, so there is no preStop exec hook — just a grace
+      # period generous enough to finish + persist + release one unit.
+      # Executor shutdown allows 120s for the in-flight unit, then a 15s
+      # interrupt/unwind window. Keep additional room for authoritative
+      # backend/task drain and the exact claimant-quiescence acknowledgement;
+      # Kubernetes must not SIGKILL the process before that proof is durable.
+      terminationGracePeriodSeconds: 180
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Same gate the provisioner injects into dynamic agent pods: the claim
+      # loop's first act is talking to the control plane.
+      initContainers:
+        - name: wait-for-orchestrator
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-orchestrator 8085; do sleep 2; done"]
+      containers:
+        - name: agent
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.agent) | quote }}
+          imagePullPolicy: {{ .Values.image.agent.pullPolicy }}
+          # Provisioner invocation shape (sh -c, explicit port/host), changing
+          # only the mode and adding --loop so the process returns to idle
+          # between units instead of exiting. `exec` makes Python PID 1 so
+          # kubelet's SIGTERM reaches the executor's graceful-drain handler.
+          command:
+            - sh
+            - -c
+            - >-
+              exec python agent.py
+              --mode stateless
+              --config {{ .Values.agent.stateless.config }}
+              --port {{ .Values.agent.port }}
+              --host 0.0.0.0
+              --loop
+          ports:
+            - containerPort: {{ .Values.agent.port | int }}
+          # Inject all env from the shared ConfigMap + Secret (same pair the
+          # provisioner wires via AGENT_CONFIGMAP/AGENT_SECRET).
+          envFrom:
+            - configMapRef:
+                name: {{ include "srw.configMapName" . }}
+            - secretRef:
+                name: {{ include "srw.secretName" . }}
+          env:
+            # Pod-specific overrides (explicit env wins over envFrom).
+            - name: AGENT_CONFIG
+              value: {{ .Values.agent.stateless.config | quote }}
+            - name: AGENT_PORT
+              value: {{ .Values.agent.port | quote }}
+            - name: MCP_INTERNAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: MCP_INTERNAL_KEY
+                  optional: true
+            # Downward-API pod UID, mirrored from the provisioner manifest.
+            # The stateless plane has no per-pod Service/Ingress to GC, but
+            # the executor reports it for lease/pod observability.
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: vm-ssh-key
+              mountPath: /run/secrets/vm-ssh-key
+              subPath: ssh-privatekey
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /run
+            - name: home-srw
+              mountPath: /home/srw
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.agent.port | int }}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            # /health is served on the agent's asyncio loop, so a GC pause or
+            # brief sync work blows the kubelet's default 1s timeout; with the
+            # default 3-failure budget that SIGKILLs a healthy-but-busy pod
+            # (observed on srw-agent-j-a7d8f8e0: "/health context deadline
+            # exceeded"). Give transient stalls room — 5s timeout x 5 failures
+            # = ~150s before kill. A genuinely dead pod is still caught by the
+            # run_queue lease-expiry reaper.
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: {{ .Values.agent.port | int }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            # Same event-loop tax as the liveness probe above: the 1s default
+            # trips on a transient stall. No Service selects this class, so
+            # readiness is observability, not routing — but keep the widened
+            # timeout so `kubectl get pods` reflects reality.
+            timeoutSeconds: 5
+          startupProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.agent.port | int }}
+            failureThreshold: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml (default .Values.agent.resources .Values.agent.stateless.resources) | nindent 12 }}
+      volumes:
+        # Plain emptyDir scratch — NEVER a PVC for this class. Anything a unit
+        # needs to survive the pod lives in the object store / Postgres; a PVC
+        # here would silently reintroduce the agent-local durable state the
+        # stateless design removes (stateless_agents.md §6.1).
+        - name: workspace
+          emptyDir:
+            sizeLimit: 10Gi
+        # Platform credential used only to authenticate RemoteBackend to a
+        # claimed sandbox workspace. Match the provisioned persistent-agent
+        # mount: the non-root process must be able to read the projected key,
+        # while Paramiko never needs to modify it.
+        - name: vm-ssh-key
+          secret:
+            secretName: {{ include "srw.vmSshKeySecretName" . }}
+            defaultMode: 0444
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: home-srw
+          emptyDir:
+            sizeLimit: 512Mi
+{{- end }}

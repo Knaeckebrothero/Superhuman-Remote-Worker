@@ -4,7 +4,7 @@ Provides Neo4j graph tools when a Neo4j datasource is attached to a job:
 - Cypher query execution
 - Schema inspection
 
-See docs/datasources.md for the datasource connector system.
+See knowledge-base/knowledge/datasources.md for the datasource connector system.
 """
 
 from typing import Any, Dict, List

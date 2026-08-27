@@ -12,11 +12,23 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import tempfile
+import time as _time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
+
+from ...core.backends.overlay import unwrap_backend
+from ...shared.cloud_sync_generations import (
+    EMPTY_BASELINE_SHA256,
+    encode_cloud_sync_baseline,
+    normalize_cloud_sync_baseline,
+)
 
 if TYPE_CHECKING:
     from ...core.workspace_backend import WorkspaceBackend
@@ -24,6 +36,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SYNC_IGNORE_PATTERNS = [
+    ".srw/",
     ".git/",
     "repos/",
     "projects/",
@@ -39,6 +52,49 @@ SYNC_IGNORE_PATTERNS = [
     "plan.md",
 ]
 
+SYNC_GENERATION_MARKER_DIR = ".srw/sync-generations"
+
+
+class CloudSyncMarkerError(RuntimeError):
+    """A resource-side generation marker was malformed or contradicted DB."""
+
+
+@dataclass(frozen=True)
+class CloudSyncMarker:
+    thread_id: str
+    mount_id: str
+    generation: int
+    lease_token: int
+    workspace_generation: str
+    sync_scope_sha256: str
+    baseline_sha256: str = EMPTY_BASELINE_SHA256
+    committed_manifest: object = field(default_factory=dict)
+    committed_manifest_sha256: str = EMPTY_BASELINE_SHA256
+
+
+@dataclass(frozen=True)
+class CloudSyncGenerationCommit:
+    """Resource bytes and membership durably represented by one marker."""
+
+    paths: list[str]
+    manifest: dict[str, dict[str, str]]
+    manifest_sha256: str
+
+
+def _sync_generation_marker_path(thread_id: str, sync_scope_sha256: str) -> str:
+    """Return a path-safe marker name scoped to one thread/resource pair.
+
+    Project and user-home mounts can point several threads at the same WebDAV
+    root.  A single well-known marker there lets one thread overwrite another's
+    acknowledgement.  Hashing both non-secret identities keeps the path safe
+    even if a malformed identifier reaches this layer and prevents that shared-
+    root collision without exposing either value in a remote filename.
+    """
+
+    identity = f"{thread_id}\0{sync_scope_sha256}".encode("utf-8")
+    marker_name = hashlib.sha256(identity).hexdigest()
+    return f"{SYNC_GENERATION_MARKER_DIR}/{marker_name}.json"
+
 
 def _should_ignore(rel_path: str) -> bool:
     """Return True if ``rel_path`` matches any ignore pattern."""
@@ -49,6 +105,63 @@ def _should_ignore(rel_path: str) -> bool:
         elif rel_path == pattern or rel_path.endswith(f"/{pattern}"):
             return True
     return False
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    """Write every byte to an already-open temporary file descriptor."""
+
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("temporary cloud-sync staging write made no progress")
+        remaining = remaining[written:]
+
+
+def _reject_ignored_generation_paths(manifest: object) -> None:
+    """Keep cooperative markers from authorizing out-of-scope mutations."""
+
+    if not isinstance(manifest, dict):
+        return
+    ignored = sorted(path for path in manifest if _should_ignore(path))
+    if ignored:
+        raise CloudSyncMarkerError(
+            "cloud sync generation manifest contains ignored path(s): "
+            + ", ".join(ignored[:3])
+        )
+
+
+def _normalize_dav_listing(raw: list, webdav_base_path: str) -> list[dict]:
+    """Shape a webdav3 ``list(get_info=True)`` result for the sync algorithm.
+
+    Shared by the Nextcloud and OpenCloud transports (it was duplicated).
+    Strips the server-absolute prefix down to mount-relative paths and
+    coerces ``size`` (webdav3 reports it as a string, absent for
+    collections) to ``int | None``.
+    """
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        raw_path = item.get("path", "")
+        if raw_path.startswith(webdav_base_path):
+            rel = raw_path[len(webdav_base_path) :]
+        else:
+            rel = raw_path.strip("/")
+        size = item.get("size")
+        try:
+            size_int: Optional[int] = int(size) if size not in (None, "") else None
+        except (TypeError, ValueError):
+            size_int = None
+        out.append(
+            {
+                "path": rel,
+                "etag": item.get("etag", "") or "",
+                "isdir": bool(item.get("isdir")),
+                "size": size_int,
+            }
+        )
+    return out
 
 
 class WorkspaceSyncBase(abc.ABC):
@@ -68,7 +181,19 @@ class WorkspaceSyncBase(abc.ABC):
     ) -> None:
         self._workspace_path = Path(workspace_path)
         self._poll_interval = poll_interval
-        self._backend = workspace_backend
+        # Unwrap the virtual overlay once, here, so no method below can reach a
+        # virtual path. Cloud sync is not a tool-layer consumer: virtual
+        # prefixes (tools/, contacts/, instructions.md) are framework
+        # projection, not user data. Walking the overlay merged contacts/ into
+        # the root listing and uploaded contact names, emails and phone numbers
+        # to the user's cloud folder — SYNC_IGNORE_PATTERNS lists tools/ but
+        # nothing else — and the return pull then raised VirtualPathError,
+        # which the coordinator's strict=True turned into "cloud sync disabled
+        # for the rest of the session". Doing it structurally, rather than by
+        # extending SYNC_IGNORE_PATTERNS, means a future provider cannot
+        # reintroduce either failure.
+        # See knowledge-base/knowledge/features/virtual_directories.md.
+        self._backend = unwrap_backend(workspace_backend) if workspace_backend else None
         # Workspace-relative path of this mount inside the backend's filesystem.
         # Empty string means "the whole workspace" (legacy single-folder mount).
         # For project mounts, e.g. "projects/alpha". No leading/trailing slash.
@@ -76,8 +201,24 @@ class WorkspaceSyncBase(abc.ABC):
 
         self._local_state: dict[str, float] = {}
         self._remote_state: dict[str, str] = {}
+        # ETag is optional in WebDAV listings. Keep presence separate so an
+        # observed remote file with an empty ETag is still a clean baseline
+        # entry, never misclassified as local-only and re-uploaded every turn.
+        self._remote_known_paths: set[str] = set()
+        # Content hashes from the predecessor's v3 commit marker (or a download
+        # performed by this instance). They represent remote truth even when an
+        # idle workspace process changed the local copy after the marker.
+        self._remote_content_hashes: dict[str, str] = {}
         self._remote_dirs: set[str] = set()
         self._pushed_sizes: dict[str, int] = {}
+        # One-shot guard for priming the dedup dicts from the remote tree.
+        # All state above is process memory: a fresh agent pod used to
+        # re-upload (and re-download) the whole mount because it had no way
+        # to know the cloud already held identical content. Set by the first
+        # pull (whose listing doubles as the seed) or by _seed_remote_state
+        # on a push that runs before any pull.
+        # knowledge-base/knowledge/issues/session_turn_end_cloud_push_blocks_queued_input.md
+        self._remote_seeded: bool = False
 
         self._poll_task: Optional[asyncio.Task] = None
         self._running = False
@@ -89,19 +230,52 @@ class WorkspaceSyncBase(abc.ABC):
         """Verify transport is ready (lazy client init, token fetch, etc.)."""
 
     @abc.abstractmethod
-    async def _ensure_remote_dir(self, rel_dir: str) -> None:
+    async def _ensure_remote_dir(
+        self,
+        rel_dir: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
         """Create a single remote directory. Idempotent; swallow "exists"."""
 
     @abc.abstractmethod
-    async def _upload_file(self, rel_path: str, local_path: str) -> None:
+    async def _upload_file(
+        self,
+        rel_path: str,
+        local_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
         """Upload ``local_path`` to remote ``rel_path``. Parent dirs already exist."""
 
+    async def _delete_remote_file(
+        self,
+        rel_path: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        """Delete one remote file for a generation delta.
+
+        Legacy pinned sync never calls this method.  Stateless generation
+        commits do so only for a path that existed in the armed baseline and
+        disappeared from the durable workspace.  A transport that cannot
+        implement deletion must fail closed rather than acknowledge a partial
+        mirror generation.
+        """
+
+        raise NotImplementedError("cloud transport does not support fenced deletes")
+
     @abc.abstractmethod
-    async def _list_remote_files(self) -> list[dict]:
-        """List the session folder recursively.
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
+        """List ONE remote directory level (``rel_dir`` is mount-relative).
 
         Returns a list of dicts shaped
-        ``{"path": <rel>, "etag": <str>, "isdir": <bool>}``.
+        ``{"path": <rel>, "etag": <str>, "isdir": <bool>, "size": <int|None>}``
+        where ``path`` is relative to the MOUNT ROOT, not to ``rel_dir``.
+        WebDAV ``list`` is a Depth-1 PROPFIND, so this is a single level;
+        recursion lives in ``_list_remote_tree``. Implementations returning
+        more than the requested level (test doubles list recursively) are
+        fine — the tree walk dedups.
         """
 
     @abc.abstractmethod
@@ -112,17 +286,386 @@ class WorkspaceSyncBase(abc.ABC):
         """Release per-instance resources. Default: nothing to release."""
         return None
 
+    # ----------------------------------------------------- Generation marker
+
+    @staticmethod
+    def _marker_missing(exc: BaseException) -> bool:
+        """Best-effort cross-WebDAV missing-resource classification.
+
+        Both production clients raise webdav3's RemoteResourceNotFound while
+        the filesystem test transport raises FileNotFoundError. Other errors
+        stay fail-closed: treating an auth/network failure as an absent marker
+        would turn a read outage into an unsolicited recovery push.
+        """
+
+        if isinstance(exc, FileNotFoundError):
+            return True
+        name = type(exc).__name__.lower()
+        return "notfound" in name or "not_found" in name
+
+    async def read_sync_generation_marker(
+        self,
+        *,
+        thread_id: str,
+        sync_scope_sha256: str,
+    ) -> Optional[CloudSyncMarker]:
+        """Read and strictly validate the cloud-resource commit marker.
+
+        The marker lives with the bytes it acknowledges, so it survives agent
+        pod death. It is user-writable cloud data and therefore a cooperative
+        correctness marker, not an authorization/security fence. The DB-side
+        required generation remains lease-fenced and authoritative.
+        """
+
+        marker_path = _sync_generation_marker_path(thread_id, sync_scope_sha256)
+        await self._ensure_ready()
+        fd, tmp_path = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            try:
+                await self._download_file(marker_path, tmp_path)
+            except Exception as exc:
+                if self._marker_missing(exc):
+                    return None
+                raise
+            try:
+                with open(tmp_path, "r", encoding="utf-8") as marker_file:
+                    raw = json.load(marker_file)
+                if not isinstance(raw, dict) or raw.get("version") != 3:
+                    raise ValueError("unsupported marker version")
+                thread_id = raw.get("thread_id")
+                mount_id = raw.get("mount_id")
+                generation = raw.get("generation")
+                lease_token = raw.get("lease_token")
+                workspace_generation = raw.get("workspace_generation")
+                sync_scope_sha256 = raw.get("sync_scope_sha256")
+                baseline_sha256 = raw.get("baseline_sha256")
+                committed_manifest = raw.get("committed_manifest")
+                committed_manifest_sha256 = raw.get("committed_manifest_sha256")
+                if not isinstance(thread_id, str) or not thread_id:
+                    raise ValueError("thread_id must be a non-empty string")
+                if not isinstance(mount_id, str) or not mount_id:
+                    raise ValueError("mount_id must be a non-empty string")
+                if type(generation) is not int or generation < 1:
+                    raise ValueError("generation must be a positive integer")
+                if type(lease_token) is not int or lease_token < 1:
+                    raise ValueError("lease_token must be a positive integer")
+                if (
+                    not isinstance(workspace_generation, str)
+                    or not workspace_generation
+                ):
+                    raise ValueError("workspace_generation must be a non-empty string")
+                if (
+                    not isinstance(sync_scope_sha256, str)
+                    or len(sync_scope_sha256) != 64
+                    or any(char not in "0123456789abcdef" for char in sync_scope_sha256)
+                ):
+                    raise ValueError("sync_scope_sha256 must be a lowercase SHA-256")
+                if (
+                    not isinstance(baseline_sha256, str)
+                    or len(baseline_sha256) != 64
+                    or any(char not in "0123456789abcdef" for char in baseline_sha256)
+                ):
+                    raise ValueError("baseline_sha256 must be a lowercase SHA-256")
+                (
+                    committed_manifest,
+                    _committed_encoded,
+                    actual_committed_sha256,
+                ) = encode_cloud_sync_baseline(committed_manifest)
+                _reject_ignored_generation_paths(committed_manifest)
+                if committed_manifest_sha256 != actual_committed_sha256:
+                    raise ValueError("committed manifest digest mismatch")
+                return CloudSyncMarker(
+                    thread_id=thread_id,
+                    mount_id=mount_id,
+                    generation=generation,
+                    lease_token=lease_token,
+                    workspace_generation=workspace_generation,
+                    sync_scope_sha256=sync_scope_sha256,
+                    baseline_sha256=baseline_sha256,
+                    committed_manifest=committed_manifest,
+                    committed_manifest_sha256=actual_committed_sha256,
+                )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise CloudSyncMarkerError(
+                    f"invalid cloud sync generation marker: {exc}"
+                ) from exc
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    async def write_sync_generation_marker(
+        self,
+        marker: CloudSyncMarker,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
+        """PUT the marker only after every generation byte has landed."""
+
+        marker_path = _sync_generation_marker_path(
+            marker.thread_id, marker.sync_scope_sha256
+        )
+        await self._ensure_ready()
+        if before_write is not None:
+            await before_write()
+        await self._ensure_remote_dirs(
+            str(Path(marker_path).parent), before_write=before_write
+        )
+        fd, tmp_path = tempfile.mkstemp()
+        try:
+            (
+                committed_manifest,
+                _committed_encoded,
+                committed_manifest_sha256,
+            ) = encode_cloud_sync_baseline(marker.committed_manifest or {})
+            _reject_ignored_generation_paths(committed_manifest)
+            if marker.committed_manifest_sha256 != committed_manifest_sha256:
+                raise CloudSyncMarkerError(
+                    "cloud sync committed manifest digest changed before marker write"
+                )
+            payload = json.dumps(
+                {
+                    "version": 3,
+                    "thread_id": marker.thread_id,
+                    "mount_id": marker.mount_id,
+                    "generation": marker.generation,
+                    "lease_token": marker.lease_token,
+                    "workspace_generation": marker.workspace_generation,
+                    "sync_scope_sha256": marker.sync_scope_sha256,
+                    "baseline_sha256": marker.baseline_sha256,
+                    "committed_manifest": committed_manifest,
+                    "committed_manifest_sha256": committed_manifest_sha256,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            _write_all(fd, payload)
+            os.close(fd)
+            if before_write is not None:
+                await before_write()
+            await self._upload_file(marker_path, tmp_path, before_write=before_write)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    # ---------------------------------------------------- Generation baseline
+
+    async def capture_generation_baseline(
+        self,
+    ) -> tuple[dict[str, dict[str, str]], str]:
+        """Hash the durable workspace after pull and bind known remote etags.
+
+        Stateless cloud ordering cannot use the legacy process-local
+        size/mtime caches: those both reset on handoff and miss same-length
+        edits.  The baseline is armed in Postgres before tool work and lets a
+        successor recover only paths the predecessor actually changed.  That
+        preserves cloud-side edits to unrelated paths and avoids a full PUT of
+        the workspace on every turn.
+        """
+
+        started = _time.perf_counter()
+        if self._backend is None:
+            raise CloudSyncMarkerError(
+                "stateless cloud generation requires a durable workspace backend"
+            )
+        local_files = {
+            path
+            for path in await self._walk_backend_files_async(strict=True)
+            if not _should_ignore(path)
+        }
+        # A marker-proven remote file may have been deleted locally by an idle
+        # workspace process after the predecessor committed. Keep that path in
+        # the armed baseline so the next delta issues the remote DELETE. A true
+        # cloud tombstone is removed from _remote_known_paths by pull first.
+        files = sorted(local_files | self._remote_known_paths)
+        walked = _time.perf_counter()
+        semaphore = asyncio.Semaphore(8)
+
+        async def _one(path: str) -> tuple[str, dict[str, str]]:
+            remote_digest = self._remote_content_hashes.get(path)
+            if path in self._remote_known_paths and remote_digest:
+                return path, {
+                    "sha256": remote_digest,
+                    "remote_etag": str(self._remote_state.get(path) or ""),
+                }
+            async with semaphore:
+                content = await asyncio.to_thread(
+                    self._backend.read_file,
+                    self._backend_path(path),
+                    True,
+                )
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            return path, {
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "remote_etag": str(self._remote_state.get(path) or ""),
+            }
+
+        # Only remote-proven entries are clean.  A local-only path deliberately
+        # stays absent so the generation delta uploads it even when it already
+        # existed before the turn.
+        manifest = {
+            path: entry
+            for path, entry in await asyncio.gather(*(_one(path) for path in files))
+            if path in self._remote_known_paths
+        }
+        normalized, _encoded, digest = encode_cloud_sync_baseline(manifest)
+        logger.info(
+            "cloud generation baseline detail: mount=%s walk=%.2fs files=%d "
+            "remote_proven=%d hash=%.2fs total=%.2fs",
+            self._mount_subdir or "<root>",
+            walked - started,
+            len(files),
+            len(normalized),
+            _time.perf_counter() - walked,
+            _time.perf_counter() - started,
+        )
+        return normalized, digest
+
+    def install_generation_baseline(self, manifest: object) -> None:
+        """Seed cross-pod remote etags from a validated durable baseline."""
+
+        normalized = normalize_cloud_sync_baseline(manifest)
+        _reject_ignored_generation_paths(normalized)
+        self._remote_state.clear()
+        self._remote_known_paths = set(normalized)
+        self._remote_content_hashes = {
+            path: entry["sha256"] for path, entry in normalized.items()
+        }
+        for path, entry in normalized.items():
+            if entry["remote_etag"]:
+                self._remote_state[path] = entry["remote_etag"]
+
+    async def push_generation_delta(
+        self,
+        baseline: object,
+        *,
+        before_write: Callable[[], Awaitable[None]],
+    ) -> CloudSyncGenerationCommit:
+        """Commit only paths changed since the durable turn-start baseline.
+
+        New and content-changed files are uploaded. Baseline membership is the
+        proof that a path existed remotely; an empty ETag is valid and does not
+        by itself make an unchanged path dirty. Deletions of baseline files use
+        the transport delete primitive; a transport that cannot prove that
+        delete fails the generation instead of writing a lying marker.
+        """
+
+        started = _time.perf_counter()
+        normalized = normalize_cloud_sync_baseline(baseline)
+        _reject_ignored_generation_paths(normalized)
+        committed_manifest = {path: dict(entry) for path, entry in normalized.items()}
+        if self._backend is None:
+            raise CloudSyncMarkerError(
+                "stateless cloud generation requires a durable workspace backend"
+            )
+        current_paths = sorted(
+            {
+                path
+                for path in await self._walk_backend_files_async(strict=True)
+                if not _should_ignore(path)
+            }
+        )
+        walked = _time.perf_counter()
+        deletes = sorted(path for path in normalized if path not in current_paths)
+
+        await before_write()
+        await self._ensure_ready()
+        pushed: list[str] = []
+        for path in current_paths:
+            content = await asyncio.to_thread(
+                self._backend.read_file,  # type: ignore[union-attr]
+                self._backend_path(path),
+                True,
+            )
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            current_digest = hashlib.sha256(content).hexdigest()
+            previous = normalized.get(path)
+            if previous is not None and previous["sha256"] == current_digest:
+                continue
+            fd, tmp_path = tempfile.mkstemp()
+            try:
+                _write_all(fd, content)
+                os.close(fd)
+                await before_write()
+                await self._ensure_remote_dirs(
+                    str(Path(path).parent), before_write=before_write
+                )
+                await before_write()
+                await self._upload_file(path, tmp_path, before_write=before_write)
+                self._pushed_sizes[path] = len(content)
+                self._remote_known_paths.add(path)
+                self._remote_content_hashes[path] = current_digest
+                self._remote_state.pop(path, None)
+                committed_manifest[path] = {
+                    "sha256": current_digest,
+                    "remote_etag": "",
+                }
+                pushed.append(path)
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        for path in deletes:
+            await before_write()
+            await self._delete_remote_file(path, before_write=before_write)
+            self._remote_state.pop(path, None)
+            self._remote_known_paths.discard(path)
+            self._remote_content_hashes.pop(path, None)
+            self._pushed_sizes.pop(path, None)
+            committed_manifest.pop(path, None)
+            pushed.append(path)
+        committed_manifest, _encoded, committed_manifest_sha256 = (
+            encode_cloud_sync_baseline(committed_manifest)
+        )
+        logger.info(
+            "cloud generation push detail: mount=%s walk=%.2fs files=%d "
+            "uploads=%d deletes=%d total=%.2fs",
+            self._mount_subdir or "<root>",
+            walked - started,
+            len(current_paths),
+            len(pushed) - len(deletes),
+            len(deletes),
+            _time.perf_counter() - started,
+        )
+        return CloudSyncGenerationCommit(
+            paths=pushed,
+            manifest=committed_manifest,
+            manifest_sha256=committed_manifest_sha256,
+        )
+
     # --------------------------------------------------------------- Algorithm
 
-    async def _ensure_remote_dirs(self, rel_dir: str) -> None:
+    async def _ensure_remote_dirs(
+        self,
+        rel_dir: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> None:
         """Recursively create remote directories, caching known dirs."""
         if not rel_dir or rel_dir == "." or rel_dir in self._remote_dirs:
             return
         parent = str(Path(rel_dir).parent)
         if parent and parent != rel_dir:
-            await self._ensure_remote_dirs(parent)
+            await self._ensure_remote_dirs(parent, before_write=before_write)
         try:
-            await self._ensure_remote_dir(rel_dir)
+            if before_write is not None:
+                await before_write()
+            await self._ensure_remote_dir(rel_dir, before_write=before_write)
         except Exception:
             # Already exists or created by parent — not worth distinguishing
             pass
@@ -137,6 +680,155 @@ class WorkspaceSyncBase(abc.ABC):
             if mount_rel_path
             else self._mount_subdir
         )
+
+    async def _list_remote_tree_fast(self) -> Optional[list[dict]]:
+        """Optional transport primitive: the WHOLE mount tree in one shot.
+
+        Return the complete recursive listing (files may include ignored
+        paths and directory entries — the caller filters), or ``None`` when
+        the transport has no such capability (permanently or for this
+        server). The default has none. Motivation: the per-directory walk
+        costs one ``_list_remote_files`` round trip per directory, measured
+        at ~2.5s/dir via webdav3 (2026-08-08 baseline: 39.9s to list 16
+        files); Nextcloud serves the same tree in ONE ``Depth: infinity``
+        PROPFIND (~1s).
+        """
+        return None
+
+    async def _list_remote_tree(self) -> list[dict]:
+        """Recursively list the mount via per-directory ``_list_remote_files``.
+
+        Tries the transport's one-shot ``_list_remote_tree_fast`` first;
+        falls back to the walk when the transport reports no capability.
+        Fast results pass through the same shaping the walk applies (files
+        only, ignored subtrees dropped, deduped) — ``_should_ignore``'s
+        directory patterns match by path prefix, so per-file filtering
+        subsumes the walk's descend-time pruning.
+
+        The old single ``_list_remote_files()`` call was documented as
+        recursive but backed by a Depth-1 PROPFIND, which silently limited
+        pull (and now dedup seeding) to ROOT-LEVEL files — cloud-side edits
+        under ``output/`` etc. never reached the agent. Ignored subtrees are
+        pruned before descending; the visited set drops entries echoing the
+        listed collection itself (WebDAV servers include it) and keeps
+        fully-recursive test doubles from double-listing.
+        """
+        fast = await self._list_remote_tree_fast()
+        if fast is not None:
+            out: list[dict] = []
+            seen_fast: set[str] = set()
+            for item in fast:
+                path = (item.get("path") or "").strip("/")
+                if not path or item.get("isdir") or _should_ignore(path):
+                    continue
+                if path not in seen_fast:
+                    seen_fast.add(path)
+                    out.append({**item, "path": path})
+            return out
+        out = []
+        seen_files: set[str] = set()
+        visited: set[str] = set()
+        stack: list[str] = [""]
+        while stack:
+            rel_dir = stack.pop()
+            if rel_dir in visited:
+                continue
+            visited.add(rel_dir)
+            for item in await self._list_remote_files(rel_dir):
+                path = (item.get("path") or "").strip("/")
+                if not path or path == rel_dir:
+                    continue
+                if item.get("isdir"):
+                    if not _should_ignore(f"{path}/") and path not in visited:
+                        stack.append(path)
+                    continue
+                if path not in seen_files:
+                    seen_files.add(path)
+                    out.append({**item, "path": path})
+        return out
+
+    async def _seed_remote_state(self) -> None:
+        """One-shot: prime push dedup from the remote tree's sizes.
+
+        A fresh agent pod starts with empty in-memory dedup state and used
+        to re-upload the entire mount on its first push — minutes of serial
+        WebDAV round-trips. Recording each remote file's size as the
+        last-pushed size makes the first push skip everything the cloud
+        already holds at the same size: the documented size-dedup tradeoff
+        (a same-size, different-content change is missed until the size
+        moves), extended across pod recycles instead of newly invented.
+
+        Normally the attach/turn-start pull has already seeded (shared
+        ``_remote_seeded`` flag); this covers a push that runs before any
+        pull succeeded. Fail-soft and single-shot: on listing failure the
+        push simply runs unseeded, which is the old behavior.
+        """
+        if self._remote_seeded:
+            return
+        self._remote_seeded = True
+        try:
+            items = await self._list_remote_tree()
+        except Exception as e:
+            logger.debug("Remote dedup seeding skipped: %s", e)
+            return
+        seeded = 0
+        for item in items:
+            path = item.get("path", "")
+            if not path or _should_ignore(path):
+                continue
+            size = item.get("size")
+            if path not in self._pushed_sizes and isinstance(size, int) and size >= 0:
+                self._pushed_sizes[path] = size
+                seeded += 1
+        if seeded:
+            logger.info("Seeded push dedup from %d remote file size(s)", seeded)
+
+    async def _local_size(self, rel_path: str) -> Optional[int]:
+        """Byte size of the workspace copy of ``rel_path``, or None if absent.
+
+        Backend ``stat()`` reports 0 for missing paths, so a 0 answer gets an
+        ``is_file`` confirmation — otherwise an empty remote file would be
+        recorded as in-sync against a local copy that does not exist.
+        """
+        if self._backend:
+            backend_path = self._backend_path(rel_path)
+            try:
+                size = await asyncio.to_thread(self._backend.stat, backend_path)
+                if size == 0 and not await asyncio.to_thread(
+                    self._backend.is_file, backend_path
+                ):
+                    return None
+                return size
+            except Exception:
+                return None
+        local_path = self._workspace_path / rel_path
+        try:
+            return local_path.stat().st_size if local_path.is_file() else None
+        except OSError:
+            return None
+
+    async def _workspace_content_sha256(self, rel_path: str) -> Optional[str]:
+        """Hash one durable workspace file, or return None when it is absent."""
+
+        if self._backend:
+            try:
+                content = await asyncio.to_thread(
+                    self._backend.read_file,
+                    self._backend_path(rel_path),
+                    True,
+                )
+            except FileNotFoundError:
+                return None
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            return hashlib.sha256(content).hexdigest()
+        local_path = self._workspace_path / rel_path
+        try:
+            if not local_path.is_file():
+                return None
+            return hashlib.sha256(local_path.read_bytes()).hexdigest()
+        except FileNotFoundError:
+            return None
 
     def _walk_backend_files(self) -> list[str]:
         """Recursively list files from the remote workspace backend.
@@ -164,7 +856,118 @@ class WorkspaceSyncBase(abc.ABC):
                         results.append(entry)
         return results
 
-    async def push(self, *, strict: bool = False) -> list[str]:
+    async def _walk_backend_files_async(self, *, strict: bool = False) -> list[str]:
+        """Level-parallel ``_walk_backend_files`` (same semantics, same
+        skip-dir-on-error behavior). One ``list_dir`` per directory is a
+        backend round trip — S3 LIST for virtual workspaces, measured 5.5s
+        serial for a 16-file tree — so directories of a level are listed
+        concurrently under a small semaphore.
+        """
+        results: list[str] = []
+        level = [self._mount_subdir]
+        prefix = f"{self._mount_subdir}/" if self._mount_subdir else ""
+        sem = asyncio.Semaphore(8)
+
+        async def _list(dir_path: str) -> list[str]:
+            async with sem:
+                try:
+                    return await asyncio.to_thread(
+                        self._backend.list_dir,  # type: ignore[union-attr]
+                        dir_path,
+                    )
+                except Exception:
+                    if strict:
+                        raise
+                    return []
+
+        while level:
+            listings = await asyncio.gather(*[_list(d) for d in level])
+            level = []
+            for entries in listings:
+                for entry in entries:
+                    if entry.endswith("/"):
+                        level.append(entry.rstrip("/"))
+                    elif prefix and entry.startswith(prefix):
+                        results.append(entry[len(prefix) :])
+                    elif not prefix:
+                        results.append(entry)
+        return results
+
+    async def _backend_file_index(self) -> Optional[dict[str, int]]:
+        """Mount-relative path → size for every file under the mount, in ONE
+        backend round trip — when the backend can do that.
+
+        Capability probe by duck typing: :class:`VirtualWorkspaceBackend`
+        exposes ``list_files_with_sizes`` (one recursive object-store list;
+        every individual op there is an rclone subprocess spawn, measured
+        ~0.3–0.6s each — a per-file stat pass costs seconds, this costs one
+        spawn). SSH/remote backends have no such bulk primitive and answer
+        ``None``, which keeps them on the per-file path. ``None`` on failure
+        too — the caller's fallback re-runs the ordinary walk/stat path and
+        surfaces the real error under its own strict rules.
+        """
+        lister = getattr(self._backend, "list_files_with_sizes", None)
+        if lister is None:
+            return None
+        try:
+            raw = await asyncio.to_thread(lister, self._mount_subdir)
+        except Exception as e:
+            logger.debug("Bulk file index failed (%s); per-file path", e)
+            return None
+        prefix = f"{self._mount_subdir}/" if self._mount_subdir else ""
+        out: dict[str, int] = {}
+        for path, size in raw:
+            if prefix and path.startswith(prefix):
+                out[path[len(prefix) :]] = size
+            elif not prefix:
+                out[path] = size
+        return out
+
+    async def _local_sizes(self, paths: list[str]) -> dict[str, Optional[int]]:
+        """``_local_size`` for many paths with bounded concurrency.
+
+        ``_local_size`` never raises (it answers None for anything it cannot
+        stat), so the gather needs no exception shaping.
+        """
+        if not paths:
+            return {}
+        sem = asyncio.Semaphore(8)
+
+        async def _one(path: str) -> tuple[str, Optional[int]]:
+            async with sem:
+                return path, await self._local_size(path)
+
+        return dict(await asyncio.gather(*[_one(p) for p in paths]))
+
+    async def _backend_stats(self, paths: list[str]) -> dict[str, object]:
+        """Backend ``stat`` for many paths with bounded concurrency.
+
+        Failures are returned as the exception object (not raised) so the
+        caller can honor its own strict/lenient per-file policy.
+        """
+        if not paths:
+            return {}
+        sem = asyncio.Semaphore(8)
+
+        async def _one(path: str) -> tuple[str, object]:
+            async with sem:
+                try:
+                    return path, await asyncio.to_thread(
+                        self._backend.stat,  # type: ignore[union-attr]
+                        self._backend_path(path),
+                    )
+                except Exception as e:
+                    return path, e
+
+        return dict(await asyncio.gather(*[_one(p) for p in paths]))
+
+    async def push(
+        self,
+        *,
+        strict: bool = False,
+        force: bool = False,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> list[str]:
         """Push locally modified/new files to the cloud.
 
         When ``strict`` is True, transport-level and per-file errors raise
@@ -174,11 +977,23 @@ class WorkspaceSyncBase(abc.ABC):
         """
         pushed: list[str] = []
         try:
+            if before_write is not None:
+                await before_write()
             await self._ensure_ready()
+            if not force:
+                await self._seed_remote_state()
             if self._backend:
-                pushed = await self._push_via_backend(strict=strict)
+                pushed = await self._push_via_backend(
+                    strict=strict,
+                    force=force,
+                    before_write=before_write,
+                )
             else:
-                pushed = await self._push_local(strict=strict)
+                pushed = await self._push_local(
+                    strict=strict,
+                    force=force,
+                    before_write=before_write,
+                )
             if pushed:
                 logger.info("Synced %d file(s) to cloud", len(pushed))
         except Exception as e:
@@ -187,15 +1002,54 @@ class WorkspaceSyncBase(abc.ABC):
             logger.warning("Push sync failed: %s", e)
         return pushed
 
-    async def _push_via_backend(self, *, strict: bool = False) -> list[str]:
+    async def _push_via_backend(
+        self,
+        *,
+        strict: bool = False,
+        force: bool = False,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> list[str]:
         """Push files from a remote workspace backend. Uses size-based dedup."""
         pushed: list[str] = []
-        files = await asyncio.to_thread(self._walk_backend_files)
+        _t0 = _time.perf_counter()
+        # One bulk walk-with-sizes when the backend supports it (virtual/S3:
+        # a single rclone spawn replaces the per-dir walk AND every per-file
+        # size check). Fallback: level-parallel walk + batched stats.
+        index = await self._backend_file_index()
+        if index is not None:
+            files = list(index)
+            stat_results: dict[str, object] = dict(index)
+            _n_stats = 0
+        else:
+            files = await self._walk_backend_files_async(strict=strict)
+            # stat() is one round-trip with no payload — read the (possibly
+            # large) file only when its size moved. All size-checks run up
+            # front with bounded concurrency (measured 2.2s serial for 16
+            # files on the virtual/S3 backend). stat() reports 0 for
+            # vanished paths, which mismatches any tracked nonzero size and
+            # falls through to the read; that read's failure is the per-file
+            # skip below. A failed stat re-raises inside the per-file try so
+            # the strict/lenient policy stays exactly per-file.
+            tracked = [
+                p
+                for p in files
+                if not _should_ignore(p) and self._pushed_sizes.get(p) is not None
+            ]
+            stat_results = await self._backend_stats(tracked)
+            _n_stats = len(tracked)
+        _t_walk = _time.perf_counter() - _t0
 
         for rel_path in files:
             if _should_ignore(rel_path):
                 continue
             try:
+                prev_size = self._pushed_sizes.get(rel_path)
+                if prev_size is not None and not force:
+                    cur_size = stat_results.get(rel_path)
+                    if isinstance(cur_size, Exception):
+                        raise cur_size
+                    if cur_size == prev_size:
+                        continue
                 content = await asyncio.to_thread(
                     self._backend.read_file,  # type: ignore[union-attr]
                     self._backend_path(rel_path),
@@ -204,18 +1058,24 @@ class WorkspaceSyncBase(abc.ABC):
                 if isinstance(content, str):
                     content = content.encode("utf-8")
 
-                prev_size = self._pushed_sizes.get(rel_path)
-                if prev_size is not None and len(content) == prev_size:
+                if not force and prev_size is not None and len(content) == prev_size:
                     continue
 
                 fd, tmp_path = tempfile.mkstemp()
                 try:
                     os.write(fd, content)
                     os.close(fd)
-
+                    if before_write is not None:
+                        await before_write()
                     remote_dir = str(Path(rel_path).parent)
-                    await self._ensure_remote_dirs(remote_dir)
-                    await self._upload_file(rel_path, tmp_path)
+                    await self._ensure_remote_dirs(
+                        remote_dir, before_write=before_write
+                    )
+                    if before_write is not None:
+                        await before_write()
+                    await self._upload_file(
+                        rel_path, tmp_path, before_write=before_write
+                    )
                     self._pushed_sizes[rel_path] = len(content)
                     pushed.append(rel_path)
                 finally:
@@ -227,9 +1087,24 @@ class WorkspaceSyncBase(abc.ABC):
                 if strict:
                     raise
                 logger.debug("Push failed for %s: %s", rel_path, e)
+        logger.info(
+            "push detail: mount=%s walk=%.2fs files=%d stats=%d uploads=%d total=%.2fs",
+            self._mount_subdir or "<root>",
+            _t_walk,
+            len(files),
+            _n_stats,
+            len(pushed),
+            _time.perf_counter() - _t0,
+        )
         return pushed
 
-    async def _push_local(self, *, strict: bool = False) -> list[str]:
+    async def _push_local(
+        self,
+        *,
+        strict: bool = False,
+        force: bool = False,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> list[str]:
         """Push files from the local filesystem. Uses mtime-based dedup."""
         pushed: list[str] = []
         for root, _dirs, files in os.walk(self._workspace_path):
@@ -242,13 +1117,30 @@ class WorkspaceSyncBase(abc.ABC):
 
                 mtime = local_path.stat().st_mtime
                 prev_mtime = self._local_state.get(rel_path)
-                if prev_mtime is not None and mtime <= prev_mtime:
+                if not force and prev_mtime is not None and mtime <= prev_mtime:
                     continue
+                if not force and prev_mtime is None:
+                    # First sighting by this instance. A seeded size match
+                    # means the cloud already holds this content — record
+                    # the mtime so the normal dedup takes over, skip the
+                    # upload (fresh-pod full re-upload fix, local mode).
+                    seeded = self._pushed_sizes.get(rel_path)
+                    if seeded is not None and local_path.stat().st_size == seeded:
+                        self._local_state[rel_path] = mtime
+                        continue
 
                 try:
+                    if before_write is not None:
+                        await before_write()
                     remote_dir = str(Path(rel_path).parent)
-                    await self._ensure_remote_dirs(remote_dir)
-                    await self._upload_file(rel_path, str(local_path))
+                    await self._ensure_remote_dirs(
+                        remote_dir, before_write=before_write
+                    )
+                    if before_write is not None:
+                        await before_write()
+                    await self._upload_file(
+                        rel_path, str(local_path), before_write=before_write
+                    )
                     self._local_state[rel_path] = mtime
                     pushed.append(rel_path)
                 except Exception as e:
@@ -257,7 +1149,13 @@ class WorkspaceSyncBase(abc.ABC):
                     logger.debug("Push failed for %s: %s", rel_path, e)
         return pushed
 
-    async def pull(self, *, strict: bool = False) -> list[str]:
+    async def pull(
+        self,
+        *,
+        strict: bool = False,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+        force_unknown: bool = False,
+    ) -> list[str]:
         """Pull remotely modified/new files from the cloud into the workspace.
 
         When ``strict`` is True, transport-level and per-file errors raise
@@ -265,15 +1163,53 @@ class WorkspaceSyncBase(abc.ABC):
         turn boundaries.
         """
         pulled: list[str] = []
+        _t0 = _time.perf_counter()
+        _t_list = 0.0
+        _n_stats = 0
         try:
             await self._ensure_ready()
+            # A v3 resource marker installs the exact set of files committed by
+            # the predecessor. Only that durable membership proof authorizes a
+            # missing remote path to act as a cloud tombstone. Fresh/legacy
+            # pulls start empty and therefore never delete local-only files.
+            previously_committed_paths = set(self._remote_known_paths)
             try:
-                remote_files = await self._list_remote_files()
+                remote_files = await self._list_remote_tree()
             except Exception:
                 if strict:
                     raise
                 # Folder doesn't exist yet — nothing to pull
                 return pulled
+            _t_list = _time.perf_counter() - _t0
+            # A successful listing doubles as the dedup seed (the reconcile
+            # below records sizes/etags), so a later push needn't re-list.
+            self._remote_seeded = True
+            observed_remote_paths: set[str] = set()
+
+            # First-sighting local size checks are one backend round trip
+            # each (an rclone subprocess spawn on virtual workspaces;
+            # measured 1.9s serial / 4.0s under thread contention for 16
+            # files) — prefer ONE bulk walk-with-sizes, else resolve them
+            # with bounded concurrency.
+            _stat_paths = [
+                item.get("path", "")
+                for item in remote_files
+                if item.get("path")
+                and not item.get("isdir")
+                and not _should_ignore(item.get("path", ""))
+                and not self._remote_state.get(item.get("path", ""))
+                and isinstance(item.get("size"), int)
+                and item.get("size", -1) >= 0
+            ]
+            _index = await self._backend_file_index() if _stat_paths else None
+            if _index is not None:
+                _local_sizes: dict[str, Optional[int]] = {
+                    p: _index.get(p) for p in _stat_paths
+                }
+                _n_stats = 1
+            else:
+                _local_sizes = await self._local_sizes(_stat_paths)
+                _n_stats = len(_stat_paths)
 
             for item in remote_files:
                 path = item.get("path", "")
@@ -281,57 +1217,267 @@ class WorkspaceSyncBase(abc.ABC):
                     continue
                 if _should_ignore(path):
                     continue
+                observed_remote_paths.add(path)
 
                 etag = item.get("etag", "")
                 prev_etag = self._remote_state.get(path)
-                if prev_etag and etag == prev_etag:
+                if (
+                    prev_etag
+                    and etag == prev_etag
+                    and (not force_unknown or path in self._remote_content_hashes)
+                ):
                     continue
+
+                if not prev_etag and not force_unknown:
+                    # First sighting by this instance (fresh pod). If the
+                    # workspace copy already matches by size, record it as
+                    # in-sync instead of re-downloading the whole mount on
+                    # every pod recycle — which also clobbered any unpushed
+                    # local edit with a stale same-size cloud copy. Size is
+                    # the same heuristic push dedup has always used.
+                    size = item.get("size")
+                    if isinstance(size, int) and size >= 0:
+                        local_size = _local_sizes.get(path)
+                        if local_size == size:
+                            self._remote_state[path] = etag
+                            self._pushed_sizes[path] = size
+                            if not self._backend:
+                                try:
+                                    self._local_state[path] = (
+                                        (self._workspace_path / path).stat().st_mtime
+                                    )
+                                except OSError:
+                                    pass
+                            continue
 
                 try:
                     if self._backend:
-                        await self._pull_file_to_backend(path, etag)
+                        changed = await self._pull_file_to_backend(
+                            path,
+                            etag,
+                            before_write=before_write,
+                            committed_sha256=(
+                                self._remote_content_hashes.get(path)
+                                if force_unknown
+                                else None
+                            ),
+                        )
                     else:
-                        await self._pull_file_local(path, etag)
-                    pulled.append(path)
+                        changed = await self._pull_file_local(
+                            path,
+                            etag,
+                            before_write=before_write,
+                            committed_sha256=(
+                                self._remote_content_hashes.get(path)
+                                if force_unknown
+                                else None
+                            ),
+                        )
+                    if changed:
+                        pulled.append(path)
                 except Exception as e:
                     if strict:
                         raise
                     logger.debug("Pull failed for %s: %s", path, e)
 
+            deleted = 0
+            if force_unknown:
+                for path in sorted(previously_committed_paths - observed_remote_paths):
+                    try:
+                        expected_digest = self._remote_content_hashes.get(path)
+                        local_digest = await self._workspace_content_sha256(path)
+                        self._remote_state.pop(path, None)
+                        self._pushed_sizes.pop(path, None)
+                        # The marker says what the remote held at commit time.
+                        # If an idle process wrote a different local value after
+                        # that marker, preserve it as a new local-only delta.
+                        # Only the unchanged stale copy is deleted in response
+                        # to the cloud tombstone. No digest means no authority
+                        # to delete anything.
+                        if expected_digest is None or (
+                            local_digest is not None and local_digest != expected_digest
+                        ):
+                            continue
+                        if before_write is not None:
+                            await before_write()
+                        removed = False
+                        if self._backend:
+                            removed = bool(
+                                await asyncio.to_thread(
+                                    self._backend.delete_file,
+                                    self._backend_path(path),
+                                )
+                            )
+                        else:
+                            local_path = self._workspace_path / path
+                            removed = local_path.exists()
+                            local_path.unlink(missing_ok=True)
+                        if removed:
+                            pulled.append(path)
+                            deleted += 1
+                    except Exception as e:
+                        if strict:
+                            raise
+                        logger.debug("Cloud tombstone apply failed for %s: %s", path, e)
+
             if pulled:
                 logger.info("Pulled %d file(s) from cloud", len(pulled))
+            self._remote_known_paths = observed_remote_paths
+            self._remote_content_hashes = {
+                path: digest
+                for path, digest in self._remote_content_hashes.items()
+                if path in observed_remote_paths
+            }
+            logger.info(
+                "pull detail: mount=%s list=%.2fs files=%d reconcile=%.2fs "
+                "stats=%d downloads=%d deletes=%d total=%.2fs",
+                self._mount_subdir or "<root>",
+                _t_list,
+                len(remote_files),
+                _time.perf_counter() - _t0 - _t_list,
+                _n_stats,
+                len(pulled) - deleted,
+                deleted,
+                _time.perf_counter() - _t0,
+            )
         except Exception as e:
             if strict:
                 raise
             logger.warning("Pull sync failed: %s", e)
         return pulled
 
-    async def _pull_file_to_backend(self, path: str, etag: str) -> None:
+    async def _pull_file_to_backend(
+        self,
+        path: str,
+        etag: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+        committed_sha256: Optional[str] = None,
+    ) -> bool:
         fd, tmp_path = tempfile.mkstemp()
         os.close(fd)
         try:
             await self._download_file(path, tmp_path)
             with open(tmp_path, "rb") as f:
                 content = f.read()
-            await asyncio.to_thread(
-                self._backend.write_file,  # type: ignore[union-attr]
-                self._backend_path(path),
-                content,
-            )
+            remote_digest = hashlib.sha256(content).hexdigest()
+            preserve_local = False
+            if committed_sha256 and remote_digest == committed_sha256:
+                try:
+                    local_content = await asyncio.to_thread(
+                        self._backend.read_file,  # type: ignore[union-attr]
+                        self._backend_path(path),
+                        True,
+                    )
+                    if isinstance(local_content, str):
+                        local_content = local_content.encode("utf-8")
+                    preserve_local = (
+                        hashlib.sha256(local_content).hexdigest() != committed_sha256
+                    )
+                except FileNotFoundError:
+                    preserve_local = False
+            if before_write is not None:
+                await before_write()
+            # Never stream directly over the durable target: a pod/transport
+            # death mid-SFTP write would leave a partial file with no armed
+            # generation.  Stage under the ignored management tree, then use
+            # the backend's replace/move primitive (POSIX rename for sandbox;
+            # atomic destination PUT for the object-store backend).
+            if not preserve_local:
+                staged_path = f".srw/cloud-pull/{uuid.uuid4().hex}.tmp"
+                try:
+                    if await asyncio.to_thread(
+                        self._backend.is_dir,  # type: ignore[union-attr]
+                        self._backend_path(path),
+                    ):
+                        raise CloudSyncMarkerError(
+                            f"cloud pull target is a directory: {path}"
+                        )
+                    await asyncio.to_thread(
+                        self._backend.write_file,  # type: ignore[union-attr]
+                        staged_path,
+                        content,
+                    )
+                    if before_write is not None:
+                        await before_write()
+                    await asyncio.to_thread(
+                        self._backend.replace_file,  # type: ignore[union-attr]
+                        staged_path,
+                        self._backend_path(path),
+                    )
+                    installed = await asyncio.to_thread(
+                        self._backend.read_file,  # type: ignore[union-attr]
+                        self._backend_path(path),
+                        True,
+                    )
+                    if isinstance(installed, str):
+                        installed = installed.encode("utf-8")
+                    if hashlib.sha256(installed).hexdigest() != remote_digest:
+                        raise CloudSyncMarkerError(
+                            f"staged cloud pull verification failed for {path}"
+                        )
+                finally:
+                    try:
+                        await asyncio.to_thread(
+                            self._backend.delete_file,  # type: ignore[union-attr]
+                            staged_path,
+                        )
+                    except Exception:
+                        pass
             self._remote_state[path] = etag
+            self._remote_content_hashes[path] = remote_digest
             self._pushed_sizes[path] = len(content)
+            return not preserve_local
         finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
-    async def _pull_file_local(self, path: str, etag: str) -> None:
+    async def _pull_file_local(
+        self,
+        path: str,
+        etag: str,
+        *,
+        before_write: Optional[Callable[[], Awaitable[None]]] = None,
+        committed_sha256: Optional[str] = None,
+    ) -> bool:
         local_path = self._workspace_path / path
+        if before_write is not None:
+            await before_write()
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        await self._download_file(path, str(local_path))
+        fd, staged_path = tempfile.mkstemp(
+            prefix=f".{local_path.name}.srw-pull-", dir=local_path.parent
+        )
+        os.close(fd)
+        try:
+            await self._download_file(path, staged_path)
+            content = Path(staged_path).read_bytes()
+            remote_digest = hashlib.sha256(content).hexdigest()
+            preserve_local = False
+            if (
+                committed_sha256
+                and remote_digest == committed_sha256
+                and local_path.is_file()
+            ):
+                preserve_local = (
+                    hashlib.sha256(local_path.read_bytes()).hexdigest()
+                    != committed_sha256
+                )
+            if not preserve_local:
+                if before_write is not None:
+                    await before_write()
+                os.replace(staged_path, local_path)
+        finally:
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
         self._remote_state[path] = etag
+        self._remote_content_hashes[path] = remote_digest
+        self._pushed_sizes[path] = len(content)
         self._local_state[path] = local_path.stat().st_mtime
+        return not preserve_local
 
     async def full_sync(self, *, strict: bool = False) -> tuple[list[str], list[str]]:
         """Push first, then pull."""

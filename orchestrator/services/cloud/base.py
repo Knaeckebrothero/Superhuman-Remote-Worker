@@ -17,8 +17,8 @@ Phase 1.5 tightened the contract:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 from .handles import (
     GroupId,
@@ -52,6 +52,60 @@ class UserHome:
     webdav_url: Optional[str]
 
 
+@dataclass(frozen=True, slots=True)
+class CloudMountSubject:
+    """Identity context for a user-scoped cloud mount.
+
+    Backends use this only when the remote they are exposing belongs to a
+    specific user rather than to a service/project space.
+    """
+
+    user_id: Optional[str] = None
+    user_sub: Optional[str] = None
+    username: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class RcloneMountSpec:
+    """Provider-owned description of one rclone remote.
+
+    The orchestrator serializes this into the agent's ``cloud_mount`` payload.
+    The agent-side mount manager is intentionally generic: it writes the
+    rclone config and starts the mount without knowing provider business rules.
+    """
+
+    source_type: str
+    source_config: dict[str, Any]
+    auth: dict[str, Any] = field(default_factory=dict)
+    root: str = ""
+    provider_flags: list[str] = field(default_factory=list)
+    cache: dict[str, Any] = field(default_factory=dict)
+    required_capabilities: list[str] = field(
+        default_factory=lambda: ["rclone", "fuse", "rc"]
+    )
+    # Lowest rclone release the runtime may use for this remote (e.g. the
+    # webdav `infinitescale` vendor only exists from 1.70.0). Empty = any.
+    min_rclone_version: str = ""
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = {
+            "type": self.source_type,
+            "config": dict(self.source_config),
+        }
+        if self.root:
+            payload["root"] = self.root
+        out = {
+            "source": payload,
+            "auth": dict(self.auth),
+            "provider_flags": list(self.provider_flags),
+            "cache": dict(self.cache),
+            "required_capabilities": list(self.required_capabilities),
+        }
+        if self.min_rclone_version:
+            out["min_rclone_version"] = self.min_rclone_version
+        return out
+
+
 @runtime_checkable
 class MainCloudBackend(Protocol):
     """Contract every main-cloud backend must satisfy.
@@ -67,6 +121,29 @@ class MainCloudBackend(Protocol):
     """
 
     backend_id: str
+
+    @property
+    def backend_instance_id(self) -> Optional[str]:
+        """Durable installation authority, or ``None`` until DB adoption."""
+        ...
+
+    @property
+    def installation_proof_sha256(self) -> Optional[str]:
+        """Digest of the provider-owned installation proof after init."""
+        ...
+
+    def bind_backend_instance(self, backend_instance_id: str) -> None:
+        """Bind the exact DB installation UUID after remote attestation."""
+        ...
+
+    def prepare_backend_instance_attestation(self, backend_instance_id: str) -> None:
+        """Supply a proposed UUID for an installation-bound remote probe.
+
+        This is not routing authority and must not populate
+        :attr:`backend_instance_id`; a racing first-boot replica may ultimately
+        adopt a different UUID from the database.
+        """
+        ...
 
     # ------------------------------------------------------------------ Lifecycle
     @property
@@ -167,9 +244,17 @@ class MainCloudBackend(Protocol):
         list every descendant file and directory, sorted by ``path``.
 
         Used by the job cloud-export Mode A baseline-seed
-        (docs/done/job_cloud_export.md §3.1) to enumerate what to
+        (knowledge-history/done/job_cloud_export.md §3.1) to enumerate what to
         push into Gitea before the agent starts.
         """
+        ...
+
+    async def capture_etag_baseline(
+        self, handle: ProjectFolderHandle
+    ) -> dict[str, str]:
+        """Return ``{path: etag}`` for every file under the project folder, for
+        the protected-mode conflict baseline (design §3.4). Infinity-first with
+        a Depth:1 BFS fallback (§11.5)."""
         ...
 
     async def get_project_folder_file_bytes(
@@ -264,7 +349,7 @@ class MainCloudBackend(Protocol):
         advisory; backends may pick a default if omitted.
 
         Used by the job cloud-export endpoint (Mode B in
-        docs/done/job_cloud_export.md) to copy a completed job's
+        knowledge-history/done/job_cloud_export.md) to copy a completed job's
         output files into a freshly-allocated shared folder.
         """
         ...
@@ -275,4 +360,97 @@ class MainCloudBackend(Protocol):
         """Credentials the agent uses for WebDAV access, or ``{}`` if the
         backend does not speak WebDAV (e.g. Microsoft Graph).
         """
+        ...
+
+
+@runtime_checkable
+class SupportsRcloneMount(Protocol):
+    """Optional capability for backends that can expose handles via rclone."""
+
+    async def build_rclone_mount_spec(
+        self,
+        *,
+        handle: ProjectFolderHandle | SessionFolderHandle,
+        mount_kind: str,
+        target_path: str,
+        access: Literal["read_only", "read_write"],
+        subject: CloudMountSubject | None = None,
+        prefer_public_url: bool = False,
+    ) -> RcloneMountSpec:
+        """``prefer_public_url`` selects the public WebDAV endpoint instead of
+        the internal one — required for cross-cluster VM runtimes that can't
+        reach the internal service DNS (workspace_upgrade_drops_cloud_mount.md).
+        Same-cluster workspace pods leave it ``False`` (no public-edge hairpin).
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class RoReaderGrant:
+    """One minted per-mount read-only grant for protected cloud mode.
+
+    ``credentials`` is the reader's per-provision app-password (Nextcloud) or
+    ``None`` when the reader authenticates with a short-TTL bearer (OpenCloud).
+    ``grant_handle`` is opaque JSON the same backend later passes to
+    ``revoke_ro_grant`` to undo exactly this grant (design §8.1.4).
+    """
+
+    reader_id: str
+    grant_handle: str
+    webdav_url: str
+    credentials: Optional[str]
+    auth_kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanaryFixture:
+    """A real file the write identity seeds so the RO probe's CVE-side-channel
+    checks target real ids instead of synthetic ones (design §11.4).
+
+    ``version_ref``/``trash_ref`` are populated only where the backend can
+    enumerate a real version/trash id; ``None`` leaves that side channel
+    inconclusive, which — under the strict engage gate — keeps it fail-closed
+    until the §11.4 live-validation step wires + tunes them.
+    """
+
+    path: str
+    version_ref: Optional[str] = None
+    trash_ref: Optional[str] = None
+
+
+@runtime_checkable
+class SupportsRoReader(Protocol):
+    """Optional capability: provision a dedicated low-privilege read-only
+    reader identity + per-mount grant for protected cloud mode (design §3.3,
+    §8.1.4). Kept separate from ``MainCloudBackend`` so a backend that cannot
+    provide it simply does not implement these methods."""
+
+    backend_id: str
+
+    async def ensure_ro_reader(self, *, user_key: str) -> str:
+        """Idempotently ensure the ``srw-reader-<user_key>`` account exists with
+        no standing folder access. Returns its native id."""
+        ...
+
+    async def mint_ro_grant(
+        self, handle: ProjectFolderHandle, *, user_key: str, grant_key: str
+    ) -> RoReaderGrant:
+        """Grant the reader read-only access to ``handle`` for one mount
+        (``grant_key`` uniquely identifies the mount, e.g. the thread id)."""
+        ...
+
+    async def revoke_ro_grant(self, grant_handle: str, *, user_key: str) -> None:
+        """Undo a grant minted by ``mint_ro_grant``. Idempotent — a
+        double-revoke or already-gone grant is not an error."""
+        ...
+
+    async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
+        """Write a real canary file with the WRITE identity so the RO probe can
+        target real ids (design §11.4)."""
+        ...
+
+    async def remove_canary_fixture(
+        self, handle: ProjectFolderHandle, fixture: CanaryFixture
+    ) -> None:
+        """Remove the canary file seeded by ``seed_canary_fixture``."""
         ...

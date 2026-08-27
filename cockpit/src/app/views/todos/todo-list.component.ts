@@ -230,7 +230,7 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       align-items: center;
       gap: 12px;
       padding: 8px 12px;
-      background: var(--panel-header-bg, #1e1e2e);
+      background: var(--panel-header-bg);
       border-bottom: 1px solid var(--border-color, var(--surface-0));
       flex-shrink: 0;
     }
@@ -349,7 +349,7 @@ import { AppSpinnerComponent } from '../../ui/spinner';
     }
 
     .todo-item:hover {
-      background: var(--panel-header-bg, #1e1e2e);
+      background: var(--panel-header-bg);
     }
 
     .todo-item.completed {

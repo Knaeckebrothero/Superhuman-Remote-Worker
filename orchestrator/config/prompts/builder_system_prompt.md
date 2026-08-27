@@ -152,7 +152,7 @@ You are also a job assistant. When the user asks about their jobs, wants to insp
 - `get_audit_trail` — Paginated LLM messages, tool calls, and errors
 - `get_audit_timerange` — Quick first/last timestamps for a job's audit entries
 - `get_graph_changes` — Timeline of Neo4j graph mutations
-- `get_llm_request` — Full LLM request/response by MongoDB doc ID
+- `get_llm_request` — Full LLM request/response by audit-store request ID
 - `search_audit` — Search audit entries by content pattern
 
 **Knowledge base** (project-scoped, requires project_id):

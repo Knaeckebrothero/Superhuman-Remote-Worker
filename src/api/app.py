@@ -30,6 +30,11 @@ from .orchestrator_client import OrchestratorClient, create_orchestrator_client_
 from ..agent import UniversalAgent
 from ..core.loader import resolve_config_path
 from ..core.workspace import get_logs_path
+from ..core.workspace_backend import completion_error_payload
+from ..shared.workspace_contract import (
+    WorkspaceContractError,
+    validate_worker_workspace_projection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +76,55 @@ def _clear_stop() -> None:
     _stop_completed.clear()
 
 
+# Statuses that mean "this job is no longer ours to run". Deliberately a
+# DENY-list: an unrecognised or new status leaves the run alone (fail-open),
+# because wrongly stopping a healthy run is worse than a late stop, and the
+# push signal remains the fast path either way.
+_PREEMPTED_JOB_STATUSES = {
+    "failed": "cancel",
+    "cancelled": "cancel",
+    "paused": "pause",
+}
+
+
+def _on_heartbeat_response(response: dict) -> None:
+    """Stop the run if the orchestrator says our job was taken away.
+
+    The heartbeat used to be one-directional — the agent asserted liveness and
+    learned nothing back. So when something terminated a job out-of-band, the
+    running agent never found out: job c6dd288d kept streaming for 21 minutes
+    and 45 LLM calls after it had been failed, and only noticed when its VM was
+    collected underneath it, which it reasonably misread as "my workspace died"
+    rather than "my job was killed".
+
+    The orchestrator's push stop signal stays the fast path. This is the
+    backstop for the 13+ call sites that can write a terminal status without
+    sending one, and it costs no new call — the heartbeat already runs on the
+    right cadence.
+    knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
+    """
+    job_id = _current_job_id
+    if not job_id or _stop_requested.is_set():
+        return
+    if not isinstance(response, dict):
+        return
+    job_status = response.get("job_status")
+    reason = _PREEMPTED_JOB_STATUSES.get(job_status)
+    if reason is None:
+        # Includes job_status=None (older orchestrator, or the lookup failed) —
+        # degrade to the previous push-only behaviour rather than guessing.
+        return
+    logger.warning(
+        "Job %s is '%s' on the orchestrator but this agent is still running it "
+        "— stopping (reason=%s). The job was terminated out-of-band; work since "
+        "then was not attributable to it.",
+        job_id,
+        job_status,
+        reason,
+    )
+    _request_stop(reason)
+
+
 def set_config_path(path: str) -> None:
     """Set the configuration path for the agent.
 
@@ -94,7 +148,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Universal Agent application...")
 
     # Get config path from environment or global setting
-    config_path = _config_path or os.getenv("AGENT_CONFIG", "default")
+    config_path = _config_path or os.getenv("AGENT_CONFIG", "worker_base")
     resolved_path, deployment_dir = resolve_config_path(config_path)
 
     logger.info(f"Loading agent configuration from: {resolved_path}")
@@ -102,6 +156,11 @@ async def lifespan(app: FastAPI):
     # Create and initialize agent - pass original config_path, not resolved tuple
     _agent = UniversalAgent.from_config(config_path)
     await _agent.initialize()
+
+    # NOTE: experts no longer resolve agent-side. The orchestrator emits a fully
+    # resolved config blob (services/config_resolver.py) delivered via the
+    # session-attach payload; the agent is a pure executor. from_config(config_name)
+    # above is the migration fallback when no blob is present.
 
     # Register with orchestrator and start heartbeat
     _orchestrator_client = create_orchestrator_client_from_env(_agent.config.agent_id)
@@ -121,6 +180,7 @@ async def lifespan(app: FastAPI):
             get_status=_get_agent_status_for_heartbeat,
             get_job_id=_get_current_job_id,
             get_metrics=_get_agent_metrics,
+            on_response=_on_heartbeat_response,
         )
     )
     logger.info("Orchestrator heartbeat loop started")
@@ -221,6 +281,18 @@ def _get_current_job_id() -> Optional[str]:
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
     """Get agent metrics for heartbeat reporting."""
+    metrics: Dict[str, Any] = {}
+    try:
+        graph_progress = (
+            _agent._tool_context.get_graph_progress()
+            if _agent is not None and _agent._tool_context is not None
+            else None
+        )
+        if graph_progress is not None:
+            metrics["graph_progress"] = graph_progress
+    except Exception:
+        pass
+
     try:
         import psutil
 
@@ -228,17 +300,61 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
         listening = [
             c for c in psutil.net_connections(kind="inet") if c.status == "LISTEN"
         ]
-        return {
-            "memory_mb": process.memory_info().rss / (1024 * 1024),
-            "cpu_percent": process.cpu_percent(),
-            "listening_ports": len(listening),
-            "process_count": len(psutil.pids()),
-        }
+        metrics.update(
+            {
+                "memory_mb": process.memory_info().rss / (1024 * 1024),
+                "cpu_percent": process.cpu_percent(),
+                "listening_ports": len(listening),
+                "process_count": len(psutil.pids()),
+            }
+        )
     except ImportError:
-        # psutil not installed
-        return None
+        pass  # psutil not installed
     except Exception as e:
         logger.debug(f"Failed to collect metrics: {e}")
+
+    # Auxiliary-task health → the orchestrator persists the degraded flag and
+    # surfaces an admin badge (aux Phase 2). Best-effort; never fail heartbeat.
+    aux = _aux_health_for_heartbeat()
+    if aux is not None:
+        metrics["aux"] = aux
+
+    # Contained memory-store failures (deadlock containment). Best-effort;
+    # never fail heartbeat.
+    memory = _memory_health_for_heartbeat()
+    if memory is not None:
+        metrics["memory"] = memory
+
+    return metrics or None
+
+
+def _memory_health_for_heartbeat() -> Optional[Dict[str, Any]]:
+    """Contained memory-store failure counters for the heartbeat.
+
+    Returns None while every counter is zero so the healthy common case adds
+    no payload (and the orchestrator persists nothing new).
+    """
+    try:
+        from src.services.recall_store import memory_health
+
+        return memory_health.snapshot()
+    except Exception:
+        return None
+
+
+def _aux_health_for_heartbeat() -> Optional[Dict[str, Any]]:
+    """Compact auxiliary-model health for the heartbeat (aux Phase 2).
+
+    Returns None when no auxiliary LLM is wired yet (e.g. booting) so the
+    orchestrator leaves any previously-persisted ``aux_degraded`` untouched
+    rather than clearing it on incomplete information.
+    """
+    aux_llm = getattr(_agent, "_auxiliary_llm", None) if _agent is not None else None
+    if aux_llm is None:
+        return None
+    try:
+        return aux_llm.health.heartbeat_summary()
+    except Exception:
         return None
 
 
@@ -372,12 +488,10 @@ def _setup_job_file_logging(job_id: str) -> Path:
     # Create flushing file handler for crash safety
     file_handler = _FlushingFileHandler(log_file, mode="a")
     file_handler.setLevel(level)
-    file_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
+    from ..core.logging_config import build_formatter
+
+    # Same formatter as stdout — JSON in-cluster (LOG_FORMAT=json).
+    file_handler.setFormatter(build_formatter(component="agent"))
 
     # Add to root logger
     root_logger = logging.getLogger()
@@ -419,12 +533,16 @@ async def _process_orchestrator_job(
     context: Optional[Dict[str, Any]] = None,
     instructions: Optional[str] = None,
     config_name: Optional[str] = None,
+    expert_id: Optional[str] = None,
     config_override: Optional[Dict[str, Any]] = None,
+    resolved_config: Optional[Dict[str, Any]] = None,
     git_remote_url: Optional[str] = None,
     datasources: Optional[list] = None,
     repositories: Optional[list] = None,
+    managed_repository_credentials: Optional[list] = None,
     branch_name: Optional[str] = None,
     project_id: Optional[str] = None,
+    runtime_actor: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Process a job assigned by the orchestrator.
 
@@ -437,6 +555,10 @@ async def _process_orchestrator_job(
         logger.error("Cannot process job - agent not initialized")
         return
 
+    from ..core.logging_config import bind_log_context, reset_log_context
+
+    # Tag every log line for this job with job_id (correlation).
+    _log_token = bind_log_context(job_id=job_id)
     try:
         # Set up per-job file logging for crash safety
         _setup_job_file_logging(job_id)
@@ -459,20 +581,28 @@ async def _process_orchestrator_job(
             metadata.update(context)
         if instructions:
             metadata["instructions"] = instructions
-        if config_name and config_name != "default":
+        if config_name and config_name != "worker_base":
             metadata["config_name"] = config_name
+        if expert_id:
+            metadata["expert_id"] = expert_id
         if config_override:
             metadata["config_override"] = config_override
+        if resolved_config:
+            metadata["resolved_config"] = resolved_config
         if git_remote_url:
             metadata["git_remote_url"] = git_remote_url
         if datasources:
             metadata["datasources"] = datasources
         if repositories:
             metadata["repositories"] = repositories
+        if managed_repository_credentials:
+            metadata["managed_repository_credentials"] = managed_repository_credentials
         if branch_name:
             metadata["branch_name"] = branch_name
         if project_id:
             metadata["project_id"] = project_id
+        if runtime_actor:
+            metadata["runtime_actor"] = runtime_actor
 
         # Reset stop flags for this job
         _clear_stop()
@@ -517,8 +647,26 @@ async def _process_orchestrator_job(
         result = final_state or {}
         logger.info(f"Orchestrator job {job_id} completed: {result.get('should_stop')}")
 
-        # Mark agent as available BEFORE reporting completion.
+        # Report completion FIRST, then mark the agent available. The reverse
+        # order was a live race: a ready(job_id=None) heartbeat lets
+        # recover_orphaned_jobs pause this still-'processing' job ("agent says
+        # ready" — no current_job_id check, no grace), after which the
+        # completion report is DISCARDED with a 400 (the rescue path is
+        # failed-only) and the dispatcher re-runs the finished job. The 30s
+        # dispatcher cooldown means slot availability is not on the critical
+        # path, so reporting first costs nothing.
+        # knowledge-base/knowledge/research/stateless_agents/gate3_adversarial_review.md (B8).
         _current_job_id = None
+        if _orchestrator_client:
+            try:
+                await _orchestrator_client.report_completion(
+                    job_id,
+                    result,
+                    agent_id=_orchestrator_client.agent_id,
+                )
+            except Exception as e:
+                logger.error(f"Failed to report completion for job {job_id}: {e}")
+
         if _orchestrator_client and _orchestrator_client.agent_id:
             await _orchestrator_client.heartbeat(
                 status="ready",
@@ -526,24 +674,20 @@ async def _process_orchestrator_job(
                 metrics=_get_agent_metrics(),
             )
 
-        # Report completion to orchestrator — it is the single authority
-        # for DB status, verification, critic verdicts, curation, and dispatch.
-        if _orchestrator_client:
-            try:
-                await _orchestrator_client.report_completion(job_id, result)
-            except Exception as e:
-                logger.error(f"Failed to report completion for job {job_id}: {e}")
-
     except asyncio.CancelledError:
         logger.info(f"Orchestrator job {job_id} was cancelled")
         raise
     except Exception as e:
         logger.error(f"Orchestrator job {job_id} failed: {e}", exc_info=True)
         # Report error to orchestrator
-        error_result = {"error": {"message": str(e)}}
+        error_result = completion_error_payload(e)
         if _orchestrator_client:
             try:
-                await _orchestrator_client.report_completion(job_id, error_result)
+                await _orchestrator_client.report_completion(
+                    job_id,
+                    error_result,
+                    agent_id=_orchestrator_client.agent_id,
+                )
             except Exception:
                 logger.error(f"Failed to report error for job {job_id}")
     finally:
@@ -552,6 +696,7 @@ async def _process_orchestrator_job(
         if _current_job_id == job_id:
             _current_job_id = None
         _cleanup_job_file_handler(job_id)
+        reset_log_context(_log_token)
 
 
 def create_app(config_path: Optional[str] = None) -> FastAPI:
@@ -633,6 +778,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             ready=ready,
             message="Ready to accept jobs" if ready else "Not ready",
             connections=status["connections"],
+            capabilities={"resolved_config_resume": True},
         )
 
     @app.get("/status", response_model=AgentStatusResponse, tags=["Health"])
@@ -786,6 +932,15 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
 
+        try:
+            validate_worker_workspace_projection(
+                config_override=request.config_override,
+                resolved_config=request.resolved_config,
+                workspace_runtime=request.workspace_runtime,
+            )
+        except WorkspaceContractError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+
         # Check if already processing a job
         if _current_job_id is not None:
             raise HTTPException(
@@ -798,6 +953,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         _clear_stop()
 
         # Start processing in background
+        start_context = dict(request.context or {})
+        start_context["workspace_runtime"] = request.workspace_runtime
         _current_job_task = asyncio.create_task(
             _process_orchestrator_job(
                 job_id=request.job_id,
@@ -807,15 +964,19 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 instructions_upload_id=request.instructions_upload_id,
                 document_path=request.document_path,
                 document_dir=request.document_dir,
-                context=request.context,
+                context=start_context,
                 instructions=request.instructions,
                 config_name=request.config_name,
+                expert_id=request.expert_id,
                 config_override=request.config_override,
+                resolved_config=request.resolved_config,
                 git_remote_url=request.git_remote_url,
                 datasources=request.datasources,
                 repositories=request.repositories,
+                managed_repository_credentials=(request.managed_repository_credentials),
                 branch_name=request.branch_name,
                 project_id=request.project_id,
+                runtime_actor=request.runtime_actor,
             )
         )
 
@@ -972,6 +1133,15 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
 
+        try:
+            validate_worker_workspace_projection(
+                config_override=request.config_override,
+                resolved_config=request.resolved_config,
+                workspace_runtime=request.workspace_runtime,
+            )
+        except WorkspaceContractError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+
         # Log config mismatch as warning (don't reject - checkpoint discovery handles it)
         if request.config_name and request.config_name != _agent.config.agent_id:
             logger.warning(
@@ -1001,10 +1171,25 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["config_upload_id"] = request.config_upload_id
         if request.config_override:
             resume_metadata["config_override"] = request.config_override
+        if request.resolved_config:
+            resume_metadata["resolved_config"] = request.resolved_config
         if request.datasources:
             resume_metadata["datasources"] = request.datasources
+        if request.repositories:
+            resume_metadata["repositories"] = request.repositories
+        if request.managed_repository_credentials:
+            resume_metadata["managed_repository_credentials"] = (
+                request.managed_repository_credentials
+            )
         if request.project_id:
             resume_metadata["project_id"] = request.project_id
+        if request.runtime_actor:
+            resume_metadata["runtime_actor"] = request.runtime_actor
+        resume_metadata["workspace_runtime"] = request.workspace_runtime
+        if request.git_remote_url:
+            # Feeds the pod-handoff clone fallback in _setup_job_workspace
+            # (resume_fresh_workspace_no_clone_fallback.md).
+            resume_metadata["git_remote_url"] = request.git_remote_url
         if delegation_results:
             resume_metadata["delegation_results"] = delegation_results
 
@@ -1063,8 +1248,21 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     f"Resumed job {request.job_id} completed: {result.get('should_stop')}"
                 )
 
-                # Mark agent as available BEFORE reporting completion
+                # Report completion FIRST, then mark available — same race as
+                # the primary job path (see the comment there; review B8).
                 _current_job_id = None
+                if _orchestrator_client:
+                    try:
+                        await _orchestrator_client.report_completion(
+                            request.job_id,
+                            result,
+                            agent_id=_orchestrator_client.agent_id,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to report completion for resumed job {request.job_id}: {e}"
+                        )
+
                 if _orchestrator_client and _orchestrator_client.agent_id:
                     await _orchestrator_client.heartbeat(
                         status="ready",
@@ -1072,27 +1270,18 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                         metrics=_get_agent_metrics(),
                     )
 
-                # Report completion to orchestrator
-                if _orchestrator_client:
-                    try:
-                        await _orchestrator_client.report_completion(
-                            request.job_id, result
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to report completion for resumed job {request.job_id}: {e}"
-                        )
-
             except asyncio.CancelledError:
                 logger.info(f"Resumed job {request.job_id} was cancelled")
                 raise
             except Exception as e:
                 logger.error(f"Resumed job {request.job_id} failed: {e}", exc_info=True)
-                error_result = {"error": {"message": str(e)}}
+                error_result = completion_error_payload(e)
                 if _orchestrator_client:
                     try:
                         await _orchestrator_client.report_completion(
-                            request.job_id, error_result
+                            request.job_id,
+                            error_result,
+                            agent_id=_orchestrator_client.agent_id,
                         )
                     except Exception:
                         logger.error(

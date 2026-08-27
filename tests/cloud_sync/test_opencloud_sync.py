@@ -21,6 +21,7 @@ class _FakeDav:
     def __init__(self):
         self.uploads: list = []
         self.mkdirs: list = []
+        self.deletes: list = []
         self.list_returns: list = []
         self.should_raise = None
 
@@ -36,6 +37,11 @@ class _FakeDav:
 
     def download_sync(self, **kwargs):
         pass
+
+    def clean(self, path):
+        self.deletes.append(path)
+        if self.should_raise:
+            raise self.should_raise
 
     def list(self, _path, get_info=False):
         return self.list_returns
@@ -54,10 +60,6 @@ def _token_response(token="abc123", expires_in=300):
 def sync_with_mocks(tmp_path: Path, monkeypatch):
     """OpenCloud sync with mocked httpx token fetch and webdav3 client."""
     fake_dav = _FakeDav()
-    monkeypatch.setattr(
-        "webdav3.client.Client",
-        MagicMock(return_value=fake_dav),
-    )
 
     fake_httpx = MagicMock()
     fake_httpx.post = AsyncMock(return_value=_token_response())
@@ -71,6 +73,14 @@ def sync_with_mocks(tmp_path: Path, monkeypatch):
         client_secret=SECRET,
     )
     sync._httpx = fake_httpx
+
+    async def fake_dav_client():
+        # Preserve token fetch/refresh behavior without importing the optional
+        # WebDAV transport merely to replace it with a fake.
+        await sync._get_token()
+        return fake_dav
+
+    monkeypatch.setattr(sync, "_dav", fake_dav_client)
     return sync, fake_dav, fake_httpx
 
 
@@ -142,6 +152,56 @@ async def test_401_retry_forces_refresh(sync_with_mocks):
 
 
 @pytest.mark.asyncio
+async def test_generation_delete_is_idempotent_when_resource_already_missing(
+    sync_with_mocks,
+):
+    sync, fake_dav, _fake_httpx = sync_with_mocks
+
+    class RemoteResourceNotFound(Exception):
+        pass
+
+    fake_dav.should_raise = RemoteResourceNotFound("already gone")
+    before_write_calls = 0
+
+    async def before_write():
+        nonlocal before_write_calls
+        before_write_calls += 1
+
+    await sync._delete_remote_file("deleted.txt", before_write=before_write)
+
+    assert fake_dav.deletes == ["deleted.txt"]
+    assert before_write_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_401_mutation_retry_rechecks_generation_owner(sync_with_mocks):
+    """A lease lost during token refresh must block the second PUT attempt."""
+
+    sync, fake_dav, _fake_httpx = sync_with_mocks
+
+    class UnauthorizedError(Exception):
+        code = 401
+
+    def always_401(**_kwargs):
+        raise UnauthorizedError("401")
+
+    fake_dav.upload_sync = always_401
+    checks = 0
+
+    async def before_write():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("lease stolen during token refresh")
+
+    with pytest.raises(RuntimeError, match="lease stolen"):
+        await sync._upload_file("a.txt", "/tmp/x", before_write=before_write)
+
+    assert checks == 2
+    assert fake_dav.uploads == []
+
+
+@pytest.mark.asyncio
 async def test_repr_masks_secret(sync_with_mocks):
     sync, _fake_dav, _fake_httpx = sync_with_mocks
     text = repr(sync)
@@ -202,10 +262,6 @@ def _routed_token_post():
 def impersonation_sync(tmp_path: Path, monkeypatch):
     """OpenCloud sync configured for user-impersonation mode."""
     fake_dav = _FakeDav()
-    monkeypatch.setattr(
-        "webdav3.client.Client",
-        MagicMock(return_value=fake_dav),
-    )
 
     fake_httpx = MagicMock()
     fake_httpx.post = _routed_token_post()
@@ -220,6 +276,14 @@ def impersonation_sync(tmp_path: Path, monkeypatch):
         target_user_sub=TARGET_SUB,
     )
     sync._httpx = fake_httpx
+
+    async def fake_dav_client():
+        # Keep the real service-token/exchange path while replacing only the
+        # optional WebDAV transport boundary.
+        await sync._get_token()
+        return fake_dav
+
+    monkeypatch.setattr(sync, "_dav", fake_dav_client)
     return sync, fake_dav, fake_httpx
 
 

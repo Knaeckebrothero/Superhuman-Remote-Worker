@@ -8,7 +8,7 @@ Run this FIRST, before any planning. You are auditing the previous tactical phas
 
 1. Spec hash check. Read `spec.yaml` and the `## Acceptance Criteria` block in `spec_lock.md`. Are they the same content? If they differ, someone modified the spec mid-flight — this is the failure mode the discipline exists to prevent. Either restore the locked version, or record a deliberate revision via kb_write (type=decision, tag=spec-revision) with WHAT changed, WHY, IMPACT on existing tests, and any NEW AC IDs.
 
-2. Phase-scope compliance. Read the previous tactical phase's `tdd_phase`, then `git_diff` against the phase-start tag. For every file in the diff, emit one row:
+2. Phase-scope compliance. Read the previous tactical phase's `tdd_phase`, then `git diff` against the boundary tag that started it (`<job_short_id>-phase-<N>-<type>-complete`; list them with `git tag`). For every file in the diff, emit one row:
    - path: <file path>
    - allowed_by_tdd_phase: yes | no
    - if no: <why — e.g., "edit under src/ during red phase">
@@ -90,12 +90,12 @@ Choose exactly one `tdd_phase` per tactical phase. Stamp it on every todo. Mixin
 - `integration` — packaging, commit cleanup, PR prep.
 </phase_type_assignment>
 
-{% if has_tool("delegate_work") -%}
-<delegation>
-Rarely correct for TDD work. The red/green/refactor handoff produces context that is hard to merge, and shared test fixtures are a common collision point. Only delegate when a phase has 2+ truly independent feature streams with disjoint specs and disjoint test files.
+{% if has_tool("spawn_subagent") -%}
+<subagent_delegation>
+Parallelize understanding, not typing — the expensive part of implementation is figuring out what's correct, not writing it. `spawn_subagent` runs throwaway subagents inline (own fresh context, full toolset — read/shell/websearch/browser/writes, return a string). Use them to explore several independent code areas at once, research external docs/APIs/errors via web_search, or prototype a throwaway spike. Call it several times in ONE turn — one self-contained task each (question + paths/URLs + what to return); they run concurrently.
 
-Do NOT delegate: anything within one spec, refactors, bug fixes, or work that shares fixtures/imports. If you do delegate, each subagent gets its own `spec.yaml` and you merge their workspaces and run the integrated test suite.
-</delegation>
+NEVER split the production feature across parallel subagents — subagent-driven coding fragments the one thing that needs a coherent head. Subagents inform and prototype; you write the code that lands, test it, and own it.
+</subagent_delegation>
 
 {% endif -%}
 <execution_ready_todos>

@@ -267,7 +267,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config.",
+          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j connector is attached to the job. Usually left empty in config.",
           "examples": [["cypher_query", "cypher_execute", "get_database_schema"]]
         },
         "sql": {
@@ -275,7 +275,7 @@
           "items": {
             "type": "string"
           },
-          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job.",
+          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL connector is attached to the job.",
           "examples": [["sql_query", "sql_schema", "sql_execute"]]
         },
         "mongodb": {
@@ -283,7 +283,7 @@
           "items": {
             "type": "string"
           },
-          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job.",
+          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB connector is attached to the job.",
           "examples": [["mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"]]
         },
         "git": {
@@ -308,7 +308,7 @@
             "type": "string"
           },
           "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/)",
-          "examples": [["approve_job", "return_job_with_feedback"]]
+          "examples": [["approve_job_verdict", "return_job_with_feedback"]]
         },
         "knowledge": {
           "type": "array",
@@ -339,31 +339,87 @@
           "items": {
             "type": "string"
           },
-          "description": "Orchestrator tools: create/monitor/manage worker jobs via the orchestrator REST API. Primarily for persistent agents (src/tools/orchestrator/)",
-          "examples": [["create_worker_job", "list_worker_jobs", "get_worker_job", "approve_worker_job", "resume_worker_job"]]
+          "description": "Non-job orchestrator application tools for projects, repositories, catalog/workflows, and session context",
+          "examples": [["get_session_context", "get_current_project", "list_project_jobs"]]
+        },
+        "job_control": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Canonical job-control writes generated from the shared job descriptors",
+          "examples": [["create_job", "approve_job", "resume_job_with_feedback", "cancel_job", "pause_job"]]
+        },
+        "job_inspection": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Canonical job inspection reads generated from the shared job descriptors",
+          "examples": [["list_jobs", "get_job", "get_job_file", "list_job_files"]]
+        },
+        "agent_catalog": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/tools/orchestrator/catalog.py)",
+          "examples": [["list_experts", "get_expert", "list_skills", "search_skills", "get_skill"]]
+        },
+        "workflows": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/tools/orchestrator/workflows.py)",
+          "examples": [["list_automations", "get_automation", "list_automation_runs", "propose_automation", "get_project_loop", "list_project_loop_jobs", "explain_project_loop"]]
         }
       }
     },
     "instruction_files": {
       "type": "array",
-      "description": "Instruction files with config-driven trigger conditions for auto-injection. Each entry copies a file to the workspace and triggers delivery based on conditions.",
+      "description": "Instruction files or bound skills with bounded activation: one-shot phase-start injection or a required read before a tool action.",
       "items": {
         "type": "object",
-        "required": ["file", "trigger"],
+        "required": ["trigger"],
+        "oneOf": [
+          {"required": ["file"]},
+          {"required": ["skill"]}
+        ],
         "properties": {
           "file": {
             "type": "string",
             "description": "Workspace-relative target path for the instruction file (e.g., 'todo_guide.md' or 'instructions/review_guide.md')"
           },
+          "skill": {
+            "type": "string",
+            "description": "Bundled skill name, materialized as skills/<name>/SKILL.md; mutually exclusive with file"
+          },
           "trigger": {
             "type": "string",
-            "description": "Trigger condition. Format: 'before_tool:<tool_name>' (fires before tool execution) or 'phase:<phase_name>' (fires on phase transition). Examples: 'before_tool:next_phase_todos', 'phase:strategic'",
-            "pattern": "^(before_tool|phase):.+$"
+            "description": "Trigger condition: before_tool:<tool> gates an action; phase_start:<phase> injects once per concrete phase. Legacy phase:<phase> is a once-only compatibility alias.",
+            "pattern": "^(before_tool|phase_start|phase):.+$"
           },
           "enforce": {
             "type": "boolean",
             "default": true,
-            "description": "If true (passive), the tool rejects until the agent reads the file. If false (active), the system auto-injects the content as a transient message."
+            "description": "When true on a before_tool binding, reject the action until the artifact has been read. Phase-start bindings are injected once regardless of this compatibility field; false never enables continuous injection."
+          },
+          "phases": {
+            "type": "array",
+            "items": {"enum": ["strategic", "tactical"]},
+            "uniqueItems": true,
+            "description": "Optional phase-kind filter for before_tool enforcement"
+          },
+          "read_scope": {
+            "enum": ["job", "phase"],
+            "default": "job",
+            "description": "Whether a successful instruction read remains valid for the worker run or only the current concrete phase"
+          },
+          "max_read_age_turns": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional maximum LLM-turn age of a read before a before_tool gate closes again"
           }
         },
         "additionalProperties": false
@@ -371,7 +427,7 @@
       "examples": [
         [
           {"file": "todo_guide.md", "trigger": "before_tool:next_phase_todos", "enforce": true},
-          {"file": "instructions/review_guide.md", "trigger": "phase:strategic", "enforce": false}
+          {"skill": "research-guide", "trigger": "phase_start:tactical", "enforce": false}
         ]
       ]
     },
@@ -579,13 +635,13 @@
           "type": "boolean",
           "default": true,
           "description": "Restrict working directory to workspace root"
-        },
+        }
       },
       "additionalProperties": false
     },
     "verification": {
       "type": "object",
-      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback. See docs/features/verification_phase.md.",
+      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback. See knowledge-base/knowledge/features/verification_phase.md.",
       "properties": {
         "enabled": {
           "type": "boolean",

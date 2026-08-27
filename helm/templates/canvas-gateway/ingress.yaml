@@ -1,0 +1,56 @@
+{{- $viewer := .Values.canvas.livePreview.viewer }}
+{{- if and $viewer.enabled $viewer.ingress.enabled }}
+{{- $fullName := include "srw.fullname" . -}}
+{{- if not $viewer.hostSuffix }}
+{{- fail "canvas.livePreview.viewer.ingress.enabled requires a non-empty hostSuffix" }}
+{{- end }}
+{{- $wildcardHost := printf "*%s" $viewer.hostSuffix -}}
+# Optional plug-and-play wildcard route for the Canvas gateway. The gateway
+# validates the exact UUID host and owns all security headers itself; an
+# ordinary normalizing ingress in front is a supported edge (adjacent-slash
+# merging is an accepted, documented limitation of this mode — see
+# knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). Deployments
+# fronted by a Cloudflare tunnel or an operator-owned edge leave this off
+# and route to the ClusterIP Service directly.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-canvas-gateway
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway") | nindent 4 }}
+  annotations:
+    {{- if and $viewer.ingress.tls.enabled $viewer.ingress.tls.issuerName }}
+    # Wildcard certificates require a DNS-01 solver on this issuer.
+    cert-manager.io/cluster-issuer: {{ $viewer.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if $viewer.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    {{- with $viewer.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with $viewer.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if $viewer.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $wildcardHost | quote }}
+      secretName: {{ $viewer.ingress.tls.secretName | default (printf "%s-canvas-gateway-tls" $fullName) }}
+  {{- end }}
+  rules:
+    - host: {{ $wildcardHost | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-canvas-gateway
+                port:
+                  number: 8086
+{{- end }}

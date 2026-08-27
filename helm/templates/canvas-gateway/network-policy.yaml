@@ -1,0 +1,65 @@
+{{- if .Values.canvas.livePreview.viewer.enabled }}
+{{- $network := .Values.canvas.livePreview.viewer.networkPolicy -}}
+{{- $namespaceSelector := $network.edgeNamespaceSelector -}}
+{{- $podSelector := $network.edgePodSelector -}}
+{{- $hasNamespaceSelector := or (not (empty (get $namespaceSelector "matchLabels"))) (not (empty (get $namespaceSelector "matchExpressions"))) -}}
+{{- $hasPodSelector := or (not (empty (get $podSelector "matchLabels"))) (not (empty (get $podSelector "matchExpressions"))) -}}
+{{- if not (and $hasNamespaceSelector $hasPodSelector) -}}
+{{- fail "canvas.livePreview.viewer.enabled requires non-empty networkPolicy.edgeNamespaceSelector and edgePodSelector label selectors" -}}
+{{- end -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-canvas-gateway
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Whatever fronts the gateway (cloudflared, ingress-controller pods, or a
+  # dedicated edge). The required selectors open only that source on 8086.
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml $network.edgeNamespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $network.edgePodSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 8086
+  egress:
+    # Cluster DNS. Restricting this to kube-system labels is not portable across
+    # the chart's supported CNIs, so match the established workspace policy.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Canvas viewer/session state and cross-replica revocation.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Pinned SSH transport; application ports remain workspace-loopback only.
+    - to:
+        - podSelector:
+            matchLabels:
+              srw.io/component: agent-workspace
+      ports:
+        - protocol: TCP
+          port: 30022
+        - protocol: TCP
+          port: 22
+    {{- with $network.extraEgress }}
+    # Deployment-specific external Postgres/VM targets. Rules are additive and
+    # should name the narrowest possible namespace/CIDR and destination port.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

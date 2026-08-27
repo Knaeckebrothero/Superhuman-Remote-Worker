@@ -6,8 +6,8 @@ import {TranslocoDatePipe} from '@jsverse/transloco-locale';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
+import {classifyResumeError} from '../../core/services/resume-error';
 import {ModelService} from '../../core/services/model.service';
-import {SettingsService} from '../../core/services/settings.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
@@ -15,9 +15,11 @@ import {Thread} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
+import {AppDialogComponent} from '../../ui/dialog';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppTabBarComponent, AppTabComponent} from '../../ui/tab-bar';
 import {AppInputComponent} from '../../ui/input';
+import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppSelectComponent} from '../../ui/select';
 import {AppChipComponent} from '../../ui/chip';
 import {AppIconComponent} from '../../ui/icon';
@@ -44,10 +46,12 @@ interface Project {
         AppTabBarComponent,
         AppTabComponent,
         AppInputComponent,
+        AppInlineEditableTextComponent,
         AppSelectComponent,
         AppChipComponent,
         AppIconComponent,
         AppFormFieldComponent,
+        AppDialogComponent,
     ],
     template: `
     <div class="page-toggle">
@@ -82,7 +86,7 @@ interface Project {
           </app-form-field>
           <app-form-field [label]="'sessions.create.configLabel' | transloco">
             <app-select [(value)]="newConfig">
-              <option value="persistent_defaults">{{ 'sessions.create.configDefault' | transloco }}</option>
+              <option value="session_base">{{ 'sessions.create.configDefault' | transloco }}</option>
               <option value="developer">{{ 'sessions.create.configDeveloper' | transloco }}</option>
               <option value="scholar">{{ 'sessions.create.configScholar' | transloco }}</option>
             </app-select>
@@ -121,6 +125,9 @@ interface Project {
               <option value="autonomous">{{ 'sessions.create.permissionAutonomous' | transloco }}</option>
             </app-select>
           </app-form-field>
+          @if (createError()) {
+            <div class="create-error" role="alert">{{ createError() }}</div>
+          }
           <div class="dialog-actions">
             <app-button variant="primary" size="sm" [loading]="creating()" (clicked)="createSession()">
               {{ 'sessions.create.create' | transloco }}
@@ -140,6 +147,9 @@ interface Project {
           <div class="empty-state">
             <app-icon size="inherit" class="empty-icon">chat_bubble_outline</app-icon>
             <p>{{ 'sessions.empty' | transloco }}</p>
+            <app-button variant="primary" size="sm" (clicked)="goToDraft()">
+              {{ 'sessions.emptyCta' | transloco }}
+            </app-button>
           </div>
         } @else {
           <!-- Filter tabs -->
@@ -162,18 +172,31 @@ interface Project {
           }
 
           @for (thread of filteredThreads(); track thread.id) {
-            <div class="session-card" [class.ended]="thread.status === 'ended'">
-              <div class="session-main" (click)="openSession(thread)">
-                <div class="session-info">
-                  <span class="session-status-dot" [class]="thread.status"></span>
-                  <span class="session-title">{{ thread.title || ('sessions.untitledSession' | transloco) }}</span>
-                  <span class="session-id" title="Session ID">{{ thread.id.slice(0, 8) }}</span>
-                  <span class="session-config">{{ thread.config_name | titlecase }}</span>
-                </div>
-                <div class="session-meta">
-                  <span class="meta-item">{{ thread.total_turns || 0 }} {{ ((thread.total_turns || 0) === 1 ? 'sessions.turnsOne' : 'sessions.turnsMany') | transloco }}</span>
-                  <span class="meta-item">{{ thread.last_activity | translocoDate:{dateStyle:'short', timeStyle:'short'} }}</span>
-                </div>
+            <div class="session-card"
+                 data-testid="session-card"
+                 [attr.data-thread-id]="thread.id"
+                 [class.ended]="thread.status === 'ended'"
+                 [class.ending]="thread.status === 'ending'">
+              <div class="session-heading" (click)="openSession(thread)">
+                <span class="session-status-dot" [class]="thread.status"></span>
+                <span class="session-title">
+                  <app-inline-editable-text
+                    [value]="thread.title || ('sessions.untitledSession' | transloco)"
+                    [ariaLabel]="'common.rename' | transloco"
+                    (save)="onRenameThread(thread, $event)"
+                  />
+                </span>
+              </div>
+              <div class="session-meta" (click)="openSession(thread)">
+                <span class="session-id" title="Session ID">{{ thread.id.slice(0, 8) }}</span>
+                <span class="session-config">{{ thread.config_name | titlecase }}</span>
+                @if (officerBadge(thread); as ob) {
+                  <span class="session-officer-badge" [attr.data-kind]="ob">{{
+                    ob === 'centurion' ? 'Centurion' : 'Conference'
+                  }}</span>
+                }
+                <span class="meta-item">{{ thread.total_turns || 0 }} {{ ((thread.total_turns || 0) === 1 ? 'sessions.turnsOne' : 'sessions.turnsMany') | transloco }}</span>
+                <span class="meta-item">{{ thread.last_activity | translocoDate:{dateStyle:'short', timeStyle:'short'} }}</span>
               </div>
               <div class="session-actions">
                 @if (thread.cloud_session_url || thread.nc_session_folder) {
@@ -188,6 +211,7 @@ interface Project {
                 <app-icon-button
                   [ariaLabel]="'sessions.tooltip.resume' | transloco"
                   [tooltip]="'sessions.tooltip.resume' | transloco"
+                  [disabled]="thread.status === 'ending'"
                   (clicked)="resumeSession(thread)"
                 >
                   <app-icon size="sm">play_arrow</app-icon>
@@ -196,6 +220,7 @@ interface Project {
                   variant="danger"
                   [ariaLabel]="'sessions.tooltip.delete' | transloco"
                   [tooltip]="'sessions.tooltip.delete' | transloco"
+                  [disabled]="thread.status === 'ending'"
                   (clicked)="deleteSession(thread)"
                 >
                   <app-icon size="sm">delete</app-icon>
@@ -205,6 +230,38 @@ interface Project {
           }
         }
       </div>
+
+      <app-dialog
+        [open]="confirmDeleteOpen()"
+        [title]="'sessions.confirmDelete' | transloco"
+        (closed)="confirmDeleteOpen.set(false)"
+      >
+        <p>{{ pendingDelete()?.title || ('sessions.untitledSession' | transloco) }}</p>
+        <div appDialogActions>
+          <app-button variant="secondary" (clicked)="confirmDeleteOpen.set(false)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="danger" (clicked)="confirmDelete()">
+            {{ 'common.delete' | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
+
+      <app-dialog
+        [open]="confirmForceOpen()"
+        [title]="'common.delete' | transloco"
+        (closed)="confirmForceOpen.set(false)"
+      >
+        <p>{{ 'sessions.confirmForceDelete' | transloco }}</p>
+        <div appDialogActions>
+          <app-button variant="secondary" (clicked)="confirmForceOpen.set(false)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="danger" (clicked)="confirmForceDelete()">
+            {{ 'common.delete' | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
     </div>
   `,
     styles: [`
@@ -212,7 +269,7 @@ interface Project {
       display: block;
       height: 100%;
       overflow-y: auto;
-      background: var(--app-bg, #1e1e2e);
+      background: var(--app-bg);
     }
 
     .page-toggle {
@@ -220,12 +277,12 @@ interface Project {
       flex-shrink: 0;
     }
 
-    .page-toggle:empty {
+    .page-toggle:not(:has(.sidebar-toggle)) {
       display: none;
     }
 
     .sessions-page {
-      max-width: 800px;
+      max-width: var(--content-max-width);
       margin: 0 auto;
       padding: 24px;
     }
@@ -285,7 +342,7 @@ interface Project {
 
     .dialog-hint {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       line-height: 1.5;
       margin-bottom: 8px;
     }
@@ -318,7 +375,17 @@ interface Project {
 
     .chip-hint {
       font-size: 10px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
+    }
+
+    .create-error {
+      padding: 8px 12px;
+      margin-bottom: 12px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      border: 1px solid var(--danger-tint);
+      color: var(--danger-color);
+      font-size: 12px;
     }
 
     .dialog-actions {
@@ -333,8 +400,14 @@ interface Project {
 
     /* Session cards */
     .session-card {
-      display: flex;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      grid-template-areas:
+        "heading heading"
+        "meta    actions";
       align-items: center;
+      column-gap: 8px;
+      row-gap: 6px;
       padding: 12px;
       border: 1px solid var(--border-color, var(--surface-0));
       border-radius: var(--radius-surface);
@@ -346,17 +419,15 @@ interface Project {
     .session-card:hover { border-color: var(--accent-color, var(--accent-color)); }
     .session-card.ended { opacity: 0.6; }
 
-    .session-main {
-      flex: 1;
-      cursor: pointer;
-      min-width: 0;
-    }
-
-    .session-info {
+    /* The title gets its own full-width row so it shows as much as possible;
+       the id/config/meta and the action buttons sit on the row beneath it. */
+    .session-heading {
+      grid-area: heading;
       display: flex;
       align-items: center;
       gap: 8px;
-      margin-bottom: 4px;
+      min-width: 0;
+      cursor: pointer;
     }
 
     .session-status-dot {
@@ -367,7 +438,8 @@ interface Project {
     }
 
     .session-status-dot.active, .session-status-dot.created { background: var(--success); }
-    .session-status-dot.ended { background: var(--surface-2, #585b70); }
+    .session-status-dot.ending { background: var(--warning, #f59e0b); }
+    .session-status-dot.ended { background: var(--surface-2); }
 
     .session-title {
       font-size: 13px;
@@ -376,46 +448,70 @@ interface Project {
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      flex: 1;
+      min-width: 0;
     }
 
+    .session-officer-badge {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: var(--radius-tag);
+      border: 1px solid color-mix(in srgb, var(--accent, #6366f1) 45%, transparent);
+      color: var(--accent, #6366f1);
+      white-space: nowrap;
+    }
+    .session-officer-badge[data-kind='conference'] {
+      border-style: dashed;
+    }
     .session-config {
       font-size: 10px;
       padding: 1px 6px;
       border-radius: var(--radius-tag);
       background: var(--surface-0, var(--surface-0));
-      color: var(--text-muted, #6c7086);
-      flex-shrink: 0;
+      color: var(--text-muted);
+      /* Shrink + ellipsis so a long config (e.g. a project UUID) truncates
+         instead of pushing the title to 0 width or overlapping the actions. */
+      flex-shrink: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .session-id {
       font-family: var(--font-mono, monospace);
       font-size: 10px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       flex-shrink: 0;
     }
 
     .session-meta {
+      grid-area: meta;
       display: flex;
-      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 4px 12px;
+      min-width: 0;
+      cursor: pointer;
     }
 
     .meta-item {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .session-actions {
+      grid-area: actions;
       display: flex;
       gap: 4px;
-      flex-shrink: 0;
-      margin-left: 8px;
+      justify-self: end;
     }
 
     /* Empty / loading */
     .loading, .empty-state {
       text-align: center;
       padding: 40px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       font-size: 13px;
     }
 
@@ -434,7 +530,7 @@ interface Project {
     .filter-empty {
       text-align: center;
       padding: 32px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       font-size: 13px;
     }
 
@@ -470,7 +566,6 @@ export class SessionsPageComponent implements OnInit {
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
     private readonly userService = inject(UserService);
-    private readonly settingsService = inject(SettingsService);
     readonly modelService = inject(ModelService);
     readonly chat = inject(PersistentChatService);
     private readonly transloco = inject(TranslocoService);
@@ -482,9 +577,16 @@ export class SessionsPageComponent implements OnInit {
     statusFilter = signal<string | null>(null);
     selectedProjectIds = signal<string[]>([]);
 
+    // Themed delete-confirmation dialogs (replace the native confirm()).
+    confirmDeleteOpen = signal(false);
+    confirmForceOpen = signal(false);
+    pendingDelete = signal<Thread | null>(null);
+
     showCreate = false;
+    /** In-dialog server rejection, so a bad config is correctable in place. */
+    readonly createError = signal<string | null>(null);
     newTitle = '';
-    newConfig = 'persistent_defaults';
+    newConfig = 'session_base';
     newModel = this.loadSavedSessionModel();
     newPermission = 'supervised';
 
@@ -492,6 +594,10 @@ export class SessionsPageComponent implements OnInit {
         const filter = this.statusFilter();
         const all = this.threads();
         if (!filter) return all;
+        // "Active" is the non-terminal bucket shown by activeCount: created,
+        // awaiting, suspended and the non-resumable ending handoff all remain
+        // visible until the authoritative ended transition lands.
+        if (filter === 'active') return all.filter(t => t.status !== 'ended');
         return all.filter(t => t.status === filter);
     };
 
@@ -510,7 +616,13 @@ export class SessionsPageComponent implements OnInit {
             const data = await firstValueFrom(
                 this.http.get<{ threads: Thread[] }>(`${environment.apiUrl}/persistent/threads`)
             );
-            this.threads.set(data.threads || []);
+            this.threads.set(
+                (data.threads || []).map(thread =>
+                    thread.runtime_retirement_pending === true
+                        ? { ...thread, status: 'ending' as const }
+                        : thread,
+                ),
+            );
         } catch (e) {
             // Silent — sessions not available
         }
@@ -549,10 +661,15 @@ export class SessionsPageComponent implements OnInit {
 
     async createSession(): Promise<void> {
         this.creating.set(true);
+        this.createError.set(null);
         const body: Record<string, any> = {
             title: this.newTitle || 'Untitled Session',
             config_name: this.newConfig,
             permission_mode: this.newPermission,
+            // This legacy dialog has no connector picker and is no longer
+            // reachable from the New Session button. If invoked by an older
+            // host, be explicit instead of silently applying defaults.
+            datasource_ids: [],
         };
         if (this.newModel) {
             body['model'] = this.newModel;
@@ -561,12 +678,41 @@ export class SessionsPageComponent implements OnInit {
         if (this.selectedProjectIds().length > 0) {
             body['project_ids'] = this.selectedProjectIds();
         }
-        this.showCreate = false;
-        this.newTitle = '';
-        this.selectedProjectIds.set([]);
-        // Navigate immediately to chat view with spinner, create thread in background
-        this.router.navigate(['/sessions', '_creating'], {state: {createBody: body}});
-        this.creating.set(false);
+        // Create before dismissing the dialog: a rejected config used to close
+        // it, clear the fields and bounce back here with a toast, so there was
+        // nothing left to correct. Mirrors the full New Session form.
+        try {
+            const resp = await firstValueFrom(
+                this.http.post<{ thread_id: string }>(
+                    `${environment.apiUrl}/persistent/threads`,
+                    body,
+                ),
+            );
+            this.showCreate = false;
+            this.newTitle = '';
+            this.selectedProjectIds.set([]);
+            await this.router.navigate(['/sessions', resp.thread_id]);
+        } catch (err) {
+            this.createError.set(this.errors.translate(err, 'sessions.create.failed'));
+        } finally {
+            this.creating.set(false);
+        }
+    }
+
+    async onRenameThread(thread: Thread, title: string): Promise<void> {
+        const previous = thread.title;
+        // Optimistic: update the card immediately, revert if the PATCH fails.
+        this.threads.update((list) =>
+            list.map((t) => (t.id === thread.id ? {...t, title} : t)),
+        );
+        try {
+            await this.chat.renameThread(thread.id, title);
+        } catch (e) {
+            this.threads.update((list) =>
+                list.map((t) => (t.id === thread.id ? {...t, title: previous} : t)),
+            );
+            this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
+        }
     }
 
     /**
@@ -575,6 +721,25 @@ export class SessionsPageComponent implements OnInit {
      * threads it just navigates. No POST to /resume — the user opts in to
      * spinning the agent back up via the resume card or the dedicated icon.
      */
+    /**
+     * 'centurion' for a standing officer thread, 'conference' for his
+     * interactive embodiment, null otherwise (centurion.md S9). Reads the
+     * denormalized officer block from thread metadata; lists that omit
+     * metadata simply show no badge.
+     */
+    officerBadge(thread: Thread): 'centurion' | 'conference' | null {
+        const metadata = thread.metadata as
+            | {config_override?: {officer?: {enabled?: unknown; conference?: unknown}}}
+            | undefined;
+        const officer = metadata?.config_override?.officer;
+        if (!officer) return null;
+        if (officer.enabled === true || officer.enabled === 'true') return 'centurion';
+        if (officer.conference === true || officer.conference === 'true') {
+            return 'conference';
+        }
+        return null;
+    }
+
     openSession(thread: Thread): void {
         this.router.navigate(['/sessions', thread.id]);
     }
@@ -587,8 +752,29 @@ export class SessionsPageComponent implements OnInit {
                 );
                 thread.status = 'created';
             } catch (e: any) {
-                this.toast.danger(this.errors.translate(e, 'errors.sessions.resumeFailed'));
-                return;
+                // This page has no drift dialog of its own. A config-drift
+                // 428 falling into the generic toast below would show the
+                // same "Failed to resume session" wording a 500 gets and
+                // dead-end here forever — the exact problem this feature
+                // exists to remove, just moved from silence to a toast.
+                // Fall through to the plain navigate instead: the chat page
+                // DOES own the drift dialog (config-drift-dialog.component.ts),
+                // and its in-chat Resume card re-POSTs /resume, which
+                // repopulates PersistentChatService.pendingDrift and surfaces
+                // the real dialog there. Anything else (403/500/...) still
+                // dead-ends here with the toast.
+                if (classifyResumeError(e).kind !== 'drift') {
+                    this.toast.danger(this.errors.translate(e, 'errors.sessions.resumeFailed'));
+                    return;
+                }
+                // The 428 arrives before the thread's status flips, so the
+                // chat page would otherwise render its generic ended-card
+                // with no sign that a resume was already attempted — the
+                // first click looks like it did nothing. An informational
+                // toast (not danger — this isn't an error, it's recoverable
+                // via the in-chat drift dialog on the very next click) is
+                // honest about what happened before navigating there.
+                this.toast.info(this.transloco.translate('sessions.configDrift.attentionNeeded'));
             }
         }
         this.router.navigate(['/sessions', thread.id]);
@@ -606,20 +792,60 @@ export class SessionsPageComponent implements OnInit {
         window.open(`${environment.cloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
     }
 
-    async deleteSession(thread: Thread): Promise<void> {
-        if (!confirm(this.transloco.translate('sessions.confirmDelete'))) return;
+    deleteSession(thread: Thread): void {
+        // Open the themed confirmation dialog instead of a native confirm().
+        this.pendingDelete.set(thread);
+        this.confirmDeleteOpen.set(true);
+    }
+
+    async confirmDelete(): Promise<void> {
+        const thread = this.pendingDelete();
+        if (!thread) return;
+        this.confirmDeleteOpen.set(false);
         try {
             await firstValueFrom(
                 this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true`)
             );
             this.loadThreads();
         } catch (e: any) {
+            // Mid-turn guard (session_silent_failure_audit.md #11): a
+            // cleanup sweep used to tear down live sessions silently.
+            if (
+                e?.status === 409 &&
+                e?.error?.detail?.code === 'turn_in_flight'
+            ) {
+                // Live/mid-turn session — escalate to a force-delete confirm.
+                this.confirmForceOpen.set(true);
+                return;
+            }
             this.toast.danger(this.errors.translate(e, 'errors.sessions.deleteFailed'));
+        }
+    }
+
+    async confirmForceDelete(): Promise<void> {
+        const thread = this.pendingDelete();
+        if (!thread) return;
+        this.confirmForceOpen.set(false);
+        try {
+            await firstValueFrom(
+                this.http.delete(
+                    `${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true&force=true`
+                )
+            );
+            this.loadThreads();
+        } catch (e2: any) {
+            this.toast.danger(this.errors.translate(e2, 'errors.sessions.deleteFailed'));
         }
     }
 
     goToCreate(): void {
         this.router.navigate(['/sessions/new']);
+    }
+
+    goToDraft(): void {
+        // Instant landing: `/` is an open draft chat — type first, the
+        // session is created on send (knowledge-base/knowledge/features/instant_landing_session.md).
+        this.router.navigate(['/']);
     }
 
     returnToActive(): void {
@@ -638,9 +864,11 @@ export class SessionsPageComponent implements OnInit {
     }
 
     private persistSessionModel(model: string): void {
+        // UI-only preselect (localStorage). Does NOT write account preferences —
+        // a per-session control must not set a global default. See Layer 2 in
+        // loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
         try {
             localStorage.setItem('default_session_model', model);
         } catch { /* localStorage may be unavailable */ }
-        this.settingsService.updatePreferences({ default_session_model: model }).subscribe();
     }
 }

@@ -120,7 +120,10 @@ class TodoManager:
 
         Args:
             workspace: WorkspaceManager for archive operations
-            min_todos: Minimum todos required for tactical phases (default: 5)
+            min_todos: Minimum todos required for tactical phases (default: 5).
+                This is the LIVE floor enforced by stage_tactical_todos;
+                production sites pass config.phase_settings.min_todos
+                (worker_base.yaml sets 2).
             max_todos: Maximum todos allowed for tactical phases (default: 20)
             model_name: Optional model id used to resolve family-specific
                 runtime nudges (e.g. the todo-list footer rendered into
@@ -384,10 +387,23 @@ class TodoManager:
         # Completed
         completed = [t for t in self._todos if t.status == TodoStatus.COMPLETED]
         if completed:
+            # A concise completion note is the handoff from the last completed
+            # task to the current one (for example final-review PASS/GAPS). Show
+            # only the latest noted todo so phase-long note history does not
+            # become another per-turn injection tax. Full notes remain in the
+            # checkpoint, Git commit, and phase archive.
+            latest_noted_todo = next(
+                (todo for todo in reversed(completed) if todo.notes), None
+            )
             lines.append("")
             lines.append("Completed:")
             for todo in completed:
                 lines.append(f"  - [x] {todo.id}: {todo.content}")
+                if todo is latest_noted_todo:
+                    note = " | ".join(" ".join(item.split()) for item in todo.notes)
+                    if len(note) > 1000:
+                        note = f"{note[:997]}..."
+                    lines.append(f"      Outcome: {note}")
 
         # In progress
         in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
@@ -841,12 +857,17 @@ class TodoManager:
             f"Use next_phase_todos to add new tasks."
         )
 
-    def complete_first_pending_sync(self) -> Dict[str, Any]:
+    def complete_first_pending_sync(
+        self, notes: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
         """Find and complete the first pending or in-progress task.
 
         Looks for tasks in this order:
         1. First in_progress task
         2. First pending task (by priority)
+
+        Args:
+            notes: Optional completion notes to persist with the selected task.
 
         Returns:
             Dictionary with:
@@ -870,7 +891,7 @@ class TodoManager:
             target = pending[0]
 
         # Complete it
-        self.complete(target.id)
+        self.complete(target.id, notes=notes)
 
         # Check if all complete now
         is_last = self.all_complete()
@@ -962,13 +983,30 @@ class TodoManager:
             f"set_phase_info called (ignored): phase={phase_number}/{total_phases}, name={phase_name}"
         )
 
-    def archive_with_failure_note(self, issue: str) -> str:
-        """Archive todos with a failure note.
+    def archive_with_failure_note(
+        self,
+        issue: str,
+        *,
+        phase_label: str = "failed",
+        heading: str = "Failure Note",
+    ) -> str:
+        """Archive todos with an explanatory note.
 
-        Used by todo_rewind when the current approach isn't working.
+        Used by restore_from_feedback to archive in-flight todos a feedback
+        resume preempts (with an honest label instead of "failed"), and by the
+        ``max_tool_calls_per_phase`` budget rewind in graph.py.
+
+        NOT used by ``request_replan`` any more. That tool used to call this
+        with the "failed" defaults, which wrote *every* todo — including the
+        completed ones — into a failure archive and emptied the list, so the
+        next strategic phase inherited no record of what had actually been
+        achieved. A replan now leaves the todos alone and lets the normal
+        phase archive record their real statuses.
 
         Args:
-            issue: Description of why the approach failed
+            issue: Description of why the todos are being archived
+            phase_label: Prefix for the archive header name (default "failed")
+            heading: Section heading for the appended note
 
         Returns:
             Confirmation message
@@ -976,15 +1014,15 @@ class TodoManager:
         if not self._todos:
             return "No todos to archive."
 
-        # Add failure note to archive content
+        # Add explanatory note to archive content
         count = len(self._todos)
-        phase_name = f"failed_{datetime.now(timezone.utc).strftime('%H%M%S')}"
+        phase_name = f"{phase_label}_{datetime.now(timezone.utc).strftime('%H%M%S')}"
 
-        # Archive with phase name indicating failure
+        # Archive with phase name indicating why the phase ended early
         archive_path = self.archive(phase_name)
 
-        # Append failure note to the archive file
-        note_content = f"\n\n## Failure Note\n\n{issue}\n"
+        # Append the note to the archive file
+        note_content = f"\n\n## {heading}\n\n{issue}\n"
         try:
             existing = self._workspace.read_file(archive_path)
             self._workspace.write_file(archive_path, existing + note_content)
@@ -992,7 +1030,7 @@ class TodoManager:
             logger.warning(f"Could not append failure note: {e}")
 
         return (
-            f"Archived {count} todos with failure note to {archive_path}.\n"
+            f"Archived {count} todos with {heading.lower()} to {archive_path}.\n"
             f"Issue: {issue}\n"
             f"Todo list cleared for re-planning."
         )

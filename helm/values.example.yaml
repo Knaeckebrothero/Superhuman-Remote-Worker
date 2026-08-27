@@ -58,6 +58,42 @@ gitea:
   internalUrl: "https://git.internal.example.com"
   externalUrl: "https://git.internal.example.com"
 
+# Exact self-hosted Git endpoints approved for orchestrator-side OKF datasource
+# reads. Public github.com/gitlab.com/bitbucket.org/codeberg.org are built in.
+orchestrator:
+  kbGitAllowedHosts: "git.internal.example.com"
+  kbExternalReindexConcurrency: 2
+  kbReindexSweepSeconds: 900
+
+# -----------------------------------------------------------------------------
+# Office Canvas — Collabora Online remains dark until every exact-origin and
+# network boundary below is supplied. Keep Cloudflare Access off the Office
+# hostname; it breaks Collabora WebSockets and WOPI callbacks.
+# -----------------------------------------------------------------------------
+collabora:
+  enabled: false
+  publicUrl: ""
+  # A configured sessionRouter.jwtSecret or jwtSecretName is also mandatory;
+  # Office WOPI tokens reuse that existing HS256 secret boundary.
+  # Enabling also requires these values (see values.yaml for the full block):
+  # collabora:
+  #   server_name: "office.srw.example.com"
+  #   aliasgroups:
+  #     - host: "http://<release>-superhuman-remote-worker-orchestrator:8085"
+  #   extra_params: >-
+  #     --o:ssl.enable=false
+  #     --o:ssl.termination=true
+  #     --o:per_document.always_save_on_exit=true
+  #     --o:admin_console.enable=false
+  #     --o:net.content_security_policy=frame-ancestors https://cockpit.srw.example.com;
+  # networkPolicy:
+  #   edgeNamespaceSelector:
+  #     matchLabels:
+  #       kubernetes.io/metadata.name: cloudflare-tunnel
+  #   edgePodSelector:
+  #     matchLabels:
+  #       app: cloudflared
+
 # -----------------------------------------------------------------------------
 # Databases — external managed instances. See README for required Secret keys.
 # -----------------------------------------------------------------------------
@@ -65,6 +101,8 @@ databases:
   postgres:
     enabled: true
     internal: false
+    # HA: must be a direct/session-mode endpoint — NOT a transaction-mode pooler
+    # (PgBouncer/pgcat txn mode breaks the leader-election session advisory lock).
     externalUrl: "postgres://srw:<pw>@pg.example.com:5432/srw"
   vector:
     enabled: true
@@ -77,10 +115,6 @@ databases:
     internal: false
     # JDBC URL — password still comes from KC_DB_PASSWORD in the secret.
     externalUrl: "jdbc:postgresql://kc-pg.example.com:5432/keycloak?user=keycloak"
-  mongodb:
-    enabled: true
-    internal: false
-    externalUrl: "mongodb://srw:<pw>@mongo.example.com:27017/srw_logs"
   neo4j:
     # Neo4j is optional. Disable unless you use the project knowledge graph.
     enabled: false
@@ -123,8 +157,6 @@ headscale:
   enabled: false
 pgadmin:
   enabled: false
-mongoExpress:
-  enabled: false
 dozzle:
   enabled: false
 codexProxy:
@@ -154,9 +186,61 @@ ingress:
     enabled: true
     issuerName: letsencrypt-prod
 
+# Workspace-port Canvas previews remain unavailable until the deployment has
+# a separate viewer domain and has passed the browser security gates. The
+# gateway can be fronted three ways: the optional chart Ingress below
+# (viewer.ingress, wildcard host + cert-manager DNS-01), a Cloudflare tunnel
+# entry pointing at the gateway Service, or an operator-owned edge. Ordinary
+# normalizing proxies are supported (see
+# knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). An enabled
+# production viewer must reference a separately provisioned, least-privilege
+# database credential Secret.
+canvas:
+  livePreview:
+    enabled: false
+    deniedPorts: []
+    viewer:
+      enabled: false
+      deploymentProfile: production
+      cookieMode: ""
+      domain: ""
+      hostSuffix: ""
+      cockpitOrigins: []
+      pslBoundaryVerified: false
+      # Optional wildcard Ingress for the gateway (`*` + hostSuffix); off when
+      # a tunnel or operator edge routes to the Service directly.
+      ingress:
+        enabled: false
+        className: ""
+        annotations: {}
+        tls:
+          enabled: true
+          issuerName: ""   # needs a DNS-01 solver for wildcard certs
+          secretName: ""
+      database:
+        username: "srw_canvas_gateway"
+        credentials:
+          create: false
+          existingSecret: ""
+          # Alternatively, set a Vault path while using externalSecrets; it is
+          # synced only after viewer.enabled becomes true.
+          vaultPath: ""
+          passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
+        provisionRole: false
+        pool:
+          min: 1
+          max: 4
+      # Keep both selectors empty while disabled. Enabling requires non-empty
+      # selectors for whatever fronts the gateway (cloudflared, the cluster's
+      # ingress-controller pods, or a dedicated edge); only TCP/8086 opens.
+      networkPolicy:
+        edgeNamespaceSelector: {}
+        edgePodSelector: {}
+        extraEgress: []
+
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
-# (docs/features/direct_session_websockets.md)
+# (knowledge-base/knowledge/features/direct_session_websockets.md)
 #
 # Generate a strong key with:  openssl rand -hex 32
 # Then pass at install time so it never lives in the repo:
@@ -196,6 +280,8 @@ agent:
     reservedJobSlots: "2"
 
 logLevel: "INFO"
+# "json" (structured, for log aggregation) or "text" (human-readable).
+logFormat: "json"
 
 # -----------------------------------------------------------------------------
 # VM Controller — uncomment to run KubeVirt VMs in this cluster instead of a

@@ -1,0 +1,235 @@
+:host {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 320px;
+}
+
+.browser-renderer {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 320px;
+  flex-direction: column;
+  background: var(--app-bg);
+}
+
+.browser-toolbar {
+  display: flex;
+  min-width: 0;
+  min-height: 48px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 12px;
+  box-sizing: border-box;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.browser-page {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 5px;
+}
+
+.browser-title {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-navigation {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+}
+
+.browser-url-label {
+  display: flex;
+  min-width: 120px;
+  flex: 1 1 auto;
+}
+
+.browser-url-label > span {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.browser-url-label input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 3px 8px;
+  box-sizing: border-box;
+  color: var(--text-primary);
+  font: 10.5px/1.3 var(--font-mono, ui-monospace, monospace);
+  background: var(--input-bg, var(--app-bg));
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-control);
+}
+
+.browser-url-label input:focus-visible {
+  border-color: var(--accent-color);
+  outline: 2px solid color-mix(in srgb, var(--accent-color) 35%, transparent);
+  outline-offset: 0;
+}
+
+.browser-url-label input:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.browser-indicators,
+.browser-loading {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.browser-indicators {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.browser-connection,
+.browser-baton,
+.browser-loading {
+  min-height: 24px;
+  padding: 3px 7px;
+  box-sizing: border-box;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-control);
+}
+
+.browser-baton[data-baton='user'] {
+  color: var(--accent-color);
+  border-color: color-mix(in srgb, var(--accent-color) 55%, var(--border-color));
+}
+
+.browser-baton {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.browser-baton-pending {
+  color: var(--text-muted);
+}
+
+.browser-baton-action {
+  padding: 3px 8px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-control);
+}
+
+.browser-baton-action:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
+}
+
+
+.browser-navigation-error {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  color: var(--danger);
+  font-size: 12px;
+  background: var(--danger-tint);
+  border-bottom: 1px solid var(--danger);
+}
+
+.browser-stage {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #15171b;
+}
+
+.browser-surface {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  background: white;
+  outline: none;
+  touch-action: none;
+}
+
+.browser-surface:focus-visible {
+  outline: 3px solid var(--accent-color);
+  outline-offset: -3px;
+}
+
+.browser-empty-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 24px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.browser-lifecycle-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-empty-state,
+  .browser-loading,
+  .browser-lifecycle-actions {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+@media (width <= 620px) {
+  .browser-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .browser-indicators {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .browser-navigation {
+    width: 100%;
+  }
+}

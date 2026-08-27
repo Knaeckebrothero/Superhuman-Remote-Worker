@@ -1,3 +1,22 @@
+// Protected-cloud / Mode-A review surface.
+//
+// NOTE ON TOKENS. The previous revision of this file was written against a
+// vocabulary the cockpit does not have — `--space-*`, `--font-size-*`,
+// `--text-strong`, `--border`, `--accent-tint`, `--accent-strong` are all
+// undefined, so every `gap`, `padding`, `font-size`, `border` and selected-row
+// style it declared was invalid at computed-value time and dropped. That, not
+// the layout, is why the panel rendered as an unpadded borderless slab with
+// body-size headings and no visible selection.
+//
+// The real contract (cockpit/src/styles/README.md):
+//   * colours are CSS custom properties emitted per theme  → var(--surface-1)
+//   * sizes and spacing are Sass scalars                    → v.$space-md
+//   * radii come from shape recipes, never literal px       → @include shape.control
+@use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
+@use '../../../styles/typography-recipes' as type;
+@use '../../../styles/mixins' as m;
+
 :host {
   display: flex;
   flex-direction: column;
@@ -5,260 +24,946 @@
   height: 100%;
 }
 
-.diff-review {
+.review {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
   height: 100%;
   min-height: 0;
-  padding: var(--space-3);
+  background: var(--panel-bg);
+  color: var(--text-primary);
+}
 
-  &__header {
+// ── Header ──────────────────────────────────────────────────────────────────
+
+.review__head {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: v.$space-md;
+  padding: v.$space-md v.$space-lg;
+  border-bottom: 1px solid var(--border-color);
+
+  // The accent rail marks this as a decision surface rather than another
+  // information panel — same device the resume card uses.
+  border-left: 3px solid var(--accent-color);
+  background: var(--panel-header-bg);
+}
+
+.review__identity {
+  min-width: 0;
+  flex: 1 1 22rem;
+}
+
+.review__eyebrow {
+  @include type.eyebrow;
+
+  display: flex;
+  align-items: center;
+  gap: v.$space-xs;
+  margin: 0 0 v.$space-xs;
+  color: var(--accent-color);
+}
+
+.review__eyebrow-icon {
+  color: inherit;
+}
+
+// NOT type.display: the Roman display recipe uppercases and letter-spaces,
+// and this heading is a folder path, i.e. data. "cloud" must not render as
+// "C L O U D".
+.review__title {
+  margin: 0;
+  font-weight: v.$font-weight-bold;
+  font-size: v.$font-size-lg;
+  line-height: v.$line-height-tight;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.review__subtitle {
+  margin: v.$space-xs 0 0;
+  font-size: v.$font-size-sm;
+  color: var(--text-secondary);
+}
+
+// Technical details disclosure. `<details>` rather than a media query,
+// because open/closed is DOM state: the surface opens it on a desktop and
+// leaves it shut on a phone, where it costs one line instead of four.
+.review__tech {
+  flex: 0 0 auto;
+  padding: 0 v.$space-lg v.$space-sm;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--panel-header-bg);
+}
+
+.review__tech-summary {
+  @include type.eyebrow;
+  @include shape.control;
+
+  display: inline-block;
+  padding: v.$space-xs 0;
+  color: var(--text-muted);
+  cursor: pointer;
+
+  &:focus-visible {
+    @include m.focus-ring(-2px);
+  }
+}
+
+.review__meta {
+  list-style: none;
+  margin: v.$space-xs 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: v.$space-xs v.$space-md;
+  font-size: v.$font-size-xs;
+  color: var(--text-secondary);
+
+  li {
     display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
+    align-items: baseline;
+    gap: v.$space-xs;
+  }
+}
+
+.review__meta-key {
+  color: var(--text-muted);
+}
+
+.review__mono {
+  @include type.mono;
+}
+
+.review__head-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: v.$space-sm;
+}
+
+// Per-status totals. Colour is one of three channels — the count and the
+// spelled-out word carry the same information without it.
+.review__tallies {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: v.$space-xs;
+}
+
+.review__tally {
+  @include shape.control;
+
+  display: flex;
+  align-items: baseline;
+  gap: v.$space-xs;
+  padding: v.$space-xs v.$space-sm;
+  font-size: v.$font-size-xs;
+  border: 1px solid var(--border-color);
+  background: var(--surface-0);
+  color: var(--text-secondary);
+
+  &[data-status='added'] {
+    background: var(--success-tint);
+    border-color: var(--success);
   }
 
-  &__title {
-    font-size: var(--font-size-lg);
-    font-weight: 600;
-    color: var(--text-strong);
+  &[data-status='modified'] {
+    background: var(--info-tint);
+    border-color: var(--info);
   }
 
-  &__subtitle {
-    font-size: var(--font-size-sm);
-    color: var(--text-muted);
+  &[data-status='deleted'] {
+    background: var(--danger-tint);
+    border-color: var(--danger);
+  }
+}
+
+.review__tally-count {
+  @include type.mono;
+
+  font-weight: v.$font-weight-bold;
+  font-size: v.$font-size-sm;
+  color: var(--text-primary);
+}
+
+.review__folder-link {
+  @include shape.control;
+
+  display: inline-flex;
+  align-items: center;
+  gap: v.$space-xs;
+  padding: v.$space-xs v.$space-sm;
+  font-size: v.$font-size-xs;
+  color: var(--text-primary);
+  text-decoration: none;
+  border: 1px solid var(--border-color);
+  background: var(--surface-0);
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+
+  &:hover {
+    background: var(--hover);
+    border-color: var(--accent-color);
   }
 
-  &__loading,
-  &__empty {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-2);
-    flex: 1 1 auto;
-    color: var(--text-muted);
+  &:focus-visible {
+    @include m.focus-ring;
   }
+}
 
-  &__banner {
-    display: flex;
-    gap: var(--space-3);
-    align-items: flex-start;
-    padding: var(--space-3);
-    border-radius: var(--radius-control);
-    border: 1px solid;
+.review__sr-status {
+  @include m.visually-hidden;
+}
 
-    &--conflict {
-      background: var(--warning-tint);
-      border-color: var(--warning-border, var(--warning));
-      color: var(--text-strong);
-    }
+// ── Body ────────────────────────────────────────────────────────────────────
 
-    &--partial {
-      background: var(--danger-tint);
-      border-color: var(--danger-border, var(--danger));
-      color: var(--text-strong);
-    }
-  }
+.review__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(13rem, 19rem) 1fr;
 
-  &__banner-body {
-    flex: 1 1 auto;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-
-    strong {
-      font-size: var(--font-size-base);
-    }
-
-    p {
-      margin: 0;
-      font-size: var(--font-size-sm);
-      color: var(--text-muted);
-    }
-  }
-
-  &__diverged {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-
-    li {
-      display: flex;
-      gap: var(--space-2);
-      align-items: center;
-      font-family: var(--font-family-mono);
-      font-size: var(--font-size-xs);
-
-      code {
-        background: var(--surface-2);
-        padding: 0 var(--space-1);
-        border-radius: var(--radius-tag, 4px);
-      }
-    }
-  }
-
-  &__layout {
-    flex: 1 1 auto;
+  // No fixed heights anywhere: each pane owns its own overflow so the surface
+  // adapts to whatever height the host gives it.
+  > * {
     min-height: 0;
-    display: grid;
-    grid-template-columns: 280px 1fr;
-    gap: var(--space-3);
+    min-width: 0;
+  }
+}
 
-    @media (max-width: 720px) {
-      grid-template-columns: 1fr;
-    }
+.review__files {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border-color);
+  background: var(--surface-0);
+}
+
+.review__files-head {
+  @include type.eyebrow;
+
+  margin: 0;
+  flex: 0 0 auto;
+  padding: v.$space-sm v.$space-md;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-color);
+}
+
+// Phone-only disclosure trigger for the file list. Full-width and
+// touch-sized: it is the primary navigation control at that size.
+.review__files-toggle {
+  @include m.touch-target;
+
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: v.$space-xs;
+  width: 100%;
+  padding: v.$space-xs v.$space-md;
+  text-align: left;
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--surface-0);
+  border: none;
+  border-bottom: 1px solid var(--border-color);
+  cursor: pointer;
+
+  &:focus-visible {
+    @include m.focus-ring(-2px);
+  }
+}
+
+.review__files-toggle-label {
+  flex: 0 0 auto;
+  font-size: v.$font-size-xs;
+  font-weight: v.$font-weight-medium;
+}
+
+.review__files-toggle-path {
+  @include type.mono;
+  @include m.truncate;
+
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: v.$font-size-xs;
+  color: var(--text-secondary);
+}
+
+.review__file-list {
+  list-style: none;
+  margin: 0;
+  padding: v.$space-xs;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.review__file {
+  @include shape.control;
+
+  display: flex;
+  align-items: center;
+  gap: v.$space-sm;
+  padding: v.$space-xs v.$space-sm;
+  min-height: 2rem;
+  cursor: pointer;
+  color: var(--text-primary);
+  border: 1px solid transparent;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+
+  &:hover {
+    background: var(--hover);
   }
 
-  &__tree {
+  // Selection is a border + a filled surface + a bold path, not a background
+  // one shade away from :hover — previously the two were literally the same
+  // colour and the selected file was indistinguishable.
+  &.is-selected {
     background: var(--surface-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-surface);
+    border-color: var(--accent-color);
+
+    .review__file-path {
+      font-weight: v.$font-weight-medium;
+    }
+  }
+
+  &:focus-visible {
+    @include m.focus-ring(-2px);
+  }
+
+  &[data-status='deleted'] .review__file-path {
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+    color: var(--text-secondary);
+  }
+
+  @include m.breakpoint-down(md) {
+    @include m.touch-target;
+  }
+}
+
+// Square tinted chip with a distinct glyph per status: shape, symbol and
+// colour all encode the same thing, so none of them is load-bearing alone.
+.review__file-glyph {
+  @include type.mono;
+  @include shape.tag;
+
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  font-size: v.$font-size-xs;
+  font-weight: v.$font-weight-bold;
+  border: 1px solid;
+
+  &[data-status='added'] {
+    color: var(--success);
+    background: var(--success-tint);
+    border-color: var(--success);
+  }
+
+  &[data-status='modified'] {
+    color: var(--info);
+    background: var(--info-tint);
+    border-color: var(--info);
+  }
+
+  &[data-status='deleted'] {
+    color: var(--danger);
+    background: var(--danger-tint);
+    border-color: var(--danger);
+  }
+}
+
+.review__file-path {
+  @include type.mono;
+  @include m.truncate;
+
+  font-size: v.$font-size-xs;
+}
+
+// ── Viewer ──────────────────────────────────────────────────────────────────
+
+.review__viewer {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--panel-bg);
+}
+
+.review__viewer-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: v.$space-sm;
+  padding: v.$space-sm v.$space-md;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--surface-0);
+}
+
+.review__viewer-path {
+  @include type.mono;
+  @include m.truncate;
+
+  flex: 1 1 12rem;
+  font-size: v.$font-size-xs;
+  color: var(--text-secondary);
+}
+
+.review__status-pill {
+  @include shape.pill;
+
+  flex: 0 0 auto;
+  padding: 0 v.$space-sm;
+  font-size: v.$font-size-xs;
+  font-weight: v.$font-weight-medium;
+  line-height: 1.6;
+  border: 1px solid;
+
+  &[data-status='added'] {
+    color: var(--success);
+    background: var(--success-tint);
+    border-color: var(--success);
+  }
+
+  &[data-status='modified'] {
+    color: var(--info);
+    background: var(--info-tint);
+    border-color: var(--info);
+  }
+
+  &[data-status='deleted'] {
+    color: var(--danger);
+    background: var(--danger-tint);
+    border-color: var(--danger);
+  }
+}
+
+// "Cloud now → After apply". The arrow makes the old/new direction explicit
+// rather than leaving it to column order.
+.review__direction {
+  display: inline-flex;
+  align-items: center;
+  gap: v.$space-xs;
+  font-size: v.$font-size-xs;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.review__direction-old,
+.review__direction-new {
+  color: var(--text-secondary);
+}
+
+.review__viewer-note {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: v.$space-sm v.$space-md;
+  font-size: v.$font-size-xs;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-primary);
+  background: var(--surface-0);
+
+  &[data-tone='danger'] {
+    background: var(--danger-tint);
+  }
+
+  &[data-tone='success'] {
+    background: var(--success-tint);
+  }
+}
+
+.review__monaco {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+}
+
+.review__fallback {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.review__fallback-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: v.$space-sm;
+  padding: v.$space-md;
+
+  h3 {
+    @include type.eyebrow;
+
+    margin: 0 0 v.$space-xs;
+    color: var(--text-muted);
+  }
+
+  pre {
+    @include type.mono;
+
+    margin: 0;
+    background: var(--surface-0);
+    border: 1px solid var(--border-color);
+    padding: v.$space-sm;
+    overflow: auto;
+    font-size: v.$font-size-xs;
+    max-height: 60vh;
+
+    &:focus-visible {
+      @include m.focus-ring(-2px);
+    }
+  }
+
+  @include m.breakpoint-down(md) {
+    grid-template-columns: 1fr;
+  }
+}
+
+// ── Shared state blocks ─────────────────────────────────────────────────────
+
+.review__state {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: v.$space-sm;
+  padding: v.$space-lg;
+  color: var(--text-secondary);
+
+  h3 {
+    @include type.display;
+
+    margin: 0;
+    font-size: v.$font-size-base;
+    color: var(--text-primary);
+  }
+
+  p {
+    margin: 0;
+    max-width: 44ch;
+    font-size: v.$font-size-sm;
+  }
+
+  app-icon {
+    color: var(--text-muted);
+  }
+}
+
+.review__state--inline {
+  padding: v.$space-md;
+}
+
+.review__state--blocked app-icon {
+  color: var(--alert);
+}
+
+.review__state--receipt {
+  &[data-decision='applied'] app-icon {
+    color: var(--success);
+  }
+
+  &[data-decision='rejected'] app-icon {
+    color: var(--info);
+  }
+}
+
+.review__receipt-facts {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: v.$space-sm v.$space-lg;
+  margin: v.$space-xs 0 0;
+
+  div {
     display: flex;
     flex-direction: column;
-    min-height: 0;
+    gap: 0;
   }
 
-  &__tree-header {
-    padding: var(--space-2) var(--space-3);
-    font-size: var(--font-size-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+  dt {
+    @include type.eyebrow;
+
     color: var(--text-muted);
-    border-bottom: 1px solid var(--border);
   }
 
-  &__tree-list {
-    list-style: none;
+  dd {
     margin: 0;
-    padding: var(--space-1);
-    overflow-y: auto;
-    flex: 1 1 auto;
+    font-size: v.$font-size-sm;
+    color: var(--text-primary);
+  }
+}
+
+.review__receipt-warning {
+  @include shape.control;
+
+  padding: v.$space-sm v.$space-md;
+  background: var(--warning-tint);
+  border: 1px solid var(--warning);
+  color: var(--text-primary);
+  font-size: v.$font-size-xs;
+}
+
+.review__receipt-provenance,
+.review__muted {
+  font-size: v.$font-size-xs;
+  color: var(--text-muted);
+}
+
+.review__binary dl {
+  margin-bottom: v.$space-xs;
+}
+
+// ── Notices ─────────────────────────────────────────────────────────────────
+
+.review__notice {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  gap: v.$space-sm;
+  margin: v.$space-md v.$space-lg 0;
+  padding: v.$space-sm v.$space-md;
+  border: 1px solid;
+
+  @include shape.control;
+
+  &--conflict {
+    background: var(--warning-tint);
+    border-color: var(--warning);
+
+    .review__notice-icon {
+      color: var(--warning);
+    }
   }
 
-  &__tree-item {
-    width: 100%;
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-1) var(--space-2);
-    background: transparent;
-    border: none;
-    border-radius: var(--radius-control);
-    color: var(--text-strong);
-    font-size: var(--font-size-sm);
-    cursor: pointer;
-    text-align: left;
+  &--partial {
+    background: var(--danger-tint);
+    border-color: var(--danger);
 
-    &:hover {
-      background: var(--surface-2);
-    }
-
-    &.is-active {
-      background: var(--accent-tint, var(--surface-2));
-      color: var(--accent-strong, var(--text-strong));
-    }
-  }
-
-  &__status-glyph {
-    font-family: var(--font-family-mono);
-    font-weight: 700;
-    width: 1.25rem;
-    text-align: center;
-    flex: 0 0 auto;
-
-    &[data-status='added'] {
-      color: var(--success);
-    }
-    &[data-status='modified'] {
-      color: var(--info);
-    }
-    &[data-status='deleted'] {
+    .review__notice-icon {
       color: var(--danger);
     }
   }
+}
 
-  &__tree-path {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--font-family-mono);
-    font-size: var(--font-size-xs);
+.review__notice-icon {
+  flex: 0 0 auto;
+  margin-top: 0.1rem;
+}
+
+.review__notice-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: v.$space-xs;
+
+  strong {
+    font-size: v.$font-size-sm;
+    color: var(--text-primary);
   }
 
-  &__viewer {
-    background: var(--surface-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-surface);
-    display: flex;
-    flex-direction: column;
-    min-height: 280px;
-    overflow: hidden;
+  // Body copy stays --text-primary: the old --text-muted over a 15-18% tint
+  // measured ~3.4:1 in Travertine, below the 4.5:1 AA floor.
+  p {
+    margin: 0;
+    font-size: v.$font-size-xs;
+    color: var(--text-primary);
   }
+}
 
-  &__viewer-empty {
-    flex: 1 1 auto;
+.review__notice-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: v.$space-xs;
+  max-height: 8rem;
+  overflow-y: auto;
+
+  li {
     display: flex;
-    flex-direction: column;
+    flex-wrap: wrap;
+    gap: v.$space-xs;
     align-items: center;
-    justify-content: center;
-    gap: var(--space-2);
-    color: var(--text-muted);
-    padding: var(--space-4);
-    text-align: center;
+    font-size: v.$font-size-xs;
   }
 
-  &__viewer-note {
-    padding: var(--space-2) var(--space-3);
-    background: var(--surface-2);
-    border-bottom: 1px solid var(--border);
-    font-size: var(--font-size-sm);
-    color: var(--text-muted);
+  code {
+    @include type.mono;
+    @include shape.tag;
+
+    background: var(--surface-0);
+    border: 1px solid var(--border-color);
+    padding: 0 v.$space-xs;
+    overflow-wrap: anywhere;
   }
+}
 
-  &__monaco {
-    flex: 1 1 auto;
-    min-height: 300px;
-    width: 100%;
+.review__notice-kind {
+  @include shape.pill;
+
+  padding: 0 v.$space-sm;
+  font-size: v.$font-size-xs;
+  background: var(--surface-0);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+}
+
+// ── Decision bar ────────────────────────────────────────────────────────────
+
+.review__decision {
+  flex: 0 0 auto;
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: v.$space-sm v.$space-md;
+  padding: v.$space-md v.$space-lg;
+  background: var(--panel-header-bg);
+  border-top: 1px solid var(--border-color);
+
+  // Lifts the decision away from the content it acts on, at every viewport.
+  box-shadow: var(--shadow-md);
+
+  &:empty {
+    display: none;
   }
+}
 
-  &__monaco-fallback {
-    padding: var(--space-3);
-    overflow: auto;
-    flex: 1 1 auto;
-  }
+.review__decision-copy {
+  margin: 0;
+  flex: 1 1 20rem;
+  min-width: 0;
+  font-size: v.$font-size-xs;
+  color: var(--text-secondary);
 
-  &__fallback-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--space-2);
-
-    h4 {
-      margin: 0 0 var(--space-1) 0;
-      font-size: var(--font-size-xs);
-      color: var(--text-muted);
-      text-transform: uppercase;
-    }
-
-    pre {
-      background: var(--surface-2);
-      padding: var(--space-2);
-      border-radius: var(--radius-control);
-      overflow: auto;
-      font-size: var(--font-size-xs);
-      max-height: 60vh;
-    }
-  }
-
-  &__actions {
+  &--armed {
     display: flex;
-    gap: var(--space-2);
-    justify-content: flex-end;
-    padding-top: var(--space-2);
-    border-top: 1px solid var(--border);
+    align-items: flex-start;
+    gap: v.$space-xs;
+    color: var(--text-primary);
+    font-weight: v.$font-weight-medium;
+
+    app-icon {
+      flex: 0 0 auto;
+      color: var(--alert);
+    }
+  }
+
+  // In-flight apply/reject. The previous revision unmounted the confirmation
+  // the instant confirm was pressed, leaving two disabled buttons as the only
+  // sign of a request that has been observed to take 34 seconds.
+  &--running {
+    display: flex;
+    align-items: center;
+    gap: v.$space-sm;
+    color: var(--text-primary);
+
+    strong {
+      display: block;
+      font-size: v.$font-size-sm;
+    }
+  }
+
+  // A refused decision, reported where the controls it refers to are rather
+  // than in a toast that outlives the surface by four seconds.
+  &--error {
+    display: flex;
+    align-items: flex-start;
+    gap: v.$space-xs;
+    color: var(--text-primary);
+
+    app-icon {
+      flex: 0 0 auto;
+      color: var(--danger);
+    }
+  }
+}
+
+.review__decision-sub {
+  display: block;
+  font-size: v.$font-size-xs;
+  color: var(--text-secondary);
+}
+
+.review__decision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: v.$space-sm;
+  justify-content: flex-end;
+  margin-left: auto;
+}
+
+// ── Responsive ──────────────────────────────────────────────────────────────
+//
+// One rule governs every size below the desktop grid: the reviewer must keep
+// a usable view of the selected file *before* deciding. Everything that is
+// not the viewer is therefore bounded — the header trims, the chooser
+// collapses, notices and confirmation copy scroll inside themselves — and the
+// viewer takes what is left, with a floor.
+
+@include m.breakpoint-down(lg) {
+  .review__body {
+    // Flex, not grid: "shrink but never below 9rem" is exactly what
+    // flex-basis + min-height expresses, and a grid `minmax()` row would
+    // silently overflow its track instead.
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .review__files {
+    flex: 0 0 auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .review__file-list {
+    max-height: min(30vh, 11rem);
+  }
+
+  // The expanded chooser OVERLAYS the viewer instead of pushing it down.
+  //
+  // Stacked, it cost the viewer its whole height whenever anything else was
+  // on screen — a conflict notice plus an open list at 375x667 scrolled the
+  // file content out of view entirely while the decision controls stayed
+  // live, which is a reviewer deciding with nothing to review. As an overlay
+  // the viewer keeps its position and height at all times, and expanding is
+  // what it reads as: a transient picker that closes on pick.
+  .review__files {
+    position: relative;
+    z-index: 2;
+  }
+
+  .review__file-list {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: var(--surface-0);
+    border-bottom: 1px solid var(--border-color);
+    box-shadow: var(--shadow-md);
+  }
+
+  // `> .review__viewer`, not `.review__viewer`. Angular's emulated
+  // encapsulation rewrites the base rule `.review__body > *` into
+  // `.review__body[_ngcontent] > *[_ngcontent]` — specificity (0,4,0) — which
+  // outranks a bare `.review__viewer[_ngcontent]` at (0,2,0) no matter how
+  // late it appears. The floor silently did nothing until this matched that
+  // shape, and the browser gate is what caught it.
+  .review__body > .review__viewer {
+    flex: 1 1 auto;
+    min-height: 9rem;
+  }
+
+  .review__head,
+  .review__decision,
+  .review__tech {
+    padding-left: v.$space-md;
+    padding-right: v.$space-md;
+  }
+
+  .review__notice {
+    margin-left: v.$space-md;
+    margin-right: v.$space-md;
+  }
+
+  .review__head-side {
+    align-items: flex-start;
+  }
+}
+
+@include m.breakpoint-down(md) {
+  // Tallies and the folder action share a line instead of stacking: two rows
+  // of chrome above a ~360px viewer is a line the surface cannot afford.
+  .review__head-side {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+}
+
+@include m.breakpoint-down(md) {
+  // The dialog's own title already names this surface. Three stacked lines of
+  // chrome above a ~360px viewer is the single largest avoidable cost on a
+  // phone, so the eyebrow keeps its text for assistive tech and gives up its
+  // line.
+  .review__eyebrow {
+    @include m.visually-hidden;
+  }
+
+  .review__head {
+    padding-top: v.$space-sm;
+    padding-bottom: v.$space-sm;
+    gap: v.$space-xs;
+  }
+
+  .review__title {
+    font-size: v.$font-size-base;
+  }
+
+  .review__subtitle {
+    font-size: v.$font-size-xs;
+  }
+
+  // A conflict listing eight diverged paths used to eat the whole viewer.
+  .review__notice {
+    max-height: min(24vh, 9rem);
+    overflow-y: auto;
+  }
+
+  .review__decision {
+    padding-top: v.$space-sm;
+    padding-bottom: v.$space-sm;
+  }
+
+  // German confirmation copy runs roughly 1.6x English and left no viewer at
+  // all. Bounded and scrollable, it costs a fixed maximum in every language.
+  .review__decision-copy {
+    flex: 1 1 100%;
+    max-height: 6.5rem;
+    overflow-y: auto;
+  }
+
+  .review__decision-actions {
+    width: 100%;
+
+    app-button {
+      flex: 1 1 auto;
+    }
+  }
+
+  .review__receipt-facts {
+    justify-content: flex-start;
+  }
+}
+
+// The global reduced-motion rule clamps transition-duration only; it does not
+// touch animation, so a component that animates must suppress its own.
+@media (prefers-reduced-motion: reduce) {
+  .review *,
+  .review *::before,
+  .review *::after {
+    animation: none !important;
+    transition: none !important;
   }
 }

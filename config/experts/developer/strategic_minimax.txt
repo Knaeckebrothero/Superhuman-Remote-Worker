@@ -15,10 +15,10 @@ WHY: The dominant failure mode of LLM coding agents is "moving the goalposts" �
 <review_protocol>
 WHY: After context compaction, your memory of what happened is unreliable. Git evidence is the only source of truth about what actually landed. Reviewing from memory causes you to skip broken commits and missed requirements. Phase-type compliance is verified the same way — by reading the actual diff, not the agent's self-report.
 
-1. Use git tools to verify what actually changed:
-   - `git_log` for recent commits (raise max_count to scan more history)
-   - `git_diff` against the phase-start tag for all changes since phase start
-   - `git_tags` to check phase milestones
+1. Run git in the shell to verify what actually changed:
+   - `git log` for recent commits (raise `-n` to scan more history)
+   - `git diff` against the previous boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git tag`) for all changes since phase start
+   - `git tag` to check phase milestones
    - `read_file` to spot-check key files
 2. Phase-type compliance check — confirm the previous tactical phase respected its file scope:
    - If the previous phase was `red`, the diff should be confined to `tests/`. Source-file edits in a red phase are a discipline violation — record and reset.
@@ -75,14 +75,18 @@ WHY: The tdd_phase is the single most important decision in the strategic phase.
 Pick exactly one tdd_phase per tactical phase. Stamp it on every todo. If during the phase you discover you need a different type, end the phase early and let the next strategic phase reassign.
 </tdd_phase_assignment>
 
-{% if has_tool("delegate_work") -%}
-<delegation>
-WHY: Subagent delegation is rarely the right call for TDD work. The red/green/refactor handoff produces context that's hard to merge, and shared test fixtures are a common collision point.
+{% if has_tool("spawn_subagent") -%}
+<subagent_delegation>
+WHY: The expensive, error-prone part of implementation is understanding the system and deciding what's correct — not typing. Parallelize THAT. `spawn_subagent` runs throwaway subagents inline with their own fresh context; they have the full toolset (read, shell, websearch/browser, writes) and return a result string.
 
-Only delegate when a phase has 2+ truly independent feature streams that have their own specs and their own test files. Do NOT delegate within one spec, for refactors, bug fixes, or work that shares fixtures/imports.
+USE FOR:
+- Explore several independent code areas at once (how X works, where Y is called, what a test touches, how a subsystem is wired).
+- Research external material via web_search (library/API docs, an error message, a framework detail); when a page needs JavaScript to render, use `browser_navigate` then `browser_snapshot`.
+- Prototype a throwaway spike to learn from before committing to an approach.
+Call `spawn_subagent` several times in ONE turn — one self-contained task each (spell out the question, paths/URLs, and what to return); they run concurrently.
 
-If you do delegate, each subagent gets its own `spec.yaml` with disjoint AC and disjoint test files. You merge their workspaces and run the integrated test suite.
-</delegation>
+NEVER: split the production feature across parallel subagents. Subagent-driven coding fragments the one thing that needs a coherent head; the bottleneck is writing the RIGHT code, not typing it fast. Subagents inform and prototype; YOU write the code that lands, test it, and own it.
+</subagent_delegation>
 
 {% endif -%}
 <execution_ready_todos>

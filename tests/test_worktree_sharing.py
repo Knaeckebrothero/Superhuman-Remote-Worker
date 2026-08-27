@@ -730,3 +730,69 @@ class TestDispatchParentJobUnaffected:
             remaining_context["worktree_path"] = job["worktree_path"]
 
         assert "worktree_path" not in remaining_context
+
+
+# =============================================================================
+# Critic config override — remove self-closing tools
+# =============================================================================
+
+
+def test_critic_config_override_removes_self_closing_tools():
+    """`deep_merge` merges dicts by key, so the override ADDS `evaluation` and
+    narrows nothing — `core` still carried job_complete/mark_complete, the most
+    likely LLM mistake and a direct path to a verdict-less completion.
+
+    Also verifies parent LLM passthrough: the override must propagate the parent's
+    LLM config exactly as before (via isinstance check), including edge cases like
+    empty dict.
+    """
+    from orchestrator.main import _critic_config_override
+
+    # Test 1: core tools are narrowed (self-closing tools removed)
+    override = _critic_config_override(parent_llm=None)
+    core = override["tools"]["core"]
+    assert "job_complete" not in core
+    assert "mark_complete" not in core
+    assert set(override["tools"]["evaluation"]) == {
+        "approve_job_verdict",
+        "return_job_with_feedback",
+    }
+
+    # Test 2: parent_llm is NOT passed through when None
+    assert "llm" not in _critic_config_override(parent_llm=None)
+
+    # Test 3: parent_llm IS passed through when provided
+    mock_llm = {"model": "test-model", "api_key": "test-key"}
+    override_with_llm = _critic_config_override(parent_llm=mock_llm)
+    assert override_with_llm.get("llm") == mock_llm
+
+    # Test 4: empty dict parent_llm is passed through (matches original isinstance behavior)
+    empty_llm = {}
+    override_with_empty = _critic_config_override(parent_llm=empty_llm)
+    assert override_with_empty.get("llm") == empty_llm
+
+
+def test_critic_config_override_removes_communication_tools():
+    """A critic must not be able to park in `waiting_for_reply`.
+
+    `worker_base.yaml` sets `tools.communication: [send_message]` and the
+    critic expert never overrides that key, so `deep_merge` (which merges the
+    `tools` dict by key) leaves it inherited. A blocking `send_message` flips
+    the CALLER's own job to `waiting_for_reply` — and there is no timeout
+    reaper for that state anywhere: `communication.blocking_timeout_hours: 24`
+    in config/worker_base.yaml has no implementation (grep: it appears only in
+    that file and two docs, never in Python). A critic parked there leaves its
+    target in 'reviewing' forever.
+
+    Removing the state upstream is one line and symmetric with how
+    `job_complete` was already removed from the critic's toolset: a
+    verification critic has no business blocking on a human reply.
+    """
+    from orchestrator.main import _critic_config_override
+
+    override = _critic_config_override(parent_llm=None)
+
+    assert override["tools"]["communication"] == [], (
+        "deep_merge REPLACES lists, so an empty list is what actually strips "
+        "the inherited send_message"
+    )

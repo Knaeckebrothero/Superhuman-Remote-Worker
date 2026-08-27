@@ -15,6 +15,11 @@ const getEnvOrNull = (key: string): string | null => {
 export const environment = {
   // Core
   apiUrl: getEnv('apiUrl', 'http://localhost:8085/api'),
+  // Isolated Dynamic Canvas viewer suffix (for example
+  // `.canvas.example-userland.com`). Null keeps live apps dark-shipped.
+  canvasViewerHostSuffix: getEnvOrNull('canvasViewerHostSuffix'),
+  // Exact public Collabora origin. Null keeps Office Canvas viewing disabled.
+  canvasOfficeOrigin: getEnvOrNull('canvasOfficeOrigin'),
 
   // External tools
   giteaUrl: getEnv('giteaUrl', 'http://localhost:3000/srw'),
@@ -23,6 +28,5 @@ export const environment = {
   cloudUrl: getEnvOrNull('cloudUrl'),
   neo4jUrl: getEnv('neo4jUrl', 'http://localhost:7474'),
   pgadminUrl: getEnv('pgadminUrl', 'http://localhost:5050'),
-  mongoExpressUrl: getEnv('mongoExpressUrl', 'http://localhost:8081'),
   mcpUrl: getEnv('mcpUrl', 'http://localhost:8055/mcp'),
 };

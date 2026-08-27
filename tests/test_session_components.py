@@ -2,8 +2,8 @@
 
 Task 1 (this file's first test) pins the REAL shape the codex proxy returns for
 gpt-5.5 so the adapter is built against reality, not an assumed API. See
-docs/features/persistent_session_source_of_truth.md and
-docs/superpowers/plans/2026-05-24-persistent-session-component-store.md.
+knowledge-base/knowledge/features/persistent_session_source_of_truth.md and
+knowledge-base/knowledge/superpowers/plans/2026-05-24-persistent-session-component-store.md.
 """
 
 import json

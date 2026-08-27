@@ -18,7 +18,9 @@ import asyncio
 import json
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -29,6 +31,10 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from orchestrator.services.sudo_gate import SudoGateService, _SHELL_META_RE  # noqa: E402
+from orchestrator.services.sudo_gate import (  # noqa: E402
+    SudoEntityUnavailable,
+    SudoRequestConflict,
+)
 
 
 # =============================================================================
@@ -84,6 +90,13 @@ def make_db_pool(
 
     pool = MagicMock()
     pool.acquire = acquire
+    pool.get_thread = AsyncMock(return_value=None)
+    pool.get_job = AsyncMock(
+        return_value={
+            "id": "job-aaa",
+            "context": {"vm": {"provision_generation": "nats-generation"}},
+        }
+    )
     return pool, conn
 
 
@@ -141,6 +154,219 @@ def make_sudo_request_data(
         "runas_user": runas_user,
         "cwd": cwd,
     }
+
+
+HTTP_REQUEST_ID = "11111111-1111-4111-8111-111111111111"
+HTTP_GENERATION = "22222222-2222-4222-8222-222222222222"
+
+
+def http_identity(**overrides):
+    values = {
+        "entity_type": "job",
+        "entity_id": "job-aaa",
+        "provision_generation": HTTP_GENERATION,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def make_http_sudo_body(**overrides):
+    body = {
+        "request_id": HTTP_REQUEST_ID,
+        "command": "apt-get",
+        "argv": ["install", "-y", "curl"],
+        "runas_user": "root",
+        "user": "agent-host",
+        "host": "vm-one",
+        "tty": "pts/1",
+        "cwd": "/workspace",
+        "pid": 42,
+    }
+    body.update(overrides)
+    return body
+
+
+def make_http_row(**overrides):
+    row = {
+        "id": HTTP_REQUEST_ID,
+        "job_id": "job-aaa",
+        "thread_id": None,
+        "status": "pending",
+        "decision_reason": None,
+        "expires_at": datetime.now(timezone.utc),
+        "command": "apt-get",
+        "arguments": ["install", "-y", "curl"],
+        "working_directory": "/workspace",
+        "metadata": {"provision_generation": HTTP_GENERATION},
+    }
+    row.update(overrides)
+    return row
+
+
+class TestHttpSudoBridge:
+    @staticmethod
+    def service():
+        svc = SudoGateService()
+        db = AsyncMock()
+        db.get_job.return_value = {
+            "id": "job-aaa",
+            "context": {
+                "vm": {
+                    "vm_name": "vm-from-context",
+                    "provision_generation": HTTP_GENERATION,
+                }
+            },
+        }
+        svc.connect(db)
+        svc._get_request_by_reply_subject = AsyncMock(return_value=None)
+        svc._insert_request = AsyncMock(return_value=HTTP_REQUEST_ID)
+        svc._get_request = AsyncMock(side_effect=[None, make_http_row()])
+        svc._broadcast_sse = AsyncMock()
+        svc._notify_project_officer = AsyncMock()
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_auto_rule_returns_immediate_decision(self):
+        svc = self.service()
+        svc._evaluate_auto_rules = AsyncMock(return_value="approve")
+        svc._finalize_request = AsyncMock()
+        svc._get_request.side_effect = [
+            None,
+            make_http_row(status="auto_approved", decision_reason="auto-approval rule"),
+        ]
+
+        result = await svc.open_request(
+            http_identity(),
+            make_http_sudo_body(),
+        )
+
+        assert result.status == "approved"
+        assert result.reason == "auto-approval rule"
+        svc._finalize_request.assert_awaited_once()
+        svc._broadcast_sse.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_rule_finalize_failure_returns_actual_pending_state(self):
+        svc = self.service()
+        svc._evaluate_auto_rules = AsyncMock(return_value="approve")
+        svc._finalize_request = AsyncMock()
+
+        result = await svc.open_request(http_identity(), make_http_sudo_body())
+
+        assert result.status == "pending"
+        assert result.reason is None
+
+    @pytest.mark.asyncio
+    async def test_pending_becomes_approved_across_polls(self, monkeypatch):
+        svc = self.service()
+        svc._get_scoped_request = AsyncMock(
+            side_effect=[
+                make_http_row(),
+                make_http_row(status="approved", decision_reason="operator approved"),
+            ]
+        )
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+        result = await svc.wait_for_decision(HTTP_REQUEST_ID, 25)
+
+        assert result == {
+            "request_id": HTTP_REQUEST_ID,
+            "status": "approved",
+            "reason": "operator approved",
+        }
+
+    @pytest.mark.asyncio
+    async def test_idempotent_repost_returns_existing_state(self):
+        svc = self.service()
+        svc._get_request_by_reply_subject.return_value = make_http_row()
+
+        result = await svc.open_request(
+            http_identity(),
+            make_http_sudo_body(),
+        )
+
+        assert result.created is False
+        svc._insert_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repost_payload_mismatch_conflicts(self):
+        svc = self.service()
+        svc._get_request_by_reply_subject.return_value = make_http_row()
+
+        with pytest.raises(SudoRequestConflict):
+            await svc.open_request(
+                http_identity(),
+                make_http_sudo_body(cwd="/different"),
+            )
+
+    @pytest.mark.asyncio
+    async def test_repost_from_new_vm_generation_conflicts(self):
+        svc = self.service()
+        svc._get_request_by_reply_subject.return_value = make_http_row()
+        new_generation = "33333333-3333-4333-8333-333333333333"
+        svc._db.get_job.return_value["context"]["vm"]["provision_generation"] = (
+            new_generation
+        )
+
+        with pytest.raises(SudoRequestConflict):
+            await svc.open_request(
+                http_identity(provision_generation=new_generation),
+                make_http_sudo_body(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_client_request_id_collision_with_other_claim_conflicts(self):
+        svc = self.service()
+        svc._get_request.side_effect = None
+        svc._get_request.return_value = make_http_row(
+            nats_reply_subject="_INBOX.some-other-request"
+        )
+
+        with pytest.raises(SudoRequestConflict):
+            await svc.open_request(http_identity(), make_http_sudo_body())
+
+        svc._insert_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_entity_vanishing_between_auth_and_open_is_rejected(self):
+        svc = self.service()
+        svc._db.get_job.return_value = None
+
+        with pytest.raises(SudoEntityUnavailable):
+            await svc.open_request(http_identity(), make_http_sudo_body())
+
+        svc._insert_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_open_stores_current_provision_generation(self):
+        svc = self.service()
+        svc._evaluate_auto_rules = AsyncMock(return_value=None)
+
+        await svc.open_request(http_identity(), make_http_sudo_body())
+
+        metadata = svc._insert_request.await_args.kwargs["metadata"]
+        assert metadata["provision_generation"] == HTTP_GENERATION
+
+    @pytest.mark.asyncio
+    async def test_sweep_expiry_ends_wait(self, monkeypatch):
+        svc = self.service()
+        svc._get_scoped_request = AsyncMock(
+            side_effect=[make_http_row(), make_http_row(status="expired")]
+        )
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+        result = await svc.wait_for_decision(HTTP_REQUEST_ID, 25)
+
+        assert result["status"] == "expired"
+
+    @pytest.mark.asyncio
+    async def test_nats_reply_skips_http_claim(self):
+        svc = self.service()
+        svc._nc = AsyncMock()
+
+        await svc._nats_reply(f"http:{HTTP_REQUEST_ID}", True, "approved")
+
+        svc._nc.publish.assert_not_awaited()
 
 
 # =============================================================================
@@ -269,9 +495,15 @@ class TestOnSudoRequest:
 
     @pytest.mark.asyncio
     async def test_db_insert_failure_denies_immediately(self):
-        """When DB insert fails, the request is denied via NATS reply."""
+        """When the DB insert errors, the request is denied via NATS reply.
+
+        M2-L4: a genuine insert error now raises out of _insert_request and
+        on_sudo_request denies — distinct from a lost claim (fetchrow returns
+        None under ON CONFLICT), which drops silently (see
+        test_lost_claim_drops_silently).
+        """
         svc = SudoGateService()
-        pool, conn = make_db_pool(fetchrow_return=None)
+        pool, conn = make_db_pool(fetchrow_side_effect=Exception("insert failed"))
         nc = MagicMock()
         nc.publish = AsyncMock()
         nc.flush = AsyncMock()
@@ -288,6 +520,30 @@ class TestOnSudoRequest:
         payload = json.loads(call_args[0][1].decode())
         assert payload["approved"] is False
         assert "internal error" in payload["reason"]
+
+    @pytest.mark.asyncio
+    async def test_lost_claim_drops_silently(self):
+        """A lost claim (another replica owns it) drops without denying.
+
+        M2-L4: under replicas:2 the NATS sudo subject fans out to both replicas;
+        the loser's INSERT ... ON CONFLICT DO NOTHING returns no row
+        (_insert_request -> None), so it must drop silently — NOT deny (the
+        winning replica responds).
+        """
+        svc = SudoGateService()
+        pool, conn = make_db_pool(fetchrow_return=None)
+        nc = MagicMock()
+        nc.publish = AsyncMock()
+        nc.flush = AsyncMock()
+        svc.connect(pool, nc)
+
+        data = make_sudo_request_data()
+        msg = make_nats_msg(data, reply="_INBOX.lost123")
+
+        await svc.on_sudo_request(msg)
+
+        # No reply at all — the winning replica owns the response.
+        nc.publish.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_missing_fields_use_defaults(self):
@@ -307,13 +563,13 @@ class TestOnSudoRequest:
         conn.fetchrow.assert_called_once()
         args = conn.fetchrow.call_args[0]
         # job_id defaults to ""
-        assert args[1] == ""
-        # vm_name defaults to ""
         assert args[2] == ""
+        # vm_name defaults to ""
+        assert args[4] == ""
         # requesting_user defaults to "unknown"
-        assert args[6] == "unknown"
+        assert args[8] == "unknown"
         # target_user defaults to "root"
-        assert args[7] == "root"
+        assert args[9] == "root"
 
     @pytest.mark.asyncio
     async def test_nats_reply_subject_from_msg(self):
@@ -330,7 +586,7 @@ class TestOnSudoRequest:
 
         # The reply subject should be passed to the insert
         args = conn.fetchrow.call_args[0]
-        assert args[8] == "_INBOX.custom_reply"
+        assert args[10] == "_INBOX.custom_reply"
 
     @pytest.mark.asyncio
     async def test_msg_without_reply_attribute(self):
@@ -349,7 +605,7 @@ class TestOnSudoRequest:
 
         # reply subject should be None
         args = conn.fetchrow.call_args[0]
-        assert args[8] is None
+        assert args[10] is None
 
 
 # =============================================================================
@@ -1701,25 +1957,29 @@ class TestInsertRequest:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_insert_db_error_returns_none(self):
-        """DB error during insert returns None."""
+    async def test_insert_db_error_raises(self):
+        """DB error during insert raises (M2-L4 contract).
+
+        _insert_request no longer swallows errors into None — a None must mean
+        'another replica claimed it' (ON CONFLICT), never 'the insert failed',
+        so on_sudo_request can deny on a real error instead of dropping silently.
+        """
         svc = SudoGateService()
         pool, conn = make_db_pool(fetchrow_side_effect=Exception("insert failed"))
         svc.connect(pool)
 
-        result = await svc._insert_request(
-            job_id="job-1",
-            vm_name="vm-1",
-            command="ls",
-            arguments=[],
-            cwd="/",
-            requesting_user="agent",
-            target_user="root",
-            nats_reply_subject=None,
-            metadata={},
-        )
-
-        assert result is None
+        with pytest.raises(Exception, match="insert failed"):
+            await svc._insert_request(
+                job_id="job-1",
+                vm_name="vm-1",
+                command="ls",
+                arguments=[],
+                cwd="/",
+                requesting_user="agent",
+                target_user="root",
+                nats_reply_subject=None,
+                metadata={},
+            )
 
     @pytest.mark.asyncio
     async def test_insert_null_fetchrow_returns_none(self):
@@ -1764,7 +2024,7 @@ class TestInsertRequest:
 
         # The metadata param (last positional arg) should be a JSON string
         args = conn.fetchrow.call_args[0]
-        metadata_arg = args[9]  # $9 in the query
+        metadata_arg = args[11]  # $11 in the query
         parsed = json.loads(metadata_arg)
         assert parsed["extra"] == [1, 2, 3]
 

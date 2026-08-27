@@ -2,7 +2,7 @@
 
 This toolkit is always loaded as it provides essential agent functionality.
 It includes:
-- Todo tools: Task tracking (next_phase_todos, todo_complete, todo_list, todo_rewind)
+- Todo tools: Task tracking (next_phase_todos, todo_complete, todo_list, request_replan)
 - Job tools: Completion signaling (mark_complete, job_complete)
 """
 
@@ -22,6 +22,8 @@ def create_core_tools(context: ToolContext) -> List[Any]:
     """
     from .todo import create_todo_tools
     from .job import create_job_tools
+    from .upgrade import create_workspace_upgrade_tools
+    from .officer import create_officer_tools
 
     tools = []
 
@@ -31,6 +33,14 @@ def create_core_tools(context: ToolContext) -> List[Any]:
     if context.has_workspace():
         tools.extend(create_job_tools(context))
 
+    # No workspace/todo dependency — loads on the lite tiers (todo_manager=None);
+    # only requested when exposed (lite sessions, workspace_tier_upgrade.md S5).
+    tools.extend(create_workspace_upgrade_tools(context))
+
+    # Officer sleep — flag-setter only; exposed solely when the session's
+    # config has officer.enabled (persistent_session tool assembly).
+    tools.extend(create_officer_tools(context))
+
     return tools
 
 
@@ -38,8 +48,15 @@ def get_core_metadata() -> Dict[str, Dict[str, Any]]:
     """Get metadata for all core tools."""
     from .todo import TODO_TOOLS_METADATA
     from .job import JOB_TOOLS_METADATA
+    from .upgrade import WORKSPACE_UPGRADE_TOOLS_METADATA
+    from .officer import OFFICER_TOOLS_METADATA
 
-    return {**TODO_TOOLS_METADATA, **JOB_TOOLS_METADATA}
+    return {
+        **TODO_TOOLS_METADATA,
+        **JOB_TOOLS_METADATA,
+        **WORKSPACE_UPGRADE_TOOLS_METADATA,
+        **OFFICER_TOOLS_METADATA,
+    }
 
 
 __all__ = [

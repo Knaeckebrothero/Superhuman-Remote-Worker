@@ -225,6 +225,7 @@ class TestTurnCountState:
             workspace_path="/tmp/test",
         )
         assert state["turn_count"] == 0
+        assert state["phase_instruction_injections"] == []
 
     def test_turn_count_is_int(self):
         from src.core.state import create_initial_state

@@ -2,7 +2,16 @@
  * Shared types for the agent settings component tree.
  */
 
-export type SettingsMode = 'job' | 'session';
+import type {EffectiveModels} from '../../core/models/api.model';
+import {JOB_TOOL_GROUP_CATEGORIES} from '../../core/tools/job-surface.generated';
+
+/**
+ * - `job` / `session`: creation forms — overrides collected at submit time.
+ * - `live`: a running session's settings pane — pin-only (no reset-to-default
+ *   affordances; the live protocol has no clear-override op), per-change apply
+ *   via the host's state diff, and only the surface the live path honors.
+ */
+export type SettingsMode = 'job' | 'session' | 'live';
 
 /** Tool category metadata for toggle display. */
 export interface ToolCategoryMeta {
@@ -22,14 +31,54 @@ export const JOB_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   { key: 'delegation', label: 'Delegation', icon: 'account_tree', description: 'Ability to spawn subagents that work in parallel' },
 ];
 
-/** Session creation also shows knowledge and git categories. */
+/** Session creation also shows SRW, knowledge, and git categories. */
 export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   ...JOB_TOOL_CATEGORIES,
+  { key: 'canvas', label: 'Canvas', icon: 'dashboard_customize', description: 'Ability to present workspace files in the shared session Canvas' },
+  ...JOB_TOOL_GROUP_CATEGORIES,
+  { key: 'orchestrator', label: 'SRW Projects', icon: 'hub', description: 'Ability to inspect SRW projects, repositories, session context, and workspace upgrades' },
+  { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to look up experts and skills. Read-only — the row below is what creates them' },
+  { key: 'workflows', label: 'Automations & Loops', icon: 'auto_mode', description: 'Ability to inspect automations and project loops, and draft disabled automations' },
+  { key: 'catalog_authoring', label: 'Author Experts & Automations', icon: 'edit_note', description: 'Ability to create and update your own experts, skills and automations on your behalf. New automations are created switched off for you to review' },
   { key: 'knowledge', label: 'Knowledge', icon: 'psychology', description: 'Ability to read and write to the project knowledge base' },
   { key: 'git', label: 'Git', icon: 'commit', description: 'Ability to inspect workspace version history' },
 ];
 
-/** Autonomy level options. */
+/**
+ * Presentation metadata for the categories the twelve above do not cover.
+ *
+ * PRESENTATION ONLY — icons, order and copy. It decides nothing about
+ * enablement and is never a vocabulary: the resolved read
+ * (`GET /api/persistent/threads/{id}/tool-groups`, `POST .../tool-groups/preview`)
+ * returns EVERY category the agent can hold, including `mcp`, `unclassified`
+ * and anything a config names, and the surfaces render what it returns. A key
+ * missing from here still renders — see `humanizeCategoryKey` — so this list
+ * going stale costs a nice label and nothing else. That is deliberate: the
+ * lists this change deleted were all lists whose staleness cost correctness.
+ */
+export const AUXILIARY_TOOL_CATEGORIES: ToolCategoryMeta[] = [
+  { key: 'workspace', label: 'Workspace Files', icon: 'folder_open', description: 'Read, write, move and search files in the session workspace' },
+  { key: 'core', label: 'Core', icon: 'bolt', description: 'Planning, progress and completion — todos, replanning, notifications, sleep' },
+  { key: 'session_task', label: 'Session Tasks', icon: 'checklist', description: "The session's own task list" },
+  { key: 'product_help', label: 'Product Help', icon: 'help_center', description: 'Read the SRW product guide and capability reference' },
+  { key: 'evaluation', label: 'Evaluation', icon: 'rule', description: 'Approve or return worker jobs with feedback' },
+  { key: 'loop', label: 'Project Loop', icon: 'restart_alt', description: 'Plan an autonomous project loop' },
+  { key: 'sql', label: 'SQL', icon: 'table', description: 'Query attached PostgreSQL datasources' },
+  { key: 'mongodb', label: 'MongoDB', icon: 'database', description: 'Query attached MongoDB datasources' },
+  { key: 'graph', label: 'Graph', icon: 'share', description: 'Query attached Neo4j datasources' },
+  { key: 'webdav', label: 'Cloud Storage', icon: 'cloud', description: 'Read and write files on attached WebDAV / cloud datasources' },
+  { key: 'email', label: 'Email', icon: 'inbox', description: 'Read and send through an attached email datasource' },
+  { key: 'repo', label: 'Repositories', icon: 'source', description: 'Read and write attached repository datasources' },
+  { key: 'mcp', label: 'MCP Servers', icon: 'extension', description: 'Tools discovered from attached MCP servers at session start' },
+  { key: 'unclassified', label: 'Other', icon: 'category', description: 'Tools this cockpit build does not recognise — usually discovered at runtime' },
+];
+
+/** Every category the cockpit has copy for, session order first. */
+export const ALL_TOOL_CATEGORIES: ToolCategoryMeta[] = [
+  ...SESSION_TOOL_CATEGORIES,
+  ...AUXILIARY_TOOL_CATEGORIES,
+];
+
 export const AUTONOMY_LEVELS = [
   { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },
   { value: 'review', label: 'Review', description: 'Freezes at job completion for human review' },
@@ -60,6 +109,43 @@ export const PERMISSION_MODES = [
   { value: 'auto_accept', label: 'Auto-accept', description: 'Auto-approve most actions, flag risky ones' },
   { value: 'autonomous', label: 'Autonomous', description: 'Agent runs without asking for approval' },
 ] as const;
+
+/** Image-quality tiers: resolution of images delivered to the model. Higher =
+ *  more visual detail + more image tokens. Mirrors backend
+ *  VALID_IMAGE_QUALITY_TIERS (src/core/loader.py) / image_downscale.py. */
+export const IMAGE_QUALITY_TIERS = [
+  { value: 'economy', label: 'Economy', description: 'Lowest resolution (~768px) — cheapest, coarse detail' },
+  { value: 'standard', label: 'Standard', description: 'Balanced (~1568px) — good detail for most tasks' },
+  { value: 'high', label: 'High', description: 'Model-family max — best for OCR, charts, UI screenshots' },
+] as const;
+
+/** Workspace backends, in the order the selector lists them. `i18nKey` names
+ *  the shared label under `advanced.options.*` — one vocabulary for the
+ *  creation forms and the live session pane alike. */
+export const WORKSPACE_BACKENDS = [
+  { value: 'sandbox', i18nKey: 'container' },
+  { value: 'vm', i18nKey: 'vmQemu' },
+  { value: 'virtual', i18nKey: 'virtual' },
+  { value: 'none', i18nKey: 'none' },
+] as const;
+
+/**
+ * Whether a running session can move to a given workspace tier.
+ *
+ * `current` is the tier it is on; `ok` is reachable. Everything else is a
+ * reason the move is refused, and doubles as the i18n key suffix under
+ * `agentSettings.execution.tierUnreachable.*` — the reason renders in the
+ * option itself, so the "no" arrives before the click rather than after it.
+ *
+ * Reachability is the live pane's to decide (it holds the tier and the
+ * grants); the settings group only renders what it is told.
+ */
+export type TierReachability =
+  | 'current'
+  | 'ok'
+  | 'downgrade'
+  | 'needsApproval'
+  | 'unsupported';
 
 /** Deep-read a nested path from a config object. */
 export function readConfigPath(config: Record<string, unknown>, path: string): unknown {
@@ -102,10 +188,17 @@ export function detectModelFamily(model: string): string {
   if (name.startsWith('claude-haiku')) return 'claude-haiku';
   if (name.includes('codex-spark')) return 'codex-spark';
   if (name.includes('codex') && name.startsWith('gpt-5')) return 'codex';
+  if (name.startsWith('gpt-5.6')) return 'gpt-5.6';
   if (name.startsWith('gpt-5')) return 'gpt-5';
   if (name.startsWith('gpt-4o')) return 'gpt-4o';
   if (name.startsWith('o1') || name.startsWith('o3') || name.startsWith('o4')) return 'o-series';
   if (name.includes('deepseek')) return 'deepseek';
+  if (name.includes('glm')) return 'glm';
+  if (
+    name.startsWith('mistral') || name.startsWith('codestral') || name.startsWith('magistral') ||
+    name.startsWith('ministral') || name.startsWith('devstral') || name.startsWith('pixtral') ||
+    name.startsWith('voxtral')
+  ) return 'mistral';
   if (name.includes('qwen') || name.includes('qwq')) return 'qwen';
   if (name.includes('llama')) return 'llama';
   if (name.startsWith('gemini')) return 'gemini';
@@ -148,4 +241,105 @@ export function resolveMatrixForModel(
     return deepMerge(base, matrix[family] as Record<string, unknown>);
   }
   return base;
+}
+
+/** Result of comparing the two phase models' family settings (window + multimodal). */
+export interface ModelMismatch {
+  /** Window gap exceeds 2× (mirrors the backend's prominent-warning threshold). */
+  prominent: boolean;
+  /** Set when the two windows differ; `min` is the budget the shared history is capped to. */
+  window: {min: number; strategicWindow: number; tacticalWindow: number} | null;
+  /** True when the two models differ in multimodal capability (⇒ image input disabled for both). */
+  multimodal: boolean;
+}
+
+/**
+ * Compare the strategic + tactical phase models' family settings and report a
+ * mismatch worth warning about. Pure client-side mirror of the backend's
+ * `resolve_phase_model_budget` (src/core/loader.py): a worker job runs both
+ * phase models over ONE shared history, so the context budget collapses to the
+ * `min` of their windows and multimodal collapses to the AND.
+ *
+ * Only flags cases with a real consequence — different context windows (history
+ * capped to the smaller) or different multimodal capability (image input
+ * disabled for both). Stays silent when the two models merely differ in family
+ * but agree on window AND multimodal, because there the backend's min/AND is a
+ * no-op. Window/multimodal come from the family matrix, so an admin per-model
+ * `context_window` override is not reflected (this is an advisory hint).
+ */
+export function computeModelMismatch(
+  matrix: Record<string, Record<string, unknown>>,
+  strategicModel: string | null,
+  tacticalModel: string | null,
+): ModelMismatch | null {
+  if (!matrix || Object.keys(matrix).length === 0) return null;
+  if (!strategicModel || !tacticalModel || strategicModel === tacticalModel) return null;
+
+  const sm = resolveMatrixForModel(matrix, strategicModel);
+  const tm = resolveMatrixForModel(matrix, tacticalModel);
+
+  const sWin = typeof sm['model_max_context_tokens'] === 'number'
+    ? (sm['model_max_context_tokens'] as number) : null;
+  const tWin = typeof tm['model_max_context_tokens'] === 'number'
+    ? (tm['model_max_context_tokens'] as number) : null;
+  const sMulti = sm['multimodal'] === true;
+  const tMulti = tm['multimodal'] === true;
+
+  const windowDiffers = sWin !== null && tWin !== null && sWin !== tWin;
+  const multimodalDiffers = sMulti !== tMulti;
+  if (!windowDiffers && !multimodalDiffers) return null;
+
+  const window = windowDiffers
+    ? {min: Math.min(sWin as number, tWin as number), strategicWindow: sWin as number, tacticalWindow: tWin as number}
+    : null;
+  const prominent = window !== null && Math.max(sWin as number, tWin as number) > 2 * window.min;
+
+  return {prominent, window, multimodal: multimodalDiffers};
+}
+
+/**
+ * Pick the server-resolved effective-models payload the model picker should show
+ * for its "Default" option: the selected expert's resolution when present, else
+ * the framework defaults' resolution (the no-expert create path). Without the
+ * framework fallback the picker drops to the config-literal `llm.model` — the
+ * hardcoded YAML placeholder (`RedHatAI/gemma-4-31B-it-FP8-Dynamic`) — instead of
+ * the resolved system chat pin. `undefined` (older API, no `effective_models`)
+ * falls back the same as `null` (no expert selected).
+ */
+export function resolveEffectiveModels(
+  expertModels: EffectiveModels | null | undefined,
+  frameworkModels: EffectiveModels | null,
+): EffectiveModels | null {
+  return expertModels ?? frameworkModels ?? null;
+}
+
+/**
+ * Label for a model picker's "inherit the default" option, revealing the model
+ * that default currently resolves to. `prefix` is the inherit-marker ("Base
+ * default", "Project default"); when a resolved `model` is known it is appended
+ * ("Base default · gemma-4-31b") so the option isn't an opaque "default". Falls
+ * back to the bare prefix when nothing is resolved yet (picker still loading, or
+ * no catalog row), avoiding a dangling separator.
+ */
+export function defaultModelOptionLabel(prefix: string, model: string | null | undefined): string {
+  return model ? `${prefix} · ${model}` : prefix;
+}
+
+/**
+ * Commit a currently-inherited value into its override signal.
+ *
+ * Paired with `PinOnInteractDirective`: the controls render
+ * `override() ?? resolved()`, so "what the user sees" and "what the user chose"
+ * are different things. When they deliberately interact with a control, the
+ * displayed value becomes a choice. No-op once an override exists, so repeated
+ * interaction never clobbers a real selection — only the reset button clears
+ * back to inherit.
+ */
+export function pinResolvedValue<T>(
+  target: {(): T | null; set(value: T | null): void},
+  resolved: T,
+): boolean {
+  if (target() !== null) return false;
+  target.set(resolved);
+  return true;
 }

@@ -6,7 +6,6 @@ databases, deduplicate results, and download available papers.
 
 import asyncio
 import logging
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -75,15 +74,26 @@ def create_workflow_tools(context: ToolContext) -> List[Any]:
         )
 
         # Handle errors gracefully
+        provider_warnings: List[str] = []
         if isinstance(arxiv_papers, Exception):
             logger.warning(f"arXiv search failed: {arxiv_papers}")
+            provider_warnings.append(f"arXiv search failed: {arxiv_papers}")
             arxiv_papers = []
         if isinstance(s2_papers, Exception):
             logger.warning(f"Semantic Scholar search failed: {s2_papers}")
+            provider_warnings.append(f"Semantic Scholar search failed: {s2_papers}")
             s2_papers = []
 
         if not arxiv_papers and not s2_papers:
-            return f"No results found for: {topic}\nTry different keywords or a broader search query."
+            warning_text = ""
+            if provider_warnings:
+                warning_text = "\nProvider failures:\n- " + "\n- ".join(
+                    provider_warnings
+                )
+            return (
+                f"No results found for: {topic}\n"
+                f"Try different keywords or a broader search query.{warning_text}"
+            )
 
         # Deduplicate across databases
         unique_papers = _deduplicate_papers(arxiv_papers, s2_papers)
@@ -112,6 +122,7 @@ def create_workflow_tools(context: ToolContext) -> List[Any]:
             arxiv_count=len(arxiv_papers) if isinstance(arxiv_papers, list) else 0,
             s2_count=len(s2_papers) if isinstance(s2_papers, list) else 0,
             include_abstracts=include_abstracts,
+            provider_warnings=provider_warnings,
         )
 
     return [research_topic]
@@ -130,30 +141,17 @@ async def _search_arxiv_raw(query: str, max_results: int):
 
 async def _search_semantic_scholar_raw(query: str, max_results: int, *, proxy=None):
     """Search Semantic Scholar and return Paper objects."""
-    import os
-
-    from .utils.network import research_request
     from .utils.paper_types import AccessStatus, Paper, PaperSource
+    from .utils.semantic_scholar_client import search_semantic_scholar
 
-    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
-    headers = {}
-    if api_key:
-        headers["x-api-key"] = api_key
-
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
-    params = {
-        "query": query,
-        "limit": max_results,
-        "fields": "title,authors,year,abstract,citationCount,openAccessPdf,externalIds,venue",
-    }
-
-    async with research_request(
-        "GET", url, proxy=proxy, timeout=30, params=params, headers=headers
-    ) as resp:
-        if resp.status == 429:
-            raise Exception("Semantic Scholar rate limit hit")
-        resp.raise_for_status()
-        data = await resp.json()
+    data = await search_semantic_scholar(
+        query,
+        max_results,
+        fields=(
+            "title,authors,year,abstract,citationCount,openAccessPdf,externalIds,venue"
+        ),
+        proxy=proxy,
+    )
 
     results = data.get("data", [])
     papers = []
@@ -242,8 +240,9 @@ async def _download_available_papers(
     Only attempts download for papers with known PDF URLs or arXiv IDs.
     Limits concurrent downloads to avoid rate limiting.
 
-    For remote workspaces, downloads to a local temp dir first, then
-    transfers each file to the workspace via the backend.
+    Downloads always use a local operation-scoped temp directory, then write
+    each completed file through the workspace backend. A backend path is not a
+    reliable local-filesystem path, even when ``backend.host`` is ``None``.
 
     Returns:
         List of result messages for each download attempt
@@ -252,14 +251,6 @@ async def _download_available_papers(
 
     results = []
     backend = context.workspace_manager.backend
-    remote = backend.host is not None
-
-    if remote:
-        dest_dir = Path(tempfile.mkdtemp(prefix="paper_dl_"))
-        backend.mkdir("documents")
-    else:
-        dest_dir = context.workspace_manager.get_path("documents")
-        dest_dir.mkdir(parents=True, exist_ok=True)
 
     downloadable = [
         p
@@ -272,7 +263,9 @@ async def _download_available_papers(
     if not downloadable:
         return ["No open access papers available for download."]
 
-    try:
+    backend.mkdir("documents")
+    with tempfile.TemporaryDirectory(prefix="paper_dl_") as temp_dir:
+        dest_dir = Path(temp_dir)
         for paper in downloadable[:5]:  # Limit to 5 downloads per research call
             try:
                 if paper.arxiv_id:
@@ -285,18 +278,13 @@ async def _download_available_papers(
                     continue
 
                 if result:
-                    # Transfer to workspace if remote
-                    if remote:
-                        ws_rel = f"documents/{result.name}"
-                        backend.write_file(ws_rel, result.read_bytes())
-                        display_path = ws_rel
-                    else:
-                        display_path = str(result)
+                    ws_rel = f"documents/{result.name}"
+                    backend.write_file(ws_rel, result.read_bytes())
 
                     # Register as citation source
                     try:
-                        context.get_or_register_doc_source(
-                            display_path, name=paper.title
+                        await context.get_or_register_doc_source(
+                            ws_rel, name=paper.title
                         )
                     except Exception:
                         pass
@@ -307,9 +295,6 @@ async def _download_available_papers(
             except Exception as e:
                 logger.debug(f"Download failed for {paper.title}: {e}")
                 results.append(f"  Failed: {paper.title} ({e})")
-    finally:
-        if remote:
-            shutil.rmtree(dest_dir, ignore_errors=True)
 
     return results
 
@@ -357,6 +342,7 @@ def _format_research_report(
     arxiv_count: int,
     s2_count: int,
     include_abstracts: bool,
+    provider_warnings: Optional[List[str]] = None,
 ) -> str:
     """Format a comprehensive research report."""
     from .utils.paper_types import AccessStatus
@@ -368,6 +354,10 @@ def _format_research_report(
         f"Sources searched: arXiv ({arxiv_count} results), Semantic Scholar ({s2_count} results)",
         f"Unique papers after deduplication: {len(papers)}",
     ]
+
+    if provider_warnings:
+        lines.append("Provider warnings:")
+        lines.extend(f"- {warning}" for warning in provider_warnings)
 
     # Stats
     oa_count = sum(

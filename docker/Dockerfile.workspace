@@ -10,9 +10,33 @@
 
 FROM ubuntu:24.04
 
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
 ARG DEBIAN_FRONTEND=noninteractive
 ARG CODE_SERVER_VERSION=4.100.3
 ARG NODE_MAJOR=22
+# Pinned upstream rclone (Ubuntu's packaged 1.60.1-DEV predates the webdav
+# `infinitescale` vendor needed for OpenCloud mounts and lacks modern VFS
+# cache flags — see knowledge-base/knowledge/features/rclone_cloud_mount.md §12). Keep version
+# and checksum in sync with docker/agent-vm-base/scripts/provision-stage1.sh.
+# SRW_ prefix is load-bearing: rclone parses RCLONE_* env vars as flags, so
+# an ARG named RCLONE_VERSION crashes `rclone version` inside the RUN.
+ARG SRW_RCLONE_VERSION=1.74.3
+ARG SRW_RCLONE_SHA256=408cde598307dedc26b7108553cb2147a8d2d12853100447e802f47454582ecc
+
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="workspace"
+
+ENV SRW_COMPONENT=workspace \
+    SRW_SOURCE_REVISION=${SRW_SOURCE_REVISION} \
+    SRW_SOURCE_URL=${SRW_SOURCE_URL} \
+    SRW_RELEASE_VERSION=${SRW_RELEASE_VERSION} \
+    SRW_DOCUMENTATION_URL=${SRW_DOCUMENTATION_URL}
 
 # ---------------------------------------------------------------------------
 # 0. Apt tuning: prefer Azure mirror (faster from GHA Azure runners) but keep
@@ -62,6 +86,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     zip \
     unzip \
     zstd \
+    fuse3 \
+    fuse-overlayfs \
     # NOTE: sudo intentionally excluded — agent-host must not escalate to root
     ca-certificates \
     gnupg \
@@ -117,6 +143,34 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         cypher-shell
 
 # ---------------------------------------------------------------------------
+# 1c. rclone — pinned upstream release with checksum verification (not apt:
+#     Noble ships 1.60.1-DEV, too old for OpenCloud's webdav vendor). The deb
+#     replaces any distro rclone and lands in /usr/bin/rclone.
+# ---------------------------------------------------------------------------
+RUN curl -fsSL "https://downloads.rclone.org/v${SRW_RCLONE_VERSION}/rclone-v${SRW_RCLONE_VERSION}-linux-amd64.deb" \
+        -o /tmp/rclone.deb \
+    && echo "${SRW_RCLONE_SHA256}  /tmp/rclone.deb" | sha256sum -c - \
+    && dpkg -i /tmp/rclone.deb \
+    && rm /tmp/rclone.deb \
+    && rclone version
+
+# fuse-overlayfs version gate — the overlay-over-rclone spike (see
+# knowledge-base/knowledge/superpowers/plans/2026-07-09-protected-cloud-mode-phase0-spike.md)
+# needs the big-dir/readdir fixes that landed in 1.13. Fail the build loudly
+# rather than silently shipping a too-old binary.
+#
+# The sed must be anchored to the tool's own "fuse-overlayfs: version X"
+# line: `--version` also prints the FUSE library version and the FUSE
+# kernel interface version, each on their own "... version N.N" line, so
+# an unanchored `.*version \(...\)` pattern matches all three lines and
+# `$v` becomes a multi-line string that makes `dpkg --compare-versions`
+# print "bad syntax" on every build.
+RUN fuse-overlayfs --version \
+    && v="$(fuse-overlayfs --version | sed -n 's/^fuse-overlayfs: version \([0-9.]*\).*/\1/p')" \
+    && dpkg --compare-versions "$v" ge 1.13 \
+        || { echo "fuse-overlayfs $v < 1.13 (big-dir/readdir fixes needed)"; exit 1; }
+
+# ---------------------------------------------------------------------------
 # 2. Node.js 22 + global packages
 # ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -136,14 +190,22 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # 2b. Chromium via Playwright (replaces apt chromium-browser, which on Ubuntu
 #     Noble is a snap shim — see docker/agent-vm-base/scripts/provision-stage1.sh).
 #     PLAYWRIGHT_VERSION must match .playwright-version (also consumed by
-#     provision.sh and requirements.txt). Path matches Dockerfile.agent:80.
+#     provision.sh). The agent image has no Playwright/Chromium at all.
 # ---------------------------------------------------------------------------
-ARG PLAYWRIGHT_VERSION
+ARG PLAYWRIGHT_VERSION=1.59.0
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/root/.cache/pip \
     test -n "$PLAYWRIGHT_VERSION" || (echo "PLAYWRIGHT_VERSION build-arg required" && exit 1) \
-    && eatmydata pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" "browser-use>=0.11.0" \
+    # browser-use is CAPPED below 0.13.0: 0.13 (2026-06-08) rewrote the browser
+    # layer to pure CDP and dropped Playwright, so it no longer finds the
+    # Playwright-installed Chromium under PLAYWRIGHT_BROWSERS_PATH and falls back
+    # to auto-installing one via `uvx playwright install` — which fails on this
+    # image ([Errno 2] No such file or directory: 'uvx'), breaking every
+    # browser_* tool cluster-wide. 0.12.x (validated 2026-05-27) is the last
+    # Playwright-compatible line the browser-exec daemon is written against. Do
+    # NOT loosen this cap without upgrading docker/browser-exec to the 0.13 API.
+    && eatmydata pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" "browser-use>=0.12.9,<0.13.0" \
     && apt-get update -y && eatmydata apt-get install -y fonts-noto-core \
     && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright eatmydata playwright install --with-deps chromium \
     # Layout varies by version: older revs use chrome-linux/, newer (>=1.49) use
@@ -157,10 +219,24 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 # ---------------------------------------------------------------------------
 # 2c. browser-exec — workspace-side browser executor. The agent drives it over
 #     SSH (exec_command), so Chrome's CDP stays on the workspace loopback and
-#     never crosses the pod network. See docs/features/browser_workspace_executor.md
+#     never crosses the pod network. See knowledge-base/knowledge/features/browser_workspace_executor.md
 # ---------------------------------------------------------------------------
 COPY docker/browser-exec /usr/local/bin/browser-exec
 RUN chmod +x /usr/local/bin/browser-exec
+
+# ---------------------------------------------------------------------------
+# 2d. Browser stack conformance gate — the SAME script the VM golden image runs
+#     at the end of stage2 (docker/agent-vm-base). Shared, not duplicated: these
+#     two images are hand-maintained twins, and the VM shipped for ~5 weeks with
+#     a working Chromium that no agent could reach because browser-exec and
+#     browser-use were added here only, with nothing asserting the images agreed.
+#     See knowledge-base/knowledge/issues/vm_workspace_missing_browser_exec.md. Installed permanently
+#     as well as run, so any live workspace can be interrogated in five seconds.
+# ---------------------------------------------------------------------------
+COPY docker/check-browser-stream.py /usr/local/bin/check-browser-stream
+COPY docker/assert-browser-stack.sh /usr/local/bin/assert-browser-stack
+RUN chmod +x /usr/local/bin/check-browser-stream /usr/local/bin/assert-browser-stack \
+    && /usr/local/bin/assert-browser-stack
 
 # ---------------------------------------------------------------------------
 # 3. code-server (IDE)
@@ -187,7 +263,8 @@ RUN mkdir -p /home/agent-host/.local/bin \
              /home/agent-host/.local/lib/python3/site-packages \
              /home/agent-host/.npm-global \
              /home/agent-host/.cache \
-    && chown -R agent-host:agent-host /home/agent-host
+             /cloud \
+    && chown -R agent-host:agent-host /home/agent-host /cloud
 
 ENV PIP_TARGET=/home/agent-host/.local/lib/python3/site-packages \
     PATH="/home/agent-host/.local/bin:/home/agent-host/.npm-global/bin:${PATH}" \
@@ -201,7 +278,7 @@ RUN mkdir -p /run/sshd \
 # Workspace container SSH config — optimized for RemoteBackend
 # Listener on 30022 (not 22): removes the egress/ingress port alias on
 # TCP/22 and is defense-in-depth against future NetworkPolicy drift.
-# See docs/features/workspace_network_isolation.md (PR 2).
+# See knowledge-base/knowledge/features/workspace_network_isolation.md (PR 2).
 Port 30022
 PermitRootLogin no
 PasswordAuthentication no
@@ -211,14 +288,31 @@ X11Forwarding no
 PrintMotd no
 AcceptEnv LANG LC_*
 Subsystem sftp /usr/lib/openssh/sftp-server
+# Canvas reaches declared workspace HTTP ports only through request-scoped
+# direct-tcpip channels on this authenticated SSH transport. Keep forwarding
+# local to the SSH client, restrict its destination to workspace loopback, and
+# disable the unrelated forwarding/tunnel surfaces explicitly.
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:*
+GatewayPorts no
+AllowAgentForwarding no
+PermitTunnel no
 # Keep connections alive (agent may have idle periods between tool calls)
 ClientAliveInterval 60
 ClientAliveCountMax 720
 MaxStartups 10:30:100
+# Above the OpenSSH default (10): the agent multiplexes parallel tool execs
+# plus persistent SFTP/shell channels over ONE transport, and a 14-wide tool
+# batch at the default limit masqueraded as workspace death. The backend caps
+# concurrent execs at WORKSPACE_SSH_MAX_CONCURRENT_CHANNELS (10); 16 leaves
+# headroom for the long-lived channels.
+# knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md
+MaxSessions 16
 SSHEOF
 
-# Generate host keys (normally done on first boot)
-RUN ssh-keygen -A
+# Host keys are generated at runtime into the workspace-system volume. Baking
+# them into the image would give every workspace the same SSH identity.
+RUN rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
 
 # ---------------------------------------------------------------------------
 # 6. tmux config (mirrors provision.sh lines 255-262)

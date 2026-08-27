@@ -96,8 +96,9 @@ class TestTranscribeService:
         cls.assert_not_called()  # no client built when STT is unconfigured
 
     @pytest.mark.asyncio
-    async def test_none_when_no_api_key(self):
-        from services.transcribe import transcribe_thread_audio
+    async def test_raises_when_no_api_key(self):
+        """A configured model with no key is broken, not off → raise (→ 502)."""
+        from services.transcribe import TranscriptionError, transcribe_thread_audio
 
         cls, _ = _mock_openai("x")
         with (
@@ -107,14 +108,14 @@ class TestTranscribeService:
                 AsyncMock(return_value=("whisper-1", None, None)),
             ),
         ):
-            text = await transcribe_thread_audio(
-                audio_bytes=b"\x00",
-                filename="voice.webm",
-                user_id="u1",
-                postgres_db=_mock_db(),
-            )
-        assert text is None
-        cls.assert_not_called()
+            with pytest.raises(TranscriptionError):
+                await transcribe_thread_audio(
+                    audio_bytes=b"\x00",
+                    filename="voice.webm",
+                    user_id="u1",
+                    postgres_db=_mock_db(),
+                )
+        cls.assert_not_called()  # no client built without a key
 
     @pytest.mark.asyncio
     async def test_none_on_empty_audio(self):
@@ -129,8 +130,9 @@ class TestTranscribeService:
         assert text is None
 
     @pytest.mark.asyncio
-    async def test_none_on_openai_error(self):
-        from services.transcribe import transcribe_thread_audio
+    async def test_raises_on_openai_error(self):
+        """A transcription call failure is broken, not off → raise (→ 502)."""
+        from services.transcribe import TranscriptionError, transcribe_thread_audio
 
         client = MagicMock()
         client.audio.transcriptions.create = AsyncMock(side_effect=RuntimeError("boom"))
@@ -143,14 +145,48 @@ class TestTranscribeService:
                 AsyncMock(return_value=("whisper-1", None, "sk-key")),
             ),
         ):
+            with pytest.raises(TranscriptionError):
+                await transcribe_thread_audio(
+                    audio_bytes=b"\x00\x01",
+                    filename="voice.webm",
+                    user_id="u1",
+                    postgres_db=_mock_db(),
+                )
+        client.close.assert_awaited_once()  # cleaned up even on failure
+
+    def test_timeout_scales_with_payload_size(self):
+        from services.transcribe import (
+            _STT_TIMEOUT_MAX,
+            _STT_TIMEOUT_MIN,
+            _stt_timeout,
+        )
+
+        assert _stt_timeout(1000) == _STT_TIMEOUT_MIN  # tiny clip → floor
+        assert _stt_timeout(10**9) == _STT_TIMEOUT_MAX  # huge clip → ceiling
+        mid = _stt_timeout(4_000_000)  # ~a few-minute clip → between the bounds
+        assert _STT_TIMEOUT_MIN < mid < _STT_TIMEOUT_MAX
+
+    @pytest.mark.asyncio
+    async def test_empty_transcript_returns_empty_not_none(self):
+        """Silence (empty transcript) is a success, distinct from the None
+        'no model' signal, so it must not collapse into a 204."""
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai("")  # endpoint returns an empty transcript
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
             text = await transcribe_thread_audio(
-                audio_bytes=b"\x00\x01",
+                audio_bytes=b"\x00",
                 filename="voice.webm",
                 user_id="u1",
                 postgres_db=_mock_db(),
             )
-        assert text is None
-        client.close.assert_awaited_once()  # cleaned up even on failure
+        assert text == ""
 
     @pytest.mark.asyncio
     async def test_handles_object_response_with_text_attr(self):
@@ -304,6 +340,31 @@ class TestTranscribeEndpoint:
         assert resp.status_code == 204
 
     @pytest.mark.asyncio
+    async def test_502_on_transcription_error(self):
+        """A configured model that fails → 502 (honest error), not a silent 204."""
+        import main
+        from fastapi import HTTPException
+
+        from services.transcribe import TranscriptionError
+
+        with (
+            patch.object(
+                main,
+                "require_thread_owner",
+                AsyncMock(return_value=({"id": "u1"}, {"id": "t1"})),
+            ),
+            patch(
+                "services.transcribe.transcribe_thread_audio",
+                AsyncMock(side_effect=TranscriptionError("down")),
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.transcribe_thread_audio_endpoint(
+                    thread_id="t1", request=MagicMock(), audio=_upload(b"\x00\x01")
+                )
+        assert exc.value.status_code == 502
+
+    @pytest.mark.asyncio
     async def test_400_on_empty_audio(self):
         import main
         from fastapi import HTTPException
@@ -335,3 +396,99 @@ class TestTranscribeEndpoint:
                     thread_id="t1", request=MagicMock(), audio=big
                 )
         assert exc.value.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# Usage metering (rate-limiting v2): STT is metered per request, non-fatally.
+# ---------------------------------------------------------------------------
+
+
+def _mock_ledger(*, available=True):
+    led = MagicMock()
+    led.is_available = available
+    led.record_events = AsyncMock(return_value=1)
+    return led
+
+
+class TestTranscribeMetering:
+    @pytest.mark.asyncio
+    async def test_records_stt_request_event(self):
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai("hi")
+        led = _mock_ledger()
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
+            text = await transcribe_thread_audio(
+                audio_bytes=b"\x00\x01\x02",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id="t1",
+            )
+        assert text == "hi"
+        led.record_events.assert_awaited_once()
+        (events,), _ = led.record_events.call_args
+        ev = events[0]
+        assert ev.category == "stt"
+        assert ev.unit == "stt-request"
+        assert ev.quantity == 1
+        assert ev.resource == "whisper-1"
+        assert ev.ref_id == "t1"
+        assert ev.details["bytes"] == 3
+
+    @pytest.mark.asyncio
+    async def test_metering_failure_does_not_drop_transcript(self):
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai("hi")
+        led = _mock_ledger()
+        led.record_events = AsyncMock(side_effect=RuntimeError("audit down"))
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
+            text = await transcribe_thread_audio(
+                audio_bytes=b"\x00",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id="t1",
+            )
+        # The metering write is OUTSIDE the transcribe try — a failure here must
+        # never cost the user their transcript.
+        assert text == "hi"
+
+    @pytest.mark.asyncio
+    async def test_no_write_when_ledger_unavailable(self):
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai("hi")
+        led = _mock_ledger(available=False)
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
+            text = await transcribe_thread_audio(
+                audio_bytes=b"\x00",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id="t1",
+            )
+        assert text == "hi"
+        led.record_events.assert_not_awaited()

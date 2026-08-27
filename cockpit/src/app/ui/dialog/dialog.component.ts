@@ -36,6 +36,7 @@ let dialogIdCounter = 0;
           [attr.aria-labelledby]="title() ? titleId : null"
           [attr.aria-label]="!title() ? ariaLabel() || null : null"
           [attr.data-size]="size()"
+          [attr.data-full-height]="fullHeight() ? 'true' : null"
           cdkTrapFocus
           [cdkTrapFocusAutoCapture]="true"
           (click)="$event.stopPropagation()"
@@ -51,13 +52,13 @@ let dialogIdCounter = 0;
                 <button
                   type="button"
                   class="app-dialog__close"
-                  aria-label="Close dialog"
+                  [attr.aria-label]="closeLabel() || 'Close dialog'"
                   (click)="requestClose('close-button')"
                 >×</button>
               }
             </header>
           }
-          <div class="app-dialog__body">
+          <div class="app-dialog__body" [attr.data-flush]="flushBody() ? 'true' : null">
             <ng-content></ng-content>
           </div>
           <footer class="app-dialog__actions">
@@ -78,6 +79,26 @@ export class AppDialogComponent {
   closeOnBackdrop = input<boolean>(true);
   closeOnEsc = input<boolean>(true);
   ariaLabel = input<string>('');
+  /**
+   * Give the container a definite height (capped by the viewport) instead of
+   * sizing to content. Needed by dialogs whose projected content is itself a
+   * `height: 100%` flex surface — without a definite height on the ancestor
+   * chain that resolves to `auto` and the surface collapses. Also widens
+   * `xl` for the review-class dialogs that need the room.
+   */
+  fullHeight = input<boolean>(false);
+  /** Drop the body's padding and make it a flex column, for projected content
+   *  that owns its own chrome (a full-bleed review surface, an editor). */
+  flushBody = input<boolean>(false);
+  /**
+   * Accessible name for the close button. An input rather than a translation
+   * inside this component: `AppDialogComponent` is used in dozens of places
+   * and none of them currently provide Transloco to their test beds, so
+   * injecting it here would break them all to fix one label. Callers that
+   * care pass a translated string; the untranslated default is what shipped
+   * before.
+   */
+  closeLabel = input<string>('');
 
   closed = output<DialogCloseReason>();
 

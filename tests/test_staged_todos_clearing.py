@@ -1,11 +1,13 @@
-"""Tests for staged todos clearing in job_complete and todo_rewind.
+"""Tests for staged todos clearing in job_complete and request_replan.
 
 Verifies that:
 - job_complete auto-clears staged todos instead of rejecting (deadlock fix)
-- todo_rewind clears staged todos when abandoning an approach
+- request_replan clears staged todos but keeps active ones
 """
 
 import pytest
+
+from tests._tool_invoke import invoke_tool
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -73,12 +75,13 @@ class TestJobCompleteClears:
         ctx = make_context(todo_mgr)
         job_complete = self._get_job_complete(ctx)
 
-        result = await job_complete.ainvoke(
+        result = await invoke_tool(
+            job_complete,
             {
                 "summary": "Job is done.",
                 "deliverables": ["output/result.md"],
                 "confidence": 0.9,
-            }
+            },
         )
 
         # Should NOT contain the old rejection error
@@ -97,12 +100,13 @@ class TestJobCompleteClears:
         ctx = make_context(todo_mgr)
         job_complete = self._get_job_complete(ctx)
 
-        result = await job_complete.ainvoke(
+        result = await invoke_tool(
+            job_complete,
             {
                 "summary": "Job is done.",
                 "deliverables": ["output/result.md"],
                 "confidence": 0.9,
-            }
+            },
         )
 
         assert "ERROR" not in result
@@ -110,25 +114,29 @@ class TestJobCompleteClears:
 
 
 # =============================================================================
-# Test: todo_rewind clears staged todos
+# Test: request_replan clears staged todos but keeps active ones
 # =============================================================================
 
 
-class TestTodoRewindClears:
-    """Verify todo_rewind clears staged todos when abandoning approach."""
+class TestRequestReplanClearsStaged:
+    """Verify request_replan drops the staged batch but preserves live work.
 
-    def _get_todo_rewind(self, context: ToolContext):
-        """Create and return the todo_rewind tool function."""
+    Staged todos are a bet on the plan being revised, so they go. Active todos
+    are the *record* of what this phase did and must survive — the incoming
+    strategic phase reads their real statuses to decide what to carry forward.
+    """
+
+    def _get_request_replan(self, context: ToolContext):
+        """Create and return the request_replan tool function."""
         from src.tools.core.todo import create_todo_tools
 
         tools = create_todo_tools(context)
-        return next(t for t in tools if t.name == "todo_rewind")
+        return next(t for t in tools if t.name == "request_replan")
 
     def test_clears_staged_todos(self):
-        """todo_rewind should clear staged todos and mention it."""
+        """request_replan should clear staged todos and mention it."""
         todo_mgr = TodoManager(workspace=MagicMock())
 
-        # Add active todos first (rewind archives these)
         todo_mgr.stage_tactical_todos(
             [f"Active todo {i} long enough" for i in range(5)],
         )
@@ -140,45 +148,45 @@ class TestTodoRewindClears:
         assert todo_mgr.has_staged_todos()
 
         ctx = make_context(todo_mgr)
-        todo_rewind = self._get_todo_rewind(ctx)
+        request_replan = self._get_request_replan(ctx)
 
-        result = todo_rewind.invoke(
-            {"issue": "Current approach is fundamentally broken"}
+        result = request_replan.invoke(
+            {"reason": "The API caps batches at 100, so the bulk todos are wrong"}
         )
 
         # Staged todos should be cleared
         assert not todo_mgr.has_staged_todos()
-        # Result should mention the clearing
-        assert "Cleared previously staged todos" in result
+        assert "staged todos were cleared" in result
+        # ...but the active todos must NOT be — they are the phase record.
+        assert len(todo_mgr.list_all()) == 5
 
     def test_no_staged_todos_no_message(self):
-        """todo_rewind without staged todos doesn't mention clearing."""
+        """request_replan without staged todos doesn't mention clearing."""
         todo_mgr = TodoManager(workspace=MagicMock())
 
-        # Add active todos only
         todo_mgr.stage_tactical_todos(
             [f"Active todo {i} long enough" for i in range(5)],
         )
         todo_mgr.apply_staged_todos()
 
         ctx = make_context(todo_mgr)
-        todo_rewind = self._get_todo_rewind(ctx)
+        request_replan = self._get_request_replan(ctx)
 
-        result = todo_rewind.invoke({"issue": "Need different approach"})
+        result = request_replan.invoke({"reason": "Need a different approach"})
 
-        assert "Cleared previously staged todos" not in result
+        assert "staged todos were cleared" not in result
         assert not todo_mgr.has_staged_todos()
 
-    def test_rewind_with_only_staged_no_active(self):
-        """todo_rewind with staged but no active todos still clears staged."""
+    def test_replan_with_only_staged_no_active(self):
+        """request_replan with staged but no active todos still clears staged."""
         todo_mgr = TodoManager(workspace=MagicMock())
         stage_some_todos(todo_mgr)
         # No active todos, only staged
 
         ctx = make_context(todo_mgr)
-        todo_rewind = self._get_todo_rewind(ctx)
+        request_replan = self._get_request_replan(ctx)
 
-        result = todo_rewind.invoke({"issue": "Changed my mind before executing"})
+        result = request_replan.invoke({"reason": "Changed my mind before executing"})
 
         assert not todo_mgr.has_staged_todos()
-        assert "Cleared previously staged todos" in result
+        assert "staged todos were cleared" in result

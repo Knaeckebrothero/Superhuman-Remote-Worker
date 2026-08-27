@@ -1,0 +1,186 @@
+{{- if .Values.canvas.livePreview.viewer.enabled }}
+{{- $viewer := .Values.canvas.livePreview.viewer -}}
+{{- $database := $viewer.database -}}
+{{- $credentials := $database.credentials -}}
+{{- $hasExistingSecret := ne (trim $credentials.existingSecret) "" -}}
+{{- $vaultPath := trim $credentials.vaultPath -}}
+{{- $hasVaultPath := ne $vaultPath "" -}}
+{{- $validCredentialSource := or
+      (and $credentials.create (not $hasExistingSecret) (not $hasVaultPath))
+      (and (not $credentials.create) $hasExistingSecret (not $hasVaultPath))
+      (and (not $credentials.create) (not $hasExistingSecret) $hasVaultPath) -}}
+{{- if not .Values.databases.postgres.enabled -}}
+{{- fail "canvas.livePreview.viewer.enabled requires databases.postgres.enabled=true" -}}
+{{- end -}}
+{{- if not $validCredentialSource -}}
+{{- fail "enabled Canvas viewer database credentials require exactly one of credentials.create=true, credentials.existingSecret, or credentials.vaultPath" -}}
+{{- end -}}
+{{- if and $hasVaultPath (not .Values.externalSecrets.enabled) -}}
+{{- fail "canvas.livePreview.viewer.database.credentials.vaultPath requires externalSecrets.enabled=true when the Canvas viewer is enabled" -}}
+{{- end -}}
+{{- if gt (int $database.pool.min) (int $database.pool.max) -}}
+{{- fail "canvas.livePreview.viewer.database.pool.min must not exceed pool.max" -}}
+{{- end -}}
+{{- if and $credentials.create (ne $database.username "srw_canvas_gateway") -}}
+{{- fail "chart-created Canvas database credentials require the fixed srw_canvas_gateway role" -}}
+{{- end -}}
+{{- if and $credentials.create (not $database.provisionRole) -}}
+{{- fail "chart-created Canvas database credentials require database.provisionRole=true" -}}
+{{- end -}}
+{{- if and $database.provisionRole (not .Values.databases.postgres.internal) -}}
+{{- fail "Canvas database role provisioning is supported only for chart-owned internal Postgres" -}}
+{{- end -}}
+{{- if and (eq $viewer.deploymentProfile "production") (or $credentials.create $database.provisionRole) -}}
+{{- fail "production Canvas viewers require operator-provisioned credentials through database.credentials.existingSecret or database.credentials.vaultPath" -}}
+{{- end -}}
+{{- if and (eq $viewer.deploymentProfile "production") (eq $credentials.existingSecret (include "srw.secretName" .)) -}}
+{{- fail "production Canvas viewer database credentials must use a dedicated Secret, not the shared application Secret" -}}
+{{- end -}}
+{{- $databaseSecretName := include "srw.canvasGatewayDatabaseSecretName" . -}}
+{{- if not .Values.canvas.livePreview.enabled -}}
+{{- fail "canvas.livePreview.viewer.enabled requires canvas.livePreview.enabled=true" -}}
+{{- end -}}
+{{- if not (hasSuffix (printf ".%s" $viewer.domain) $viewer.hostSuffix) -}}
+{{- fail "canvas.livePreview.viewer.hostSuffix must be at or below canvas.livePreview.viewer.domain" -}}
+{{- end -}}
+{{- if and (eq $viewer.deploymentProfile "production") (ne $viewer.hostSuffix (printf ".%s" $viewer.domain)) -}}
+{{- fail "production canvas.livePreview.viewer.hostSuffix must exactly equal the dotted canvas.livePreview.viewer.domain effective-PSL boundary" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-canvas-gateway
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
+spec:
+  replicas: {{ $viewer.replicas }}
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
+      initContainers:
+        - name: wait-for-canvas-database
+          image: {{ .Values.databases.postgres.image }}
+          command:
+            - sh
+            - -ec
+            - |
+              for attempt in $(seq 1 60); do
+                if PGPASSWORD="$CANVAS_VIEWER_POSTGRES_PASSWORD" psql \
+                    --no-psqlrc --host "$CANVAS_VIEWER_POSTGRES_HOST" \
+                    --port "$CANVAS_VIEWER_POSTGRES_PORT" \
+                    --username "$CANVAS_VIEWER_POSTGRES_USER" \
+                    --dbname "$CANVAS_VIEWER_POSTGRES_DB" --quiet --tuples-only \
+                    --no-align --command \
+                    "SELECT to_regclass('public.canvas_origin_sessions') IS NOT NULL" \
+                    2>/dev/null | grep -qx t; then
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "Canvas gateway database role or schema is unavailable" >&2
+              exit 1
+          envFrom:
+            - configMapRef:
+                name: {{ include "srw.fullname" . }}-canvas-gateway-config
+          env:
+            # Username arrives via the allowlisted ConfigMap (envFrom above);
+            # only the password is secret material.
+            - name: CANVAS_VIEWER_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $databaseSecretName }}
+                  key: {{ $credentials.passwordKey }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      {{- end }}
+      containers:
+        - name: canvas-gateway
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
+          imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
+          command:
+            - uvicorn
+            - canvas_gateway:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8086"
+            - --http
+            - h11
+            # Bootstrap URLs contain only a random attachment locator. The
+            # gateway still owns redacted control-path logging; Uvicorn access
+            # logging stays off so handshake metadata is not duplicated.
+            - --no-access-log
+          ports:
+            - name: http
+              containerPort: 8086
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "srw.fullname" . }}-canvas-gateway-config
+          env:
+            - name: PORT
+              value: "8086"
+            - name: CANVAS_VIEWER_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $databaseSecretName }}
+                  key: {{ $credentials.passwordKey }}
+            - name: SSH_KEY_PATH
+              value: /run/secrets/vm-ssh-key
+          volumeMounts:
+            - name: vm-ssh-key
+              mountPath: /run/secrets/vm-ssh-key
+              subPath: ssh-privatekey
+              readOnly: true
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml $viewer.resources | nindent 12 }}
+      volumes:
+        - name: vm-ssh-key
+          secret:
+            secretName: {{ include "srw.vmSshKeySecretName" . }}
+            # Matches the orchestrator mount: the production image runs as the
+            # non-root `srw` user while the projected key is root-owned.
+            defaultMode: 0444
+{{- end }}

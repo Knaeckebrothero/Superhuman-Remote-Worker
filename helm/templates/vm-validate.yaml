@@ -1,0 +1,52 @@
+{{/* Render-time validation for the explicit VM topology. Included once by license-gate.yaml. */}}
+{{- define "srw.vmValidate" -}}
+{{- $reasons := list -}}
+{{- $rawMode := .Values.vm.mode | default "off" -}}
+{{- $mode := include "srw.vmMode" . -}}
+{{- $legacyAlias := and .Values.vmController.enabled (eq $rawMode "off") -}}
+{{- if and .Values.vmController.enabled (eq $rawMode "external") -}}
+{{- $reasons = append $reasons "vm-mode-alias-conflict: vmController.enabled=true contradicts vm.mode=external" -}}
+{{- end -}}
+{{- if and (eq $mode "off") (or (not (empty .Values.orchestratorId)) (not (empty .Values.headscale.url)) .Values.agent.tailscale.enabled) -}}
+{{- $reasons = append $reasons "vm-mode-off-with-external-knobs: set vm.mode=external or clear orchestratorId/headscale.url/agent.tailscale.enabled" -}}
+{{- end -}}
+{{- if and (eq $mode "same-cluster") (ne (.Values.vmController.transport | default "http") "http") -}}
+{{- $reasons = append $reasons "vm-transport-alias-conflict: same-cluster mode requires vmController.transport=http" -}}
+{{- end -}}
+{{- if eq $mode "same-cluster" -}}
+  {{- if and (not $legacyAlias) (empty (include "srw.vmLifecycleAuthSecretName" .)) -}}
+  {{- $reasons = append $reasons "vm-lifecycle-secret-required: same-cluster mode requires vm.lifecycleAuthSecretName" -}}
+  {{- end -}}
+  {{- if and (not $legacyAlias) (not (empty .Values.vmController.namespace)) -}}
+  {{- $reasons = append $reasons "vm-release-namespace-required: vmController.namespace must be empty in same-cluster mode" -}}
+  {{- end -}}
+  {{- if .Values.agent.tailscale.enabled -}}
+  {{- $reasons = append $reasons "vm-tailscale-conflict: agent.tailscale.enabled must be false in same-cluster mode" -}}
+  {{- end -}}
+  {{- $headscaleSecret := dig "headscale" "apiKeySecretName" "" .Values.vmController -}}
+  {{- if $headscaleSecret -}}
+  {{- $reasons = append $reasons "vm-headscale-conflict: vmController.headscale.apiKeySecretName must be empty in same-cluster mode" -}}
+  {{- end -}}
+  {{- if and (.Values.infrastructureMetering.pvcInventoryEnabled | default false) (.Values.infrastructureMetering.vmPvcInventoryEnabled | default false) -}}
+  {{- $reasons = append $reasons "vm-metering-pvc-double-inventory: infrastructureMetering.pvcInventoryEnabled and vmPvcInventoryEnabled cannot both be true in same-cluster mode" -}}
+  {{- end -}}
+  {{- if .Values.vm.preflight.renderTime -}}
+    {{- if not (.Capabilities.APIVersions.Has "kubevirt.io/v1") -}}
+    {{- $reasons = append $reasons "vm-kubevirt-crd-missing: kubevirt.io/v1 is unavailable" -}}
+    {{- end -}}
+    {{- if not (.Capabilities.APIVersions.Has "cdi.kubevirt.io/v1beta1") -}}
+    {{- $reasons = append $reasons "vm-cdi-crd-missing: cdi.kubevirt.io/v1beta1 is unavailable" -}}
+    {{- end -}}
+  {{- end -}}
+{{- else if eq $mode "external" -}}
+  {{- if and (not .Values.nats.internal) (empty .Values.nats.url) -}}
+  {{- $reasons = append $reasons "vm-external-nats-required: external mode requires nats.internal=true or nats.url" -}}
+  {{- end -}}
+  {{- if empty .Values.orchestratorId -}}
+  {{- $reasons = append $reasons "vm-external-orchestrator-id-required: external mode requires orchestratorId" -}}
+  {{- end -}}
+{{- end -}}
+{{- if gt (len $reasons) 0 -}}
+{{- fail (printf "VM configuration validation failed:\n- %s" (join "\n- " $reasons)) -}}
+{{- end -}}
+{{- end -}}

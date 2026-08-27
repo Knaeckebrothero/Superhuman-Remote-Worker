@@ -22,7 +22,7 @@ import pytest
 
 
 def _build_generic_note(name: str, desc: str, ds: dict) -> str:
-    lines = [f"## Datasource: {name}"]
+    lines = [f"## Connector: {name}"]
     if desc:
         lines.append(desc)
     url = ds.get("connection_url")
@@ -96,7 +96,7 @@ def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
     }
     info = cli_info.get(ds_type, {})
     lines = [
-        f"## Datasource: {name}",
+        f"## Connector: {name}",
         f"**Type:** {ds_type} | **Access:** full (CLI)",
     ]
     if desc:
@@ -133,9 +133,9 @@ def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
             "- `mongo_schema` — collections, fields, indexes",
         ],
     }
-    tools = tool_info.get(ds_type, ["- Check available tools for this datasource type"])
+    tools = tool_info.get(ds_type, ["- Check available tools for this connector type"])
     lines = [
-        f"## Datasource: {name}",
+        f"## Connector: {name}",
         f"**Type:** {ds_type} | **Access:** read-only (tools)",
     ]
     if desc:
@@ -149,7 +149,7 @@ def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
 def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
     access = "read-only" if is_read_only else "read-write"
     lines = [
-        f"## Datasource: {name}",
+        f"## Connector: {name}",
         f"**Type:** webdav | **Access:** {access}",
     ]
     if desc:
@@ -181,7 +181,7 @@ def _build_datasource_note_content(ds: dict) -> str:
         else:
             return _build_managed_readwrite_note(ds_name, desc, ds_type)
     else:
-        return f"## Datasource: {ds_name}\n{desc}"
+        return f"## Connector: {ds_name}\n{desc}"
 
 
 def _build_datasources_payload(resolved_ds):
@@ -235,7 +235,7 @@ class TestGenericNote:
             },
         }
         content = _build_generic_note("Production DB", ds["description"], ds)
-        assert "## Datasource: Production DB" in content
+        assert "## Connector: Production DB" in content
         assert "Analytics database with user events" in content
         assert "postgresql://host:5432/analytics" in content
         assert "`psql $DATABASE_URL`" in content
@@ -258,13 +258,13 @@ class TestGenericNote:
             "credentials": {"env_vars": {"TOKEN": "abc"}},
         }
         content = _build_generic_note("Minimal", "", ds)
-        assert "## Datasource: Minimal" in content
+        assert "## Connector: Minimal" in content
         assert "`TOKEN`" in content
 
     def test_empty_env_vars(self):
         ds = {"name": "Empty", "credentials": {}}
         content = _build_generic_note("Empty", "Some desc", ds)
-        assert "## Datasource: Empty" in content
+        assert "## Connector: Empty" in content
         assert "Some desc" in content
         assert "Environment Variables" not in content
 
@@ -371,7 +371,7 @@ class TestBuildDatasourceNoteContent:
 
     def test_dispatches_generic(self):
         ds = {"type": "generic", "name": "Test", "credentials": {}}
-        assert "## Datasource: Test" in _build_datasource_note_content(ds)
+        assert "## Connector: Test" in _build_datasource_note_content(ds)
 
     def test_dispatches_repository(self):
         ds = {"type": "repository", "name": "Repo"}
@@ -676,7 +676,8 @@ class TestDatasourceIndex:
         agent._inject_datasource_index(configs)
         written = ws.write_file.call_args[0][1]
 
-        assert "## Available Datasources" in written
+        assert "## Available Connectors" in written
+        assert "Available Datasources" not in written
         assert "**API Gateway** (generic)" in written
         assert "**Frontend App** (repository)" in written
         assert "./repos/frontend-app/" in written
@@ -785,6 +786,53 @@ class TestRenderInstructionContentCLI:
         template = "{% if cli_datasources %}HAS_CLI{% endif %}"
         result = render_instruction_content(template, [])
         assert "HAS_CLI" not in result
+
+
+class TestRenderInstructionContentProtectedCloud:
+    """Tests for the F-C1 protected-cloud honesty block (Task 15)."""
+
+    PROTECTED_BLOCK_TEMPLATE = (
+        "Workspace:\n"
+        "- Your workspace is your persistent working area.\n"
+        "{% if protected_cloud %}\n"
+        "Protected cloud mode:\n"
+        "- The cloud folder (workspace/cloud) is in PROTECTED mode: everything "
+        "you write there is STAGED for the user's review — nothing is saved to "
+        "the cloud or visible to anyone else until the user applies it in the "
+        "review panel.\n"
+        '- Never say a cloud file is "saved", "uploaded", or "shared". Say it '
+        'is "staged for your review".\n'
+        "- When a piece of work is ready, tell the user so they can open the "
+        'review panel ("Cloud changes" in the session header) and apply it.\n'
+        "{% endif %}\n"
+        "Conversation style:\n"
+    )
+
+    def test_protected_block_rendered_when_flag_true(self):
+        from src.core.loader import render_instruction_content
+
+        result = render_instruction_content(
+            self.PROTECTED_BLOCK_TEMPLATE, [], protected_cloud=True
+        )
+        assert "staged for your review" in result
+        assert "{%" not in result
+        assert "{}" not in result
+
+    def test_protected_block_absent_when_flag_false(self):
+        from src.core.loader import render_instruction_content
+
+        result = render_instruction_content(
+            self.PROTECTED_BLOCK_TEMPLATE, [], protected_cloud=False
+        )
+        assert "staged for your review" not in result
+        assert "{%" not in result
+
+    def test_protected_block_absent_by_default(self):
+        from src.core.loader import render_instruction_content
+
+        result = render_instruction_content(self.PROTECTED_BLOCK_TEMPLATE, [])
+        assert "staged for your review" not in result
+        assert "{%" not in result
 
 
 # =============================================================================

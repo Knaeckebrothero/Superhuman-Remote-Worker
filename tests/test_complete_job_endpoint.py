@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import pytest
 
 # Add project root to path
@@ -40,6 +41,7 @@ def make_job(
     autonomy: str = "review",
     config_name: str = "defaults",
     context: dict | None = None,
+    config_override: dict | None = None,
 ) -> dict:
     """Create a minimal job dict for testing."""
     resolved_config = {
@@ -66,6 +68,7 @@ def make_job(
         "context": context or {},
         "project_id": None,
         "freeze_data": freeze_data,
+        "config_override": config_override,
     }
     return job
 
@@ -175,6 +178,63 @@ class TestCompleteJobStatusDetermination:
         assert status2 == "completed"  # This one gets completed_at
 
 
+class TestMemoryUnavailableStatus:
+    """memory/KB-unavailable freeze → bounded pause-then-fail.
+
+    knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md
+    """
+
+    def _result(self, freeze_type="memory_unavailable"):
+        return {
+            "should_stop": True,
+            "freeze_data": {
+                "freeze_type": freeze_type,
+                "reason": "Embedding service unavailable at startup.",
+            },
+        }
+
+    def test_first_attempt_pauses(self):
+        job = make_job(verification_enabled=False, context={})
+        status, err = determine_job_status(job, self._result())
+        assert status == "paused"
+        assert err is None
+
+    def test_under_cap_pauses(self):
+        job = make_job(verification_enabled=False, context={"memory_retry_count": 1})
+        status, _ = determine_job_status(job, self._result())
+        assert status == "paused"
+
+    def test_at_cap_fails_with_reason(self):
+        job = make_job(verification_enabled=False, context={"memory_retry_count": 2})
+        status, err = determine_job_status(job, self._result())
+        assert status == "failed"
+        assert err is not None
+        assert "embedding" in err.lower()
+
+    def test_kb_unavailable_pauses_then_fails(self):
+        result = self._result(freeze_type="kb_unavailable")
+        assert (
+            determine_job_status(
+                make_job(verification_enabled=False, context={}), result
+            )[0]
+            == "paused"
+        )
+        assert (
+            determine_job_status(
+                make_job(verification_enabled=False, context={"memory_retry_count": 2}),
+                result,
+            )[0]
+            == "failed"
+        )
+
+    def test_context_as_json_string(self):
+        # The job row's context can arrive as a JSON string, not a dict.
+        job = make_job(verification_enabled=False)
+        job["context"] = '{"memory_retry_count": 2}'
+        status, _ = determine_job_status(job, self._result())
+        assert status == "failed"
+
+
 class TestCompleteJobCriticStatus:
     """Test status determination for critic (sub) jobs."""
 
@@ -237,63 +297,460 @@ class TestCompleteJobCriticStatus:
 
 
 class TestVerificationTriggerGuards:
-    """Test the 5 guard conditions in _trigger_verification_on_complete.
+    """Test the guard conditions in ``_trigger_verification_on_complete``.
 
-    These are tested as pure logic (no async DB calls needed) since
-    the guards are checked before any DB operations.
+    This class previously asserted the guard *predicates* directly (e.g.
+    ``assert result.get("error") is not None``) without ever calling the
+    guarded function — it would have kept passing even if every guard were
+    deleted from ``_trigger_verification_on_complete``. Every case below
+    instead invokes the REAL function (mocked ``postgres_db`` only) and
+    asserts no critic was created: ``create_job`` is never awaited and
+    ``actions`` stays empty.
+
+    Each job/result starts from ``_passing_job``/``_passing_result`` — a
+    baseline that clears every guard — with only the ONE condition under
+    test broken, so a case only goes green because of the guard it names, not
+    because some other guard also happened to fire.
+    ``test_critic_created_when_all_guards_pass`` is the positive control that
+    proves the untouched baseline really does reach ``create_job``; without
+    it, an implementation that always returns early (e.g. every guard
+    accidentally inverted at once) would pass every case above for the wrong
+    reason.
     """
 
-    def test_guard_error_skips(self):
-        """Guard 1: Jobs with errors should not trigger verification."""
-        result = {"error": {"message": "failed"}, "should_stop": True}
-        # Error guard: result.get("error") → return
-        assert result.get("error") is not None
-
-    def test_guard_not_stopped_skips(self):
-        """Guard 2: Jobs that haven't stopped should not trigger verification."""
-        result = {"should_stop": False}
-        assert not result.get("should_stop", False)
-
-    def test_guard_subjob_skips(self):
-        """Guard 3: Sub-jobs should not trigger verification."""
-        job = make_job(parent_job_id="parent-123", verification_enabled=True)
-        assert job.get("parent_job_id") is not None
-
-    def test_guard_verification_disabled_skips(self):
-        """Guard 4: Verification disabled should not trigger verification."""
-        job = make_job(verification_enabled=False)
-        assert not is_verification_enabled(job)
-
-    def test_guard_phase_boundary_skips(self):
-        """Guard 5: Phase boundary freezes should not trigger verification."""
-        job = make_job(
+    @staticmethod
+    def _passing_job(**overrides) -> dict:
+        base: dict = dict(
             verification_enabled=True,
-            freeze_data={"freeze_type": "phase_boundary"},
+            status="reviewing",
+            freeze_data={
+                "freeze_type": "job_complete",
+                "summary": "done",
+                "deliverables": [],
+                "confidence": 0.9,
+            },
         )
-        # is_job_completion_freeze returns False for phase boundaries
-        assert not is_job_completion_freeze(job)
-        # And status is not "reviewing"
-        assert job.get("status") != "reviewing"
+        base.update(overrides)
+        return make_job(**base)
 
-    def test_all_guards_pass_for_valid_completion(self):
-        """All guards should pass for a valid job completion with verification."""
-        job = make_job(
-            verification_enabled=True,
-            freeze_data={"freeze_type": "job_complete", "summary": "done"},
-            status="reviewing",  # Set by determine_job_status
+    @staticmethod
+    def _passing_result(**overrides) -> dict:
+        base = {"should_stop": True, "goal_achieved": True}
+        base.update(overrides)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_result_has_error(self, monkeypatch):
+        """Guard 1: an errored result must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job()
+        result = self._passing_result(error={"message": "failed"})
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_not_stopped(self, monkeypatch):
+        """Guard 2: a job that hasn't stopped must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job()
+        result = self._passing_result(should_stop=False)
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_subjob(self, monkeypatch):
+        """Guard 3: sub-jobs (parent_job_id set) must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job(parent_job_id="parent-123")
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_lite_backend(self, monkeypatch):
+        """Guard 4: a lite (virtual/none) workspace backend has no git
+        workspace for the critic handoff, so it must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job(config_override={"workspace": {"backend": "virtual"}})
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_verification_disabled(self, monkeypatch):
+        """Guard 5: verification disabled must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job(verification_enabled=False)
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_not_job_completion_freeze(self, monkeypatch):
+        """Guard 6: a phase-boundary freeze (not a genuine job completion,
+        and status isn't 'reviewing' either) must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job(
+            status="processing",
+            freeze_data={"freeze_type": "phase_boundary", "phase_number": 3},
         )
-        result = {"should_stop": True, "goal_achieved": True}
+        result = self._passing_result()
+        actions: list[str] = []
 
-        # Guard 1: no error
-        assert not result.get("error")
-        # Guard 2: stopped
-        assert result.get("should_stop", False)
-        # Guard 3: not a sub-job
-        assert job.get("parent_job_id") is None
-        # Guard 4: verification enabled
-        assert is_verification_enabled(job)
-        # Guard 5: is a job completion
-        assert is_job_completion_freeze(job) or job.get("status") == "reviewing"
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_critic_created_when_all_guards_pass(self, monkeypatch):
+        """Positive control: the SAME baseline used above, left untouched,
+        really does reach ``create_job``."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock(return_value={"id": "critic-999"})
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
+        monkeypatch.setattr(main, "_trigger_dispatch", lambda: None)
+        # No critic already in flight. Stubbed rather than left real because
+        # the baseline job id is not a UUID and the guard fails CLOSED on one.
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+
+        job = self._passing_job()
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_awaited_once()
+        assert any("critic job" in a and "created" in a for a in actions)
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_one_is_already_in_flight(self, monkeypatch):
+        """Guard 7: the same baseline, with a live critic already spawned for
+        this target — a retried /complete must not double it."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock(return_value={"id": "critic-999"})
+        round_lookup_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_verification_critic_for_round",
+            round_lookup_mock,
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=True),
+        )
+
+        job = self._passing_job()
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        round_lookup_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_durable_replay_finishes_existing_critic_handoff(self, monkeypatch):
+        """A post-INSERT replay reuses the indexed critic and finishes S30."""
+        from orchestrator import main
+
+        critic_id = "11111111-2222-3333-4444-555555555555"
+        create_job_mock = AsyncMock()
+        # The indexed critic row carries its OWN context — including the
+        # inherits_parent_workspace flag stamped at spawn when it copied the
+        # parent's workspace snapshot. That flag, not the parent's context, is
+        # what the handoff reads to decide the worktree path.
+        round_lookup_mock = AsyncMock(
+            return_value={
+                "id": critic_id,
+                "config_name": "critic",
+                "context": {
+                    "workspace_container": {"status": "ready"},
+                    "inherits_parent_workspace": True,
+                },
+            }
+        )
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_verification_critic_for_round",
+            round_lookup_mock,
+        )
+        bind_repo = AsyncMock(return_value=True)
+        monkeypatch.setattr(main.postgres_db, "bind_job_managed_repository", bind_repo)
+        # The handoff branches from the parent's PROVEN authority, not from a
+        # repo name guessed off the job id, so the resolver is the collaborator
+        # under stub here.
+        authority = AsyncMock(
+            return_value={
+                "repo_name": "job-aaaaaaaa",
+                "clean_repo_url": "http://gitea/job-aaaaaaaa.git",
+            }
+        )
+        monkeypatch.setattr(main, "prepare_job_primary_repository_authority", authority)
+
+        conn = AsyncMock()
+        conn.execute.return_value = "UPDATE 1"
+        acquired = MagicMock()
+        acquired.__aenter__ = AsyncMock(return_value=conn)
+        acquired.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            main.postgres_db, "acquire", MagicMock(return_value=acquired)
+        )
+
+        gitea = MagicMock()
+        gitea.is_initialized = True
+        gitea.create_branch = AsyncMock(return_value=True)
+        monkeypatch.setattr(main, "gitea_client", gitea)
+        trigger_dispatch = MagicMock()
+        monkeypatch.setattr(main, "_trigger_dispatch", trigger_dispatch)
+
+        job = self._passing_job(
+            context={
+                "git_remote_url": "http://gitea/job-aaaaaaaa.git",
+                "workspace_container": {"status": "ready"},
+            }
+        )
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(
+            job,
+            self._passing_result(),
+            actions,
+            reconcile_existing_critic=True,
+        )
+
+        create_job_mock.assert_not_awaited()
+        round_lookup_mock.assert_awaited_once_with(job["id"], 0)
+        gitea.create_branch.assert_awaited_once_with(
+            "job-aaaaaaaa",
+            "subjob/11111111/critic",
+            from_branch="main",
+        )
+        bind_repo.assert_awaited_once_with(
+            critic_id,
+            repo_name="job-aaaaaaaa",
+            clean_url="http://gitea/job-aaaaaaaa.git",
+        )
+        update_args = conn.execute.await_args.args
+        assert update_args[1:] == (
+            "subjob/11111111/critic",
+            "/home/agent-host/workspace/worktrees/11111111-critic",
+            critic_id,
+        )
+        trigger_dispatch.assert_called_once_with()
+        assert actions == [f"critic job {critic_id} reconciled"]
+
+    @pytest.mark.asyncio
+    async def test_replay_leaves_worktree_null_for_a_non_inheriting_critic(
+        self, monkeypatch
+    ):
+        """A critic that did NOT copy the parent workspace gets no worktree.
+
+        The parent still carries a workspace_container here — presence of that
+        key on the PARENT is exactly the ambiguous signal this handoff must not
+        gate on. A stateless-lane critic provisions its own workspace, so a
+        parent-derived worktree path would point at a directory that never
+        exists on its host.
+        """
+        from orchestrator import main
+
+        critic_id = "11111111-2222-3333-4444-555555555555"
+        monkeypatch.setattr(main.postgres_db, "create_job", AsyncMock())
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_verification_critic_for_round",
+            AsyncMock(
+                return_value={
+                    "id": critic_id,
+                    "config_name": "critic",
+                    "context": {"verification_target": "aaaaaaaa"},
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "bind_job_managed_repository",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            main,
+            "prepare_job_primary_repository_authority",
+            AsyncMock(
+                return_value={
+                    "repo_name": "job-aaaaaaaa",
+                    "clean_repo_url": "http://gitea/job-aaaaaaaa.git",
+                }
+            ),
+        )
+
+        conn = AsyncMock()
+        conn.execute.return_value = "UPDATE 1"
+        acquired = MagicMock()
+        acquired.__aenter__ = AsyncMock(return_value=conn)
+        acquired.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            main.postgres_db, "acquire", MagicMock(return_value=acquired)
+        )
+
+        gitea = MagicMock()
+        gitea.is_initialized = True
+        gitea.create_branch = AsyncMock(return_value=True)
+        monkeypatch.setattr(main, "gitea_client", gitea)
+        monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+
+        job = self._passing_job(
+            context={
+                "git_remote_url": "http://gitea/job-aaaaaaaa.git",
+                "workspace_container": {"status": "ready"},
+            }
+        )
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(
+            job,
+            self._passing_result(),
+            actions,
+            reconcile_existing_critic=True,
+        )
+
+        update_args = conn.execute.await_args.args
+        assert update_args[1:] == (
+            "subjob/11111111/critic",
+            None,
+            critic_id,
+        )
+        assert actions == [f"critic job {critic_id} reconciled"]
+
+    @pytest.mark.asyncio
+    async def test_index_loser_skips_critic_side_effects(self, monkeypatch):
+        """The unique index, not the optimistic live-critic read, owns races."""
+        from orchestrator import main
+
+        violation = asyncpg.UniqueViolationError("duplicate critic round")
+        violation.constraint_name = "jobs_verification_uniq"
+        create_job_mock = AsyncMock(side_effect=violation)
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+        trigger_dispatch = MagicMock()
+        monkeypatch.setattr(main, "_trigger_dispatch", trigger_dispatch)
+
+        job = self._passing_job()
+        actions: list[str] = []
+        await main._trigger_verification_on_complete(
+            job, self._passing_result(), actions
+        )
+
+        create_job_mock.assert_awaited_once()
+        trigger_dispatch.assert_not_called()
+        assert actions == [
+            f"critic round 0 already exists for {job['id']} — spawn skipped"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unrelated_unique_violation_still_raises(self, monkeypatch):
+        """Only the exact critic-index loser is a successful dedupe."""
+        from orchestrator import main
+
+        violation = asyncpg.UniqueViolationError("other duplicate")
+        violation.constraint_name = "some_other_unique_index"
+        monkeypatch.setattr(
+            main.postgres_db,
+            "create_job",
+            AsyncMock(side_effect=violation),
+        )
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+
+        with pytest.raises(asyncpg.UniqueViolationError) as exc_info:
+            await main._trigger_verification_on_complete(
+                self._passing_job(), self._passing_result(), []
+            )
+        assert exc_info.value.constraint_name == "some_other_unique_index"
 
 
 class TestVerificationTriggerIntegration:
@@ -498,6 +955,83 @@ class TestOrchestratorClientReportCompletion:
         assert payload["should_stop"] is True
         assert payload["goal_achieved"] is True
         assert payload["freeze_data"]["freeze_type"] == "job_complete"
+        assert "lease_token" not in payload
+        assert "agent_id" not in payload
+        assert "client_report_id" not in payload
+        assert call_kwargs["timeout"] == 60.0
+
+    @pytest.mark.asyncio
+    async def test_stateless_completion_sends_token_with_wide_timeout(self, client):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"new_status": "completed", "actions": []}
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            await client.report_completion(
+                "job-123", {"should_stop": True}, lease_token=17
+            )
+
+        call_kwargs = mock_http.post.call_args.kwargs
+        assert call_kwargs["json"]["lease_token"] == 17
+        assert call_kwargs["timeout"] == 300.0
+
+    @pytest.mark.asyncio
+    async def test_sends_optional_pinned_fence_and_report_identity(self, client):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"new_status": "completed", "actions": []}
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            await client.report_completion(
+                "job-123",
+                {"should_stop": True},
+                agent_id="22222222-2222-4222-8222-222222222222",
+                client_report_id="11111111-1111-4111-8111-111111111111",
+            )
+
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert payload["agent_id"] == "22222222-2222-4222-8222-222222222222"
+        assert payload["client_report_id"] == ("11111111-1111-4111-8111-111111111111")
+        assert "lease_token" not in payload
+
+    @pytest.mark.asyncio
+    async def test_retry_uses_checkpointed_four_field_payload_verbatim(self, client):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"new_status": "completed", "actions": []}
+        checkpointed = {
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": None,
+            "freeze_data": {
+                "freeze_type": "job_complete",
+                "generated_at": "2026-08-12T22:00:00Z",
+            },
+        }
+        result = {
+            "client_report_id": "11111111-1111-4111-8111-111111111111",
+            "completion_report_payload": checkpointed,
+            # These live values deliberately disagree with the durable stop.
+            "should_stop": False,
+            "goal_achieved": False,
+            "error": {"message": "later mutation"},
+            "freeze_data": None,
+        }
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            await client.report_completion("job-123", result, lease_token=17)
+
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert {
+            key: value
+            for key, value in payload.items()
+            if key not in {"lease_token", "client_report_id"}
+        } == checkpointed
+        assert payload["client_report_id"] == result["client_report_id"]
+        assert payload["lease_token"] == 17
 
     @pytest.mark.asyncio
     async def test_sends_error(self, client):
@@ -529,3 +1063,126 @@ class TestOrchestratorClientReportCompletion:
             success = await client.report_completion("job-123", {"should_stop": True})
 
         assert success is True
+
+    @pytest.mark.asyncio
+    async def test_returns_true_on_async_accept(self, client):
+        """HTTP 202 is a successful durable accept for stateless finalization."""
+        mock_response = MagicMock()
+        mock_response.status_code = 202
+        mock_response.json.side_effect = ValueError("empty response body")
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            success = await client.report_completion(
+                "job-123", {"should_stop": True}, lease_token=17
+            )
+
+        assert success is True
+
+    @pytest.mark.asyncio
+    async def test_machine_coded_nonterminal_422_is_definitive(self, client):
+        from src.api.orchestrator_client import CompletionNonTerminalReportError
+
+        mock_response = MagicMock()
+        mock_response.status_code = 422
+        mock_response.json.return_value = {
+            "detail": {
+                "code": "completion_non_terminal_report",
+                "message": "stateless completion requires should_stop=true",
+            }
+        }
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            with pytest.raises(CompletionNonTerminalReportError) as caught:
+                await client.report_completion(
+                    "job-123", {"should_stop": True}, lease_token=17
+                )
+
+        assert caught.value.code == "completion_non_terminal_report"
+        assert caught.value.message == (
+            "stateless completion requires should_stop=true"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "client_report_id was reused",
+            {"code": "different_422", "message": "not this contract"},
+            {"message": "missing machine code"},
+        ],
+    )
+    async def test_other_422_remains_ambiguous_false(self, client, detail):
+        mock_response = MagicMock()
+        mock_response.status_code = 422
+        mock_response.json.return_value = {"detail": detail}
+        mock_response.text = "unprocessable"
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            success = await client.report_completion(
+                "job-123", {"should_stop": True}, lease_token=17
+            )
+
+        assert success is False
+
+
+# =============================================================================
+# Structured cooldown fail-fast error (knowledge-base/knowledge/issues/loop_advances_into_active_model_cooldown.md)
+# =============================================================================
+
+
+class TestStructuredCooldownFailfast:
+    """The fail-fast error dict gained classification/model/reset_at — the
+    completion path must neither divert on the extra keys nor lose the text."""
+
+    def test_cooldown_failfast_dict_fails_with_message_text(self):
+        job = make_job()
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {
+                "message": "cooldown msg",
+                "type": "llm_error",
+                "recoverable": False,
+                "classification": "cooldown",
+                "model": "gpt-5.3-codex-spark",
+                "reset_at": 1785412444.0,
+            },
+        }
+        new_status, error_message = determine_job_status(job, result)
+        assert new_status == "failed"
+        assert error_message == "cooldown msg"
+
+    @pytest.mark.asyncio
+    async def test_update_job_status_writes_error_details(self):
+        from contextlib import asynccontextmanager
+
+        from orchestrator.database.postgres import PostgresDB
+
+        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+            db = PostgresDB()
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        @asynccontextmanager
+        async def fake_acquire():
+            yield conn
+
+        db.acquire = fake_acquire
+
+        updated = await db.update_job_status(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            status="failed",
+            error_message="cooldown msg",
+            error_details={"classification": "cooldown", "reset_at": 1785412444.0},
+        )
+        assert updated is True
+        query = conn.execute.await_args.args[0]
+        params = conn.execute.await_args.args[1:]
+        assert "error_details = $" in query
+        assert "::jsonb" in query
+        assert any(
+            isinstance(p, str) and '"classification": "cooldown"' in p for p in params
+        )

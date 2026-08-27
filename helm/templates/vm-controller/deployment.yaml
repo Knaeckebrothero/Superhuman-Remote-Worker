@@ -1,4 +1,4 @@
-{{- if .Values.vmController.enabled }}
+{{- if include "srw.vmSameCluster" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,6 +8,9 @@ metadata:
     {{- include "srw.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
 spec:
   replicas: 1
+  # Lifecycle create/delete locking is process-local; avoid rollout overlap.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 6 }}
@@ -27,25 +30,13 @@ spec:
           imagePullPolicy: {{ .Values.vmController.image.pullPolicy }}
           env:
             - name: TRANSPORT
-              value: {{ .Values.vmController.transport | quote }}
+              value: "http"
             - name: LISTEN_PORT
               value: {{ .Values.vmController.service.port | quote }}
-            {{- if eq .Values.vmController.transport "nats" }}
-            - name: NATS_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: NATS_URL
-            {{- else if eq .Values.vmController.transport "both" }}
-            - name: NATS_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: NATS_URL
-                  optional: true
-            {{- end }}
             - name: VM_TEMPLATE_PATH
               value: "/config/vm-template.yaml"
+            - name: VM_CLOUD_INIT_PATH
+              value: "/config/cloud-init.yaml"
             - name: VM_NAMESPACE
               value: {{ include "srw.vmControllerNamespace" . | quote }}
             - name: DEFAULT_VM_IMAGE
@@ -58,41 +49,59 @@ spec:
               value: {{ .Values.vmController.vmStorageClass | quote }}
             - name: VM_DISK_SIZE
               value: {{ .Values.vmController.vmDiskSize | quote }}
-            - name: HEADSCALE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: HEADSCALE_URL
-                  optional: true
-            {{- if .Values.vmController.headscale.apiKeySecretName }}
-            - name: HEADSCALE_API_KEY
+            - name: ORCHESTRATOR_URL
+              value: {{ include "srw.orchestratorClusterUrl" . | quote }}
+            - name: VM_DEFAULT_NETWORK_TIER
+              value: {{ .Values.vmController.defaultNetworkTier | quote }}
+            - name: VM_MAX_CONCURRENT
+              value: {{ .Values.vmController.maxConcurrentVms | quote }}
+            - name: VM_NODE_SELECTOR
+              value: {{ toJson .Values.vmController.nodeSelector | quote }}
+            - name: VM_TOLERATIONS
+              value: {{ toJson .Values.vmController.tolerations | quote }}
+            - name: SSH_AUTHORIZED_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.vmController.headscale.apiKeySecretName }}
-                  key: {{ .Values.vmController.headscale.apiKeySecretKey | default "api-key" }}
-                  optional: true
-            - name: HEADSCALE_USER
-              value: {{ .Values.vmController.headscale.user | quote }}
-            {{- end }}
-            - name: LOG_LEVEL
+                  name: {{ include "srw.vmSshKeySecretName" . | quote }}
+                  key: ssh-publickey
+            {{- if include "srw.vmLifecycleAuthSecretName" . }}
+            - name: VM_LIFECYCLE_HMAC_SECRET
               valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: LOG_LEVEL
-                  optional: true
+                secretKeyRef:
+                  name: {{ include "srw.vmLifecycleAuthSecretName" . | quote }}
+                  key: {{ .Values.vm.lifecycleAuthSecretKey | quote }}
+            {{- end }}
+            # Golden-image boot acceleration
+            # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md)
+            - name: VM_GOLDEN_IMAGE_ENABLED
+              value: {{ .Values.vmController.goldenImage.enabled | default false | quote }}
+            - name: VM_GOLDEN_DISK_SIZE
+              value: {{ .Values.vmController.goldenImage.diskSize | default .Values.vmController.vmDiskSize | quote }}
+            - name: VM_GOLDEN_GC_ENABLED
+              value: {{ .Values.vmController.goldenImage.gc.enabled | default true | quote }}
+            - name: VM_GOLDEN_KEEP
+              value: {{ .Values.vmController.goldenImage.gc.keep | default 3 | quote }}
+            - name: VM_GOLDEN_GC_MIN_AGE_MINUTES
+              value: {{ .Values.vmController.goldenImage.gc.minAgeMinutes | default 30 | quote }}
+            # Persistent rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md)
+            - name: VM_PERSISTENT_ROOTDISK
+              value: {{ .Values.vmController.persistentRootdisk.enabled | default false | quote }}
+            - name: VM_ROOTDISK_GC_ENABLED
+              value: {{ .Values.vmController.persistentRootdisk.gc.enabled | default false | quote }}
+            - name: VM_ROOTDISK_ORPHAN_HOURS
+              value: {{ .Values.vmController.persistentRootdisk.gc.orphanHours | default 72 | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
           ports:
-            {{- if ne .Values.vmController.transport "nats" }}
             - name: http
               containerPort: {{ .Values.vmController.service.port }}
               protocol: TCP
-            {{- end }}
           volumeMounts:
             - name: vm-template
               mountPath: /config
               readOnly: true
           resources:
             {{- toYaml .Values.vmController.resources | nindent 12 }}
-          {{- if ne .Values.vmController.transport "nats" }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -105,13 +114,6 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
-          {{- else }}
-          livenessProbe:
-            exec:
-              command: ["python", "-c", "import os; os.getpid()"]
-            initialDelaySeconds: 10
-            periodSeconds: 30
-          {{- end }}
       volumes:
         - name: vm-template
           configMap:

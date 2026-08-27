@@ -6,9 +6,18 @@ name: stage1-rebuild
 # missed security updates. This cron forces a fresh build every Monday so the
 # baseline never drifts more than a week.
 #
+# Refreshes BOTH release channels (matrix): main -> :latest, develop ->
+# :experimental. Each channel is its own stage1 base so develop can carry
+# base-image changes ahead of main (e.g. browser_use) without main's cron
+# clobbering develop's base — the bug that broke develop when the browser_use
+# gate landed on develop but not main.
+#
+# NOTE: GitHub only fires `schedule` from the DEFAULT branch (main), so the
+# weekly cron uses main's copy of this file — the matrix must be present on
+# main for the develop leg to run on schedule. `workflow_dispatch --ref <b>`
+# uses branch <b>'s copy.
+#
 # Triggers: weekly cron + manual workflow_dispatch (for emergency refreshes).
-# The job dispatches to the same `build-agent-vm-base-stage1` flow used in
-# develop.yml — pushes to GHCR with both `:sha-<short>` and `:latest` tags.
 
 on:
   schedule:
@@ -23,6 +32,8 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  SRW_SOURCE_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs
 
 jobs:
   build-agent-vm-base-stage1:
@@ -31,10 +42,29 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # One leg per release channel: main -> :latest, develop -> :experimental.
+    # Each leg checks out its own branch and pushes its own tag, so the two
+    # channels never overwrite each other's stage1 base image.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ref: main
+            tag: latest
+          - ref: develop
+            tag: experimental
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
 
       - name: Free disk space
+        # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
+        # runners do not need it, and the heavy variants below delete
+        # /opt/hostedtoolcache, which is where setup-* install. Guarded rather
+        # than deleted so the hosted fallback (gh variable delete CI_RUNNER_LABEL)
+        # still works.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/share/chromium \
@@ -45,12 +75,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
 
-      - name: Enable KVM
+      - name: Enable KVM (hosted runner udev rule)
+        # Hosted runners ship /dev/kvm as root:kvm with no world access, so this
+        # udev rule is how the runner user reaches it. Inside a container there is
+        # no udevd: the rule file goes nowhere and `udevadm control` fails. There,
+        # access comes from the pod spec instead — privileged + a /dev/kvm
+        # CharDevice hostPath, see HomeLab deployments_managed/arc-runners-kvm/.
+        # (Measured on node4: /dev/kvm is gid 36, mode 0666.)
+        if: runner.environment == 'github-hosted'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
+      - name: Verify KVM is usable
+        # Runs on BOTH runner types, unconditionally. stage1.pkr.hcl and
+        # stage2.pkr.hcl set accelerator = "kvm", and without acceleration packer
+        # does not fail — it silently falls back to TCG and burns the entire
+        # 75-90 minute timeout. Fail in five seconds instead.
+        #
+        # KVM_GET_API_VERSION = _IO(KVMIO=0xAE, 0) = 0xAE00. Opening the device
+        # and getting an answer proves the permissions AND that the host kernel's
+        # KVM subsystem is reachable from in here, which `ls` alone does not.
+        run: |
+          set -euo pipefail
           ls -la /dev/kvm
+          id
+          python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
 
       - uses: hashicorp/setup-packer@main
         with:
@@ -108,9 +159,19 @@ jobs:
         working-directory: docker/agent-vm-base
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1" | tr '[:upper:]' '[:lower:]')
-          TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:latest" "${IMAGE}:cron-$(date -u +%Y%m%d)")
-          BUILD_ARGS=()
+          # Per-channel tag (matrix.tag): main -> latest, develop -> experimental.
+          # SHA tag uses the checked-out ref's HEAD, not GITHUB_SHA (the scheduling
+          # ref), so each channel image is traceable to its own commit.
+          REF_SHA=$(git rev-parse --short=7 HEAD)
+          REF_FULL_SHA=$(git rev-parse HEAD)
+          TAGS=("${IMAGE}:sha-${REF_SHA}" "${IMAGE}:${{ matrix.tag }}" "${IMAGE}:cron-$(date -u +%Y%m%d)-${{ matrix.tag }}")
+          BUILD_ARGS=(
+            --build-arg "SRW_SOURCE_REVISION=${REF_FULL_SHA}"
+            --build-arg "SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}"
+            --build-arg "SRW_RELEASE_VERSION=0.0.0-${{ matrix.tag }}.sha-${REF_FULL_SHA}"
+            --build-arg "SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}"
+          )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk-stage1 .
           for T in "${TAGS[@]}"; do docker push "$T"; done
-          printf 'Pushed stage1:\n'; printf '  %s\n' "${TAGS[@]}"
+          printf 'Pushed stage1 [%s]:\n' "${{ matrix.ref }}"; printf '  %s\n' "${TAGS[@]}"

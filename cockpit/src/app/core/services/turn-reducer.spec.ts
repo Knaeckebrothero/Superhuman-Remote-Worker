@@ -8,6 +8,7 @@ import {
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    UserTurn,
 } from '../models/turn.model';
 import {reduce, ReducerAction} from './turn-reducer';
 
@@ -69,6 +70,66 @@ describe('turn-reducer — user_message / system_message', () => {
     });
 });
 
+describe('user_message attachments before upload', () => {
+    it('keeps distinct ids for attachments that have no server path yet', () => {
+        const state = reduce(EMPTY_CONVERSATION, {
+            type: 'user_message',
+            id: 'user-1',
+            content: 'here',
+            attachments: [
+                {id: 'p1', name: 'a.pdf', size: 1, mimeType: 'application/pdf'},
+                {id: 'p2', name: 'b.pdf', size: 2, mimeType: 'application/pdf'},
+            ],
+            timestamp: 1,
+        });
+
+        const turn = state.turns[state.turns.length - 1];
+        expect(turn.kind).toBe('user');
+        const ids = (turn as UserTurn).attachments?.map((a) => a.id);
+        expect(ids).toEqual(['p1', 'p2']);
+        expect(new Set(ids).size).toBe(2);
+    });
+});
+
+describe('turn-reducer — update_attachments', () => {
+    it('patches the chips of an already-rendered bubble in place', () => {
+        const state = play([
+            {
+                type: 'user_message',
+                id: 'user-1',
+                content: 'here',
+                attachments: [{id: 'p1', name: 'a.pdf', size: 1, mimeType: 'application/pdf'}],
+                timestamp: 1,
+            },
+            {type: 'user_message', id: 'user-2', content: 'and this', timestamp: 2},
+            {
+                type: 'update_attachments',
+                id: 'user-1',
+                // The upload resolved: real path, server-renamed on collision.
+                attachments: [
+                    {id: 'p1', name: 'a_1.pdf', size: 1, mimeType: 'application/pdf', path: 'uploads/a_1.pdf'},
+                ],
+            },
+        ]);
+
+        // Patched in place: no duplicate bubble, and the message the user
+        // queued behind it stays behind it.
+        expect(state.turns.map((t) => t.id)).toEqual(['user-1', 'user-2']);
+        expect((state.turns[0] as UserTurn).attachments).toEqual([
+            {id: 'p1', name: 'a_1.pdf', size: 1, mimeType: 'application/pdf', path: 'uploads/a_1.pdf'},
+        ]);
+    });
+
+    it('is a no-op when no turn matches the id', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'hi', timestamp: 1},
+            {type: 'update_attachments', id: 'gone', attachments: []},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        expect((state.turns[0] as UserTurn).attachments).toBeUndefined();
+    });
+});
+
 describe('turn-reducer — remove_turn', () => {
     it('removes the turn with the matching id and leaves the others', () => {
         const state = play([
@@ -119,6 +180,130 @@ describe('turn-reducer — turn lifecycle', () => {
         expect(state.turns.filter(isAssistantTurn)).toHaveLength(1);
         const turn = activeTurn(state);
         expect((turn.events[0] as TextEvent).content).toBe('hi');
+    });
+
+    it('reattach_turn joins a historical prefix and recovered suffix into one live turn', () => {
+        const historical: AssistantTurn = {
+            kind: 'assistant',
+            id: 'history-message-uuid',
+            turnNumber: 7,
+            historical: true,
+            status: 'done',
+            startedAt: 500,
+            finishedAt: 700,
+            events: [
+                {
+                    kind: 'text',
+                    id: 'history-message-uuid.b0',
+                    content: 'I will update the draft.',
+                    status: 'done',
+                    startedAt: 500,
+                },
+            ],
+        };
+        let state = reduce(EMPTY_CONVERSATION, {
+            type: 'load_history',
+            threadId: 'thread-1',
+            turns: [
+                {kind: 'user', id: 'u7', content: 'Please update it', timestamp: 400},
+                historical,
+            ],
+        });
+        // Cursor replay resumes after turn.started, so the first new token
+        // initially lands in a recovered suffix.
+        state = reduce(state, {type: 'token', content: 'Done.', timestamp: 800});
+        expect(state.turns.filter(isAssistantTurn)).toHaveLength(2);
+
+        state = reduce(state, {type: 'reattach_turn', turnId: '7', timestamp: 900});
+
+        const assistants = state.turns.filter(isAssistantTurn);
+        expect(assistants).toHaveLength(1);
+        expect(assistants[0]).toMatchObject({
+            id: '7',
+            turnNumber: 7,
+            historical: true,
+            status: 'streaming',
+        });
+        expect(assistants[0].finishedAt).toBeUndefined();
+        expect(assistants[0].events.map((event) => event.kind)).toEqual(['text', 'text']);
+        expect((assistants[0].events[1] as TextEvent).content).toBe('Done.');
+        expect(state.activeAssistantTurnId).toBe('7');
+
+        state = reduce(state, {type: 'turn_completed', turnId: '7', finishedAt: 1000});
+        expect(state.turns.filter(isAssistantTurn)).toHaveLength(1);
+        expect((state.turns[1] as AssistantTurn).status).toBe('done');
+        expect(state.activeAssistantTurnId).toBeNull();
+    });
+
+    it('reattach_turn reopens a same-thread turn interrupted by transport teardown', () => {
+        const interrupted: AssistantTurn = {
+            kind: 'assistant',
+            id: '12',
+            turnNumber: 12,
+            events: [],
+            status: 'interrupted',
+            startedAt: 100,
+            finishedAt: 200,
+        };
+        const state = reduce(
+            {threadId: 'thread-1', turns: [interrupted], activeAssistantTurnId: null},
+            {type: 'reattach_turn', turnId: '12', timestamp: 300},
+        );
+        expect(state.turns).toHaveLength(1);
+        expect((state.turns[0] as AssistantTurn).status).toBe('streaming');
+        expect((state.turns[0] as AssistantTurn).finishedAt).toBeUndefined();
+        expect(state.activeAssistantTurnId).toBe('12');
+    });
+
+    it('reattach_turn does not reopen a turn already closed by replay', () => {
+        const state = play([
+            {type: 'turn_started', turnId: '8', startedAt: 100},
+            {type: 'token', content: 'finished', timestamp: 150},
+            {type: 'turn_completed', turnId: '8', finishedAt: 200},
+            // A stale cross-transport welcome snapshot arrives last.
+            {type: 'reattach_turn', turnId: '8', timestamp: 250},
+        ]);
+        const turn = state.turns[0] as AssistantTurn;
+        expect(turn.status).toBe('done');
+        expect(turn.finishedAt).toBe(200);
+        expect(state.activeAssistantTurnId).toBeNull();
+    });
+
+    it('turn_started rebuilds a matching historical prefix during full cold replay', () => {
+        const historical: AssistantTurn = {
+            kind: 'assistant',
+            id: 'history-message-uuid',
+            turnNumber: 4,
+            historical: true,
+            events: [
+                {
+                    kind: 'text',
+                    id: 'history-message-uuid.b0',
+                    content: 'persisted prefix',
+                    status: 'done',
+                    startedAt: 100,
+                },
+            ],
+            status: 'done',
+            startedAt: 100,
+            finishedAt: 200,
+        };
+        const state = play(
+            [
+                {type: 'turn_started', turnId: '4', startedAt: 100},
+                {type: 'token', content: 'persisted prefix', timestamp: 110},
+            ],
+            {threadId: 'thread-1', turns: [historical], activeAssistantTurnId: null},
+        );
+        const assistants = state.turns.filter(isAssistantTurn);
+        expect(assistants).toHaveLength(1);
+        expect(assistants[0]).toMatchObject({
+            id: '4',
+            turnNumber: 4,
+            historical: true,
+            status: 'streaming',
+        });
+        expect((assistants[0].events[0] as TextEvent).content).toBe('persisted prefix');
     });
 
     it('turn_completed flips status to done and clears activeAssistantTurnId', () => {
@@ -226,7 +411,7 @@ describe('turn-reducer — text/thinking deltas', () => {
 
     it('deltas without an active turn open a recovered placeholder turn (Approach 2)', () => {
         // Defense-in-depth from
-        // docs/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md:
+        // knowledge-base/knowledge/issues/persistent_chat_lost_assistant_turn_on_mid_turn_reload.md:
         // when streaming events arrive with activeAssistantTurnId === null
         // (e.g. SSE replay cursor is past turn.started after a mid-turn
         // reconnect), the reducer now synthesises a placeholder turn so the
@@ -271,6 +456,185 @@ describe('turn-reducer — text/thinking deltas', () => {
         ]);
         const turn = activeTurn(state);
         expect(turn.events.map((e) => e.id)).toEqual(['t1.b0', 't1.b1', 't1.b2']);
+    });
+});
+
+describe('turn-reducer — reasoning frame dedupe (message-id keyed)', () => {
+    // knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+    // For gemma-style models, the reasoning frame is journaled after the whole
+    // token run; an SSE replay cursor landing in that gap re-emits just the
+    // thinking frame after the turn closed, and ensurePlaceholderTurn would
+    // otherwise materialise it as a duplicate `recovered:` bubble.
+
+    function historicalTurn(messageId: string): AssistantTurn {
+        return {
+            kind: 'assistant',
+            id: 'hist-turn',
+            events: [
+                {
+                    kind: 'thought',
+                    id: 'hist-turn.b0',
+                    messageId,
+                    content: 'because X',
+                    status: 'done',
+                    startedAt: 500,
+                },
+                {kind: 'text', id: 'hist-turn.b1', content: 'answer', status: 'done', startedAt: 600},
+            ],
+            status: 'done',
+            startedAt: 500,
+            finishedAt: 600,
+            historical: true,
+        };
+    }
+
+    it('drops a replayed thinking frame whose message already rendered in another turn', () => {
+        const loaded = reduce(EMPTY_CONVERSATION, {
+            type: 'load_history',
+            threadId: 'th',
+            turns: [historicalTurn('msg-x')],
+        });
+        // Replay re-emits the trailing reasoning frame; activeAssistantTurnId
+        // is null because the turn already closed.
+        const after = reduce(loaded, {
+            type: 'thinking',
+            content: 'because X',
+            messageId: 'msg-x',
+            timestamp: 1000,
+        });
+        expect(after.turns).toHaveLength(1);
+        expect(after.turns[0].id).toBe('hist-turn');
+        expect(after.activeAssistantTurnId).toBeNull();
+        const thoughts = (after.turns[0] as AssistantTurn).events.filter((e) => e.kind === 'thought');
+        expect(thoughts).toHaveLength(1);
+    });
+
+    it('a full live turn then a trailing replayed reasoning frame yields one bubble', () => {
+        let state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'reason', messageId: 'msg-1', timestamp: 1100},
+            {type: 'token', content: 'answer', timestamp: 1200},
+            {type: 'turn_completed', turnId: 't1', finishedAt: 1300},
+        ]);
+        state = reduce(state, {
+            type: 'thinking',
+            content: 'reason',
+            messageId: 'msg-1',
+            timestamp: 1400,
+        });
+        expect(state.turns).toHaveLength(1);
+        const thoughts = (state.turns[0] as AssistantTurn).events.filter((e) => e.kind === 'thought');
+        expect(thoughts).toHaveLength(1);
+        expect(state.activeAssistantTurnId).toBeNull();
+    });
+
+    it('live deltas for the active message keep appending (active turn exempt)', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'a', messageId: 'msg-1', timestamp: 1100},
+            {type: 'thinking', content: 'b', messageId: 'msg-1', timestamp: 1200},
+        ]);
+        const thoughts = activeTurn(state).events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(1);
+        expect(thoughts[0].content).toBe('ab');
+        expect(thoughts[0].messageId).toBe('msg-1');
+    });
+
+    it('adjacent thinking frames with different message ids form separate bubbles', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'first', messageId: 'msg-1', timestamp: 1100},
+            {type: 'thinking', content: 'second', messageId: 'msg-2', timestamp: 1200},
+        ]);
+        const thoughts = activeTurn(state).events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(2);
+        expect(thoughts.map((t) => t.messageId)).toEqual(['msg-1', 'msg-2']);
+    });
+
+    it('an orphan thinking frame with no message id still recovers (back-compat)', () => {
+        const state = play([{type: 'thinking', content: 'orphan', timestamp: 1000}]);
+        expect(state.turns).toHaveLength(1);
+        expect(state.turns[0].id).toBe('recovered:1000');
+    });
+
+    it('an orphan thinking frame for an unrendered message still recovers', () => {
+        const state = play([
+            {type: 'thinking', content: 'new', messageId: 'msg-new', timestamp: 1000},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns[0] as AssistantTurn;
+        expect(turn.recovered).toBe(true);
+        expect((turn.events[0] as ThoughtEvent).messageId).toBe('msg-new');
+    });
+});
+
+describe('turn-reducer — thinking_reset (live replace)', () => {
+    it('drops the active streaming reasoning bubble for a message id', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'dead ', timestamp: 1100, messageId: 'a1'},
+            {type: 'thinking', content: 'end', timestamp: 1150, messageId: 'a1'},
+            {type: 'thinking_reset', messageId: 'a1', timestamp: 1200},
+        ]);
+        const turn = activeTurn(state);
+        expect(turn.events.filter((e) => e.kind === 'thought')).toHaveLength(0);
+    });
+
+    it('lets the retry re-stream a fresh bubble after a reset', () => {
+        // The empty-response replace: dead-end reasoning is cleared, then the
+        // retry streams its own reasoning + answer under the same message id.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'dead end', timestamp: 1100, messageId: 'a1'},
+            {type: 'thinking_reset', messageId: 'a1', timestamp: 1200},
+            {type: 'thinking', content: 'fresh reasoning', timestamp: 1300, messageId: 'a1'},
+            {type: 'token', content: 'recovered', timestamp: 1400},
+        ]);
+        const turn = activeTurn(state);
+        const thoughts = turn.events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(1);
+        expect(thoughts[0].content).toBe('fresh reasoning'); // dead-end gone
+        const texts = turn.events.filter((e) => e.kind === 'text') as TextEvent[];
+        expect(texts[0].content).toBe('recovered');
+    });
+
+    it('is a no-op when there is no active turn (replay-safe)', () => {
+        const state = play([{type: 'thinking_reset', messageId: 'a1', timestamp: 1000}]);
+        expect(state).toEqual(EMPTY_CONVERSATION);
+    });
+
+    it('leaves a done thought and a non-matching streaming thought intact', () => {
+        // a1 closes to done when a2 opens; resetting a1 matches neither the
+        // (done) a1 nor the (streaming, different-id) a2 — nothing is removed.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'first', timestamp: 1100, messageId: 'a1'},
+            {type: 'thinking', content: 'second', timestamp: 1200, messageId: 'a2'},
+            {type: 'thinking_reset', messageId: 'a1', timestamp: 1300},
+        ]);
+        const turn = activeTurn(state);
+        const thoughts = turn.events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(2);
+        expect(thoughts.map((t) => t.content)).toEqual(['first', 'second']);
+    });
+
+    it('an UNKEYED reset removes every streaming thought of the active turn', () => {
+        // The agent sends an unkeyed reset when attempt-1's dead-end reasoning
+        // was broadcast as UNKEYED in-stream block frames (Responses/codex) —
+        // only an unkeyed reset can clear those bubbles. Done thoughts stay.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'finished lead-up', timestamp: 1050, messageId: 'a0'},
+            {type: 'token', content: 'text closes a0 to done', timestamp: 1075},
+            {type: 'thinking', content: 'unkeyed dead-end', timestamp: 1100},
+            {type: 'thinking', content: 'keyed dead-end', timestamp: 1150, messageId: 'a1'},
+            {type: 'thinking_reset', timestamp: 1200},
+        ]);
+        const turn = activeTurn(state);
+        const thoughts = turn.events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(1);
+        expect(thoughts[0].content).toBe('finished lead-up');
+        expect(thoughts[0].status).toBe('done');
     });
 });
 
@@ -447,6 +811,47 @@ describe('turn-reducer — permissions', () => {
         expect(tc.id).toBe('tc-ghost');
     });
 
+    it('permission_decision (expired) marks the call unanswered, NOT denied', () => {
+        // A gate that timed out or was swept at turn end is not a refusal.
+        // Painting it "denied" is the fabricated-denial bug, in the UI:
+        // knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {
+                type: 'permission_request',
+                toolUseId: 'tc1',
+                tool: 'web_search',
+                args: {},
+                timestamp: 1100,
+            },
+            {
+                type: 'permission_decision',
+                toolUseId: 'tc1',
+                decision: 'expired',
+                timestamp: 1200,
+            },
+        ]);
+        const tc = activeTurn(state).events[0] as ToolCallEvent;
+        expect(tc.status).toBe('expired');
+        expect(tc.status).not.toBe('denied');
+        expect(tc.decision).toBe('expired');
+    });
+
+    it('permission_decision (expired) without a prior request fabricates nothing', () => {
+        // The denied path synthesises a marker so a deny-before-start is
+        // visible. An expired gate must NOT invent a row the user never saw.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {
+                type: 'permission_decision',
+                toolUseId: 'tc-ghost',
+                decision: 'expired',
+                timestamp: 1100,
+            },
+        ]);
+        expect(activeTurn(state).events).toHaveLength(0);
+    });
+
     it('permission_decision (approved) records the decision but does not change a running call', () => {
         const state = play([
             {type: 'turn_started', turnId: 't1', startedAt: 1000},
@@ -507,7 +912,7 @@ describe('turn-reducer — replay idempotency', () => {
 });
 
 describe('turn-reducer — add_compaction', () => {
-    it('appends a compaction banner turn', () => {
+    it('appends a compaction banner turn between turns (no turn open)', () => {
         const state = play([
             {type: 'user_message', id: 'u1', content: 'hi', timestamp: 100},
             {type: 'add_compaction', id: 'compaction-3', summary: 'We did X.', timestamp: 200},
@@ -528,5 +933,59 @@ describe('turn-reducer — add_compaction', () => {
         const c = state.turns[0];
         expect(c.kind).toBe('compaction');
         if (c.kind === 'compaction') expect(c.summary).toBe('updated');
+    });
+
+    // Auto-compaction fires mid-turn. The banner must land where it fired, not
+    // trail the whole turn — post-compaction work renders inside the open turn,
+    // so a top-level divider gets stranded at the foot of the transcript and
+    // then jumps into place on reload (when historyToTurns inlines it).
+    it('lands inline at its true position when a turn is open', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1},
+            {type: 'tool_started', toolUseId: 'a', tool: 'edit_citation', args: {}, timestamp: 2},
+            {type: 'tool_completed', toolUseId: 'a', result: 'ok', timestamp: 3},
+            {type: 'add_compaction', id: 'compaction-2', summary: 'We did X.', timestamp: 4},
+            {type: 'thinking', content: 'more', timestamp: 5},
+            {type: 'tool_started', toolUseId: 'b', tool: 'edit_citation', args: {}, timestamp: 6},
+        ]);
+        // One turn only — no trailing top-level divider.
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns.find(isAssistantTurn)!;
+        expect(turn.events.map((e) => e.kind)).toEqual([
+            'tool_call',
+            'compaction',
+            'thought',
+            'tool_call',
+        ]);
+        const marker = turn.events[1];
+        expect(marker.id).toBe('compaction-2');
+        if (marker.kind === 'compaction') expect(marker.summary).toBe('We did X.');
+    });
+
+    it('replays an inline marker in place, even after its turn closed', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1},
+            {type: 'add_compaction', id: 'compaction-2', summary: 'first', timestamp: 2},
+            {type: 'token', content: 'answer', timestamp: 3},
+            {type: 'turn_completed', turnId: 't1', finishedAt: 4},
+            // Replay after the turn closed: must not spawn a second divider.
+            {type: 'add_compaction', id: 'compaction-2', summary: 'updated', timestamp: 2},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns.find(isAssistantTurn)!;
+        expect(turn.events.map((e) => e.kind)).toEqual(['compaction', 'text']);
+        const marker = turn.events[0];
+        if (marker.kind === 'compaction') expect(marker.summary).toBe('updated');
+    });
+
+    it('does not merge reasoning across a compaction boundary', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1},
+            {type: 'thinking', content: 'before', timestamp: 2},
+            {type: 'add_compaction', id: 'compaction-2', summary: 'We did X.', timestamp: 3},
+            {type: 'thinking', content: 'after', timestamp: 4},
+        ]);
+        const turn = state.turns.find(isAssistantTurn)!;
+        expect(turn.events.map((e) => e.kind)).toEqual(['thought', 'compaction', 'thought']);
     });
 });

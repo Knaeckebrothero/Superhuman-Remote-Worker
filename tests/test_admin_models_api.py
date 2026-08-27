@@ -6,7 +6,7 @@ Covers:
 - Pydantic bodies (``CatalogModelCreate``, ``CatalogModelUpdate``) accept the
   expected shapes and reject invalid enums / missing required fields.
 - ``params_json={"temperature": 0}`` and ``context_window=0`` round-trip as
-  themselves through the DB accessors (LiteLLM #14661 hazard regression).
+  themselves through the DB accessors.
 - ``resolve_catalog_model`` JOINs to the right transport (system vs endpoint)
   and prefers the system row when both are present.
 - ``list_models_by_capability_alphabetical`` filters on enabled and sorts.
@@ -235,7 +235,7 @@ def _row(**overrides):
 
 
 class TestCreateModelJsonbHandling:
-    """LiteLLM #14661 hazard — null vs explicit zero must be distinguished.
+    """Null vs explicit zero must be distinguished.
 
     Positional argument indices on the INSERT bind layout (post chunk 7):
     $1 provider_kind, $2 provider_ref, $3 model_id, $4 display_label,
@@ -385,6 +385,35 @@ class TestCreateModelJsonbHandling:
         row = _row(params_json={"top_p": 0.9})
         result = PostgresDB._row_to_model(row)
         assert result["params_json"] == {"top_p": 0.9}
+
+
+class TestSerializeCatalogModelContextWindow:
+    """`_serialize_catalog_model` surfaces the resolved context window + source
+    for the Admin → Models "Context" column: the explicit per-model cap when
+    set, else the family default from the model config matrix."""
+
+    def test_explicit_context_window_is_reported_as_explicit(self):
+        out = main._serialize_catalog_model(_row(context_window=262144))
+        assert out["context_window"] == 262144
+        assert out["resolved_context_window"] == 262144
+        assert out["context_window_source"] == "explicit"
+
+    def test_unset_falls_back_to_family_default(self):
+        # claude-opus family default is 1,000,000 (config/model_config_matrix.yaml).
+        out = main._serialize_catalog_model(
+            _row(context_window=None, family="claude-opus")
+        )
+        assert out["context_window"] is None
+        assert out["resolved_context_window"] == 1_000_000
+        assert out["context_window_source"] == "family_default"
+
+    def test_unknown_family_falls_back_to_default_128k(self):
+        # Unknown family → the `default` block's model_max_context_tokens (128000).
+        out = main._serialize_catalog_model(
+            _row(context_window=None, family="totally-unknown-family")
+        )
+        assert out["resolved_context_window"] == 128000
+        assert out["context_window_source"] == "family_default"
 
 
 class TestListModelsFilters:
@@ -551,7 +580,7 @@ class TestResolveCatalogModelTransportJoin:
 
     @pytest.mark.asyncio
     async def test_system_row_returns_decrypted_system_key(self):
-        from orchestrator.security.crypto import encrypt
+        from security.crypto import encrypt
 
         conn = _conn()
         conn.fetchrow = AsyncMock(
@@ -573,7 +602,7 @@ class TestResolveCatalogModelTransportJoin:
 
     @pytest.mark.asyncio
     async def test_endpoint_row_returns_decrypted_endpoint_key(self):
-        from orchestrator.security.crypto import encrypt
+        from security.crypto import encrypt
 
         conn = _conn()
         conn.fetchrow = AsyncMock(

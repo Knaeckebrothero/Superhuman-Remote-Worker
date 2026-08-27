@@ -1,0 +1,351 @@
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi import HTTPException
+
+
+def _valid_sandbox_thread(**metadata_overrides):
+    generation = "11111111-1111-4111-8111-111111111111"
+    runtime = "22222222-2222-4222-8222-222222222222"
+    metadata = {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "workspace_container": {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.42.0.25",
+            "port": 30022,
+            "pod_name": "ws-thread-thread-a",
+            "namespace": "agent-workspaces",
+            "_canvas_workspace_generation": generation,
+            "_runtime_incarnation": runtime,
+        },
+        "_workspace_binding": {
+            "generation": generation,
+            "kind": "remote",
+            "backing_id": "k8s-pod:agent-workspaces:pod-uid",
+            "ssh_host_key_fingerprint": "SHA256:trusted",
+        },
+        **metadata_overrides,
+    }
+    return {
+        "id": "thread-a",
+        "execution_lane": "stateless",
+        "status": "active",
+        "metadata": metadata,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["suspended", "ended"])
+async def test_stale_ready_stateless_ide_refuses_nonactive_lifecycle(status):
+    from orchestrator import main
+
+    thread = {
+        "id": "thread-a",
+        "execution_lane": "stateless",
+        "status": status,
+        "metadata": {"workspace_container": {"status": "ready"}},
+    }
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ide_proxy_service", MagicMock()) as proxy,
+        pytest.raises(HTTPException) as exc,
+    ):
+        await main._require_stateless_ide_lifecycle("thread-a")
+
+    assert exc.value.status_code == 409
+    proxy.evict.assert_called_once_with("thread-a")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker_key",
+    [
+        "_stateless_workspace_retirement_pending",
+        "_stateless_claim_retirement",
+        "_stateless_claim_loss_hold",
+        "_stateless_claim_losses",
+    ],
+)
+@pytest.mark.parametrize("value", [None, False, 0, "", [], {}])
+async def test_present_falsey_stop_marker_refuses_ide(marker_key, value):
+    from orchestrator import main
+
+    thread = {
+        "id": "thread-a",
+        "execution_lane": "stateless",
+        "status": "active",
+        "metadata": {marker_key: value},
+    }
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ide_proxy_service", MagicMock()),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await main._require_stateless_ide_lifecycle("thread-a")
+
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config_override",
+    [
+        {"workspace": {"backend": "sandbox"}, "officer": []},
+        {
+            "workspace": {"backend": "sandbox"},
+            "officer": {"enabled": "yes"},
+        },
+        {
+            "workspace": {"backend": "sandbox"},
+            "officer": {"conference": True},
+        },
+        {"workspace": {"backend": "docker"}},
+        {"workspace": {"backend": "virtual"}},
+    ],
+)
+async def test_stateless_ide_refuses_unsupported_session_class_or_workspace(
+    config_override,
+):
+    from orchestrator import main
+
+    thread = _valid_sandbox_thread(config_override=config_override)
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ide_proxy_service", MagicMock()) as proxy,
+        pytest.raises(HTTPException) as exc,
+    ):
+        await main._require_stateless_ide_lifecycle("thread-a")
+
+    assert exc.value.status_code == 409
+    proxy.evict.assert_called_once_with("thread-a")
+
+
+@pytest.mark.asyncio
+async def test_valid_stateless_sandbox_ide_is_admitted_and_pinned_is_unchanged():
+    from orchestrator import main
+
+    db = MagicMock()
+    db.get_thread = AsyncMock(
+        side_effect=[
+            _valid_sandbox_thread(),
+            {
+                "id": "thread-pinned",
+                "execution_lane": "pinned",
+                "status": "suspended",
+                "metadata": {"config_override": "malformed"},
+            },
+        ]
+    )
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ide_proxy_service", MagicMock()) as proxy,
+    ):
+        await main._require_stateless_ide_lifecycle("thread-a")
+        await main._require_stateless_ide_lifecycle("thread-pinned")
+
+    proxy.evict.assert_called_once_with("thread-a")
+
+
+@pytest.mark.asyncio
+async def test_http_virtual_stateless_ide_refuses_before_proxy_resolution():
+    from orchestrator import main
+
+    thread = _valid_sandbox_thread(
+        config_override={"workspace": {"backend": "virtual"}}
+    )
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    proxy = MagicMock()
+    proxy.resolve_pod_ip = AsyncMock()
+    request = MagicMock()
+    request.headers = {}
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ide_proxy_service", proxy),
+        patch.object(
+            main, "require_approved_user", AsyncMock(return_value={"id": "u"})
+        ),
+        patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await main.ide_proxy_http(request, "thread-a", "")
+
+    assert exc.value.status_code == 409
+    proxy.resolve_pod_ip.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ws_malformed_stateless_class_refuses_before_proxy_resolution():
+    from orchestrator import main
+
+    thread = _valid_sandbox_thread(
+        config_override={
+            "workspace": {"backend": "sandbox"},
+            "officer": {"enabled": "yes"},
+        }
+    )
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    proxy = MagicMock()
+    proxy.resolve_pod_ip = AsyncMock()
+    ws = MagicMock()
+    ws.close = AsyncMock()
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ide_proxy_service", proxy),
+        patch.object(
+            main,
+            "resolve_ws_user",
+            AsyncMock(return_value={"id": "u", "is_approved": True}),
+        ),
+        patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
+    ):
+        await main.ide_proxy_ws(ws, "thread-a", "")
+
+    ws.close.assert_awaited_once_with(
+        code=4409,
+        reason="Workspace lifecycle fenced",
+    )
+    proxy.resolve_pod_ip.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_http_stateless_cache_is_refreshed_again_at_use_boundary():
+    from orchestrator import main
+
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=_valid_sandbox_thread())
+    proxy = MagicMock()
+    proxy.resolve_pod_ip = AsyncMock(side_effect=["10.0.0.1", "10.0.0.2"])
+    client = MagicMock()
+    upstream = MagicMock()
+    upstream.headers.multi_items.return_value = []
+    upstream.status_code = 200
+    client.request = AsyncMock(return_value=upstream)
+    request = MagicMock()
+    request.headers = {}
+    request.method = "GET"
+    request.url.query = ""
+    request.client = None
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ide_proxy_service", proxy),
+        patch.object(
+            main, "require_approved_user", AsyncMock(return_value={"id": "u"})
+        ),
+        patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
+        patch.object(main, "_get_ide_http_client", return_value=client),
+        patch("services.ssh_helpers.orchestrator_can_reach", return_value=True),
+    ):
+        await main.ide_proxy_http(request, "thread-a", "workspace")
+
+    assert proxy.resolve_pod_ip.await_count == 2
+    assert client.request.await_args.kwargs["url"] == (
+        "http://10.0.0.2:38080/workspace"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ws_stateless_cache_is_refreshed_again_before_accept_and_connect():
+    from orchestrator import main
+
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=_valid_sandbox_thread())
+    proxy = MagicMock()
+    proxy.resolve_pod_ip = AsyncMock(side_effect=["10.0.0.1", "10.0.0.2"])
+    ws = MagicMock()
+    ws.url.query = ""
+    ws.accept = AsyncMock()
+    ws.close = AsyncMock()
+    ws.receive = AsyncMock(return_value={"type": "websocket.disconnect"})
+    ws.send_text = AsyncMock()
+    ws.send_bytes = AsyncMock()
+    connected_urls = []
+
+    class _Upstream:
+        async def send(self, _message):
+            return None
+
+        def __aiter__(self):
+            async def empty():
+                if False:
+                    yield None
+
+            return empty()
+
+    class _Connection:
+        async def __aenter__(self):
+            return _Upstream()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    def connect(url, **_kwargs):
+        connected_urls.append(url)
+        return _Connection()
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "ide_proxy_service", proxy),
+        patch.object(
+            main,
+            "resolve_ws_user",
+            AsyncMock(return_value={"id": "u", "is_approved": True}),
+        ),
+        patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
+        patch("services.ssh_helpers.orchestrator_can_reach", return_value=True),
+        patch("websockets.connect", side_effect=connect),
+    ):
+        await main.ide_proxy_ws(ws, "thread-a", "workspace")
+
+    assert proxy.resolve_pod_ip.await_count == 2
+    assert connected_urls == ["ws://10.0.0.2:38080/workspace"]
+    ws.accept.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker_key",
+    [
+        "_stateless_workspace_retirement_pending",
+        "_stateless_claim_retirement",
+        "_stateless_claim_loss_hold",
+        "_stateless_claim_losses",
+    ],
+)
+@pytest.mark.parametrize("value", [None, False, 0, "", [], {}])
+async def test_present_falsey_stop_marker_refuses_admin_unpark(marker_key, value):
+    from orchestrator import main
+
+    conn = MagicMock()
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "execution_lane": "stateless",
+            "metadata": {marker_key: value},
+        }
+    )
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    db = MagicMock()
+    db.acquire = _acquire
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_require_admin", AsyncMock()),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await main.admin_run_queue_unpark(
+            "11111111-1111-4111-8111-111111111111", MagicMock()
+        )
+
+    assert exc.value.status_code == 409

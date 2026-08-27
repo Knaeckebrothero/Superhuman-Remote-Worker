@@ -1,10 +1,12 @@
-import {Component, computed, effect, inject, input, output, signal} from '@angular/core';
+import {Component, computed, inject, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
-import {readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
-import {getReasoningOptions} from './reasoning-options';
-import {UserService} from '../../core/services/user.service';
+import {AppTooltipDirective} from '../../ui/tooltip';
+import {pinResolvedValue, readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
+import {PinOnInteractDirective} from './pin-on-interact.directive';
+import {reasoningOptionsForModel} from './reasoning-options';
+import {ModelService} from '../../core/services/model.service';
 
 /**
  * Advanced settings tab: collapsible accordion sections for power-user settings.
@@ -13,7 +15,7 @@ import {UserService} from '../../core/services/user.service';
 @Component({
   selector: 'app-advanced-accordion',
   standalone: true,
-    imports: [FormsModule, TranslocoPipe, AppIconComponent],
+    imports: [FormsModule, TranslocoPipe, AppIconComponent, AppTooltipDirective, PinOnInteractDirective],
   template: `
     <div class="advanced-container">
       <!-- Inference Parameters -->
@@ -36,6 +38,7 @@ import {UserService} from '../../core/services/user.service';
                   <div class="field-control">
                     <select class="form-input"
                       [ngModel]="strategicReasoning() ?? resolvedStrategicReasoning()"
+                  appPinOnInteract (pin)="pinValue(strategicReasoning, resolvedStrategicReasoning())"
                       (ngModelChange)="onStrategicReasoningChange($event)"
                       [disabled]="disabled()">
                       @for (opt of strategicReasoningOptions(); track opt.value) {
@@ -88,6 +91,7 @@ import {UserService} from '../../core/services/user.service';
                   <div class="field-control">
                     <select class="form-input"
                       [ngModel]="tacticalReasoning() ?? resolvedTacticalReasoning()"
+                  appPinOnInteract (pin)="pinValue(tacticalReasoning, resolvedTacticalReasoning())"
                       (ngModelChange)="onTacticalReasoningChange($event)"
                       [disabled]="disabled()">
                       @for (opt of tacticalReasoningOptions(); track opt.value) {
@@ -133,27 +137,10 @@ import {UserService} from '../../core/services/user.service';
                 </div>
               </div>
             } @else {
-              <!-- Session: single model inference settings -->
-              <div class="field-row" [class.modified]="sessionReasoning() !== null">
-                <label class="field-label">{{ 'advanced.labels.reasoning' | transloco }}</label>
-                <div class="field-control">
-                  <select class="form-input"
-                    [ngModel]="sessionReasoning() ?? resolvedSessionReasoning()"
-                    (ngModelChange)="onSessionReasoningChange($event)"
-                    [disabled]="disabled()">
-                    @for (opt of sessionReasoningOptions(); track opt.value) {
-                      @if (opt.value === null) {
-                        <option [ngValue]="null">{{ opt.label }}</option>
-                      } @else {
-                        <option [value]="opt.value">{{ opt.label }}</option>
-                      }
-                    }
-                  </select>
-                  @if (sessionReasoning() !== null) {
-                    <button type="button" class="reset-btn" (click)="sessionReasoning.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                  }
-                </div>
-              </div>
+              <!-- Session: single model inference settings. The Reasoning
+                   select moved to the Settings tab's MODEL group
+                   (model-group.component.ts), which is the single session-mode
+                   writer of llm.reasoning_level. -->
               <div class="field-row" [class.modified]="sessionTemperature() !== null">
                 <label class="field-label">
                   {{ 'advanced.labels.temperature' | transloco: {value: effectiveSessionTemp()} }}
@@ -233,6 +220,9 @@ import {UserService} from '../../core/services/user.service';
                     [disabled]="disabled()">
                   <span>{{ 'advanced.labels.parallelToolCalls' | transloco }}</span>
                 </label>
+                <app-icon size="xs" class="info-icon" tabindex="0"
+                  [appTooltip]="'advanced.hints.parallelToolCalls' | transloco"
+                  [attr.aria-label]="'advanced.hints.parallelToolCalls' | transloco">info</app-icon>
                 @if (parallelToolCalls() !== null) {
                   <button type="button" class="reset-btn" (click)="parallelToolCalls.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
@@ -394,24 +384,13 @@ import {UserService} from '../../core/services/user.service';
         </button>
         @if (expanded().has('workspace')) {
           <div class="accordion-body">
-            <div class="field-row" [class.modified]="workspaceBackend() !== null">
-              <label class="field-label">{{ 'advanced.labels.backend' | transloco }}</label>
-              <div class="field-control">
-                <select class="form-input"
-                  [ngModel]="workspaceBackend() ?? resolvedWorkspaceBackend()"
-                  (ngModelChange)="workspaceBackend.set($event); emitChange()"
-                  [disabled]="disabled()">
-                  <option value="sandbox">{{ 'advanced.options.container' | transloco }}</option>
-                  @if (canUseVm()) {
-                    <option value="vm">{{ 'advanced.options.vmQemu' | transloco }}</option>
-                  }
-                </select>
-                @if (workspaceBackend() !== null) {
-                  <button type="button" class="reset-btn" (click)="workspaceBackend.set(null); vmCpuCores.set(null); vmMemory.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                }
-              </div>
-            </div>
-            @if ((workspaceBackend() ?? resolvedWorkspaceBackend()) === 'vm') {
+            <!-- The backend selector itself is a level-1 control, in the
+                 Settings tab's EXECUTION group. This section keeps the tuning
+                 that hangs off it and explains the greying below. -->
+            @if (isLiteBackend()) {
+              <p class="field-hint lite-hint">{{ (isNoneBackend() ? 'advanced.hints.noneBackend' : 'advanced.hints.virtualBackend') | transloco }}</p>
+            }
+            @if (effectiveBackend() === 'vm') {
               <div class="field-row" [class.modified]="vmCpuCores() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmCpuCores' | transloco }}</label>
                 <div class="field-control">
@@ -427,7 +406,7 @@ import {UserService} from '../../core/services/user.service';
               <div class="field-row" [class.modified]="vmMemory() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmMemory' | transloco }}</label>
                 <div class="field-control">
-                  <input type="text" class="form-input compact-input" placeholder="4Gi"
+                  <input type="text" class="form-input compact-input" placeholder="16Gi"
                     [ngModel]="vmMemory() ?? resolvedVmMemory()"
                     (ngModelChange)="vmMemory.set($event); emitChange()"
                     [disabled]="disabled()">
@@ -443,7 +422,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="number" class="form-input compact-input" min="0" step="1000"
                   [ngModel]="maxReadWords() ?? resolvedMaxReadWords()"
                   (ngModelChange)="maxReadWords.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isNoneBackend()">
                 @if (maxReadWords() !== null) {
                   <button type="button" class="reset-btn" (click)="maxReadWords.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
@@ -455,7 +434,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="number" class="form-input compact-input" min="0" step="1000"
                   [ngModel]="maxWriteWords() ?? resolvedMaxWriteWords()"
                   (ngModelChange)="maxWriteWords.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isNoneBackend()">
                 @if (maxWriteWords() !== null) {
                   <button type="button" class="reset-btn" (click)="maxWriteWords.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
@@ -466,7 +445,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="checkbox"
                   [checked]="gitVersioning() ?? resolvedGitVersioning()"
                   (change)="onGitVersioningChange($event)"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 <span>{{ 'advanced.labels.gitVersioning' | transloco }}</span>
               </label>
               @if (gitVersioning() !== null) {
@@ -490,8 +469,9 @@ import {UserService} from '../../core/services/user.service';
               <div class="field-control">
                 <select class="form-input"
                   [ngModel]="shellMode() ?? resolvedShellMode()"
+                  appPinOnInteract (pin)="pinValue(shellMode, resolvedShellMode())"
                   (ngModelChange)="shellMode.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                   <option value="stateless">{{ 'advanced.options.stateless' | transloco }}</option>
                   <option value="persistent">{{ 'advanced.options.persistent' | transloco }}</option>
                 </select>
@@ -505,7 +485,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="checkbox"
                   [checked]="shellSandbox() ?? resolvedShellSandbox()"
                   (change)="onShellSandboxChange($event)"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 <span>{{ 'advanced.labels.sandbox' | transloco }}</span>
               </label>
               @if (shellSandbox() !== null) {
@@ -518,7 +498,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="number" class="form-input compact-input" min="1"
                   [ngModel]="shellTimeout() ?? resolvedShellTimeout()"
                   (ngModelChange)="shellTimeout.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 @if (shellTimeout() !== null) {
                   <button type="button" class="reset-btn" (click)="shellTimeout.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
@@ -529,8 +509,9 @@ import {UserService} from '../../core/services/user.service';
               <div class="field-control">
                 <select class="form-input"
                   [ngModel]="sudoAction() ?? resolvedSudoAction()"
+                  appPinOnInteract (pin)="pinValue(sudoAction, resolvedSudoAction())"
                   (ngModelChange)="sudoAction.set($event); emitChange()"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                   <option value="freeze">{{ 'advanced.options.sudoFreeze' | transloco }}</option>
                   <option value="block">{{ 'advanced.options.sudoBlock' | transloco }}</option>
                   <option value="allow">{{ 'advanced.options.sudoAllow' | transloco }}</option>
@@ -569,7 +550,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="checkbox"
                   [checked]="browserHeadless() ?? resolvedBrowserHeadless()"
                   (change)="onBrowserHeadlessChange($event)"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 <span>{{ 'advanced.labels.browserHeadless' | transloco }}</span>
               </label>
               @if (browserHeadless() !== null) {
@@ -581,7 +562,7 @@ import {UserService} from '../../core/services/user.service';
                 <input type="checkbox"
                   [checked]="browserVision() ?? resolvedBrowserVision()"
                   (change)="onBrowserVisionChange($event)"
-                  [disabled]="disabled()">
+                  [disabled]="disabled() || isLiteBackend()">
                 <span>{{ 'advanced.labels.browserVision' | transloco }}</span>
               </label>
               @if (browserVision() !== null) {
@@ -721,7 +702,7 @@ import {UserService} from '../../core/services/user.service';
       background: rgba(255, 255, 255, 0.05);
     }
     .accordion-icon {
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
     .modified-badge {
       margin-left: auto;
@@ -751,7 +732,7 @@ import {UserService} from '../../core/services/user.service';
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-bottom: 8px;
     }
     .shared-params {
@@ -782,8 +763,24 @@ import {UserService} from '../../core/services/user.service';
     .field-hint {
       display: block;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-top: 2px;
+    }
+    .info-icon {
+      color: var(--text-muted);
+      cursor: help;
+      margin-left: 2px;
+    }
+    .info-icon:hover, .info-icon:focus-visible {
+      color: var(--text-secondary);
+    }
+    .lite-hint {
+      margin: 4px 0 8px;
+      padding: 6px 9px;
+      line-height: 1.4;
+      border-left: 2px solid var(--accent-color, var(--accent-color));
+      background: var(--surface-1, rgba(127, 127, 127, 0.08));
+      border-radius: 3px;
     }
     .form-input {
       flex: 1;
@@ -813,7 +810,7 @@ import {UserService} from '../../core/services/user.service';
     }
     .slider-label {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       min-width: 12px;
       text-align: center;
     }
@@ -846,7 +843,7 @@ import {UserService} from '../../core/services/user.service';
       border: none;
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.08);
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;
     }
@@ -866,6 +863,11 @@ export class AdvancedAccordionComponent {
   strategicModelOverride = input<string | null>(null);
   tacticalModelOverride = input<string | null>(null);
   sessionModelOverride = input<string | null>(null);
+  /** The workspace backend chosen in the Settings tab's EXECUTION group, or
+   *  null when it is unset there. The selector is a level-1 control and lives
+   *  in ExecutionGroupComponent; this section reads it to grey the tools a lite
+   *  tier cannot run and to scope what its own `getOverrides()` emits. */
+  backendOverride = input<string | null>(null);
 
   change = output<void>();
 
@@ -879,7 +881,6 @@ export class AdvancedAccordionComponent {
   readonly tacticalReasoning = signal<string | null>(null);
   readonly tacticalTemperature = signal<number | null>(null);
   readonly tacticalMultimodal = signal<boolean | null>(null);
-  readonly sessionReasoning = signal<string | null>(null);
   readonly sessionTemperature = signal<number | null>(null);
   readonly sessionMultimodal = signal<boolean | null>(null);
   readonly topP = signal<number | null>(null);
@@ -903,13 +904,7 @@ export class AdvancedAccordionComponent {
   readonly keepRecentMessages = signal<number | null>(null);
 
   // --- Workspace ---
-  private readonly userService = inject(UserService);
-  /** Whether the current user is allowed to pick the VM backend. Admins always qualify. */
-  readonly canUseVm = computed(() => {
-    const u = this.userService.currentUser();
-    return !!(u?.is_admin || u?.can_use_vm);
-  });
-  readonly workspaceBackend = signal<string | null>(null);
+  private readonly modelService = inject(ModelService);
   readonly vmCpuCores = signal<number | null>(null);
   readonly vmMemory = signal<string | null>(null);
   readonly maxReadWords = signal<number | null>(null);
@@ -967,7 +962,6 @@ export class AdvancedAccordionComponent {
     (this.r('llm.tactical.temperature') ?? this.mv(this.effectiveTacticalModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
   readonly resolvedTacticalMultimodal = computed(() =>
     (this.r('llm.tactical.multimodal') ?? this.mv(this.effectiveTacticalModel(), 'multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
-  readonly resolvedSessionReasoning = computed(() => this.r('llm.reasoning_level') as string | null);
   readonly resolvedSessionTemp = computed(() =>
     (this.mv(this.effectiveSessionModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
   readonly resolvedSessionMultimodal = computed(() =>
@@ -999,14 +993,26 @@ export class AdvancedAccordionComponent {
   readonly resolvedKeepRecentMessages = computed(() => (this.r('context_management.keep_recent_messages') ?? 10) as number);
 
   readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'sandbox') as string);
-  readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 2) as number);
-  readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '4Gi') as string);
+  readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 8) as number);
+  readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '16Gi') as string);
   readonly resolvedMaxReadWords = computed(() => (this.r('workspace.max_read_words') ?? 25000) as number);
   readonly resolvedMaxWriteWords = computed(() => (this.r('workspace.max_write_words') ?? 10000) as number);
   readonly resolvedGitVersioning = computed(() => {
     const v = this.r('workspace.git_versioning');
     return (v ?? (this.mode() === 'job')) as boolean;
   });
+
+  // Effective backend = the Execution group's override → resolved config
+  // default. The lite tiers (`virtual`/`none`) run with no workspace container,
+  // so shell/browser/git tools are gated off server-side
+  // (no_workspace_agent_mode.md §7) and the form greys the matching controls.
+  // `none` additionally has no file tools.
+  readonly effectiveBackend = computed(() => this.backendOverride() ?? this.resolvedWorkspaceBackend());
+  readonly isLiteBackend = computed(() => {
+    const b = this.effectiveBackend();
+    return b === 'virtual' || b === 'none';
+  });
+  readonly isNoneBackend = computed(() => this.effectiveBackend() === 'none');
 
   readonly resolvedShellMode = computed(() => (this.r('shell.mode') ?? 'stateless') as string);
   readonly resolvedShellSandbox = computed(() => (this.r('shell.sandbox') ?? true) as boolean);
@@ -1031,15 +1037,17 @@ export class AdvancedAccordionComponent {
   readonly effectiveAuxTemp = computed(() => this.auxTemperature() ?? this.resolvedAuxTemperature());
 
   readonly strategicReasoningOptions = computed(() =>
-    getReasoningOptions(this.strategicModelOverride() ?? (this.r('llm.strategic.model') ?? this.r('llm.model')) as string | null)
+    reasoningOptionsForModel(
+      this.strategicModelOverride() ?? (this.r('llm.strategic.model') ?? this.r('llm.model')) as string | null,
+      this.modelService.reasoningByModel(),
+    )
   );
   readonly tacticalReasoningOptions = computed(() =>
-    getReasoningOptions(this.tacticalModelOverride() ?? (this.r('llm.tactical.model') ?? this.r('llm.model')) as string | null)
+    reasoningOptionsForModel(
+      this.tacticalModelOverride() ?? (this.r('llm.tactical.model') ?? this.r('llm.model')) as string | null,
+      this.modelService.reasoningByModel(),
+    )
   );
-  readonly sessionReasoningOptions = computed(() =>
-    getReasoningOptions(this.sessionModelOverride() ?? this.r('llm.model') as string | null)
-  );
-
   readonly inferenceModifiedCount = computed(() => {
     let c = 0;
     if (this.strategicReasoning() !== null) c++;
@@ -1048,7 +1056,6 @@ export class AdvancedAccordionComponent {
     if (this.tacticalReasoning() !== null) c++;
     if (this.tacticalTemperature() !== null) c++;
     if (this.tacticalMultimodal() !== null) c++;
-    if (this.sessionReasoning() !== null) c++;
     if (this.sessionTemperature() !== null) c++;
     if (this.sessionMultimodal() !== null) c++;
     if (this.topP() !== null) c++;
@@ -1069,22 +1076,15 @@ export class AdvancedAccordionComponent {
     this.expanded.set(next);
   }
 
-  constructor() {
-    // Snap ineligible users off 'vm' so the form can't submit a denied backend.
-    // The server is authoritative — this is a UX safeguard.
-    effect(() => {
-      if (this.canUseVm()) return;
-      const effective = this.workspaceBackend() ?? this.resolvedWorkspaceBackend();
-      if (effective === 'vm') {
-        this.workspaceBackend.set('sandbox');
-        this.vmCpuCores.set(null);
-        this.vmMemory.set(null);
-        this.emitChange();
-      }
-    });
-  }
-
   emitChange(): void { this.change.emit(); }
+
+  /** Commit a displayed-but-inherited value on deliberate interaction.
+   *  See PinOnInteractDirective — a <select> emits no change event when the
+   *  option already showing is re-picked, so without this the resolved default
+   *  is the one value the form cannot express. */
+  pinValue<T>(target: {(): T | null; set(value: T | null): void}, resolved: T): void {
+    if (pinResolvedValue(target, resolved)) this.emitChange();
+  }
 
   clampTemp(value: number): number {
     return Math.round(Math.min(2, Math.max(0, value)) * 10) / 10;
@@ -1096,7 +1096,6 @@ export class AdvancedAccordionComponent {
   onTacticalReasoningChange(v: string | null): void { this.tacticalReasoning.set(v); this.emitChange(); }
   onTacticalTempChange(v: number): void { this.tacticalTemperature.set(this.clampTemp(v)); this.emitChange(); }
   onTacticalMultimodalChange(e: Event): void { this.tacticalMultimodal.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onSessionReasoningChange(v: string | null): void { this.sessionReasoning.set(v); this.emitChange(); }
   onSessionTempChange(v: number): void { this.sessionTemperature.set(this.clampTemp(v)); this.emitChange(); }
   onSessionMultimodalChange(e: Event): void { this.sessionMultimodal.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onTopPChange(v: number | null): void { this.topP.set(v); this.emitChange(); }
@@ -1129,7 +1128,7 @@ export class AdvancedAccordionComponent {
       if (this.tacticalMultimodal() !== null) t['multimodal'] = this.tacticalMultimodal();
       if (Object.keys(t).length) llm['tactical'] = t;
     } else {
-      if (this.sessionReasoning() !== null) llm['reasoning_level'] = this.sessionReasoning();
+      // llm.reasoning_level is owned by ModelGroupComponent in session mode.
       if (this.sessionTemperature() !== null) llm['temperature'] = this.sessionTemperature();
       if (this.sessionMultimodal() !== null) llm['multimodal'] = this.sessionMultimodal();
     }
@@ -1161,34 +1160,46 @@ export class AdvancedAccordionComponent {
     if (this.keepRecentMessages() !== null) ctx['keep_recent_messages'] = this.keepRecentMessages();
     if (Object.keys(ctx).length) o['context_management'] = ctx;
 
-    // Workspace
+    // Workspace. Lite tiers (virtual/none) run with no container, so the gated
+    // tool categories' settings aren't emitted (no_workspace_agent_mode.md §7):
+    // git is forced off for any lite tier, file-size limits drop for `none`
+    // (no file tools), and the whole shell/browser fragments are skipped.
+    // `backend` itself is emitted by ExecutionGroupComponent, which owns the
+    // selector; the host deep-merges the two `workspace` fragments.
+    const lite = this.isLiteBackend();
     const ws: Record<string, unknown> = {};
-    if (this.workspaceBackend() !== null) ws['backend'] = this.workspaceBackend();
-    if (this.workspaceBackend() === 'vm') {
+    if (this.effectiveBackend() === 'vm') {
       const vm: Record<string, unknown> = {};
       if (this.vmCpuCores() !== null) vm['cpu_cores'] = this.vmCpuCores();
       if (this.vmMemory() !== null) vm['memory'] = this.vmMemory();
       if (Object.keys(vm).length) ws['vm'] = vm;
     }
-    if (this.maxReadWords() !== null) ws['max_read_words'] = this.maxReadWords();
-    if (this.maxWriteWords() !== null) ws['max_write_words'] = this.maxWriteWords();
-    if (this.gitVersioning() !== null) ws['git_versioning'] = this.gitVersioning();
+    if (!this.isNoneBackend()) {
+      if (this.maxReadWords() !== null) ws['max_read_words'] = this.maxReadWords();
+      if (this.maxWriteWords() !== null) ws['max_write_words'] = this.maxWriteWords();
+    }
+    if (!lite && this.gitVersioning() !== null) ws['git_versioning'] = this.gitVersioning();
     if (Object.keys(ws).length) o['workspace'] = ws;
 
-    // Shell
-    const sh: Record<string, unknown> = {};
-    if (this.shellMode() !== null) sh['mode'] = this.shellMode();
-    if (this.shellSandbox() !== null) sh['sandbox'] = this.shellSandbox();
-    if (this.shellTimeout() !== null) sh['default_timeout'] = this.shellTimeout();
-    if (this.sudoAction() !== null) sh['sudo_action'] = this.sudoAction();
-    if (Object.keys(sh).length) o['shell'] = sh;
+    // Shell — no shell tools on lite tiers, so skip the fragment entirely.
+    if (!lite) {
+      const sh: Record<string, unknown> = {};
+      if (this.shellMode() !== null) sh['mode'] = this.shellMode();
+      if (this.shellSandbox() !== null) sh['sandbox'] = this.shellSandbox();
+      if (this.shellTimeout() !== null) sh['default_timeout'] = this.shellTimeout();
+      if (this.sudoAction() !== null) sh['sudo_action'] = this.sudoAction();
+      if (Object.keys(sh).length) o['shell'] = sh;
+    }
 
-    // Research & Browser
+    // Research & Browser — browser tools are gated off on lite tiers; the proxy
+    // toggle stays (web_search egress still applies).
     if (this.proxyEnabled() !== null) o['research'] = { proxy: { enabled: this.proxyEnabled() } };
-    const br: Record<string, unknown> = {};
-    if (this.browserHeadless() !== null) br['headless'] = this.browserHeadless();
-    if (this.browserVision() !== null) br['use_vision'] = this.browserVision();
-    if (Object.keys(br).length) o['browser'] = br;
+    if (!lite) {
+      const br: Record<string, unknown> = {};
+      if (this.browserHeadless() !== null) br['headless'] = this.browserHeadless();
+      if (this.browserVision() !== null) br['use_vision'] = this.browserVision();
+      if (Object.keys(br).length) o['browser'] = br;
+    }
 
     // Auxiliary
     const aux: Record<string, unknown> = {};
@@ -1229,7 +1240,6 @@ export class AdvancedAccordionComponent {
     this.tacticalReasoning.set(null);
     this.tacticalTemperature.set(null);
     this.tacticalMultimodal.set(null);
-    this.sessionReasoning.set(null);
     this.sessionTemperature.set(null);
     this.sessionMultimodal.set(null);
     this.topP.set(null);
@@ -1245,7 +1255,6 @@ export class AdvancedAccordionComponent {
     this.compactOnArchive.set(null);
     this.keepRecentToolResults.set(null);
     this.keepRecentMessages.set(null);
-    this.workspaceBackend.set(null);
     this.vmCpuCores.set(null);
     this.vmMemory.set(null);
     this.maxReadWords.set(null);

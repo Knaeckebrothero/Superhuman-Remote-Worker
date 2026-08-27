@@ -49,6 +49,8 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     # the `gpt-5` prefix and the `codex` substring.
     (re.compile(r"codex-spark", re.IGNORECASE), "codex-spark"),
     (re.compile(r"codex", re.IGNORECASE), "codex"),
+    # GPT-5.6 tiers (Luna/Terra/Sol) — must beat the generic gpt-5 rule below.
+    (re.compile(r"gpt-5\.6", re.IGNORECASE), "gpt-5.6"),
     # OpenAI gpt-5 family + o-series reasoning models
     (re.compile(r"gpt-5", re.IGNORECASE), "gpt-5"),
     (re.compile(r"^o[1-9](-|$)", re.IGNORECASE), "o-series"),
@@ -65,6 +67,18 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     (re.compile(r"minimax[-_]?m3", re.IGNORECASE), "minimax-m3"),
     (re.compile(r"minimax", re.IGNORECASE), "minimax"),
     (re.compile(r"deepseek", re.IGNORECASE), "deepseek"),
+    # Mistral 3 family + specialists (Codestral/Magistral/Ministral/Devstral/
+    # Pixtral/Voxtral). Native api.mistral.ai serves bare ids; the openrouter
+    # prefix rule above recurses here for `mistralai/...`. Mirrors family_of()
+    # in src/core/model_registry.py and the `mistral` model_config_matrix family.
+    (
+        re.compile(
+            r"mistral|codestral|magistral|ministral|devstral|pixtral|voxtral",
+            re.IGNORECASE,
+        ),
+        "mistral",
+    ),
+    (re.compile(r"glm", re.IGNORECASE), "glm"),
     (re.compile(r"kimi", re.IGNORECASE), "default"),
     # Embeddings
     (re.compile(r"text-embedding", re.IGNORECASE), "openai-embedding"),

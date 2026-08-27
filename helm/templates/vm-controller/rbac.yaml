@@ -1,4 +1,4 @@
-{{- if .Values.vmController.enabled }}
+{{- if include "srw.vmSameCluster" . }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -21,6 +21,27 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete", "patch"]
+  # Golden-image cloning: the controller creates a shared golden DataVolume per
+  # image digest and GCs stale ones. Same-namespace clone → no
+  # datavolumes/source cross-namespace grant needed. PVC delete is needed too:
+  # a captured (snapshot-taken) teardown deletes the exact rootdisk PVC by UID
+  # precondition after the DataVolume, rather than trusting the cascade, so
+  # a superseded incarnation's disk can never be purged by mistake. Without
+  # the verb every captured teardown 403s and the job's VM context is left
+  # `ready` forever.
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes"]
+    verbs: ["get", "list", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "delete"]
+  # Durable replay claims for authenticated create/delete request UUIDs.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

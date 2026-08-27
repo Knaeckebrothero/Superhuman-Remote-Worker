@@ -1,0 +1,30 @@
+[Unit]
+Description=SRW code-server (live-VM Web IDE)
+Documentation=https://github.com/Knaeckebrothero/Superhuman-Remote-Worker
+After=network-online.target
+Wants=network-online.target
+
+# NOTE: intentionally NOT enabled at image-build time. The orchestrator starts
+# and stops this unit over SSH for live-VM IDE sessions, so it stays dormant
+# during normal headless job runs. Reached only via the agent's SSH
+# direct-tcpip channel to 127.0.0.1:8080 (see
+# knowledge-base/knowledge/features/vm_snapshots_and_ide.md, "Live-VM IDE Access via the Agent").
+
+[Service]
+Type=simple
+User=agent-host
+Group=agent-host
+# code-server is an interactive shell environment (terminals, sudo gate), so
+# it runs with the same latitude as the agent-host user — no ProtectSystem /
+# NoNewPrivileges sandboxing (that would break the IDE terminal and the sudo
+# approval gate). bind-addr / auth / data dirs come from the config file; the
+# positional arg is the folder code-server opens on launch.
+ExecStart=/usr/bin/code-server --config /etc/code-server/config.yaml /home/agent-host/workspace
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=code-server
+
+[Install]
+WantedBy=multi-user.target

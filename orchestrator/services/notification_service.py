@@ -103,10 +103,16 @@ class NotificationService:
         recipient_email: str | None = None,
         recipient_name: str | None = None,
         sudo_request_id: str | None = None,
+        bypass_quiet_hours: bool = False,
     ) -> dict[str, Any]:
         """Dispatch notification to all enabled channels.
 
-        Respects user channel preferences and quiet hours.
+        Respects user channel preferences and quiet hours —
+        ``bypass_quiet_hours=True`` skips only the quiet-hours queueing
+        (officer *pages*: 'action needed from you NOW' is the one urgency the
+        notify contract lets through at night, centurion.md §6; same doctrine
+        as the bespoke no-quiet-hours system alerts in this module). Channel
+        preferences still apply.
 
         Returns:
             Dict with channel results, e.g.::
@@ -128,7 +134,7 @@ class NotificationService:
         user_settings = await self._get_user_settings(user_id)
 
         # Check quiet hours
-        if self._is_in_quiet_hours(user_settings):
+        if not bypass_quiet_hours and self._is_in_quiet_hours(user_settings):
             # Queue for digest delivery when quiet hours end
             await self._queue_notification(
                 user_id=user_id,
@@ -284,6 +290,182 @@ class NotificationService:
                 except Exception as e:
                     logger.warning("Auto-disable email failed: %s", e)
                     results["email"] = False
+
+        return results
+
+    async def notify_review_returned_to_manual(
+        self,
+        user_id: str,
+        job_id: str,
+        config_name: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Notify the owner that automated review ended and a human must decide.
+
+        Two callers, both meaning "nothing was approved, it is yours now":
+
+        - ``stale_verification_sweeper``, after ``unstick_reviewing_parents``
+          flips a parent 'reviewing' → 'pending_review' because its critic
+          pipeline died. No ``reason`` — the cause is the pipeline itself.
+        - ``_escalate_target`` (orchestrator/main.py), the verification gate's
+          primary escalation: round cap reached, no progress since the last
+          round, or a critic that finished with no verdict. Passes ``reason``,
+          which is the same text written to the job's ``error_message``.
+
+        Mirrors ``notify_automation_auto_disabled``: SSE for real-time cockpit
+        plus an email if the user has that channel enabled. Does NOT respect
+        quiet hours — an unattended job needing manual review should reach the
+        owner promptly. Best-effort; failures are logged, never raised.
+        """
+        if not self._available:
+            return {"error": "NotificationService not initialized"}
+
+        results: dict[str, Any] = {}
+        user_channels = await self._get_user_channels(user_id)
+
+        label = config_name or "job"
+        review_path = f"/inbox?job={job_id}&review=1"
+        subject = "Job needs manual review — automated verification failed"
+        if reason:
+            body_md = (
+                f"Automated verification for your **{label}** job stopped without "
+                f"approving it, so it needs **manual review**.\n\n"
+                f"> {reason}\n\n"
+                f"Open it in the cockpit to approve it or send it back with "
+                f"feedback."
+            )
+        else:
+            body_md = (
+                f"Automated verification for your **{label}** job did not complete "
+                f"(the review pipeline died), so it has been returned to **manual "
+                f"review**. Open it in the cockpit to approve it or send it back "
+                f"with feedback."
+            )
+
+        # SSE broadcast — real-time cockpit notification.
+        if self._notification_feed:
+            try:
+                self._notification_feed.broadcast(
+                    user_id=user_id,
+                    event_type="review_returned_to_manual",
+                    data={
+                        "job_id": job_id,
+                        "config_name": config_name,
+                        "reason": reason or "",
+                        "cockpit_url": f"{self._cockpit_url}{review_path}",
+                    },
+                )
+                results["sse"] = True
+            except Exception as e:
+                logger.warning(
+                    "SSE broadcast failed for review-returned (job=%s): %s",
+                    job_id,
+                    e,
+                )
+                results["sse"] = False
+
+        # Email — only if the user has the email channel enabled and SMTP is
+        # configured. The SSE event is the primary in-cockpit signal.
+        if user_channels.get("email", True) and self._email_service and self._db:
+            try:
+                user = await self._db.get_user(user_id)
+            except Exception:
+                user = None
+            if user and user.get("email"):
+                try:
+                    results[
+                        "email"
+                    ] = await self._email_service.send_system_notification(
+                        to=user["email"],
+                        to_name=user.get("display_name") or "User",
+                        subject=subject,
+                        body_md=body_md,
+                        cockpit_path=review_path,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Email send failed for review-returned (job=%s): %s",
+                        job_id,
+                        e,
+                    )
+                    results["email"] = False
+        return results
+
+    async def notify_admins_user_registered(
+        self,
+        new_user_id: str,
+        display_name: str | None = None,
+        email: str | None = None,
+    ) -> dict[str, Any]:
+        """Notify all admins that a new user registered and awaits approval.
+
+        Fan-out to every admin (app-side admission — an admin decides who gets
+        in). SSE is sent unconditionally (the in-app feed isn't subject to quiet
+        hours); email is sent per each admin's channel preference and skipped
+        during that admin's quiet hours, since a registration is not
+        safety-critical. Best-effort; failures are logged, never raised.
+
+        Mirrors :py:meth:`notify_automation_auto_disabled` (direct SSE +
+        ``send_system_notification``), not the job-shaped :py:meth:`dispatch`.
+        """
+        if not self._available or not self._db:
+            return {"error": "NotificationService not initialized"}
+
+        try:
+            admin_ids = await self._db.list_admin_user_ids()
+        except Exception as e:
+            logger.warning("Could not list admins for registration notify: %s", e)
+            return {"error": "admin lookup failed"}
+
+        label = display_name or email or "A new user"
+        suffix = f" ({email})" if email else ""
+        subject = f"New user pending approval: {label}"
+        body_md = (
+            f"**{label}**{suffix} just registered and is awaiting approval.\n\n"
+            "Review and approve pending users on the Users page in the cockpit."
+        )
+
+        results: dict[str, Any] = {"notified": 0}
+        for admin_id in admin_ids:
+            if admin_id == str(new_user_id):
+                continue  # a self-registered admin isn't pending anyway
+
+            # SSE — always (the in-app feed isn't quiet-houred).
+            if self._notification_feed:
+                try:
+                    self._notification_feed.broadcast(
+                        user_id=admin_id,
+                        event_type="user_registered",
+                        data={
+                            "user_id": str(new_user_id),
+                            "display_name": display_name,
+                            "email": email,
+                            "cockpit_url": f"{self._cockpit_url}/admin/users",
+                        },
+                    )
+                    results["notified"] += 1
+                except Exception as e:
+                    logger.warning("SSE broadcast failed for user_registered: %s", e)
+
+            # Email — per preference, skipped during the admin's quiet hours.
+            if not self._email_service:
+                continue
+            try:
+                channels = await self._get_user_channels(admin_id)
+                settings = await self._get_user_settings(admin_id)
+                if not channels.get("email", True) or self._is_in_quiet_hours(settings):
+                    continue
+                admin = await self._db.get_user(admin_id)
+                if admin and admin.get("email"):
+                    await self._email_service.send_system_notification(
+                        to=admin["email"],
+                        to_name=admin.get("display_name") or "Admin",
+                        subject=subject,
+                        body_md=body_md,
+                        cockpit_path="/admin/users",
+                    )
+            except Exception as e:
+                logger.warning("Registration email to admin %s failed: %s", admin_id, e)
 
         return results
 

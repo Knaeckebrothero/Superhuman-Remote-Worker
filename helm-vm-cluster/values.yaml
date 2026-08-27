@@ -52,6 +52,17 @@ orchestratorId: ""
 # Container Images
 # =============================================================================
 image:
+  # -- Database-free infrastructure collectors run the orchestrator image so
+  # they reuse its typed normalizers and signed ingestion client without any
+  # application database credentials. Unlike the VM-controller image, this
+  # component never falls back to Chart.AppVersion: enabling VMI inventory
+  # requires an explicit independently-built tag or digest. When both are set,
+  # the digest is the deployed identity and the tag remains a display/update aid.
+  orchestrator:
+    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
   vmController:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller
     # -- Defaults to .Chart.AppVersion (set by CI on release) when empty.
@@ -89,13 +100,48 @@ nats:
 # =============================================================================
 vmController:
   replicas: 1
+  # -- Secret shared only with the paired orchestrator/controller. Empty keeps
+  # legacy unsigned lifecycle operational, but identities remain unsuitable
+  # for publication. A Vault bundle may be referenced by the chart fullname.
+  lifecycleAuthSecretName: ""
+  lifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
   # -- Default VM image — override per-job via the orchestrator API.
   # Defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<chart.AppVersion>
   defaultVmImage: ""
-  defaultCpu: 2
-  defaultMemory: "4Gi"
+  # -- Per-VM size: 8 cores / 16Gi (bumped from 2c/4Gi 2026-06-21). The
+  # orchestrator passes explicit cpu/memory per upgrade, so this is the
+  # controller-side fallback. Workspace *containers* (sandbox tier) are sized
+  # separately (container_provisioner) and are intentionally NOT changed.
+  defaultCpu: 8
+  defaultMemory: "16Gi"
   vmStorageClass: "local-path"
   vmDiskSize: "20Gi"
+  # -- Golden-image boot acceleration
+  # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md). Import the base image
+  # once into a shared golden PVC per digest; clone each VM root disk from it
+  # (host-assisted local copy on local-path) instead of a per-VM registry
+  # import. Off = byte-for-byte the current registry-per-VM behaviour.
+  goldenImage:
+    enabled: false
+    # Golden PVC size; empty → vmDiskSize (keeps the clone target >= source).
+    diskSize: ""
+    gc:
+      enabled: true
+      keep: 3            # keep the N newest image digests
+      minAgeMinutes: 30  # don't GC a golden younger than this
+  # -- Persistent VM rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
+  # Create each VM's root disk as a standalone DataVolume instead of via
+  # spec.dataVolumeTemplates, so it is not cascade-deleted with the VM. A
+  # recreate reattaches it by name: files survive a crash or a suspend, and the
+  # clone is skipped entirely. Off = today's templated (VM-owned) disk.
+  persistentRootdisk:
+    enabled: false
+    # Orphan backstop for disks whose entity row the orchestrator no longer
+    # knows (a DB reset). OFF by default: the controller has no DB, so it
+    # cannot tell a leaked disk from a long-suspended session's workspace.
+    gc:
+      enabled: false
+      orphanHours: 72
   service:
     port: 8080
   resources:
@@ -107,6 +153,104 @@ vmController:
       cpu: "200m"
 
 # =============================================================================
+# Infrastructure metering — admitted VMI and root-disk inventory (Slice 3B)
+# =============================================================================
+# Two independent database-free collectors keep compute and storage authority
+# separated. The VMI identity reads only VMIs. The storage identity reads PVCs
+# in the exact VM namespace and, only after an explicit acknowledgement, PVs
+# cluster-wide. Publication/serving/cutover are not configurable here and stay
+# hard-disabled in both Deployments.
+infrastructureMetering:
+  # -- Enable the dedicated VMI LIST/WATCH collector. Defaults dark.
+  vmInventoryEnabled: false
+  # -- Enable WATCH-backed shadow reconciliation. Requires vmInventoryEnabled.
+  vmShadowEnabled: false
+  # -- Enable the dedicated root-disk PVC LIST/WATCH collector. Defaults dark
+  # and does not enable VMI inventory or local-cluster PVC collection.
+  pvcInventoryEnabled: false
+  # -- Enable cluster-wide PV LIST/WATCH for physical-volume identity. Requires
+  # pvClusterWideRbacAcknowledged plus the durable identity Secret/version.
+  pvInventoryEnabled: false
+  # -- Enable remote PVC shadow reconciliation. Requires pvcInventoryEnabled.
+  pvcShadowEnabled: false
+  # -- Enable remote PV shadow reconciliation. Requires pvInventoryEnabled.
+  pvShadowEnabled: false
+  # -- Explicitly acknowledge that Kubernetes RBAC cannot namespace-filter PVs
+  # and the dedicated collector will be able to observe every PV in this cluster.
+  pvClusterWideRbacAcknowledged: false
+  # -- Stable identity of this VM cluster; must not be reused by another install.
+  vmStableClusterId: ""
+  # -- Exact KubeVirt VM namespace. Empty uses the Helm release namespace.
+  vmNamespace: ""
+  # -- Private/TLS orchestrator ingestion base URL reachable from this cluster.
+  orchestratorUrl: ""
+  # -- Optional static DNS overrides applied only to remote collector Pods.
+  # This keeps orchestratorUrl's TLS hostname/SNI intact while routing directly
+  # to a private ingress address. Entries use Kubernetes HostAlias shape. The
+  # initial contract intentionally accepts canonical IPv4 addresses and
+  # lowercase DNS hostnames only; invalid or ambiguous entries fail rendering.
+  orchestratorHostAliases: []
+  # - ip: "10.0.51.11"
+  #   hostnames:
+  #     - api.srw.works
+  # -- Pre-existing Secret containing a VMI-specific rotated HMAC key. The
+  # corresponding credential must be configured for collector `kubevirt-vmis`
+  # on the orchestrator cluster; this chart never creates or copies it.
+  ingestionSecretName: ""
+  ingestionSecretKey: INFRASTRUCTURE_METERING_VMI_INGESTION_KEY
+  # -- Pre-existing Secret containing the independent `kubevirt-storage`
+  # ingestion HMAC credential. It must not share a Secret with the VMI key or
+  # the non-rotating volume identity key; this chart never creates it.
+  storageIngestionSecretName: ""
+  storageIngestionSecretKey: INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY
+  # -- Pre-existing Secret containing the same non-rotating, high-entropy
+  # volume identity key used by other PV collectors. Rotating the bytes or
+  # version changes durable identities and requires an explicit migration.
+  volumeIdentitySecretName: ""
+  volumeIdentitySecretKey: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY
+  volumeIdentityKeyVersion: ""
+  # -- Optional ESO projections from the shared SRW Vault bundle. The source
+  # properties deliberately use concise Vault names, while the generated
+  # Kubernetes Secrets retain the canonical runtime keys below. Every target
+  # remains a distinct Secret even though the Vault record is shared.
+  externalSecrets:
+    enabled: false
+    vaultPath: ""
+    vmiIngestionProperty: METERING_VMI_INGESTION_KEY
+    vmStorageIngestionProperty: METERING_VM_STORAGE_INGESTION_KEY
+    volumeIdentityProperty: METERING_VOLUME_IDENTITY_KEY
+    vmLifecycleAuthProperty: METERING_VM_LIFECYCLE_HMAC_SECRET
+  # -- Bump when rotating data inside either pre-existing ingestion Secret so
+  # Helm rolls the env-backed collector Pods even though Secret names stay put.
+  credentialRevision: ""
+  relistIntervalSeconds: 300
+  staleAfterSeconds: 900
+  listPageSize: 500
+  watchQueueSize: 10000
+  maxSnapshotItems: 10000
+  maxSnapshotBytes: 67108864
+  networkPolicy:
+    # Standard NetworkPolicy cannot target an HTTPS hostname. Supply the exact
+    # control-plane and orchestrator endpoint CIDRs before enabling this fence.
+    # If the cluster CNI cannot enforce NetworkPolicy, explicitly acknowledge
+    # unrestricted egress instead of silently deploying without a boundary.
+    enabled: false
+    allowUnrestrictedEgress: false
+    apiServerCidrs: []
+    orchestratorCidrs: []
+    orchestratorPorts: [443]
+    dnsNamespace: kube-system
+    dnsPodSelector:
+      k8s-app: kube-dns
+  resources:
+    requests:
+      cpu: "25m"
+      memory: "64Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+
+# =============================================================================
 # Headscale (mesh VPN coordination server)
 # =============================================================================
 # The vm-controller calls Headscale's API to register newly-provisioned VMs.
@@ -114,6 +258,16 @@ vmController:
 headscale:
   url: ""
   user: "srw"
+  # -- Pre-auth key registration deadline (minutes). The VM must join the mesh
+  # within this window of the key being minted (at VM-create). It must comfortably
+  # exceed the worst-case create→join latency — which today includes the cold
+  # per-VM CDI image import (minutes), NOT just guest boot. The old 10-min default
+  # was sized for fast boots and the import would expire the key mid-boot, so the
+  # VM never registered a mesh IP and workspace-tier `*→vm` upgrades timed out.
+  # (Single-use + ephemeral + tag:vm-scoped, so a longer registration window is a
+  # minor trade-off. A golden-image clone — removing the import — lets this shrink
+  # again; see knowledge-base/knowledge/features/workspace_tier_upgrade.md Q7.)
+  keyExpiryMinutes: 30
   # -- Provide EXACTLY ONE source (or leave both empty to fall back to
   # externalSecrets.vaultPath — see "Layout B" in external-secret.yaml):
   #   apiKeySecret      — name of a pre-existing K8s Secret in this namespace

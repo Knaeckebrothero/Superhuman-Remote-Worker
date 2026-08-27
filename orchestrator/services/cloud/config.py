@@ -10,7 +10,7 @@ actually consumed by ``NextcloudBackend`` today — the other two exist so
 Phase 2 (OpenCloud adapter) and Phase 5 (MS365 adapter) can start from a
 populated settings class instead of re-inventing env-var plumbing.
 
-See §4.2 of ``docs/features/main_cloud_abstraction.md``.
+See §4.2 of ``knowledge-base/knowledge/features/main_cloud_abstraction.md``.
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ from __future__ import annotations
 import os
 from typing import Annotated, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, SecretStr, model_validator
+
+from .backend_instance_authority import MainCloudBackendInstanceAuthority
 
 
 class NextcloudSettings(BaseModel):
@@ -38,6 +40,36 @@ class NextcloudSettings(BaseModel):
     agent_user: str
     agent_password: SecretStr
     oidc_client_secret: Optional[SecretStr] = None
+    protected_effect_url: Optional[HttpUrl] = None
+    protected_effect_config_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    protected_effect_hmac_key: Optional[SecretStr] = None
+
+    @model_validator(mode="after")
+    def _protected_effect_lane_is_complete(self) -> NextcloudSettings:
+        coordinates = (
+            self.protected_effect_url,
+            self.protected_effect_config_sha256,
+            self.protected_effect_hmac_key,
+        )
+        if any(value is not None for value in coordinates) and not all(
+            value is not None for value in coordinates
+        ):
+            raise ValueError(
+                "Nextcloud protected-effect URL, config digest, and HMAC key "
+                "must be configured together"
+            )
+        if (
+            self.protected_effect_hmac_key is not None
+            and len(self.protected_effect_hmac_key.get_secret_value().encode("utf-8"))
+            < 32
+        ):
+            raise ValueError(
+                "Nextcloud protected-effect HMAC key must contain at least 32 bytes"
+            )
+        return self
 
 
 class OpenCloudSettings(BaseModel):
@@ -59,6 +91,12 @@ class OpenCloudSettings(BaseModel):
     # proxy.yaml with a different role_mapping.
     admin_role_claim_value: str = "opencloudAdmin"
     default_quota_bytes: Optional[int] = None
+    # Local-dev only: rclone mounts pass --no-check-certificate so the tus
+    # upload hop (ocdav redirects PATCHes to the PUBLIC data-gateway URL,
+    # which presents the mkcert edge cert on local k3d) doesn't fail TLS
+    # verification. All other mount traffic uses the internal plain-HTTP
+    # service URL and is unaffected. Never enable on a real deployment.
+    mount_insecure_tls: bool = False
 
 
 class MS365Settings(BaseModel):
@@ -241,6 +279,14 @@ def load_main_cloud_config(
                 "oidc_client_secret": _secret(
                     "oidc_client_secret", "NEXTCLOUD_OIDC_CLIENT_SECRET"
                 ),
+                "protected_effect_url": _ov("protected_effect_url")
+                or _pick("NEXTCLOUD_PROTECTED_EFFECT_URL"),
+                "protected_effect_config_sha256": _ov("protected_effect_config_sha256")
+                or _pick("NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256"),
+                "protected_effect_hmac_key": _secret(
+                    "protected_effect_hmac_key",
+                    "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY",
+                ),
             }
         }
     elif backend_id == "opencloud":
@@ -279,6 +325,13 @@ def load_main_cloud_config(
                 "default_quota_bytes": overlay_value.get("default_quota_bytes")
                 if overlay_value.get("default_quota_bytes") is not None
                 else _parse_int(os.getenv("OPENCLOUD_DEFAULT_QUOTA_BYTES")),
+                "mount_insecure_tls": (
+                    _ov("mount_insecure_tls")
+                    or os.getenv("OPENCLOUD_MOUNT_INSECURE_TLS", "")
+                )
+                .strip()
+                .lower()
+                in ("1", "true", "yes"),
             }
         }
     elif backend_id == "ms365":
@@ -343,7 +396,7 @@ def missing_secret_envs(
     run "just works". This helper lets the admin endpoints **refuse to activate**
     (PUT) or **warn before probing** (test) a backend whose real secrets are not
     wired, instead of silently connecting with dev credentials and failing at
-    the first cloud call. See ``docs/issues/main_cloud.md`` Issue 5.
+    the first cloud call. See ``knowledge-base/knowledge/issues/main_cloud.md`` Issue 5.
 
     Returns one ``{"field", "env_var", "checked"}`` entry per missing secret; an
     empty list means every required secret resolves to a non-empty value.
@@ -384,3 +437,151 @@ def missing_secret_envs(
                 }
             )
     return missing
+
+
+def main_cloud_routing_snapshot(settings: MainCloudConfig) -> dict:
+    """Return the complete non-secret routing snapshot for DB adoption."""
+
+    if isinstance(settings, NextcloudSettings):
+        return {
+            "version": 1,
+            "backend_id": "nextcloud",
+            "base_url": str(settings.base_url),
+            "public_url": str(settings.public_url),
+            "admin_user": settings.admin_user,
+            "agent_user": settings.agent_user,
+            "protected_effect_url": (
+                str(settings.protected_effect_url).rstrip("/")
+                if settings.protected_effect_url is not None
+                else None
+            ),
+            "protected_effect_config_sha256": (settings.protected_effect_config_sha256),
+        }
+    if isinstance(settings, OpenCloudSettings):
+        return {
+            "version": 1,
+            "backend_id": "opencloud",
+            "base_url": str(settings.base_url),
+            "public_url": str(settings.public_url),
+            "keycloak_issuer": str(settings.keycloak_issuer),
+            "keycloak_client_id": settings.keycloak_client_id,
+            "admin_role_claim_value": settings.admin_role_claim_value,
+            "default_quota_bytes": settings.default_quota_bytes,
+            "mount_insecure_tls": settings.mount_insecure_tls,
+        }
+    raise ValueError("MS365 does not have a main-cloud instance contract")
+
+
+def main_cloud_secret_references(
+    backend_id: str,
+    db_overlay: Optional[dict] = None,
+) -> dict[str, str]:
+    """Resolve the env *names* that supplied the active backend's secrets.
+
+    Secret values are never returned. Required fields fail closed when their
+    source is only a built-in development default: such a value cannot be
+    reconstructed safely by another replica or by historical cleanup.
+    """
+
+    required = _REQUIRED_SECRET_ENVS.get(backend_id)
+    if required is None:
+        raise ValueError(f"unknown main cloud backend: {backend_id!r}")
+    optional: dict[str, tuple[str, ...]] = (
+        {
+            "oidc_client_secret": ("NEXTCLOUD_OIDC_CLIENT_SECRET",),
+            "protected_effect_hmac_key": ("NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY",),
+        }
+        if backend_id == "nextcloud"
+        else {}
+    )
+    overlay_value = (db_overlay or {}).get("value") or {}
+    if not isinstance(overlay_value, dict):
+        overlay_value = {}
+    secret_fields = overlay_value.get("__secret_fields__") or []
+    if not isinstance(secret_fields, list):
+        secret_fields = []
+    credentials_ref = (db_overlay or {}).get("credentials_ref")
+
+    refs: dict[str, str] = {}
+    for field, fallbacks in {**required, **optional}.items():
+        if (
+            isinstance(credentials_ref, str)
+            and credentials_ref.startswith("env:")
+            and field in secret_fields
+        ):
+            env_name = credentials_ref[4:]
+            if not env_name or not os.getenv(env_name):
+                if field in required:
+                    raise ValueError(
+                        f"required secret env is unset for {backend_id}.{field}"
+                    )
+                continue
+            refs[field] = f"env:{env_name}"
+            continue
+        env_name = next((name for name in fallbacks if os.getenv(name)), None)
+        if env_name is None:
+            if field in required:
+                raise ValueError(
+                    f"required secret env is unset for {backend_id}.{field}"
+                )
+            continue
+        refs[field] = f"env:{env_name}"
+    return refs
+
+
+def load_main_cloud_config_from_instance(
+    authority: MainCloudBackendInstanceAuthority,
+) -> MainCloudConfig:
+    """Rebuild one historical adapter only from its retained snapshot.
+
+    There is deliberately no fallback to the active overlay or legacy env
+    aliases. Every required secret must resolve through the exact reference
+    recorded on this backend instance.
+    """
+
+    if not isinstance(authority, MainCloudBackendInstanceAuthority):
+        raise ValueError("main-cloud backend instance authority is missing")
+    routing = authority.routing
+    refs = authority.secret_refs
+
+    def _secret(field: str, *, required: bool = True) -> str | None:
+        reference = refs.get(field)
+        if reference is None:
+            if required:
+                raise ValueError(f"main-cloud secret reference {field!r} is missing")
+            return None
+        value = os.getenv(reference.removeprefix("env:"))
+        if not value:
+            raise ValueError(f"main-cloud secret reference {field!r} is unresolved")
+        return value
+
+    if authority.backend_id == "nextcloud":
+        return NextcloudSettings(
+            backend_id="nextcloud",
+            base_url=routing["base_url"],
+            public_url=routing["public_url"],
+            admin_user=routing["admin_user"],
+            admin_password=_secret("admin_password"),
+            agent_user=routing["agent_user"],
+            agent_password=_secret("agent_password"),
+            oidc_client_secret=_secret("oidc_client_secret", required=False),
+            protected_effect_url=routing["protected_effect_url"],
+            protected_effect_config_sha256=routing["protected_effect_config_sha256"],
+            protected_effect_hmac_key=_secret(
+                "protected_effect_hmac_key",
+                required=False,
+            ),
+        )
+    if authority.backend_id == "opencloud":
+        return OpenCloudSettings(
+            backend_id="opencloud",
+            base_url=routing["base_url"],
+            public_url=routing["public_url"],
+            keycloak_issuer=routing["keycloak_issuer"],
+            keycloak_client_id=routing["keycloak_client_id"],
+            keycloak_client_secret=_secret("keycloak_client_secret"),
+            admin_role_claim_value=routing["admin_role_claim_value"],
+            default_quota_bytes=routing["default_quota_bytes"],
+            mount_insecure_tls=routing["mount_insecure_tls"],
+        )
+    raise ValueError(f"unsupported main-cloud backend {authority.backend_id!r}")

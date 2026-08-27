@@ -1,13 +1,14 @@
 """Tests for Phase 3 of headless persistent sessions: DB-backed permission
-gates with LISTEN/NOTIFY. The real round-trip (INSERT → UPDATE → trigger →
-NOTIFY → wake) needs a live Postgres and lives in integration tests; here
-we cover the data-flow and contract surface with mocks.
+gates. The real INSERT → UPDATE → polling round-trip needs a live Postgres
+and lives in integration tests; here we cover the data-flow and contract
+surface with mocks.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from src.persistent_graph import PermissionOutcome
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,10 @@ def _make_postgres_conn(
     async def _fetchval(sql, *args, **kwargs):
         if "INSERT" in sql:
             return insert_returns
+        if "SELECT id FROM threads" in sql:
+            return args[0]
+        if "SELECT unit_id FROM run_queue" in sql:
+            return args[0]
         if "SELECT status" in sql:
             return (
                 select_status_sequence.pop(0) if select_status_sequence else "pending"
@@ -115,7 +120,9 @@ class TestPermissionCheckEarlyReturns:
         import src.api.persistent_app as mod
 
         result = await mod._loop_permission_check("read_file", {}, "tc1")
-        assert result is False
+        # A gone session can never be answered — a real stop, not a pending
+        # question, so DECLINED (not NO_ANSWER).
+        assert result is PermissionOutcome.DECLINED
 
     @pytest.mark.asyncio
     async def test_autonomous_approves_without_db(self):
@@ -123,7 +130,7 @@ class TestPermissionCheckEarlyReturns:
 
         _install_session(postgres_conn=None, permission_mode="autonomous")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
-        assert result is True
+        assert result is PermissionOutcome.APPROVED
 
     @pytest.mark.asyncio
     async def test_auto_accept_approves_non_shell(self):
@@ -131,7 +138,7 @@ class TestPermissionCheckEarlyReturns:
 
         _install_session(postgres_conn=None, permission_mode="auto_accept")
         result = await mod._loop_permission_check("read_file", {}, "tc1")
-        assert result is True
+        assert result is PermissionOutcome.APPROVED
 
     @pytest.mark.asyncio
     async def test_auto_accept_falls_through_for_shell(self):
@@ -141,7 +148,8 @@ class TestPermissionCheckEarlyReturns:
 
         session = _install_session(postgres_conn=None, permission_mode="auto_accept")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
-        assert result is False
+        # No durable row can exist, so no later answer is possible: DECLINED.
+        assert result is PermissionOutcome.DECLINED
         assert session.tool_decisions["tc1"] == "denied"
 
 
@@ -192,6 +200,33 @@ class TestInsertPermissionRequest:
         _install_session(postgres_conn=postgres)
         rid = await mod._insert_permission_request("tc1", "x", {})
         assert rid is None
+
+    @pytest.mark.asyncio
+    async def test_stateless_insert_stamps_exact_accepted_lease_token(
+        self, monkeypatch
+    ):
+        import src.api.persistent_app as mod
+        from src.api.lease_context import LeaseHandle
+
+        postgres = _make_postgres_conn(insert_returns="aaaaaaaa-1111")
+        _install_session(postgres_conn=postgres)
+        mod._thread_id = "11111111-1111-4111-8111-111111111111"
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        handle = LeaseHandle()
+        handle.update(mod._thread_id, 17)
+        context_token = mod._current_lease_var.set(handle)
+        try:
+            rid = await mod._insert_permission_request("tc1", "read_file", {})
+        finally:
+            mod._current_lease_var.reset(context_token)
+
+        assert rid == "aaaaaaaa-1111"
+        calls = postgres._fake_conn.fetchval.await_args_list
+        assert "FOR UPDATE" in calls[0].args[0]
+        assert "FOR SHARE" in calls[1].args[0]
+        insert = calls[2]
+        assert "accepted_lease_token" in insert.args[0]
+        assert insert.args[-1] == 17
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +303,7 @@ class TestResolvePendingPermission:
 
 
 # ---------------------------------------------------------------------------
-# Section 4 — _wait_for_permission_resolution: race-safe SELECT-first
+# Section 4 — _wait_for_permission_resolution: short-acquisition polling
 # ---------------------------------------------------------------------------
 
 
@@ -278,17 +313,23 @@ class TestWaitForPermissionResolution:
 
         mod._session = None
         mod._thread_id = None
+        # The wait races the status read against this module global. A stale
+        # Event left behind by an earlier test file is bound to that file's
+        # (now closed) event loop, so awaiting it here raises and the wait
+        # returns its conservative 'denied' default instead of the real
+        # status. Own the precondition rather than inherit it.
+        mod._hard_interrupt_event = None
 
     def teardown_method(self):
         import src.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
+        mod._hard_interrupt_event = None
 
     @pytest.mark.asyncio
     async def test_returns_immediately_if_already_approved(self):
-        """SELECT-first guard: if the UPDATE happened between INSERT and
-        add_listener, the pre-wait status check picks it up without waiting."""
+        """The first short acquisition observes a decision without waiting."""
         import src.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
@@ -297,9 +338,8 @@ class TestWaitForPermissionResolution:
         _install_session(postgres_conn=postgres)
         result = await mod._wait_for_permission_resolution("rid-1", timeout=1.0)
         assert result == "approved"
-        # add_listener registered then immediately removed.
-        postgres._fake_conn.add_listener.assert_awaited_once()
-        postgres._fake_conn.remove_listener.assert_awaited_once()
+        postgres._fake_conn.add_listener.assert_not_awaited()
+        postgres._fake_conn.remove_listener.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_denied_when_already_denied(self):
@@ -332,58 +372,56 @@ class TestWaitForPermissionResolution:
         assert "SET status = 'expired'" in update_sql
 
     @pytest.mark.asyncio
-    async def test_returns_denied_on_db_error(self):
+    async def test_db_error_is_a_non_decision_not_a_denial(self):
+        """A read that blows up says nothing about what the user wanted, so it
+        must not come back as a refusal — the model would be told the user
+        declined a call they were never asked about."""
         import src.api.persistent_app as mod
 
         postgres = _make_postgres_conn()
-        postgres._fake_conn.add_listener.side_effect = RuntimeError("listener fail")
+        postgres._fake_conn.fetchval.side_effect = RuntimeError("status read failed")
         _install_session(postgres_conn=postgres)
         result = await mod._wait_for_permission_resolution("rid-4", timeout=0.1)
-        assert result == "denied"
+        assert result == "unavailable"
+        assert result != "denied"
+        # The row is left pending: no decision was made, so none is recorded.
+        assert postgres._fake_conn.execute.await_args_list == []
 
     @pytest.mark.asyncio
-    async def test_notify_callback_wakes_the_wait(self):
-        """When the NOTIFY callback fires for our id, the wait returns
-        the final status from the post-wake SELECT."""
+    async def test_dead_session_is_a_non_decision_not_a_denial(self):
         import src.api.persistent_app as mod
 
-        target_id = "rid-5"
+        mod._session = None
+        result = await mod._wait_for_permission_resolution("rid-6", timeout=0.1)
+        assert result == "unavailable"
 
-        captured_callbacks = []
+    @pytest.mark.asyncio
+    async def test_retired_row_reads_as_expired_not_denied(self):
+        """The untethered CAS found no row to re-read — the question is gone
+        unanswered, which is an expiry, not a refusal."""
+        import src.api.persistent_app as mod
 
-        async def _capture_listener(channel, callback):
-            captured_callbacks.append(callback)
+        postgres = _make_postgres_conn(select_status_sequence=["pending", None])
+        _install_session(postgres_conn=postgres)
+        mod._subscribers.clear()
+        result = await mod._wait_for_permission_resolution("rid-7", timeout=0.1)
+        assert result == "expired"
+
+    @pytest.mark.asyncio
+    async def test_short_poll_observes_resolution(self, monkeypatch):
+        """A decision committed during the slice is observed on a fresh poll."""
+        import src.api.persistent_app as mod
 
         postgres = _make_postgres_conn(
-            # Pre-wait SELECT: pending. Post-wake SELECT: approved.
+            # First short acquisition: pending. Next acquisition: approved.
             select_status_sequence=["pending", "approved"],
         )
-        postgres._fake_conn.add_listener.side_effect = _capture_listener
         _install_session(postgres_conn=postgres)
+        monkeypatch.setattr(mod, "_PERMISSION_POLL_SECONDS", 0.01)
 
-        async def _trigger_notify():
-            # Wait for the listener to register, then fire a NOTIFY
-            # carrying our id.
-            for _ in range(50):
-                if captured_callbacks:
-                    break
-                await asyncio.sleep(0.01)
-            assert captured_callbacks, "listener never registered"
-            import json as _json
-
-            captured_callbacks[0](
-                MagicMock(),
-                12345,
-                "thread_permission_updates",
-                _json.dumps({"id": target_id, "status": "approved"}),
-            )
-
-        trigger_task = asyncio.create_task(_trigger_notify())
-        try:
-            result = await mod._wait_for_permission_resolution(target_id, timeout=2.0)
-        finally:
-            await trigger_task
+        result = await mod._wait_for_permission_resolution("rid-5", timeout=2.0)
         assert result == "approved"
+        postgres._fake_conn.add_listener.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +438,8 @@ class TestLoopPermissionCheckDBPath:
         mod._subscribers.clear()
         mod._events_epoch = 0
         mod._next_seq = 0
+        # Reaches _wait_for_permission_resolution — same cross-loop hazard.
+        mod._hard_interrupt_event = None
 
     def teardown_method(self):
         import src.api.persistent_app as mod
@@ -407,6 +447,7 @@ class TestLoopPermissionCheckDBPath:
         mod._session = None
         mod._thread_id = None
         mod._subscribers.clear()
+        mod._hard_interrupt_event = None
 
     @pytest.mark.asyncio
     async def test_denies_when_insert_fails(self):
@@ -414,7 +455,7 @@ class TestLoopPermissionCheckDBPath:
 
         session = _install_session(postgres_conn=None, permission_mode="supervised")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
-        assert result is False
+        assert result is PermissionOutcome.DECLINED
         assert session.tool_decisions["tc1"] == "denied"
 
     @pytest.mark.asyncio
@@ -427,7 +468,7 @@ class TestLoopPermissionCheckDBPath:
         )
         session = _install_session(postgres_conn=postgres, permission_mode="supervised")
         result = await mod._loop_permission_check("run_command", {"cmd": "ls"}, "tc1")
-        assert result is True
+        assert result is PermissionOutcome.APPROVED
         assert session.tool_decisions["tc1"] == "approved"
 
     @pytest.mark.asyncio
@@ -442,7 +483,8 @@ class TestLoopPermissionCheckDBPath:
         result = await mod._loop_permission_check(
             "run_command", {"cmd": "rm -rf /"}, "tc1"
         )
-        assert result is False
+        # An explicit user "no" — DECLINED, distinct from an unanswered gate.
+        assert result is PermissionOutcome.DECLINED
         assert session.tool_decisions["tc1"] == "denied"
 
     @pytest.mark.asyncio

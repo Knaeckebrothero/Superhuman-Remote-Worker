@@ -383,6 +383,7 @@ class TestReconcilerTick:
             "reaped": 0,
             "reap_attempts": 0,
             "reap_forced": 0,
+            "orphans_reaped": 0,
         }
 
     @pytest.mark.asyncio

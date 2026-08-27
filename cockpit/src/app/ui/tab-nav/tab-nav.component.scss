@@ -6,6 +6,7 @@
 
   &[data-orientation='horizontal'] {
     flex-direction: row;
+    flex-wrap: wrap;
     gap: 0;
     border-bottom: 1px solid var(--border-color);
   }

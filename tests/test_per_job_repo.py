@@ -20,6 +20,13 @@ import main as orch_main  # noqa: E402
 
 MODULE = "main"
 
+DELETE_RESULT = {
+    "status": "deleted",
+    "ticket_claim_retained": False,
+    "ticket_rearmed": False,
+    "message": "Job deleted. This job had no durable backlog-ticket claim.",
+}
+
 
 def _stub_request() -> MagicMock:
     """A minimal Request stub for endpoints whose Track A/B gates need one.
@@ -178,14 +185,25 @@ class TestDeleteJobGiteaCleanup:
             _bypass_job_access_gate(job),
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
+            mock_db.claim_managed_repository_authority_revoke = AsyncMock(
+                return_value=None
+            )
+            mock_db.claim_managed_repository_creation_cleanup = AsyncMock(
+                return_value=None
+            )
             mock_gitea.is_initialized = True
+            mock_gitea.repository_owner = "srw"
             mock_gitea.delete_repo = AsyncMock()
             mock_gitea.delete_branch = AsyncMock()
 
             result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
 
-            assert result == {"status": "deleted"}
-            mock_gitea.delete_repo.assert_awaited_once_with("job-abcd1234")
+            assert result == DELETE_RESULT
+            mock_gitea.delete_repo.assert_awaited_once_with(
+                "job-abcd1234", intent_marker=None
+            )
             mock_gitea.delete_branch.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -204,13 +222,15 @@ class TestDeleteJobGiteaCleanup:
             _bypass_job_access_gate(job),
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
             mock_gitea.is_initialized = True
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
             result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
 
-            assert result == {"status": "deleted"}
+            assert result == DELETE_RESULT
             mock_gitea.delete_branch.assert_awaited_once_with(
                 "job-parent12", "subjob/abcd1234/creator"
             )
@@ -232,6 +252,8 @@ class TestDeleteJobGiteaCleanup:
             _bypass_job_access_gate(job),
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
             mock_db.get_project_repositories = AsyncMock(
                 return_value=[{"name": "project-jobs-repo"}]
             )
@@ -241,14 +263,49 @@ class TestDeleteJobGiteaCleanup:
 
             result = await orch_main.delete_job(_stub_request(), "legacy-id")
 
-            assert result == {"status": "deleted"}
+            assert result == DELETE_RESULT
             mock_gitea.delete_branch.assert_awaited_once_with(
                 "project-jobs-repo", "job/legacy-branch"
             )
 
     @pytest.mark.asyncio
-    async def test_gitea_not_initialized_skips_cleanup(self):
-        """When Gitea is not initialized, cleanup is skipped entirely."""
+    async def test_legacy_stamped_shared_repo_is_never_deleted_with_job(self):
+        """Later legacy rows stored the shared repo name directly on the job.
+
+        The presence of ``repo_name`` must not make that shared project repo
+        look job-owned during migration cleanup.
+        """
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "repo_name": "project-68137e29-jobs",
+            "branch_name": "job/12345678",
+            "parent_job_id": None,
+            "project_id": "68137e29-1111-2222-3333-444444444444",
+        }
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
+            mock_gitea.is_initialized = True
+            mock_gitea.delete_branch = AsyncMock()
+            mock_gitea.delete_repo = AsyncMock()
+
+            result = await orch_main.delete_job(_stub_request(), str(job["id"]))
+
+        assert result == DELETE_RESULT
+        mock_gitea.delete_branch.assert_awaited_once_with(
+            "project-68137e29-jobs", "job/12345678"
+        )
+        mock_gitea.delete_repo.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_gitea_not_initialized_retains_owner_for_revocation_retry(self):
+        """An unavailable forge may not orphan a still-usable repository key."""
         job = {"repo_name": "job-abc", "branch_name": None, "parent_job_id": None}
 
         with (
@@ -257,13 +314,142 @@ class TestDeleteJobGiteaCleanup:
             _bypass_job_access_gate(job),
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
+            mock_db.claim_managed_repository_authority_revoke = AsyncMock(
+                return_value=None
+            )
+            mock_db.claim_managed_repository_creation_cleanup = AsyncMock(
+                return_value=None
+            )
             mock_gitea.is_initialized = False
+            mock_gitea.repository_owner = "srw"
+            mock_gitea.delete_repo = AsyncMock(return_value=False)
 
-            result = await orch_main.delete_job(_stub_request(), "some-id")
+            with pytest.raises(HTTPException) as exc:
+                await orch_main.delete_job(_stub_request(), "some-id")
 
-            assert result == {"status": "deleted"}
-            mock_gitea.delete_repo.assert_not_called()
+            assert exc.value.status_code == 503
+            mock_db.delete_job.assert_not_awaited()
+            mock_gitea.delete_repo.assert_awaited_once_with(
+                "job-abc", intent_marker=None
+            )
             mock_gitea.delete_branch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stateless_delete_fences_and_prunes_before_resource_cleanup(self):
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "execution_lane": "stateless",
+            "repo_name": None,
+            "branch_name": None,
+            "parent_job_id": None,
+            "project_id": None,
+        }
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            patch(f"{MODULE}.snapshot_service") as mock_snapshots,
+            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=True)
+
+            async def cleanup_after_fence(_job_id):
+                mock_db.prepare_stateless_job_for_delete.assert_awaited_once_with(
+                    str(job["id"])
+                )
+
+            cleanup_workspace.side_effect = cleanup_after_fence
+
+            async def delete_after_fence(
+                _job_id,
+                *,
+                prepared_stateless=False,
+                deletion_actor_user_id=None,
+                deletion_reason=None,
+                return_claim_state=False,
+            ):
+                mock_db.prepare_stateless_job_for_delete.assert_awaited_once()
+                assert prepared_stateless is True
+                assert deletion_actor_user_id == (
+                    "00000000-0000-0000-0000-000000000099"
+                )
+                assert deletion_reason == "authorized_api_delete"
+                assert return_claim_state is True
+                return {"deleted": True, "ticket_claim_retained": False}
+
+            mock_db.delete_job = AsyncMock(side_effect=delete_after_fence)
+            mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
+            mock_gitea.is_initialized = False
+            mock_snapshots.is_available = False
+
+            result = await orch_main.delete_job(_stub_request(), str(job["id"]))
+
+        assert result == DELETE_RESULT
+        cleanup_workspace.assert_awaited_once_with(str(job["id"]))
+        mock_db.delete_job.assert_awaited_once_with(
+            str(job["id"]),
+            prepared_stateless=True,
+            deletion_actor_user_id="00000000-0000-0000-0000-000000000099",
+            deletion_reason="authorized_api_delete",
+            return_claim_state=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stateless_delete_prepare_failure_keeps_resources_intact(self):
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "execution_lane": "stateless",
+            "parent_job_id": None,
+            "project_id": None,
+        }
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=False)
+            mock_db.delete_job = AsyncMock()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await orch_main.delete_job(_stub_request(), str(job["id"]))
+
+        assert exc_info.value.status_code == 409
+        cleanup_workspace.assert_not_awaited()
+        mock_db.delete_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_delete_strict_prune_error_keeps_resources_intact(self):
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "execution_lane": "stateless",
+            "parent_job_id": None,
+            "project_id": None,
+        }
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}._archive_and_cleanup_workspace") as cleanup_workspace,
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.prepare_stateless_job_for_delete = AsyncMock(
+                side_effect=RuntimeError("strict prune failed")
+            )
+            mock_db.delete_job = AsyncMock()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await orch_main.delete_job(_stub_request(), str(job["id"]))
+
+        assert exc_info.value.status_code == 500
+        assert "strict prune failed" in str(exc_info.value.detail)
+        cleanup_workspace.assert_not_awaited()
+        mock_db.delete_job.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_job_not_found_raises_404(self):
@@ -325,8 +511,13 @@ class TestSubjobMergeEndpoint:
 
     @pytest.mark.asyncio
     async def test_returns_skipped_when_no_branch(self):
-        """Subjob without branch config returns skipped."""
-        job = {"parent_job_id": "parent-id", "branch_name": None, "repo_name": None}
+        """Stateless subjob merge is unchanged by the /complete lease fence."""
+        job = {
+            "parent_job_id": "parent-id",
+            "branch_name": None,
+            "repo_name": None,
+            "execution_lane": "stateless",
+        }
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
@@ -425,6 +616,9 @@ class _GraftFakeGitea:
     def __init__(self, trees: dict[str, dict[str, bytes]]):
         self.trees = {b: dict(t) for b, t in trees.items()}
         self.is_initialized = True
+        self.commits: dict[str, list[dict[str, str]]] = {}
+        self.commit_probe_available = True
+        self.change_calls: list[dict[str, object]] = []
 
     async def list_tree(self, repo, ref):
         return [{"path": p, "type": "blob"} for p in self.trees.get(ref, {})]
@@ -442,10 +636,23 @@ class _GraftFakeGitea:
         return [{"name": n, "path": f"outputs/{n}", "type": "dir"} for n in names]
 
     async def change_files(self, repo, branch, files, message):
+        self.change_calls.append(
+            {"repo": repo, "branch": branch, "files": files, "message": message}
+        )
         tree = self.trees.setdefault(branch, {})
         for f in files:
             tree[f["path"]] = _b64.b64decode(f["content_b64"])
+        self.commits.setdefault(branch, []).insert(
+            0,
+            {"sha": f"commit-{len(self.change_calls)}", "message": message},
+        )
         return True
+
+    async def get_commits(self, repo, sha="main", page=1, limit=20):
+        if not self.commit_probe_available:
+            return None
+        start = (page - 1) * limit
+        return self.commits.get(sha, [])[start : start + limit]
 
 
 def _subjob(**over):
@@ -463,6 +670,8 @@ def _subjob(**over):
 
 
 class TestGraftSubjobOutput:
+    COMMAND_ID = "12345678-1234-5678-9abc-123456789abc"
+
     @pytest.mark.asyncio
     async def test_grafts_output_to_namespaced_dir_and_leaves_parent_untouched(self):
         fake = _GraftFakeGitea(
@@ -488,7 +697,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -534,7 +743,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -557,7 +766,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -582,7 +791,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -611,7 +820,7 @@ class TestGraftSubjobOutput:
                 }.get(j)
             )
             db.update_job_merge_status = AsyncMock()
-            db.update_job_context = AsyncMock()
+            db.merge_job_context = AsyncMock()
 
             result = await orch_main._graft_subjob_output("sub-uuid-1234abcd")
 
@@ -620,7 +829,159 @@ class TestGraftSubjobOutput:
         assert result["output_path"] == "outputs/001-scholar-sub-uuid"
         # No second ordinal folder created; context not rewritten.
         assert not any(k.startswith("outputs/002-") for k in fake.trees["main"])
-        db.update_job_context.assert_not_called()
+        db.merge_job_context.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_command_key_is_written_as_exact_commit_trailer(self):
+        fake = _GraftFakeGitea(
+            {
+                "main": {},
+                "subjob/1234abcd/scholar": {"output/report.md": b"done"},
+            }
+        )
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda job_id: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(job_id)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.merge_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output(
+                "sub-uuid-1234abcd",
+                completion_command_id=self.COMMAND_ID,
+            )
+
+        message = str(fake.change_calls[0]["message"])
+        assert f"SRW-Completion-Command: {self.COMMAND_ID}" in message
+        assert f"SRW-Graft-Output: {result['output_path']}" in message
+
+    @pytest.mark.asyncio
+    async def test_command_trailer_reconciles_commit_before_db_marker(self):
+        output_path = "outputs/007-scholar-sub-uuid"
+        fake = _GraftFakeGitea(
+            {
+                "main": {f"{output_path}/report.md": b"already committed"},
+                "subjob/1234abcd/scholar": {"output/report.md": b"done"},
+            }
+        )
+        fake.commits["main"] = [
+            {
+                "sha": "deadbeef",
+                "message": (
+                    f"Graft {output_path} from subjob sub-uuid\n\n"
+                    f"SRW-Completion-Command: {self.COMMAND_ID}\n"
+                    f"SRW-Graft-Output: {output_path}"
+                ),
+            }
+        ]
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda job_id: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(job_id)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.merge_job_context = AsyncMock()
+
+            result = await orch_main._graft_subjob_output(
+                "sub-uuid-1234abcd",
+                completion_command_id=self.COMMAND_ID,
+            )
+
+        assert result == {
+            "status": "grafted",
+            "reason": "reconciled-command-trailer",
+            "base_branch": "main",
+            "output_path": output_path,
+            "commit_sha": "deadbeef",
+        }
+        assert fake.change_calls == []
+        db.update_job_merge_status.assert_awaited_once_with(
+            "sub-uuid-1234abcd", merge_status="grafted"
+        )
+        db.merge_job_context.assert_awaited_once_with(
+            "sub-uuid-1234abcd", {"graft_output_path": output_path}
+        )
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_command_probe_refuses_to_repeat_graft(self):
+        from services.completion_effect_reconciliation import (
+            CompletionEffectProbeError,
+        )
+
+        fake = _GraftFakeGitea(
+            {
+                "main": {},
+                "subjob/1234abcd/scholar": {"output/report.md": b"done"},
+            }
+        )
+        fake.commit_probe_available = False
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda job_id: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(job_id)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.merge_job_context = AsyncMock()
+
+            with pytest.raises(CompletionEffectProbeError):
+                await orch_main._graft_subjob_output(
+                    "sub-uuid-1234abcd",
+                    completion_command_id=self.COMMAND_ID,
+                )
+
+        assert fake.change_calls == []
+        db.update_job_merge_status.assert_not_awaited()
+        db.merge_job_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_write_result_stays_pending_for_command_probe(self):
+        fake = _GraftFakeGitea(
+            {
+                "main": {},
+                "subjob/1234abcd/scholar": {"output/report.md": b"done"},
+            }
+        )
+        fake.change_files = AsyncMock(return_value=False)
+        with (
+            patch(f"{MODULE}.postgres_db") as db,
+            patch(f"{MODULE}.gitea_client", fake),
+        ):
+            db.get_job = AsyncMock(
+                side_effect=lambda job_id: {
+                    "sub-uuid-1234abcd": _subjob(),
+                    "parent-uuid": {"branch_name": None},
+                }.get(job_id)
+            )
+            db.update_job_merge_status = AsyncMock()
+            db.merge_job_context = AsyncMock()
+
+            with pytest.raises(
+                RuntimeError, match="durable graft write outcome is ambiguous"
+            ):
+                await orch_main._graft_subjob_output(
+                    "sub-uuid-1234abcd",
+                    completion_command_id=self.COMMAND_ID,
+                )
+
+        fake.change_files.assert_awaited_once()
+        db.update_job_merge_status.assert_not_awaited()
+        db.merge_job_context.assert_not_awaited()
 
 
 class TestCompletionGraftWiring:
@@ -690,13 +1051,38 @@ class TestScholarOutputPointer:
             db.get_job = AsyncMock(
                 side_effect=lambda j: {"sch-1": scholar_fresh, "par-1": parent}.get(j)
             )
-            db.update_job_context = AsyncMock(side_effect=upd_ctx)
+            db.merge_job_context = AsyncMock(side_effect=upd_ctx)
             db.update_job_status = AsyncMock()
             with patch(f"{MODULE}._trigger_dispatch"):
                 await orch_main._handle_scholar_completion(scholar_in_memory, [])
 
         assert captured["par-1"]["scholar_output_dir"] == "outputs/003-scholar-sch1"
         assert captured["par-1"]["scholar_completed"] is True
+
+    @pytest.mark.asyncio
+    async def test_paused_scholar_does_not_unblock_parent(self):
+        # An outage/drain-paused scholar reports /complete with a NON-terminal
+        # status (the pause path sets job["status"]="paused" in-memory before
+        # step 3b) — the parent must keep waiting for the resumed scholar's
+        # real outcome, not be unblocked as research-success. Live-caught on
+        # k3d: a cooldown-paused scholar falsely flipped its parent
+        # waiting→created. knowledge-base/knowledge/features/llm_outage_subjob_resilience.md
+        scholar = {
+            "id": "sch-1",
+            "parent_job_id": "par-1",
+            "status": "paused",
+            "context": {"scholar_target": "par-1"},
+        }
+        parent = {"id": "par-1", "status": "waiting", "context": {}}
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.get_job = AsyncMock(return_value=parent)
+            db.merge_job_context = AsyncMock()
+            db.update_job_status = AsyncMock()
+            with patch(f"{MODULE}._trigger_dispatch") as trig:
+                await orch_main._handle_scholar_completion(scholar, [])
+        db.merge_job_context.assert_not_awaited()
+        db.update_job_status.assert_not_awaited()
+        trig.assert_not_called()
 
 
 class TestDelegationOutputPathPopulation:
@@ -738,8 +1124,9 @@ class TestDelegationOutputPathPopulation:
             db.all_delegation_children_terminal = AsyncMock(return_value=True)
             db.get_job = AsyncMock(side_effect=lambda j: {"par-1": parent}.get(j))
             db.get_delegation_children = AsyncMock(return_value=children)
-            db.update_job_context = AsyncMock(side_effect=upd_ctx)
+            db.merge_job_context = AsyncMock(side_effect=upd_ctx)
             db.update_job_status = AsyncMock()
+            db.claim_delegation_resume = AsyncMock(return_value=True)
             with patch(f"{MODULE}._trigger_dispatch"):
                 await orch_main._handle_delegation_child_completion(job, [])
 
@@ -748,3 +1135,94 @@ class TestDelegationOutputPathPopulation:
         assert by_order[0]["output_path"] == "outputs/001-scholar-c0"
         assert by_order[0]["config_name"] == "scholar"
         assert by_order[1]["output_path"] is None
+
+
+class TestDelegationUnblockDispatcherContract:
+    """Unblock must re-queue via the CAS claim that clears freeze_data.
+
+    ``update_job_status(status="paused")`` leaves the parent's delegation
+    freeze set, and ``get_dispatchable_jobs`` requires ``freeze_data IS
+    NULL`` — the re-queued parent would be dispatcher-invisible forever.
+    Regression for knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md (Gap 1).
+    """
+
+    def _fixtures(self):
+        job = {"id": "child-1", "parent_job_id": "par-1", "creation_order": 0}
+        parent = {"id": "par-1", "status": "waiting", "context": {}}
+        children = [
+            {
+                "id": "child-1",
+                "creation_order": 0,
+                "status": "completed",
+                "config_name": "scholar",
+                "branch_name": "subjob/child-1/scholar",
+                "context": {},
+                "freeze_data": {},
+            }
+        ]
+        return job, parent, children
+
+    @pytest.mark.asyncio
+    async def test_unblock_requeues_via_cas_claim(self):
+        job, parent, children = self._fixtures()
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.all_delegation_children_terminal = AsyncMock(return_value=True)
+            db.get_job = AsyncMock(return_value=parent)
+            db.get_delegation_children = AsyncMock(return_value=children)
+            db.merge_job_context = AsyncMock()
+            db.update_job_status = AsyncMock()
+            db.claim_delegation_resume = AsyncMock(return_value=True)
+            with patch(f"{MODULE}._trigger_dispatch") as trig:
+                await orch_main._handle_delegation_child_completion(job, [])
+        db.claim_delegation_resume.assert_awaited_once_with("par-1")
+        # update_job_status can't clear freeze_data → must not be the writer
+        db.update_job_status.assert_not_awaited()
+        trig.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_losing_cas_skips_dispatch_trigger(self):
+        # A concurrent sibling (or the timeout sweeper) already re-queued the
+        # parent — the loser must not double-trigger or log a second resume.
+        job, parent, children = self._fixtures()
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.all_delegation_children_terminal = AsyncMock(return_value=True)
+            db.get_job = AsyncMock(return_value=parent)
+            db.get_delegation_children = AsyncMock(return_value=children)
+            db.merge_job_context = AsyncMock()
+            db.update_job_status = AsyncMock()
+            db.claim_delegation_resume = AsyncMock(return_value=False)
+            with patch(f"{MODULE}._trigger_dispatch") as trig:
+                await orch_main._handle_delegation_child_completion(job, [])
+        trig.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stateless_parent_reenqueues_without_dispatcher(self):
+        job, parent, children = self._fixtures()
+        parent.update(
+            {
+                "execution_lane": "stateless",
+                "priority": 9,
+                "user_id": "33333333-3333-3333-3333-333333333333",
+            }
+        )
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.all_delegation_children_terminal = AsyncMock(return_value=True)
+            db.get_job = AsyncMock(return_value=parent)
+            db.get_delegation_children = AsyncMock(return_value=children)
+            db.queue_stateless_job_for_resume = AsyncMock(return_value=True)
+            db.merge_job_context = AsyncMock()
+            db.claim_delegation_resume = AsyncMock()
+            with patch(f"{MODULE}._trigger_dispatch") as trig:
+                await orch_main._handle_delegation_child_completion(job, [])
+
+        queued = db.queue_stateless_job_for_resume.await_args
+        assert queued.args[0] == "par-1"
+        assert queued.args[1]["delegation_results"][0]["job_id"] == "child-1"
+        assert queued.kwargs == {
+            "priority": 9,
+            "fair_key": "33333333-3333-3333-3333-333333333333",
+            "expected_status": "waiting",
+        }
+        db.merge_job_context.assert_not_awaited()
+        db.claim_delegation_resume.assert_not_awaited()
+        trig.assert_not_called()

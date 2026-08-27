@@ -6,7 +6,7 @@ This module provides a modern async PostgreSQL interface using asyncpg with:
 - Named query loading from SQL files
 - CRUD operations with proper async patterns
 
-Part of Phase 1 database refactoring - see docs/db_refactor.md
+Part of Phase 1 database refactoring - see knowledge-base/knowledge/db_refactor.md
 """
 
 import json
@@ -16,7 +16,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 
 try:
     import asyncpg
@@ -54,6 +54,96 @@ def _coerce_row_id(raw_id: Optional[str]) -> str:
         return str(uuid.uuid5(_THREAD_MSG_ID_NS, str(raw_id)))
 
 
+def _active_run_queue_lease():
+    """``(unit_id, lease_token)`` when a stateless-executor lease is active.
+
+    Pinned-lane processes never set the lease ContextVar, so this returns
+    ``None`` and every fenced code path below keeps today's exact behavior.
+    Imported lazily: ``src.api.lease_context`` is stdlib-only, but importing
+    it at module scope from here would couple import order to ``src.api``'s
+    package init (which pulls the full app tree).
+    """
+    try:
+        from src.api.lease_context import get_current_lease
+    except Exception:  # pragma: no cover - defensive (partial installs)
+        return None
+    return get_current_lease()
+
+
+def _active_run_queue_lease_for_thread(thread_id: str):
+    """Return the active lease only when it owns ``thread_id`` exactly.
+
+    A mutable lease handle is repointed between claims.  Callers must bind the
+    snapshot they fence to the thread whose durable state they are about to
+    access; fencing a valid queue row for thread A must never authorize SQL for
+    thread B.  The comparison happens before acquiring a connection so this
+    mismatch is a fail-closed, zero-SQL path.
+
+    No active handle means the pinned lane and preserves its historical
+    unfenced behavior.
+    """
+
+    lease = _active_run_queue_lease()
+    if lease is None:
+        return None
+
+    unit_id, lease_token = lease
+    if str(unit_id) == str(thread_id):
+        return lease
+
+    from src.api.lease_context import LeaseLostError, mark_current_lease_lost
+
+    mark_current_lease_lost()
+    logger.error(
+        "run_queue lease/thread mismatch: unit=%s target_thread=%s token=%s",
+        unit_id,
+        thread_id,
+        lease_token,
+    )
+    raise LeaseLostError(
+        f"run_queue lease for unit {unit_id} cannot access thread {thread_id}"
+    )
+
+
+async def _require_run_queue_fence(conn, lease) -> None:
+    """§5.2 exact-lease fence for a stateless persist transaction.
+
+    ``FOR SHARE`` on the run_queue row blocks a concurrent reaper steal until
+    this transaction commits, so check-then-write cannot interleave with a
+    steal. Zero rows ⇒ the lease is lost ⇒ raise :class:`LeaseLostError` so
+    the enclosing transaction rolls back and nothing lands.  It is normally
+    the transaction's first SQL statement.  A durable-state table with a
+    ``threads`` foreign key first takes its required parent-row authority lock
+    to preserve the repository-wide ``threads -> run_queue`` lock order; the
+    fence still precedes every mutation/fenced persist statement.
+
+    Torn-turn invariant (stateless_agents.md §5.2): a turn's durable footprint
+    spans multiple fenced transactions (per-append message rows, the turn-end
+    reconcile, the compaction checkpoint row, completion). Each is fenced
+    individually; a steal BETWEEN them leaves a torn turn, and that is
+    accepted because sessions rebuild from ``thread_messages`` + the consumed
+    watermark alone — a checkpoint-ahead-of-messages tear is converged by the
+    next claim's rebuild, and the claim-time skip-if-answered watermark
+    prevents the double-answer.
+    """
+    from src.api.lease_context import LeaseLostError, mark_current_lease_lost
+    from src.shared.run_queue import fence_lease
+
+    unit_id, lease_token = lease
+    ok = await fence_lease(conn, unit_id=unit_id, lease_token=lease_token)
+    if not ok:
+        mark_current_lease_lost()
+        logger.error(
+            "run_queue fence rejected: unit=%s token=%s — lease lost, "
+            "aborting fenced thread persist",
+            unit_id,
+            lease_token,
+        )
+        raise LeaseLostError(
+            f"run_queue lease lost for unit {unit_id} (token {lease_token})"
+        )
+
+
 class PostgresDB:
     """PostgreSQL database manager with async connection pooling.
 
@@ -67,11 +157,8 @@ class PostgresDB:
         db = PostgresDB()
         await db.connect()
 
-        # Create a job
-        job_id = await db.jobs.create(
-            description="Extract requirements",
-            document_path="doc.pdf"
-        )
+        # Jobs are created by the orchestrator, not here — db.jobs is
+        # read/update only (see JobsNamespace.create).
 
         # Get pending jobs
         jobs = await db.jobs.get_pending()
@@ -130,8 +217,11 @@ class PostgresDB:
         self._queries: Dict[str, str] = {}  # Cache for loaded queries
 
         # Initialize namespaces
+        # (No citations namespace: citations live in the vector store and are
+        # written only through CitationEngine. The old CitationsNamespace here
+        # targeted this app DB, which has no citations table — it was dead and
+        # would have thrown had anything called it.)
         self.jobs = JobsNamespace(self)
-        self.citations = CitationsNamespace(self)
         self.config_overrides = ConfigOverridesNamespace(self)
 
         logger.info("PostgresDB initialized (not connected yet)")
@@ -326,25 +416,32 @@ class PostgresDB:
                 """
                 UPDATE threads
                 SET status   = 'ended',
-                    ended_at = CURRENT_TIMESTAMP
+                    ended_at = CURRENT_TIMESTAMP,
+                    control_admission_agent_id = NULL
                 WHERE id = $1
                 """,
                 thread_id,
             )
 
-    async def update_thread_status(self, thread_id: str, status: str) -> None:
-        """Update thread status."""
+    async def update_thread_status(self, thread_id: str, status: str) -> bool:
+        """Update a live thread status without reviving an ended row."""
         async with self.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 """
                 UPDATE threads
                 SET status        = $2,
-                    last_activity = CURRENT_TIMESTAMP
+                    last_activity = CURRENT_TIMESTAMP,
+                    control_admission_agent_id = CASE
+                        WHEN $2 IN ('ended', 'suspended') THEN NULL
+                        ELSE control_admission_agent_id
+                    END
                 WHERE id = $1
+                  AND (status <> 'ended' OR $2 = 'ended')
                 """,
                 thread_id,
                 status,
             )
+        return result == "UPDATE 1"
 
     async def get_thread_messages_history(
         self,
@@ -383,14 +480,29 @@ class PostgresDB:
         when there's no usable summary/boundary; it is a floor, not the
         mechanism. The caller logs when ``len(result) == limit`` (trimmed).
         """
+        # HF-7 thread-read diet: the resume consumers read only
+        # role/content/tool_calls/tool_call_id (_db_rows_to_lc_messages) and
+        # turn_number (the turn_count restore in _restore_session_messages). The
+        # other 10 columns — including the large JSONB reasoning/tool_results/
+        # provider_raw/response_metadata/additional_kwargs — were fetched on
+        # every resume and never read (the rebuilt AIMessage doesn't carry them).
+        # Select only what resume consumes. The seq / turn_number / created_at
+        # ORDER BYs below don't require the column in the projection.
         query = """
-            SELECT id, role, content, tool_calls, turn_number, metrics,
-                   tool_call_id, thinking, reasoning, tool_results,
-                   provider, provider_raw, additional_kwargs, response_metadata,
-                   created_at
-            FROM thread_messages
-            WHERE thread_id = $1
-              AND role <> 'summary'
+            SELECT message.id, message.role, message.content,
+                   message.tool_calls, message.tool_call_id,
+                   message.turn_number
+            FROM thread_messages AS message
+            WHERE message.thread_id = $1
+              AND message.role NOT IN ('summary', 'error')
+              AND message.rewound_at IS NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM thread_input_deliveries AS delivery
+                     WHERE delivery.message_id = message.id
+                       AND delivery.state IN (
+                           'persisted', 'owned', 'queued', 'deferred', 'cancelled'
+                       )
+                  )
         """
         params: List[Any] = [thread_id]
         if seq_gt is not None:
@@ -423,31 +535,11 @@ class PostgresDB:
         for row in rows:
             result.append(
                 {
-                    "id": str(row["id"]),
                     "role": row["role"],
                     "content": row["content"],
                     "tool_calls": _j(row["tool_calls"]) if row["tool_calls"] else None,
-                    "turn_number": row["turn_number"],
-                    "metrics": _j(row["metrics"]) if row["metrics"] else None,
                     "tool_call_id": row["tool_call_id"],
-                    "thinking": row["thinking"],
-                    "reasoning": _j(row["reasoning"]) if row["reasoning"] else None,
-                    "tool_results": _j(row["tool_results"])
-                    if row["tool_results"]
-                    else None,
-                    "provider": row["provider"],
-                    "provider_raw": _j(row["provider_raw"])
-                    if row["provider_raw"]
-                    else None,
-                    "additional_kwargs": _j(row["additional_kwargs"])
-                    if row["additional_kwargs"]
-                    else None,
-                    "response_metadata": _j(row["response_metadata"])
-                    if row["response_metadata"]
-                    else None,
-                    "created_at": row["created_at"].isoformat()
-                    if row["created_at"]
-                    else None,
+                    "turn_number": row["turn_number"],
                 }
             )
         if newest_first:
@@ -478,6 +570,7 @@ class PostgresDB:
             FROM thread_messages
             WHERE thread_id = $1
               AND role = 'summary'
+              AND rewound_at IS NULL
             ORDER BY turn_number DESC NULLS LAST, created_at DESC
             LIMIT 1
         """
@@ -512,11 +605,644 @@ class PostgresDB:
         ``boundary_seq`` unset and falls back to ``boundary_turn``.
         """
         row = await self.fetchrow(
-            "SELECT seq FROM thread_messages WHERE thread_id = $1 AND id = $2",
+            "SELECT seq FROM thread_messages "
+            "WHERE thread_id = $1 AND id = $2 AND rewound_at IS NULL",
             thread_id,
             _coerce_row_id(msg_id),
         )
         return row["seq"] if row else None
+
+    async def get_live_message(
+        self, thread_id: str, msg_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a message id to its live row (seq/role/content).
+
+        The rewind target lookup: returns ``None`` for unknown ids AND for
+        rows already tombstoned by an earlier rewind — a rewound-away message
+        is not a valid rewind target.
+        """
+        row = await self.fetchrow(
+            "SELECT seq, role, content FROM thread_messages "
+            "WHERE thread_id = $1 AND id = $2 AND rewound_at IS NULL",
+            thread_id,
+            _coerce_row_id(msg_id),
+        )
+        if row is None:
+            return None
+        return {"seq": row["seq"], "role": row["role"], "content": row["content"]}
+
+    async def apply_rewind(
+        self,
+        thread_id: str,
+        from_seq: int,
+        mode: str,
+        actor: Optional[str] = None,
+        abandoned_sha: Optional[str] = None,
+        restored_to_sha: Optional[str] = None,
+        restore_commit_sha: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Tombstone the tail at ``seq >= from_seq`` and ledger the rewind.
+
+        One transaction: the sweep (skipped for mode='code' — files-only
+        rewinds leave the transcript untouched), the ``thread_rewinds``
+        ledger insert, the surviving-turn readback the caller uses to reset
+        ``turn_count``, and a clamp of the durable memory-extraction cursor to
+        that surviving turn. The clamp updates an existing cursor only: a
+        thread that has never extracted memory must retain the implicit zero
+        baseline. Idempotent re-run sweeps 0 rows (the ``rewound_at IS NULL``
+        guard) but does append a second ledger row — callers serialize
+        (session loop / advisory lock).
+        """
+        if mode not in ("both", "conversation", "code"):
+            raise ValueError(f"invalid rewind mode: {mode}")
+        swept = 0
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                # Serialize the rewind with the stateless turn's final fenced
+                # transcript/effect transaction. Whichever owns the thread
+                # row first wins cleanly: a committed obligation blocks the
+                # rewind; a committed rewind makes the boundary update fail
+                # and rolls the producer back. Pinned sessions have no queue
+                # lease but retain the same thread-row serialization.
+                thread_exists = await conn.fetchval(
+                    "SELECT 1 FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if thread_exists is None:
+                    raise ValueError("session thread no longer exists")
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
+                if mode in ("both", "conversation"):
+                    unfinished = await conn.fetch(
+                        self._SESSION_MEMORY_REWIND_GUARD_SQL,
+                        thread_id,
+                        from_seq,
+                    )
+                    if unfinished:
+                        raise RuntimeError("rewind waits for final-memory extraction")
+                    swept = await conn.fetchval(
+                        """
+                        WITH swept AS (
+                            UPDATE thread_messages
+                            SET rewound_at = now()
+                            WHERE thread_id = $1
+                              AND seq >= $2
+                              AND rewound_at IS NULL
+                            RETURNING 1
+                        )
+                        SELECT COUNT(*) FROM swept
+                        """,
+                        thread_id,
+                        from_seq,
+                    )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO thread_rewinds
+                        (thread_id, from_seq, mode, actor, swept_count,
+                         abandoned_sha, restored_to_sha, restore_commit_sha)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING id
+                    """,
+                    thread_id,
+                    from_seq,
+                    mode,
+                    actor,
+                    swept or 0,
+                    abandoned_sha,
+                    restored_to_sha,
+                    restore_commit_sha,
+                )
+                surviving_turn = await conn.fetchval(
+                    """
+                    SELECT COALESCE(MAX(turn_number), 0)
+                    FROM thread_messages
+                    WHERE thread_id = $1
+                      AND rewound_at IS NULL
+                      AND role NOT IN ('summary', 'error')
+                    """,
+                    thread_id,
+                )
+                if mode in ("both", "conversation"):
+                    # Rewind and cursor movement are one commit. Without this,
+                    # a cursor from the abandoned future (for example 10 after
+                    # rewinding to turn 5) suppresses extraction on the rebuilt
+                    # timeline until it catches up with that dead history.
+                    # Do not INSERT an absent row: absence is the pre-first-
+                    # extraction baseline and must continue to behave as zero.
+                    await conn.execute(
+                        """
+                        UPDATE thread_session_runtime_state
+                        SET memory_extraction_turn = LEAST(
+                                memory_extraction_turn, $2
+                            ),
+                            updated_at = now()
+                        WHERE thread_id = $1
+                        """,
+                        thread_id,
+                        int(surviving_turn or 0),
+                    )
+        return {
+            "rewind_id": str(row["id"]),
+            "swept": int(swept or 0),
+            "surviving_turn": int(surviving_turn or 0),
+        }
+
+    async def resweep_rewind(self, thread_id: str, from_seq: int) -> int:
+        """Narrow, idempotent mop-up sweep for stragglers past a rewind.
+
+        `_handle_rewind`'s hard-interrupt wait (up to 60s) can overlap a
+        turn-completion INSERT already in flight: a message at/after
+        `from_seq` can land *after* `apply_rewind`'s sweep already ran,
+        leaving a live, un-tombstoned stray racing the just-truncated
+        in-memory view. Same shape and same `rewound_at IS NULL` guard as
+        `apply_rewind`'s sweep, so a normal run with no stragglers touches 0
+        rows. Deliberately not a second `apply_rewind` call — this must not
+        append a second `thread_rewinds` ledger row for what is mop-up of
+        the *same* rewind, not a new one.
+        """
+        async with self.acquire() as conn:
+            swept = await conn.fetchval(
+                """
+                WITH swept AS (
+                    UPDATE thread_messages
+                    SET rewound_at = now()
+                    WHERE thread_id = $1
+                      AND seq >= $2
+                      AND rewound_at IS NULL
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM swept
+                """,
+                thread_id,
+                from_seq,
+            )
+        return int(swept or 0)
+
+    async def record_turn_commit(self, thread_id: str, commit_sha: str) -> None:
+        """Map the workspace commit that just landed to the transcript position.
+
+        seq = MAX(seq) over the thread's rows at commit time (0 before the
+        first message — the pre-conversation workspace state, a valid restore
+        target for a rewind to the very first message). Two commits at the
+        same transcript position (e.g. a compaction checkpoint right after a
+        turn commit) collapse to the later SHA — the newest workspace state
+        for that position is the correct restore target.
+        """
+        sql = """
+            INSERT INTO thread_turn_commits (thread_id, seq, commit_sha)
+            SELECT $1,
+                   COALESCE(MAX(seq), 0),
+                   $2
+            FROM thread_messages
+            WHERE thread_id = $1
+            ON CONFLICT (thread_id, seq) DO UPDATE
+                SET commit_sha = EXCLUDED.commit_sha,
+                    created_at = now()
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            if lease is None:
+                await conn.execute(sql, thread_id, commit_sha)
+                return
+            async with conn.transaction():
+                # First statement: hold the exact queue row across the mapping
+                # upsert so a zombie cannot publish its Git SHA after a steal.
+                await _require_run_queue_fence(conn, lease)
+                await conn.execute(sql, thread_id, commit_sha)
+
+    async def seed_workspace_baseline_commit(
+        self, thread_id: str, commit_sha: str
+    ) -> None:
+        """Create the immutable pre-first-turn workspace ledger row.
+
+        A first completed turn needs two ledger points for files-only undo:
+        its new workspace commit and the workspace HEAD from before that turn.
+        Reattaches keep the original baseline (``DO NOTHING``), while the
+        active stateless claimant must prove the exact thread lease before the
+        insert. ``thread_turn_commits`` has no parent foreign key, so no
+        ``threads`` lock is needed and the queue fence remains first SQL.
+        """
+
+        sql = """
+            INSERT INTO thread_turn_commits (thread_id, seq, commit_sha)
+            VALUES ($1, 0, $2)
+            ON CONFLICT (thread_id, seq) DO NOTHING
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            if lease is None:
+                await conn.execute(sql, thread_id, commit_sha)
+                return
+            async with conn.transaction():
+                await _require_run_queue_fence(conn, lease)
+                await conn.execute(sql, thread_id, commit_sha)
+
+    async def resolve_restore_commit(
+        self, thread_id: str, before_seq: int
+    ) -> Optional[str]:
+        """Workspace SHA for 'state before the message at before_seq'.
+
+        The newest mapped commit strictly below the target: the workspace as
+        it stood after every turn that survives the rewind. ``None`` = no
+        coverage (thread predates the feature) — code restore unavailable.
+        """
+        return await self.fetchval(
+            """
+            SELECT commit_sha FROM thread_turn_commits
+            WHERE thread_id = $1 AND seq < $2
+            ORDER BY seq DESC
+            LIMIT 1
+            """,
+            thread_id,
+            before_seq,
+        )
+
+    async def list_workspace_turn_commits(self, thread_id: str) -> List[str]:
+        """Return the thread's workspace ledger from newest to oldest.
+
+        Undo chooses the previous *distinct Git tree*, not merely the previous
+        row: attach reconciliation, read-only turns, and earlier undo effects
+        may all map the same file state at different transcript positions.
+        Git owns tree equivalence; this fenced method supplies its complete,
+        ordered durable candidate chain without trying to infer it in SQL.
+        """
+
+        sql = """
+            SELECT commit_sha
+            FROM thread_turn_commits
+            WHERE thread_id = $1
+            ORDER BY seq DESC
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        if lease is None:
+            rows = await self.fetch(sql, thread_id)
+        else:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    # The chain is input to an external workspace mutation.
+                    # Hold the exact queue share lock through the complete read;
+                    # the Git marker + later fenced mapping make the wider
+                    # cross-system operation crash recoverable.
+                    await _require_run_queue_fence(conn, lease)
+                    rows = await conn.fetch(sql, thread_id)
+        return [str(row["commit_sha"]) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Durable persistent-session state (migration 0133)
+    # ------------------------------------------------------------------
+
+    async def list_session_tasks(self, thread_id: str) -> List[Dict[str, Any]]:
+        """Load the authoritative task checklist for one session thread."""
+
+        sql = """
+            SELECT task_number, description, status, priority, notes,
+                   created_at, completed_at
+            FROM thread_session_tasks
+            WHERE thread_id = $1
+            ORDER BY task_number
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        if lease is None:
+            rows = await self.fetch(sql, thread_id)
+        else:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    await _require_run_queue_fence(conn, lease)
+                    rows = await conn.fetch(sql, thread_id)
+        return [dict(row) for row in rows]
+
+    async def create_session_task(
+        self,
+        thread_id: str,
+        description: str,
+        priority: str,
+    ) -> Dict[str, Any]:
+        """Allocate and insert one task under the thread/lease fence."""
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM threads WHERE id = $1 FOR UPDATE",
+                    thread_id,
+                )
+                if exists is None:
+                    raise ValueError("session thread no longer exists")
+                if lease is not None:
+                    # Global admission order is threads -> run_queue.  Keep the
+                    # numbering lock first, then prove the exact lease before
+                    # the INSERT; a rejected fence rolls the transaction back.
+                    await _require_run_queue_fence(conn, lease)
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO thread_session_tasks
+                        (thread_id, task_number, description, priority)
+                    SELECT $1,
+                           COALESCE(MAX(task_number), 0) + 1,
+                           $2,
+                           $3
+                    FROM thread_session_tasks
+                    WHERE thread_id = $1
+                    RETURNING task_number, description, status, priority,
+                              notes, created_at, completed_at
+                    """,
+                    thread_id,
+                    description,
+                    priority,
+                )
+        return dict(row)
+
+    async def start_session_task(
+        self, thread_id: str, task_number: int
+    ) -> Optional[Dict[str, Any]]:
+        """Move one pending task to ``in_progress`` under the owner fence."""
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
+                row = await conn.fetchrow(
+                    """
+                    UPDATE thread_session_tasks
+                    SET status = 'in_progress', updated_at = now()
+                    WHERE thread_id = $1 AND task_number = $2
+                      AND status = 'pending'
+                    RETURNING task_number, description, status, priority,
+                              notes, created_at, completed_at
+                    """,
+                    thread_id,
+                    task_number,
+                )
+        return dict(row) if row is not None else None
+
+    async def complete_session_task(
+        self,
+        thread_id: str,
+        task_number: int,
+        notes: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Complete one task durably before its tool result is returned."""
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
+                row = await conn.fetchrow(
+                    """
+                    UPDATE thread_session_tasks
+                    SET status = 'completed',
+                        completed_at = now(),
+                        notes = CASE WHEN $3 = '' THEN notes ELSE $3 END,
+                        updated_at = now()
+                    WHERE thread_id = $1 AND task_number = $2
+                      AND status <> 'completed'
+                    RETURNING task_number, description, status, priority,
+                              notes, created_at, completed_at
+                    """,
+                    thread_id,
+                    task_number,
+                    notes,
+                )
+        return dict(row) if row is not None else None
+
+    async def claim_memory_extraction_interval(
+        self,
+        thread_id: str,
+        *,
+        turn_count: int,
+        interval: int,
+    ) -> bool:
+        """Atomically claim one elapsed interval for memory extraction.
+
+        The cursor advances before the auxiliary call, matching the historical
+        in-process writer.  A successor observing the cursor cannot repeat the
+        same extraction after a claim handoff or process crash.
+        """
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        if interval <= 0 or turn_count < interval:
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if lease is not None:
+                    # The INSERT/UPSERT may take a parent FK lock implicitly.
+                    # Take it explicitly before run_queue to keep the global
+                    # threads -> queue ordering, then fence before the write.
+                    exists = await conn.fetchval(
+                        "SELECT 1 FROM threads WHERE id = $1 FOR KEY SHARE",
+                        thread_id,
+                    )
+                    if exists is None:
+                        raise ValueError("session thread no longer exists")
+                    await _require_run_queue_fence(conn, lease)
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO thread_session_runtime_state
+                        (thread_id, memory_extraction_turn)
+                    VALUES ($1, $2)
+                    ON CONFLICT (thread_id) DO UPDATE
+                    SET memory_extraction_turn = EXCLUDED.memory_extraction_turn,
+                        updated_at = now()
+                    WHERE thread_session_runtime_state.memory_extraction_turn
+                          <= EXCLUDED.memory_extraction_turn - $3
+                    RETURNING memory_extraction_turn
+                    """,
+                    thread_id,
+                    turn_count,
+                    interval,
+                )
+        return row is not None
+
+    async def list_thread_cloud_anchors(
+        self, thread_id: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load durable cloud provenance keyed by logical workspace path."""
+
+        sql = """
+            SELECT workspace_path, anchor
+            FROM thread_cloud_citation_anchors
+            WHERE thread_id = $1
+        """
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        if lease is None:
+            rows = await self.fetch(sql, thread_id)
+        else:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    await _require_run_queue_fence(conn, lease)
+                    rows = await conn.fetch(sql, thread_id)
+        anchors: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            value = row["anchor"]
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, dict):
+                anchors[str(row["workspace_path"])] = value
+        return anchors
+
+    async def upsert_thread_cloud_anchor(
+        self,
+        thread_id: str,
+        workspace_path: str,
+        anchor: Dict[str, Any],
+    ) -> None:
+        """Persist one cloud anchor under the current stateless lease fence."""
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if lease is not None:
+                    # See claim_memory_extraction_interval: establish parent
+                    # authority before queue fencing so the FK cannot invert
+                    # admission's threads -> run_queue lock order.
+                    exists = await conn.fetchval(
+                        "SELECT 1 FROM threads WHERE id = $1 FOR KEY SHARE",
+                        thread_id,
+                    )
+                    if exists is None:
+                        raise ValueError("session thread no longer exists")
+                    await _require_run_queue_fence(conn, lease)
+                await conn.execute(
+                    """
+                    INSERT INTO thread_cloud_citation_anchors
+                        (thread_id, workspace_path, anchor)
+                    VALUES ($1, $2, $3::jsonb)
+                    ON CONFLICT (thread_id, workspace_path) DO UPDATE
+                    SET anchor = EXCLUDED.anchor, updated_at = now()
+                    """,
+                    thread_id,
+                    workspace_path,
+                    json.dumps(anchor, sort_keys=True, separators=(",", ":")),
+                )
+
+    # Shared by the single-row upsert (RETURNING id, seq) and the turn-complete
+    # reconcile batch (same statement minus RETURNING — executemany discards
+    # results). Keep the column set in lockstep with the orchestrator's writer.
+    _THREAD_MESSAGE_UPSERT_SQL = """
+        INSERT INTO thread_messages
+            (id, thread_id, role, content, tool_calls, turn_number,
+             metrics, tool_call_id, thinking,
+             reasoning, tool_results, provider, provider_raw,
+             additional_kwargs, response_metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14, $15)
+        ON CONFLICT (id) DO UPDATE SET
+            content           = EXCLUDED.content,
+            tool_calls        = EXCLUDED.tool_calls,
+            turn_number       = EXCLUDED.turn_number,
+            metrics           = EXCLUDED.metrics,
+            tool_call_id      = EXCLUDED.tool_call_id,
+            thinking          = EXCLUDED.thinking,
+            reasoning         = EXCLUDED.reasoning,
+            tool_results      = EXCLUDED.tool_results,
+            provider          = EXCLUDED.provider,
+            provider_raw      = EXCLUDED.provider_raw,
+            additional_kwargs = EXCLUDED.additional_kwargs,
+            response_metadata = EXCLUDED.response_metadata
+        RETURNING id, seq
+    """
+    _THREAD_MESSAGE_UPSERT_BATCH_SQL = _THREAD_MESSAGE_UPSERT_SQL.replace(
+        "RETURNING id, seq", ""
+    )
+    _THREAD_ACTIVITY_BUMP_SQL = """
+        UPDATE threads
+        SET last_activity = CURRENT_TIMESTAMP,
+            total_turns   = GREATEST(total_turns, COALESCE($2, 0))
+        WHERE id = $1
+    """
+    _THREAD_MESSAGE_PARENT_LOCK_SQL = """
+        SELECT 1 FROM threads
+        WHERE id = $1::uuid
+        FOR KEY SHARE
+    """
+    _SESSION_MEMORY_PARENT_LOCK_SQL = """
+        SELECT project_id, metadata, execution_lane
+        FROM threads
+        WHERE id = $1::uuid
+        FOR UPDATE
+    """
+    _SESSION_MEMORY_PROJECT_SCOPE_SQL = """
+        SELECT 1
+        FROM thread_mounts
+        WHERE thread_id = $1::uuid
+          AND source_ref = $2::uuid
+          AND mount_kind IN ('project', 'project_default')
+        FOR KEY SHARE
+    """
+    _SESSION_TURN_EXECUTION_SQL = """
+        UPDATE thread_messages
+        SET turn_execution_id = COALESCE(
+                turn_execution_id,
+                uuid_generate_v4()
+            )
+        WHERE thread_id = $1::uuid
+          AND id = $2::uuid
+          AND turn_number = $3
+          AND rewound_at IS NULL
+        RETURNING turn_execution_id, seq
+    """
+    _SESSION_TURN_END_SEQ_SQL = """
+        SELECT max(seq)
+        FROM thread_messages
+        WHERE thread_id = $1::uuid
+          AND id = ANY($2::uuid[])
+          AND rewound_at IS NULL
+    """
+    _SESSION_MEMORY_EFFECT_INSERT_SQL = """
+        WITH inserted AS (
+            INSERT INTO completion_effects
+                (producer_kind, producer_id, scope_id, effect_name,
+                 effect_group, detail)
+            VALUES
+                ('session_turn', $2::uuid, $1::uuid,
+                 'final_memory_extraction', 'memory_extraction',
+                 jsonb_build_object(
+                     'input_message_id', $3::uuid,
+                     'turn_number', $4::integer,
+                     'memory_scope_kind', $5::text,
+                     'memory_scope_id', $6::uuid,
+                     'boundary_seq', $7::bigint,
+                     'end_seq', $8::bigint
+                 ))
+            ON CONFLICT (producer_kind, producer_id, effect_name) DO NOTHING
+            RETURNING producer_id
+        )
+        SELECT producer_id FROM inserted
+        UNION ALL
+        SELECT producer_id
+        FROM completion_effects
+        WHERE producer_kind = 'session_turn'
+          AND producer_id = $2::uuid
+          AND scope_id = $1::uuid
+          AND effect_name = 'final_memory_extraction'
+          AND effect_group = 'memory_extraction'
+          AND detail = jsonb_build_object(
+              'input_message_id', $3::uuid,
+              'turn_number', $4::integer,
+              'memory_scope_kind', $5::text,
+              'memory_scope_id', $6::uuid,
+              'boundary_seq', $7::bigint,
+              'end_seq', $8::bigint
+          )
+        LIMIT 1
+    """
+    _SESSION_MEMORY_REWIND_GUARD_SQL = """
+        SELECT effect.producer_id
+        FROM completion_effects AS effect
+        JOIN thread_messages AS boundary
+          ON boundary.thread_id = effect.scope_id
+         AND boundary.turn_execution_id = effect.producer_id
+        WHERE effect.producer_kind = 'session_turn'
+          AND effect.effect_name = 'final_memory_extraction'
+          AND effect.scope_id = $1::uuid
+          AND effect.state = 'pending'
+          AND boundary.seq >= $2::bigint
+        ORDER BY boundary.seq, effect.producer_id
+        FOR UPDATE OF effect
+    """
 
     async def save_thread_message(
         self,
@@ -542,7 +1268,7 @@ class PostgresDB:
         config writes, so message writes go straight here instead of through
         ``POST /api/agents/threads/{id}/messages`` (a pure pass-through). Two
         properties this direct path adds, both load-bearing for the resume fix in
-        docs/issues/persistent_session_midturn_message_loss.md:
+        knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md:
 
         - **Caller-supplied ``id`` + idempotent upsert.** The agent mints a stable
           id per message (``persistent_graph._ensure_msg_id`` /
@@ -564,64 +1290,451 @@ class PostgresDB:
         its ``ON CONFLICT`` target arrived in migration 0023.
         """
         msg_id = _coerce_row_id(id)
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO thread_messages
-                    (id, thread_id, role, content, tool_calls, turn_number,
-                     metrics, tool_call_id, thinking,
-                     reasoning, tool_results, provider, provider_raw,
-                     additional_kwargs, response_metadata)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                        $14, $15)
-                ON CONFLICT (id) DO UPDATE SET
-                    content           = EXCLUDED.content,
-                    tool_calls        = EXCLUDED.tool_calls,
-                    turn_number       = EXCLUDED.turn_number,
-                    metrics           = EXCLUDED.metrics,
-                    tool_call_id      = EXCLUDED.tool_call_id,
-                    thinking          = EXCLUDED.thinking,
-                    reasoning         = EXCLUDED.reasoning,
-                    tool_results      = EXCLUDED.tool_results,
-                    provider          = EXCLUDED.provider,
-                    provider_raw      = EXCLUDED.provider_raw,
-                    additional_kwargs = EXCLUDED.additional_kwargs,
-                    response_metadata = EXCLUDED.response_metadata
-                RETURNING id, seq
-                """,
-                msg_id,
-                thread_id,
-                role,
-                content,
-                json.dumps(tool_calls) if tool_calls is not None else None,
-                turn_number,
-                json.dumps(metrics) if metrics is not None else None,
-                tool_call_id,
-                thinking,
-                json.dumps(reasoning) if reasoning is not None else None,
-                json.dumps(tool_results) if tool_results is not None else None,
-                provider,
-                json.dumps(provider_raw) if provider_raw is not None else None,
-                json.dumps(additional_kwargs)
-                if additional_kwargs is not None
-                else None,
-                json.dumps(response_metadata)
-                if response_metadata is not None
-                else None,
-            )
+        insert_args = (
+            msg_id,
+            thread_id,
+            role,
+            content,
+            json.dumps(tool_calls) if tool_calls is not None else None,
+            turn_number,
+            json.dumps(metrics) if metrics is not None else None,
+            tool_call_id,
+            thinking,
+            json.dumps(reasoning) if reasoning is not None else None,
+            json.dumps(tool_results) if tool_results is not None else None,
+            provider,
+            json.dumps(provider_raw) if provider_raw is not None else None,
+            json.dumps(additional_kwargs) if additional_kwargs is not None else None,
+            json.dumps(response_metadata) if response_metadata is not None else None,
+        )
+
+        async def _write(conn):
+            row = await conn.fetchrow(self._THREAD_MESSAGE_UPSERT_SQL, *insert_args)
             # Bump thread activity + turn count (mirrors the orchestrator path so
             # going direct doesn't regress last_activity / total_turns tracking).
             await conn.execute(
-                """
-                UPDATE threads
-                SET last_activity = CURRENT_TIMESTAMP,
-                    total_turns   = GREATEST(total_turns, COALESCE($2, 0))
-                WHERE id = $1
-                """,
+                self._THREAD_ACTIVITY_BUMP_SQL,
                 thread_id,
                 turn_number,
             )
+            return row
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            if lease is None:
+                # Pinned lane: today's exact behavior (autocommit statements).
+                row = await _write(conn)
+            else:
+                # Public End, admission, and reaper retirement lock the thread
+                # before its queue row.  Establish the message FK's parent-row
+                # authority explicitly in that same order before fencing the
+                # exact claim; otherwise an implicit FK lock after run_queue
+                # can deadlock with terminal retirement's threads -> queue
+                # transaction.  Both the upsert and activity update remain in
+                # this transaction, so a stale fence rolls everything back.
+                async with conn.transaction():
+                    thread_exists = await conn.fetchval(
+                        self._THREAD_MESSAGE_PARENT_LOCK_SQL,
+                        thread_id,
+                    )
+                    if thread_exists is None:
+                        raise ValueError("session thread no longer exists")
+                    await _require_run_queue_fence(conn, lease)
+                    row = await _write(conn)
         return {"id": str(row["id"]), "seq": row["seq"]}
+
+    async def persist_pinned_input_delivery(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        role: str,
+        content: str,
+        source: str,
+        turn_number: Optional[int],
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        runtime_attach_token: str,
+    ) -> Dict[str, Any]:
+        """Persist and claim one pinned input in a parent-first transaction."""
+
+        from src.shared.persistent_input_delivery import persist_input_delivery
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await persist_input_delivery(
+                    conn,
+                    thread_id=thread_id,
+                    delivery_id=delivery_id,
+                    role=role,
+                    content=content,
+                    source=source,
+                    turn_number=turn_number,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
+                )
+
+    async def claim_pending_pinned_input_deliveries(
+        self,
+        *,
+        thread_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        runtime_attach_token: str,
+    ) -> List[Dict[str, Any]]:
+        """Reclaim persisted but unadmitted input after attach/restart."""
+
+        from src.shared.persistent_input_delivery import claim_pending_input_deliveries
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await claim_pending_input_deliveries(
+                    conn,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
+                )
+
+    async def mark_pinned_input_delivery_queued(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        runtime_attach_token: str,
+        claim_generation: int,
+    ) -> bool:
+        from src.shared.persistent_input_delivery import (
+            lock_runtime_authority,
+            mark_input_delivery_queued,
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await lock_runtime_authority(
+                    conn,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
+                )
+                return await mark_input_delivery_queued(
+                    conn,
+                    delivery_id=delivery_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
+                    claim_generation=claim_generation,
+                )
+
+    async def transition_pinned_input_delivery(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        runtime_attach_token: str,
+        claim_generation: int,
+        transition: str,
+        turn_number: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> bool:
+        from src.shared.persistent_input_delivery import (
+            lock_runtime_authority,
+            transition_input_delivery,
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await lock_runtime_authority(
+                    conn,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
+                )
+                return await transition_input_delivery(
+                    conn,
+                    delivery_id=delivery_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
+                    claim_generation=claim_generation,
+                    transition=transition,
+                    turn_number=turn_number,
+                    reason=reason,
+                )
+
+    async def verify_pinned_runtime_effect_authority(
+        self,
+        *,
+        thread_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        runtime_attach_token: str,
+    ) -> bool:
+        """Prove the exact pinned runtime is still allowed external effects.
+
+        The shared lock also requires ``runtime_retirement_token IS NULL``.
+        Provider and tool boundaries call this immediately before external I/O
+        so owner-authorized retirement cannot wait for the lifecycle watchdog's
+        next poll to close admission.
+        """
+
+        from src.shared.persistent_input_delivery import (
+            InputDeliveryAuthorityLost,
+            lock_runtime_authority,
+        )
+
+        try:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    await lock_runtime_authority(
+                        conn,
+                        thread_id=thread_id,
+                        agent_id=agent_id,
+                        pod_uid=pod_uid,
+                        runtime_generation=runtime_generation,
+                        runtime_attach_token=runtime_attach_token,
+                    )
+            return True
+        except InputDeliveryAuthorityLost:
+            return False
+
+    async def get_pinned_input_delivery(
+        self, delivery_id: str
+    ) -> Optional[Dict[str, Any]]:
+        from src.shared.persistent_input_delivery import get_input_delivery
+
+        async with self.acquire() as conn:
+            return await get_input_delivery(conn, delivery_id)
+
+    async def save_thread_messages(
+        self,
+        thread_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        turn_input_message_id: Optional[str] = None,
+        turn_number: Optional[int] = None,
+        memory_scope_kind: Optional[str] = None,
+        memory_scope_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Batch-upsert a turn's messages: one pipelined ``executemany`` + a
+        single ``threads`` bump.
+
+        Replaces the turn-complete reconcile's row-by-row ``save_thread_message``
+        loop (~2 round-trips per message) with 2 round-trips for the whole turn.
+        Each dict carries the same fields as :meth:`save_thread_message`'s kwargs;
+        a stable ``id`` makes the upsert land on the incremental row via
+        ``ON CONFLICT (id)``, and ``seq`` is preserved (assigned once on first
+        insert). No ``RETURNING`` — the reconcile never reads ``seq`` back, and
+        ``executemany`` discards results anyway.
+
+        The upsert runs inside a transaction so the whole turn reconciles
+        atomically. This batches ONLY the reconcile; the incremental mid-turn
+        persists still go through :meth:`save_thread_message` one at a time (the
+        crash-durability path).
+
+        A stateless turn-complete caller also supplies the exact accepted input
+        message, turn number, and immutable memory scope. After the claim fence
+        succeeds, this method validates that scope against the locked thread,
+        mints (or reuses) a ``turn_execution_id`` on the boundary row, and
+        inserts the stable final-memory obligation in the same transaction as
+        the final transcript. A stale claimant therefore commits neither, and
+        an idempotent reconcile returns the same producer identity. A later
+        project/mount edit cannot redirect the captured destination. Pinned
+        callers have no lease context and preserve the transcript-only path.
+
+        An empty message list remains a no-op except for the stateless producer
+        path: even a turn that emitted no AI/tool row must durably mint its
+        final-memory obligation.
+        """
+        if not messages and not turn_input_message_id:
+            return None
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        should_mint_effect = lease is not None and bool(turn_input_message_id)
+        if not messages and not should_mint_effect:
+            # In particular, preserve the pinned lane's historical empty-batch
+            # no-op even when its caller provides turn-boundary metadata.
+            return None
+        if should_mint_effect and turn_number is None:
+            raise ValueError(
+                "turn_number is required when minting a session-turn effect"
+            )
+        if should_mint_effect:
+            if memory_scope_kind not in {"thread", "project"}:
+                raise ValueError(
+                    "memory_scope_kind must be thread or project for a "
+                    "session-turn effect"
+                )
+            try:
+                destination_id = uuid.UUID(str(memory_scope_id))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "memory_scope_id must be a UUID for a session-turn effect"
+                ) from exc
+            if memory_scope_kind == "thread" and str(destination_id) != str(
+                uuid.UUID(str(thread_id))
+            ):
+                raise ValueError("thread memory scope must equal the thread id")
+        else:
+            destination_id = None
+
+        def _dj(value: Any) -> Optional[str]:
+            return json.dumps(value) if value is not None else None
+
+        args: List[Tuple] = []
+        max_turn = 0
+        for m in messages:
+            row_turn_number = m.get("turn_number")
+            max_turn = max(max_turn, row_turn_number or 0)
+            args.append(
+                (
+                    _coerce_row_id(m.get("id")),
+                    thread_id,
+                    m["role"],
+                    m.get("content"),
+                    _dj(m.get("tool_calls")),
+                    row_turn_number,
+                    _dj(m.get("metrics")),
+                    m.get("tool_call_id"),
+                    m.get("thinking"),
+                    _dj(m.get("reasoning")),
+                    _dj(m.get("tool_results")),
+                    m.get("provider"),
+                    _dj(m.get("provider_raw")),
+                    _dj(m.get("additional_kwargs")),
+                    _dj(m.get("response_metadata")),
+                )
+            )
+
+        turn_execution_id = None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                # Match public End's threads -> run_queue order before any
+                # batch FK/upsert or activity mutation. Pinned lane (no lease
+                # context) keeps today's exact transaction shape.
+                memory_parent = None
+                if lease is not None:
+                    # The authoritative final reconcile captures its memory
+                    # tenancy while the thread row is locked, before the exact
+                    # queue fence. A later project/mount edit can refresh
+                    # credentials but cannot redirect an old turn's facts.
+                    memory_parent = await conn.fetchrow(
+                        self._SESSION_MEMORY_PARENT_LOCK_SQL,
+                        thread_id,
+                    )
+                    if memory_parent is None:
+                        raise ValueError("session thread no longer exists")
+                    await _require_run_queue_fence(conn, lease)
+                if should_mint_effect:
+                    if str(memory_parent["execution_lane"] or "") != "stateless":
+                        raise ValueError(
+                            "session-turn effects require the stateless lane"
+                        )
+                    if memory_scope_kind == "project":
+                        metadata = memory_parent["metadata"] or {}
+                        if isinstance(metadata, str):
+                            try:
+                                metadata = json.loads(metadata)
+                            except (TypeError, ValueError):
+                                metadata = {}
+                        legacy_ids = (
+                            metadata.get("project_ids", [])
+                            if isinstance(metadata, dict)
+                            else []
+                        )
+                        direct_match = memory_parent["project_id"] is not None and str(
+                            memory_parent["project_id"]
+                        ) == str(destination_id)
+                        legacy_match = str(destination_id) in {
+                            str(value) for value in legacy_ids
+                        }
+                        mount_match = await conn.fetchval(
+                            self._SESSION_MEMORY_PROJECT_SCOPE_SQL,
+                            thread_id,
+                            destination_id,
+                        )
+                        if not (direct_match or legacy_match or mount_match):
+                            raise ValueError(
+                                "captured memory project is not attached to "
+                                "the exact thread"
+                            )
+                # Same upsert as save_thread_message, minus RETURNING. Each
+                # execution's ON CONFLICT is independent (executemany runs N
+                # separate commands), so distinct-id rows never collide.
+                if args:
+                    await conn.executemany(
+                        self._THREAD_MESSAGE_UPSERT_BATCH_SQL,
+                        args,
+                    )
+                # One activity/turn bump for the whole batch (was per-message).
+                # The stateless producer path also bumps an output-less turn.
+                activity_turn = max_turn
+                if should_mint_effect:
+                    activity_turn = max(activity_turn, turn_number or 0)
+                await conn.execute(
+                    self._THREAD_ACTIVITY_BUMP_SQL,
+                    thread_id,
+                    activity_turn,
+                )
+                if should_mint_effect:
+                    input_row_id = _coerce_row_id(turn_input_message_id)
+                    boundary = await conn.fetchrow(
+                        self._SESSION_TURN_EXECUTION_SQL,
+                        thread_id,
+                        input_row_id,
+                        turn_number,
+                    )
+                    if boundary is None:
+                        raise ValueError(
+                            "exact live turn-boundary message was not found"
+                        )
+                    turn_execution_id = boundary["turn_execution_id"]
+                    boundary_seq = int(boundary["seq"])
+                    reconciled_ids = [input_row_id]
+                    reconciled_ids.extend(row[0] for row in args)
+                    end_seq = await conn.fetchval(
+                        self._SESSION_TURN_END_SEQ_SQL,
+                        thread_id,
+                        reconciled_ids,
+                    )
+                    if end_seq is None or int(end_seq) < boundary_seq:
+                        raise ValueError(
+                            "exact reconciled turn transcript has no valid end"
+                        )
+                    effect_producer_id = await conn.fetchval(
+                        self._SESSION_MEMORY_EFFECT_INSERT_SQL,
+                        thread_id,
+                        turn_execution_id,
+                        input_row_id,
+                        turn_number,
+                        memory_scope_kind,
+                        destination_id,
+                        boundary_seq,
+                        int(end_seq),
+                    )
+                    if effect_producer_id is None:
+                        raise ValueError(
+                            "existing session-turn effect has conflicting identity"
+                        )
+        return str(turn_execution_id) if turn_execution_id is not None else None
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)
@@ -752,28 +1865,29 @@ class JobsNamespace:
         document_path: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> uuid.UUID:
-        """Create a new job.
+        """Refuses. Agents do not create jobs; the orchestrator does.
 
-        Args:
-            description: Job description - what the agent should accomplish
-            document_path: Path to document file (optional)
-            context: Additional context dictionary (optional)
+        This used to be a raw ``INSERT INTO jobs`` — the only one in the tree
+        outside tests — and it bypassed every invariant
+        ``orchestrator.database.postgres.create_job()`` maintains: the
+        ``origin`` stamp, execution-lane inheritance from the parent, the
+        authority columns, datasource linking and the policy-revision
+        snapshot. A row written here would be silently classified as
+        human-submitted work.
 
-        Returns:
-            UUID of the created job
+        It had no callers, but ``src/agent.py`` already holds this exact
+        object and calls sibling methods on it, so it sat one line away from
+        being used. Kept as an explicit refusal rather than deleted, so that
+        line fails loudly at the call instead of quietly writing a
+        half-initialised job.
+
+        Raises:
+            NotImplementedError: always.
         """
-        job_id = await self.db.fetchval(
-            """
-            INSERT INTO jobs (description, document_path, context)
-            VALUES ($1, $2, $3)
-            RETURNING id
-            """,
-            description,
-            document_path,
-            json.dumps(context or {}),
+        raise NotImplementedError(
+            "Agents must not insert jobs directly — POST /api/jobs through the "
+            "orchestrator, which stamps origin and the authority columns."
         )
-        logger.info(f"Created job {job_id}")
-        return job_id
 
     async def get(self, job_id: uuid.UUID) -> Optional[Dict[str, Any]]:
         """Get job by ID.
@@ -786,6 +1900,263 @@ class JobsNamespace:
         """
         row = await self.db.fetchrow("SELECT * FROM jobs WHERE id = $1", job_id)
         return self.db._row_to_dict(row)
+
+    async def merge_context(self, job_id: uuid.UUID, updates: Dict[str, Any]) -> bool:
+        """Atomically merge caller-safe top-level keys into job context."""
+        safe_updates = dict(updates or {})
+        for key in (
+            "pull_request",
+            "required_deliverables",
+            "deliverable_contract_provenance",
+            "prior_deliverable_contract",
+            "required_pr_repositories",
+        ):
+            safe_updates.pop(key, None)
+        result = await self.db.execute(
+            """
+            UPDATE jobs
+            SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb,
+                updated_at = NOW()
+            WHERE id = $2
+            """,
+            json.dumps(safe_updates),
+            job_id,
+        )
+        return result == "UPDATE 1"
+
+    async def record_pull_request(
+        self,
+        job_id: uuid.UUID,
+        datasource_id: uuid.UUID,
+        pull_request: Dict[str, Any],
+        *,
+        source_revision: str,
+    ) -> bool:
+        """Persist PR authority only for an exact writable job attachment.
+
+        The caller cannot select authority through the record itself: the
+        linked datasource row is loaded first and its server-owned repository
+        identity must match. ``source_revision`` is derived by ``repo_open_pr``
+        only after the checked-out branch and its pushed remote ref agree.
+        This is the sole agent-side PR authority writer.
+        """
+
+        from urllib.parse import urlparse
+
+        from src.services.forge import (
+            ForgeError,
+            forge_web_url_matches_connector,
+            parse_owner_repo,
+        )
+        from src.shared.deliverable_contract import normalize_repository_identity
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT datasource.connection_url,
+                           datasource.config,
+                           datasource.read_only,
+                           datasource.policy_revision,
+                           contract.pr_repositories,
+                           contract.pr_bindings,
+                           job.status AS job_status,
+                           COALESCE((
+                               SELECT bool_or(link.read_only)
+                                 FROM project_datasources AS link
+                                WHERE link.project_id = job.project_id
+                                  AND link.datasource_id = datasource.id
+                           ), FALSE) AS project_read_only
+                      FROM job_datasources AS attachment
+                      JOIN jobs AS job ON job.id = attachment.job_id
+                      JOIN datasources AS datasource
+                        ON datasource.id = attachment.datasource_id
+                      LEFT JOIN job_deliverable_contracts AS contract
+                        ON contract.job_id = job.id
+                     WHERE attachment.job_id = $1
+                       AND attachment.datasource_id = $2
+                       AND datasource.type = 'repository'
+                     FOR UPDATE OF job
+                     FOR SHARE OF attachment, datasource
+                    """,
+                    job_id,
+                    datasource_id,
+                )
+                if (
+                    row is None
+                    or row["job_status"] != "processing"
+                    or row["read_only"]
+                    or row["project_read_only"]
+                ):
+                    return False
+                try:
+                    owner, repository = parse_owner_repo(
+                        str(row["connection_url"] or "")
+                    )
+                except ForgeError:
+                    return False
+                expected = normalize_repository_identity(f"{owner}/{repository}")
+                supplied = normalize_repository_identity(pull_request.get("repo"))
+                if expected is None or supplied != expected:
+                    return False
+
+                config = row["config"]
+                if isinstance(config, str):
+                    try:
+                        config = json.loads(config)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        config = {}
+                config = config if isinstance(config, dict) else {}
+                expected_forge = str(config.get("forge") or "").strip().lower()
+                supplied_forge = str(pull_request.get("forge") or "").strip().lower()
+                number = pull_request.get("number")
+                url = pull_request.get("url")
+                head = pull_request.get("head")
+                base = pull_request.get("base")
+                normalized_revision = str(source_revision or "").strip().lower()
+                parsed_url = urlparse(url) if isinstance(url, str) else None
+                connection_url = str(row["connection_url"] or "")
+                if (
+                    not expected_forge
+                    or supplied_forge != expected_forge
+                    or isinstance(number, bool)
+                    or not isinstance(number, int)
+                    or number < 1
+                    or parsed_url is None
+                    or parsed_url.scheme not in {"http", "https"}
+                    or parsed_url.hostname is None
+                    or parsed_url.username is not None
+                    or parsed_url.password is not None
+                    or not forge_web_url_matches_connector(
+                        url,
+                        connection_url,
+                        expected_forge,
+                    )
+                    or not isinstance(head, str)
+                    or not head.strip()
+                    or len(head) > 500
+                    or not isinstance(base, str)
+                    or not base.strip()
+                    or len(base) > 500
+                    or len(url) > 2_000
+                    or len(normalized_revision) not in {40, 64}
+                    or any(
+                        char not in "0123456789abcdef" for char in normalized_revision
+                    )
+                ):
+                    return False
+
+                pr_repositories = list(row["pr_repositories"] or [])
+                bindings = row["pr_bindings"]
+                if isinstance(bindings, str):
+                    try:
+                        bindings = json.loads(bindings)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        bindings = []
+                bindings = bindings if isinstance(bindings, list) else []
+                if pr_repositories:
+                    binding = bindings[0] if len(bindings) == 1 else None
+                    if (
+                        len(pr_repositories) != 1
+                        or pr_repositories[0] != expected
+                        or not isinstance(binding, dict)
+                        or str(binding.get("repository") or "") != expected
+                        or str(binding.get("datasource_id") or "") != str(datasource_id)
+                        or str(binding.get("forge") or "") != expected_forge
+                        or int(binding.get("policy_revision") or -1)
+                        != int(row["policy_revision"])
+                    ):
+                        return False
+
+                # Persist only the fixed, credential-free record produced by
+                # repo_open_pr. Extra caller/result fields never enter durable
+                # context, and the server-derived connector supplies both
+                # repository and forge authority.
+                record = {
+                    "forge": expected_forge,
+                    "repo": expected,
+                    "number": number,
+                    "url": url,
+                    "head": head.strip(),
+                    "base": base.strip(),
+                }
+                semantic = (
+                    datasource_id,
+                    expected,
+                    expected_forge,
+                    number,
+                    url,
+                    head.strip(),
+                    base.strip(),
+                    normalized_revision,
+                    int(row["policy_revision"]),
+                )
+                existing = await conn.fetchrow(
+                    """
+                    SELECT datasource_id, repository, forge, number, url,
+                           head, base, source_revision, policy_revision
+                      FROM job_pull_request_authorities
+                     WHERE job_id = $1
+                     FOR UPDATE
+                    """,
+                    job_id,
+                )
+                existing_semantic = (
+                    tuple(existing.values()) if existing is not None else None
+                )
+                if existing_semantic != semantic:
+                    await conn.execute(
+                        """
+                        INSERT INTO job_pull_request_authorities (
+                            job_id, datasource_id, repository, forge, number,
+                            url, head, base, source_revision, policy_revision
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT (job_id) DO UPDATE
+                           SET record_id = gen_random_uuid(),
+                               record_generation =
+                                   job_pull_request_authorities.record_generation + 1,
+                               datasource_id = EXCLUDED.datasource_id,
+                               repository = EXCLUDED.repository,
+                               forge = EXCLUDED.forge,
+                               number = EXCLUDED.number,
+                               url = EXCLUDED.url,
+                               head = EXCLUDED.head,
+                               base = EXCLUDED.base,
+                               source_revision = EXCLUDED.source_revision,
+                               policy_revision = EXCLUDED.policy_revision,
+                               updated_at = now(),
+                               verified_at = NULL,
+                               verified_record_id = NULL,
+                               verified_generation = NULL,
+                               verified_state = NULL,
+                               verified_head = NULL,
+                               verified_base = NULL,
+                               verified_head_revision = NULL
+                        """,
+                        job_id,
+                        *semantic,
+                    )
+
+                result = await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET context = COALESCE(context, '{}'::jsonb)
+                                     || jsonb_build_object(
+                                         'pull_request', $1::jsonb
+                                     ),
+                           updated_at = now()
+                     WHERE id = $2
+                       AND EXISTS (
+                           SELECT 1
+                             FROM job_datasources
+                            WHERE job_id = $2 AND datasource_id = $3
+                       )
+                    """,
+                    json.dumps(record),
+                    job_id,
+                    datasource_id,
+                )
+        return result == "UPDATE 1"
 
     async def update_status(
         self,
@@ -988,104 +2359,6 @@ class ConfigOverridesNamespace:
             family,
         )
         return [self.db._row_to_dict(row) for row in rows]
-
-
-class CitationsNamespace:
-    """Namespace for citation-related operations.
-
-    Provides CRUD operations for citations (if schema includes citations table).
-    """
-
-    def __init__(self, db: PostgresDB):
-        self.db = db
-
-    async def edit(
-        self,
-        citation_id: int,
-        claim: Optional[str] = None,
-        verbatim_quote: Optional[str] = None,
-        quote_context: Optional[str] = None,
-        relevance_reasoning: Optional[str] = None,
-        confidence: Optional[str] = None,
-        extraction_method: Optional[str] = None,
-        locator: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Edit fields of a citation.
-
-        When content fields (claim, verbatim_quote, quote_context) change,
-        verification_status is reset to 'pending' and verification_notes,
-        similarity_score, matched_location are cleared.
-
-        Args:
-            citation_id: Citation integer ID
-            claim: The assertion being supported
-            verbatim_quote: Exact quote from source
-            quote_context: Context around the quote
-            relevance_reasoning: Why this citation is relevant
-            confidence: Confidence level (high, medium, low)
-            extraction_method: How the citation was extracted
-            locator: Location reference (JSON)
-
-        Raises:
-            ValueError: If citation not found or no fields provided
-        """
-        # Guard: check citation exists
-        row = await self.db.fetchrow(
-            "SELECT id FROM citations WHERE id = $1", citation_id
-        )
-        if not row:
-            raise ValueError(f"Citation {citation_id} not found")
-
-        # Determine if content fields are changing
-        content_fields_changed = any(
-            v is not None for v in [claim, verbatim_quote, quote_context]
-        )
-
-        # Build dynamic UPDATE clause
-        updates = []
-        values = []
-        idx = 1
-
-        field_map = [
-            ("claim", claim, lambda v: v),
-            ("verbatim_quote", verbatim_quote, lambda v: v),
-            ("quote_context", quote_context, lambda v: v),
-            ("relevance_reasoning", relevance_reasoning, lambda v: v),
-            ("confidence", confidence, lambda v: v),
-            ("extraction_method", extraction_method, lambda v: v),
-            ("locator", locator, lambda v: json.dumps(v)),
-        ]
-
-        for col, val, transform in field_map:
-            if val is not None:
-                updates.append(f"{col} = ${idx}")
-                values.append(transform(val))
-                idx += 1
-
-        if not updates:
-            raise ValueError("No fields provided to edit")
-
-        # Reset verification fields when content changes
-        if content_fields_changed:
-            updates.append("verification_status = 'pending'")
-            updates.append("verification_notes = NULL")
-            updates.append("similarity_score = NULL")
-            updates.append("matched_location = NULL")
-
-        values.append(citation_id)
-
-        query = f"""
-            UPDATE citations
-            SET {", ".join(updates)}
-            WHERE id = ${idx}
-        """
-
-        await self.db.execute(query, *values)
-        logger.debug(f"Edited citation {citation_id}")
-
-    def edit_sync(self, citation_id: int, **kwargs) -> None:
-        """Synchronous wrapper for edit()."""
-        return PostgresDB._run_async(self.edit(citation_id, **kwargs))
 
 
 __all__ = ["PostgresDB"]

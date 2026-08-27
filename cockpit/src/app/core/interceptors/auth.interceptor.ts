@@ -14,6 +14,9 @@ import {SessionService} from '../services/session.service';
  *   - Adds `X-CSRF: 1` on non-safe methods. The orchestrator's CSRF
  *     middleware requires it (alongside `Sec-Fetch-Site != cross-site`)
  *     before accepting state-changing cookie-authenticated requests.
+ *   - Adds `ngsw-bypass: 1` on non-safe methods so the Angular service
+ *     worker hands them to the browser untouched (its re-issue breaks
+ *     multipart uploads; mutations are never SW-cached anyway).
  *   - On 401, redirects to the BFF login endpoint with `return_to` set to
  *     the current URL. The orchestrator either honors an existing KC SSO
  *     session and bounces back authenticated, or shows the KC login form.
@@ -38,8 +41,14 @@ export const authInterceptor: HttpInterceptorFn = (
 
   let modified = req.clone({withCredentials: true});
   if (!isSafe) {
+    // ngsw-bypass keeps the Angular service worker from re-issuing the
+    // request via scope.fetch() — that re-issue corrupts multipart bodies
+    // (file uploads die with net::ERR_FAILED) and buys nothing since ngsw
+    // never caches non-GET/HEAD anyway. It is ngsw's only real opt-out;
+    // dataGroup config only controls caching, not handling. See
+    // knowledge-base/knowledge/issues/cockpit_service_worker_breaks_file_uploads.md.
     modified = modified.clone({
-      headers: modified.headers.set('X-CSRF', '1'),
+      headers: modified.headers.set('X-CSRF', '1').set('ngsw-bypass', '1'),
     });
   }
 

@@ -21,6 +21,8 @@ from src.services.auxiliary import (
     ExtractedMemory,
     ExtractMemoriesTask,
     CurationResult,
+    KnowledgeVerdict,
+    KnowledgeVerdictTask,
     _format_messages_for_extraction,
     _get_message_role,
 )
@@ -141,14 +143,42 @@ class TestAuxiliaryConfigParsing:
         assert config.timeout == 60.0
 
     def test_full_config_from_yaml(self):
-        """Test that defaults.yaml auxiliary section parses correctly."""
+        """Test that worker_base.yaml's auxiliary section parses correctly."""
         from src.core.loader import load_agent_config
 
-        config = load_agent_config("config/defaults.yaml")
+        config = load_agent_config("config/worker_base.yaml")
         assert config.auxiliary.enabled is True
         assert config.auxiliary.model == "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
         assert config.auxiliary.tasks["extract_memories"].enabled is True
         assert config.auxiliary.tasks["curate_knowledge"].enabled is True
+
+    def test_curator_verdict_defaults_off(self):
+        # The KB ingestion verdict gate is a measured opt-in (mirrors
+        # memory.ingestion.enabled) — off by default with the memory knob values.
+        config = _parse_auxiliary_config({})
+        ck = config.tasks["curate_knowledge"]
+        assert ck.verdict is False
+        assert ck.verdict_top_k == 5
+        assert ck.review_floor == 0.6
+
+    def test_curator_verdict_knobs_parse(self):
+        config = _parse_auxiliary_config(
+            {
+                "tasks": {
+                    "curate_knowledge": {
+                        "enabled": True,
+                        "verdict": True,
+                        "verdict_top_k": 8,
+                        "review_floor": 0.72,
+                    }
+                }
+            }
+        )
+        ck = config.tasks["curate_knowledge"]
+        assert ck.enabled is True
+        assert ck.verdict is True
+        assert ck.verdict_top_k == 8
+        assert ck.review_floor == 0.72
 
 
 # =============================================================================
@@ -277,6 +307,73 @@ class TestCurateKnowledgeTask:
 
 
 # =============================================================================
+# KnowledgeVerdict + KnowledgeVerdictTask (OKF KB slice 2 PR2)
+# =============================================================================
+
+
+_TEST_VERDICT_PROMPT = (
+    "You adjudicate knowledge notes. Return ADD/UPDATE/SUPERSEDE/DISCARD."
+)
+
+
+class TestKnowledgeVerdict:
+    """The verdict schema — the KB analog of IngestionVerdict."""
+
+    def test_add_needs_no_targets(self):
+        v = KnowledgeVerdict(action="ADD", reason="new")
+        assert v.action == "ADD"
+        assert v.target_indices == []
+
+    def test_supersede_carries_targets(self):
+        v = KnowledgeVerdict(action="SUPERSEDE", target_indices=[1, 2], reason="stale")
+        assert v.action == "SUPERSEDE"
+        assert v.target_indices == [1, 2]
+
+
+class TestKnowledgeVerdictTask:
+    """Chain-mode task that formats the candidate + neighbours for the adjudicator."""
+
+    def test_system_prompt_is_event_time_prompt(self):
+        task = KnowledgeVerdictTask(
+            candidate_content="c", neighbours=[], prompt=_TEST_VERDICT_PROMPT
+        )
+        assert task.system_prompt == _TEST_VERDICT_PROMPT
+
+    def test_output_schema(self):
+        task = KnowledgeVerdictTask(
+            candidate_content="c", neighbours=[], prompt=_TEST_VERDICT_PROMPT
+        )
+        assert task.output_schema is KnowledgeVerdict
+
+    def test_build_context_numbers_neighbours_with_similarity_and_title(self):
+        task = KnowledgeVerdictTask(
+            candidate_content="We now use RS256, not HS256.",
+            neighbours=[
+                {"content": "Auth uses HS256.", "similarity": 0.88, "title": "Auth"},
+            ],
+            prompt=_TEST_VERDICT_PROMPT,
+        )
+        ctx = task.build_context()
+        assert "We now use RS256" in ctx
+        assert "Auth uses HS256." in ctx
+        assert "similarity 0.88" in ctx
+        assert "Auth" in ctx
+        assert "[1]" in ctx
+        # instruction lists the four KB verbs
+        assert "ADD" in ctx and "SUPERSEDE" in ctx and "DISCARD" in ctx
+
+    def test_build_context_omits_similarity_when_absent(self):
+        task = KnowledgeVerdictTask(
+            candidate_content="c",
+            neighbours=[{"content": "n1"}],
+            prompt=_TEST_VERDICT_PROMPT,
+        )
+        ctx = task.build_context()
+        assert "similarity" not in ctx
+        assert "[1]" in ctx and "n1" in ctx
+
+
+# =============================================================================
 # AuxiliaryLLM.chain()
 # =============================================================================
 
@@ -305,7 +402,9 @@ class TestAuxiliaryLLMChain:
             == "The users table uses soft deletes via deleted_at."
         )
         mock_llm.with_structured_output.assert_called_once_with(
-            ExtractedMemories, include_raw=True
+            ExtractedMemories,
+            method="json_schema",
+            include_raw=True,
         )
 
     @pytest.mark.asyncio
@@ -660,3 +759,130 @@ class TestOutputSchemas:
             summary="Created 3 notes.",
         )
         assert result.notes_created == 3
+
+
+# =============================================================================
+# Failed-aux archiving — surface silent aux failures
+# (knowledge-base/knowledge/issues/surface_silent_aux_failures.md)
+# =============================================================================
+
+
+class TestAuxErrorArchiving:
+    @pytest.mark.asyncio
+    async def test_chain_failure_archives_error_and_reraises(self):
+        mock_llm = MagicMock()
+        structured_mock = AsyncMock()
+        structured_mock.ainvoke = AsyncMock(
+            side_effect=ConnectionError("503 backend down")
+        )
+        mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
+
+        archiver = MagicMock()
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=5.0)
+        aux.set_job_context(archiver=archiver, job_id="job-123", agent_type="scholar")
+        task = ExtractMemoriesTask(messages=[], prompt=_TEST_MEMORY_PROMPT, phase=0)
+
+        with pytest.raises(ConnectionError):
+            await aux.chain(task)
+
+        archiver.archive_error.assert_called_once()
+        kwargs = archiver.archive_error.call_args.kwargs
+        assert kwargs["job_id"] == "job-123"
+        assert kwargs["call_type"] == "memory_extraction"
+        assert kwargs["error_type"] == "ConnectionError"
+        assert "503" in kwargs["error"]
+        # A failed call must not also archive a success row.
+        archiver.archive.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_archive_error_noop_without_job_context(self):
+        # Persistent-session path: no archiver wired -> must not crash, still raises.
+        mock_llm = MagicMock()
+        structured_mock = AsyncMock()
+        structured_mock.ainvoke = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
+
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=5.0)  # no set_job_context
+        task = ExtractMemoriesTask(messages=[], prompt=_TEST_MEMORY_PROMPT, phase=0)
+
+        with pytest.raises(RuntimeError):
+            await aux.chain(task)
+
+    @pytest.mark.asyncio
+    async def test_successful_chain_archives_success_not_error(self):
+        mock_llm = _make_structured_llm(ExtractedMemories(memories=[]))
+        archiver = MagicMock()
+        aux = AuxiliaryLLM(llm=mock_llm)
+        aux.set_job_context(archiver=archiver, job_id="job-1", agent_type="scholar")
+        task = ExtractMemoriesTask(
+            messages=[HumanMessage(content="hi")],
+            prompt=_TEST_MEMORY_PROMPT,
+            phase=0,
+        )
+
+        await aux.chain(task)
+
+        archiver.archive.assert_called_once()
+        archiver.archive_error.assert_not_called()
+
+
+class TestArchiveError:
+    class _FakeWriter:
+        """Captures the row the Postgres archiver builds (mirrors test_archiver_pg)."""
+
+        def __init__(self, ready=True, request_id="deadbeef"):
+            self.ready = ready
+            self.request_id = request_id
+            self.rows = []
+
+        def ensure_ready(self):
+            return self.ready
+
+        def insert_llm_request(self, row):
+            self.rows.append(row)
+            return self.request_id
+
+    def _archiver(self, connected=True, inserted_id="deadbeef"):
+        from src.core.archiver import LLMArchiver
+
+        return LLMArchiver(
+            writer=self._FakeWriter(ready=connected, request_id=inserted_id)
+        )
+
+    def test_writes_error_document(self):
+        archiver = self._archiver()
+        request_id = archiver.archive_error(
+            job_id="job-1",
+            agent_type="scholar",
+            messages=[HumanMessage(content="hello")],
+            model="gemma-4-moe",
+            error="503 All backends unavailable",
+            error_type="ConnectionError",
+            latency_ms=12,
+            call_type="memory_extraction",
+            auxiliary_metadata={"task_class": "ExtractMemoriesTask"},
+        )
+        assert request_id == "deadbeef"
+        row = archiver._writer.rows[0]
+        # The Postgres schema folds the error into metadata and stores an empty
+        # response (response is NOT NULL) so a failed call stays queryable.
+        assert row["metadata"]["status"] == "error"
+        assert row["call_type"] == "memory_extraction"
+        assert row["metadata"]["error"]["type"] == "ConnectionError"
+        assert "503" in row["metadata"]["error"]["message"]
+        assert row["response"] == {}
+        assert row["model"] == "gemma-4-moe"
+        assert row["request"]["message_count"] == 1
+
+    def test_noop_when_disconnected(self):
+        archiver = self._archiver(connected=False)
+        out = archiver.archive_error(
+            job_id="j",
+            agent_type="a",
+            messages=[],
+            model="m",
+            error="e",
+            error_type="E",
+        )
+        assert out is None
+        assert archiver._writer.rows == []

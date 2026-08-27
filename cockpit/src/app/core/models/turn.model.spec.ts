@@ -1,13 +1,20 @@
 import {describe, expect, it} from 'vitest';
 import {
     AssistantTurn,
+    collapsedAnswer,
+    CompactionEvent,
+    EventGroup,
     firstSentence,
     firstTextOf,
+    FoldableEvent,
     groupEvents,
     lastTextOf,
+    notifyToolCalls,
+    summarizeFolded,
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    ToolCallStatus,
     trailingText,
 } from './turn.model';
 
@@ -15,9 +22,20 @@ function mkTurn(events: AssistantTurn['events']): AssistantTurn {
     return {kind: 'assistant', id: 't1', events, status: 'done', startedAt: 0};
 }
 const txt = (id: string, content: string): TextEvent => ({kind: 'text', id, content, status: 'done', startedAt: 0});
-const tht = (id: string): ThoughtEvent => ({kind: 'thought', id, content: '...', status: 'done', startedAt: 0});
-const tool = (id: string): ToolCallEvent =>
-    ({kind: 'tool_call', id, tool: 'read_file', args: {}, status: 'completed', startedAt: 0});
+const tht = (id: string, status: ThoughtEvent['status'] = 'done'): ThoughtEvent =>
+    ({kind: 'thought', id, content: '...', status, startedAt: 0});
+const tool = (id: string, status: ToolCallStatus = 'completed', category?: string): ToolCallEvent =>
+    ({kind: 'tool_call', id, tool: 'read_file', args: {}, status, startedAt: 0, category});
+const notify = (id: string): ToolCallEvent =>
+    ({kind: 'tool_call', id, tool: 'notify_user', args: {message: 'm', urgency: 'log'}, status: 'completed', startedAt: 0});
+const job = (id: string, status: ToolCallStatus = 'completed'): ToolCallEvent =>
+    ({kind: 'tool_call', id, tool: 'create_job', args: {description: 'd'}, status, startedAt: 0});
+const comp = (id: string): CompactionEvent => ({kind: 'compaction', id, summary: 'compacted', startedAt: 0});
+
+/** Ids in a group, folded / batched / single — keeps the assertions readable. */
+const idsOf = (g: EventGroup): string[] =>
+    g.kind === 'single' ? [g.event.id] : g.events.map(e => e.id);
+const shapeOf = (gs: EventGroup[]) => gs.map(g => `${g.kind}(${idsOf(g).join(',')})`);
 
 describe('firstTextOf', () => {
     it('returns the first text event, skipping leading thoughts', () => {
@@ -84,8 +102,36 @@ describe('trailingText', () => {
         expect(trailingText(mkTurn([txt('b0', 'doing'), tool('b1')]))).toBe('');
     });
 
-    it('returns "" when the turn ends on a thought', () => {
-        expect(trailingText(mkTurn([txt('b0', 'hi'), tht('b1')]))).toBe('');
+    it('skips a stray finished thought trailing the closing prose', () => {
+        // Transports that only hand reasoning over post-stream broadcast the
+        // thought AFTER the answer tokens — it must not blank the answer.
+        expect(trailingText(mkTurn([txt('b0', 'hi'), tht('b1')]))).toBe('hi');
+    });
+
+    it('skips multiple trailing finished/hidden thoughts', () => {
+        const t = mkTurn([tool('b0'), txt('b1', 'answer.'), tht('b2'), tht('b3', 'hidden')]);
+        expect(trailingText(t)).toBe('answer.');
+    });
+
+    it('returns "" when the trailing thought is still streaming (mid-work)', () => {
+        expect(trailingText(mkTurn([txt('b0', 'so far'), tht('b1', 'streaming')]))).toBe('');
+    });
+
+    it('skips a trailing inline compaction marker', () => {
+        expect(trailingText(mkTurn([txt('b0', 'answer.'), comp('b1')]))).toBe('answer.');
+    });
+
+    it('still cuts the run at a thought BETWEEN texts (earlier text is lead-up)', () => {
+        const t = mkTurn([txt('b0', 'lead'), tht('b1'), txt('b2', 'final.'), tht('b3')]);
+        expect(trailingText(t)).toBe('final.');
+    });
+
+    it('returns "" when a tool call follows the last text, even behind a thought', () => {
+        expect(trailingText(mkTurn([txt('b0', 'doing'), tool('b1'), tht('b2')]))).toBe('');
+    });
+
+    it('returns "" for an all-thought turn', () => {
+        expect(trailingText(mkTurn([tht('b0'), tht('b1')]))).toBe('');
     });
 
     it('returns the whole text for an all-text turn', () => {
@@ -102,42 +148,274 @@ describe('trailingText', () => {
     });
 });
 
+describe('collapsedAnswer', () => {
+    it('returns the closing prose when the turn ends on text', () => {
+        const t = mkTurn([txt('b0', 'plan'), tool('b1'), txt('b2', 'Here is the result.')]);
+        expect(collapsedAnswer(t)).toBe('Here is the result.');
+    });
+
+    it('recovers the answer when a completed citation pass trails the text', () => {
+        // The model writes its answer, then registers citations — the turn ends
+        // on cite_web tool calls, so trailingText() is empty. The answer must
+        // still surface instead of collapsing to a one-line opening headline.
+        const t = mkTurn([
+            txt('b0', 'I will build the pack.'),
+            tool('b1'),
+            txt('b2', 'Done — here is the finished pack.'),
+            tool('b3', 'completed', 'citation'),
+            tool('b4', 'completed', 'citation'),
+        ]);
+        expect(collapsedAnswer(t)).toBe('Done — here is the finished pack.');
+    });
+
+    it('joins the trailing text run behind the trailing tool calls', () => {
+        const t = mkTurn([txt('b0', 'First.'), txt('b1', 'Second.'), tool('b2', 'completed', 'citation')]);
+        expect(collapsedAnswer(t)).toBe('First.\n\nSecond.');
+    });
+
+    it('recovers the answer regardless of the trailing tool category', () => {
+        // Not just citations — a closing verification run_command, a final save,
+        // etc.; history rows may also lack a stamped category entirely.
+        const t = mkTurn([txt('b0', 'The file is valid.'), tool('b1')]);
+        expect(collapsedAnswer(t)).toBe('The file is valid.');
+    });
+
+    it('returns "" while a trailing tool call is still running (mid-work)', () => {
+        expect(collapsedAnswer(mkTurn([txt('b0', 'working'), tool('b1', 'running')]))).toBe('');
+    });
+
+    it('returns "" while a trailing thought is still streaming (mid-work)', () => {
+        expect(collapsedAnswer(mkTurn([txt('b0', 'so far'), tht('b1', 'streaming')]))).toBe('');
+    });
+
+    it('returns "" when the turn has no text at all', () => {
+        expect(collapsedAnswer(mkTurn([tool('b0', 'completed', 'citation'), tht('b1')]))).toBe('');
+    });
+
+    it('cuts the run at a tool BETWEEN texts (earlier text is lead-up)', () => {
+        const t = mkTurn([txt('b0', 'lead'), tool('b1'), txt('b2', 'final.'), tool('b3', 'completed', 'citation')]);
+        expect(collapsedAnswer(t)).toBe('final.');
+    });
+});
+
 describe('groupEvents', () => {
     it('returns [] for no events', () => {
         expect(groupEvents([])).toEqual([]);
     });
 
-    it('coalesces a run of consecutive tool calls into one tools group', () => {
-        const g = groupEvents([tool('b0'), tool('b1'), tool('b2')]);
-        expect(g).toHaveLength(1);
-        expect(g[0]).toMatchObject({kind: 'tools', id: 'b0'});
-        expect((g[0] as {tools: unknown[]}).tools).toHaveLength(3);
-    });
-
-    it('keeps a lone tool call as a one-member tools group', () => {
-        const g = groupEvents([tool('b0')]);
-        expect(g).toHaveLength(1);
-        expect(g[0].kind).toBe('tools');
-        expect((g[0] as {tools: unknown[]}).tools).toHaveLength(1);
-    });
-
-    it('emits thoughts and text as single groups', () => {
-        const g = groupEvents([tht('b0'), txt('b1', 'hi')]);
-        expect(g.map(x => x.kind)).toEqual(['single', 'single']);
-        expect(g[0]).toMatchObject({kind: 'single', id: 'b0'});
-    });
-
-    it('does NOT merge tool runs across an interleaved thought', () => {
+    it('MERGES tool runs across an interleaved thought — the whole point', () => {
+        // The old rule broke a run at every thought, so a turn that alternated
+        // thought/tools/thought/tools rendered as a dozen rows even though each
+        // run folded. Only the latest tool (b4) stays pinned.
         const g = groupEvents([tool('b0'), tool('b1'), tht('b2'), tool('b3'), tool('b4')]);
-        expect(g.map(x => x.kind)).toEqual(['tools', 'single', 'tools']);
-        expect((g[0] as {tools: unknown[]}).tools).toHaveLength(2);
-        expect(g[1]).toMatchObject({kind: 'single', id: 'b2'});
-        expect((g[2] as {tools: unknown[]}).tools).toHaveLength(2);
-        expect(g[2].id).toBe('b3');
+        expect(shapeOf(g)).toEqual(['folded(b0,b1,b2,b3)', 'single(b4)']);
     });
 
-    it('breaks runs on text too', () => {
-        const g = groupEvents([txt('b0', 'plan'), tool('b1'), txt('b2', 'done')]);
-        expect(g.map(x => x.kind)).toEqual(['single', 'tools', 'single']);
+    it('never folds text — it is the answer', () => {
+        // b4 is the latest tool call so it pins; b1..b3 fold between the two texts.
+        const g = groupEvents([txt('b0', 'plan'), tool('b1'), tool('b2'), tool('b3'), tool('b4'), txt('b5', 'done')]);
+        expect(shapeOf(g)).toEqual(['single(b0)', 'folded(b1,b2,b3)', 'single(b4)', 'single(b5)']);
+    });
+
+    it('never folds a compaction marker', () => {
+        const comp = {kind: 'compaction', id: 'b2', summary: 's', startedAt: 0} as const;
+        const g = groupEvents([tool('b0'), tht('b1'), comp, tool('b3'), tool('b4'), tool('b5')]);
+        expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)', 'folded(b3,b4)', 'single(b5)']);
+    });
+
+    it('never folds notify_user — an officer→user message is first-class, like text', () => {
+        // Buried mid-run between plain tool calls, the message must still
+        // surface as its own bubble rather than vanish into the chip.
+        const g = groupEvents([tool('b0'), tool('b1'), notify('b2'), tool('b3'), tool('b4'), tool('b5')]);
+        expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)', 'folded(b3,b4)', 'single(b5)']);
+    });
+
+    describe('the live edge', () => {
+        it('pins every in-flight call — 5 tools at once means 5 cards', () => {
+            const g = groupEvents([
+                tool('b0'), tool('b1', 'running'), tool('b2', 'running'),
+                tool('b3', 'running'), tool('b4', 'running'), tool('b5', 'pending'),
+            ]);
+            // b0 alone is below MIN_FOLD_RUN, so it renders inline rather than chipping.
+            expect(shapeOf(g)).toEqual([
+                'single(b0)', 'single(b1)', 'single(b2)', 'single(b3)', 'single(b4)', 'single(b5)',
+            ]);
+        });
+
+        it('drops each call into the chip as it completes', () => {
+            const g = groupEvents([
+                tool('b0'), tool('b1'), tool('b2'), tool('b3', 'running'), tool('b4', 'running'),
+            ]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1,b2)', 'single(b3)', 'single(b4)']);
+        });
+
+        it('pins a streaming thought', () => {
+            // No tool call here, so nothing competes for the latest-tool pin.
+            const g = groupEvents([tht('b0'), tht('b1'), tht('b2'), tht('b3', 'streaming')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1,b2)', 'single(b3)']);
+        });
+
+        it('always pins the latest tool call, even in a finished turn', () => {
+            const g = groupEvents([tht('b0'), tool('b1'), tht('b2'), tool('b3')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1,b2)', 'single(b3)']);
+        });
+
+        it('pins only the LAST tool call, not every trailing one', () => {
+            const g = groupEvents([tool('b0'), tool('b1'), tool('b2')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)']);
+        });
+
+        it('handles out-of-order completion without reordering', () => {
+            // b1 still running while b2/b3 already returned: b1 pinned (in flight),
+            // b3 pinned (latest), b2 stranded between them — renders inline, in place.
+            const g = groupEvents([tool('b0'), tool('b1', 'running'), tool('b2'), tool('b3')]);
+            expect(shapeOf(g)).toEqual(['single(b0)', 'single(b1)', 'single(b2)', 'single(b3)']);
+        });
+
+        it('folds a thought-only turn with no tool call to pin', () => {
+            const g = groupEvents([tht('b0'), tht('b1'), tht('b2')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1,b2)']);
+        });
+    });
+
+    it('renders a sub-threshold run inline instead of chipping it', () => {
+        // A "1× thought" chip is the same height as the card and less informative.
+        const g = groupEvents([tht('b0'), tool('b1', 'running')]);
+        expect(shapeOf(g)).toEqual(['single(b0)', 'single(b1)']);
+    });
+
+    it('ids the group by its first member so @for track stays stable', () => {
+        const g = groupEvents([tool('b0'), tht('b1'), tool('b2')]);
+        expect(g[0].id).toBe('b0');
+    });
+
+    describe('job fan-out', () => {
+        it('groups contiguous job calls into one batch', () => {
+            expect(shapeOf(groupEvents([job('b0'), job('b1'), job('b2')])))
+                .toEqual(['job_batch(b0,b1,b2)']);
+        });
+
+        it('FIXES the fan-out that used to hide two of three job cards', () => {
+            // Before: job calls were foldable and pinnedEventIds() pins only the
+            // turn's LAST tool call, so this rendered as 'folded(b0,b1)' plus
+            // 'single(b2)' — two actionable cards buried in a "2× tool calls"
+            // chip that gave no hint they were there. The regression this guards
+            // is re-adding create_job to isFoldable().
+            const g = groupEvents([job('b0'), job('b1'), job('b2')]);
+            expect(g.map(x => x.kind)).not.toContain('folded');
+            expect(g).toHaveLength(1);
+        });
+
+        it('leaves a lone job call as an ordinary card', () => {
+            // A one-row batch is a card with a redundant header.
+            expect(shapeOf(groupEvents([job('b0')]))).toEqual(['single(b0)']);
+        });
+
+        it('never folds a job call buried in a run of ordinary tools', () => {
+            // The notify_user case, but for an actionable card. b5 is the latest
+            // tool call and pins; b2 stands alone because it can never fold.
+            const g = groupEvents([tool('b0'), tool('b1'), job('b2'), tool('b3'), tool('b4'), tool('b5')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)', 'folded(b3,b4)', 'single(b5)']);
+        });
+
+        it('breaks the batch on anything the agent said or did between dispatches', () => {
+            const g = groupEvents([job('b0'), job('b1'), txt('b2', 'and now'), job('b3'), job('b4')]);
+            expect(shapeOf(g)).toEqual(['job_batch(b0,b1)', 'single(b2)', 'job_batch(b3,b4)']);
+        });
+
+        it('batches while still in flight, preserving order', () => {
+            const g = groupEvents([job('b0'), job('b1', 'running'), job('b2', 'pending')]);
+            expect(shapeOf(g)).toEqual(['job_batch(b0,b1,b2)']);
+        });
+
+        it('ids the batch by its first member so @for track stays stable', () => {
+            expect(groupEvents([job('b0'), job('b1')])[0].id).toBe('b0');
+        });
+
+        it('does not disturb a turn with no job calls', () => {
+            const g = groupEvents([tool('b0'), tool('b1'), tool('b2')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)']);
+        });
+    });
+
+    it('collapses the screenshot case to one chip plus the live edge', () => {
+        // The reported shape: text, then thought/tools alternating forever.
+        const events = [txt('b0', 'analysis')];
+        for (let i = 1; i <= 12; i++) {
+            events.push(i % 2 ? tht(`b${i}`) : tool(`b${i}`));
+        }
+        const g = groupEvents(events);
+        expect(g.map(x => x.kind)).toEqual(['single', 'folded', 'single']);
+    });
+});
+
+describe('notifyToolCalls', () => {
+    it('returns only the notify_user calls, in order', () => {
+        const t = mkTurn([tool('b0'), notify('b1'), txt('b2', 'closing'), notify('b3')]);
+        expect(notifyToolCalls(t).map(e => e.id)).toEqual(['b1', 'b3']);
+    });
+
+    it('returns [] for a turn without officer messages', () => {
+        expect(notifyToolCalls(mkTurn([tool('b0'), txt('b1', 'x')]))).toEqual([]);
+    });
+});
+
+describe('summarizeFolded', () => {
+    const sum = (evts: FoldableEvent[]) => summarizeFolded(evts);
+
+    it('counts by category, with thoughts as their own bucket', () => {
+        const s = sum([
+            tool('a', 'completed', 'research'), tool('b', 'completed', 'research'),
+            tool('c', 'completed', 'citation'), tht('d'),
+        ]);
+        expect(s.parts).toEqual([
+            {category: 'research', count: 2},
+            {category: 'citation', count: 1},
+            {category: 'thought', count: 1},
+        ]);
+    });
+
+    it('sorts by count, highest first', () => {
+        const s = sum([
+            tool('a', 'completed', 'shell'),
+            tool('b', 'completed', 'research'), tool('c', 'completed', 'research'),
+            tool('d', 'completed', 'research'),
+        ]);
+        expect(s.parts.map(p => p.category)).toEqual(['research', 'shell']);
+    });
+
+    it('keeps first-appearance order for ties', () => {
+        const s = sum([tool('a', 'completed', 'git'), tool('b', 'completed', 'shell')]);
+        expect(s.parts.map(p => p.category)).toEqual(['git', 'shell']);
+    });
+
+    it('buckets calls with no category as "other" (older history rows)', () => {
+        expect(sum([tool('a')]).parts).toEqual([{category: 'other', count: 1}]);
+    });
+
+    it('counts failures for the chip badge', () => {
+        const s = sum([
+            tool('a', 'completed', 'shell'), tool('b', 'error', 'shell'),
+            tool('c', 'denied', 'shell'), tht('d'),
+        ]);
+        expect(s.failed).toBe(2);
+    });
+
+    it('counts a resultStatus error even when status looks completed', () => {
+        const e: ToolCallEvent = {...tool('a', 'completed', 'shell'), resultStatus: 'error'};
+        expect(sum([e]).failed).toBe(1);
+    });
+
+    it('never counts a thought as failed', () => {
+        expect(sum([tht('a'), tht('b')]).failed).toBe(0);
+    });
+
+    it('does not double-count: parts sum to the event count', () => {
+        // The reason this is categorical and has no grand total — a total plus
+        // per-category counts would count every command twice.
+        const evts = [
+            tool('a', 'completed', 'shell'), tool('b', 'completed', 'research'), tht('c'),
+        ];
+        expect(sum(evts).parts.reduce((n, p) => n + p.count, 0)).toBe(evts.length);
     });
 });

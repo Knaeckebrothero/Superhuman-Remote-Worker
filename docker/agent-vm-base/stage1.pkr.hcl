@@ -124,7 +124,17 @@ build {
 
   # Light cleanup — preserve packer user, cloud-init state, machine-id, and
   # sshd PasswordAuthentication (stage 2 SSHs in as packer when it boots).
+  #
+  # This script ends in `shutdown -P now` (shutdown_command is empty above), so
+  # SSH drops as the VM powers off. Without these two flags Packer races the
+  # poweroff trying to SSH back in and `rm` its temp script, intermittently
+  # failing with "Error removing temporary script: connection refused".
+  #   expect_disconnect: the SSH drop on shutdown is expected, not an error.
+  #   skip_clean:        don't reconnect to delete the temp script (the script
+  #                      already `rm -rf /tmp/*` and the VM is being captured).
   provisioner "shell" {
-    script = "scripts/cleanup-stage1.sh"
+    script            = "scripts/cleanup-stage1.sh"
+    expect_disconnect = true
+    skip_clean        = true
   }
 }

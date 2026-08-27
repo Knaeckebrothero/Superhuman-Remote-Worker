@@ -9,7 +9,6 @@ default:
   instructions:
     instructions: instructions.md
     strategic_todos_initial: strategic_todos_initial.yaml
-    todo_guide: todo_guide.md
 
 minimax:
   prompts:

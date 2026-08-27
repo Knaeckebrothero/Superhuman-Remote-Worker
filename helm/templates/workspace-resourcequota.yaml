@@ -1,0 +1,38 @@
+{{- /*
+Capacity guard for PVC-backed workspaces (Branch a, Phase 3a).
+
+A namespaced ResourceQuota keyed on the *ephemeral* workspace storage class
+caps BOTH the total storage and the number of workspace PVCs of that class.
+When the cap is hit the orchestrator's PVC create gets a 403 and the owning
+work fails closed with a distinct "workspace capacity quota exceeded" log line
+(no silent emptyDir fallback).
+
+Sessions consume this quota too (2026-08-04): under `workspace.pvcEnabled` a
+session claims `pvc-ws-thread-*` for its workspace pod AND `pvc-agent-s-*` for
+its agent pod, both on this storage class, and both are held until the thread
+row is deleted — an `ended` thread is resumable and keeps its volumes. Jobs and
+sessions therefore share ONE bucket with no per-kind split: a session backlog
+can 403 a job's PVC create. Size `resourceQuota.maxCount` against retained
+threads, not peak concurrency (arithmetic in values.yaml).
+
+Keyed per-storage-class (not namespace-wide) so it bounds *workspace* storage
+without conflating it with the platform's own data PVCs (Postgres, …).
+That isolation only holds when `ephemeralStorageClass` is DEDICATED to
+workspaces: on prod `longhorn-ephemeral` already is; on single-node/local-path
+create a dedicated local-path-backed class (same provisioner, distinct name)
+and point `ephemeralStorageClass` at it. See the storage-substrate section of
+knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
+*/ -}}
+{{- if and .Values.workspace.pvcEnabled .Values.workspace.resourceQuota.enabled }}
+{{- $sc := required "workspace.resourceQuota.enabled requires workspace.ephemeralStorageClass to be set — the capacity quota is keyed on that storage class" .Values.workspace.ephemeralStorageClass }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "srw.fullname" . }}-workspace-storage
+  labels:
+    {{- include "srw.labels" . | nindent 4 }}
+spec:
+  hard:
+    {{ printf "%s.storageclass.storage.k8s.io/requests.storage" $sc }}: {{ .Values.workspace.resourceQuota.maxStorage | quote }}
+    {{ printf "%s.storageclass.storage.k8s.io/persistentvolumeclaims" $sc }}: {{ .Values.workspace.resourceQuota.maxCount | quote }}
+{{- end }}

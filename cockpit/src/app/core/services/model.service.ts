@@ -9,12 +9,6 @@ export interface ModelGroup {
   models: string[];
 }
 
-export interface BuilderModel {
-  label: string;
-  id: string;
-  configured: boolean;
-}
-
 export interface HelperModel {
   id: string;
   label: string;
@@ -25,15 +19,27 @@ export interface EmbeddingModel extends HelperModel {
   dimensions?: number;
 }
 
+/**
+ * Per-model reasoning control capability, derived server-side from the model
+ * family's `reasoning` block (config/model_config_matrix.yaml). Drives the
+ * Cockpit reasoning dropdown so it can't drift from the backend.
+ * `method`: effort_enum | binary_toggle | token_budget | always_on | none.
+ */
+export interface ReasoningCapability {
+  method: string;
+  default: string | null;
+  options: string[];
+}
+
 interface ModelsResponse {
   groups: ModelGroup[];
-  builder_models: BuilderModel[];
   auxiliary_models: HelperModel[];
   vision_models: HelperModel[];
   whisper_models: HelperModel[];
   tts_models: HelperModel[];
   embedding_models: EmbeddingModel[];
   configured_providers: string[];
+  reasoning_by_model?: Record<string, ReasoningCapability>;
 }
 
 /**
@@ -47,13 +53,14 @@ export class ModelService {
   private fetchInFlight = false;
 
   readonly models = signal<ModelGroup[]>([]);
-  readonly builderModels = signal<BuilderModel[]>([]);
   readonly auxiliaryModels = signal<HelperModel[]>([]);
   readonly visionModels = signal<HelperModel[]>([]);
   readonly whisperModels = signal<HelperModel[]>([]);
   readonly ttsModels = signal<HelperModel[]>([]);
   readonly embeddingModels = signal<EmbeddingModel[]>([]);
   readonly providers = signal<string[]>([]);
+  /** model_id → reasoning capability (family-derived); drives the reasoning UI. */
+  readonly reasoningByModel = signal<Record<string, ReasoningCapability>>({});
   readonly loading = signal(false);
   readonly loaded = signal(false);
 
@@ -72,13 +79,13 @@ export class ModelService {
     this.http.get<ModelsResponse>(url).subscribe({
       next: (resp) => {
         this.models.set(resp.groups);
-        this.builderModels.set(resp.builder_models);
         this.auxiliaryModels.set(resp.auxiliary_models ?? []);
         this.visionModels.set(resp.vision_models ?? []);
         this.whisperModels.set(resp.whisper_models ?? []);
         this.ttsModels.set(resp.tts_models ?? []);
         this.embeddingModels.set(resp.embedding_models ?? []);
         this.providers.set(resp.configured_providers);
+        this.reasoningByModel.set(resp.reasoning_by_model ?? {});
         this.loading.set(false);
         this.loaded.set(true);
         this.fetchInFlight = false;
@@ -88,13 +95,13 @@ export class ModelService {
         // catalog so the empty-state banner + disabled pickers render
         // instead of stale, hard-coded fallbacks.
         this.models.set([]);
-        this.builderModels.set([]);
         this.auxiliaryModels.set([]);
         this.visionModels.set([]);
         this.whisperModels.set([]);
         this.ttsModels.set([]);
         this.embeddingModels.set([]);
         this.providers.set([]);
+        this.reasoningByModel.set({});
         this.loading.set(false);
         this.loaded.set(true);
         this.fetchInFlight = false;

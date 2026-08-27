@@ -1,0 +1,43 @@
+{{/*
+One PodDisruptionBudget per replicated CloudNativePG cluster.
+
+Rendered only above a single instance: at instances:1 a minAvailable of 1
+would block every voluntary eviction, the same trap as the orchestrator PDB.
+The selector matches on the component labels CNPG inherits onto its pods --
+which the bundled StatefulSet pod carries too, so this must never render for a
+database still on the StatefulSet engine.
+*/}}
+{{- define "srw.cnpgPdb" -}}
+{{- $ctx := .context -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "srw.fullname" $ctx }}-{{ .component }}-pdb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" $ctx "component" .component) | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" $ctx "component" .component) | nindent 6 }}
+{{- end }}
+
+{{- $clusters := list
+      (dict "key" "postgres" "component" "postgres")
+      (dict "key" "vector" "component" "pgvector")
+      (dict "key" "audit" "component" "auditdb")
+      (dict "key" "gitea" "component" "giteadb")
+      (dict "key" "keycloak" "component" "keycloakdb") -}}
+{{- $rendered := 0 -}}
+{{- range $entry := $clusters }}
+{{- if (include "srw.dbRendersCnpg" (dict "context" $ "key" $entry.key)) }}
+{{- $db := index $.Values.databases $entry.key }}
+{{- if gt (int (include "srw.dbInstances" (dict "context" $ "db" $db))) 1 }}
+{{- if $rendered }}
+---
+{{- end }}
+{{- $rendered = add1 $rendered }}
+{{- include "srw.cnpgPdb" (dict "context" $ "component" $entry.component) }}
+{{- end }}
+{{- end }}
+{{- end }}

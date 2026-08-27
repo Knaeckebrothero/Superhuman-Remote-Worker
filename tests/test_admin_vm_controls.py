@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -68,20 +68,21 @@ class TestAdminVmRoutesRegistered:
 
 
 class TestAdminUserUpdate:
-    def test_accepts_partial_is_admin_only(self):
-        body = AdminUserUpdate(is_admin=True)
-        assert body.is_admin is True
-        assert body.can_use_vm is None
+    def test_is_admin_is_not_a_settable_field(self):
+        # Admin is owned by the Keycloak `admin` realm role and reconciled onto
+        # users.is_admin per request; the app must not offer a write path that
+        # would be silently clobbered. So is_admin is intentionally not a field.
+        assert "is_admin" not in AdminUserUpdate.model_fields
 
     def test_accepts_partial_can_use_vm_only(self):
         body = AdminUserUpdate(can_use_vm=True)
         assert body.can_use_vm is True
-        assert body.is_admin is None
+        assert body.is_approved is None
 
     def test_accepts_empty_body(self):
         body = AdminUserUpdate()
-        assert body.is_admin is None
         assert body.can_use_vm is None
+        assert body.is_approved is None
 
 
 # ---------------------------------------------------------------------------
@@ -89,23 +90,36 @@ class TestAdminUserUpdate:
 # ---------------------------------------------------------------------------
 
 
+def _patch_db(*, setting=None, setting_error=None):
+    """Patch ``main.postgres_db`` for the gate tests.
+
+    The gate makes two async DB calls: ``get_system_setting`` (the global
+    kill-switch) and ``user_can_use_vm`` (the per-user grant). The latter
+    resolves capability grants and falls back to ``bool(user['can_use_vm'])``
+    when none exist, so the mock mirrors that fallback — the per-user
+    expectations below read straight off the user dict, as before.
+    """
+    mock_db = MagicMock()
+    mock_db.get_system_setting = AsyncMock(
+        side_effect=setting_error, return_value=setting
+    )
+    mock_db.user_can_use_vm = AsyncMock(
+        side_effect=lambda u: bool(u and u.get("can_use_vm"))
+    )
+    return patch(f"{MODULE}.postgres_db", mock_db)
+
+
 class TestCheckVmPermission:
     @pytest.mark.asyncio
     async def test_no_op_when_job_does_not_need_vm(self):
         """The gate short-circuits for non-VM jobs — no DB call, no raise."""
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(
-                side_effect=AssertionError("should not read kill-switch")
-            )
+        with _patch_db(setting_error=AssertionError("should not read kill-switch")):
             await orch_main._check_vm_permission(user=None, job_needs_vm=False)
 
     @pytest.mark.asyncio
     async def test_kill_switch_blocks_admin(self):
         admin = {"id": "u1", "is_admin": True, "can_use_vm": True}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(
-                return_value={"value": {"enabled": False}}
-            )
+        with _patch_db(setting={"value": {"enabled": False}}):
             with pytest.raises(HTTPException) as exc:
                 await orch_main._check_vm_permission(admin, job_needs_vm=True)
             assert exc.value.status_code == 403
@@ -114,10 +128,7 @@ class TestCheckVmPermission:
     @pytest.mark.asyncio
     async def test_kill_switch_blocks_granted_non_admin(self):
         user = {"id": "u2", "is_admin": False, "can_use_vm": True}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(
-                return_value={"value": {"enabled": False}}
-            )
+        with _patch_db(setting={"value": {"enabled": False}}):
             with pytest.raises(HTTPException) as exc:
                 await orch_main._check_vm_permission(user, job_needs_vm=True)
             assert exc.value.status_code == 403
@@ -126,17 +137,13 @@ class TestCheckVmPermission:
     async def test_admin_bypasses_per_user_grant(self):
         """Admin without can_use_vm still gets through when kill-switch is on."""
         admin = {"id": "u3", "is_admin": True, "can_use_vm": False}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(
-                return_value={"value": {"enabled": True}}
-            )
+        with _patch_db(setting={"value": {"enabled": True}}):
             await orch_main._check_vm_permission(admin, job_needs_vm=True)
 
     @pytest.mark.asyncio
     async def test_non_admin_without_grant_denied(self):
         user = {"id": "u4", "is_admin": False, "can_use_vm": False}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(return_value=None)
+        with _patch_db(setting=None):
             with pytest.raises(HTTPException) as exc:
                 await orch_main._check_vm_permission(user, job_needs_vm=True)
             assert exc.value.status_code == 403
@@ -145,15 +152,13 @@ class TestCheckVmPermission:
     @pytest.mark.asyncio
     async def test_non_admin_with_grant_allowed(self):
         user = {"id": "u5", "is_admin": False, "can_use_vm": True}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(return_value=None)
+        with _patch_db(setting=None):
             await orch_main._check_vm_permission(user, job_needs_vm=True)
 
     @pytest.mark.asyncio
     async def test_missing_user_denied(self):
         """No user record = treated as unauthenticated non-admin."""
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(return_value=None)
+        with _patch_db(setting=None):
             with pytest.raises(HTTPException) as exc:
                 await orch_main._check_vm_permission(None, job_needs_vm=True)
             assert exc.value.status_code == 403
@@ -162,26 +167,21 @@ class TestCheckVmPermission:
     async def test_absent_setting_is_fail_open_enabled(self):
         """No vm_workspaces row = kill-switch not engaged, proceed to per-user."""
         user = {"id": "u6", "is_admin": False, "can_use_vm": True}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(return_value=None)
+        with _patch_db(setting=None):
             await orch_main._check_vm_permission(user, job_needs_vm=True)
 
     @pytest.mark.asyncio
     async def test_malformed_setting_is_fail_open(self):
         """Non-dict value = falls through to per-user check, no crash."""
         admin = {"id": "u7", "is_admin": True, "can_use_vm": False}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(return_value={"value": "garbage"})
+        with _patch_db(setting={"value": "garbage"}):
             await orch_main._check_vm_permission(admin, job_needs_vm=True)
 
     @pytest.mark.asyncio
     async def test_enabled_true_is_noop_path(self):
         """Explicit enabled:true should defer to per-user check."""
         user = {"id": "u8", "is_admin": False, "can_use_vm": False}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(
-                return_value={"value": {"enabled": True}}
-            )
+        with _patch_db(setting={"value": {"enabled": True}}):
             with pytest.raises(HTTPException) as exc:
                 await orch_main._check_vm_permission(user, job_needs_vm=True)
             assert exc.value.status_code == 403
@@ -191,8 +191,7 @@ class TestCheckVmPermission:
     async def test_db_read_error_is_non_fatal(self):
         """A DB read failure on the kill-switch shouldn't hard-fail the gate."""
         user = {"id": "u9", "is_admin": False, "can_use_vm": True}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_system_setting = AsyncMock(side_effect=RuntimeError("db down"))
+        with _patch_db(setting_error=RuntimeError("db down")):
             await orch_main._check_vm_permission(user, job_needs_vm=True)
 
 
@@ -214,9 +213,27 @@ class TestJobNeedsVm:
         job = {"config_override": {"workspace": {"backend": "sandbox"}}}
         assert orch_main._job_needs_vm(job) is False
 
-    def test_context_vm_requested_triggers(self):
-        job = {"context": {"vm": {"requested": True}}}
+    def test_context_vm_requested_with_provenance_triggers(self):
+        """A legacy VM request counts only with provisioner-written provenance."""
+        job = {
+            "context": {
+                "vm": {
+                    "requested": True,
+                    "provision_generation": "6f1d1e02-4d24-4d6e-9f7e-6a0d1c2b3a45",
+                }
+            }
+        }
         assert orch_main._job_needs_vm(job) is True
+
+    def test_bare_context_vm_request_is_ambiguous_not_a_vm_tier(self):
+        """A bare context.vm.requested flag no longer assigns the VM tier.
+
+        The contract is the sole authority for the tier; a request with no
+        authoritative provenance is refused by the resolver, and the gate
+        feeder must fail closed rather than guess a tier from context.
+        """
+        job = {"context": {"vm": {"requested": True}}}
+        assert orch_main._job_needs_vm(job) is False
 
     def test_empty_job_does_not_trigger(self):
         assert orch_main._job_needs_vm({}) is False

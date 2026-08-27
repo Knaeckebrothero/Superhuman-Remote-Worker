@@ -2,26 +2,31 @@
 """
 SRW Management Daemon — runs inside KubeVirt agent VMs.
 
-Bridges the in-VM agent process to the orchestrator via NATS:
-  - Registers the VM (IP, hostname) so the orchestrator can inject SSH config
+Bridges the VM to the orchestrator over same-cluster HTTP or external NATS:
+  - Registers VM identity and network details; external mode also reports its
+    legacy tailnet-based ssh_ready evidence
   - Sends periodic heartbeats with resource usage
   - Relays control commands (freeze/resume/terminate) to the agent process
   - Reports agent process exit status
 
 Configuration (written by cloud-init at VM creation):
+  /etc/default/srw-guest          — same-cluster HTTP credentials and identity
   /etc/default/management-daemon  — NATS_URL, JOB_ID (sourced by systemd)
   /run/agent/job-config.json      — full job config (job_id, agent_config, etc.)
 
-See docs/features/nats.md for the NATS subject design.
+See knowledge-base/knowledge/features/nats.md for the NATS subject design.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import signal
 import socket
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -49,31 +54,78 @@ AGENT_POLL_INTERVAL = 10  # seconds
 NATS_RETRY_INTERVAL = 5  # seconds
 TAILSCALE_WAIT_TIMEOUT = 60  # seconds to wait for Tailscale before registering
 IP_RECHECK_INTERVAL = 15  # seconds between IP re-checks
+HTTP_TIMEOUT = 10  # seconds per register/heartbeat request
+HTTP_RETRY_MAX = 30  # seconds between register retries
+PROC_NET_TCP = Path("/proc/net/tcp")
+
+# Headscale/Tailscale mesh address space (CGNAT range)
+TAILNET_NET = ipaddress.ip_network("100.64.0.0/10")
 
 
 def load_config() -> dict:
     """Load configuration from environment and job config file."""
-    nats_url = os.environ.get("NATS_URL")
-    job_id = os.environ.get("JOB_ID")
+    orchestrator_url = (os.environ.get("ORCHESTRATOR_URL") or "").strip()
+    vm_auth_token = (os.environ.get("VM_AUTH_TOKEN") or "").strip()
+    nats_url = (os.environ.get("NATS_URL") or "").strip()
+    job_id = (os.environ.get("JOB_ID") or "").strip()
     orchestrator_id = (os.environ.get("ORCHESTRATOR_ID") or "").strip()
+    entity_id = (os.environ.get("ENTITY_ID") or "").strip()
+    entity_type = (os.environ.get("ENTITY_TYPE") or "").strip()
+    vm_id = (os.environ.get("VM_ID") or "").strip()
 
-    if not nats_url or not job_id or not orchestrator_id:
+    if orchestrator_url and vm_auth_token:
+        transport = "http"
+        if not entity_id:
+            log.error("ENTITY_ID must be set in HTTP mode")
+            sys.exit(1)
+    elif nats_url:
+        transport = "nats"
+        if not job_id or not orchestrator_id:
+            log.error(
+                "JOB_ID and ORCHESTRATOR_ID must be set in NATS mode "
+                "(via /etc/default/management-daemon)"
+            )
+            sys.exit(1)
+    else:
         log.error(
-            "NATS_URL, JOB_ID, and ORCHESTRATOR_ID must be set "
-            "(via /etc/default/management-daemon)"
+            "No guest transport configured: set ORCHESTRATOR_URL and "
+            "VM_AUTH_TOKEN, or NATS_URL"
         )
         sys.exit(1)
 
     config = {
+        "transport": transport,
+        "orchestrator_url": orchestrator_url,
+        "vm_auth_token": vm_auth_token,
         "nats_url": nats_url,
         "job_id": job_id,
         "orchestrator_id": orchestrator_id,
+        "entity_id": entity_id,
+        "entity_type": entity_type,
+        "vm_id": vm_id,
     }
 
     if JOB_CONFIG_FILE.exists():
         try:
             with open(JOB_CONFIG_FILE) as f:
-                config.update(json.load(f))
+                job_config = json.load(f)
+                protected = {
+                    "transport",
+                    "orchestrator_url",
+                    "vm_auth_token",
+                    "nats_url",
+                    "entity_id",
+                    "entity_type",
+                    "orchestrator_id",
+                    "vm_id",
+                }
+                config.update(
+                    {
+                        key: value
+                        for key, value in job_config.items()
+                        if key not in protected
+                    }
+                )
         except Exception as e:
             log.warning("Failed to read %s: %s", JOB_CONFIG_FILE, e)
 
@@ -131,6 +183,28 @@ def detect_ip() -> str:
     return socket.gethostname()
 
 
+def check_ssh_ready(ip: str) -> bool:
+    """Whether this VM is SSH-reachable by agent pods.
+
+    True when local sshd accepts connections AND the detected IP is a tailnet
+    address (100.64.x.y) — the only address agent pods can route to. Reported
+    to the orchestrator as ``ssh_ready`` in the register payload; the
+    orchestrator itself has no tailnet route and cannot probe this (see
+    knowledge-base/knowledge/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+    """
+    try:
+        if ipaddress.ip_address(ip) not in TAILNET_NET:
+            return False
+    except ValueError:
+        return False  # hostname fallback — not a routable tailnet address
+
+    try:
+        with socket.create_connection(("127.0.0.1", 22), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
 def read_agent_pid() -> int | None:
     """Read the agent process PID from the PID file."""
     try:
@@ -161,17 +235,43 @@ def get_system_metrics() -> dict:
         return {"cpu_percent": 0.0, "memory_percent": 0.0, "disk_percent": 0.0}
 
 
+def count_code_server_connections() -> int:
+    """Count established IPv4 TCP connections to code-server on loopback:8080."""
+    try:
+        lines = PROC_NET_TCP.read_text().splitlines()[1:]
+    except OSError as e:
+        log.debug("Failed to read %s: %s", PROC_NET_TCP, e)
+        return 0
+
+    count = 0
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        local_address = fields[1].upper()
+        state = fields[3].upper()
+        if local_address == "0100007F:1F90" and state == "01":
+            count += 1
+    return count
+
+
 class ManagementDaemon:
     """Manages communication between an in-VM agent and the orchestrator."""
 
     def __init__(self, config: dict):
         self.config = config
-        self.job_id = config["job_id"]
-        self.nats_url = config["nats_url"]
-        self.orchestrator_id = config["orchestrator_id"]
+        self.transport = config["transport"]
+        self.job_id = config.get("job_id", "")
+        self.nats_url = config.get("nats_url", "")
+        self.orchestrator_id = config.get("orchestrator_id", "")
+        self.orchestrator_url = config.get("orchestrator_url", "").rstrip("/")
+        self.vm_auth_token = config.get("vm_auth_token", "")
+        self.entity_id = config.get("entity_id", "")
         self.nc = None
         self._shutdown = asyncio.Event()
         self._agent_exit_reported = False
+        self._registered_ip = None
+        self._registered_ssh_ready = None
 
     # =========================================================================
     # NATS connection
@@ -221,9 +321,20 @@ class ManagementDaemon:
     # =========================================================================
 
     async def register(self):
-        """Announce this VM to the orchestrator."""
+        """Announce this VM to the orchestrator.
+
+        ``ssh_ready`` is this VM's own readiness evidence (local sshd up +
+        tailnet IP held) — the orchestrator promotes the VM to dispatchable
+        on it. The readiness_update_loop re-registers when it flips.
+        """
+        if self.transport == "http":
+            await self._register_http()
+            return
+
         ip = detect_ip()
+        ssh_ready = check_ssh_ready(ip)
         self._registered_ip = ip
+        self._registered_ssh_ready = ssh_ready
         hostname = socket.gethostname()
 
         payload = {
@@ -231,11 +342,70 @@ class ManagementDaemon:
             "hostname": hostname,
             "ip": ip,
             "pid": os.getpid(),
+            "ssh_ready": ssh_ready,
         }
 
         subject = f"agent.vm.{self.orchestrator_id}.{self.job_id}.register"
         await self.nc.publish(subject, json.dumps(payload).encode())
-        log.info("Registered: subject=%s, ip=%s, hostname=%s", subject, ip, hostname)
+        log.info(
+            "Registered: subject=%s, ip=%s, hostname=%s, ssh_ready=%s",
+            subject,
+            ip,
+            hostname,
+            ssh_ready,
+        )
+
+    def _http_post(self, path: str, payload: dict) -> dict:
+        """POST JSON to a guest route with an explicit per-request timeout."""
+        url = f"{self.orchestrator_url}{path}"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"Bearer {self.vm_auth_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            response_body = response.read()
+        if not response_body:
+            return {}
+        return json.loads(response_body)
+
+    async def _wait_or_shutdown(self, delay: float) -> bool:
+        """Wait for delay seconds; return True when shutdown interrupted the wait."""
+        try:
+            await asyncio.wait_for(self._shutdown.wait(), timeout=delay)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _register_http(self):
+        """Register over HTTP, retrying with bounded backoff until accepted."""
+        path = (
+            f"/api/internal/vm/{urllib.parse.quote(self.entity_id, safe='')}/register"
+        )
+        payload = {
+            "hostname": socket.gethostname(),
+            "ip": detect_ip(),
+            "pid": os.getpid(),
+        }
+        delay = 1
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.to_thread(self._http_post, path, payload)
+                log.info("Registered over HTTP: entity_id=%s", self.entity_id)
+                return
+            except Exception as e:
+                log.warning(
+                    "HTTP registration failed (%s), retrying in %ds...",
+                    e,
+                    delay,
+                )
+            if await self._wait_or_shutdown(delay):
+                return
+            delay = min(delay * 2, HTTP_RETRY_MAX)
 
     # =========================================================================
     # Control commands
@@ -282,22 +452,33 @@ class ManagementDaemon:
     async def heartbeat_loop(self):
         """Publish periodic heartbeats with resource usage."""
         subject = f"agent.vm.{self.orchestrator_id}.{self.job_id}.heartbeat"
+        http_path = (
+            f"/api/internal/vm/{urllib.parse.quote(self.entity_id, safe='')}/heartbeat"
+        )
 
         while not self._shutdown.is_set():
             try:
-                pid = read_agent_pid()
                 metrics = get_system_metrics()
 
-                payload = {
-                    "job_id": self.job_id,
-                    "agent_pid": pid,
-                    "agent_running": pid is not None,
-                    **metrics,
-                }
+                if self.transport == "http":
+                    payload = {
+                        **metrics,
+                        "code_server_connections": count_code_server_connections(),
+                    }
+                    await asyncio.to_thread(self._http_post, http_path, payload)
+                    log.debug("HTTP heartbeat sent")
+                else:
+                    pid = read_agent_pid()
+                    payload = {
+                        "job_id": self.job_id,
+                        "agent_pid": pid,
+                        "agent_running": pid is not None,
+                        **metrics,
+                    }
 
-                if self.nc and self.nc.is_connected:
-                    await self.nc.publish(subject, json.dumps(payload).encode())
-                    log.debug("Heartbeat sent: agent_running=%s", pid is not None)
+                    if self.nc and self.nc.is_connected:
+                        await self.nc.publish(subject, json.dumps(payload).encode())
+                        log.debug("Heartbeat sent: agent_running=%s", pid is not None)
             except Exception:
                 log.exception("Heartbeat error")
 
@@ -363,21 +544,29 @@ class ManagementDaemon:
     # =========================================================================
 
     async def ip_update_loop(self):
-        """Periodically re-check IP and re-register if it changes.
+        """Periodically re-check IP + SSH readiness and re-register on change.
 
         Tailscale runs in the background (cloud-init runcmd). The daemon
         may register before Tailscale connects, using the QEMU NAT IP.
-        Once Tailscale gets a 100.64.x.y address, re-register so the
-        orchestrator can route SSH through the mesh VPN.
+        Once Tailscale gets a 100.64.x.y address (and local sshd accepts),
+        re-register so the orchestrator sees ``ssh_ready`` flip and promotes
+        the VM to dispatchable.
         """
         while not self._shutdown.is_set():
             try:
                 current_ip = detect_ip()
-                if current_ip != self._registered_ip:
+                current_ssh_ready = check_ssh_ready(current_ip)
+                if (
+                    current_ip != self._registered_ip
+                    or current_ssh_ready != self._registered_ssh_ready
+                ):
                     log.info(
-                        "IP changed: %s -> %s, re-registering",
+                        "IP/readiness changed: %s (ssh_ready=%s) -> %s "
+                        "(ssh_ready=%s), re-registering",
                         self._registered_ip,
+                        self._registered_ssh_ready,
                         current_ip,
+                        current_ssh_ready,
                     )
                     await self.register()
             except Exception:
@@ -449,12 +638,24 @@ class ManagementDaemon:
 
     async def run(self):
         """Main entry point."""
-        log.info("Management daemon starting (job_id=%s)", self.job_id)
+        log.info("Management daemon starting (transport=%s)", self.transport)
 
         # Wait for cloud-init to write job config
         await self._wait_for_cloud_init()
 
-        # Wait for Tailscale mesh VPN (runs in background via cloud-init)
+        if self.transport == "http":
+            await self.register()
+            if self._shutdown.is_set():
+                return
+
+            heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+            await self._shutdown.wait()
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            log.info("Management daemon stopped")
+            return
+
+        # External mode keeps the existing Tailscale + NATS workflow.
         await self._wait_for_tailscale()
 
         await self.connect_nats()
@@ -463,6 +664,7 @@ class ManagementDaemon:
 
         # Register with orchestrator
         self._registered_ip = None
+        self._registered_ssh_ready = None
         await self.register()
 
         # Subscribe to control commands

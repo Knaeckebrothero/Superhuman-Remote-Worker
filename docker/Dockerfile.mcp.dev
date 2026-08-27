@@ -8,7 +8,7 @@
 #   1. **BuildKit cache mounts on every download step** for the same
 #      reason as Dockerfile.agent.dev — prod's `--no-cache-dir` and apt
 #      list deletion make layers non-deterministic and kill BuildKit's
-#      cache on warm rebuilds. See docs/features/tilt_inner_loop_dev.md
+#      cache on warm rebuilds. See knowledge-base/knowledge/features/tilt_inner_loop_dev.md
 #      for the full diagnosis.
 #   2. **watchfiles wrapper instead of plain `python run.py`** — Tilt's
 #      live_update sync drops new files into /app, and `watchfiles`
@@ -24,7 +24,7 @@
 # fires.
 # =============================================================================
 
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 LABEL maintainer="SRW Team"
 LABEL description="MCP Server (Tilt dev image)"
@@ -57,9 +57,12 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 # Source code LAST. live_update will sync these paths into the running
 # container without a rebuild for ordinary edits.
 COPY --chown=srw:srw orchestrator/mcp/ ./
-# formatters module imported by server.py
-COPY --chown=srw:srw orchestrator/services/formatters.py ./services/formatters.py
-COPY --chown=srw:srw orchestrator/services/__init__.py ./services/__init__.py
+# Shared orchestrator-surface package (REST client + formatters), imported by
+# server.py as src.shared.orch_surface — the same path the repo layout uses.
+COPY --chown=srw:srw src/shared/ ./src/shared/
+# Shared trusted-origin response boundary used by the optional OAuth pages.
+COPY --chown=srw:srw orchestrator/security/__init__.py ./security/__init__.py
+COPY --chown=srw:srw orchestrator/security/anti_framing.py ./security/anti_framing.py
 
 # /app and /app/services are created by COPY/WORKDIR with root ownership;
 # `USER srw` then can't write into them, which kills Tilt's live_update

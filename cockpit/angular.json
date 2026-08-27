@@ -61,7 +61,8 @@
             ],
             "styles": [
               "src/styles.scss",
-              "node_modules/prismjs/plugins/line-numbers/prism-line-numbers.css"
+              "node_modules/prismjs/plugins/line-numbers/prism-line-numbers.css",
+              "node_modules/katex/dist/katex.min.css"
             ],
             "scripts": [
               "node_modules/clipboard/dist/clipboard.min.js",
@@ -86,13 +87,13 @@
               "budgets": [
                 {
                   "type": "initial",
-                  "maximumWarning": "1.5MB",
-                  "maximumError": "2MB"
+                  "maximumWarning": "2.25MB",
+                  "maximumError": "2.75MB"
                 },
                 {
                   "type": "anyComponentStyle",
-                  "maximumWarning": "32kB",
-                  "maximumError": "40kB"
+                  "maximumWarning": "36kB",
+                  "maximumError": "48kB"
                 }
               ],
               "outputHashing": "all"
@@ -107,6 +108,12 @@
         },
         "serve": {
           "builder": "@angular/build:dev-server",
+          "options": {
+            "headers": {
+              "Content-Security-Policy": "frame-ancestors 'none'; img-src 'self' blob: data:",
+              "X-Frame-Options": "DENY"
+            }
+          },
           "configurations": {
             "production": {
               "buildTarget": "cockpit:build:production"

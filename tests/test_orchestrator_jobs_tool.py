@@ -1,228 +1,492 @@
-"""Tests for the ``create_worker_job`` orchestrator tool.
-
-The tool runs inside the persistent agent and POSTs to ``/api/jobs`` on the
-orchestrator. The orchestrator route has no auth, so the tool must propagate
-the originating session's identity. Without the ``thread_id`` field in the
-payload the orchestrator can't derive the calling user, dispatch skips the
-user-preference injection block, and the worker boots with the YAML default
-model + ``not-needed`` API key — which silently routes to api.openai.com and
-401s. Regression coverage for that flow lives here.
-"""
+"""Focused contracts for descriptor-backed LangChain job tools."""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-from unittest.mock import MagicMock
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
+import httpx
 import pytest
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.tools.context import ToolContext  # noqa: E402
-from src.tools.orchestrator import jobs as jobs_module  # noqa: E402
-from src.tools.orchestrator.jobs import create_orchestrator_tools  # noqa: E402
+from src.shared.orch_surface.client import AsyncCockpitClient
+from src.shared.runtime_actor import RUNTIME_ACTOR_HEADER, RuntimeActorContext
+from src.tools.context import ToolContext
+from src.tools.orchestrator import jobs as jobs_module
+from src.tools.orchestrator.jobs import create_orchestrator_tools
 
 
-def _tool_by_name(tools, name):
-    for t in tools:
-        if t.name == name:
-            return t
-    raise AssertionError(f"tool {name!r} not in {[t.name for t in tools]}")
+JOB_ID = "19707fa1-0000-4000-8000-000000000001"
+PARENT_ID = "11111111-2222-3333-4444-555555555555"
 
 
-class _CapturingClient:
-    """Minimal httpx.AsyncClient stand-in that records POST and GET calls."""
-
-    def __init__(self):
-        self.posted: list[tuple[str, dict]] = []
-        self.gets: list[tuple[str, dict]] = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    async def post(self, url, json=None, **kwargs):
-        self.posted.append((url, json or {}))
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.json = MagicMock(return_value={"id": "new-job-uuid"})
-        return resp
-
-    async def get(self, url, params=None, **kwargs):
-        self.gets.append((url, params or {}))
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.json = MagicMock(return_value=[])
-        return resp
+def _tool(tools: list[Any], name: str) -> Any:
+    return next(item for item in tools if item.name == name)
 
 
-@pytest.fixture
-def capturing_client(monkeypatch):
-    cap = _CapturingClient()
-    # _get_client gained an optional ``user_id`` kwarg so the agent can
-    # forward the originating user's identity via X-MCP-User-Id. Accept
-    # kwargs here so this fixture works with the new signature.
-    monkeypatch.setattr(
-        "src.tools.orchestrator.jobs._get_client",
-        lambda *a, **kw: cap,
+class Recorder:
+    """Small HTTP backend that records the request contract under test."""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.jobs: list[dict[str, Any]] = [
+            {
+                "id": JOB_ID,
+                "status": "paused",
+                "config_name": "worker_base",
+                "created_at": "2026-08-14T08:00:00Z",
+                "audit_count": 3,
+            }
+        ]
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        path = request.url.path
+        if request.method == "POST" and path == "/api/jobs":
+            body = json.loads(request.content)
+            return httpx.Response(
+                201,
+                json={
+                    "id": JOB_ID,
+                    "status": "created",
+                    "description": body["description"],
+                },
+            )
+        if request.method == "GET" and path == "/api/jobs":
+            return httpx.Response(200, json=self.jobs)
+        if request.method == "GET" and path == f"/api/jobs/{JOB_ID}":
+            return httpx.Response(200, json=self.jobs[0])
+        if request.method == "GET" and path.endswith("/repo/file"):
+            return httpx.Response(
+                200,
+                json={"path": "plan.md", "content": "the plan", "size": 8},
+            )
+        if request.method == "GET" and path.endswith("/repo/contents"):
+            return httpx.Response(
+                200,
+                json=[{"name": "plan.md", "type": "file", "size": 8}],
+            )
+        if request.method in {"PUT", "POST"}:
+            return httpx.Response(
+                200,
+                json={"status": "ok", "delivery_strategy": "guidance_next_turn"},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+
+def _install_surface_client(
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: Recorder,
+) -> AsyncCockpitClient:
+    client = AsyncCockpitClient(
+        base_url="http://orchestrator.test",
+        transport=httpx.MockTransport(recorder),
     )
-    return cap
+    monkeypatch.setattr(jobs_module, "_get_surface_client", lambda: client)
+    return client
+
+
+def _json_body(request: httpx.Request) -> dict[str, Any]:
+    return json.loads(request.content)
 
 
 @pytest.mark.asyncio
-async def test_create_worker_job_includes_thread_id_from_context(capturing_client):
-    """When the calling tool context carries a thread_id (i.e., the caller
-    is a persistent session), it must be forwarded so the orchestrator can
-    derive the owning user_id and apply their model preferences."""
-    ctx = ToolContext(_thread_id="thread-abc-123")
-    tools = create_orchestrator_tools(ctx)
-    create = _tool_by_name(tools, "create_worker_job")
+async def test_create_job_uses_hidden_trusted_lineage_without_scope_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_INTERNAL_KEY", "internal-test-key")
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    context = ToolContext(
+        _thread_id="thread-1",
+        _project_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        _job_metadata={"job_id": PARENT_ID},
+        user_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    )
 
-    await create.ainvoke({"description": "test job"})
+    try:
+        result = await _tool(create_orchestrator_tools(context), "create_job").ainvoke(
+            {
+                "description": "trusted child",
+                # Extra model input must not override the hidden binding.
+                "user_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            }
+        )
+    finally:
+        await client.close()
 
-    assert len(capturing_client.posted) == 1
-    _, body = capturing_client.posted[0]
-    assert body["thread_id"] == "thread-abc-123"
-
-
-@pytest.mark.asyncio
-async def test_create_worker_job_omits_thread_id_when_not_in_context(
-    capturing_client,
-):
-    """Worker-mode callers (no session) must not send a thread_id field."""
-    ctx = ToolContext()
-    tools = create_orchestrator_tools(ctx)
-    create = _tool_by_name(tools, "create_worker_job")
-
-    await create.ainvoke({"description": "worker job"})
-
-    _, body = capturing_client.posted[0]
-    assert "thread_id" not in body
-
-
-@pytest.mark.asyncio
-async def test_create_worker_job_inherits_project_id_from_context(
-    capturing_client,
-):
-    """Session's project scope flows through unless the caller overrides it."""
-    ctx = ToolContext(_thread_id="thread-1", _project_id="proj-from-session")
-    tools = create_orchestrator_tools(ctx)
-    create = _tool_by_name(tools, "create_worker_job")
-
-    await create.ainvoke({"description": "test"})
-
-    _, body = capturing_client.posted[0]
-    assert body["project_id"] == "proj-from-session"
+    request = recorder.requests[-1]
+    body = _json_body(request)
+    assert body["thread_id"] == "thread-1"
+    assert body["parent_job_id"] == PARENT_ID
+    # Omitted project_id falls back to the trusted lineage default.
+    assert body["project_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    assert body["user_id"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    assert request.headers["X-MCP-User-Id"] == body["user_id"]
+    # The session/agent lane never sends X-MCP-Scope: stamping it activated
+    # server-side project fencing this lane never had (NULL-project jobs
+    # vanished from list_jobs and 403'd on get_job). Officer-lane scoping is
+    # reintroduced deliberately by officer_supervision_surface E2.
+    assert "X-MCP-Scope" not in request.headers
+    assert request.headers["X-Internal-Key"] == "internal-test-key"
+    assert "Job created successfully" in result
 
 
 @pytest.mark.asyncio
-async def test_explicit_project_id_argument_wins_over_context(capturing_client):
-    """An explicit project_id passed to the tool overrides the session's."""
-    ctx = ToolContext(_thread_id="thread-1", _project_id="proj-from-session")
-    tools = create_orchestrator_tools(ctx)
-    create = _tool_by_name(tools, "create_worker_job")
+async def test_create_job_explicit_project_id_wins_over_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    context = ToolContext(
+        _thread_id="thread-1",
+        _project_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        user_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    )
 
-    await create.ainvoke({"description": "test", "project_id": "explicit-proj-id"})
+    try:
+        await _tool(create_orchestrator_tools(context), "create_job").ainvoke(
+            {
+                "description": "explicit project target",
+                "project_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            }
+        )
+    finally:
+        await client.close()
 
-    _, body = capturing_client.posted[0]
-    assert body["project_id"] == "explicit-proj-id"
-
-
-# ---------------------------------------------------------------------------
-# X-MCP-User-Id forwarding — fixes the agent's read-job 401.
-#
-# The persistent agent's job-read tools (list_worker_jobs / get_worker_job)
-# hit /api/jobs and /api/jobs/{id}, which both require an approved user.
-# X-Internal-Key alone is not sufficient — the orchestrator's
-# _get_user_from_mcp_headers requires BOTH X-Internal-Key (matching env
-# MCP_INTERNAL_KEY) AND X-MCP-User-Id. The agent reads the owning user_id
-# from its ToolContext and forwards it on every orchestrator call.
-# ---------------------------------------------------------------------------
-
-
-class TestGetClientHeaders:
-    """``_get_client`` must emit X-MCP-User-Id alongside X-Internal-Key
-    when the caller supplies a ``user_id``. Without ``user_id`` (worker
-    mode, lifecycle calls) only X-Internal-Key is attached — preserves
-    back-compat with the require_internal endpoints."""
-
-    def test_includes_user_id_header_when_supplied(self, monkeypatch):
-        monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
-
-        client = jobs_module._get_client(user_id="user-abc")
-        try:
-            assert client.headers.get("X-Internal-Key") == "test-internal-key"
-            assert client.headers.get("X-MCP-User-Id") == "user-abc"
-        finally:
-            # httpx.AsyncClient holds resources even before aclose; this
-            # avoids ResourceWarning noise in the test output.
-            pass
-
-    def test_omits_user_id_header_when_not_supplied(self, monkeypatch):
-        monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
-
-        client = jobs_module._get_client()
-        assert client.headers.get("X-Internal-Key") == "test-internal-key"
-        assert "X-MCP-User-Id" not in client.headers
+    body = _json_body(recorder.requests[-1])
+    # Explicit project_id reaches the API body; server-side membership
+    # validation decides whether it is accepted.
+    assert body["project_id"] == "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    assert body["user_id"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
-@pytest.mark.asyncio
-async def test_list_worker_jobs_forwards_user_id_from_context(monkeypatch):
-    """list_worker_jobs hits GET /api/jobs, which requires a real user.
-    The tool must forward context.user_id so _get_user_from_mcp_headers
-    resolves the user instead of 401-ing."""
-    monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
-    captured: dict = {}
+def _officer_actor(project_id: str) -> RuntimeActorContext:
+    return RuntimeActorContext(
+        caller_kind="officer",
+        project_id=project_id,
+        project_role="owner",
+        thread_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        officer_incarnation=2,
+        user_id="user-1",
+        access_credential="sra_abcdefghijklmnopqrstuvwxyzABCDEFG123456789",
+        refresh_credential="srr_abcdefghijklmnopqrstuvwxyzABCDEFG123456789",
+        access_expires_at=datetime.now(timezone.utc) + timedelta(minutes=4),
+        refresh_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
 
-    def _factory(*, user_id=None):
-        cap = _CapturingClient()
-        captured["user_id"] = user_id
-        return cap
 
-    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", _factory)
+def test_caller_ctx_detects_officer_only_from_runtime_actor() -> None:
+    """Parsed config may shape tools, but it can never mint actor authority."""
+    context = ToolContext(
+        user_id="user-1",
+        config={"officer": {"enabled": True}},  # not the runtime fact
+    )
+    assert jobs_module._caller_ctx(context).kind == "session"
 
-    ctx = ToolContext(user_id="user-xyz")
-    tools = create_orchestrator_tools(ctx)
-    lst = _tool_by_name(tools, "list_worker_jobs")
+    officer_context = ToolContext(
+        user_id="user-1",
+        config={"officer_session": True},
+        runtime_actor=_officer_actor("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+    )
+    assert jobs_module._caller_ctx(officer_context).kind == "officer"
 
-    await lst.ainvoke({})
-
-    assert captured["user_id"] == "user-xyz"
+    config_only_context = ToolContext(
+        user_id="user-1",
+        config={"officer_session": True},
+    )
+    assert jobs_module._caller_ctx(config_only_context).kind == "session"
 
 
 @pytest.mark.asyncio
-async def test_get_worker_job_forwards_user_id_from_context(monkeypatch):
-    """get_worker_job hits GET /api/jobs/{id} (require_job_access). Same
-    requirement as list — must forward user_id from the context."""
-    monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
-    captured: dict = {}
+async def test_officer_lane_stamps_project_scope_and_fails_closed_unbound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E2 scope split: officer calls carry X-MCP-Scope: project:<uuid>;
+    an officer bound to zero (or many) projects gets a binding error, never
+    an unscoped fleet view. The plain session lane still sends no scope."""
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    project_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    officer_ctx = ToolContext(
+        user_id="user-1",
+        _project_id=project_id,
+        _project_ids=[project_id],
+        config={"officer_session": True},
+        runtime_actor=_officer_actor(project_id),
+    )
+    try:
+        await _tool(create_orchestrator_tools(officer_ctx), "list_jobs").ainvoke({})
+        scoped_request = recorder.requests[-1]
 
-    def _factory(*, user_id=None):
-        cap = _CapturingClient()
-        captured["user_id"] = user_id
-        # Return a job dict so the tool's response code path completes.
-        cap.gets = []  # reset
+        unbound_ctx = ToolContext(
+            user_id="user-1",
+            config={"officer_session": True},
+            runtime_actor=_officer_actor(project_id),
+        )
+        refusal = await _tool(
+            create_orchestrator_tools(unbound_ctx), "list_jobs"
+        ).ainvoke({})
 
-        async def _get(url, **kwargs):
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            resp.json = MagicMock(return_value={"id": "j-1", "status": "running"})
-            return resp
+        session_ctx = ToolContext(
+            user_id="user-1",
+            _project_id=project_id,
+            _project_ids=[project_id],
+        )
+        await _tool(create_orchestrator_tools(session_ctx), "list_jobs").ainvoke({})
+        session_request = recorder.requests[-1]
+    finally:
+        await client.close()
 
-        cap.get = _get
-        return cap
+    assert scoped_request.headers["X-MCP-Scope"] == f"project:{project_id}"
+    assert scoped_request.headers[RUNTIME_ACTOR_HEADER].startswith("sra_")
+    assert "Officer project binding error" in refusal
+    assert "X-MCP-Scope" not in session_request.headers
 
-    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", _factory)
 
-    ctx = ToolContext(user_id="user-xyz")
-    tools = create_orchestrator_tools(ctx)
-    get = _tool_by_name(tools, "get_worker_job")
+@pytest.mark.asyncio
+async def test_create_job_always_asks_for_the_projects_connector_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dispatch plane does not name connectors — it cannot.
 
-    await get.ainvoke({"job_id": "j-1"})
+    ``datasource_ids`` was a parameter here, tri-state and correctly documented.
+    The only thing it ever did in anger was let an officer pass ``[]`` — which
+    means "attach none" — because the schema advertised an array and the empty
+    one reads as the neutral value. His workers came up with no repository
+    checkout and the century idled for a night.
 
-    assert captured["user_id"] == "user-xyz"
+    The callers of this plane are dispatchers (officer, session) with no basis
+    for connector surgery, so the lever is gone rather than merely discouraged:
+    a model cannot mis-set what it is never shown. Narrowing still exists on the
+    surfaces where a human reviews the choice — MCP, REST, cockpit.
+    """
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    tool = _tool(create_orchestrator_tools(ToolContext()), "create_job")
+    try:
+        await tool.ainvoke({"description": "connector contract"})
+    finally:
+        await client.close()
+
+    body = _json_body(recorder.requests[-1])
+    assert body["use_datasource_defaults"] is True
+    assert "datasource_ids" not in body
+    assert "datasource_ids" not in tool.args_schema.model_json_schema()["properties"]
+
+
+@pytest.mark.asyncio
+async def test_create_job_slot_wins_without_repurposing_kickoff_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    try:
+        await _tool(create_orchestrator_tools(ToolContext()), "create_job").ainvoke(
+            {
+                "description": "brief lanes",
+                "kickoff_message": "safe opening brief",
+                "context": {"officer_slot": "old-slot", "trace": "kept"},
+                "slot": "researcher",
+            }
+        )
+    finally:
+        await client.close()
+
+    body = _json_body(recorder.requests[-1])
+    assert body["kickoff_message"] == "safe opening brief"
+    assert "instructions" not in body
+    assert body["context"] == {"officer_slot": "researcher", "trace": "kept"}
+    assert "slot" not in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config_override",
+    [
+        {"llm": {"api_key": "nope"}},
+        {"llm": {"provider_api_key": "nope"}},
+        {"transport": {"base_url": "https://example.invalid"}},
+        {"env_keys": ["SECRET"]},
+    ],
+)
+async def test_create_job_rejects_forbidden_override_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    config_override: dict[str, Any],
+) -> None:
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    try:
+        result = await _tool(
+            create_orchestrator_tools(ToolContext()), "create_job"
+        ).ainvoke({"description": "unsafe", "config_override": config_override})
+    finally:
+        await client.close()
+
+    assert result.startswith("Refusing to create job")
+    assert recorder.requests == []
+
+
+@pytest.mark.asyncio
+async def test_create_job_preserves_expert_config_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    try:
+        result = await _tool(
+            create_orchestrator_tools(ToolContext()), "create_job"
+        ).ainvoke(
+            {
+                "description": "invalid selector pair",
+                "expert_id": "expert-1",
+                "config_name": "developer",
+            }
+        )
+    finally:
+        await client.close()
+
+    assert "expert_id cannot be combined" in result
+    assert recorder.requests == []
+
+
+@pytest.mark.asyncio
+async def test_unique_job_prefix_resolution_is_preserved_for_agent_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    try:
+        result = await _tool(
+            create_orchestrator_tools(ToolContext(user_id="user-1")), "get_job"
+        ).ainvoke({"job_id": "19707fa1..."})
+    finally:
+        await client.close()
+
+    assert [request.url.path for request in recorder.requests] == [
+        "/api/jobs",
+        f"/api/jobs/{JOB_ID}",
+    ]
+    assert f"Job: {JOB_ID}" in result
+
+
+@pytest.mark.asyncio
+async def test_job_lifecycle_routes_and_steer_are_non_destructive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    tools = create_orchestrator_tools(ToolContext(user_id="user-1"))
+    try:
+        await _tool(tools, "pause_job").ainvoke({"job_id": JOB_ID})
+        await _tool(tools, "cancel_job").ainvoke({"job_id": JOB_ID})
+        result = await _tool(tools, "steer_job").ainvoke(
+            {"job_id": JOB_ID, "message": "keep the plan", "urgent": True}
+        )
+    finally:
+        await client.close()
+
+    assert [(request.method, request.url.path) for request in recorder.requests] == [
+        ("PUT", f"/api/jobs/{JOB_ID}/pause"),
+        ("PUT", f"/api/jobs/{JOB_ID}/cancel"),
+        ("POST", f"/api/jobs/{JOB_ID}/messages/officer/reply"),
+    ]
+    assert _json_body(recorder.requests[-1]) == {
+        "message": "keep the plan",
+        "urgent": True,
+    }
+    assert "guidance_next_turn" in result
+
+
+@pytest.mark.asyncio
+async def test_canonical_file_tools_use_shared_mcp_schema_and_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = Recorder()
+    client = _install_surface_client(monkeypatch, recorder)
+    tools = create_orchestrator_tools(ToolContext(user_id="user-1"))
+    try:
+        file_result = await _tool(tools, "get_job_file").ainvoke(
+            {"job_id": JOB_ID, "file_path": "plan.md"}
+        )
+        list_result = await _tool(tools, "list_job_files").ainvoke(
+            {"job_id": JOB_ID, "path": ""}
+        )
+    finally:
+        await client.close()
+
+    assert "File: plan.md (ref: HEAD, 8 bytes)" in file_result
+    assert "[file] plan.md" in list_result
+
+
+def test_create_job_schema_has_no_model_selectable_lineage() -> None:
+    schema = _tool(
+        create_orchestrator_tools(ToolContext()), "create_job"
+    ).args_schema.model_json_schema()
+    fields = set(schema["properties"])
+    assert fields == {
+        "description",
+        # One selector for the whole expert catalogue (bundled slug or DB
+        # UUID); config_name/expert_id remain as deprecated single-store
+        # aliases. tests/test_unified_expert_selection.py owns the contract.
+        "expert",
+        "config_name",
+        "expert_id",
+        # datasource_ids is deliberately absent: connectors are resolved
+        # server-side from the project's auto-attach defaults. See
+        # test_create_job_always_asks_for_the_projects_connector_defaults.
+        "instructions",
+        "kickoff_message",
+        "config_override",
+        "context",
+        # project_id is deliberately model-visible (the old agent-lane
+        # create_worker_job had it); explicit wins over the lineage default.
+        "project_id",
+        "priority",
+        "required_deliverables",
+        "slot",
+        "ticket",
+        "work_category",
+    }
+    assert not {"user_id", "thread_id", "parent_job_id"} & fields
+
+
+@pytest.mark.asyncio
+async def test_get_session_context_remains_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DiscoveryClient:
+        async def __aenter__(self) -> DiscoveryClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> httpx.Response:
+            request = httpx.Request("GET", url)
+            if url.endswith("/api/models"):
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={"groups": [{"models": ["gpt-5.6"]}]},
+                )
+            return httpx.Response(
+                200,
+                request=request,
+                json={"is_admin": True, "grants": None},
+            )
+
+    monkeypatch.setattr(jobs_module, "_get_client", lambda **_: DiscoveryClient())
+    context = ToolContext(
+        _thread_id="thread-1",
+        _project_id="project-1",
+        user_id="user-1",
+    )
+    result = await _tool(
+        create_orchestrator_tools(context), "get_session_context"
+    ).ainvoke({})
+
+    assert "Thread ID: thread-1" in result
+    assert "Primary project ID: project-1" in result
+    assert "Available chat models: gpt-5.6" in result
+    assert "admin (unrestricted)" in result

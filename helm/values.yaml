@@ -1,5 +1,5 @@
 # Superhuman Remote Worker — Helm Chart Values
-# See docs/helm_migration.md for architecture overview.
+# See knowledge-base/knowledge/helm_migration.md for architecture overview.
 
 # -- Override chart name in resource names
 nameOverride: ""
@@ -58,7 +58,6 @@ global:
     neo4j: ""          # default: neo4j.<domain>       (Neo4j browser UI)
     neo4jBolt: ""      # default: bolt-neo4j.<domain>  (Bolt TLS SAN + LoadBalancer host)
     pgadmin: ""        # default: pgadmin.<domain>
-    mongo: ""          # default: mongo.<domain>       (mongo-express UI)
     dozzle: ""         # default: dozzle.<domain>
     headscale: ""      # default: headscale.<domain>   (overridden by headscale.url when set)
     minio: ""          # default: minio.<domain>       (cockpit deep-link only — chart does not deploy MinIO)
@@ -70,29 +69,77 @@ image:
   orchestrator:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator
     tag: latest
+    digest: ""
     pullPolicy: Always
   agent:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent
     tag: latest
+    digest: ""
     pullPolicy: Always
   cockpit:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-cockpit
     tag: latest
+    digest: ""
     pullPolicy: Always
   mcp:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp
     tag: latest
+    digest: ""
     pullPolicy: Always
   workspace:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace
     tag: latest
+    digest: ""
     pullPolicy: Always
+
+# Public, declarative component identity. Source revisions are full commit IDs,
+# never display tags. Artifact digests remain empty unless the corresponding
+# image is actually deployed by digest above.
+provenance:
+  sourceUrl: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+  documentationUrl: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs
+  releaseVersion: ""
+  components:
+    orchestrator:
+      sourceRevision: ""
+      releaseVersion: ""
+    agent:
+      sourceRevision: ""
+      releaseVersion: ""
+    cockpit:
+      sourceRevision: ""
+      releaseVersion: ""
+    mcp:
+      sourceRevision: ""
+      releaseVersion: ""
+    workspace:
+      sourceRevision: ""
+      releaseVersion: ""
 
 # =============================================================================
 # Orchestrator
 # =============================================================================
 orchestrator:
+  # -- 1 replica by default. NOT a statement about what HA needs: leader
+  # election (M1) makes replicas:2 correctness-safe and removes the
+  # orchestrator as a hard SPOF — one pod can fail or drain with zero serving
+  # blackout, live-verified on dev 2026-06-26. The default optimises for the
+  # single-node self-host on a mini PC, whose operator is the least likely to
+  # edit this file and for whom a second replica is pure overhead. Raise it to
+  # 2+ on any cluster with more than one node; the PDB below follows
+  # automatically, and `databases.profile: ha` is the data-tier counterpart.
   replicas: 1
+  # -- One-shot acknowledgement for the drained pinned-runtime authority
+  # migration. Keep false during an ordinary rolling upgrade: a new pod then
+  # refuses pending migration 0185 while the old ready pod keeps serving.
+  # Before setting true, place the service in maintenance, end/drain every
+  # pinned session, delete old warm/dedicated agent writers, and wait for
+  # in-flight provisioning/staging effects. True injects the exact migration
+  # gate and changes the orchestrator Deployment strategy to Recreate so the
+  # old ReplicaSet is gone before the migration transaction starts. Do not use
+  # Helm --atomic or roll back to an old image after 0185 commits. Clear this
+  # value again on the next all-new-version rollout.
+  runtimeAuthorityMigrationMaintenanceAck: false
   resources:
     requests:
       memory: "256Mi"
@@ -105,6 +152,73 @@ orchestrator:
       cpu: "500m"
   # -- Auto-assign jobs to idle agents
   autoAssignEnabled: "true"
+  # -- Enable durable completion-command admission/finalization. Ships dark;
+  # open only after the Gate-3 parity and crash-recovery proof is complete.
+  completionCommandsEnabled: false
+  # -- Move terminal status behind Class B and delivery-gated completion
+  # effects. Independently revertible and invalid unless completion commands
+  # are also enabled.
+  completionStatusReorderEnabled: false
+  # -- Local crash-recovery proof hook: pause after durable command acceptance
+  # and before inline finalization. Keep at zero outside an intentional test.
+  completionFinalizerInlineDelaySeconds: 0
+  # -- Automatic image-drift and missing-pod reconciliation for commissioned
+  # Officer runtimes. First rollout stays dark until every orchestrator
+  # replica serves the parked-boundary acknowledgement contract; the
+  # owner/admin manual recycle endpoint remains available while false.
+  persistentAgentReconciliationEnabled: false
+  # -- Admin-only, exact-binding runtime-grant verification plans. This is a
+  # deployed-test seam, never an Officer/model capability; every profile ships
+  # disabled and a bounded gate enables it only for the test interval.
+  officerRuntimeVerificationEnabled: false
+  # -- Additional exact Git host or host:port endpoints trusted for external
+  # OKF KB datasources. The built-in public-provider set remains enabled.
+  # Wildcards, IP literals, and localhost are rejected. Example:
+  # "gitea.example.com,gitea.internal:3000"
+  # Gitea, so an external OKF KB connector can reach a repo hosted here.
+  # Without this only github.com/gitlab.com/bitbucket.org/codeberg.org are
+  # trusted and the connector fails closed. Exact host:port, no wildcards.
+  #
+  # NOTE the public HTTPS name, not srw-gitea:3000. Token/password auth is
+  # refused over plain http (kb_git_source.validate_git_auth_configuration),
+  # and the in-cluster service exposes only port 3000 over http — so a private
+  # repo can only be reached via the TLS ingress. Keep both entries: the
+  # in-cluster name still serves a public (credential-less) repo.
+  kbGitAllowedHosts: "git.srw.works,srw-gitea:3000"
+  # -- Optional OpenSSH known_hosts content for external OKF KB deploy-key
+  # remotes. Non-empty content switches SSH from accept-new to strict pinning.
+  kbGitSshKnownHosts: ""
+  # -- Maximum simultaneous external OKF Git snapshot/embed operations per
+  # orchestrator replica (create/update/manual/test plus the leader sweep).
+  kbExternalReindexConcurrency: 2
+  # -- Seconds between leader-gated native/external OKF freshness sweeps.
+  kbReindexSweepSeconds: 900
+  # -- Per-store asyncpg connection pool sizing for the orchestrator's own
+  # pools (control-plane app DB, pgvector, audit trail). The orchestrator does
+  # NOT envFrom the shared ConfigMap, so these are wired as explicit env in
+  # orchestrator/deployment.yaml — the ConfigMap's POSTGRES_*_CONNECTIONS carry
+  # the small AGENT-pod sizing (agent.dbPool) and must not reach the
+  # orchestrator. These match the code defaults; override only to tune.
+  # Budget per server: sum(maxes across replicas + agents) <= max_connections
+  # - 3 reserved - ~10 headroom. At the defaults (replicas=2,
+  # agent.pool.maxAgents=10, agent.dbPool.app.max=3), per server:
+  #   app    : 2*10 (orch) + 10*3 (agents) = 50   (fits default max_connections=100)
+  #   vector : 2*5  + 10*3 = 40
+  #   audit  : 2*4  + (agents keep the code default) = 8
+  # Scaling to ~30 agents pushes app to 2*10 + 30*3 = 110 -> raise Postgres
+  # max_connections, trim agent.dbPool.app.max, or front the app DB with
+  # pgbouncer (transaction mode; the advisory-lock migration runner + LISTEN
+  # users stay on direct connections).
+  dbPool:
+    app:
+      min: "2"
+      max: "10"
+    vector:
+      min: "1"
+      max: "5"
+    audit:
+      min: "1"
+      max: "4"
   # -- Budget (seconds) for the WS proxy to wait for the agent's /ready
   # endpoint to flip true. Must outlast the agent's own workspace SSH poll
   # (120s) plus margin for cold workspace image pulls (~130s observed).
@@ -113,6 +227,170 @@ orchestrator:
   # and bind to a thread. Must accommodate a cold agent image pull on every
   # node — observed up to 5+ minutes for a fresh tag with no cache.
   agentBindTimeoutSeconds: 300
+  # -- Graceful shutdown. On SIGTERM the pod is removed from Service endpoints;
+  # the preStop sleep holds the container alive while that removal propagates
+  # (kube-proxy/LB) so in-flight requests drain instead of being cut. Long-lived
+  # SSE streams drop regardless and are recovered by thread_events replay.
+  preStopDrainSeconds: 15
+  # -- Must exceed preStopDrainSeconds + lifespan shutdown (background loops,
+  # NATS drain, DB pool close).
+  terminationGracePeriodSeconds: 60
+  # -- Pod Disruption Budget. minAvailable is DERIVED from `replicas`, not
+  # configured: 1 above a single replica (a leader keeps serving through
+  # kubectl drain / node cordon — M1, live-verified on dev 2026-06-26), and 0
+  # at replicas:1, where minAvailable:1 would block ALL voluntary evictions
+  # (the 2026-05-16 incident mode). The knob used to be settable and the
+  # warning was a comment; the template enforces it now.
+  pdb:
+    enabled: true
+
+# =============================================================================
+# Infrastructure allocation metering
+# =============================================================================
+# Gated infrastructure allocation metering. Slice 1 can run the dedicated Pod
+# collector and shadow reconciliation without publishing customer usage.
+infrastructureMetering:
+  v2ReadsEnabled: false
+  sourceAwareReadsEnabled: false
+  collectorEnabled: false
+  shadowEnabled: false
+  # Enables the authenticated one-shot fleet-admin cutover request surface.
+  # It does not choose a barrier automatically and may be disabled again after
+  # the durable state reaches active.
+  cutoverEnabled: false
+  publicationEnabled: false
+  # Slice 2 storage classes remain independently dark-launched. Inventory can
+  # be enabled without reconciliation, and reconciliation without publication.
+  # The global collector/shadow/publication gates remain mandatory masters.
+  pvcInventoryEnabled: false
+  pvInventoryEnabled: false
+  pvcShadowEnabled: false
+  pvShadowEnabled: false
+  pvcPublicationEnabled: false
+  pvPublicationEnabled: false
+  # Slice 3 compute classes reuse Pod inventory where possible but cannot
+  # inherit an already-active workspace cutover. Each class has its own
+  # shadow/publication gate and durable activation boundary.
+  idePodShadowEnabled: false
+  agentPodShadowEnabled: false
+  idePodPublicationEnabled: false
+  agentPodPublicationEnabled: false
+  # Remote KubeVirt inventory uses a dedicated authenticated collector
+  # identity. These remain dark until its transport and controller journal are
+  # configured and validated on the VM cluster.
+  vmInventoryEnabled: false
+  vmShadowEnabled: false
+  vmPublicationEnabled: false
+  # Root-disk storage is collected by a second VM-cluster identity so the VMI
+  # credential can never authorize PVC/PV observations. These inventory and
+  # shadow gates are independent of both VMI compute and local-cluster storage.
+  vmPvcInventoryEnabled: false
+  vmPvInventoryEnabled: false
+  vmPvcShadowEnabled: false
+  vmPvShadowEnabled: false
+  # Remote storage publication is authorized only by the main orchestrator.
+  # The VM-cluster collectors remain database-free and cannot enable it.
+  vmPvcPublicationEnabled: false
+  vmPvPublicationEnabled: false
+  # Kubernetes PVs are cluster-scoped. Enabling remote PV inventory grants the
+  # dedicated storage collector visibility of every PV in the VM cluster, so
+  # the server and remote chart both require this explicit acknowledgement.
+  vmPvClusterWideRbacAcknowledged: false
+  vmStableClusterId: ""
+  vmNamespace: ""
+  # Stable operator-owned installation identity. Required before collection or
+  # publication; it must survive endpoint and credential rotation.
+  stableClusterId: ""
+  deploymentMode: dedicated
+  # The release namespace is always included. Add separate workspace/agent
+  # namespaces here; each receives its own namespace-scoped RoleBinding.
+  namespaceAllowlist: []
+  relistIntervalSeconds: 300
+  staleAfterSeconds: 900
+  # Remote lifecycle timestamps are evidence only. VMI scheduled transitions
+  # outside this app-receipt skew window cannot become exact interval starts.
+  maxCollectorClockSkewSeconds: 300
+  listPageSize: 500
+  scopeConcurrency: 2
+  watchQueueSize: 10000
+  maxSnapshotItems: 50000
+  maxSnapshotBytes: 67108864
+  ingestionTicketTtlSeconds: 600
+  # Raw snapshot items are diagnostic scaffolding, not the durable accounting
+  # record. Immutable manifests remain after their children expire.
+  snapshotItemRetentionDays: 7
+  diagnosticRetentionDays: 35
+  cleanupIntervalSeconds: 300
+  # Empty in chart-managed mode creates a dedicated preserved Secret readable
+  # only by the collector and orchestrator. External secret modes must provide
+  # a distinct Secret name; the main application Secret is rejected.
+  ingestionSecretName: ""
+  ingestionSecretKey: INFRASTRUCTURE_METERING_INGESTION_KEY
+  # The VM-cluster collector uses an independently rotated HMAC credential.
+  # Provision the same key into this Secret and the remote VM-cluster Secret;
+  # this chart never copies credentials between clusters.
+  vmIngestionSecretName: ""
+  vmIngestionSecretKey: INFRASTRUCTURE_METERING_VMI_INGESTION_KEY
+  # Remote PVC/PV inventory has its own rotated ingestion credential. Keep it
+  # separate from the application, local collector, VMI, and durable-volume
+  # identity Secrets; this chart never copies credentials between clusters.
+  vmStorageIngestionSecretName: ""
+  vmStorageIngestionSecretKey: INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY
+  # Controller lifecycle identity uses a fourth, dedicated credential. It is
+  # intentionally never read from the application or collector Secrets because
+  # dynamic guests/collectors must not be able to forge VM commands or admitted
+  # UID evidence. Provision the same key independently on the VM cluster.
+  vmLifecycleAuthSecretName: ""
+  vmLifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
+  # Optional authenticated route for a collector in another cluster. Prefer a
+  # private tunnel; when this is enabled, TLS and an explicit source-CIDR
+  # allowlist remain mandatory in addition to per-request HMAC authentication.
+  remoteIngress:
+    enabled: false
+    sourceCidrs: []
+  # PV identities use a separate, non-rotating HMAC key. In chart-managed
+  # secret mode, an empty name creates a dedicated preserved Secret. Other
+  # secret modes must name a separately provisioned Secret. The key version
+  # becomes part of every durable identity and is required before PV inventory.
+  volumeIdentitySecretName: ""
+  volumeIdentitySecretKey: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY
+  volumeIdentityKeyVersion: ""
+  # Optional ESO projections for metering credentials stored alongside the
+  # existing application bundle. Vault-facing property names stay concise,
+  # while each value is projected into a dedicated Kubernetes Secret under
+  # the canonical runtime key expected by the collectors/controllers.
+  externalSecrets:
+    enabled: false
+    vaultPath: ""
+    vmiIngestionProperty: METERING_VMI_INGESTION_KEY
+    vmStorageIngestionProperty: METERING_VM_STORAGE_INGESTION_KEY
+    volumeIdentityProperty: METERING_VOLUME_IDENTITY_KEY
+    vmLifecycleAuthProperty: METERING_VM_LIFECYCLE_HMAC_SECRET
+  # Exact, operator-owned PV pricing classifications. These rules are stored
+  # immutably by the orchestrator; collector labels and StorageClass parameters
+  # can never select a priced resource. Empty means quantity-only/unpriced.
+  volumeResourceMappings: []
+  networkPolicy:
+    # Egress-deny cannot infer every distribution's API-server address. Enable
+    # after supplying the control-plane CIDRs used by this cluster. DNS is
+    # restricted to the selected kube-system resolver Pods; adjust the selector
+    # for distributions that do not use the standard CoreDNS label.
+    enabled: false
+    # Explicit break-glass acknowledgement for clusters where a supported
+    # egress NetworkPolicy cannot be installed. Enabling the collector with
+    # both this and `enabled` false is rejected at template time.
+    allowUnrestrictedEgress: false
+    apiServerCidrs: []
+    dnsNamespace: kube-system
+    dnsPodSelector:
+      k8s-app: kube-dns
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
 
 # =============================================================================
 # Agent
@@ -123,7 +401,7 @@ agent:
   # lifecycle redesign — `agent.replicas` is no longer honored. The
   # PodDisruptionBudget and Service stay; they target the dynamic pods
   # via shared chart selector labels.
-  config: "defaults"
+  config: "worker_base"
   port: "8001"
   persistentConfig: "interactive"
   # -- Apply admin-curated DB config overrides (config_overrides table) to
@@ -131,6 +409,53 @@ agent:
   # file turns it on. Gates only the agent's prompt resolver — not the
   # orchestrator or the admin UI (overrides remain editable regardless).
   configDbOverridesEnabled: "false"
+  # -- Enable DB-backed experts for both orchestrator and agent.
+  # DB-backed experts are the source of truth for the application and personal
+  # root-creation defaults. Set false only as an emergency compatibility switch.
+  expertsDbEnabled: "true"
+  # -- Enable DB-backed Agent Skills (skills + skill_files tables). Default OFF
+  # (prod-safe); the dev/experimental values file turns it on. Mirrors
+  # expertsDbEnabled.
+  skillsDbEnabled: "false"
+  # -- Emergency operator-only withdrawal of the managed in-product App Guide.
+  # Default OFF. This is not a user preference or normal feature gate; enable
+  # only to contain a broken guide/reader, then disable it after rollback or
+  # repair. Persistent-agent health reports operator_break_glass while active.
+  appGuideBreakGlassDisabled: "false"
+  # -- Dark-launch gate for the authenticated, read-only M2 product-capability
+  # endpoint. This is an operator rollout control, not a user preference.
+  # Keep false until the shadow comparison/acceptance gates pass.
+  productCapabilitiesEndpointEnabled: "false"
+  # -- Separate canary gate for the persistent-session capability tool.
+  # Operators must also enable the endpoint gate for controlled live probes.
+  productCapabilitiesToolEnabled: "false"
+  # -- Enable user-added MCP servers as datasources. Both gates default off;
+  # stdio executes third-party commands in agent pods and should remain off
+  # for hosted/multi-tenant deployments without suitable isolation.
+  mcpDatasourcesEnabled: "false"
+  mcpStdioEnabled: "false"
+  # -- Temporary compatibility gate for REST/session requests that omit
+  # datasource_ids. Cockpit submits an explicit reviewed array; enable this
+  # after legacy clients no longer encode "none" by omission.
+  datasourceDefaultsOnOmission: "false"
+  # -- Coordinated rollout gate for the connector project-scope/auto-attach UI.
+  # Keep false until all orchestrator replicas understand the v1 API contract.
+  datasourceScopeAutoAttachV1Enabled: "false"
+  # -- Enable protected cloud mode: RO-reader provisioning + capture overlay.
+  # Default OFF (prod-safe); the dev/experimental values file turns it on.
+  # See knowledge-base/knowledge/design/cloud_access_unification.md §8 Phase 1.
+  protectedCloudModeEnabled: "false"
+  # -- Require every pinned lifecycle/credential write to carry exact runtime
+  # generation and attach identity. Migration 0185 is a drained maintenance
+  # cutover rather than a mixed-version reader-first rollout, so this remains
+  # true after the cutover and must never be disabled while 0185 is installed.
+  requirePinnedStatusIdentity: "true"
+  # -- Effective context ceiling (tokens) for models routed via the system codex
+  # proxy, whose ChatGPT-OAuth backend caps context ~400K regardless of the
+  # model's true API window. Compaction fires at 80% of this. Set 0 to disable
+  # (e.g. once OpenAI ships 1M-for-Codex). See
+  # knowledge-base/knowledge/issues/codex_proxy_context_window_cap.md.
+  codexContextWindowCap: 400000
   resources:
     requests:
       memory: "512Mi"
@@ -150,13 +475,109 @@ agent:
   pdb:
     enabled: true
     minAvailable: 0
-  # -- Agent pool sizing (AgentProvisioner)
+  # -- Egress NetworkPolicy for agent pods (helm/templates/agent/network-policy.yaml).
+  # Agent pods hold internal credentials and historically had NO policy at all;
+  # this is the companion control to the local-execution-fallback removals
+  # (no_workspace_agent_mode.md §9.1). In-cluster dependencies are allowed by
+  # podSelector; public internet is allowed on TCP 80/443/22 minus the `except`
+  # CIDRs below.
+  networkPolicy:
+    # -- DEFAULT OFF (opt-in). External LLM/Keycloak/Tavily work over the 443
+    # wildcard out of the box, but a deployment whose LLM, Keycloak, or cloud
+    # lives on an RFC1918 address (in-cluster other-namespace, or the home LAN)
+    # MUST add an `extraEgress` carve-out before enabling, or agents lose model
+    # access. See knowledge-base/knowledge/issues/agent_egress_networkpolicy_enablement.md.
+    enabled: false
+    # -- CIDRs subtracted from the 0.0.0.0/0 internet egress allow. Cluster
+    # CIDRs + home LAN + link-local/metadata denied by default (prod-safe,
+    # matches the workspace `internet-only` tier); in-cluster services stay
+    # reachable only via the explicit podSelector rules in the template.
+    except:
+      - 10.0.50.0/24       # K3s nodes
+      - 10.0.51.0/24       # MetalLB IPs (use podSelector for in-cluster services)
+      - 10.42.0.0/16       # pod CIDR
+      - 10.43.0.0/16       # service CIDR
+      - 192.168.178.0/24   # home LAN
+      - 169.254.0.0/16     # link-local / cloud-metadata
+    # -- Extra egress rules appended verbatim to the policy (raw NetworkPolicy
+    # egress entries). Use for an in-cluster LLM in another namespace
+    # (namespaceSelector) or a LAN LLM/Keycloak/cloud endpoint (ipBlock) that
+    # the `except` list above denies. Example:
+    #   - to:
+    #       - namespaceSelector:
+    #           matchLabels:
+    #             kubernetes.io/metadata.name: ai
+    #     ports:
+    #       - protocol: TCP
+    #         port: 8000
+    extraEgress: []
+  # -- Agent pool sizing (AgentProvisioner) — this is the agent COUNT, not DB
+  # connections (see dbPool below).
   pool:
     maxAgents: "10"
     minAgents: "2"
     buffer: "1"
     reservedSessionSlots: "2"
     reservedJobSlots: "2"
+  # -- Per-agent asyncpg connection pool sizing (app DB). Provisioned agent pods
+  # inherit these via envFrom on the shared ConfigMap as POSTGRES_MIN/MAX_
+  # CONNECTIONS. Kept small: the connection multiplier is agent COUNT, so this
+  # bounds the fleet's total footprint on the app DB (maxAgents * app.max). The
+  # agent's vector pool shares the same POSTGRES_* env, so one knob bounds both
+  # its app and vector pools. asyncpg's default max_inactive_connection_lifetime
+  # (300s) sheds idle connections between jobs. The orchestrator sizes its own
+  # (larger) pools separately (orchestrator.dbPool) and never sees these values.
+  dbPool:
+    app:
+      min: "1"
+      max: "3"
+  # -- Allow pinned agents to write terminal `cancelled` input-delivery rows.
+  # Reader-first rollout only: leave false through the migration/reader deploy,
+  # drain or replace every old persistent/warm agent, then enable and roll the
+  # agent fleet. Once a cancellation is written, never roll back below an
+  # 0183-aware reader; deleting only the ledger row exposes its surviving
+  # transcript row to old model-history readers. Rollback requires tombstoning
+  # or deleting that transcript/thread, or an old-reader-compatible exclusion.
+  # See the design note.
+  persistentInputCancellationEnabled: false
+  # -- Stateless executor Deployment (knowledge-base/knowledge/features/stateless_agents.md §5.8;
+  # templates/agent/stateless-deployment.yaml). A static pool of generic agent
+  # processes running `--mode stateless` that PULL work units from the
+  # run_queue, replacing per-thread provisioning for queue-lane threads
+  # (threads.execution_lane='stateless'). Coexists with the AgentProvisioner
+  # plane: the pods carry distinct class labels so the agent Service/PDB,
+  # reap/scale sweeps, and per-session routing never touch them.
+  stateless:
+    # -- DEFAULT OFF (prod-safe). This renders the executor pool and opens
+    # stateless admission for supported session workspace tiers. Disabled
+    # preserves pinned session behavior. VM/remote tiers remain pinned/refused
+    # even when enabled.
+    enabled: false
+    # -- Warm floor of executor pods (§5.8: interactive floor ≥ 2). KEDA/HPA
+    # autoscaling is a later, separately-gated addition.
+    replicas: 2
+    # -- Boot config for the executor process. Pool pods boot as workers and
+    # re-resolve per-attach from the claim bundle, mirroring provisioner job
+    # pods (agent.config above).
+    config: "worker_base"
+    # -- Pod resources for the stateless class. Empty = inherit
+    # agent.resources.
+    resources: {}
+    # -- Worker-job admission on the stateless executor plane. This is
+    # independent from `stateless.enabled`: the shared pool may serve session
+    # turns while every new worker job continues to use the pinned lane.
+    # Turning admission off does not stop these executor pods from draining
+    # worker_batch rows that were already accepted into the durable queue.
+    worker:
+      # -- DEFAULT OFF. A fresh install preserves the pinned worker path.
+      enabled: false
+      # -- DEFAULT OFF. When enabled, omitted root jobs try the stateless lane
+      # only when admission is open and an in-cluster Kubernetes sandbox is
+      # available. Other workspaces fall back to pinned; VM jobs always pin.
+      defaultEnabled: false
+      # -- Minimum wall-clock budget for one worker batch. Production keeps a
+      # five-minute floor; local acceptance may explicitly lower it.
+      batchMinWallSeconds: 300
 
 # =============================================================================
 # Cockpit (Angular frontend)
@@ -195,13 +616,222 @@ cockpit:
   # `GET /api/models`, which is the authoritative source (system endpoints
   # seeded via `llm.seed.systemEndpoints` + user endpoints). Empty catalogs
   # render a role-aware empty-state banner pointing operators to
-  # Admin → Providers. See docs/features/db_backed_llm_config.md.
+  # Admin → Providers. See knowledge-base/knowledge/features/db_backed_llm_config.md.
+
+# =============================================================================
+# Dynamic Canvas
+# =============================================================================
+canvas:
+  # Shared browser (knowledge-base/knowledge/features/shared_browser.md): stream the workspace
+  # Chromium into the Canvas. Dark by default; the dev profile enables it.
+  sharedBrowser:
+    enabled: false
+  livePreview:
+    # -- Master capability gate for workspace-port live preview. The proxy,
+    # isolated viewer origin, and browser acceptance gates must all fail closed
+    # when this is false. Viewer/domain configuration and the dedicated internal
+    # gateway are charted below, but wildcard DNS/TLS and the public edge remain
+    # operator-owned. Enabling this flag alone admits `workspace_port` only for
+    # positively attested eligible agents/internal calls; it creates no
+    # browser-facing viewer or public route.
+    enabled: false
+    # -- Additional workspace loopback ports which live preview must reject.
+    # The built-in control-port denylist remains enforced independently.
+    deniedPorts: []
+    # Browser-facing live-app delivery is a separate, stricter gate. The
+    # conditional gateway below is internal-only by default; the optional
+    # ingress block renders a standard wildcard Ingress for it. A normalizing
+    # HTTP proxy in front (Cloudflare tunnel/proxy, an ordinary ingress
+    # controller) is a supported edge: adjacent-slash merging is an accepted,
+    # documented limitation of that mode, not a security regression (see
+    # knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). Production
+    # operators must still supply the restricted database role/Secret and the
+    # PSL-boundary attestation.
+    viewer:
+      # -- Create the internal Canvas gateway and let the orchestrator advertise
+      # viewer-session capability. Also requires livePreview.enabled=true and,
+      # for the production profile, the PSL-boundary attestation below.
+      enabled: false
+      # -- `production` requires a verified effective-PSL boundary and
+      # psl-isolated cookies. `development` may use cookie-free proxy mode but
+      # is not a production security claim.
+      deploymentProfile: production
+      # -- Empty while disabled. Enabled values are `psl-isolated` or, only for
+      # the development profile, `development-cookie-free`.
+      cookieMode: ""
+      # -- Dedicated, independently registrable user-content domain, without
+      # scheme or wildcard (for example `example-userland.com`). Its exact name
+      # must be the effective PSL boundary in production. No DNS/ingress is
+      # created.
+      domain: ""
+      # -- Exact dotted suffix for random origins. Production requires this to
+      # equal `.` plus domain, yielding one-label origins covered by a normal
+      # first-level wildcard. Development may use a nested suffix.
+      hostSuffix: ""
+      # -- Exact trusted HTTPS Cockpit origins allowed to embed the gateway.
+      cockpitOrigins: []
+      # -- Explicit operator attestation. Production requires the exact
+      # user-content domain to be a verified effective-PSL cookie boundary.
+      pslBoundaryVerified: false
+      sessionTtlSeconds: 900
+      bootstrapTtlSeconds: 60
+      attachmentTtlSeconds: 1200
+      revalidateSeconds: 15
+      replicas: 1
+      # -- Optional plug-and-play wildcard Ingress for the gateway
+      # (`*` + hostSuffix). Default off: deployments fronted by a Cloudflare
+      # tunnel or an operator-owned edge route to the ClusterIP Service
+      # directly. A cert-manager wildcard certificate requires a DNS-01
+      # solver on the referenced issuer.
+      ingress:
+        enabled: false
+        className: ""
+        annotations: {}
+        tls:
+          enabled: true
+          # -- cert-manager ClusterIssuer with a DNS-01 solver for the
+          # user-content domain. Empty = no cert-manager annotation.
+          issuerName: ""
+          # -- Existing wildcard TLS Secret; empty derives a chart-local name.
+          secretName: ""
+      # The public gateway must never inherit the orchestrator's application
+      # database credential. It connects with a dedicated login whose grants
+      # are limited to the viewer/session query surface.
+      database:
+        # -- Dedicated PostgreSQL login. Chart-managed development credentials
+        # use this fixed name so an uninstall/reinstall cannot strand older
+        # privileged roles under operator-selected names.
+        username: "srw_canvas_gateway"
+        credentials:
+          # -- Generate a dedicated Secret. Development/internal-Postgres only;
+          # production must reference an operator-managed Secret instead.
+          create: false
+          # -- Existing Secret containing only the gateway DB credential.
+          existingSecret: ""
+          # -- Vault KV path containing exactly `username` and `password`.
+          # This selects a chart-rendered ExternalSecret instead of a
+          # pre-created Kubernetes Secret and requires externalSecrets.enabled.
+          # The path is inert while viewer.enabled=false: no provider lookup or
+          # credential requirement is created until the gateway is enabled.
+          vaultPath: ""
+          passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
+        # -- Reconcile the restricted login/grants with a bounded one-shot Job.
+        # Allowed only for bundled Postgres and required with credentials.create.
+        provisionRole: false
+        pool:
+          min: 1
+          max: 4
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "50m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      limits:
+        maxConnections: 256
+        maxHttpPerSession: 16
+        maxHeaderBytes: 65536
+        maxHeaderFields: 100
+        maxQueryBytes: 16384
+        maxQueryFields: 256
+        maxRequestBodyBytes: 10485760
+        maxResponseBodyBytes: 104857600
+        connectTimeoutSeconds: 5
+        idleTimeoutSeconds: 60
+        exchangeTimeoutSeconds: 300
+      networkPolicy:
+        # -- Both selectors must contain matchLabels and/or matchExpressions
+        # before viewer.enabled can be set. They identify whatever fronts the
+        # gateway — a Cloudflare tunnel connector (cloudflared), the cluster's
+        # ingress-controller pods, or a dedicated edge — and open only that
+        # source to the otherwise internal Service on TCP/8086.
+        edgeNamespaceSelector: {}
+        edgePodSelector: {}
+        # -- Raw egress rules for an external app Postgres endpoint or
+        # non-pod workspace SSH target. Built-in rules cover cluster DNS,
+        # chart Postgres, and labelled in-cluster workspaces on SSH 22/30022.
+        extraEgress: []
+
+# =============================================================================
+# Collabora Online — Office documents in Dynamic Canvas
+# =============================================================================
+# Official collabora-online dependency. This surface is deliberately dark by
+# default: enabling it also requires an exact public origin, WOPI aliasgroup,
+# Cockpit frame-ancestor CSP, and edge selectors (validated by the parent
+# chart), plus one of the sessionRouter JWT-secret layouts below. Keep one
+# replica and no HPA until a document-affinity design exists.
+collabora:
+  enabled: false
+  # -- Exact browser-visible Collabora origin, without a trailing slash.
+  # Example: https://office.example.com
+  publicUrl: ""
+  # Session-length read token; live user/thread/path checks remain the actual
+  # revocation boundary on every WOPI request.
+  tokenTtlSeconds: 36000
+  discoveryCacheTtlSeconds: 21600
+  discoveryTimeoutSeconds: 5
+  maxOfficeBytes: 26214400
+
+  # Official subchart values.
+  replicaCount: 1
+  autoscaling:
+    enabled: false
+    # Preserve the upstream value to make the required HPA override explicit.
+    minReplicas: 2
+    maxReplicas: 100
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 50
+    scaleDownDisabled: false
+  terminationGracePeriodSeconds: 60
+  image:
+    repository: docker.io/collabora/code
+    pullPolicy: IfNotPresent
+    # Empty pins to the dependency's 26.04.x appVersion.
+    tag: ""
+  collabora:
+    # Required when enabled. Must equal the host[:port] in publicUrl.
+    server_name: ""
+    # Required when enabled. aliasgroup1.host must exactly equal the rendered
+    # in-cluster orchestrator URL printed by the validation error/NOTES.
+    aliasgroups: []
+    # When enabling, append the exact rendered Cockpit origin after
+    # `frame-ancestors`, followed by `;`. The parent chart validates it.
+    extra_params: >-
+      --o:ssl.enable=false
+      --o:ssl.termination=true
+      --o:per_document.always_save_on_exit=true
+      --o:admin_console.enable=false
+      --o:net.content_security_policy=frame-ancestors
+    proofKeysSecretRef: ""
+    proofKeyGeneration:
+      enabled: false
+      secretName: ""
+  resources:
+    requests:
+      cpu: 1800m
+      memory: 2Gi
+    limits:
+      cpu: 1800m
+      memory: 2Gi
+  ingress:
+    enabled: false
+  route:
+    enabled: false
+  podLabels:
+    srw.io/component: collabora
+  # The dependency's generic policy stays off; the parent renders a stricter
+  # DNS + WOPI-only policy with an ANDed edge namespace/pod selector.
+  networkPolicy:
+    enabled: false
+    edgeNamespaceSelector: {}
+    edgePodSelector: {}
 
 # =============================================================================
 # Auth — cockpit cookie BFF + (future) PAT system
 # =============================================================================
 # Knobs for the orchestrator's cookie-backed session layer for the cockpit.
-# See docs/features/auth_bff_and_api_tokens.md. The cookie domain defaults
+# See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md. The cookie domain defaults
 # to a leading-dot prefix of global.domain so the cookie rides on both the
 # cockpit and api subdomains; override below for non-shared parents.
 auth:
@@ -251,6 +881,14 @@ auth:
 mcp:
   enabled: true
   replicas: 1
+  # -- Reject mutable tag-only image references. Enable in production values;
+  # local/Tilt workflows may leave this false for developer-built images.
+  requireImageDigest: false
+  # -- Also route the MCP server under the cockpit host at /mcp (e.g.
+  # https://localhost/mcp on k3d). Convenience for local dev so a committed
+  # .mcp.json works without a dedicated mcp.<domain> cert/DNS. Leave off in
+  # prod, where the dedicated mcp.<domain> subdomain is the OAuth-client host.
+  exposeOnRootHost: false
   oauth:
     enabled: true
     clientId: "mcp-server"
@@ -277,6 +915,13 @@ ingress:
   # -- CORS middleware (Traefik CRD) for cockpit -> API cross-origin
   cors:
     enabled: true
+    # -- Extra browser origins allowed to call the API, in addition to the
+    # canonical cockpit URL (srw.cockpitUrl). Use this when the app is served
+    # from more than one domain (e.g. a domain migration where an old hostname
+    # is kept as a working alias). Each entry is a full scheme://host origin.
+    # Merged into both the orchestrator's CORS_ORIGINS env and the Traefik CORS
+    # middleware allow-list.
+    additionalOrigins: []
   # -- Layer 1 (P4b): block /api/agents/* and /api/internal/* at the public
   # API ingress so agent-internal paths can't be probed externally. Renders
   # a Traefik IPWhiteList middleware + a high-priority Ingress that 403s
@@ -293,7 +938,7 @@ ingress:
   # (Cloudflare Tunnel, Tailscale Funnel, Ngrok, etc.) — Traefik never
   # sees the request, so the middleware would be dead code. Add the
   # equivalent path rule at your tunnel/edge instead. See
-  # docs/multi_tenancy.md for the cloudflared example.
+  # knowledge-base/knowledge/multi_tenancy.md for the cloudflared example.
   internalPathBlock:
     enabled: false
 
@@ -331,9 +976,339 @@ headscale:
 # =============================================================================
 # Databases
 # =============================================================================
+# LangGraph checkpointer backend for WORKER jobs (persistent/interactive
+# sessions don't use a checkpointer — they resume from thread_messages).
+#
+#   "postgres" (default) — graph state lives in the shared app Postgres, keyed
+#     by thread_id = job_id. Any pod move (preemption, orphan-recovery, pod
+#     eviction, rolling deploy, manual pause→resume) resumes from the actual
+#     interruption point instead of cold-starting from the job opening. This is
+#     the fix for the cross-pod cold-start class of bugs. The agent creates the
+#     LangGraph tables (checkpoints / checkpoint_blobs / checkpoint_writes /
+#     checkpoint_migrations) on first run via setup(); the orchestrator prunes a
+#     job's rows when it reaches a terminal state (completed/failed/cancelled)
+#     and KEEPS them while non-terminal (paused/waiting/pending_review) so those
+#     can resume. Live checkpoint volume is therefore bounded to currently-active
+#     jobs. Requires the orchestrator to receive CHECKPOINTER_BACKEND (wired as
+#     an explicit env in helm/templates/orchestrator/deployment.yaml — it does
+#     NOT read the ConfigMap via envFrom like the agents do), otherwise retention
+#     silently no-ops.
+#
+#   "sqlite" — legacy pod-local checkpoint (/workspace/checkpoints/job_<id>.db).
+#     Lower write traffic to Postgres, but a job that relocates to another pod
+#     cold-starts. Use only if the shared-PG write load proves problematic; it's
+#     the one-line rollback (revert this value, redeploy).
+#
+# Cutover caveat: at the flip, any in-flight job still holding a sqlite-only
+# checkpoint has no PG checkpoint yet, so it cold-starts ONCE, then runs on PG.
+# Docs: knowledge-history/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
+checkpointer:
+  # -- Worker checkpointer backend: "postgres" (shared, cross-pod — default) or "sqlite" (pod-local, legacy)
+  backend: "postgres"
+
+# LLM-outage / cooldown resilience. Docs:
+# knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md +
+# knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md.
+# This single ceiling is read by BOTH the orchestrator (give-up: fail a job
+# loudly after this much continuous outage) AND every agent pod (cutoff: a quota
+# cooldown whose provider-stated reset fits inside this budget PAUSES + resumes
+# from checkpoint; a longer/multi-day wall fails fast). They MUST agree, so it
+# flows through the shared ConfigMap (agents envFrom it; the orchestrator
+# references the same key explicitly). The other llm_outage_* knobs (backoff,
+# jitter, attempts, reset-window, sweep) are orchestrator-only and stay on code
+# defaults — expose them here the same way only if a need arises.
+llmOutage:
+  # -- Max pause budget in seconds (default 12h): the outage give-up ceiling AND
+  # the cooldown pause-vs-fail-fast cutoff. Lower to surface long walls to an
+  # operator sooner; raise to wait out longer quota windows unattended.
+  ceilingSeconds: 43200
+
 databases:
+  # -- CloudNativePG operator. The chart can install it as a subchart for a
+  #    batteries-included self-host, or defer to one the cluster already runs
+  #    (one operator serving many namespaces is the normal deployment, and is
+  #    how the dev cluster is set up — cnpg-system, cluster-wide).
+  operator:
+    # -- Install the CloudNativePG operator as a subchart. OFF while every
+    #    database still runs on `engine: statefulset` — an operator with no
+    #    Cluster to reconcile is pure risk, and one operator serving many
+    #    namespaces is the normal deployment (the dev cluster is set up that
+    #    way: cnpg-system, cluster-wide, installed out of band).
+    #    Turn it on for a self-host whose cluster has no operator yet.
+    #    NOTE: Helm does not upgrade CRDs installed by a subchart, and
+    #    `helm uninstall` does not remove them, so this is close to a one-way
+    #    door. A cluster that already runs CloudNativePG must leave it off, or
+    #    the two installs fight over the same cluster-scoped CRDs.
+    install: false
+    # -- Namespace the CloudNativePG operator runs in. The database
+    #    NetworkPolicies allow it in so it can poll instance health and
+    #    orchestrate failover; without this the operator is silently locked
+    #    out and a failover simply never happens. Dev: cnpg-system.
+    namespace: "cnpg-system"
+
+  # -- Seconds Postgres spends in SMART shutdown before CloudNativePG escalates
+  #    to a fast one. CNPG's own default is 180; this chart lowers it, on
+  #    purpose.
+  #
+  #    Smart shutdown waits for existing client SESSIONS to end, not
+  #    transactions. Every SRW component reaches Postgres through a connection
+  #    pool, and a pool holds its sessions open indefinitely by design, so the
+  #    wait cannot succeed -- it simply runs out. Measured on dev 2026-08-23: a
+  #    plain `kubectl delete pod` on a primary cost 195s of write
+  #    unavailability, of which 180 was this timer, because CNPG will not
+  #    promote the replica until the old primary is down.
+  #
+  #    That is the number every node drain and every rolling operand upgrade
+  #    pays, per cluster. A hard failure does not: there is no graceful
+  #    shutdown to wait for, and the same cluster promoted in 9s.
+  #
+  #    Fast shutdown is still clean -- it disconnects clients, rolls back open
+  #    transactions and checkpoints. It is not a crash. Raise this only if you
+  #    genuinely have short-lived sessions worth waiting for.
+  #
+  #    Safe to change on a live cluster: verified on dev 2026-08-24 that CNPG
+  #    applies it in place. Pods kept their uptime and restart count, and the
+  #    cluster never left "healthy" -- there is no rolling restart to pay for.
+  smartShutdownTimeout: 30
+
+  # -- Set true when you have pre-created the per-cluster basic-auth Secrets
+  #    yourself. ONLY meaningful with `secrets.existingSecret`: in that mode the
+  #    chart never sees the database password, so it cannot build
+  #    `<release>-<component>-app` for CloudNativePG and refuses to render
+  #    rather than install a Cluster whose owner credentials do not exist.
+  #
+  #    Without this flag `existingSecret` + `engine: cnpg` is uninstallable,
+  #    which is the whole self-hosted HA path. With it, you are asserting the
+  #    Secrets exist and match the passwords in your own Secret -- the chart
+  #    cannot verify either, and a mismatch surfaces as the application
+  #    authenticating against a database whose owner has a different password.
+  #
+  #    externalSecrets and `secrets.create` do not need this: both can see the
+  #    value and build the Secret themselves.
+  credentialsPreCreated: false
+
+  # -- Replica profile. Resolves DEFAULT instance counts and nothing else.
+  #    single -> 1 each.  ha -> 2 each.  Per-database `instances` overrides it.
+  #    Anti-affinity, PDBs and topology all derive from the RESOLVED count, so
+  #    an explicit `instances: 3` behaves correctly without naming a profile.
+  profile: single
+
+  ha:
+    # -- kubernetes.io/hostname on bare metal. On a hyperscaler set
+    #    topology.kubernetes.io/zone: block volumes are zonal, so spreading
+    #    across nodes inside one zone buys nothing.
+    topologyKey: "kubernetes.io/hostname"
+
+  # -- initdb locale for CNPG Clusters. MUST match the databases being migrated.
+  #
+  #    CNPG defaults --lc-collate and --lc-ctype to `C` (see the Cluster CRD's
+  #    own field docs), because the operand image sets no LANG. The legacy
+  #    StatefulSet runs docker.io/library/postgres, which ships LANG=en_US.utf8,
+  #    so every existing SRW database is en_US.utf8. Migrating without pinning
+  #    this re-initialises the target under `C` and silently changes:
+  #      * text sort order      -- 'Banana' < 'apple' under C, the reverse under en_US
+  #      * upper()/lower()      -- upper('abaco') keeps the accented char uncased under C
+  #      * FTS tokenisation     -- non-ASCII stops being alphabetic, so one long
+  #                                token becomes thousands of short ones
+  #    That last one is not merely cosmetic: it made pgvector's restore FAIL,
+  #    `string is too long for tsvector (1237068 bytes, max 1048575 bytes)`,
+  #    because the 1MB tsvector cap is reached only under `C`. Same PG16.15
+  #    binary, same rows, en_US.utf8 builds the index in 37MB.
+  #
+  #    These are initdb arguments: they apply ONLY at Cluster creation and
+  #    cannot be changed afterwards without a re-import. The operand image must
+  #    carry the locale -- verify with `locale -a` before changing this.
+  locale:
+    encoding: "UTF8"
+    collate: "en_US.utf8"
+    ctype: "en_US.utf8"
+
+  # -- Memory GUCs derived from each database's own resources.limits.memory,
+  #    as a percentage of it. Applies only to databases on the `cnpg` engine.
+  #
+  #    WHY THIS EXISTS: CloudNativePG ships a FIXED shared_buffers of 128MB and
+  #    does not scale it with the memory limit. Raising limits.memory on its own
+  #    therefore buys the database nothing, and the two values drift apart
+  #    silently -- which is what this fleet shipped with. Measured 2026-08-24 on
+  #    dev, every cluster ran 128MB of buffers regardless of a limit between
+  #    512Mi and 12Gi, and the two LARGEST databases had the WORST cache hit
+  #    ratios for it (pgvector 19 GB / 12Gi limit / 84.2%, audit 26 GB / 4Gi /
+  #    90.6%, against 99%+ on the two small ones). Deriving makes that
+  #    combination unreachable.
+  #
+  #    Any of these can be overridden per database by setting the GUC directly
+  #    in that database's `parameters` map, which always wins. Set a percentage
+  #    to 0 to stop emitting that GUC entirely and fall back to the operand
+  #    default.
+  #
+  #    Changing either value REWRITES postgresql.conf and rolls the Cluster --
+  #    shared_buffers is postmaster-level and cannot be reloaded in place. On a
+  #    multi-instance Cluster that is a switchover, not an outage, but it is not
+  #    free either. Batch it with any resources change.
+  tuning:
+    # -- shared_buffers, as a percent of limits.memory. 25 is the long-standing
+    #    PostgreSQL starting point and leaves the rest of the limit for backend
+    #    work_mem, maintenance work and page cache. Note that page cache IS
+    #    charged to the container's cgroup, so the remainder is not wasted: the
+    #    kernel caches database files in it up to the limit.
+    sharedBuffersPercent: 25
+    # -- effective_cache_size, as a percent of limits.memory. This is a PLANNER
+    #    HINT and allocates nothing -- it tells the planner how much of the
+    #    database it can expect to find in shared_buffers plus page cache, which
+    #    is what makes it choose an index scan over a sequential one. Costing it
+    #    like the 128MB default on a multi-gigabyte limit biases every plan
+    #    toward seq scans.
+    effectiveCacheSizePercent: 75
+
+  # -- Continuous WAL archiving + scheduled base backups, via the Barman Cloud
+  #    CNPG-I plugin. Applies only to databases on the `cnpg` engine.
+  #
+  #    REQUIRES that plugin, which this chart CANNOT install: it ships as a raw
+  #    manifest that hardcodes the operator's namespace (cnpg-system), which a
+  #    release deployed elsewhere does not own. See the runbook:
+  #    knowledge-base/knowledge/operations/cnpg_backup_runbook.md
+  backup:
+    # -- none | objectstore. Default none, deliberately. Pointing this at the
+    #    BUNDLED Garage would be worse than nothing: single node, one PVC, same
+    #    cluster as the databases -- whatever kills the database plausibly kills
+    #    the backup, while looking like a backup. Use storage in a different
+    #    failure domain, and confirm a restore before believing it.
+    #    volumeSnapshot: CSI VolumeSnapshots of the data volume instead. CNPG
+    #    coordinates them (pg_backup_start/stop) rather than snapshotting behind
+    #    the database's back, which a storage-layer cron job cannot do. Needs
+    #    the snapshot.storage.k8s.io CRDs and an external-snapshotter controller
+    #    -- neither ships with Kubernetes and neither is part of this chart.
+    #    Check with `kubectl get volumesnapshotclass`; if that errors, the
+    #    prerequisite is missing.
+    method: "none"
+    # -- s3://bucket/prefix. Required when method is objectstore. Each cluster
+    #    gets its own folder underneath, named after the cluster.
+    destinationPath: ""
+    # -- Override S3 endpoint discovery (MinIO, Garage, Ceph, R2). Leave empty
+    #    for AWS S3 proper.
+    endpointURL: ""
+    # -- CA bundle for an S3 endpoint served by a private CA.
+    endpointCA:
+      secretName: ""
+      key: "ca.crt"
+    # -- Secret holding the S3 credentials. Empty = the chart's own Secret, so
+    #    the keys ride the existing Vault bundle rather than a second ESO path.
+    credentialsSecret: ""
+    accessKeyIdKey: "BACKUP_S3_ACCESS_KEY_ID"
+    secretAccessKeyKey: "BACKUP_S3_SECRET_ACCESS_KEY"
+    # -- CSI VolumeSnapshot settings. Used only when method is volumeSnapshot.
+    volumeSnapshot:
+      # -- VolumeSnapshotClass for the data volume. REQUIRED for this method;
+      #    there is no safe default, because it is storage-driver specific.
+      className: ""
+      # -- Separate class for a WAL volume. Only meaningful with `walStorage`,
+      #    which this chart does not configure -- WAL lives inside PGDATA, so
+      #    one snapshot captures both. Left empty deliberately.
+      walClassName: ""
+      # -- Take the snapshot with Postgres running. `false` fences the instance
+      #    first, which is cleaner and, on a replica, usually free.
+      online: true
+      # -- CNPG defaults this to TRUE, which is wrong for a snapshot-only
+      #    install: it waits for the backup's closing WAL segment to reach an
+      #    archive that does not exist, so the backup never completes. It is
+      #    safe to skip here precisely because there is no separate walStorage
+      #    -- the WAL is inside the volume being snapshotted. Set it true if you
+      #    ever run volume snapshots ALONGSIDE an object store.
+      waitForArchive: false
+    # -- XXu, u in [dwm]. Applies to base backups AND the WALs between them.
+    #    OBJECT STORE ONLY: CloudNativePG does not expire VolumeSnapshots, so
+    #    with method volumeSnapshot they accumulate until something else removes
+    #    them. Longhorn recurring jobs or a storage-side policy own that.
+    retentionPolicy: "30d"
+    wal:
+      # -- bzip2 | gzip | lz4 | snappy | xz | zstd
+      compression: "gzip"
+    data:
+      # -- bzip2 | gzip | lz4 | snappy. NOT xz or zstd -- those are WAL-only
+      #    and the CRD rejects them here.
+      compression: "gzip"
+    # -- SIX-field cron, seconds FIRST (robfig/cron), not the five-field
+    #    Kubernetes CronJob format. "0 0 2 * * *" is 02:00:00 daily; the
+    #    five-field "0 2 * * *" is silently misparsed into the wrong time.
+    schedule: "0 0 2 * * *"
+    # -- Take one immediately when the ScheduledBackup is created, so a fresh
+    #    install has a base backup before the first scheduled window. Without a
+    #    base backup the WAL archive restores nothing.
+    immediate: true
+    # -- Resources for the Barman Cloud sidecar the plugin injects into EVERY
+    #    instance pod of every backing-up Cluster.
+    #
+    #    It ships with NO resources at all, which has two consequences worth
+    #    knowing. First, an unbounded container next to a database can starve it
+    #    on a busy node. Second -- and this is the one that bites -- the sidecar
+    #    is a NATIVE sidecar (an initContainer with restartPolicy: Always), and
+    #    Kubernetes QoS is computed over every container in the pod including
+    #    those. One container without resources therefore drags the WHOLE pod
+    #    down in QoS class no matter how carefully the postgres container is
+    #    sized.
+    #
+    #    Memory is request == limit, matching the databases: this process
+    #    streams and compresses, it does not accumulate, so a ceiling it cannot
+    #    exceed is also a floor it always has.
+    #
+    #    CPU is deliberately NOT pinned. Both compressions default to gzip,
+    #    which is single-threaded and CPU-bound, so the CPU limit is a direct
+    #    throttle on base-backup throughput -- on a 26 GB database at a low cap
+    #    that is the difference between minutes and hours. Requesting a floor
+    #    and letting it burst keeps backups fast without reserving a core per
+    #    instance for something idle 23 hours a day.
+    sidecarResources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "2"
+
   postgres:
     enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial, which is right for a database whose
+    #    restore is dominated by COPY rather than by index builds.
+    importRestoreJobs: null
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    parameters: {}
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
     # -- Deploy StatefulSet within chart (false = external database — set
     # externalHost/externalPort/externalDb below)
     internal: true
@@ -343,12 +1318,71 @@ databases:
     # where user/password come from the Secret (POSTGRES_USER /
     # POSTGRES_PASSWORD) — never from a single bundled URL key. This avoids
     # the urlsplit/`/`-encoding footgun of ``DATABASE_URL`` in Vault.
+    # -- IMPORTANT (HA): orchestrator leader election (M1) uses a SESSION-scoped
+    # Postgres advisory lock, which silently breaks behind a TRANSACTION-mode
+    # connection pooler (PgBouncer/pgcat/RDS-Proxy in txn mode — the lock leaks
+    # and can stall autovacuum). Point externalHost at a direct or session-mode
+    # Postgres endpoint. See knowledge-history/researches/orchestrator_leader_election.md.
     externalHost: ""
     externalPort: 5432
     externalDb: "srw"
+    # -- libpq TLS mode for the DSN the orchestrator and agents compose.
+    #    Applies in BOTH internal and external mode. "prefer" is asyncpg's own
+    #    default (encrypt if the server offers it, never verify), so leaving
+    #    this alone changes nothing. A managed external Postgres usually wants
+    #    "require", or "verify-full" to defeat MITM.
+    #    NOTE: verify-ca/verify-full validate against the SYSTEM CA bundle. A
+    #    private CA needs a mounted bundle, which is not yet supported.
+    #    WARNING: the BUNDLED in-cluster database serves no TLS. Verified on
+    #    k3d 2026-08-21: "prefer" and "disable" connect (ssl_in_use=False),
+    #    "require" fails with 'rejected SSL upgrade'. Only raise this above
+    #    "prefer" when internal=false -- or once the bundled database
+    #    terminates TLS, which the CloudNativePG migration will change.
+    sslMode: "prefer"
     image: pgvector/pgvector:pg15
     storageClass: ""
-    storageSize: "10Gi"
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
+    storageSize: "16Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Separate from `resources` below because that one
+    #    also sizes the legacy StatefulSet, and raising it there restarts a live
+    #    database to reserve memory it never uses.
+    #
+    #    MEMORY IS REQUEST == LIMIT, deliberately, on every database here.
+    #
+    #    A memory limit is not a soft target: cross it and the container is
+    #    OOM-killed, and PostgreSQL has no graceful degradation on the far side
+    #    of that. Meanwhile the kubelet ranks memory-pressure evictions by how
+    #    far a pod has run ABOVE ITS REQUEST, so a database requesting 256Mi and
+    #    using 1Gi sits near the front of that queue. Setting the request to the
+    #    limit makes the pod unable to exceed its own request, which takes it
+    #    out of the ranking entirely -- the guarantee is in the parity, not in
+    #    the QoS class name.
+    #
+    #    CPU IS DELIBERATELY NOT PINNED. Pinning it too would buy the
+    #    `Guaranteed` label, but that label's only remaining benefit is the
+    #    kernel OOM killer's victim scoring, which matters only when a node
+    #    exhausts memory faster than the kubelet's eviction loop reacts. The
+    #    cost is real and constant: a reserved core per instance for a process
+    #    that is idle almost all the time, and a hard throttle on vacuum, index
+    #    builds and gzip base backups exactly when they need to burst. A CPU
+    #    limit throttles; it does not kill. Request a floor, allow the burst.
+    #
+    #    Note that shared_buffers and effective_cache_size are DERIVED from
+    #    limits.memory here -- see databases.tuning. Changing this rewrites
+    #    postgresql.conf, so a resize and a retune are one rolling restart, not
+    #    two.
+    cnpgResources:
+      requests:
+        memory: "1Gi"
+        cpu: "250m"
+      limits:
+        memory: "1Gi"
+        cpu: "2"
     resources:
       requests:
         memory: "256Mi"
@@ -358,15 +1392,137 @@ databases:
         cpu: "500m"
   vector:
     enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. This database's restore is dominated by rebuilding
+    #    3.9 GB of HNSW across ~850k rows, and index builds are exactly what
+    #    the post-data section contains -- so parallelism here is the lever.
+    #    Keep it at or below max_parallel_maintenance_workers above.
+    importRestoreJobs: 4
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    #
+    #    These two exist for the migration. A logical restore rebuilds all
+    #    3.9 GB of this database's HNSW indexes from scratch, and the legacy
+    #    server did that at maintenance_work_mem 64MB, where pgvector falls
+    #    back to building the graph on disk with repeated merges. Keep
+    #    maintenance_work_mem WELL under resources.limits.memory below -- above
+    #    it, the build is OOM-killed rather than slow.
+    parameters:
+      maintenance_work_mem: "2GB"
+      max_parallel_maintenance_workers: "4"
+      # Measured, not guessed: this database spilled 109 MB of sorts to disk in
+      # 17 hours on the 4MB default (dev, 2026-08-24). work_mem is per sort or
+      # hash NODE, not per connection, so the worst case scales with
+      # max_connections -- keep the product well under limits.memory, which the
+      # chart does not enforce because a plan using every node at once is rare
+      # enough that failing the render on it would be wrong.
+      work_mem: "32MB"
+      # NOT optional next to that maintenance_work_mem. autovacuum_work_mem
+      # defaults to it, and autovacuum_max_workers of them run at once, so the
+      # 2GB above silently authorises 6GB of autovacuum on top of
+      # shared_buffers -- a figure that appears nowhere in the config. Pinning
+      # it here keeps routine vacuum small while leaving the deliberate,
+      # one-at-a-time index build the full 2GB.
+      autovacuum_work_mem: "256MB"
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
+    # -- PostgreSQL extensions mounted as image volumes (CloudNativePG >= 1.29).
+    #    REQUIRES Kubernetes >= 1.35, or 1.33/1.34 with the ImageVolume feature
+    #    gate enabled on the API server and every kubelet, plus containerd
+    #    >= 2.1.0. The image tag encodes the PostgreSQL major ("-18-"), so it
+    #    must match `image` below. Declaring an extension only makes it
+    #    AVAILABLE; the migrations still run CREATE EXTENSION.
+    #    EMPTY ON PURPOSE. The operand image (`cnpgImage`) already carries
+    #    pgvector, which is the "alternative for older clusters" this comment
+    #    describes -- and it is not optional here: the only official extension
+    #    images are PostgreSQL 18, so mounting one into the PostgreSQL 16
+    #    operand would be a major-version mismatch. Revisit when the cluster
+    #    reaches Kubernetes 1.35 and the custom image can be retired:
+    #      - name: pgvector
+    #        image:
+    #          reference: ghcr.io/cloudnative-pg/pgvector:0.8.6-18-trixie
+    extensions: []
     internal: true
     # -- External mode connection parts. See ``databases.postgres`` above for
     # the rationale (credentials live in the Secret, not a bundled URL).
     externalHost: ""
     externalPort: 5432
     externalDb: "srw_vector"
+    # -- libpq TLS mode for the DSN the orchestrator and agents compose.
+    #    Applies in BOTH internal and external mode. "prefer" is asyncpg's own
+    #    default (encrypt if the server offers it, never verify), so leaving
+    #    this alone changes nothing. A managed external pgvector usually wants
+    #    "require", or "verify-full" to defeat MITM.
+    #    NOTE: verify-ca/verify-full validate against the SYSTEM CA bundle. A
+    #    private CA needs a mounted bundle, which is not yet supported.
+    #    WARNING: the BUNDLED in-cluster database serves no TLS. Verified on
+    #    k3d 2026-08-21: "prefer" and "disable" connect (ssl_in_use=False),
+    #    "require" fails with 'rejected SSL upgrade'. Only raise this above
+    #    "prefer" when internal=false -- or once the bundled database
+    #    terminates TLS, which the CloudNativePG migration will change.
+    sslMode: "prefer"
     image: pgvector/pgvector:pg15
     storageClass: ""
-    storageSize: "10Gi"
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
+    storageSize: "16Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Separate from `resources` above because that one
+    #    also sizes the legacy StatefulSet, and raising it there restarts a
+    #    live database to reserve memory it never uses. Memory is request ==
+    #    limit and CPU is left burstable, for the reasons spelled out on
+    #    databases.postgres above.
+    #
+    #    Sized for the index REBUILD a logical import performs, not for steady
+    #    state: this database carries 3.9 GB of HNSW across ~850k rows, and the
+    #    legacy pod idled at ~169Mi. maintenance_work_mem above this limit is an
+    #    OOM kill, not a slow build -- and with shared_buffers now derived at
+    #    25% of it, the ceiling this has to clear is shared_buffers PLUS
+    #    maintenance_work_mem. At 8Gi that is 2 GB + 2 GB, which the chart
+    #    enforces rather than trusts; see the guard in cnpg-cluster.yaml.
+    cnpgResources:
+      requests:
+        memory: "8Gi"
+        cpu: "500m"
+      limits:
+        memory: "8Gi"
+        cpu: "4"
     resources:
       requests:
         memory: "256Mi"
@@ -374,11 +1530,241 @@ databases:
       limits:
         memory: "1Gi"
         cpu: "500m"
+  # Audit DB (srw-auditdb) — the observability tier. Its own server so
+  # observability writes can't take down the control plane (failure-domain
+  # isolation). Append-only, monthly-partitioned, retention-bounded.
+  audit:
+    enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial, which is right for a database whose
+    #    restore is dominated by COPY rather than by index builds.
+    importRestoreJobs: null
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    parameters:
+      # Measured, not guessed: this database spilled 185 MB of sorts to disk in
+      # 17 hours on the 4MB default (dev, 2026-08-24), which is what an audit
+      # trail does -- it is written once and then read by wide, sorted,
+      # date-ranged scans. Per sort or hash NODE, so the worst case scales with
+      # max_connections; keep the product well under limits.memory.
+      work_mem: "32MB"
+    # -- Audit is append-heavy, so it dominates WAL volume, and it is non-fatal
+    #    by contract and already retention-bounded. Off by default; turn it on
+    #    if the audit trail is a compliance artefact for you.
+    backupEnabled: false
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
+    internal: true
+    # -- External mode connection parts (credentials live in the Secret).
+    externalHost: ""
+    externalPort: 5432
+    externalDb: "srw_audit"
+    # -- libpq TLS mode for the DSN the orchestrator and agents compose.
+    #    Applies in BOTH internal and external mode. "prefer" is asyncpg's own
+    #    default (encrypt if the server offers it, never verify), so leaving
+    #    this alone changes nothing. A managed external audit Postgres usually wants
+    #    "require", or "verify-full" to defeat MITM.
+    #    NOTE: verify-ca/verify-full validate against the SYSTEM CA bundle. A
+    #    private CA needs a mounted bundle, which is not yet supported.
+    #    WARNING: the BUNDLED in-cluster database serves no TLS. Verified on
+    #    k3d 2026-08-21: "prefer" and "disable" connect (ssl_in_use=False),
+    #    "require" fails with 'rejected SSL upgrade'. Only raise this above
+    #    "prefer" when internal=false -- or once the bundled database
+    #    terminates TLS, which the CloudNativePG migration will change.
+    sslMode: "prefer"
+    # PostgreSQL 16 (>= 16.5 ships the DETACH CONCURRENTLY + partitioned-FK
+    # fixes); 15.9+ is compatible if a 15.x is preferred for fleet uniformity.
+    image: postgres:16
+    storageClass: ""
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
+    storageSize: "16Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Memory is request == limit and CPU is left
+    #    burstable, for the reasons spelled out on databases.postgres above.
+    #    shared_buffers and effective_cache_size derive from limits.memory --
+    #    see databases.tuning.
+    cnpgResources:
+      requests:
+        memory: "1Gi"
+        cpu: "250m"
+      limits:
+        memory: "1Gi"
+        cpu: "2"
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+  # Dedicated Postgres for the bundled Gitea (gitea.database.type: postgres).
+  # Its own server for the same failure-domain reason as the audit DB: Gitea is
+  # a chatty writer on every agent push, and a git-metadata problem must not be
+  # able to stall the control plane's DB. Only renders when the bundled Gitea,
+  # `gitea.database.type: postgres`, and this DB are all internal.
+  gitea:
+    enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial, which is right for a database whose
+    #    restore is dominated by COPY rather than by index builds.
+    importRestoreJobs: null
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    parameters: {}
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
+    # -- When false, the bundled Gitea points at externalHost/Port/Db below
+    #    (managed Postgres — RDS, Cloud SQL, CloudNativePG). Credentials still
+    #    come from the Secret (GITEA_DB_USER / GITEA_DB_PASSWORD).
+    internal: true
+    externalHost: ""
+    externalPort: 5432
+    externalDb: "gitea"
+    # -- Gitea's libpq sslmode. "disable" is right for the in-cluster Service;
+    #    a managed external Postgres usually wants "require" or "verify-full".
+    sslMode: "disable"
+    image: postgres:16
+    storageClass: ""
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
+    storageSize: "8Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Memory is request == limit and CPU is left
+    #    burstable, for the reasons spelled out on databases.postgres above.
+    #    shared_buffers and effective_cache_size derive from limits.memory --
+    #    see databases.tuning.
+    cnpgResources:
+      requests:
+        memory: "512Mi"
+        cpu: "100m"
+      limits:
+        memory: "512Mi"
+        cpu: "1"
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
   # Dedicated Postgres for the bundled Keycloak. Keeps the IdP's data plane
   # isolated from the orchestrator's. Only renders when both the bundled
   # Keycloak and this DB are internal.
   keycloak:
     enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (today's default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    #    Removed once every instance is migrated and soaked.
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections for this server. The bundled StatefulSet inherited the
+    #    image default of 100; CloudNativePG sets it explicitly. Budget
+    #    arithmetic — orchestrator replicas x pool max, plus per-agent
+    #    checkpointer connections — is documented above under `orchestrator`.
+    #    Leave headroom for the instance manager's own connections.
+    maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial, which is right for a database whose
+    #    restore is dominated by COPY rather than by index builds.
+    importRestoreJobs: null
+    # -- Extra postgresql.conf settings, merged over max_connections above.
+    #    Values MUST be strings: CNPG's parameters map is map[string]string, and
+    #    an unquoted integer fails admission for the whole Cluster.
+    parameters: {}
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`. Deliberately separate from `image` above: CNPG's
+    #    admission webhook parses the tag as a PostgreSQL version and rejects
+    #    the StatefulSet's `pgvector/pgvector:pg15` outright ("invalid version
+    #    tag", verified against the live CRD 2026-08-21).
+    #
+    #    CloudNativePG's own operand image, which already bundles pgvector
+    #    0.8.6, uuid-ossp and btree_gist -- every extension this fleet uses.
+    #    Verified by inspecting the image, not by reading the docs: the
+    #    ImageVolume extension mechanism is PostgreSQL 18+ only, which is easy
+    #    to mistake for "operands no longer bundle extensions". They do.
+    #
+    #    PINNED, not floating. imageName is part of the Cluster spec, so a
+    #    moving tag would roll every Postgres cluster whenever upstream
+    #    publishes. Bumping is a deliberate act; postgres-operand-check.yml
+    #    reports weekly when a newer patch exists.
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
     # -- When false, KC_DB_URL on the Keycloak pod uses externalUrl below.
     #    Lets the bundled Keycloak point at a managed Postgres (RDS, Cloud SQL).
     internal: true
@@ -388,7 +1774,24 @@ databases:
     externalUrl: ""
     image: postgres:15
     storageClass: ""
-    storageSize: "5Gi"
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below. Size it above
+    #    the database's own size: a logical import writes the data, rebuilds
+    #    every index, and generates WAL, all onto this one volume.
+    cnpgStorageSize: ""
+    storageSize: "8Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Memory is request == limit and CPU is left
+    #    burstable, for the reasons spelled out on databases.postgres above.
+    #    shared_buffers and effective_cache_size derive from limits.memory --
+    #    see databases.tuning.
+    cnpgResources:
+      requests:
+        memory: "512Mi"
+        cpu: "100m"
+      limits:
+        memory: "512Mi"
+        cpu: "1"
     resources:
       requests:
         memory: "128Mi"
@@ -396,21 +1799,6 @@ databases:
       limits:
         memory: "512Mi"
         cpu: "200m"
-  mongodb:
-    enabled: true
-    internal: true
-    # -- Full MongoDB URL for external mode. Example: "mongodb://my-mongo.db.svc:27017/srw_logs"
-    externalUrl: ""
-    image: mongo:7
-    storageClass: ""
-    storageSize: "5Gi"
-    resources:
-      requests:
-        memory: "256Mi"
-        cpu: "100m"
-      limits:
-        memory: "1Gi"
-        cpu: "500m"
   neo4j:
     enabled: true
     internal: true
@@ -418,7 +1806,7 @@ databases:
     externalUrl: ""
     # -- Auth credentials for the bundled Neo4j: both NEO4J_USERNAME and
     # NEO4J_PASSWORD live in the Secret (Vault), mirroring how the
-    # POSTGRES_USER / VECTOR_POSTGRES_USER / CITATION_POSTGRES_USER pairs
+    # POSTGRES_USER / VECTOR_POSTGRES_USER pairs
     # work — there is no chart-level value for the username. Community
     # edition allows only "neo4j"; enterprise can admit a different name,
     # but in either case the value is set via Vault, not values.yaml.
@@ -445,7 +1833,7 @@ databases:
     #    based on edition above; override here to pin a specific tag.
     image: ""
     storageClass: ""
-    storageSize: "10Gi"
+    storageSize: "16Gi"
     # -- Neo4j Browser web UI (HTTP/7474) Ingress. Off by default — the DB
     # itself is reachable in-cluster on the Bolt port via the always-on
     # ClusterIP service, which is all the orchestrator/agents need. Turn this
@@ -477,6 +1865,20 @@ databases:
       # `metallb.universe.tf/ip-address-pool` annotation. Leave empty to use
       # MetalLB's default pool selection.
       ipAddressPool: ""
+      # -- externalTrafficPolicy for the Bolt LoadBalancer. Empty = Kubernetes
+      # default (Cluster, which SNATs the client to a node IP). Set to "Local"
+      # to preserve the real client source IP — REQUIRED when scoping Bolt with
+      # allowedClientCIDRs below, since the srw-neo4j NetworkPolicy matches on
+      # that client IP. (In a routed homelab there is no NAT between LAN and
+      # MetalLB, so Local surfaces the actual LAN address at the pod.)
+      externalTrafficPolicy: ""
+      # -- Client CIDRs permitted to reach Bolt (7688) through the LoadBalancer.
+      # Each renders an ipBlock allow-rule in the srw-neo4j NetworkPolicy, which
+      # otherwise limits Bolt to the orchestrator/agent pods — without this the
+      # Browser SPA's Bolt WebSocket is dropped. Bolt is authenticated, so this
+      # gates *reachability*, not access. Empty = no carve-out. Requires
+      # externalTrafficPolicy: Local (above) so the source IP is the real client.
+      allowedClientCIDRs: []
     # -- JVM heap and OS-level page cache. Neo4j 5 auto-detects from the cgroup
     #    limit and routinely overshoots, refusing to start with "Invalid memory
     #    configuration - exceeds physical memory". Pin both explicitly. Together
@@ -497,6 +1899,15 @@ databases:
 # =============================================================================
 gitea:
   enabled: true
+  # -- Gitea is single-writer: it holds an exclusive lock on its data volume and
+  #    its StatefulSet has no leader election, so this is 0 or 1, never more.
+  #
+  #    It exists so a database cutover can quiesce the writer THROUGH GitOps.
+  #    `kubectl scale` is reverted within ~90s, mid-migration, and
+  #    `gitea.enabled: false` is not a substitute -- that guard also covers the
+  #    PersistentVolumeClaim, so disabling Gitea to quiet it would delete its
+  #    data volume.
+  replicas: 1
   # -- Deploy Gitea StatefulSet within the chart. Set false to use external git server.
   internal: true
   # -- Internal cluster URL (when internal=false, set to your existing git server's internal URL)
@@ -505,15 +1916,54 @@ gitea:
   # When internal=true, defaults to https://git.{global.domain}.
   externalUrl: ""
   image: gitea/gitea:1.22-rootless
+  ssh:
+    # -- Repository-scoped deploy keys use Gitea's SSH server. The bundled
+    # service is enabled by default; disabling it makes managed workspace
+    # dispatch fail closed rather than falling back to administrator HTTP auth.
+    enabled: true
+    internalHost: ""
+    internalPort: 2222
+    # VM guests cannot generally resolve ClusterIP DNS. Set an exact routed
+    # host/port (and optionally expose the SSH-only Service below) before VM
+    # managed-repository dispatch is enabled.
+    externalHost: ""
+    externalPort: 22
+    externalService:
+      enabled: false
+      type: LoadBalancer
+      nodePort: null
+  # -- Metadata database backing the bundled Gitea: users, orgs, repo
+  # metadata, issues, PRs, and the OIDC login source. Git object data always
+  # lives on the Gitea PVC and is NOT affected by this setting.
+  #
+  #   postgres (default) — dedicated `srw-giteadb` StatefulSet, or an external
+  #     server via `databases.gitea`. Concurrent readers/writers, no
+  #     single-file corruption risk, and the only option with a scaling story.
+  #   sqlite3 — one file on the Gitea PVC. Simplest, zero extra infra, but
+  #     single-writer and lost/corrupted by an ungraceful kill mid-write.
+  #
+  # SWITCHING AN EXISTING INSTALL IS A DATA MIGRATION, NOT A CONFIG FLIP.
+  # The git repos on the PVC survive either way, but Gitea reads *which repos
+  # and users exist* from this database — pointing a populated instance at an
+  # empty Postgres yields a Gitea that believes it is a fresh install while
+  # hundreds of repos sit orphaned on disk. A preflight init container refuses
+  # to start in exactly that situation; run the migration first:
+  # knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
+  database:
+    type: postgres
   storageClass: ""
-  storageSize: "5Gi"
+  storageSize: "8Gi"
+  # Gitea serves every jobs-repo clone the agents make, and pack generation is
+  # CPU-bound: a 250m limit throttled clones to ~1-2 MiB/s, slow enough that
+  # large project repos outlived the agent-side clone wait. Requests stay small;
+  # the limits are burst headroom for pack-objects and the web UI.
   resources:
     requests:
-      memory: "128Mi"
-      cpu: "50m"
+      memory: "256Mi"
+      cpu: "100m"
     limits:
-      memory: "512Mi"
-      cpu: "250m"
+      memory: "1Gi"
+      cpu: "2"
 
 keycloak:
   # -- Whether the system uses Keycloak/OIDC at all. Set false only for unauthenticated dev.
@@ -522,6 +1972,18 @@ keycloak:
   # When false, fill in the externalIssuerUrl and externalInternalUrl fields below.
   internal: true
   image: quay.io/keycloak/keycloak:26.2
+  # -- Replica count for the bundled Keycloak. The pod runs in production mode
+  # (`start`), so >1 is correctness-safe without extra infrastructure: the
+  # Infinispan cluster discovers peers via `jdbc-ping` through the Keycloak
+  # database, and user sessions are persisted to that database rather than held
+  # in each pod's memory (KC 26.0+). No headless Service or DNS_PING required.
+  #
+  # Default stays 1 for the same reason the orchestrator's did before M1 soaked
+  # on dev: a FRESH install runs `--import-realm` on every replica at once
+  # against an empty database, and that concurrent-bootstrap path is untested
+  # here. Existing installs have no import to race, so opt them in via the
+  # deployment overlay (dev does this) and leave fresh installs at 1.
+  replicas: 1
   realm: "srw"
   # -- Public OIDC issuer URL (when internal=false, e.g. "https://login.microsoftonline.com/{tenant}/v2.0"
   # for Azure AD, or "https://accounts.google.com" for Google Workspace).
@@ -687,6 +2149,44 @@ nextcloud:
   replicas: 0
   storageClass: ""
   storageSize: "10Gi"
+  # Internal-only authority-creating lane for protected read-only grants.
+  # It shares the bundled Nextcloud code/data volume but runs in a dedicated
+  # Nginx + PHP-FPM pool. The FPM auto-prepend verifier authenticates an exact
+  # attempt-scoped request and rejects an expired queued request before
+  # Nextcloud boots; request_terminate_timeout supplies the hard handler bound.
+  # External Nextcloud installations are deliberately ineligible unless they
+  # deploy and attest an equivalent server-side lane.
+  protectedEffect:
+    enabled: false
+    # The HMAC root must never live in the shared application Secret: dynamic
+    # agent Pods consume that bundle via envFrom. ESO therefore reads a
+    # dedicated Vault path, while pre-created-secret users name a dedicated
+    # immutable Secret here. Chart-created mode generates its own Secret.
+    hmacSecretName: ""
+    hmacVaultPath: ""
+    fpmImage: docker.io/library/nextcloud:31-fpm
+    nginxImage: docker.io/library/nginx:1.27-alpine-slim
+    queueBoundSeconds: 30
+    handlerBoundSeconds: 10
+    clockSkewBoundSeconds: 2
+    safetyMarginSeconds: 5
+    capabilityMaxAgeSeconds: 5
+    maxChildren: 2
+    resources:
+      fpm:
+        requests:
+          memory: "128Mi"
+          cpu: "50m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      nginx:
+        requests:
+          memory: "16Mi"
+          cpu: "10m"
+        limits:
+          memory: "64Mi"
+          cpu: "100m"
   resources:
     requests:
       memory: "256Mi"
@@ -697,7 +2197,17 @@ nextcloud:
 
 opencloud:
   enabled: true
-  image: docker.io/opencloudeu/opencloud:latest
+  # PINNED — do not float this tag, and do not move to a 7.x tag yet. The entire
+  # OpenCloud 7.x line (verified on 7.2.0 AND 7.2.2) hard-requires a sharing
+  # service-account id our provisioning never sets, so the pod CrashLoops on
+  # boot:  "service account id has not been configured for sharing".
+  # `:latest`/`7.2`/`7` all resolve to a 7.x image and will break. 4.0.8 is the
+  # last release before that requirement and the version that ran healthy on the
+  # homelab (config PVC is 4.x-written; the chart's `echo no | opencloud init`
+  # never overwrites it). To move onto 7.x, first wire OC_SERVICE_ACCOUNT_ID/
+  # _SECRET via ESO (reuse the id/secret opencloud init wrote to the config PVC),
+  # validate a rollout, then re-pin deliberately. See the 2026-07-14 incident.
+  image: docker.io/opencloudeu/opencloud:4.0.8
   storageClass: ""
   # OpenCloud's decomposeds3 driver buffers TUS uploads on the local PVC
   # before promoting them to S3 on finalize. 16Gi is a light-use baseline
@@ -730,6 +2240,12 @@ opencloud:
       limits:
         cpu: "200m"
         memory: "128Mi"
+  # -- Local-dev only: rclone cloud mounts pass --no-check-certificate so the
+  # tus upload hop (ocdav redirects PATCHes to the PUBLIC data-gateway URL,
+  # which presents the mkcert edge cert on local k3d) passes TLS verification.
+  # Pair with workspace.networkPolicy.extraEgress for the in-cluster Traefik
+  # hairpin. Never enable on a real deployment.
+  mountInsecureTls: false
   resources:
     requests:
       memory: "256Mi"
@@ -753,6 +2269,15 @@ cloud:
   externalUrl: ""
   # -- Internal URL the agent calls server-to-server. Defaults to externalUrl when empty.
   externalServiceUrl: ""
+  # -- Main-cloud workspace data plane: "rclone_mount" (lazy rclone/FUSE
+  # mounts) or "sync" (legacy eager clone).
+  workspaceDriver: "rclone_mount"
+  rcloneMount:
+    # -- Treat SSH workspace containers as rclone/FUSE-capable runtimes.
+    allowContainer: true
+  # -- Optional explicit Nextcloud username for rclone user-home mounts.
+  # Pair with Secret key NEXTCLOUD_RCLONE_USER_HOME_PASSWORD.
+  nextcloudRcloneUserHomeUsername: ""
 
 # =============================================================================
 # Workspace
@@ -760,12 +2285,106 @@ cloud:
 workspace:
   storageClass: ""
   storageSize: "20Gi"
+  fuse:
+    # -- Mount /dev/fuse and grant SYS_ADMIN to workspace containers so rclone
+    # mount can run where the agent shell executes.
+    enabled: true
+    # -- Use a privileged/unconfined runtime profile for FUSE workspaces. This
+    # is required by k3d/containerd and many managed cluster runtimes even when
+    # /dev/fuse and SYS_ADMIN are present.
+    privileged: true
   # -- Access mode for the shared workspace PVC. Production uses
   # ReadWriteMany (Longhorn). Single-node clusters with RWO-only storage
   # (k3s local-path) can override to "ReadWriteOnce".
   accessMode: "ReadWriteMany"
-  # -- Storage class for ephemeral per-job workspace PVCs
+  # -- Storage class for the ephemeral per-workspace PVCs (jobs and sessions,
+  # including a session's agent-pod claim). The capacity quota below is keyed
+  # on this class, so all three claim kinds share one bucket.
   ephemeralStorageClass: ""
+  # -- PVC-backed workspaces (Branch a). Covers BOTH jobs and sessions: every
+  # workspace pod gets a PVC named by its owner UUID (`pvc-workspace-<job>` /
+  # `pvc-ws-thread-<thread>`) so on-disk files survive pod crashes and reattach
+  # by name on recreate. A session ALSO gets a second claim for its agent pod
+  # (`pvc-agent-s-<thread>`), so one session consumes TWO claims; job agent pods
+  # stay emptyDir.
+  #
+  # Reclaim is asymmetric, and that is the part to internalize before flipping
+  # this on:
+  #   * job PVCs are reclaimed on terminal status (completed/failed/cancelled)
+  #     and retained across idle reap / suspend / restore;
+  #   * session PVCs are reclaimed ONLY when the `threads` row is hard-deleted.
+  #     An `ended` thread is still resumable (sessions end on an idle timeout
+  #     routinely), so its two claims outlive its pods. Turning this on makes
+  #     workspace storage track the number of RETAINED THREADS rather than
+  #     concurrency — size `resourceQuota` and the backing pool for that, and
+  #     prune threads you do not intend to reopen.
+  #
+  # Default off → emptyDir (pre-Branch-a behavior) and the rollback posture.
+  # Mixed fleets are safe — the reaper reads each pod's actual volume mode — so
+  # this is a rolling flip, not a cutover; flipping it back off leaves existing
+  # PVCs to drain as their work finishes.
+  # See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
+  pvcEnabled: false
+  # -- Size of each workspace PVC (only used when pvcEnabled). Applies to every
+  # claim: job workspace, session workspace, and session agent.
+  pvcSize: "10Gi"
+  # -- Single-replica node-loss fallback (Phase 3b). Extended ready-wait (s) for a
+  # PVC REATTACH: a transient node reboot (the replica's node returning) recovers
+  # within this window without discarding data; past it, a still-wedged reattach
+  # whose holdup is a volume-attach failure means the lone replica's node is gone
+  # → the PVC is discarded and the job recovers onto a fresh volume (agent clones
+  # from Gitea + resumes the checkpoint; unpushed files are lost). Only relevant
+  # for networked single-replica storage (longhorn-ephemeral); harmless elsewhere.
+  reattachReadyTimeout: 180
+  # -- Kill-switch for the discard-and-recover fallback above (the only data-
+  # destructive recovery path). false → a wedged reattach stays in recovery until
+  # the node returns or the recovery cap fails it loud, never discarding.
+  freshFallback: true
+  # -- Reclaim-on-idle (Task 7). On a session's idle-suspend, once the S3
+  # snapshot is confirmed restorable (verify_snapshot), drop its workspace
+  # PVC instead of retaining it — the next touch extracts from S3 like any
+  # never-PVC-backed session. Bounds live PVCs to currently-active +
+  # recently-crashed sessions instead of every retained thread ever. Fail-
+  # safe: an unverifiable snapshot always keeps the PVC. Default off = keep
+  # today's retain-on-idle behavior. See
+  # knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
+  reclaimOnIdle: false
+  # -- Capacity guard for PVC-backed workspaces (Phase 3a). Renders a
+  # namespaced ResourceQuota keyed on `ephemeralStorageClass` that caps BOTH the
+  # total storage and the count of workspace PVCs of that class. At the cap, new
+  # workspace PVCs are rejected (403) and the owning work fails closed with a
+  # distinct "workspace capacity quota exceeded" log line — never a silent
+  # emptyDir fallback. Requires `pvcEnabled: true` and a DEDICATED
+  # `ephemeralStorageClass` so the quota isolates workspace storage from the
+  # platform's own data PVCs (Postgres, …). On prod `longhorn-ephemeral`
+  # is already dedicated; on single-node/local-path make a dedicated
+  # local-path-backed class (same provisioner, distinct name) and point
+  # `ephemeralStorageClass` at it. See the storage-substrate section of
+  # knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
+  #
+  # ONE BUCKET FOR BOTH KINDS. The quota is keyed on the storage class, and jobs
+  # and sessions share that class — there is no per-kind split. A backlog of
+  # retained session threads can therefore exhaust the count and 403 a JOB's PVC
+  # create, failing that job closed for a reason that has nothing to do with the
+  # job. If the two need isolating, give sessions their own storage class (and
+  # its own quota) rather than raising this one.
+  #
+  # Defaults re-derived 2026-08-04 for the jobs+sessions flip. Previously
+  # 200Gi / 20 — sized when only jobs held PVCs (20 × pvcSize 10Gi):
+  #     jobs:     20 concurrent × 1 claim  = 20 claims
+  #     sessions: 20 retained   × 2 claims = 40 claims  (workspace + agent pod)
+  #     total     60 claims × pvcSize 10Gi = 600Gi
+  # Session claims are NOT bounded by concurrency (see `pvcEnabled` above): they
+  # live until the thread row is deleted, so re-derive `maxCount` against your
+  # thread-retention policy, not your peak concurrent-session count.
+  resourceQuota:
+    enabled: false
+    # -- Max total storage summed across all workspace PVCs of the ephemeral
+    # class (jobs + sessions).
+    maxStorage: "600Gi"
+    # -- Max number of workspace PVCs of the ephemeral class (jobs + sessions;
+    # a session counts twice — workspace pod + agent pod).
+    maxCount: 60
   # -- NetworkPolicy restricting workspace traffic. Covers BOTH container
   # workspaces and same-cluster KubeVirt VM workspaces (selector
   # srw.io/component=agent-workspace matches both). Disabling removes the
@@ -773,7 +2392,7 @@ workspace:
   # that enforces NetworkPolicy: Calico, Cilium, OVN-Kubernetes, and Antrea
   # enforce natively; K3s ships Flannel paired with the embedded kube-router
   # network-policy controller, which enforces by default (Flannel alone
-  # does not). See docs/features/workspace_network_policy_unification.md.
+  # does not). See knowledge-base/knowledge/features/workspace_network_policy_unification.md.
   #
   # PR 3 (per-project tiering): one NetworkPolicy is rendered per entry
   # in `tiers` below. Each policy selects pods carrying the matching
@@ -781,7 +2400,7 @@ workspace:
   # ContainerProvisioner, derived from `projects.network_tier`). The
   # default tier `internet-only` MUST exist — pre-PR-3 pods and pods
   # whose project has no resolvable tier inherit it. See
-  # docs/features/workspace_network_isolation.md §3.
+  # knowledge-base/knowledge/features/workspace_network_isolation.md §3.
   networkPolicy:
     enabled: true
     # If set, the orchestrator init seeder bumps this user's default
@@ -817,6 +2436,15 @@ workspace:
           - 10.42.0.0/16       # pod CIDR
           - 10.43.0.0/16       # service CIDR
           - 169.254.0.0/16     # link-local / cloud-metadata
+    # -- Extra egress rules appended verbatim to EVERY tier policy (raw
+    # NetworkPolicy egress entries). Intended for deployment-specific holes
+    # the cluster-CIDR hardening would otherwise close — e.g. local k3d adds
+    # an in-cluster Traefik hairpin so uploads addressed to the public edge
+    # hostname (OpenCloud's tus data gateway resolves to the Traefik
+    # ClusterIP via coredns-custom) can connect. Real deployments resolve
+    # those hostnames externally and don't need this. See
+    # deployment/values-local.yaml.example for the Traefik block.
+    extraEgress: []
   # -- Pre-pull the workspace image on every node via a DaemonSet, so a
   # freshly-built tag doesn't pay a ~2-minute cold pull penalty on the first
   # session-attach (which would exceed the orchestrator/agent readiness
@@ -833,23 +2461,29 @@ workspace:
 pgadmin:
   enabled: false
   image: dpage/pgadmin4:latest
+  # -- Pre-register the three SRW application databases (app / pgvector / audit)
+  # in the pgAdmin server tree on startup, with passwords pre-filled from a
+  # chmod-600 .pgpass assembled from the Secret. With this on, an operator only
+  # needs the pgAdmin login (auth.* below) — all three DBs are ready on first
+  # login. Set false for a bare pgAdmin with no servers pre-configured.
+  preregisterDatabases: true
+  auth:
+    # -- Secret keys holding the pgAdmin login email + password. Add both to your
+    # Vault bundle (prod: the main ExternalSecret uses `dataFrom: extract`, so new
+    # properties appear automatically) or to secrets.values (chart-managed dev
+    # secret). The login email isn't strictly secret but is sourced from the
+    # Secret so the whole pgAdmin credential lives in one place.
+    emailSecretKey: PGADMIN_EMAIL
+    passwordSecretKey: PGADMIN_PASSWORD
+    # -- DB role pgAdmin connects as. MUST equal POSTGRES_USER (all three SRW
+    # databases share it). Used both in servers.json and the assembled .pgpass.
+    dbUsername: srw
   resources:
     requests:
       memory: "128Mi"
       cpu: "50m"
     limits:
       memory: "512Mi"
-      cpu: "250m"
-
-mongoExpress:
-  enabled: false
-  image: mongo-express:latest
-  resources:
-    requests:
-      memory: "64Mi"
-      cpu: "50m"
-    limits:
-      memory: "256Mi"
       cpu: "250m"
 
 dozzle:
@@ -865,15 +2499,68 @@ dozzle:
 
 codexProxy:
   enabled: false
-  image: docker.io/eceasy/cli-proxy-api:latest
+  # Pin a concrete upstream version — CLIProxyAPI ships multiple builds/day and
+  # `latest` makes pod restarts silently change behavior. Overlays may override.
+  #
+  # Floor is v7.2.110 (2026-08-05, was v7.2.61). Anything older than the
+  # 2026-07-15 fix `09da52ad` (router-for-me/CLIProxyAPI#3055) charges a
+  # REQUEST-scoped `408 stream disconnected before completion` to the
+  # CREDENTIAL: the auth entry goes unavailable and every following call gets an
+  # instant `503 auth_unavailable`, which reads as a dead token and takes out
+  # unrelated jobs on the same proxy. v7.2.110 adds IsRequestScoped() and is a
+  # strict descendant of that fix. Dev has run it since 2026-07-30.
+  # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
+  image: docker.io/eceasy/cli-proxy-api:v7.2.110
   storageSize: "1Gi"
+  # Retries INSIDE the proxy, on 403/408/500/502/503/504. An unset key yields 0
+  # (Go zero value) despite upstream's config.example.yaml documenting 3.
+  #
+  # Only safe at 3 BECAUSE of the image floor above. Pre-#3055, retrying a 408
+  # is what burns credentials — the upstream reporter watched it take out 4 of
+  # 6, then 5 of 6 — so on an older image this value is an amplifier, not a
+  # cure. If you ever pin the image back below v7.2.110, set this to 0.
+  requestRetry: 3
+  # Body-level request/response logging to the pod log. OFF by default: it emits
+  # full prompts AND auth headers. Flip to true only while actively catching an
+  # upstream error the status endpoint won't explain, then flip it back.
+  requestLog: false
+  debug: false
+  # The proxy buffers the full request/response body in memory (Go), so a
+  # single multimodal turn (e.g. several multi-MB images base64-inflated to
+  # ~30MB each, plus the response) can spike well past a tight limit. The old
+  # 256Mi limit was OOMKilled mid-turn by an image-heavy session, which the
+  # agent saw as `APIConnectionError: Connection error.` and the turn died.
+  # Give it generous headroom (limit is a ceiling, not a reservation).
   resources:
     requests:
-      memory: "64Mi"
-      cpu: "50m"
-    limits:
       memory: "256Mi"
-      cpu: "200m"
+      cpu: "100m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+
+# =============================================================================
+# Test-only Infrastructure
+# =============================================================================
+# Throwaway services that back integration tests. Everything under `test.` is
+# OFF by default and must stay off on production overlays.
+test:
+  # -- GreenMail — disposable IMAP+IMAPS+SMTP(+S) mail server for the `email`
+  # datasource integration tests (knowledge-base/knowledge/features/email_datasource.md §Testing).
+  # Auth disabled (any credentials work), state is in-memory only. Enable on
+  # local k3d / CI overlays; seed fixtures with scripts/seed_greenmail.py.
+  greenmail:
+    enabled: false
+    # Pin a concrete version — test assertions depend on server behavior
+    # (folder semantics, REST API), so don't track :latest.
+    image: docker.io/greenmail/standalone:2.1.11
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
 
 # =============================================================================
 # Reloader (watches ConfigMap/Secret changes and triggers rolling restarts)
@@ -897,8 +2584,8 @@ llm:
   # are admin-curated catalog rows now (system_api_keys + llm_endpoints
   # tables, plus default-model pins via Admin → Providers → Defaults).
   # The orchestrator resolves them at runtime through the model registry.
-  # See docs/features/db_backed_llm_config.md and
-  # docs/features/models_yaml_removal.md for the migration rationale.
+  # See knowledge-base/knowledge/features/db_backed_llm_config.md and
+  # knowledge-base/knowledge/features/models_yaml_removal.md for the migration rationale.
   #
   # Removed in chunk 7 of models_yaml_removal:
   #   visionModel, embeddingModel, embeddingBaseUrl, codexBaseUrl,
@@ -906,12 +2593,29 @@ llm:
   # Pin replacement defaults via Admin → Models → Defaults.
   keyCooldownSeconds: "3600"
 
+  # Codex raw-response diagnostic. When "1"/"true", the codex lane dumps each
+  # non-streaming /v1/responses request+response pair (incl. the raw usage
+  # block) to codexRawDumpDir on the pod running the LLM call — used to confirm
+  # whether the CLIProxyAPI proxy forwards input_tokens_details.cached_tokens.
+  # Default off (verbose + disk); flip in values-local.yaml for k3d testing,
+  # then start a FRESH session so a new agent pod inherits the ConfigMap value.
+  # See knowledge-base/knowledge/issues/codex_cached_tokens_not_metered.md.
+  debugCodexRawResponse: "0"
+  codexRawDumpDir: "/app/logs/codex-raw"
+
   # ---------------------------------------------------------------------------
   # One-shot seed for system-scoped provider keys and LLM endpoints. Applied
   # by a post-install / post-upgrade Job. Insert-only: existing rows in
   # system_api_keys and llm_endpoints (user_id IS NULL) are NEVER
   # overwritten, so admin-UI edits survive `helm upgrade`. Leave enabled:false
   # to bring the stack up empty and configure providers via Admin → Providers.
+  #
+  # The Job is a post-upgrade hook that waits on the orchestrator's health
+  # endpoint, so it also renders only while `orchestrator.replicas` is above
+  # zero — a cutover that quiesces the orchestrator carries no hook and cannot
+  # wedge the release. Setting enabled:false is the explicit form of the same
+  # thing; the seeder is insert-only, so turning it off for a window and back
+  # on afterwards seeds nothing twice.
   # ---------------------------------------------------------------------------
   seed:
     # -- Enable the seed Job. Missing/false leaves system tables untouched.
@@ -1019,13 +2723,12 @@ llm:
 # =============================================================================
 # Citation Engine
 # =============================================================================
-# NOTE: `llmUrl` / `llmModel` / `reasoningLevel` moved to the DB-backed LLM
-# config. The orchestrator passes resolved values through job
-# `config_override` at dispatch; the agent no longer reads CITATION_LLM_MODEL
-# / CITATION_LLM_URL from env. Embedding model/URL stay here for now.
-citation:
-  embeddingModel: "qwen3-embedding-8b"
-  embeddingUrl: ""
+# The citation engine is a native SRW subsystem: it uses the agent's shared
+# vector store (VECTOR_POSTGRES_*) for storage and SRW's EMBEDDING_* service
+# for embeddings — no separate citation DB, role, or embedding config.
+# `llmUrl` / `llmModel` / `reasoningLevel` for the verifier are passed via job
+# `config_override` at dispatch (default set in Admin → Models). See
+# knowledge-history/done/citation_engine_integration.md.
 
 # =============================================================================
 # Email / Notifications
@@ -1061,6 +2764,98 @@ s3:
   region: "us-east-1"
   snapshotMaxSizeGb: "10"
   snapshotRetentionDays: "90"
+  # Fail-closed policy (opt-in). Default false = the orchestrator logs one loud
+  # startup warning if either object-store seam is unconfigured, then runs
+  # degraded. Set true and the orchestrator REFUSES to start (pod crash-loops)
+  # unless BOTH seams have a durable store: snapshots (s3.endpoint) AND the
+  # virtual tier (virtualWorkspace.rclone.type=s3, or the bundled garage.enabled).
+  required: false
+
+# =============================================================================
+# Bundled object store (Garage) — NOT FOR PRODUCTION
+# =============================================================================
+# Single-node Garage S3 for self-host installs with no external object store.
+# When enabled AND the matching external endpoint is unset, the chart auto-wires
+# this store into snapshots (S3_ENDPOINT/s3.bucket) and the virtual workspace
+# tier (VIRTUAL_WORKSPACE_*). Single replica, PVC-bound, NO replication/erasure
+# — external S3 (s3.endpoint, virtualWorkspace.s3.endpoint) remains the
+# recommended production path and always overrides this store when set.
+# NOTE: the bundled store's S3 region is fixed at us-east-1 — keep s3.region and
+# virtualWorkspace.s3.region at their us-east-1 defaults when using it; a region
+# override would cause sigv4 signature mismatches against the store.
+garage:
+  # null = AUTO (default): run the bundled store unless you brought your own by
+  # setting `s3.endpoint`. Set `true` to force it on alongside an external
+  # endpoint, or `false` to run with no object store at all.
+  #
+  # Auto rather than a plain `false` default because every consumer degrades
+  # SILENTLY without a store: canvas presentations stop surviving their
+  # workspace (knowledge-base/knowledge/features/canvas_durable_presentation.md), workspace
+  # snapshots never capture, and the virtual tier stays unwired. An operator who
+  # configures nothing should get a store that works, not a deployment that
+  # looks healthy and quietly forgets things.
+  enabled: null
+  image: dxflrs/garage:v1.0.1        # pinned; admin API is "v1" for this tag
+  replicas: 1                         # informational only — the StatefulSet fixes replicas to 1 (not tunable)
+  storageClass: ""
+  dataStorageSize: "20Gi"             # one PVC backs meta + data + both buckets
+  # Single-node layout capacity advertised to Garage, in BYTES. Keep strictly
+  # BELOW dataStorageSize — meta + data share the one PVC, so advertising the
+  # full PVC size risks a disk-full store under load.
+  capacityBytes: 17179869184          # 16 GiB (headroom under the 20Gi PVC)
+  buckets:
+    # Snapshot bucket reuses s3.bucket (single source of truth). Only the
+    # virtual-tier workspace bucket is named here.
+    workspaces: "srw-workspaces"
+  bootstrap:
+    # Shell+curl image for the admin-API bootstrap Job (garage image is
+    # shell-less). Must have /bin/sh + curl; no runtime package installs.
+    image: curlimages/curl:8.11.0
+    resources:
+      requests: { memory: "32Mi", cpu: "10m" }
+      limits:   { memory: "128Mi", cpu: "200m" }
+  resources:
+    requests: { memory: "256Mi", cpu: "100m" }
+    limits:   { memory: "1Gi",   cpu: "1000m" }
+
+# =============================================================================
+# Virtual workspace tier (no_workspace_agent_mode.md §4/§5)
+# =============================================================================
+# Object store backing `workspace.backend: virtual` agents — file tools over
+# explicit rclone ops, no workspace pod, no PVC. The orchestrator injects this
+# as the agent's mount spec at dispatch/attach; per-job files land under
+# jobs/<id>/, sessions under threads/<id>/. Credentials travel in-flight only
+# (never persisted to the job/thread row) and reach rclone as RCLONE_CONFIG_*
+# env in the agent — never argv.
+#
+# Local-dev story (resolves the §13 open question):
+#   * dev / k3d  → type "memory": a non-durable, in-process store. A `virtual`
+#     job/session runs as a single pod and round-trips files within the agent's
+#     lifetime, with NO MinIO dependency. Not durable — files vanish on pod
+#     restart; fine for smoke tests, never a real target.
+#   * production → type "s3" against the existing MinIO (e.g. minio.minio.svc),
+#     with credentials in the bundled Secret keys VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID
+#     / VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY (secrets.values for chart-managed
+#     secrets, or ESO/Vault); endpoint/region/provider via virtualWorkspace.s3.*.
+#
+# Empty `rclone.type` disables the tier: a `virtual` job/session then fails fast
+# with an actionable error (use `none`, `sandbox`, or `vm` instead).
+virtualWorkspace:
+  rclone:
+    # rclone backend type: "s3" | "memory" | "" (disabled). "memory" is a
+    # non-durable in-process dev store (no credentials, no MinIO).
+    type: ""
+    # Bucket or bucket/subpath, e.g. "srw-workspaces". Empty for type "memory".
+    root: ""
+  # S3 connection (type: s3) — non-secret parts. The agent's scoped key is
+  # bucket-only; rclone is told not to create the (pre-provisioned) bucket.
+  # Credentials are the Secret keys VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID /
+  # VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY (secrets.values for chart-managed,
+  # or ESO/Vault). Mirrors the discrete snapshot S3 wiring (SNAPSHOT_S3_*).
+  s3:
+    endpoint: ""          # e.g. "http://minio.minio.svc:9000"
+    region: "us-east-1"
+    provider: "Minio"     # rclone S3 provider quirk-profile
 
 # =============================================================================
 # IDE Sessions
@@ -1073,7 +2868,7 @@ ide:
 
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
-# (docs/features/direct_session_websockets.md)
+# (knowledge-base/knowledge/features/direct_session_websockets.md)
 # -----------------------------------------------------------------------------
 sessionRouter:
   # Tier-1 ingress controller — tested in CI + dev cluster.
@@ -1162,31 +2957,38 @@ nats:
       memory: "512Mi"
 
 # =============================================================================
-# VM Controller (optional, same-cluster KubeVirt)
+# VM workspaces
 # =============================================================================
-# Co-locates the VM Controller in the orchestrator's cluster so VMs can be
-# created without standing up a second Kubernetes cluster + NATS.
+vm:
+  # -- VM topology: off | same-cluster | external.
+  mode: "off"
+  # -- Shared lifecycle HMAC Secret read by the orchestrator and, in
+  # same-cluster mode, by the VM controller.
+  lifecycleAuthSecretName: ""
+  lifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
+  preflight:
+    # -- Fail install/upgrade from a hook Job when KubeVirt/CDI CRDs are absent.
+    enabled: true
+    # -- Also require CRD API versions while rendering. Keep false for Fleet
+    # controller and plain `helm template` compatibility.
+    renderTime: false
+
+# =============================================================================
+# VM Controller (same-cluster KubeVirt)
+# =============================================================================
 #
 # Prerequisites the chart does NOT install (operator must do this first):
 #   - KubeVirt operator + KubeVirt CR (cluster-scoped)
 #   - CDI operator (DataVolume support — used by the VM template)
 #   - Nodes with hardware virtualization (vmx/svm) and KubeVirt feature gates
 #
-# Trade-offs vs. the cross-cluster (NATS) path:
-#   - Blast radius is namespace-scoped instead of cluster-scoped (weaker isolation)
-#   - HTTP transport carries lifecycle (create/delete/query) only. In-VM daemon
-#     events (register, heartbeat, freeze, resume) still need NATS — set
-#     vmController.transport=both and configure nats.url if you need them.
 vmController:
-  # -- Deploy the VM controller into the same cluster as the orchestrator.
+  # -- DEPRECATED one-release alias. true resolves vm.mode=off to same-cluster.
   enabled: false
-  # -- Transport: "http" (no NATS, lifecycle only) | "nats" (cross-cluster,
-  # full feature set) | "both" (HTTP for lifecycle + NATS for daemon events).
+  # -- DEPRECATED one-release alias. Same-cluster transport is always HTTP.
   transport: http
-  # -- Namespace for the controller and VMs. Defaults to the release namespace
-  # when empty. A dedicated namespace is recommended so the controller's RBAC
-  # (kubevirt.io verbs) stays scoped away from the orchestrator's namespace.
-  namespace: agent-vms
+  # -- Must be empty in same-cluster mode; controller and VMs use the release namespace.
+  namespace: ""
   image:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller
     tag: latest
@@ -1197,22 +2999,47 @@ vmController:
   # When empty, defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<Chart.AppVersion>
   # so the VM base tracks the chart release. Set explicitly to pin a specific tag.
   defaultVmImage: ""
-  defaultCpu: 2
-  defaultMemory: 4Gi
+  # -- Per-VM size. Workspace
+  # *containers* (sandbox tier) are sized separately and are NOT affected.
+  defaultCpu: 4
+  defaultMemory: 8Gi
+  # -- Zero disables the controller-side live-VM capacity gate.
+  maxConcurrentVms: 4
+  # -- Placement copied into each VMI template.
+  nodeSelector: {}
+  tolerations: []
+  # -- NetworkPolicy tier stamped on each VMI/launcher pod.
+  defaultNetworkTier: internet-only
   # -- CDI DataVolume storage class + size for the VM root disk.
   vmStorageClass: local-path
   vmDiskSize: 20Gi
-  # -- SSH public key injected into the VM's authorized_keys (cloud-init).
-  # The matching private key lives in the chart's vm-ssh-key secret and is
-  # mounted into orchestrator/agent pods. Required for HTTP/lifecycle mode
-  # since there's no external Headscale to dial — agents SSH directly to the
-  # VM's pod IP.
-  vmSshPublicKey: ""
-  headscale:
-    # -- Existing Secret with a Headscale API key. Empty disables the mesh.
-    apiKeySecretName: ""
-    apiKeySecretKey: api-key
-    user: srw
+  # -- Golden-image boot acceleration
+  # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md). Import the base image
+  # once into a shared golden PVC per digest; clone each VM root disk from it
+  # (host-assisted local copy on local-path) instead of a per-VM registry
+  # import. Off = byte-for-byte the current registry-per-VM behaviour.
+  goldenImage:
+    enabled: false
+    # Golden PVC size; empty → vmDiskSize (keeps the clone target >= source).
+    diskSize: ""
+    gc:
+      enabled: true
+      keep: 3            # keep the N newest image digests
+      minAgeMinutes: 30  # don't GC a golden younger than this
+  # -- Persistent VM rootdisks, shared by same-cluster and external modes
+  # (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
+  # Create each VM's root disk as a standalone DataVolume instead of via
+  # spec.dataVolumeTemplates, so it is not cascade-deleted with the VM. A
+  # recreate reattaches it by name: files survive a crash or a suspend, and the
+  # clone is skipped entirely. Off = today's templated (VM-owned) disk.
+  persistentRootdisk:
+    enabled: false
+    # Orphan backstop for disks whose entity row the orchestrator no longer
+    # knows (a DB reset). OFF by default: the controller has no DB, so it
+    # cannot tell a leaked disk from a long-suspended session's workspace.
+    gc:
+      enabled: false
+      orphanHours: 72
   resources:
     requests:
       memory: "64Mi"
@@ -1225,3 +3052,6 @@ vmController:
 # Logging
 # =============================================================================
 logLevel: "DEBUG"
+# Log output format: "json" (structured, for the Alloy -> Loki pipeline) or
+# "text" (human-readable). See knowledge-base/knowledge/features/centralized_logging.md.
+logFormat: "json"

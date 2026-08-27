@@ -41,43 +41,37 @@ class TestResolveFromDB:
         assert await message_triage._resolve_triage_config(db) is None
 
     @pytest.mark.asyncio
-    async def test_uses_registry_base_url_when_resolved(self, monkeypatch):
-        from src.core.model_registry import ModelMeta, register_system_lookup
-
-        async def fake_lookup(model_id, capability="chat"):
-            return {
-                "endpoint_id": "ep-1",
-                "base_url": "http://vllm.svc/v1",
-                "model_id": model_id,
-                "display_name": "Gemma",
-                "family": "gemma",
-                "context_window": 128000,
-                "reasoning_level": None,
-            }
-
-        register_system_lookup(fake_lookup)
-        try:
-            db = SimpleNamespace(
-                get_default_llm_model=AsyncMock(
-                    return_value="RedHatAI/gemma-4-31B-it-FP8-Dynamic"
-                ),
-                get_system_api_key=AsyncMock(return_value="sk-sys"),
-            )
-            model, base_url, api_key = await message_triage._resolve_triage_config(db)
-            assert base_url == "http://vllm.svc/v1"
-            assert api_key == "sk-sys"
-            assert model == "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
-        finally:
-            register_system_lookup(None)
-
-        # Silence unused import
-        _ = ModelMeta
+    async def test_uses_catalog_base_url_when_resolved(self):
+        db = SimpleNamespace(
+            get_default_llm_model=AsyncMock(
+                return_value="RedHatAI/gemma-4-31B-it-FP8-Dynamic"
+            ),
+            get_system_api_key=AsyncMock(return_value="sk-sys"),
+            list_models=AsyncMock(
+                return_value=[
+                    {
+                        "model_id": "RedHatAI/gemma-4-31B-it-FP8-Dynamic",
+                        "provider_kind": "endpoint",
+                        "provider_ref": "ep-1",
+                    }
+                ]
+            ),
+            get_system_llm_endpoint=AsyncMock(
+                return_value={"base_url": "http://vllm.svc/v1"}
+            ),
+        )
+        model, base_url, api_key = await message_triage._resolve_triage_config(db)
+        assert base_url == "http://vllm.svc/v1"
+        assert api_key == "sk-sys"
+        assert model == "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
 
     @pytest.mark.asyncio
     async def test_falls_back_to_openai_when_registry_misses(self):
         db = SimpleNamespace(
             get_default_llm_model=AsyncMock(return_value="gpt-4o"),
             get_system_api_key=AsyncMock(return_value="sk-sys"),
+            list_models=AsyncMock(return_value=[]),
+            get_system_llm_endpoint=AsyncMock(return_value=None),
         )
         model, base_url, api_key = await message_triage._resolve_triage_config(db)
         assert model == "gpt-4o"
@@ -96,9 +90,28 @@ class TestResolveFromDB:
         db = SimpleNamespace(
             get_default_llm_model=AsyncMock(return_value="claude-opus-4-6"),
             get_system_api_key=AsyncMock(side_effect=capture),
+            list_models=AsyncMock(return_value=[]),
+            get_system_llm_endpoint=AsyncMock(return_value=None),
         )
         await message_triage._resolve_triage_config(db)
         assert seen == ["anthropic"]
+
+
+class TestStructuredRecovery:
+    def test_recover_structured_json_fences(self):
+        payload = message_triage._recover_structured_json(
+            '```json\n{"action":"interrupt","reason":"urgent"}\n```'
+        )
+        assert payload == {"action": "interrupt", "reason": "urgent"}
+
+    def test_recover_structured_json_with_think_prefix(self):
+        payload = message_triage._recover_structured_json(
+            '<think>internal</think>{"action":"queue","reason":"ok"}'
+        )
+        assert payload == {"action": "queue", "reason": "ok"}
+
+    def test_recover_structured_json_invalid_falls_back(self):
+        assert message_triage._recover_structured_json("not json") is None
 
 
 class TestInferProvider:

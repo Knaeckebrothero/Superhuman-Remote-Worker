@@ -1,13 +1,13 @@
 """G2 — multi-tenancy gates on the projects family.
 
-Covers 9 reads + 6 mutations under ``/api/projects`` and
+Covers 9 reads + 5 mutations under ``/api/projects`` and
 ``/api/projects/{id}/...``:
 
 Reads (gate: ``require_project_member`` at viewer):
     GET    /api/projects                          (list_projects)
     GET    /api/projects/{id}                     (get_project)
     GET    /api/projects/{id}/members
-    GET    /api/projects/{id}/contacts
+    GET    /api/projects/{id}/contacts             (routers/contacts.py)
     GET    /api/projects/{id}/memory/stats
     GET    /api/projects/{id}/experts
     GET    /api/projects/{id}/experts/{name}
@@ -15,8 +15,7 @@ Reads (gate: ``require_project_member`` at viewer):
     GET    /api/projects/{id}/jobs
 
 Mutations:
-    POST   /api/projects/{id}/contacts            (editor)
-    DELETE /api/projects/{id}/contacts/{id}       (editor)
+    POST   /api/projects/{id}/contacts            (editor, routers/contacts.py)
     POST   /api/projects/{id}/repositories        (owner)
     PATCH  /api/projects/{id}/repositories/{id}   (owner)
     DELETE /api/projects/{id}/repositories/{id}   (owner)
@@ -104,7 +103,9 @@ class TestListProjects:
         with _patch_caller_and_db(user_a, fake_db):
             result = await list_projects(fake_request, user_id=None)
 
-        fake_db.get_projects_for_user.assert_awaited_with(str(user_a["id"]))
+        fake_db.get_projects_for_user.assert_awaited_with(
+            str(user_a["id"]), statuses=["active"]
+        )
         assert len(result) == 1  # user_a is owner of project_a only
 
     @pytest.mark.asyncio
@@ -149,7 +150,9 @@ class TestListProjects:
 
         with _patch_caller_and_db(user_admin, fake_db):
             await list_projects(fake_request, user_id=str(user_a["id"]))
-        fake_db.get_projects_for_user.assert_awaited_with(str(user_a["id"]))
+        fake_db.get_projects_for_user.assert_awaited_with(
+            str(user_a["id"]), statuses=["active"]
+        )
 
     @pytest.mark.asyncio
     async def test_mcp_project_scope_narrows_admin(
@@ -304,15 +307,21 @@ class TestProjectReadGates:
     async def test_list_contacts_blocked_cross_user(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import list_external_contacts
+        from routers.contacts import get_project_contacts
 
-        fake_db.get_external_contacts = AsyncMock(
-            side_effect=AssertionError("get_external_contacts called past the gate")
+        gate = AsyncMock(side_effect=HTTPException(status_code=403, detail="denied"))
+        fake_db.get_project_contacts = AsyncMock(
+            side_effect=AssertionError("get_project_contacts called past the gate")
         )
-        with _patch_caller_and_db(user_b, fake_db):
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("routers.contacts.require_project_member", gate),
+            patch("routers.contacts._get_db", lambda: fake_db),
+        ):
             with pytest.raises(HTTPException) as exc:
-                await list_external_contacts(fake_request, str(project_a["id"]))
+                await get_project_contacts(fake_request, str(project_a["id"]))
         assert exc.value.status_code == 403
+        gate.assert_awaited_once_with(fake_request, fake_db, str(project_a["id"]))
 
     @pytest.mark.asyncio
     async def test_memory_stats_blocked_cross_user(
@@ -431,70 +440,58 @@ class TestProjectMutationRoles:
     async def test_add_contact_viewer_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import ExternalContactCreate, add_external_contact
+        from routers.contacts import ContactCreate, add_project_contact
 
-        _set_role(fake_db, project_a["id"], user_b["id"], "viewer")
-        fake_db.add_external_contact = AsyncMock(
-            side_effect=AssertionError("add_external_contact called past the gate")
+        gate = AsyncMock(
+            side_effect=HTTPException(
+                status_code=403, detail="Project role 'editor' or higher required"
+            )
         )
-        body = ExternalContactCreate(display_name="X", email="x@example.test")
-        with _patch_caller_and_db(user_b, fake_db):
+        fake_db.create_contact = AsyncMock(
+            side_effect=AssertionError("create_contact called past the gate")
+        )
+        body = ContactCreate(display_name="X", addresses=[])
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("routers.contacts.require_project_member", gate),
+            patch("routers.contacts._get_db", lambda: fake_db),
+        ):
             with pytest.raises(HTTPException) as exc:
-                await add_external_contact(str(project_a["id"]), body, fake_request)
+                await add_project_contact(fake_request, str(project_a["id"]), body)
         assert exc.value.status_code == 403
+        gate.assert_awaited_once_with(
+            fake_request,
+            fake_db,
+            str(project_a["id"]),
+            min_role="editor",
+            allow_archived=False,
+        )
 
     @pytest.mark.asyncio
     async def test_add_contact_editor_passes(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import ExternalContactCreate, add_external_contact
+        from routers.contacts import ContactCreate, add_project_contact
 
-        _set_role(fake_db, project_a["id"], user_b["id"], "editor")
-        fake_db.add_external_contact = AsyncMock(
-            return_value={
-                "id": "00000000-0000-0000-0000-000000000abc",
-                "display_name": "X",
-                "email": "x@example.test",
-                "created_at": None,
-            }
+        gate = AsyncMock(return_value=(user_b, project_a))
+        fake_db.list_contacts_for_user = AsyncMock(return_value=[])
+        fake_db.create_contact = AsyncMock(return_value={"id": "new-contact"})
+        fake_db.add_contact_address = AsyncMock(return_value={"id": "addr-1"})
+        fake_db.get_contact = AsyncMock(
+            return_value={"id": "new-contact", "display_name": "X", "addresses": []}
         )
-        body = ExternalContactCreate(display_name="X", email="x@example.test")
-        with _patch_caller_and_db(user_b, fake_db):
-            result = await add_external_contact(
-                str(project_a["id"]), body, fake_request
-            )
-        assert result["status"] == "created"
-
-    @pytest.mark.asyncio
-    async def test_delete_contact_viewer_403(
-        self, user_b, project_a, fake_db, fake_request
-    ):
-        from main import delete_external_contact
-
-        _set_role(fake_db, project_a["id"], user_b["id"], "viewer")
-        fake_db.delete_external_contact = AsyncMock(
-            side_effect=AssertionError("delete_external_contact called past the gate")
+        fake_db.link_contact_to_project = AsyncMock(return_value=True)
+        body = ContactCreate(display_name="X", addresses=[])
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("routers.contacts.require_project_member", gate),
+            patch("routers.contacts._get_db", lambda: fake_db),
+        ):
+            result = await add_project_contact(fake_request, str(project_a["id"]), body)
+        assert result["contact"]["id"] == "new-contact"
+        fake_db.link_contact_to_project.assert_awaited_once_with(
+            str(project_a["id"]), "new-contact", user_b["id"]
         )
-        with _patch_caller_and_db(user_b, fake_db):
-            with pytest.raises(HTTPException) as exc:
-                await delete_external_contact(
-                    fake_request, str(project_a["id"]), "any-contact-id"
-                )
-        assert exc.value.status_code == 403
-
-    @pytest.mark.asyncio
-    async def test_delete_contact_editor_passes(
-        self, user_b, project_a, fake_db, fake_request
-    ):
-        from main import delete_external_contact
-
-        _set_role(fake_db, project_a["id"], user_b["id"], "editor")
-        fake_db.delete_external_contact = AsyncMock(return_value=True)
-        with _patch_caller_and_db(user_b, fake_db):
-            result = await delete_external_contact(
-                fake_request, str(project_a["id"]), "any-contact-id"
-            )
-        assert result["status"] == "deleted"
 
     @pytest.mark.asyncio
     async def test_add_repository_editor_403(
@@ -546,6 +543,57 @@ class TestProjectMutationRoles:
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
+    async def test_managed_repository_read_only_patch_rotates_before_row_update(
+        self, user_a, project_a, fake_db, fake_request
+    ):
+        from main import ProjectRepositoryUpdate, update_project_repository
+
+        repository = {
+            "id": "repo-id",
+            "project_id": project_a["id"],
+            "name": "project-source",
+            "role": "source",
+            "read_only": False,
+            "is_managed": True,
+        }
+        fake_db.get_project_repository = AsyncMock(return_value=repository)
+        fake_db.update_project_repository = AsyncMock(return_value=True)
+        events: list[str] = []
+
+        async def rotate(*_args, **kwargs):
+            events.append("rotate")
+            assert "force" not in kwargs
+            assert _args[2]["read_only"] is True
+            return {"access_mode": "read"}
+
+        async def update(*_args, **_kwargs):
+            assert events == ["rotate"]
+            events.append("update")
+            return True
+
+        fake_db.update_project_repository.side_effect = update
+        with (
+            _patch_caller_and_db(user_a, fake_db),
+            patch(
+                "main.rotate_project_repository_authority",
+                AsyncMock(side_effect=rotate),
+            ) as rotation,
+        ):
+            result = await update_project_repository(
+                fake_request,
+                str(project_a["id"]),
+                "repo-id",
+                ProjectRepositoryUpdate(read_only=True),
+            )
+
+        assert result == {"status": "updated"}
+        assert events == ["rotate", "update"]
+        rotation.assert_awaited_once()
+        fake_db.update_project_repository.assert_awaited_once_with(
+            "repo-id", read_only=True
+        )
+
+    @pytest.mark.asyncio
     async def test_remove_repository_editor_403(
         self, user_b, project_a, fake_db, fake_request
     ):
@@ -569,7 +617,13 @@ class TestProjectMutationRoles:
         from main import remove_project_repository
 
         fake_db.get_project_repository = AsyncMock(
-            return_value={"id": "r", "role": "doc", "is_managed": False, "name": "r"}
+            return_value={
+                "id": "r",
+                "project_id": project_a["id"],
+                "role": "doc",
+                "is_managed": False,
+                "name": "r",
+            }
         )
         fake_db.remove_project_repository = AsyncMock(
             return_value={"is_managed": False, "name": "r"}
@@ -617,3 +671,429 @@ class TestProjectMutationRoles:
             result = await create_project_job(fake_request, str(project_a["id"]), body)
         assert result == {"id": "new-job"}
         assert body.project_id == str(project_a["id"])
+
+
+# =============================================================================
+# Archived projects — server-side lifecycle
+# =============================================================================
+#
+# knowledge-base/knowledge/features/project_and_job_list_filtering.md §4.2,
+# §4.3a, §4.5. The guard-flag unit behaviour lives in
+# tests/test_security_access.py; the five internal creation seams live in
+# tests/test_archived_projects_refuse_new_work.py. This section is the
+# per-endpoint matrix.
+
+
+@pytest.fixture
+def archived_project(project_b):
+    """``project_b`` archived — user_b owns it, user_a is not a member."""
+    project_b["status"] = "archived"
+    return project_b
+
+
+class TestListProjectsStatusFilter:
+    @pytest.mark.asyncio
+    async def test_default_excludes_archived(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        from main import list_projects
+
+        with _patch_caller_and_db(user_b, fake_db):
+            result = await list_projects(fake_request, user_id=None)
+
+        # user_b owns exactly one project, and it is archived.
+        assert result == []
+        assert fake_db.get_projects_for_user.await_args.kwargs["statuses"] == ["active"]
+
+    @pytest.mark.asyncio
+    async def test_status_archived_returns_the_archive(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        from main import list_projects
+
+        with _patch_caller_and_db(user_b, fake_db):
+            result = await list_projects(
+                fake_request, user_id=None, status=["archived"]
+            )
+
+        assert [p["id"] for p in result] == [archived_project["id"]]
+
+    @pytest.mark.asyncio
+    async def test_both_statuses_return_everything(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        from main import list_projects
+
+        with _patch_caller_and_db(user_b, fake_db):
+            result = await list_projects(
+                fake_request, user_id=None, status=["active", "archived"]
+            )
+
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_null_status_project_stays_visible(
+        self, user_b, project_b, fake_db, fake_request
+    ):
+        """Fail toward showing (§4.2): the column is nullable and the CHECK
+        passes on NULL, so a NULL row must behave as active rather than
+        vanishing from every listing."""
+        from main import list_projects
+
+        project_b["status"] = None
+        with _patch_caller_and_db(user_b, fake_db):
+            result = await list_projects(fake_request, user_id=None)
+
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_admin_branch_binds_the_statuses_and_drops_the_dead_filter(
+        self, user_admin, project_a, project_b, fake_db, fake_request
+    ):
+        from main import list_projects
+
+        ctx = _patch_admin_list_fetch([project_a, project_b])
+        fake_db.acquire = MagicMock(return_value=ctx)
+        with _patch_caller_and_db(user_admin, fake_db):
+            await list_projects(fake_request, user_id=None, status=["archived"])
+
+        conn = await ctx.__aenter__()
+        sql, statuses = conn.fetch.await_args.args
+        assert statuses == ["archived"]
+        # `status != 'deleted'` was dead code: valid_project_status has no
+        # such value, so it never excluded a single row.
+        assert "deleted" not in sql
+        assert "COALESCE(status, 'active')" in sql
+
+
+class TestUpdateProjectOnAnArchivedProject:
+    """§4.3a — status-only while archived, and never a partial apply."""
+
+    def _patched(self, user, db, project):
+        stack = _patch_caller_and_db(user, db)
+        stack.enter_context(
+            patch(
+                "main.require_project_owner",
+                AsyncMock(return_value=(user, project)),
+            )
+        )
+        return stack
+
+    @pytest.mark.asyncio
+    async def test_unarchive_is_allowed(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        from main import ProjectUpdate, update_project
+
+        fake_db.update_project = AsyncMock(return_value=True)
+        with self._patched(user_b, fake_db, archived_project):
+            result = await update_project(
+                str(archived_project["id"]),
+                ProjectUpdate(status="active"),
+                fake_request,
+            )
+
+        assert result["status"] == "updated"
+        assert fake_db.update_project.await_args.kwargs == {"status": "active"}
+        # Unarchive does NOT auto-resume the children it quiesced.
+        fake_db.update_project_loop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_renaming_an_archived_project_is_refused(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        from main import ProjectUpdate, update_project
+
+        fake_db.update_project = AsyncMock(return_value=True)
+        with self._patched(user_b, fake_db, archived_project):
+            with pytest.raises(HTTPException) as exc:
+                await update_project(
+                    str(archived_project["id"]),
+                    ProjectUpdate(name="renamed"),
+                    fake_request,
+                )
+
+        assert exc.value.status_code == 409
+        fake_db.update_project.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_status_plus_another_field_applies_neither(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        """The worst outcome is a half-applied PATCH: the caller has no way
+        to tell which half landed."""
+        from main import ProjectUpdate, update_project
+
+        fake_db.update_project = AsyncMock(return_value=True)
+        with self._patched(user_b, fake_db, archived_project):
+            with pytest.raises(HTTPException) as exc:
+                await update_project(
+                    str(archived_project["id"]),
+                    ProjectUpdate(status="active", name="renamed"),
+                    fake_request,
+                )
+
+        assert exc.value.status_code == 409
+        fake_db.update_project.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_active_project_still_takes_any_field(
+        self, user_b, project_b, fake_db, fake_request
+    ):
+        from main import ProjectUpdate, update_project
+
+        fake_db.update_project = AsyncMock(return_value=True)
+        with self._patched(user_b, fake_db, project_b):
+            result = await update_project(
+                str(project_b["id"]), ProjectUpdate(name="renamed"), fake_request
+            )
+
+        assert result == {"status": "updated"}
+        assert fake_db.update_project.await_args.kwargs == {"name": "renamed"}
+
+    @pytest.mark.asyncio
+    async def test_default_config_override_is_locked_while_archived(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        """This layer is merged under EVERY job in the project — leaving it
+        editable would stop "archived" meaning read-only."""
+        from main import ProjectUpdate, update_project
+
+        fake_db.update_project = AsyncMock(return_value=True)
+        with self._patched(user_b, fake_db, archived_project):
+            with pytest.raises(HTTPException) as exc:
+                await update_project(
+                    str(archived_project["id"]),
+                    ProjectUpdate(default_config_override={"memory": {"x": True}}),
+                    fake_request,
+                )
+
+        assert exc.value.status_code == 409
+        fake_db.update_project.assert_not_awaited()
+
+
+class TestArchivingQuiescesChildren:
+    """§4.5 — quiesce, never refuse; then report what happened."""
+
+    def _patched(self, user, db, project):
+        stack = _patch_caller_and_db(user, db)
+        stack.enter_context(
+            patch(
+                "main.require_project_owner",
+                AsyncMock(return_value=(user, project)),
+            )
+        )
+        return stack
+
+    @pytest.mark.asyncio
+    async def test_archiving_pauses_the_loop_holds_the_officer_and_parks_jobs(
+        self, user_b, project_b, fake_db, fake_request
+    ):
+        from main import ProjectUpdate, update_project
+
+        loop_id = "1111aaaa-1111-4111-8111-111111111111"
+        officer_id = "2222bbbb-2222-4222-8222-222222222222"
+        fake_db.update_project = AsyncMock(return_value=True)
+        fake_db.get_active_project_loop = AsyncMock(
+            return_value={"id": loop_id, "status": "running"}
+        )
+        fake_db.get_officer_thread_for_project = AsyncMock(
+            return_value={"id": officer_id, "metadata": {}}
+        )
+        fake_db.park_project_jobs_for_archive = AsyncMock(return_value=3)
+
+        with self._patched(user_b, fake_db, project_b):
+            result = await update_project(
+                str(project_b["id"]), ProjectUpdate(status="archived"), fake_request
+            )
+
+        assert result == {
+            "status": "updated",
+            "archived": True,
+            "loop_paused": True,
+            "officer_held": True,
+            "jobs_parked": 3,
+        }
+        fake_db.update_project_loop.assert_awaited_once_with(loop_id, status="paused")
+        hold = fake_db.set_project_officer_hold.await_args.kwargs["hold"]
+        assert hold["kind"] == "project_archived"
+        # The hold carries NO thread_id — that absence is what stops the
+        # watchdog's stale-hold self-heal from releasing it.
+        assert "thread_id" not in hold
+
+    @pytest.mark.asyncio
+    async def test_a_paused_loop_and_an_already_held_officer_are_left_alone(
+        self, user_b, project_b, fake_db, fake_request
+    ):
+        from main import ProjectUpdate, update_project
+
+        fake_db.update_project = AsyncMock(return_value=True)
+        fake_db.get_active_project_loop = AsyncMock(
+            return_value={"id": "l1", "status": "paused"}
+        )
+        fake_db.get_officer_thread_for_project = AsyncMock(
+            return_value={
+                "id": "o1",
+                "metadata": {"config_override": {"officer": {"hold": {"kind": "m"}}}},
+            }
+        )
+        fake_db.park_project_jobs_for_archive = AsyncMock(return_value=0)
+
+        with self._patched(user_b, fake_db, project_b):
+            result = await update_project(
+                str(project_b["id"]), ProjectUpdate(status="archived"), fake_request
+            )
+
+        assert result["loop_paused"] is False
+        assert result["officer_held"] is False
+        fake_db.update_project_loop.assert_not_awaited()
+        fake_db.set_project_officer_hold.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_child_never_refuses_the_archive(
+        self, user_b, project_b, fake_db, fake_request
+    ):
+        """Refusing makes archive un-completable exactly when you most want
+        it — when something is wedged and you want it to stop mattering."""
+        from main import ProjectUpdate, update_project
+
+        fake_db.update_project = AsyncMock(return_value=True)
+        fake_db.get_active_project_loop = AsyncMock(side_effect=RuntimeError("boom"))
+        fake_db.get_officer_thread_for_project = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        fake_db.park_project_jobs_for_archive = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+
+        with self._patched(user_b, fake_db, project_b):
+            result = await update_project(
+                str(project_b["id"]), ProjectUpdate(status="archived"), fake_request
+            )
+
+        assert result["archived"] is True
+        assert result["jobs_parked"] == 0
+
+    @pytest.mark.asyncio
+    async def test_re_archiving_does_not_re_hold_a_released_officer(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        """Only the transition INTO archived quiesces. A PATCH re-asserting
+        the current status must not undo a hold the owner released."""
+        from main import ProjectUpdate, update_project
+
+        fake_db.update_project = AsyncMock(return_value=True)
+
+        with self._patched(user_b, fake_db, archived_project):
+            result = await update_project(
+                str(archived_project["id"]),
+                ProjectUpdate(status="archived"),
+                fake_request,
+            )
+
+        assert result == {"status": "updated"}
+        fake_db.set_project_officer_hold.assert_not_awaited()
+
+
+class TestCreateProjectJobOnAnArchivedProject:
+    @pytest.mark.asyncio
+    async def test_editor_is_refused(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        from main import JobCreate, create_project_job
+
+        _set_role(fake_db, archived_project["id"], user_b["id"], "editor")
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch(
+                "main.create_job",
+                AsyncMock(
+                    side_effect=AssertionError("create_job called past the gate")
+                ),
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await create_project_job(
+                    fake_request,
+                    str(archived_project["id"]),
+                    JobCreate(description="x"),
+                )
+        assert exc.value.status_code == 409
+
+
+class TestArchivedProjectStaysReadableAndTearableDown:
+    """§4.3's other half — an archive you cannot open or empty is a trap.
+
+    Every ALLOW-listed endpoint rides the guards' ``allow_archived=True``
+    default; these pin that the default is what they actually get.
+    """
+
+    @pytest.mark.asyncio
+    async def test_listing_its_jobs_still_works(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        from main import list_project_jobs
+
+        fake_db.acquire = MagicMock(return_value=_patch_admin_list_fetch([]))
+        fake_db.get_project_members = AsyncMock(return_value=[])
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.audit_reader") as audit,
+        ):
+            audit.is_available = False
+            result = await list_project_jobs(fake_request, str(archived_project["id"]))
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_reading_its_members_still_works(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        from main import list_project_members
+
+        fake_db.get_project_members = AsyncMock(return_value=[{"user_id": "u"}])
+        with _patch_caller_and_db(user_b, fake_db):
+            result = await list_project_members(
+                fake_request, str(archived_project["id"])
+            )
+        assert result == [{"user_id": "u"}]
+
+    @pytest.mark.asyncio
+    async def test_detaching_a_repository_still_works(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        from main import remove_project_repository
+
+        fake_db.get_project_repository = AsyncMock(
+            return_value={
+                "id": "r",
+                "project_id": archived_project["id"],
+                "role": "doc",
+                "is_managed": False,
+                "name": "r",
+            }
+        )
+        fake_db.remove_project_repository = AsyncMock(
+            return_value={"is_managed": False, "name": "r"}
+        )
+        with _patch_caller_and_db(user_b, fake_db), patch("main.gitea_client") as gitea:
+            gitea.is_initialized = False
+            result = await remove_project_repository(
+                fake_request, str(archived_project["id"]), "repo-id"
+            )
+        assert result == {"status": "removed"}
+
+    @pytest.mark.asyncio
+    async def test_attaching_a_repository_is_refused(
+        self, user_b, archived_project, fake_db, fake_request
+    ):
+        """The mirror image, so the pair is unambiguous: detach yes, attach no."""
+        from main import ProjectRepositoryCreate, add_project_repository
+
+        with _patch_caller_and_db(user_b, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await add_project_repository(
+                    fake_request,
+                    str(archived_project["id"]),
+                    ProjectRepositoryCreate(name="new-repo"),
+                )
+        assert exc.value.status_code == 409

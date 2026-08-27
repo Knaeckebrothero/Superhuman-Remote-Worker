@@ -3,7 +3,7 @@ import {RouterLink} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
-import {AdminLlmCoordinatorService} from '../llm/admin-llm-coordinator.service';
+import {AdminModelsCoordinatorService} from '../models/admin-models-coordinator.service';
 import {
   ApiKeyProvider,
   CATALOG_CAPABILITIES,
@@ -30,6 +30,7 @@ const SYSTEM_PROVIDERS: {value: Exclude<ApiKeyProvider, 'codex'>; label: string}
   {value: 'google', label: 'Google'},
   {value: 'groq', label: 'Groq'},
   {value: 'openrouter', label: 'OpenRouter'},
+  {value: 'mistral', label: 'Mistral'},
   {value: 'vision', label: 'Vision'},
 ];
 
@@ -42,6 +43,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
   'google',
   'groq',
   'openrouter',
+  'mistral',
 ]);
 
 @Component({
@@ -144,6 +146,9 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                 />
               </app-form-field>
             </div>
+            @if (keyFormError()) {
+              <p class="form-error">{{ keyFormError() }}</p>
+            }
             <app-button
               variant="primary"
               size="md"
@@ -766,12 +771,79 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       letter-spacing: 0;
     }
     .link-button:hover { text-decoration: underline; }
+    @media (max-width: 720px) {
+      /* Provider API Keys table is a 6-column grid
+         (1.3fr 1fr 1fr 0.9fr 0.9fr 90px); at phone widths six columns squish
+         into ~318px (~40px each), truncating every field. Collapse each row
+         into a stacked card. Desktop (>720px) keeps the table grid. */
+      .key-header {
+        display: none;
+      }
+      .key-row {
+        grid-template-columns: 1fr;
+        gap: 4px;
+        padding: 12px 14px;
+      }
+      .key-row .col-provider {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .key-row .col-updated::before {
+        content: 'Updated: ';
+        color: var(--text-muted);
+      }
+      .key-row .col-action {
+        margin-top: 4px;
+      }
+      /* System Endpoint cards: the 4-button action row (Test / Discover /
+         Edit / Delete) runs Delete off the right edge. Stack the head so the
+         actions get their own full-width line and wrap. */
+      .endpoint-head {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .endpoint-actions {
+        flex-wrap: wrap;
+      }
+      /* Stack the cramped two-up form rows. */
+      .form-row.two-col {
+        flex-direction: column;
+      }
+      /* Discovery dialog rows: the 4-col grid (24px 1.6fr 0.8fr 1.6fr) crams
+         model-id + family + capability checkboxes into ~40-80px columns at
+         phone widths (id wraps to 3 lines, caps stack one-per-line). Re-flow to
+         a checkbox + stacked-content layout: id / family / capabilities each
+         span the full content width. The direct-child combinator keeps the
+         per-capability checkboxes (nested in .discovery-caps) untouched. */
+      .discovery-row {
+        grid-template-columns: 24px 1fr;
+        align-items: start;
+        gap: 4px 8px;
+        padding: 8px 0;
+      }
+      .discovery-row > app-checkbox {
+        grid-column: 1;
+        grid-row: 1;
+      }
+      .discovery-id {
+        grid-column: 2;
+        grid-row: 1;
+      }
+      .discovery-family {
+        grid-column: 2;
+        grid-row: 2;
+      }
+      .discovery-caps {
+        grid-column: 2;
+        grid-row: 3;
+      }
+    }
   `],
 })
 export class AdminProvidersComponent implements OnInit {
   readonly admin = inject(AdminProvidersService);
   readonly catalog = inject(AdminModelsService);
-  private readonly coordinator = inject(AdminLlmCoordinatorService);
+  private readonly coordinator = inject(AdminModelsCoordinatorService);
   private readonly transloco = inject(TranslocoService);
 
   readonly switchTab = output<'providers' | 'models'>();
@@ -784,6 +856,9 @@ export class AdminProvidersComponent implements OnInit {
   readonly keyValue = signal('');
   readonly keyLabel = signal('');
   readonly savingKey = signal(false);
+  // Surfaced when a key save fails — otherwise the form silently resets the
+  // spinner and looks like nothing happened (mirrors endpointFormError).
+  readonly keyFormError = signal<string>('');
 
   // Post-save discovery dialog. `discoveryProvider` is the provider whose
   // post-save async probe we're polling for; `discoveryPolling` flips off
@@ -863,6 +938,7 @@ export class AdminProvidersComponent implements OnInit {
     const provider = this.keyProvider();
     this.savingKey.set(true);
     this.discoveryError.set('');
+    this.keyFormError.set('');
     this.admin
       .setSystemApiKey(provider, {
         api_key: value,
@@ -880,7 +956,10 @@ export class AdminProvidersComponent implements OnInit {
             this.startDiscoveryPolling(provider);
           }
         },
-        error: () => this.savingKey.set(false),
+        error: (err) => {
+          this.keyFormError.set(err?.error?.detail ?? 'Failed to save key.');
+          this.savingKey.set(false);
+        },
       });
   }
 

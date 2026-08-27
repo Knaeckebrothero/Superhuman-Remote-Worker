@@ -1,6 +1,6 @@
 # Squawk linter config for orchestrator/database/migrations/**.sql.
 # Wired into CI by .github/workflows/db-migrations.yml; design rationale
-# and the rule list this complements live in docs/db_migration.md
+# and the rule list this complements live in knowledge-base/knowledge/db_migration.md
 # §Testing & CI.
 
 # Match the orchestrator's deployed Postgres version. Squawk uses this to
@@ -12,7 +12,21 @@ pg_version = "16.0"
 # and orthogonal to the lock-safety / breakage rules we actually care about.
 excluded_rules = [
     "prefer-bigint-over-int",
+    # Sibling of prefer-bigint-over-int above, same stylistic/noisy bucket:
+    # widening a deliberately tiny, CHECK-bounded column (e.g.
+    # knowledge_index.priority, a 0-2 rank) to 64 bits to satisfy this rule
+    # would be strictly worse, not safer.
+    "prefer-bigint-over-smallint",
     "prefer-text-field",
+    # Unsatisfiable for our runner model. `.notx.sql` migrations
+    # (CREATE/DROP INDEX CONCURRENTLY) must be a SINGLE statement: the runner
+    # sends each file as one simple-query, so a multi-statement file would put
+    # CONCURRENTLY inside an implicit transaction and fail. That makes it
+    # impossible to precede the op with `SET lock_timeout` / `SET
+    # statement_timeout` in-file. Timeout safety is instead a deploy-model
+    # concern (serialized, advisory-locked runner; moderate table sizes).
+    # Revisit if we ever alter hot, high-volume tables online.
+    "require-timeout-settings",
 ]
 
 # Files excluded from lint coverage. Two categories:
@@ -25,16 +39,106 @@ excluded_rules = [
 #      without tripping the migration runner's checksum guard. The
 #      underlying advice (prefer IDENTITY over BIGSERIAL, NOT VALID on
 #      new CHECK constraints, CREATE INDEX CONCURRENTLY in .notx.sql) is
-#      documented in docs/db_migration.md and applies to all NEW migrations.
+#      documented in knowledge-base/knowledge/db_migration.md and applies to all NEW migrations.
 #      Files here shipped before squawk caught them; rewriting in place
 #      would re-execute against a DB that's already at the target state.
-#        - 0004 / 0006: BIGSERIAL primary keys (fixed forward by 0007).
-#        - 0008: ADD CHECK without NOT VALID and CREATE INDEX without
+#        - app/0004 / app/0006: BIGSERIAL primary keys (fixed forward by 0007).
+#        - app/0008: ADD CHECK without NOT VALID and CREATE INDEX without
 #                CONCURRENTLY on threads. Already applied 2026-05-13.
+#        - app/0058: CREATE INDEX without CONCURRENTLY on the brand-new Canvas
+#                table. The applied bytes predate its lint annotation and are
+#                pinned by the migration checksum guard.
+#        - vector/0008: six CREATE INDEX without CONCURRENTLY. Four are on
+#                brand-new empty tables (knowledge_chunks) — instant build, no
+#                meaningful lock; the two on knowledge_index are sub-second on a
+#                small table. The file is transactional-atomic by design
+#                (knowledge-base/knowledge/features/okf_knowledge_base.md slice-3 PR1), so
+#                CONCURRENTLY — which cannot run in a transaction — can't live in
+#                it anyway, and it is already applied on develop; the runner's
+#                checksum guard forbids editing it in place.
+#        - app/0132: the exact settled critic index intentionally omits IF NOT
+#                EXISTS. A failed concurrent build leaves an INVALID shell, so
+#                treating that shell as success would make the guard both
+#                unusable and write-rejecting. Migration 0131 performs the
+#                same-name concurrent drop first; the applied 0132 checksum is
+#                immutable, so this intentional prefer-robust-stmts exception
+#                belongs here rather than in the SQL file.
+#        - app/0117: CREATE INDEX without CONCURRENTLY on run_queue — a table
+#                CREATEd two files earlier in the same chain (0115a), so the
+#                build is against an empty table on every DB that applies it.
+#                Squawk only tracks same-file creations, so it cannot see that.
+#                The file is transactional-atomic by design (the affinity index
+#                and the column comments it documents must land together), and
+#                CONCURRENTLY cannot run in a transaction — identical shape to
+#                app/0058 and vector/0008 above.
+#        - app/0122: ban-char-field on sync_scope_sha256 CHAR(64) — a
+#                fixed-width lowercase-hex SHA-256, which is precisely the
+#                carve-out in the rule's own "almost always" wording. Its
+#                sibling stylistic rule prefer-text-field is already excluded
+#                wholesale above; this file is the only place the char variant
+#                fires, so a path entry keeps the rule live for future
+#                migrations rather than disabling it globally.
+#        - app/0123: the same digest-column exception as 0122, plus two
+#                constraint-missing-not-valid findings. Both CHECKs constrain
+#                columns added by the SAME ALTER TABLE, each with a constant
+#                DEFAULT that satisfies its own constraint — so the validation
+#                scan can only ever see rows it accepts, and there is no
+#                pre-existing data to scan (the table is CREATEd by 0122 in
+#                this chain). Splitting to NOT VALID + a later VALIDATE would
+#                open a window in which a violating row could land, i.e.
+#                strictly worse than the atomic form.
+#        - app/0143: two constraint-missing-not-valid findings on the Gate-3
+#                completion command table. The commands feature is tracked
+#                default-off, so production applies this migration before it
+#                can contain rows; local k3d had only the deliberately retained
+#                soak fixtures. The checks were therefore bounded empty-table
+#                validation, protected by a 2 s lock timeout. Tilt applied and
+#                checksummed these bytes before the pinned-linter pass, so an
+#                in-place annotation or NOT VALID rewrite would violate the
+#                migration ledger. Future constraints retain the normal
+#                NOT VALID + later VALIDATE rule.
+#        - app/0147: the composite permission-request identity UNIQUE supports
+#                the same-file composite receipt FK. PostgreSQL cannot add a
+#                UNIQUE constraint NOT VALID, and the migration explicitly
+#                bounded/retried its ACCESS EXCLUSIVE lock on the small
+#                permission table. Tilt applied and checksummed these bytes
+#                before the pinned-linter pass, so fix-forward migrations
+#                0148/0149 add the receipt index concurrently and validate the
+#                FK/CHECK while this already-applied file remains immutable.
+#        - app/0171: two constraint-missing-not-valid plus three
+#                require-concurrent-index-creation findings on the Officer
+#                runtime-grant liveness fence. The CHECKs are the app/0123
+#                carve-out exactly: both constrain columns added by the SAME
+#                ALTER TABLE, and neither can see a row it would reject —
+#                credential_generation arrives NOT NULL DEFAULT 1 (satisfies
+#                > 0) and the four refresh-handoff columns arrive all-NULL
+#                (satisfies the shape check). NOT VALID + a later VALIDATE
+#                would be strictly worse here, opening a window in which a
+#                violating row could land. The three indexes are the app/0117
+#                shape: the file is transactional-atomic by design — the two
+#                UNIQUE indexes are the enforcement half of the same fence as
+#                the BEFORE INSERT OR UPDATE trigger this file creates, so
+#                they must land in the trigger's transaction, and
+#                CONCURRENTLY cannot run in one. runtime_actor_grants is a
+#                small retained ledger (dev: ~750 rows), so each build is
+#                sub-second under the file's 2 s lock timeout. Applied on the
+#                dev cluster 2026-08-20 (the develop pipeline shipped the
+#                image before this gate reported), so the bytes are pinned by
+#                the migration checksum guard and an in-place rewrite would
+#                wedge that cluster's boot.
 excluded_paths = [
     "orchestrator/database/migrations/app/0001_initial.sql",
     "orchestrator/database/migrations/vector/0001_initial.sql",
     "orchestrator/database/migrations/app/0004_thread_events.sql",
     "orchestrator/database/migrations/app/0006_headless_notifications.sql",
     "orchestrator/database/migrations/app/0008_thread_awaiting_user.sql",
+    "orchestrator/database/migrations/app/0058_canvases.sql",
+    "orchestrator/database/migrations/app/0117_run_queue_affinity.sql",
+    "orchestrator/database/migrations/app/0122_thread_cloud_sync_generations.sql",
+    "orchestrator/database/migrations/app/0123_thread_cloud_sync_baselines.sql",
+    "orchestrator/database/migrations/app/0132_jobs_verification_uniq.notx.sql",
+    "orchestrator/database/migrations/app/0143_job_completion_accept_status.sql",
+    "orchestrator/database/migrations/app/0147_thread_permission_lease_receipts.sql",
+    "orchestrator/database/migrations/app/0171_officer_runtime_grant_liveness.sql",
+    "orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]

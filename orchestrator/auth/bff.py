@@ -4,7 +4,7 @@ Replaces the cockpit's in-memory Bearer-token model with server-side
 sessions keyed by an opaque HttpOnly cookie. The browser never sees the
 Keycloak access/refresh/id token.
 
-See docs/features/auth_bff_and_api_tokens.md.
+See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
 """
 
 from __future__ import annotations
@@ -154,6 +154,7 @@ def _clear_pre_auth_cookie(resp: Response) -> None:
 # Endpoints ---------------------------------------------------------------
 
 
+# nosec: public OIDC handshake entry — redirects to Keycloak, no session exists yet
 @router.get("/login")
 async def login(
     request: Request,
@@ -209,6 +210,7 @@ async def login(
     return resp
 
 
+# nosec: public OIDC redirect_uri — authenticates by exchanging the Keycloak code
 @router.get("/callback")
 async def callback(
     request: Request,
@@ -342,6 +344,7 @@ async def me(request: Request) -> dict:
     }
 
 
+# nosec: public BFF session cookie is validated in-handler (401 without one)
 @router.post("/refresh")
 async def refresh(request: Request) -> dict:
     """Force a server-side refresh of the stored access token.
@@ -364,6 +367,7 @@ async def refresh(request: Request) -> dict:
     return {"refreshed": True}
 
 
+# nosec: public revokes whatever session the cookie names; a no-op without one
 @router.post("/logout")
 async def logout(request: Request) -> JSONResponse:
     """Revoke the current BFF session and return the Keycloak logout URL.
@@ -402,6 +406,7 @@ async def logout(request: Request) -> JSONResponse:
     return resp
 
 
+# nosec: public OIDC back-channel logout — authenticated by Keycloak's signed logout_token
 @router.post("/backchannel-logout")
 async def backchannel_logout(request: Request) -> Response:
     """Receive Keycloak's signed logout token (OIDC BCL §2.5).

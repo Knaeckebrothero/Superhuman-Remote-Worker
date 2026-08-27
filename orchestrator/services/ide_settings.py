@@ -225,17 +225,24 @@ class OpenVsxClassifier:
 def resolve_ssh_target(context: dict) -> Optional[tuple[str, int]]:
     """Resolve a workspace context to an ``(ssh_host, ssh_port)`` pair.
 
-    Mirrors the precedence the snapshot/suspension path uses, extended to
-    restored IDE sessions: container → VM, preferring an in-cluster pod IP over a
-    VM's Tailscale ssh_host. Returns None when no reachable target exists.
+    Container → restored IDE session → VM. For container workspaces the
+    stable per-workspace Service DNS (``workspace_container.host``, the
+    headless Service from `7fb9e9e2`) is preferred over the ephemeral
+    ``pod_ip``: a workspace pod that restarted keeps its Service name but not
+    its IP, and dialing the stale IP was the residual "No route to host"
+    source in the sweeper (knowledge-history/done/
+    ide_settings_sweeper_probes_stale_workspace_endpoints.md, residual
+    hardening). ``pod_ip`` stays as the fallback for legacy context rows that
+    predate the headless Service. Returns None when no reachable target
+    exists.
     """
     ws = context.get("workspace_container") or {}
     vm = context.get("vm") or {}
     ide = context.get("ide_session") or {}
 
     host = (
-        ws.get("pod_ip")
-        or ws.get("host")
+        ws.get("host")
+        or ws.get("pod_ip")
         or ide.get("pod_ip")
         or vm.get("ssh_host")
         or vm.get("pod_ip")
@@ -243,7 +250,7 @@ def resolve_ssh_target(context: dict) -> Optional[tuple[str, int]]:
     if not host:
         return None
 
-    if ws.get("pod_ip") or ws.get("host"):
+    if ws.get("host") or ws.get("pod_ip"):
         port = ws.get("port") or DEFAULT_WS_SSH_PORT
     elif ide.get("pod_ip"):
         port = ide.get("ssh_port") or DEFAULT_WS_SSH_PORT
@@ -498,6 +505,75 @@ def _coerce_context(context: Any) -> dict:
     return context or {}
 
 
+async def evict_dead_workspaces(
+    workspaces: list[dict], provisioner: Any, db: Any
+) -> list[dict]:
+    """Drop container-backed worklist rows whose workspace pod is confirmed dead.
+
+    The worklist selects on JSONB workspace status, which can stay ``'ready'``
+    forever when a pod dies without a teardown clearing it. Before the sweeper
+    serially SSH-dials each row, probe container-backed entries (those whose
+    ``workspace_container`` carries a ``pod_name``/``pod_ip``) via
+    ``provisioner.workspace_pod_live``: a confirmed-dead pod (``False``) gets
+    ``{"status": "deleted", "pod_ip": None}`` merged into its entity's
+    ``workspace_container`` context — so it drops out of the next worklist —
+    and the row is evicted from this cycle. ``True``/``None`` (alive / can't
+    tell) keeps the row; VM-backed rows pass through untouched. Any error while
+    probing a row keeps it — the evictor must never abort the sweep.
+    """
+    from services.workspace_lifecycle import WorkspaceOwner
+
+    kept: list[dict] = []
+    for ws in workspaces:
+        entity_type = ws.get("entity_type")
+        try:
+            container = _coerce_context(ws.get("context")).get("workspace_container")
+            if not isinstance(container, dict) or not (
+                container.get("pod_name") or container.get("pod_ip")
+            ):
+                kept.append(ws)
+                continue
+            owner = (
+                WorkspaceOwner.job(str(ws["id"]))
+                if entity_type == "job"
+                else WorkspaceOwner.session(str(ws["id"]))
+            )
+            live = await provisioner.workspace_pod_live(owner)
+        except Exception as e:  # noqa: BLE001 — a probe blip must not kill the sweep
+            logger.warning(
+                "ide_settings: liveness probe failed for %s %s — keeping row (%s)",
+                entity_type,
+                ws.get("id"),
+                e,
+            )
+            kept.append(ws)
+            continue
+        if live is False:
+            logger.warning(
+                "ide_settings: evicting %s %s from sweep — workspace pod confirmed "
+                "dead; clearing stale container status",
+                entity_type,
+                ws.get("id"),
+            )
+            updates = {"status": "deleted", "pod_ip": None}
+            try:
+                if entity_type == "job":
+                    await db.merge_workspace_container_context(str(ws["id"]), updates)
+                else:
+                    await db.merge_thread_workspace_context(str(ws["id"]), updates)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "ide_settings: failed to clear stale container context for "
+                    "%s %s — %s",
+                    entity_type,
+                    ws.get("id"),
+                    e,
+                )
+        else:
+            kept.append(ws)
+    return kept
+
+
 async def reconcile_ide_settings(
     store: IdeSettingsStore, workspaces: list[dict], pull_fn: PullFn
 ) -> int:
@@ -644,12 +720,26 @@ async def _ssh_tar_to_file(
     timeout: int = 120,
 ) -> bool:
     """Stream ``ssh agent-host@host 'tar -cf - <remote_path> | zstd' > local`` —
-    the snapshot_service transport, narrowed to one path. Returns False on error.
+    the snapshot_service transport, narrowed to one path. The remote command is
+    wrapped in ``bash -c`` with a PIPESTATUS-discriminated verdict so a masked
+    upstream ``tar`` failure can't hide behind ``zstd``'s own exit code (see
+    knowledge-base/knowledge/features/workspace_durability_tiering.md §C1d). Returns False on error.
     """
     from services import resolve_ssh_key_path
 
     kp = key_path if key_path is not None else resolve_ssh_key_path()
-    remote = f"tar -cf - {remote_path} 2>/dev/null | zstd -1 -T0"
+    # tar | zstd only reports the LAST stage's exit code, so a fatal tar
+    # failure upstream of zstd is masked. Wrap in `bash -c` (guarantees
+    # PIPESTATUS regardless of the agent-host login shell) and collapse to
+    # an honest accept/reject verdict: accept tar rc in {0, 1} (rc==1 is the
+    # benign "file changed as we read it" warning on a live workspace) with
+    # a clean zstd; reject tar rc>=2 or any zstd failure. The `.tar.zst`
+    # byte stream to stdout is unchanged — only the exit code's meaning is.
+    remote = (
+        "bash -c 'tar -cf - " + remote_path + " 2>/dev/null | zstd -1 -T0; "
+        '__ps=("${PIPESTATUS[@]}"); '
+        'if [ "${__ps[1]}" -ne 0 ] || [ "${__ps[0]}" -ge 2 ]; then exit 1; else exit 0; fi\''
+    )
     cmd = [
         "ssh",
         *(["-i", kp] if kp else []),
@@ -806,11 +896,23 @@ async def _ssh_untar_from_file(
     """Reverse of :func:`_ssh_tar_to_file`: stream a local ``.tar.zst`` into the
     workspace via ``ssh ... 'zstd -d | tar -xf - -C /'``. The archive was created
     with absolute paths (e.g. ``/var/lib/code-server/User/globalStorage``) so it
-    extracts back to the same location. Returns False on error."""
+    extracts back to the same location. Wrapped in ``bash -c`` with the same
+    PIPESTATUS verdict as the capture side above, so a masked ``zstd -d``
+    decompression failure on a corrupt archive can't hide behind tar's own rc
+    (§C1d). Returns False on error."""
     from services import resolve_ssh_key_path
 
     kp = key_path if key_path is not None else resolve_ssh_key_path()
-    remote = "zstd -d | tar -xf - -C /"
+    # zstd -d | tar only reports the LAST stage's (tar's) exit code, masking
+    # a corrupt/truncated archive's decompression failure — the same pattern
+    # C1c fixed for the shared ssh_helpers extract commands. Same verdict
+    # shape as the capture side: accept tar rc in {0, 1}; reject tar rc>=2 or
+    # any zstd failure. stdin/stdout data flow is unchanged.
+    remote = (
+        "bash -c 'zstd -d | tar -xf - -C /; "
+        '__ps=("${PIPESTATUS[@]}"); '
+        'if [ "${__ps[0]}" -ne 0 ] || [ "${__ps[1]}" -ge 2 ]; then exit 1; else exit 0; fi\''
+    )
     cmd = [
         "ssh",
         *(["-i", kp] if kp else []),

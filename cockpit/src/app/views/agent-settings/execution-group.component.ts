@@ -1,15 +1,23 @@
-import {Component, computed, inject, input, output, signal} from '@angular/core';
+import {Component, computed, effect, inject, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {toSignal} from '@angular/core/rxjs-interop';
 import {AppIconComponent} from '../../ui/icon';
+import {UserService} from '../../core/services/user.service';
 import {
   AUTONOMY_LEVELS,
   CRITIC_ROUND_OPTIONS,
+  IMAGE_QUALITY_TIERS,
   PERMISSION_MODES,
   readConfigPath,
+  pinResolvedValue,
   SettingsMode,
+  TierReachability,
+  WORKSPACE_BACKENDS,
 } from './agent-settings.types';
+import {PinOnInteractDirective} from './pin-on-interact.directive';
+import {allowedEnumOptions} from './capability-gates';
+import type {GrantCatalog} from '../../core/models/api.model';
 
 /**
  * Execution settings group: autonomy, scholar, critic, project memory.
@@ -18,7 +26,7 @@ import {
 @Component({
   selector: 'app-execution-group',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe, AppIconComponent],
+  imports: [FormsModule, TranslocoPipe, AppIconComponent, PinOnInteractDirective],
   template: `
     <div class="settings-group">
       <div class="group-label">{{ 'agentSettings.execution.group' | transloco }}</div>
@@ -31,10 +39,11 @@ import {
             <select
               class="form-input"
               [ngModel]="autonomy() ?? resolvedAutonomy()"
+              appPinOnInteract (pin)="pinValue(autonomy, resolvedAutonomy())"
               (ngModelChange)="onAutonomyChange($event)"
               [disabled]="disabled()"
             >
-              @for (level of autonomyLevels; track level.value) {
+              @for (level of autonomyOptions(); track level.value) {
                 <option [value]="level.value">{{ 'agentSettings.autonomy.' + level.value + '.label' | transloco }}</option>
               }
             </select>
@@ -53,20 +62,134 @@ import {
             <select
               class="form-input"
               [ngModel]="permissionMode() ?? resolvedPermissionMode()"
+              appPinOnInteract (pin)="pinValue(permissionMode, resolvedPermissionMode())"
               (ngModelChange)="onPermissionModeChange($event)"
               [disabled]="disabled()"
             >
-              @for (pm of permissionModes; track pm.value) {
+              @for (pm of permissionOptions(); track pm.value) {
                 <option [value]="pm.value">{{ 'agentSettings.permissionModes.' + pm.value + '.label' | transloco }}</option>
               }
             </select>
-            @if (permissionMode() !== null) {
+            @if (permissionMode() !== null && mode() !== 'live') {
               <button type="button" class="reset-btn" (click)="permissionMode.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
                 <app-icon size="xs">close</app-icon>
               </button>
             }
           </div>
           <span class="field-hint">{{ effectivePermissionDesc() }}</span>
+        </div>
+      }
+
+      <!-- Workspace backend. In job/session creation this is an ordinary
+           setting. On a live session it is a launcher for the upgrade verb,
+           not a setting: it always displays the running tier, unreachable
+           tiers carry their reason, and picking one emits intent for the host
+           to confirm and dispatch. -->
+      @if (mode() === 'live' && liveTier()) {
+        <div class="field-row">
+          <label class="field-label">{{ 'agentSettings.execution.workspaceBackend' | transloco }}</label>
+          @if (anyTierReachable()) {
+            <div class="field-control">
+              <select
+                class="form-input"
+                (change)="onLiveTierPick($event)"
+                [disabled]="disabled() || upgradeInProgress() !== null"
+              >
+                @for (t of liveTierOptions(); track t.value) {
+                  <option [value]="t.value" [disabled]="t.disabled" [selected]="t.value === liveTier()">{{ t.label }}</option>
+                }
+              </select>
+            </div>
+          } @else {
+            <!-- Nothing is reachable (a none-tier session): a select whose
+                 every option is refused is worse than no select. -->
+            <span class="static-value">{{ currentTierLabel() }}</span>
+          }
+          @if (upgradeInProgress(); as prog) {
+            <span class="field-hint upgrading">
+              <span class="progress-spinner"></span>
+              {{ 'agentSettings.execution.tierUpgrading' | transloco:{ tier: tierLabel(prog.tier) } }}
+              @if (prog.elapsed) { ({{ prog.elapsed }}s) }
+            </span>
+          } @else {
+            <span class="field-hint">{{ 'agentSettings.execution.tierHint' | transloco }}</span>
+          }
+        </div>
+      }
+
+      @if (mode() !== 'live') {
+        <div class="field-row" [class.modified]="workspaceBackend() !== null">
+          <label class="field-label">{{ 'agentSettings.execution.workspaceBackend' | transloco }}</label>
+          <div class="field-control">
+            <select
+              class="form-input"
+              [ngModel]="workspaceBackend() ?? resolvedWorkspaceBackend()"
+              appPinOnInteract (pin)="pinValue(workspaceBackend, resolvedWorkspaceBackend())"
+              (ngModelChange)="onWorkspaceBackendChange($event)"
+              [disabled]="disabled()"
+            >
+              @for (b of workspaceBackends; track b.value) {
+                @if (b.value !== 'vm' || canUseVm()) {
+                  <option [value]="b.value">{{ 'advanced.options.' + b.i18nKey | transloco }}</option>
+                }
+              }
+            </select>
+            @if (workspaceBackend() !== null) {
+              <button type="button" class="reset-btn" (click)="resetWorkspaceBackend()" [title]="'agentSettings.common.resetToDefault' | transloco">
+                <app-icon size="xs">close</app-icon>
+              </button>
+            }
+          </div>
+          @if (isLiteBackend()) {
+            <span class="field-hint">{{ (isNoneBackend() ? 'advanced.hints.noneBackend' : 'advanced.hints.virtualBackend') | transloco }}</span>
+          }
+        </div>
+      }
+
+      <!-- Narration mode (live sessions only — a runtime chat concept, not a
+           creation-form field; applied via the dedicated narration.set verb) -->
+      @if (mode() === 'live') {
+        <div class="field-row" [class.modified]="narrationMode() !== null">
+          <label class="field-label">{{ 'agentSettings.execution.narration' | transloco }}</label>
+          <div class="field-control">
+            <select
+              class="form-input"
+              [ngModel]="narrationMode() ?? resolvedNarrationMode()"
+              appPinOnInteract (pin)="pinValue(narrationMode, resolvedNarrationMode())"
+              (ngModelChange)="onNarrationModeChange($event)"
+              [disabled]="disabled()"
+            >
+              @for (nm of narrationModes; track nm.value) {
+                <option [value]="nm.value">{{ 'agentSettings.narrationModes.' + nm.value | transloco }}</option>
+              }
+            </select>
+          </div>
+        </div>
+      }
+
+      <!-- Image quality (jobs + session creation; not in the live honored set) -->
+      @if (mode() !== 'live') {
+        <div class="field-row" [class.modified]="imageQuality() !== null">
+          <label class="field-label">{{ 'agentSettings.execution.imageQuality' | transloco }}</label>
+          <div class="field-control">
+            <select
+              class="form-input"
+              [ngModel]="imageQuality() ?? resolvedImageQuality()"
+              appPinOnInteract (pin)="pinValue(imageQuality, resolvedImageQuality())"
+              (ngModelChange)="onImageQualityChange($event)"
+              [disabled]="disabled()"
+            >
+              @for (q of imageQualityTiers; track q.value) {
+                <option [value]="q.value">{{ 'agentSettings.imageQuality.' + q.value + '.label' | transloco }}</option>
+              }
+            </select>
+            @if (imageQuality() !== null) {
+              <button type="button" class="reset-btn" (click)="imageQuality.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
+                <app-icon size="xs">close</app-icon>
+              </button>
+            }
+          </div>
+          <span class="field-hint">{{ effectiveImageQualityDesc() }}</span>
         </div>
       }
 
@@ -106,6 +229,7 @@ import {
             <select
               class="form-input compact-select"
               [ngModel]="criticRounds() ?? resolvedCriticRounds()"
+              appPinOnInteract (pin)="pinValue(criticRounds, resolvedCriticRounds())"
               (ngModelChange)="onCriticRoundsChange($event)"
               [disabled]="disabled()"
             >
@@ -152,7 +276,7 @@ import {
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-bottom: 12px;
       padding-bottom: 6px;
       border-bottom: 1px solid var(--border-color, var(--surface-0));
@@ -229,7 +353,7 @@ import {
       border: none;
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.08);
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;
     }
@@ -240,16 +364,54 @@ import {
     .field-hint {
       display: block;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-top: 2px;
     }
+    .static-value {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary, var(--text-primary));
+    }
+    .field-hint.upgrading {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .progress-spinner {
+      width: 10px;
+      height: 10px;
+      border: 2px solid var(--border-color);
+      border-top-color: var(--accent-color);
+      border-radius: 50%;
+      animation: execution-group-spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes execution-group-spin { to { transform: rotate(360deg); } }
   `],
 })
 export class ExecutionGroupComponent {
   private readonly transloco = inject(TranslocoService);
+  private readonly userService = inject(UserService);
   private readonly activeLang = toSignal(this.transloco.langChanges$, {
     initialValue: this.transloco.getActiveLang(),
   });
+
+  constructor() {
+    // Snap ineligible users off 'vm' so the form can't submit a denied backend.
+    // The server is authoritative — this is a UX safeguard.
+    //
+    // Creation forms only: a live session already running on a VM is a fact,
+    // not a proposal, and the form has no business second-guessing it.
+    effect(() => {
+      if (this.mode() === 'live') return;
+      if (this.canUseVm()) return;
+      if (this.effectiveBackend() === 'vm') {
+        this.workspaceBackend.set('sandbox');
+        this.change.emit();
+      }
+    });
+  }
 
   /** Merged expert/framework config. */
   config = input<Record<string, unknown>>({});
@@ -257,21 +419,133 @@ export class ExecutionGroupComponent {
   disabled = input(false);
   /** Whether the selected project has shared memory enabled. */
   showProjectMemory = input(false);
+  /** Author's resolved capability grants for editor greying; null ⇒ no gating. */
+  gatedCapabilities = input<Record<string, unknown> | null>(null);
+  /** Capability catalog (supplies the enum `order` for ceiling filtering). */
+  catalog = input<GrantCatalog>({});
+
+  // --- Live-session workspace tier (live mode only) ---
+  /** The running session's tier. Null outside live mode, or before it is
+   *  known — the row hides rather than guessing. */
+  liveTier = input<string | null>(null);
+  /** Per-tier reachability, decided by the host. Absent entries read as
+   *  `unsupported`. */
+  tierReachability = input<Record<string, TierReachability>>({});
+  /** Non-null while an upgrade is running, which disables the control. */
+  upgradeInProgress = input<{tier: string; elapsed?: number} | null>(null);
 
   change = output<void>();
+  /** A live tier the user picked. Intent only — the host confirms and
+   *  dispatches the upgrade verb; this component never mutates tier state. */
+  tierChangeRequested = output<string>();
 
   // Constants
   readonly autonomyLevels = AUTONOMY_LEVELS;
   readonly criticRoundOptions = CRITIC_ROUND_OPTIONS;
   readonly permissionModes = PERMISSION_MODES;
+  readonly imageQualityTiers = IMAGE_QUALITY_TIERS;
+
+  /** Autonomy levels at/below the granted ceiling. The currently-selected value
+   *  is always kept visible (an admin-authored expert may pin a higher level). */
+  readonly autonomyOptions = computed(() => {
+    const allowed = new Set(
+      allowedEnumOptions(this.gatedCapabilities(), 'autonomy_ceiling',
+        this.autonomyLevels.map((l) => l.value), this.catalog()),
+    );
+    const current = this.autonomy() ?? this.resolvedAutonomy();
+    return this.autonomyLevels.filter((l) => allowed.has(l.value) || l.value === current);
+  });
+
+  /** Permission modes at/below the granted ceiling (current always kept). */
+  readonly permissionOptions = computed(() => {
+    const allowed = new Set(
+      allowedEnumOptions(this.gatedCapabilities(), 'permission_mode',
+        this.permissionModes.map((p) => p.value), this.catalog()),
+    );
+    const current = this.permissionMode() ?? this.resolvedPermissionMode();
+    return this.permissionModes.filter((p) => allowed.has(p.value) || p.value === current);
+  });
+
+  readonly narrationModes = [
+    {value: 'auto'},
+    {value: 'verbose'},
+    {value: 'silent'},
+  ] as const;
 
   // User overrides (null = use default)
   readonly autonomy = signal<string | null>(null);
   readonly permissionMode = signal<string | null>(null);
+  readonly narrationMode = signal<string | null>(null);
   readonly scholar = signal<boolean | null>(null);
   readonly critic = signal<boolean | null>(null);
   readonly criticRounds = signal<number | null>(null);
   readonly projectMemory = signal<boolean | null>(null);
+  readonly imageQuality = signal<string | null>(null);
+  readonly workspaceBackend = signal<string | null>(null);
+  readonly workspaceBackends = WORKSPACE_BACKENDS;
+
+  /** Label for a tier, from the shared `advanced.options.*` vocabulary. An
+   *  unrecognised tier renders its raw value rather than vanishing — better a
+   *  bare string than silently re-labelling the session as something else. */
+  tierLabel(tier: string): string {
+    this.activeLang();
+    const known = WORKSPACE_BACKENDS.find((b) => b.value === tier);
+    return known ? this.transloco.translate(`advanced.options.${known.i18nKey}`) : tier;
+  }
+
+  readonly currentTierLabel = computed(() => this.tierLabel(this.liveTier() ?? ''));
+
+  /** Reachability of a tier from the running one. Anything the host did not
+   *  speak to is refused — fail closed, the server gates this anyway. */
+  private tierState(tier: string): TierReachability {
+    if (tier === this.liveTier()) return 'current';
+    return this.tierReachability()[tier] ?? 'unsupported';
+  }
+
+  /** Every tier, each carrying its own reason when it cannot be picked. */
+  readonly liveTierOptions = computed(() => {
+    this.activeLang();
+    const current = this.liveTier();
+    const values: string[] = WORKSPACE_BACKENDS.map((b) => b.value);
+    if (current && !values.includes(current)) values.unshift(current);
+    return values.map((value) => {
+      const state = this.tierState(value);
+      const base = this.tierLabel(value);
+      const suffix =
+        state === 'current' ? this.transloco.translate('agentSettings.execution.tierCurrent')
+        : state === 'ok' ? ''
+        : this.transloco.translate(`agentSettings.execution.tierUnreachable.${state}`);
+      return {
+        value,
+        label: suffix ? `${base} — ${suffix}` : base,
+        // The running tier stays selectable: it is what the select displays.
+        disabled: state !== 'ok' && state !== 'current',
+      };
+    });
+  });
+
+  /** False when every tier is refused (a `none` session today). */
+  readonly anyTierReachable = computed(() =>
+    this.liveTierOptions().some((t) => !t.disabled && t.value !== this.liveTier()),
+  );
+
+  /** Whether the current user is allowed to pick the VM backend. Admins always qualify. */
+  readonly canUseVm = computed(() => {
+    const u = this.userService.currentUser();
+    return !!(u?.is_admin || u?.can_use_vm);
+  });
+
+  /** Effective backend = override → resolved config default. The lite tiers
+   *  (`virtual`/`none`) run with no workspace container, so shell/browser/git
+   *  tools are gated off server-side (no_workspace_agent_mode.md §7); the
+   *  Advanced accordion reads this through its `backendOverride` input to grey
+   *  the matching controls. `none` additionally has no file tools. */
+  readonly effectiveBackend = computed(() => this.workspaceBackend() ?? this.resolvedWorkspaceBackend());
+  readonly isLiteBackend = computed(() => {
+    const b = this.effectiveBackend();
+    return b === 'virtual' || b === 'none';
+  });
+  readonly isNoneBackend = computed(() => this.effectiveBackend() === 'none');
 
   // Resolved defaults from config
   readonly resolvedAutonomy = computed(() =>
@@ -279,6 +553,9 @@ export class ExecutionGroupComponent {
   );
   readonly resolvedPermissionMode = computed(() =>
     (readConfigPath(this.config(), 'interactive.permission_mode') as string) ?? 'supervised'
+  );
+  readonly resolvedNarrationMode = computed(() =>
+    (readConfigPath(this.config(), 'interactive.narration_mode') as string) ?? 'auto'
   );
   readonly resolvedScholar = computed(() =>
     (readConfigPath(this.config(), 'scholar.enabled') as boolean) ?? true
@@ -291,6 +568,12 @@ export class ExecutionGroupComponent {
   );
   readonly resolvedProjectMemory = computed(() =>
     (readConfigPath(this.config(), 'memory.project_scoped') as boolean) ?? true
+  );
+  readonly resolvedImageQuality = computed(() =>
+    (readConfigPath(this.config(), 'image_quality') as string) ?? 'standard'
+  );
+  readonly resolvedWorkspaceBackend = computed(() =>
+    (readConfigPath(this.config(), 'workspace.backend') as string) ?? 'sandbox'
   );
 
   readonly effectiveAutonomyDesc = computed(() => {
@@ -313,49 +596,103 @@ export class ExecutionGroupComponent {
     this.critic() ?? this.resolvedCritic()
   );
 
+  readonly effectiveImageQualityDesc = computed(() => {
+    this.activeLang();
+    const val = this.imageQuality() ?? this.resolvedImageQuality();
+    const known = this.imageQualityTiers.find(q => q.value === val);
+    if (!known) return '';
+    return this.transloco.translate(`agentSettings.imageQuality.${val}.description`);
+  });
+
   /** Number of fields that differ from defaults. */
   readonly modifiedCount = computed(() => {
     let count = 0;
     if (this.autonomy() !== null) count++;
     if (this.permissionMode() !== null) count++;
+    if (this.narrationMode() !== null) count++;
     if (this.scholar() !== null) count++;
     if (this.critic() !== null) count++;
     if (this.criticRounds() !== null) count++;
     if (this.projectMemory() !== null) count++;
+    if (this.imageQuality() !== null) count++;
+    if (this.workspaceBackend() !== null) count++;
     return count;
   });
 
+  /** Commit a displayed-but-inherited value on deliberate interaction.
+   *  See PinOnInteractDirective — a <select> emits no change event when the
+   *  option already showing is re-picked, so without this the resolved default
+   *  is the one value the form cannot express. */
+  pinValue<T>(target: {(): T | null; set(value: T | null): void}, resolved: T): void {
+    if (pinResolvedValue(target, resolved)) this.change.emit();
+  }
+
   onAutonomyChange(value: string): void {
-    this.autonomy.set(value === this.resolvedAutonomy() ? null : value);
+    this.autonomy.set(value);
     this.change.emit();
   }
 
   onPermissionModeChange(value: string): void {
-    this.permissionMode.set(value === this.resolvedPermissionMode() ? null : value);
+    this.permissionMode.set(value);
+    this.change.emit();
+  }
+
+  onNarrationModeChange(value: string): void {
+    this.narrationMode.set(value);
     this.change.emit();
   }
 
   onScholarChange(event: Event): void {
     const checked = (event.target as HTMLInputElement).checked;
-    this.scholar.set(checked === this.resolvedScholar() ? null : checked);
+    this.scholar.set(checked);
     this.change.emit();
   }
 
   onCriticChange(event: Event): void {
     const checked = (event.target as HTMLInputElement).checked;
-    this.critic.set(checked === this.resolvedCritic() ? null : checked);
+    this.critic.set(checked);
     this.change.emit();
   }
 
   onCriticRoundsChange(value: number): void {
-    this.criticRounds.set(value === this.resolvedCriticRounds() ? null : value);
+    this.criticRounds.set(value);
     this.change.emit();
   }
 
   onProjectMemoryChange(event: Event): void {
     const checked = (event.target as HTMLInputElement).checked;
-    this.projectMemory.set(checked === this.resolvedProjectMemory() ? null : checked);
+    this.projectMemory.set(checked);
     this.change.emit();
+  }
+
+  onImageQualityChange(value: string): void {
+    this.imageQuality.set(value);
+    this.change.emit();
+  }
+
+  onWorkspaceBackendChange(value: string): void {
+    this.workspaceBackend.set(value);
+    this.change.emit();
+  }
+
+  /** Reset emits, unlike the other rows here: the backend also drives the
+   *  Advanced accordion's greying and the datasource picker's repo filter, so
+   *  hosts have to hear about it. */
+  resetWorkspaceBackend(): void {
+    this.workspaceBackend.set(null);
+    this.change.emit();
+  }
+
+  /** Live mode: a pick is a request, not a value.
+   *
+   *  The select displays the running tier and never holds a pending one — it
+   *  snaps straight back, so a cancelled confirmation leaves nothing stale and
+   *  a successful upgrade moves the row by changing `liveTier`. */
+  onLiveTierPick(event: Event): void {
+    const el = event.target as HTMLSelectElement;
+    const picked = el.value;
+    el.value = this.liveTier() ?? '';
+    if (picked && picked !== this.liveTier()) this.tierChangeRequested.emit(picked);
   }
 
   resetCritic(): void {
@@ -383,9 +720,25 @@ export class ExecutionGroupComponent {
       const pm = this.projectMemory();
       if (pm !== null) o['memory'] = { project_scoped: pm };
     } else {
-      if (this.permissionMode() !== null) {
-        o['interactive'] = { permission_mode: this.permissionMode() };
-      }
+      const interactive: Record<string, unknown> = {};
+      if (this.permissionMode() !== null) interactive['permission_mode'] = this.permissionMode();
+      if (this.narrationMode() !== null) interactive['narration_mode'] = this.narrationMode();
+      if (Object.keys(interactive).length > 0) o['interactive'] = interactive;
+    }
+
+    // Image quality is a top-level knob honored by both worker and persistent
+    // agents, so it applies regardless of mode.
+    if (this.imageQuality() !== null) o['image_quality'] = this.imageQuality();
+
+    // Workspace backend. The rest of the `workspace` fragment (VM sizing, file
+    // limits, git versioning) stays in the Advanced accordion; the host deep-
+    // merges the two halves.
+    //
+    // Never in live mode: there the tier moves through the upgrade verb, and
+    // letting it ride the pane's debounced config.update would be a second,
+    // silent writer of the same fact.
+    if (this.mode() !== 'live' && this.workspaceBackend() !== null) {
+      o['workspace'] = {backend: this.workspaceBackend()};
     }
 
     return o;
@@ -395,9 +748,12 @@ export class ExecutionGroupComponent {
   resetAll(): void {
     this.autonomy.set(null);
     this.permissionMode.set(null);
+    this.narrationMode.set(null);
     this.scholar.set(null);
     this.critic.set(null);
     this.criticRounds.set(null);
     this.projectMemory.set(null);
+    this.imageQuality.set(null);
+    this.workspaceBackend.set(null);
   }
 }

@@ -8,8 +8,8 @@
 {{- $mcpHost     := include "srw.urlHost" (include "srw.mcpUrl" .) -}}
 {{- $neo4jHost   := include "srw.neo4jBrowserHost" . -}}
 {{- $pgadminHost := include "srw.pgadminHost" . -}}
-{{- $mongoHost   := include "srw.mongoHost" . -}}
 {{- $dozzleHost  := include "srw.dozzleHost" . -}}
+{{- $remoteIngress := .Values.infrastructureMetering.remoteIngress | default dict -}}
 # Cockpit web UI
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -79,6 +79,21 @@ spec:
           # per-session Ingress is "longer" only because of the {tid} suffix,
           # not the literal /p prefix — they collide).
           {{- end }}
+          {{- if and .Values.mcp.enabled .Values.mcp.exposeOnRootHost }}
+          # MCP on the cockpit host (local-dev convenience). Off by default;
+          # prod keeps the dedicated mcp.<domain> subdomain (the Keycloak
+          # OAuth-client host). FastMCP serves at /mcp and traefik preserves
+          # the path (no StripPrefix), so https://<cockpit>/mcp lands on
+          # srw-mcp:8055/mcp unchanged. Longest-prefix-first puts it ahead of
+          # the cockpit catch-all. Bearer-token auth works on either host.
+          - path: /mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-mcp
+                port:
+                  number: 8055
+          {{- end }}
           - path: /
             pathType: Prefix
             backend:
@@ -129,6 +144,61 @@ spec:
                 name: {{ $fullName }}-orchestrator
                 port:
                   number: 8085
+{{- if .Values.collabora.enabled }}
+---
+# WOPI is token-authenticated but deliberately cluster-only. This higher
+# priority route prevents the public API Ingress from forwarding /wopi while
+# Collabora continues to use the in-cluster orchestrator Service directly.
+# A tunnel which bypasses Traefik must apply the same path deny at its edge.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullName }}-block-public-wopi
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      - 127.0.0.99/32
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-api-ingress-blocked-wopi
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.priority: "110"
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-block-public-wopi@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $apiHost }}
+      secretName: {{ $fullName }}-api-tls
+  {{- end }}
+  rules:
+    - host: {{ $apiHost }}
+      http:
+        paths:
+          - path: /wopi
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+{{- end }}
 {{- if .Values.ingress.internalPathBlock.enabled }}
 ---
 # Track B (P4b) — Layer 1 (opt-in). Block /api/agents/* and /api/internal/*
@@ -140,7 +210,7 @@ spec:
 # (Cloudflare Tunnel, Tailscale Funnel, Ngrok, etc.), Traefik never sees
 # the request and this middleware never fires — leave the toggle off and
 # put the equivalent path rule at your tunnel/edge instead. See
-# `docs/multi_tenancy.md` for the cloudflared example.
+# `knowledge-base/knowledge/multi_tenancy.md` for the cloudflared example.
 #
 # Layer 2 (app-layer ``require_internal`` checking the ``X-Internal-Key``
 # header) is the primary defense and is always on regardless of this toggle.
@@ -213,6 +283,150 @@ spec:
                 name: {{ $fullName }}-orchestrator
                 port:
                   number: 8085
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled (eq (.Values.ingress.className | default "traefik") "traefik") }}
+{{- if ($remoteIngress.enabled | default false) }}
+---
+# Opt-in cross-cluster collector route. Source filtering is only the outer
+# network fence; every request still requires its dedicated VMI or storage HMAC
+# credential and is read through the application's bounded ingestion contract.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullName }}-allow-remote-infra-metering
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml $remoteIngress.sourceCidrs | nindent 6 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-api-ingress-remote-infra-metering
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    {{- if .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.priority: "140"
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-allow-remote-infra-metering@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts:
+        - {{ $apiHost }}
+      secretName: {{ $fullName }}-api-tls
+  rules:
+    - host: {{ $apiHost }}
+      http:
+        paths:
+          - path: /api/internal/infrastructure-metering
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+{{- end }}
+---
+# Signed metadata and the claimed digest are authenticated before a bounded
+# body read, then the exact body is verified. This route is never browser-facing,
+# so an enabled collector also blocks it at the public Traefik edge while leaving
+# the ClusterIP Service available. Tunnels which bypass this ingress must mirror
+# the path deny for /api/internal/infrastructure-metering at their edge.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullName }}-block-public-infra-metering
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      - 127.0.0.99/32
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-api-ingress-blocked-infra-metering
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.priority: "120"
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-block-public-infra-metering@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $apiHost }}
+      secretName: {{ $fullName }}-api-tls
+  {{- end }}
+  rules:
+    - host: {{ $apiHost }}
+      http:
+        paths:
+          - path: /api/internal/infrastructure-metering
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+{{- if and .Values.auth.bff.sameOriginApi (ne $cockpitHost $apiHost) }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-cockpit-ingress-blocked-infra-metering
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.priority: "120"
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-block-public-infra-metering@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $cockpitHost }}
+      secretName: {{ $fullName }}-cockpit-tls
+  {{- end }}
+  rules:
+    - host: {{ $cockpitHost }}
+      http:
+        paths:
+          - path: /api/internal/infrastructure-metering
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+{{- end }}
 {{- end }}
 {{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
 ---
@@ -297,6 +511,54 @@ spec:
                 name: {{ $fullName }}-opencloud
                 port:
                   number: 9200
+---
+{{- end }}
+{{- if and .Values.nextcloud.enabled .Values.nextcloud.internal (not .Values.opencloud.enabled) }}
+# Nextcloud (cloud storage) — same $cloudHost as the OpenCloud Ingress above,
+# so the two are mutually exclusive. The `not opencloud.enabled` guard mirrors
+# the MAIN_CLOUD_BACKEND precedence in configmap.yaml (opencloud wins when both
+# are on); without it a both-enabled values file would render two Ingresses
+# claiming one host and Traefik would pick a winner arbitrarily.
+# Only the bundled backend gets an Ingress: with `internal: false` the
+# Nextcloud lives outside the release and brings its own routing.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-nextcloud-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $cloudHost }}
+      secretName: {{ $fullName }}-nextcloud-tls
+  {{- end }}
+  rules:
+    - host: {{ $cloudHost }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-nextcloud
+                port:
+                  number: 80
 ---
 {{- end }}
 {{- if and .Values.databases.neo4j.enabled .Values.databases.neo4j.browser.enabled }}
@@ -425,48 +687,6 @@ spec:
                   number: 5050
 ---
 {{- end }}
-{{- if .Values.mongoExpress.enabled }}
-# Mongo Express (MongoDB admin UI)
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {{ $fullName }}-mongo-ingress
-  labels:
-    {{- include "srw.componentLabels" (dict "context" . "component" "mongo-express") | nindent 4 }}
-  annotations:
-    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
-    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
-    {{- end }}
-    {{- if .Values.ingress.tls.enabled }}
-    traefik.ingress.kubernetes.io/router.entrypoints: websecure
-    traefik.ingress.kubernetes.io/router.tls: "true"
-    {{- else }}
-    traefik.ingress.kubernetes.io/router.entrypoints: web
-    {{- end }}
-    {{- with .Values.ingress.annotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-spec:
-  ingressClassName: {{ .Values.ingress.className }}
-  {{- if .Values.ingress.tls.enabled }}
-  tls:
-    - hosts:
-        - {{ $mongoHost }}
-      secretName: {{ $fullName }}-mongo-tls
-  {{- end }}
-  rules:
-    - host: {{ $mongoHost }}
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ $fullName }}-mongo-express
-                port:
-                  number: 8081
----
-{{- end }}
 {{- if .Values.mcp.enabled }}
 # MCP Server (Claude Code integration)
 apiVersion: networking.k8s.io/v1
@@ -580,6 +800,9 @@ spec:
       - "X-Admin-View-As"
     accessControlAllowOriginList:
       - {{ include "srw.cockpitUrl" . | quote }}
+      {{- range .Values.ingress.cors.additionalOrigins | default list }}
+      - {{ . | quote }}
+      {{- end }}
     accessControlMaxAge: 86400
 {{- end }}
 {{- end }}

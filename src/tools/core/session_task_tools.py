@@ -6,7 +6,7 @@ no minimum/maximum constraints, and no archiving.
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal
 
 from langchain_core.tools import tool
 
@@ -51,7 +51,9 @@ def create_session_task_tools(context: ToolContext) -> List[Any]:
         raise ValueError("ToolContext must have a session_task_manager for task tools")
 
     @tool
-    def task_add(description: str, priority: str = "medium") -> str:
+    async def task_add(
+        description: str, priority: Literal["high", "medium", "low"] = "medium"
+    ) -> str:
         """Add a task to track during this session.
 
         Use this to organize your work into discrete steps the user can
@@ -66,13 +68,16 @@ def create_session_task_tools(context: ToolContext) -> List[Any]:
         """
         if not description.strip():
             return "Error: description cannot be empty."
+        # Backstop for non-LLM callers; the Literal above stops the model from
+        # getting here. Kept silent (rather than an error) to preserve existing
+        # behaviour for anything already relying on the coercion.
         if priority not in ("high", "medium", "low"):
             priority = "medium"
-        task = task_mgr.add(description.strip(), priority)
+        task = await task_mgr.add(description.strip(), priority)
         return f"Added {task.id}: {task.description}\n\n{task_mgr.format_for_display()}"
 
     @tool
-    def task_complete(task_id: str, notes: str = "") -> str:
+    async def task_complete(task_id: str, notes: str = "") -> str:
         """Mark a session task as completed.
 
         Args:
@@ -82,13 +87,13 @@ def create_session_task_tools(context: ToolContext) -> List[Any]:
         Returns:
             Updated task list, or error if task not found.
         """
-        task = task_mgr.complete(task_id.strip(), notes.strip())
+        task = await task_mgr.complete(task_id.strip(), notes.strip())
         if not task:
             return f"Error: task '{task_id}' not found or already completed."
         return f"Completed {task.id}: {task.description}\n\n{task_mgr.format_for_display()}"
 
     @tool
-    def task_list() -> str:
+    async def task_list() -> str:
         """List all session tasks with their status.
 
         Returns:

@@ -4,8 +4,8 @@ Today an admin can configure a provider key, skip Admin → Models entirely,
 create a session, and hit a 503/401 on first turn because no chat-capability
 catalog row exists. This module computes the readiness signal that:
 
-- Powers the cockpit's three-step onboarding checklist (provider →
-  models → defaults pinned).
+- Powers the cockpit's onboarding checklist (provider → models → model defaults
+  pinned → application expert defaults selected).
 - Gates ``POST /api/jobs`` and ``POST /api/persistent/threads`` with a
   503 when one of the three required capabilities is missing.
 
@@ -23,16 +23,18 @@ an obvious cause.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 # Capabilities that *must* be ready before the cockpit releases. Aligns
-# with docs/features/models_yaml_removal.md §"Role-completeness gate".
+# with knowledge-base/knowledge/features/models_yaml_removal.md §"Role-completeness gate".
 REQUIRED_CAPABILITIES = ("chat", "embedding", "auxiliary")
 
 # Optional capabilities — surfaced in the readiness payload so the cockpit
 # can show "vision is missing → falls back to chat" hints, but they don't
 # block the gate.
 OPTIONAL_CAPABILITIES = ("vision", "whisper", "tts")
+REQUIRED_EXPERT_DEFAULTS = ("worker", "session")
 
 # When ``llm.fallback_optional_capabilities_to_chat`` is true (the default),
 # missing ``vision`` resolves to the configured chat model and audio
@@ -46,10 +48,10 @@ async def compute_readiness(db: Any) -> dict[str, Any]:
 
     Returns:
         ``{ready, missing_providers, missing_capabilities, missing_defaults,
-        optional_capability_fallbacks}``.
+        missing_expert_defaults, optional_capability_fallbacks}``.
 
-        - ``ready`` is False iff any required capability is missing
-          rows or a default pin.
+        - ``ready`` is False iff any required capability is missing rows, a
+          model default pin, or an application expert default.
         - ``missing_providers`` is non-empty only when *no* provider is
           configured at all (the existing onboarding gate's signal).
         - ``optional_capability_fallbacks`` carries the per-capability
@@ -85,13 +87,39 @@ async def compute_readiness(db: Any) -> dict[str, Any]:
 
     missing_providers: list[str] = [] if has_any_provider else ["any"]
 
-    ready = has_any_provider and not missing_capabilities and not missing_defaults
+    missing_expert_defaults: list[str] = []
+    if os.getenv("EXPERTS_DB_ENABLED", "true").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    ):
+        # The query joins the pointer to its expert row, so a missing/corrupt
+        # target is reported the same way as an absent pointer. Startup seeds
+        # both slots; this check catches runtime/operator drift afterward.
+        expert_defaults = await db.list_application_expert_defaults()
+        configured_types = {
+            str(row.get("expert_type") or row.get("default_type"))
+            for row in expert_defaults
+        }
+        missing_expert_defaults = [
+            expert_type
+            for expert_type in REQUIRED_EXPERT_DEFAULTS
+            if expert_type not in configured_types
+        ]
+
+    ready = (
+        has_any_provider
+        and not missing_capabilities
+        and not missing_defaults
+        and not missing_expert_defaults
+    )
 
     return {
         "ready": ready,
         "missing_providers": missing_providers,
         "missing_capabilities": missing_capabilities,
         "missing_defaults": missing_defaults,
+        "missing_expert_defaults": missing_expert_defaults,
         "optional_capability_fallbacks": optional_fallbacks,
     }
 
@@ -125,6 +153,7 @@ def gate_error_detail(readiness: dict[str, Any]) -> dict[str, Any]:
         "missing_providers": readiness.get("missing_providers", []),
         "missing_capabilities": readiness.get("missing_capabilities", []),
         "missing_defaults": readiness.get("missing_defaults", []),
+        "missing_expert_defaults": readiness.get("missing_expert_defaults", []),
         "message": _build_message(readiness),
     }
 
@@ -139,10 +168,13 @@ def _build_message(readiness: dict[str, Any]) -> str:
     if readiness.get("missing_defaults"):
         caps = ", ".join(readiness["missing_defaults"])
         parts.append(f"pin a default model for: {caps}")
+    if readiness.get("missing_expert_defaults"):
+        expert_types = ", ".join(readiness["missing_expert_defaults"])
+        parts.append(f"select an application default expert for: {expert_types}")
     if not parts:
         return "System ready."
     return (
         "System not ready — "
         + "; ".join(parts)
-        + ". Visit Admin → Providers → Defaults to finish setup."
+        + ". Visit the relevant Admin settings to finish setup."
     )

@@ -1,4 +1,4 @@
-"""Phase 1 of docs/issues/persistent_session_midturn_message_loss.md.
+"""Phase 1 of knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md.
 
 The persistent agent now writes thread_messages straight through its own pool
 (``PostgresDB.save_thread_message``) instead of hopping through the orchestrator
@@ -120,3 +120,83 @@ def test_coerce_row_id_passthrough_and_stability():
     minted = _coerce_row_id(None)
     uuid.UUID(minted)
     assert minted != _coerce_row_id(None)
+
+
+# ---------------------------------------------------------------------------
+# HF-2: save_thread_messages — the turn-complete reconcile batches into one
+# pipelined executemany + a single threads bump (was N serial upserts).
+# ---------------------------------------------------------------------------
+
+
+def _fake_db_batch():
+    """A PostgresDB whose ``acquire()`` yields a fake conn with a transaction()."""
+    db = PostgresDB.__new__(PostgresDB)
+    conn = AsyncMock()
+    conn.executemany = AsyncMock()
+    conn.execute = AsyncMock()
+    tx = MagicMock()
+    tx.__aenter__ = AsyncMock(return_value=None)
+    tx.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=conn)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    db.acquire = MagicMock(return_value=cm)
+    return db, conn
+
+
+@pytest.mark.asyncio
+async def test_batch_upserts_all_rows_in_one_executemany():
+    db, conn = _fake_db_batch()
+    rows = [
+        {
+            "id": "m1",
+            "role": "ai",
+            "content": "a",
+            "tool_calls": None,
+            "turn_number": 3,
+            "metrics": {"tokens": 1},
+            "tool_call_id": None,
+            "thinking": None,
+        },
+        {
+            "id": "22222222-2222-2222-2222-222222222222",
+            "role": "tool",
+            "content": "b",
+            "tool_calls": None,
+            "turn_number": 3,
+            "metrics": None,
+            "tool_call_id": "tc1",
+            "thinking": None,
+        },
+    ]
+    await db.save_thread_messages("t1", rows)
+
+    # ONE pipelined executemany for the whole turn (not N fetchrow calls).
+    conn.executemany.assert_awaited_once()
+    conn.fetchrow.assert_not_called()
+    sql = " ".join(conn.executemany.call_args[0][0].split())
+    assert "ON CONFLICT (id) DO UPDATE" in sql, "must upsert onto the incremental row"
+    assert "RETURNING" not in sql, "batch upsert needs no RETURNING (seq unread)"
+
+    argslist = conn.executemany.call_args[0][1]
+    assert len(argslist) == 2
+    uuid.UUID(argslist[0][0])  # non-UUID 'm1' coerced to a valid UUID PK
+    assert argslist[1][0] == "22222222-2222-2222-2222-222222222222"  # passthrough
+    # metrics JSON-encoded into the args (7th positional, index 6).
+    assert argslist[0][6] == '{"tokens": 1}'
+    assert argslist[1][6] is None  # tool row carries no metrics
+
+    # ONE threads bump for the whole batch, with max(turn_number) bound.
+    conn.execute.assert_awaited_once()
+    upd = " ".join(conn.execute.call_args[0][0].split())
+    assert "UPDATE threads" in upd and "total_turns" in upd
+    assert conn.execute.call_args[0][2] == 3
+
+
+@pytest.mark.asyncio
+async def test_batch_empty_is_noop():
+    db, conn = _fake_db_batch()
+    await db.save_thread_messages("t1", [])
+    conn.executemany.assert_not_called()
+    conn.execute.assert_not_called()

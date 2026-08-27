@@ -1,0 +1,118 @@
+name: postgres-operand-check
+
+# Weekly freshness check for the CloudNativePG operand image the data tier
+# runs on. Not a rebuild: the image is CloudNativePG's, not ours -- it already
+# bundles pgvector, uuid-ossp and btree_gist, so there is nothing for us to
+# build. What can go stale is the PIN.
+#
+# The pin is deliberate. `spec.imageName` is part of the CloudNativePG Cluster
+# spec, so a floating tag would roll every Postgres cluster in the fleet
+# whenever upstream publishes. That means a patch release cannot be picked up
+# automatically -- somebody has to decide when the databases restart. This job
+# makes sure that decision is prompted rather than forgotten.
+#
+# Checks BOTH release channels (matrix), because main and develop pin
+# independently and can legitimately diverge.
+#
+# NOTE: GitHub only fires `schedule` from the DEFAULT branch (main), so the
+# weekly cron uses main's copy of this file -- the matrix must be present on
+# main for the develop leg to run on schedule. `workflow_dispatch --ref <b>`
+# uses branch <b>'s copy. Same constraint as stage1-rebuild.yml.
+
+on:
+  schedule:
+    # Mondays 06:30 UTC, just after stage1-rebuild so the two do not collide.
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  check-operand-freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [main, develop]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+
+      - name: Compare the pinned operand against upstream
+        run: |
+          set -euo pipefail
+
+          PINNED=$(yq -r '.databases.postgres.cnpgImage' helm/values.yaml)
+          if [ "$PINNED" = "null" ] || [ -z "$PINNED" ]; then
+            echo "::notice::${{ matrix.ref }} pins no operand image; nothing to check"
+            exit 0
+          fi
+          REPO="${PINNED%:*}"; TAG="${PINNED##*:}"; MAJOR="${TAG%%.*}"
+
+          # Every database must agree, or a bump would silently leave one behind.
+          MISMATCHED=$(yq -r '
+            .databases | to_entries
+            | map(select(.value.cnpgImage != null and .value.cnpgImage != ""))
+            | map(select(.value.cnpgImage != "'"$PINNED"'"))
+            | map(.key) | join(", ")
+          ' helm/values.yaml)
+          if [ -n "$MISMATCHED" ]; then
+            echo "::warning::${{ matrix.ref }}: these databases pin a different operand than postgres: ${MISMATCHED}"
+          fi
+
+          # Ask the IMAGE, not the tag list. GHCR caps tags/list at 1000 entries
+          # with no Link header, so enumerating "${MAJOR}.x" silently misses the
+          # newest ones -- it reported 16.4 as newest while 16.15 was pinned,
+          # i.e. it would have advised a downgrade every week. The floating
+          # "${MAJOR}" tag always points at the newest patch, so resolve that
+          # and read the version out of it.
+          UPSTREAM=$(docker run --rm "${REPO}:${MAJOR}" postgres --version | awk '{print $3}')
+
+          # Upstream dropping a bundled extension would break the vector cluster
+          # at the next bump, and nothing else would notice until a query failed.
+          VECTOR=$(docker run --rm "${REPO}:${MAJOR}" sh -c \
+            'grep -h default_version /usr/share/postgresql/*/extension/vector.control 2>/dev/null' \
+            | tr -d " '"'"'" | cut -d= -f2 || true)
+
+          {
+            echo "### Operand freshness — \`${{ matrix.ref }}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| pinned | \`${TAG}\` |"
+            echo "| newest \`${MAJOR}\` upstream | \`${UPSTREAM}\` |"
+            echo "| pgvector upstream | \`${VECTOR:-ABSENT}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$VECTOR" ]; then
+            echo "::error::${REPO}:${MAJOR} no longer bundles pgvector. The vector database depends on it being in the operand -- do NOT bump the pin until this is resolved."
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "**pgvector is missing from the upstream operand.** Do not bump." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "$TAG" = "$UPSTREAM" ]; then
+            echo "up to date at ${TAG}"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "Up to date." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # A warning, not a failure. This stays true every week between a
+          # release and the window that takes it, and a job that is red for a
+          # fortnight by design teaches people to ignore it.
+          echo "::warning::${{ matrix.ref }} pins PostgreSQL ${TAG}; ${UPSTREAM} is available. Bump databases.*.cnpgImage in helm/values.yaml -- every cluster rolls when you do, so schedule it."
+          {
+            echo
+            echo "**A newer patch release is available.** Bump \`databases.*.cnpgImage\`"
+            echo "in \`helm/values.yaml\`; all five must move together."
+            echo
+            echo "Every Postgres cluster performs a rolling restart when this changes,"
+            echo "so take it in a window rather than alongside unrelated work."
+          } >> "$GITHUB_STEP_SUMMARY"

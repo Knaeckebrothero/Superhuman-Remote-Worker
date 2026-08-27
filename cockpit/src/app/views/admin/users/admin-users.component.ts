@@ -1,7 +1,7 @@
-import {ChangeDetectionStrategy, Component, computed, inject, OnInit} from '@angular/core';
+import {ChangeDetectionStrategy, Component, computed, effect, inject, OnInit, signal} from '@angular/core';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AdminUsersService} from '../../../core/services/admin-users.service';
-import {UserService} from '../../../core/services/user.service';
+import {NotificationService} from '../../../core/services/notification.service';
 import {User} from '../../../core/models/api.model';
 import {AppCheckboxComponent} from '../../../ui/checkbox';
 import {AppBadgeComponent} from '../../../ui/badge';
@@ -53,31 +53,84 @@ import {AppBadgeComponent} from '../../../ui/badge';
           <h2 class="section-title">Users</h2>
           <p class="section-desc">
             Admins always have VM access. Non-admins need an explicit grant.
+            New registrants stay pending until an admin approves them.
           </p>
 
-          @if (admin.users().length > 0) {
+          <div class="user-toolbar">
+            <div class="filters">
+              <button
+                type="button"
+                class="filter-chip"
+                [class.active]="filter() === 'all'"
+                (click)="setFilter('all')"
+              >
+                All ({{ admin.users().length }})
+              </button>
+              <button
+                type="button"
+                class="filter-chip"
+                [class.active]="filter() === 'pending'"
+                (click)="setFilter('pending')"
+              >
+                Pending ({{ pendingCount() }})
+              </button>
+            </div>
+            @if (selectedCount() > 0) {
+              <button type="button" class="approve-btn" (click)="approveSelected()">
+                Approve selected ({{ selectedCount() }})
+              </button>
+            }
+          </div>
+
+          @if (filteredUsers().length > 0) {
             <div class="user-table">
               <div class="user-header">
+                <span class="col-select"></span>
                 <span class="col-name">Name</span>
                 <span class="col-email">Email</span>
+                <span class="col-status">Status</span>
                 <span class="col-flag">Admin</span>
                 <span class="col-flag">VM</span>
               </div>
-              @for (u of admin.users(); track u.id) {
+              @for (u of filteredUsers(); track u.id) {
                 <div class="user-row">
+                  <span class="col-select">
+                    @if (!u.is_approved) {
+                      <app-checkbox
+                        size="sm"
+                        [checked]="isSelected(u)"
+                        [ariaLabel]="'Select ' + u.display_name + ' for approval'"
+                        (changed)="toggleSelect(u, $event)"
+                      />
+                    }
+                  </span>
                   <span class="col-name">
                     <span class="dot" [style.background]="u.avatar_color"></span>
                     {{ u.display_name }}
                   </span>
                   <span class="col-email mono">{{ u.email || '-' }}</span>
+                  <span class="col-status">
+                    @if (u.is_approved) {
+                      <app-badge
+                        tone="success"
+                        size="xs"
+                        appearance="subtle"
+                        [title]="u.approved_at ? 'Approved ' + formatDate(u.approved_at) : 'Approved'"
+                        >Approved</app-badge
+                      >
+                    } @else {
+                      <app-badge tone="warning" size="xs" appearance="solid"
+                        >Pending</app-badge
+                      >
+                    }
+                  </span>
                   <span class="col-flag">
                     <app-checkbox
                       size="sm"
                       [checked]="!!u.is_admin"
-                      [disabled]="isSelf(u)"
+                      [disabled]="true"
                       [ariaLabel]="'Admin: ' + u.display_name"
-                      [title]="isSelf(u) ? 'You cannot clear your own admin flag' : ''"
-                      (changed)="toggleAdmin(u, $event)"
+                      [title]="'Admin role is managed in Keycloak'"
                     />
                   </span>
                   <span class="col-flag">
@@ -94,7 +147,13 @@ import {AppBadgeComponent} from '../../../ui/badge';
               }
             </div>
           } @else {
-            <p class="empty-state">No users loaded.</p>
+            <p class="empty-state">
+              @if (filter() === 'pending') {
+                No pending users.
+              } @else {
+                No users loaded.
+              }
+            </p>
           }
         </section>
       </div>
@@ -108,7 +167,7 @@ import {AppBadgeComponent} from '../../../ui/badge';
     }
     .admin-page {
       padding: 32px;
-      max-width: 900px;
+      max-width: var(--content-max-width);
       margin: 0 auto;
       color: var(--text-primary);
     }
@@ -169,14 +228,62 @@ import {AppBadgeComponent} from '../../../ui/badge';
       border-radius: var(--radius-surface);
       overflow: hidden;
     }
+    .user-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .filters {
+      display: inline-flex;
+      gap: 6px;
+    }
+    .filter-chip {
+      border: 1px solid var(--border-color);
+      background: var(--surface-0);
+      color: var(--text-muted);
+      border-radius: var(--radius-surface);
+      padding: 4px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .filter-chip.active {
+      background: var(--accent-color);
+      color: var(--on-accent);
+      border-color: var(--accent-color);
+    }
+    .approve-btn {
+      border: 1px solid var(--accent-color);
+      background: var(--accent-color);
+      color: var(--on-accent);
+      border-radius: var(--radius-surface);
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .approve-btn:hover {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
     .user-header,
     .user-row {
       display: grid;
-      grid-template-columns: 1.5fr 1.8fr 80px 80px;
+      grid-template-columns: 32px 1.4fr 1.6fr 110px 70px 70px;
       padding: 10px 14px;
       gap: 8px;
       align-items: center;
       font-size: 13px;
+    }
+    .col-select,
+    .col-status {
+      display: flex;
+      align-items: center;
+    }
+    .col-select {
+      justify-content: center;
     }
     .user-header {
       background: var(--surface-0);
@@ -202,36 +309,137 @@ import {AppBadgeComponent} from '../../../ui/badge';
       padding: 20px;
       font-size: 13px;
     }
+    @media (max-width: 720px) {
+      /* The Users table is a 6-col grid (32px 1.4fr 1.6fr 110px 70px 70px) —
+         the ~282px of fixed columns alone overflow a phone, and
+         .user-table{overflow:hidden} clips the Admin/VM toggles off-screen
+         with no scrollbar. Re-grid each row into a self-contained card.
+         Desktop (>720px) keeps the table unchanged. */
+      .user-header {
+        display: none;
+      }
+      .user-row {
+        grid-template-columns: auto 1fr auto;
+        column-gap: 8px;
+        row-gap: 8px;
+        padding: 12px 14px;
+      }
+      .col-select {
+        grid-row: 1;
+        grid-column: 1;
+      }
+      .col-name {
+        grid-row: 1;
+        grid-column: 2;
+        font-weight: 600;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      .col-status {
+        grid-row: 1;
+        grid-column: 3;
+        justify-self: end;
+      }
+      .col-email {
+        grid-row: 2;
+        grid-column: 1 / -1;
+      }
+      /* The two flag toggles become full-width settings-list rows. The header
+         row that labelled them is hidden on mobile, so re-introduce visible
+         labels via ::before (5th child = Admin, 6th = VM). */
+      .user-row > .col-flag {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding-top: 8px;
+        border-top: 1px solid var(--border-color);
+        font-size: 13px;
+        color: var(--text-primary);
+      }
+      .user-row > .col-flag:nth-child(5) {
+        grid-row: 3;
+      }
+      .user-row > .col-flag:nth-child(5)::before {
+        content: 'Admin access';
+      }
+      .user-row > .col-flag:nth-child(6) {
+        grid-row: 4;
+      }
+      .user-row > .col-flag:nth-child(6)::before {
+        content: 'VM access';
+      }
+      /* Let the Approve button wrap below the filters instead of squeezing. */
+      .user-toolbar {
+        flex-wrap: wrap;
+      }
+    }
   `],
 })
 export class AdminUsersComponent implements OnInit {
   protected readonly admin = inject(AdminUsersService);
-  private readonly users = inject(UserService);
+  private readonly notifications = inject(NotificationService);
 
-  readonly selfId = computed(() => this.users.currentUser()?.id ?? null);
+  /** Refresh the table live when a user_registered SSE frame arrives. */
+  private readonly _onUserRegistered = effect(() => {
+    if (this.notifications.adminUserRegistered()) {
+      this.admin.loadUsers();
+    }
+  });
+
+  /** Table filter: all users vs. only those awaiting approval. */
+  readonly filter = signal<'all' | 'pending'>('all');
+  /** Ids checked for the next "Approve selected" batch. */
+  readonly selectedIds = signal<Set<string>>(new Set());
+
+  readonly pendingCount = computed(
+    () => this.admin.users().filter((u) => !u.is_approved).length,
+  );
+  readonly filteredUsers = computed(() => {
+    const rows = this.admin.users();
+    return this.filter() === 'pending'
+      ? rows.filter((u) => !u.is_approved)
+      : rows;
+  });
+  readonly selectedCount = computed(() => this.selectedIds().size);
 
   ngOnInit(): void {
     this.admin.loadUsers();
     this.admin.loadVmWorkspaces();
   }
 
-  isSelf(u: User): boolean {
-    return u.id === this.selfId();
+  isSelected(u: User): boolean {
+    return this.selectedIds().has(u.id);
+  }
+
+  setFilter(f: 'all' | 'pending'): void {
+    this.filter.set(f);
+  }
+
+  toggleSelect(u: User, checked: boolean): void {
+    const next = new Set(this.selectedIds());
+    if (checked) {
+      next.add(u.id);
+    } else {
+      next.delete(u.id);
+    }
+    this.selectedIds.set(next);
+  }
+
+  approveSelected(): void {
+    const ids = [...this.selectedIds()];
+    if (ids.length === 0) {
+      return;
+    }
+    this.admin.approveUsers(ids).subscribe({
+      next: () => this.selectedIds.set(new Set()),
+      error: () => this.admin.loadUsers(),
+    });
   }
 
   setKillSwitch(enabled: boolean): void {
     this.admin.setVmWorkspacesEnabled(enabled).subscribe({
       error: () => this.admin.loadVmWorkspaces(),
-    });
-  }
-
-  toggleAdmin(u: User, checked: boolean): void {
-    if (this.isSelf(u) && !checked) {
-      this.admin.loadUsers();
-      return;
-    }
-    this.admin.patchUser(u.id, {is_admin: checked}).subscribe({
-      error: () => this.admin.loadUsers(),
     });
   }
 

@@ -4,27 +4,39 @@ This module provides completion signaling tools:
 - mark_complete: Signals that a task/phase is complete (used by phase transitions)
 - job_complete: Marks the phase as final, job completes after remaining todos are done
 
-The job_complete tool implements a final phase pattern:
+The job_complete tool implements a final phase pattern (journal-before-observe,
+knowledge-base/knowledge/issues/job_finalization_decisions_held_only_in_process_memory.md):
 1. Rejects if called from tactical phase (must be in strategic phase)
-2. Sets is_final_phase=True in state
-3. Agent completes remaining strategic todos (summarize, update workspace/plan)
-4. When all todos complete, on_strategic_phase_complete detects final phase and freezes job
+2. Durably journals the decision on the job row (orchestrator POST, idempotent
+   on (job_id, tool_call_id)) BEFORE returning to the model
+3. Caches the decision in ``_final_phase_data`` (process cache, not the
+   source of truth); the audited tool node mirrors it into graph state
+   (``is_final_phase=True`` + ``completion_decision``) so a checkpoint that
+   contains the tool result also contains the decision
+4. Agent completes remaining strategic todos (summarize, update plan)
+5. When all todos complete, on_strategic_phase_complete detects the final
+   phase and freezes the job
 """
 
 import json
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import uuid as _uuid
+from datetime import datetime, timezone
+from typing import Annotated, Any, Dict, List, Optional
 
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolCallId, tool
 
+from ...core.workspace_backend import WorkspaceUnavailableError
 from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
 
-# Global storage for final phase data (set by job_complete, used by finalize_job)
-# This is necessary because tools can't directly modify state, but phase.py can read this
+# Process-level CACHE of the final phase data (set by job_complete, read by
+# finalize_job). The durable record lives on the job row
+# (``jobs.context.completion_decision``, written through the orchestrator
+# before the tool returns); this dict only saves the common no-restart case a
+# DB round-trip. Re-seeded on resume by agent-side hydration.
 _final_phase_data: Dict[str, Dict[str, Any]] = {}
 
 
@@ -118,6 +130,11 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             # Return message that triggers completion detection
             return f"Wrote file: output/completion.json - Task complete. Summary: {summary}"
 
+        except WorkspaceUnavailableError:
+            # Same lifecycle-signal rule as job_complete below: this tool also
+            # writes to the workspace, so a dead VM must propagate rather than
+            # become a result string. (Defect 8)
+            raise
         except Exception as e:
             logger.error(f"Failed to mark complete: {e}")
             return f"Error marking complete: {str(e)}"
@@ -128,6 +145,8 @@ def create_job_tools(context: ToolContext) -> List[Any]:
         deliverables: List[str],
         confidence: float = 1.0,
         notes: Optional[str] = None,
+        evidence: Optional[List[Dict[str, str]]] = None,
+        tool_call_id: Annotated[Optional[str], InjectedToolCallId] = None,
     ) -> str:
         """Signal that the job is complete and ready for human review.
 
@@ -143,6 +162,12 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             deliverables: List of ALL output files created during the job
             confidence: Overall confidence the job is truly complete (0.0-1.0, default 1.0)
             notes: Optional notes about limitations, edge cases, or recommendations
+            evidence: Optional declared evidence entries for supervision review.
+                Each entry: {"kind": "test_report"|"screenshot"|"change_summary",
+                "label": "<short label>", "media_type": "<MIME type>",
+                "source": "<workspace-relative committed file path>"}. The
+                orchestrator resolves each path at the completion commit and
+                publishes it in the job's bounded evidence manifest.
 
         Returns:
             Confirmation that phase is marked as final, or error if in tactical phase
@@ -180,22 +205,43 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             # Validate confidence
             confidence = max(0.0, min(1.0, confidence))
 
-            # Validation gate: cross-check deliverables before accepting
+            # Validation gate: cross-check deliverables before accepting.
+            # Paths are NORMALIZED, not pedantically matched (F14): a missing
+            # or extra `repo/` prefix (or `./`) must never fail a seal when the
+            # file exists under either spelling — that exact rejection forced a
+            # COMPLETE job (58027ee7) into a 0.45 honest-floor seal.
+            # knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md
+            from ...core.deliverables import (
+                KB_DELIVERABLE_PREFIX,
+                resolve_workspace_deliverable,
+            )
+
             validation_warnings = []
 
             # Check that listed deliverables exist and are non-empty
             for deliverable in deliverables:
-                if not workspace.exists(deliverable):
+                resolved, found = resolve_workspace_deliverable(workspace, deliverable)
+                if resolved and resolved.startswith(KB_DELIVERABLE_PREFIX):
+                    # Knowledge-note deliverable — verified server-side by the
+                    # orchestrator's gate, not against the workspace.
+                    continue
+                if not found:
                     validation_warnings.append(
                         f"Deliverable '{deliverable}' does not exist"
                     )
                 else:
                     try:
-                        content = workspace.read_file(deliverable)
+                        content = workspace.read_file(resolved)
                         if len(content.strip()) < 50:
                             validation_warnings.append(
                                 f"Deliverable '{deliverable}' appears empty or trivial ({len(content)} bytes)"
                             )
+                    except WorkspaceUnavailableError:
+                        # Not a "bad deliverable" — the whole workspace is gone.
+                        # Degrading it to a validation warning would report the
+                        # job's own output as unreadable and reject its
+                        # completion. Propagate. (Defect 8)
+                        raise
                     except Exception:
                         validation_warnings.append(
                             f"Deliverable '{deliverable}' could not be read"
@@ -211,15 +257,67 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                     "the issues. Re-call job_complete after addressing these problems."
                 )
 
-            # Store final phase data for later use by finalize_job
+            # Build the decision record. tool_call_id is the idempotency
+            # discriminator; ToolNode injects the real one, direct invocations
+            # (tests, scripts) get a synthesized local id.
             final_data = {
                 "summary": summary,
                 "deliverables": deliverables,
                 "confidence": confidence,
                 "job_id": context.job_id,
+                "tool_call_id": tool_call_id or f"local-{_uuid.uuid4().hex[:12]}",
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
             }
             if notes:
                 final_data["notes"] = notes
+            # E4: declared evidence rides the freeze into the completion
+            # contract; the ORCHESTRATOR resolves/pins/measures each entry —
+            # nothing here is trusted beyond being a declaration.
+            if evidence:
+                final_data["evidence"] = [
+                    dict(entry) for entry in evidence if isinstance(entry, dict)
+                ][:20]
+
+            # Journal-before-observe: the decision must be durable BEFORE the
+            # model sees success. Nothing is cached locally until the
+            # orchestrator has committed it — a failure here reports
+            # NOT-recorded so the model can retry, never a false success.
+            client = getattr(context, "orchestrator_client", None)
+            if client is not None:
+                from ...api.orchestrator_client import CompletionDecisionError
+
+                try:
+                    journal = await client.record_completion_decision(
+                        job_id=context.job_id,
+                        tool_call_id=final_data["tool_call_id"],
+                        summary=summary,
+                        deliverables=deliverables,
+                        confidence=confidence,
+                        notes=notes,
+                    )
+                    if journal.get("replay"):
+                        logger.info(
+                            f"Completion decision for job {context.job_id} was "
+                            f"already journaled (tool_call_id="
+                            f"{final_data['tool_call_id']}) — replay no-op"
+                        )
+                except CompletionDecisionError as e:
+                    logger.error(
+                        f"Completion decision for job {context.job_id} could "
+                        f"NOT be journaled: {e}"
+                    )
+                    return (
+                        f"Error: the completion decision could NOT be durably "
+                        f"recorded ({e}). The job is NOT marked as final. "
+                        f"Re-call job_complete to retry; if this persists, "
+                        f"report the problem instead of proceeding."
+                    )
+            else:
+                logger.warning(
+                    f"job_complete for job {context.job_id}: no orchestrator "
+                    f"client — decision held in process memory only (NOT "
+                    f"crash-durable)"
+                )
 
             _final_phase_data[context.job_id] = final_data
 
@@ -250,6 +348,14 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                     "Once all todos are complete, the job will be frozen for human review."
                 )
 
+        except WorkspaceUnavailableError:
+            # A dead workspace is a LIFECYCLE signal, not a tool error. Swallowing
+            # it into a result string is what let job c6dd288d call job_complete
+            # five times over 13 minutes against an already-deleted VM before an
+            # unrelated tool finally let the exception propagate. Re-raise so the
+            # fast-freeze path classifies it.
+            # knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 8)
+            raise
         except Exception as e:
             logger.error(f"Failed to mark job as final: {e}")
             return f"Error marking job as final: {str(e)}"
@@ -282,3 +388,23 @@ def clear_final_phase_data(job_id: str) -> None:
     if job_id in _final_phase_data:
         del _final_phase_data[job_id]
         logger.debug(f"Cleared final phase data for job {job_id}")
+
+
+def seed_final_phase_data(job_id: str, decision: Dict[str, Any]) -> None:
+    """Re-seed the process cache from the durable record (resume hydration).
+
+    Called by the agent's resume path after fetching the journaled decision
+    from the orchestrator, so a restarted process finalizes with the recorded
+    decision instead of treating "I decided" as "no decision was made". Never
+    called on feedback resumes — those demand new work and void the decision.
+
+    Args:
+        job_id: The job ID to seed
+        decision: The journaled decision record
+    """
+    _final_phase_data[job_id] = dict(decision)
+    logger.info(
+        f"Hydrated completion decision for job {job_id} from the durable "
+        f"record (tool_call_id={decision.get('tool_call_id')}, "
+        f"recorded_at={decision.get('recorded_at')})"
+    )

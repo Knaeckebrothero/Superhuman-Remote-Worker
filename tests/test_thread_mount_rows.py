@@ -1,6 +1,6 @@
 """Unit tests for the thread-mount-row builders in ``orchestrator/main.py``.
 
-Phase 2 of ``docs/features/cloud_collaboration_model.md`` §9 introduces the
+Phase 2 of ``knowledge-base/knowledge/features/cloud_collaboration_model.md`` §9 introduces the
 ``project_default`` row shape — default projects mount the owner's cloud
 home at the workspace root rather than under ``projects/<slug>/``. These
 tests cover the builder helpers (``_build_thread_mount_rows`` and
@@ -14,6 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import main
+from main import _build_protected_cloud_mount
+
+
+_BACKEND_INSTANCE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_THREAD_ID = "11111111-1111-4111-8111-111111111111"
+_RUNTIME_GENERATION = "22222222-2222-4222-8222-222222222222"
+
 
 def _project(
     *, project_id: str, is_default: bool = False, name: str = "Project"
@@ -24,6 +32,7 @@ def _project(
         "name": name,
         "is_default": is_default,
         "main_cloud_backend": "opencloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
         "main_cloud_folder_handle": (
             "opencloud:drive-abc:" if not is_default else None
         ),
@@ -43,6 +52,7 @@ def _backend(*, initialized: bool = True, backend_id: str = "opencloud"):
     backend = MagicMock()
     backend.is_initialized = initialized
     backend.backend_id = backend_id
+    backend.backend_instance_id = _BACKEND_INSTANCE_ID
     backend.resolve_user_identity = AsyncMock(return_value="user-xyz")
     backend.get_user_home = AsyncMock(return_value=_user_home())
     backend.get_project_folder_webdav_url = MagicMock(
@@ -69,6 +79,17 @@ def _owner_user_record(*, keycloak_sub: str = "alice-keycloak-sub") -> dict:
     return {"id": "owner-uuid", "keycloak_sub": keycloak_sub}
 
 
+def _fake_db() -> MagicMock:
+    """Base postgres_db stand-in. The identity-cache methods always exist on
+    the real Database (services/cloud/identity.py reads them on every
+    resolve), so every fake needs awaitable stubs; tests override the rest.
+    """
+    db = MagicMock()
+    db.get_user_cloud_identity = AsyncMock(return_value={})
+    db.merge_user_cloud_identity = AsyncMock(return_value=True)
+    return db
+
+
 @pytest.mark.asyncio
 async def test_default_project_emits_user_home_row():
     """Default project → ``project_default`` row with target_path='' and
@@ -80,7 +101,7 @@ async def test_default_project_emits_user_home_row():
     project = _project(project_id="p-default", is_default=True, name="Default")
     backend = _backend()
 
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
     fake_db.get_user = AsyncMock(return_value=_owner_user_record())
     router = MagicMock()
@@ -111,7 +132,7 @@ async def test_default_project_no_owner_returns_none():
     from main import _build_default_project_mount_row
 
     project = _project(project_id="p", is_default=True)
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(return_value=[])
     fake_db.get_user = AsyncMock(return_value=None)
     router = MagicMock()
@@ -134,7 +155,7 @@ async def test_default_project_owner_missing_keycloak_sub_returns_none():
     from main import _build_default_project_mount_row
 
     project = _project(project_id="p", is_default=True)
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
     fake_db.get_user = AsyncMock(
         return_value={"id": "owner-uuid", "keycloak_sub": None}
@@ -161,7 +182,7 @@ async def test_default_project_user_home_unresolvable_returns_none():
     backend = _backend()
     backend.get_user_home = AsyncMock(return_value=None)
 
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(
         return_value=[_owner_member(email="bob@example.com", display_name="Bob")]
     )
@@ -183,7 +204,7 @@ async def test_default_project_backend_uninitialized_returns_none():
 
     project = _project(project_id="p", is_default=True)
     backend = _backend(initialized=False)
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(return_value=[])
     fake_db.get_user = AsyncMock(return_value=None)
     router = MagicMock()
@@ -207,7 +228,7 @@ async def test_build_thread_mount_rows_mixes_default_and_non_default():
 
     default_project = _project(project_id="p-default", is_default=True, name="My Home")
     other_project = _project(project_id="p-other", is_default=False, name="Alpha")
-    fake_db = MagicMock()
+    fake_db = _fake_db()
 
     async def get_project(pid: str):
         return {"p-default": default_project, "p-other": other_project}.get(pid)
@@ -253,6 +274,30 @@ async def test_project_ids_from_mounts_includes_project_default():
     assert _project_ids_from_mounts(rows) == ["p-default", "p-alpha"]
 
 
+@pytest.mark.asyncio
+async def test_thread_project_ids_preserves_scope_when_default_mount_is_unavailable():
+    """Logical connector scope must survive a failed cloud-home mount build."""
+    fake_db = _fake_db()
+    fake_db.list_thread_mounts = AsyncMock(return_value=[])
+    fake_db.get_thread = AsyncMock(
+        return_value={
+            "id": "thread-1",
+            "project_id": "p-default",
+            "metadata": {},
+        }
+    )
+    fake_db.replace_thread_mounts = AsyncMock()
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main._build_thread_mount_rows", AsyncMock(return_value=[])),
+    ):
+        project_ids = await main._thread_project_ids("thread-1")
+
+    assert project_ids == ["p-default"]
+    fake_db.replace_thread_mounts.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 — session-folder skip predicate
 # ---------------------------------------------------------------------------
@@ -273,6 +318,23 @@ def test_should_skip_session_folder_with_project_default_mount():
         }
     ]
     assert _should_skip_session_folder(rows) is True
+
+
+def test_rclone_driver_keeps_session_folder_fallback(monkeypatch):
+    """With the lazy mount driver enabled, keep the regular session folder
+    provisioned so unsupported user-home auth has a safe fallback.
+    """
+    from main import _should_skip_session_folder
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    rows = [
+        {
+            "mount_kind": "project_default",
+            "target_path": "",
+            "webdav_url": "https://nc.test/remote.php/dav/files/alice/",
+        }
+    ]
+    assert _should_skip_session_folder(rows) is False
 
 
 def test_should_skip_session_folder_with_non_default_project_mount():
@@ -365,6 +427,313 @@ def test_should_skip_session_folder_returns_true_on_first_usable_mount():
     assert _should_skip_session_folder(rows) is True
 
 
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_falls_back_to_session_folder(monkeypatch):
+    """If a default user-home row lacks safe rclone credentials, the rclone
+    payload uses the regular session folder instead of the eager home clone.
+    """
+    from main import _build_agent_cloud_mount
+    from services.cloud import (
+        CloudBackendError,
+        CloudBackendErrorKind,
+        RcloneMountSpec,
+    )
+
+    class Backend:
+        backend_id = "nextcloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(self, *, mount_kind, **kwargs):
+            if mount_kind != "session_folder":
+                raise CloudBackendError(
+                    CloudBackendErrorKind.NOT_SUPPORTED,
+                    "missing explicit user-home credentials",
+                    backend=self.backend_id,
+                )
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://nc.test/remote.php/dav/files/agent/session/",
+                    "vendor": "nextcloud",
+                    "user": "agent-service",
+                },
+                auth={"type": "basic", "password": "agent-pass"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    router = MagicMock()
+    router.for_thread.return_value = Backend()
+    router.for_backend_instance.return_value = Backend()
+    thread = {
+        "id": "thread-1",
+        "main_cloud_backend": "nextcloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
+        "main_cloud_session_handle": "sessions/thread-1",
+    }
+    rows = [
+        {
+            "id": "mount-home",
+            "mount_kind": "project_default",
+            "target_path": "",
+            "source_ref": "p-default",
+            "backend_id": "nextcloud",
+            "backend_instance_id": _BACKEND_INSTANCE_ID,
+            "cloud_handle": (
+                '{"backend":"nextcloud","native_id":"home:alice",'
+                '"vendor_meta":{"kind":"user_home","username":"alice"}}'
+            ),
+        }
+    ]
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=rows,
+            metadata={"vm": {"status": "ready", "ssh_host": "10.0.0.5"}},
+        )
+
+    assert payload is not None
+    assert payload["driver"] == "rclone"
+    assert payload["fallback"] is True
+    assert len(payload["mounts"]) == 1
+    mount = payload["mounts"][0]
+    assert mount["mount_kind"] == "session_folder"
+    assert mount["target_path"] == "/cloud/home"
+    assert mount["workspace_name"] == "home"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
+    from main import _build_agent_cloud_mount
+    from services.cloud import RcloneMountSpec
+
+    class Backend:
+        backend_id = "nextcloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(self, *, mount_kind, target_path, **kwargs):
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://nc.test/remote.php/dav/files/alice/",
+                    "vendor": "nextcloud",
+                    "user": "alice",
+                },
+                auth={"type": "basic", "password": "app-pass"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    router = MagicMock()
+    router.for_backend_instance.return_value = Backend()
+    rows = [
+        {
+            "id": "mount-home",
+            "mount_kind": "project_default",
+            "target_path": "",
+            "source_ref": "p-default",
+            "backend_id": "nextcloud",
+            "backend_instance_id": _BACKEND_INSTANCE_ID,
+            "cloud_handle": (
+                '{"backend":"nextcloud","native_id":"home:alice",'
+                '"vendor_meta":{"kind":"user_home","username":"alice"}}'
+            ),
+        }
+    ]
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            {"id": "thread-1"},
+            mount_rows=rows,
+            metadata={"vm": {"status": "ready", "ssh_host": "10.0.0.5"}},
+        )
+
+    assert payload is not None
+    assert payload["fallback"] is False
+    assert payload["mounts"][0]["mount_kind"] == "project_default"
+    assert payload["mounts"][0]["target_path"] == "/cloud/home"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_vm_runtime_is_readonly_and_public(monkeypatch):
+    """A cross-cluster VM runtime mounts read-only (root tier) and requests the
+    public WebDAV URL — the internal service URL isn't reachable from the vm
+    cluster (knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md)."""
+    from main import _build_agent_cloud_mount
+    from services.cloud import RcloneMountSpec
+
+    captured: dict = {}
+
+    class Backend:
+        backend_id = "opencloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(
+            self, *, mount_kind, target_path, access, prefer_public_url=False, **kwargs
+        ):
+            captured["access"] = access
+            captured["prefer_public_url"] = prefer_public_url
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://cloud.public.test/dav/spaces/d/",
+                    "vendor": "infinitescale",
+                },
+                auth={"type": "keycloak_client_credentials"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    router = MagicMock()
+    router.for_thread.return_value = Backend()
+    thread = {
+        "id": "t1",
+        "main_cloud_backend": "opencloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
+        "main_cloud_session_handle": "sessions/t1",
+    }
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata={"vm": {"status": "ready", "ssh_host": "100.64.0.5"}},
+        )
+
+    assert payload is not None
+    assert captured["prefer_public_url"] is True
+    assert captured["access"] == "read_only"
+    assert payload["mounts"][0]["access"] == "read_only"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_pod_runtime_is_readwrite_and_internal(
+    monkeypatch,
+):
+    """A same-cluster workspace pod keeps read-write + the internal URL (no
+    public-edge hairpin, works on local k3d)."""
+    from main import _build_agent_cloud_mount
+    from services.cloud import RcloneMountSpec
+
+    captured: dict = {}
+
+    class Backend:
+        backend_id = "opencloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(
+            self, *, mount_kind, target_path, access, prefer_public_url=False, **kwargs
+        ):
+            captured["access"] = access
+            captured["prefer_public_url"] = prefer_public_url
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "http://srw-opencloud:9200/dav/spaces/d/",
+                    "vendor": "infinitescale",
+                },
+                auth={"type": "keycloak_client_credentials"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    router = MagicMock()
+    router.for_thread.return_value = Backend()
+    thread = {
+        "id": "t1",
+        "main_cloud_backend": "opencloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
+        "main_cloud_session_handle": "sessions/t1",
+    }
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata={
+                "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"}
+            },
+        )
+
+    assert payload is not None
+    assert captured["prefer_public_url"] is False
+    assert captured["access"] == "read_write"
+    assert payload["mounts"][0]["access"] == "read_write"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_uses_container_runtime_by_default(monkeypatch):
+    from main import _build_agent_cloud_mount
+    from services.cloud import RcloneMountSpec
+
+    class Backend:
+        backend_id = "nextcloud"
+        is_initialized = True
+
+        async def build_rclone_mount_spec(self, *, mount_kind, target_path, **kwargs):
+            assert mount_kind == "session_folder"
+            assert target_path == "/cloud/home"
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={
+                    "url": "https://nc.test/remote.php/dav/files/agent/session/",
+                    "vendor": "nextcloud",
+                    "user": "agent-service",
+                },
+                auth={"type": "basic", "password": "agent-pass"},
+            )
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    router = MagicMock()
+    router.for_thread.return_value = Backend()
+    thread = {
+        "id": "thread-1",
+        "main_cloud_backend": "nextcloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
+        "main_cloud_session_handle": "sessions/thread-1",
+    }
+
+    with patch("main.main_cloud_router", router):
+        payload = await _build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata={
+                "workspace_container": {
+                    "status": "ready",
+                    "pod_ip": "10.42.0.10",
+                }
+            },
+        )
+
+    assert payload is not None
+    assert payload["driver"] == "rclone"
+    assert payload["fallback"] is False
+    assert payload["mounts"][0]["mount_kind"] == "session_folder"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_container_runtime_can_be_disabled(monkeypatch):
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.setenv("CLOUD_RCLONE_ALLOW_CONTAINER", "false")
+    payload = await _build_agent_cloud_mount(
+        {
+            "id": "thread-1",
+            "main_cloud_backend": "nextcloud",
+            "main_cloud_session_handle": "sessions/thread-1",
+        },
+        mount_rows=[],
+        metadata={
+            "workspace_container": {
+                "status": "ready",
+                "pod_ip": "10.42.0.10",
+            }
+        },
+    )
+
+    assert payload is None
+
+
 # ---------------------------------------------------------------------------
 # Phase 3a — multi-project mount path collision handling
 # ---------------------------------------------------------------------------
@@ -372,7 +741,7 @@ def test_should_skip_session_folder_returns_true_on_first_usable_mount():
 
 def _multi_project_db(projects: list[dict]) -> MagicMock:
     """Build a fake postgres_db that resolves each project_id to a row."""
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     table = {p["id"]: p for p in projects}
 
     async def get_project(pid: str):
@@ -564,3 +933,215 @@ async def test_collision_with_default_project_present():
     assert "projects/alpha-2" in paths
     # source_refs preserved in input order
     assert [r["source_ref"] for r in rows] == ["p-default", "p-1", "p-2"]
+
+
+def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():
+    row = {
+        "backend": "nextcloud",
+        "reader_id": "srw-reader-abc",
+        "credentials": "app-pass-xyz",
+        "webdav_url": "https://nc.internal/remote.php/dav/files/srw-reader-abc/Proj/",
+        "auth_kind": "basic",
+        "status": "active",
+    }
+    payload = _build_protected_cloud_mount(row, thread_id="thread-1")
+    assert payload["driver"] == "rclone"
+    assert payload["protected"] is True
+    # overlay layout obeys the snapshot placement rule (design §11.3)
+    ov = payload["overlay"]
+    assert ov["upper"].startswith("/home/agent-host/.overlay")
+    assert ov["work"] == "/home/agent-host/.overlay/work"
+    assert ov["merged"] == "/cloud/merged"
+    assert ov["lower"] == "/cloud/lower"
+    assert ov["quota_bytes"] == 8 * 1024**3
+    assert isinstance(ov["quota_bytes"], int)
+    # single RO lower mount, reader creds (NOT agent-service), read_only
+    assert len(payload["mounts"]) == 1
+    m = payload["mounts"][0]
+    assert m["access"] == "read_only"
+    assert m["target_path"] == "/cloud/lower"
+    assert m["source"]["config"]["url"] == row["webdav_url"]
+    assert m["source"]["config"]["user"] == "srw-reader-abc"
+    assert m["auth"] == {"type": "basic", "password": "app-pass-xyz"}
+    # tell the agent NOT to install workspace/cloud -> lower; the overlay owns it
+    assert payload["skip_workspace_links"] is True
+
+
+def test_protected_cloud_mount_none_for_inactive_or_non_nextcloud():
+    assert (
+        _build_protected_cloud_mount(
+            {"status": "revoked", "backend": "nextcloud"}, thread_id="t"
+        )
+        is None
+    )
+    assert (
+        _build_protected_cloud_mount(
+            {"status": "active", "backend": "opencloud"}, thread_id="t"
+        )
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# F1/F4 (B8 review) — _build_agent_cloud_mount fail-closed matrix for the
+# protected_cloud marker. The marker ALONE must route into the protected
+# branch; the branch must never fall through to the LIVE builders below it.
+# ---------------------------------------------------------------------------
+
+_ACTIVE_NC_ROW = {
+    "backend": "nextcloud",
+    "reader_id": "srw-reader-abc",
+    "credentials": "app-pass-xyz",
+    "webdav_url": "https://nc.internal/remote.php/dav/files/srw-reader-abc/Proj/",
+    "auth_kind": "basic",
+    "status": "active",
+    "runtime_generation": _RUNTIME_GENERATION,
+}
+
+# A live thread_mount row: if the protected branch ever fell through to the
+# live builders (the pre-fix bug), this would resolve to a real rw payload
+# instead of None/protected — every matrix case below asserts that never
+# happens regardless of what live rows are present.
+_LIVE_MOUNT_ROWS = [
+    {
+        "id": "mount-home",
+        "mount_kind": "project_default",
+        "target_path": "",
+        "source_ref": "p-default",
+        "backend_id": "nextcloud",
+        "cloud_handle": (
+            '{"backend":"nextcloud","native_id":"home:alice",'
+            '"vendor_meta":{"kind":"user_home","username":"alice"}}'
+        ),
+    }
+]
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_protected_marker_flag_off_returns_none(
+    monkeypatch,
+):
+    """(a) marker present + flag OFF -> None, never the live builders."""
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    with patch("main._is_protected_cloud_mode_enabled", return_value=False):
+        payload = await _build_agent_cloud_mount(
+            {
+                "id": _THREAD_ID,
+                "status": "active",
+                "runtime_generation": _RUNTIME_GENERATION,
+                "runtime_retirement_token": None,
+            },
+            mount_rows=_LIVE_MOUNT_ROWS,
+            metadata={
+                "protected_cloud": True,
+                "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
+            },
+        )
+    assert payload is None
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_protected_marker_vm_tier_returns_none(
+    monkeypatch,
+):
+    """(b) marker + flag ON + VM-ready metadata -> None (v1 is
+    container-runtime-only; the reader webdav_url is internal-only)."""
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    with patch("main._is_protected_cloud_mode_enabled", return_value=True):
+        payload = await _build_agent_cloud_mount(
+            {"id": "thread-1"},
+            mount_rows=_LIVE_MOUNT_ROWS,
+            metadata={
+                "protected_cloud": True,
+                "vm": {"status": "ready", "ssh_host": "10.0.0.5"},
+            },
+        )
+    assert payload is None
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_protected_marker_active_row_returns_payload(
+    monkeypatch,
+):
+    """(c) marker + flag ON + container runtime + active NC row -> the
+    RO-lower + overlay payload, protected=True."""
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    with (
+        patch("main._is_protected_cloud_mode_enabled", return_value=True),
+        patch(
+            "main.postgres_db.get_ro_mount_by_thread",
+            new=AsyncMock(return_value=_ACTIVE_NC_ROW),
+        ),
+    ):
+        payload = await _build_agent_cloud_mount(
+            {
+                "id": _THREAD_ID,
+                "status": "active",
+                "runtime_generation": _RUNTIME_GENERATION,
+                "runtime_retirement_token": None,
+            },
+            mount_rows=[],
+            metadata={
+                "protected_cloud": True,
+                "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
+            },
+        )
+    assert payload is not None
+    assert payload["protected"] is True
+    assert payload["mounts"][0]["access"] == "read_only"
+    assert payload["mounts"][0]["source"]["config"]["user"] == "srw-reader-abc"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
+    monkeypatch,
+):
+    """(d) marker + flag ON + container runtime + no active row -> None.
+
+    No task is registered in ``_protected_engage_tasks`` for this thread_id
+    and no ``protected_cloud_error`` is recorded, so this exercises F-I1's
+    poll-exhaustion path (3x get_ro_mount_by_thread, sleep(3) between) —
+    ``asyncio.sleep`` is patched so the 9s worst case doesn't slow the suite.
+    Fail-closed: exhausting the poll still returns None, never a live mount.
+    """
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    # Defensive: no in-flight engage task registered for this thread_id (a
+    # leaked registration from another test would take the await-task branch
+    # instead of the poll branch this test targets).
+    main._protected_engage_tasks.pop((_THREAD_ID, _RUNTIME_GENERATION), None)
+    with (
+        patch("main._is_protected_cloud_mode_enabled", return_value=True),
+        patch(
+            "main.postgres_db.get_ro_mount_by_thread",
+            new=AsyncMock(return_value=None),
+        ) as get_row,
+        patch("main.asyncio.sleep", new=AsyncMock()) as sleep,
+    ):
+        payload = await _build_agent_cloud_mount(
+            {
+                "id": _THREAD_ID,
+                "status": "active",
+                "runtime_generation": _RUNTIME_GENERATION,
+                "runtime_retirement_token": None,
+            },
+            mount_rows=[],
+            metadata={
+                "protected_cloud": True,
+                "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
+            },
+        )
+    assert payload is None
+    # Initial lookup + 3 poll attempts.
+    assert get_row.await_count == 4
+    assert sleep.await_count == 3

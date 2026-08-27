@@ -35,6 +35,14 @@ DELEGATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "delegation",
         "short_description": "Spawn 1-5 parallel subagent jobs from your workspace.",
         "phases": ["strategic", "tactical"],
+        "grant": "explicit",
+        "gate": (
+            "named outright in a tools.delegation list. No config has granted "
+            "the heavy delegation pair since 57430a2a emptied worker_base on "
+            "2026-07-22; whether to restore it is an open decision "
+            "(knowledge-base/knowledge/issues/registered_tools_no_config_can_grant.md §3b) and "
+            "`delegation: true` must not be the thing that takes it"
+        ),
     },
     "resume_delegation_child": {
         "module": "delegation.delegate_work",
@@ -47,6 +55,11 @@ DELEGATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "delegation",
         "short_description": "Send a child back to work with feedback, then re-suspend.",
         "phases": ["strategic", "tactical"],
+        "grant": "explicit",
+        "gate": (
+            "named outright in a tools.delegation list; the other half of the "
+            "heavy delegation pair, same open decision as delegate_work"
+        ),
     },
 }
 
@@ -300,7 +313,7 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
             git.push()
 
         # 2. Create child jobs via orchestrator API
-        parent_config = tool_context._job_metadata.get("config_name", "defaults")
+        parent_config = tool_context._job_metadata.get("config_name", "worker_base")
         parent_project_id = tool_context._job_metadata.get("project_id")
         parent_priority = tool_context._job_metadata.get("priority", 5)
 
@@ -408,13 +421,28 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
                 "Be specific — the child resumes with this as its only new context."
             )
         )
+        timeout: int = Field(
+            default=7200,
+            description=(
+                "Max wait time for the resumed child in seconds (default 2h, max 4h)."
+            ),
+        )
 
-    def _resume_child_sync(job_id: str, feedback: str) -> str:
+    def _resume_child_sync(job_id: str, feedback: str, timeout: int = 7200) -> str:
         """Synchronous wrapper for resume_delegation_child."""
         tool_context = _outer_context
 
         if not tool_context.orchestrator_client:
             return "Error: no orchestrator client available."
+
+        # Mirror delegate_work's cap — the re-suspend freeze carries this
+        # timeout, and the timeout sweeper falls back to 7200s if absent
+        # (knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md, Gap 2).
+        max_timeout = tool_context.config.get("delegation", {}).get(
+            "max_timeout", 14400
+        )
+        if timeout > max_timeout:
+            return f"Error: timeout {timeout}s exceeds max_timeout {max_timeout}s."
 
         parent_job_id = tool_context._job_metadata.get("job_id", "unknown")
 
@@ -427,13 +455,15 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
                     result = pool.submit(
                         asyncio.run,
                         _resume_child_async(
-                            job_id, feedback, tool_context, parent_job_id
+                            job_id, feedback, tool_context, parent_job_id, timeout
                         ),
                     ).result(timeout=30)
                 return result
             else:
                 return loop.run_until_complete(
-                    _resume_child_async(job_id, feedback, tool_context, parent_job_id)
+                    _resume_child_async(
+                        job_id, feedback, tool_context, parent_job_id, timeout
+                    )
                 )
         except Exception as e:
             logger.error(f"Resume delegation child failed: {e}", exc_info=True)
@@ -444,6 +474,7 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
         feedback: str,
         tool_context: ToolContext,
         parent_job_id: str,
+        timeout: int,
     ) -> str:
         """Resume a delegation child and re-suspend the parent."""
         client = tool_context.orchestrator_client
@@ -455,12 +486,16 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
                 "The orchestrator may be unavailable or the job may not be resumable."
             )
 
-        # Re-suspend: request freeze so parent goes back to waiting
+        # Re-suspend: request freeze so parent goes back to waiting. Must
+        # carry `timeout` — the timeout sweeper falls back to 7200s when the
+        # key is absent, silently shrinking longer delegation deadlines
+        # (knowledge-base/knowledge/issues/delegation_freeze_lifecycle_gaps.md, Gap 2).
         tool_context.request_freeze(
             {
                 "freeze_type": "delegation",
                 "child_job_ids": [job_id],
                 "child_count": 1,
+                "timeout": timeout,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "job_id": parent_job_id,
                 "reason": f"Resumed child {job_id} with feedback",

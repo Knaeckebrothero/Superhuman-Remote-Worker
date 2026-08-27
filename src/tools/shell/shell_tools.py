@@ -14,6 +14,7 @@ Available in both strategic and tactical phases.
 """
 
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -23,6 +24,14 @@ from langchain_core.tools import tool
 from .coding_tools import _truncate_output
 from .shell_manager import SUDO_FREEZE_SENTINEL
 from ..context import ToolContext
+from ...services.cloud_mount.guardrails import (
+    command_may_write_cloud,
+    command_touches_cloud_mount,
+    detect_cloud_delete_risk,
+    detect_cloud_scan_risk,
+    format_cloud_delete_guard_message,
+    format_cloud_scan_guard_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +70,104 @@ def _scan_for_error_patterns(output: str) -> Optional[str]:
     return None
 
 
+def _cloud_scan_guard_decision(
+    command: str, context: ToolContext
+) -> tuple[Optional[str], bool]:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None, False
+
+    mode = str(
+        cloud_mount_cfg.get("scan_guard", os.getenv("SRW_CLOUD_SCAN_GUARD", "block"))
+    ).lower()
+    if mode in {"0", "off", "disabled", "false"}:
+        return None, False
+
+    risk = detect_cloud_scan_risk(command)
+    if risk is None:
+        return None, False
+
+    message = format_cloud_scan_guard_message(command, risk)
+    if mode == "warn":
+        return (
+            f"{message}\n\nThe command will still run because cloud_scan_guard=warn.",
+            False,
+        )
+    return message, True
+
+
+def _cloud_delete_guard_decision(
+    command: str, context: ToolContext
+) -> tuple[Optional[str], bool]:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None, False
+
+    mode = str(
+        cloud_mount_cfg.get("scan_guard", os.getenv("SRW_CLOUD_SCAN_GUARD", "block"))
+    ).lower()
+    if mode in {"0", "off", "disabled", "false"}:
+        return None, False
+
+    risk = detect_cloud_delete_risk(command)
+    if risk is None:
+        return None, False
+
+    message = format_cloud_delete_guard_message(
+        command, risk, protected=bool(cloud_mount_cfg.get("protected"))
+    )
+    if mode == "warn":
+        return (
+            f"{message}\n\nThe command will still run because cloud_scan_guard=warn.",
+            False,
+        )
+    return message, True
+
+
+def _cloud_cache_guard_decision(command: str, context: ToolContext) -> Optional[str]:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    if not command_touches_cloud_mount(command):
+        return None
+    manager = cloud_mount_cfg.get("_manager")
+    if manager is None or not hasattr(manager, "cache_limit_message"):
+        return None
+    try:
+        return manager.cache_limit_message()
+    except Exception as exc:
+        logger.warning("Cloud cache guard check failed: %s", exc)
+        return None
+
+
+def _cloud_upperdir_guard_decision(command: str, context: ToolContext) -> Optional[str]:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    if not command_may_write_cloud(command):
+        return None
+    if not command_touches_cloud_mount(command):
+        return None
+    overlay = cloud_mount_cfg.get("_overlay_manager")
+    if overlay is None or not hasattr(overlay, "quota_guard_message"):
+        return None
+    try:
+        return overlay.quota_guard_message()
+    except Exception as exc:
+        logger.warning("Cloud upperdir guard check failed: %s", exc)
+        return None
+
+
+def _cloud_mount_manager(context: ToolContext) -> Any | None:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    manager = cloud_mount_cfg.get("_manager")
+    if manager is None or not hasattr(manager, "status"):
+        return None
+    return manager
+
+
 # Tmux special key names that should NOT get Enter appended in keys mode
 TMUX_SPECIAL_KEYS = frozenset(
     {
@@ -97,6 +204,14 @@ TMUX_SPECIAL_KEYS = frozenset(
 )
 
 # Tool metadata for registry
+# Appended to run_command results when its shared command tab is wedged
+# (still-running, colliding, or blocked on a prompt). run_command has no keys
+# mode, so cancel_command is the model's only in-band escape from a hung tab.
+_CANCEL_HINT = (
+    "\n\nNote: if this command is stuck or you did not expect it to run this "
+    "long, call cancel_command to abort it and free the tab."
+)
+
 SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "run_command": {
         "module": "shell.shell_tools",
@@ -104,6 +219,14 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": "Execute a shell command and return its output",
         "category": "shell",
         "short_description": "Run a shell command and get output.",
+        "phases": ["strategic", "tactical"],
+    },
+    "cancel_command": {
+        "module": "shell.shell_tools",
+        "function": "cancel_command",
+        "description": "Abort a stuck/hung command by sending Ctrl+C to the shell tab",
+        "category": "shell",
+        "short_description": "Cancel a stuck shell command (Ctrl+C).",
         "phases": ["strategic", "tactical"],
     },
     "shell_execute": {
@@ -121,6 +244,20 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "shell",
         "short_description": "Read output from a terminal tab.",
         "phases": ["strategic", "tactical"],
+    },
+    "srw_cloud_status": {
+        "module": "shell.shell_tools",
+        "function": "srw_cloud_status",
+        "description": "Show rclone cloud mount status, cache usage, and rclone RC stats",
+        "category": "shell",
+        "short_description": "Show cloud mount/cache status.",
+        "phases": ["strategic", "tactical"],
+        # No config lists this; persistent_session.py:1526 appends it. Keeping
+        # it out of a category-level `shell: true` also stops an operator who
+        # wanted "shell commands on" from silently acquiring a cloud-mount
+        # reporter that happens to share the category.
+        "grant": "code",
+        "gate": "cloud_mount_manager.active",
     },
 }
 
@@ -225,17 +362,35 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
     )
 
     @tool
+    def srw_cloud_status() -> str:
+        """Show rclone cloud mount status and cache usage.
+
+        Use this before broad cloud work or when a cloud command is blocked by
+        the cache guard. The output includes mount paths, current VFS cache
+        usage, hard cache limits, and rclone RC status when available.
+        """
+        manager = _cloud_mount_manager(context)
+        if manager is None:
+            return "No active rclone cloud mount for this session."
+        return manager.status()
+
+    @tool
     def run_command(
         command: str,
         timeout: Optional[int] = None,
         tail: int = 30,
+        working_dir: Optional[str] = ".",
     ) -> str:
         """Execute a shell command and return its output.
 
         Runs the command to completion and returns the exit code + stdout.
-        Commands run in the workspace directory. Use for: running tests,
-        building projects, git operations, file system commands, deploying,
-        checking logs, SSH via sshpass, and any other shell task.
+        Every call starts in `working_dir`, resolved relative to the workspace
+        root, and restores the tab to the workspace root after completion.
+        Always set `working_dir`. Do not use `cd` unless absolutely necessary;
+        explicit working directories keep shell and file-tool paths aligned.
+        Use for: running tests, building projects, git operations, file system
+        commands, deploying, checking logs, SSH via sshpass, and any other
+        shell task.
 
         LONG-RUNNING / QUIET COMMANDS: a command that produces no new output for
         ~30s (a large `pip install`, a build, a big download, data ingestion or
@@ -248,8 +403,8 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             wait to check progress — do NOT poll in a tight loop. The tab is busy
             until the command finishes, so re-issuing it (or any other command)
             is rejected. If the output stays completely unchanged for a long
-            time, the command may be stuck — reconsider the approach rather than
-            polling forever.
+            time, the command may be stuck — call cancel_command to abort it and
+            free the tab, rather than polling forever.
 
         INTERACTIVE INPUT: run_command cannot answer prompts (password, y/n).
         Use a non-interactive form instead:
@@ -269,6 +424,9 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         Args:
             command: Shell command to execute (e.g., "pytest tests/ -x",
                 "git status", "curl -s https://api.example.com/health").
+            working_dir: Directory in which to start the command, relative to
+                the workspace root (default ".", the workspace root). A null or
+                empty value is also normalized to the workspace root.
             timeout: Max seconds to wait (max 600). Omit for normal commands —
                 a quiet command then returns "still running" after ~30s. Set an
                 explicit value for known long/quiet work (installs, builds) to
@@ -283,7 +441,32 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         try:
             sm.ensure_tab("default")
 
-            output = sm.run_sync(command, tab_name="default", timeout=timeout)
+            cache_guard_msg = _cloud_cache_guard_decision(command, context)
+            if cache_guard_msg:
+                return cache_guard_msg
+
+            upperdir_guard_msg = _cloud_upperdir_guard_decision(command, context)
+            if upperdir_guard_msg:
+                return upperdir_guard_msg
+
+            guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
+            if guard_msg and guard_blocks:
+                return guard_msg
+
+            delete_msg, delete_blocks = _cloud_delete_guard_decision(command, context)
+            if delete_msg and delete_blocks:
+                return delete_msg
+
+            output = sm.run_sync(
+                command,
+                tab_name="default",
+                timeout=timeout,
+                working_dir=working_dir or ".",
+            )
+            if guard_msg:
+                output = f"{guard_msg}\n\n{output}"
+            if delete_msg:
+                output = f"{delete_msg}\n\n{output}"
 
             # Sudo intercept: trigger freeze for VM upgrade
             freeze_msg = _check_sudo_freeze(output, command, context)
@@ -292,13 +475,20 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
             # Still-running (soft/hard no-change timeout) is NOT an error — the
             # command keeps running. Pass it through so the model can poll with
-            # shell_read or re-run with a higher timeout.
+            # shell_read, re-run with a higher timeout, or cancel_command it.
             if "--- still running ---" in output:
                 output = _apply_tail(output, tail)
-                return _truncate_output(output, max_output_chars, "output")
+                output = _truncate_output(output, max_output_chars, "output")
+                return output + _CANCEL_HINT
+
+            # Colliding: the shared run_command tab is busy with a previous
+            # command, so this one never ran. cancel_command is the way out.
+            if "previous command still running" in output:
+                output = _truncate_output(output, max_output_chars, "output")
+                return output + _CANCEL_HINT
 
             # Genuine interactive prompt: stateless run_command can't answer it,
-            # so steer the model toward a non-interactive form.
+            # so steer the model toward a non-interactive form (or cancel it).
             if "Interactive prompt detected" in output:
                 return (
                     f"Error: Command requires interactive input, which "
@@ -306,6 +496,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                     f"Use a non-interactive form instead (sshpass, -y flags, "
                     f"`yes |`, etc.).\n"
                     f"{output}"
+                    f"{_CANCEL_HINT}"
                 )
 
             output = _apply_tail(output, tail)
@@ -327,6 +518,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         is_async: bool = False,
         keys: bool = False,
         timeout: Optional[int] = None,
+        working_dir: Optional[str] = None,
     ) -> str:
         """Execute a command or send keystrokes in a persistent terminal tab.
 
@@ -334,6 +526,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         window). Tabs auto-create on first use and persist between calls —
         environment, working directory, virtualenvs, and history all survive.
         You can SSH in one tab while running local commands in another.
+
+        Always set `working_dir` for commands. Do not use `cd` unless absolutely
+        necessary — when `working_dir` is omitted, an inline `cd` persists in
+        that tab for the rest of the job. A supplied `working_dir` is resolved
+        relative to the workspace root and the root is restored when the
+        command finishes.
 
         IMPORTANT: Never write paramiko, fabric, pexpect, or subprocess SSH
         scripts. Every tab is a real terminal — just use ssh/scp/rsync directly.
@@ -354,9 +552,13 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
           keys=True: Send raw keystrokes. Text input (passwords, "yes", "y")
               auto-submits with Enter. Control keys ("C-c", "Up", "Escape")
               are sent as-is. Send "Enter" alone to press Enter without text.
+              `working_dir` is ignored because keystrokes target the live
+              process exactly where it is already running.
           is_async=True: Fire-and-forget. Returns immediately without waiting.
               ONLY for long-running background processes (dev servers, builds,
-              VPN connections). Use shell_read() later to check progress.
+              VPN connections). Use shell_read() later to check progress. When
+              `working_dir` is set, the command is anchored there and the tab
+              returns to the workspace root after the command exits.
 
         SSH workflow (use sync mode, not is_async):
           1. shell_execute(command="ssh user@host", name="srv")
@@ -384,6 +586,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 default no-change behavior (~30s quiet → "still running"); set
                 an explicit value for known long/quiet work (large installs,
                 builds) to wait the full duration.
+            working_dir: Directory in which to start the command, relative to
+                the workspace root. In sync and async command modes the tab is
+                restored to the workspace root after completion. Ignored when
+                `keys=True`.
 
         Returns:
             [Shells: tab1 | tab2 | ...] header + command output.
@@ -398,7 +604,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 is_special = command in TMUX_SPECIAL_KEYS or command.startswith(
                     ("C-", "M-")
                 )
-                result = sm.send(name, command, enter=not is_special)
+                result = sm.send(
+                    name,
+                    command,
+                    enter=not is_special,
+                    allow_busy=True,
+                )
                 # Sudo intercept: trigger freeze for VM upgrade
                 freeze_msg = _check_sudo_freeze(result, command, context)
                 if freeze_msg:
@@ -409,9 +620,31 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 return f"{tab_header}\n{text}"
 
             elif is_async:
+                cache_guard_msg = _cloud_cache_guard_decision(command, context)
+                if cache_guard_msg:
+                    return f"{tab_header}\n{cache_guard_msg}"
+
+                upperdir_guard_msg = _cloud_upperdir_guard_decision(command, context)
+                if upperdir_guard_msg:
+                    return f"{tab_header}\n{upperdir_guard_msg}"
+
+                guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
+                if guard_msg and guard_blocks:
+                    return f"{tab_header}\n{guard_msg}"
+
+                delete_msg, delete_blocks = _cloud_delete_guard_decision(
+                    command, context
+                )
+                if delete_msg and delete_blocks:
+                    return f"{tab_header}\n{delete_msg}"
                 # Async mode: send command, wait briefly, return what appeared
                 sm.read(name, lines=1, since_cursor=False)  # snapshot cursor
-                result = sm.send(name, command, enter=True)
+                result = sm.send(
+                    name,
+                    command,
+                    enter=True,
+                    working_dir=working_dir,
+                )
                 # Sudo intercept: trigger freeze for VM upgrade
                 freeze_msg = _check_sudo_freeze(result, command, context)
                 if freeze_msg:
@@ -419,11 +652,41 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 time.sleep(0.5)
                 text, metadata = sm.read(name, since_cursor=True)
                 text = _truncate_output(text, max_output_chars, "shell output")
+                if guard_msg:
+                    text = f"{guard_msg}\n\n{text}"
+                if delete_msg:
+                    text = f"{delete_msg}\n\n{text}"
                 return f"{tab_header}\n{text}"
 
             else:
+                cache_guard_msg = _cloud_cache_guard_decision(command, context)
+                if cache_guard_msg:
+                    return f"{tab_header}\n{cache_guard_msg}"
+
+                upperdir_guard_msg = _cloud_upperdir_guard_decision(command, context)
+                if upperdir_guard_msg:
+                    return f"{tab_header}\n{upperdir_guard_msg}"
+
+                guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
+                if guard_msg and guard_blocks:
+                    return f"{tab_header}\n{guard_msg}"
+
+                delete_msg, delete_blocks = _cloud_delete_guard_decision(
+                    command, context
+                )
+                if delete_msg and delete_blocks:
+                    return f"{tab_header}\n{delete_msg}"
                 # Sync mode: sentinel-based wait for completion
-                output = sm.run_sync(command, tab_name=name, timeout=timeout)
+                output = sm.run_sync(
+                    command,
+                    tab_name=name,
+                    timeout=timeout,
+                    working_dir=working_dir,
+                )
+                if guard_msg:
+                    output = f"{guard_msg}\n\n{output}"
+                if delete_msg:
+                    output = f"{delete_msg}\n\n{output}"
                 # Sudo intercept: trigger freeze for VM upgrade
                 freeze_msg = _check_sudo_freeze(output, command, context)
                 if freeze_msg:
@@ -483,8 +746,33 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 tab_header = "[Shells: ?]"
             return f"{tab_header}\nError: {e}"
 
+    @tool
+    def cancel_command() -> str:
+        """Abort a stuck or hung command by sending Ctrl+C to the shell.
+
+        Use this when a run_command reported "still running" and you did NOT
+        expect the command to be long, when a command is hung / not returning,
+        or when the tab is stuck on an interactive prompt you cannot answer.
+        run_command uses a single shell tab, so a wedged command blocks every
+        later command (including your own recovery attempts) until it is
+        cancelled — this is how you get unstuck instead of giving up.
+
+        Sends Ctrl+C to the tab (retrying once); if the process ignores the
+        interrupt, resets the tab as a last resort. Afterwards the tab is free
+        to run new commands. Safe to call when nothing is running (it says so).
+
+        Returns:
+            A short status: whether the command was interrupted, there was
+            nothing to cancel, or the tab had to be reset.
+        """
+        try:
+            sm.ensure_tab("default")
+            return sm.cancel("default")
+        except (ValueError, KeyError) as e:
+            return f"Error: {e}"
+
     if mode == "persistent":
-        return [shell_execute, shell_read]
+        return [shell_execute, shell_read, srw_cloud_status]
     else:
         # Stateless mode (default)
-        return [run_command, shell_read]
+        return [run_command, cancel_command, shell_read, srw_cloud_status]

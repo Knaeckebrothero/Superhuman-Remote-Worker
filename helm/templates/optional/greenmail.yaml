@@ -1,0 +1,85 @@
+{{/*
+GreenMail — test-only mail server for the `email` datasource.
+
+Disposable IMAP+IMAPS+SMTP(+S) server backing the email datasource
+integration tests (knowledge-base/knowledge/features/email_datasource.md §Testing). Auth is
+disabled: any user/password pair works and mailboxes are created on first
+use; all state is in-memory (no PVC — a pod restart wipes it, which is the
+point). Seed folders + fixture mails with scripts/seed_greenmail.py, e.g.
+via `kubectl port-forward svc/<fullname>-greenmail 3143:3143`.
+
+TEST-ONLY: gated behind test.greenmail.enabled (default false). Never
+enable this on a production overlay — it accepts any credentials.
+*/}}
+{{- if .Values.test.greenmail.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-greenmail
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "greenmail") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "greenmail") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "greenmail") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: greenmail
+          image: {{ .Values.test.greenmail.image }}
+          env:
+            # Overrides the image default (which also wires a TLS keystore) —
+            # IMAPS/SMTPS fall back to GreenMail's built-in self-signed cert,
+            # which is exactly what the trust-self-signed test path needs.
+            - name: GREENMAIL_OPTS
+              value: "-Dgreenmail.setup.test.all -Dgreenmail.auth.disabled -Dgreenmail.hostname=0.0.0.0"
+          ports:
+            - name: smtp
+              containerPort: 3025
+            - name: imap
+              containerPort: 3143
+            - name: imaps
+              containerPort: 3993
+            - name: api
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /api/service/readiness
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.test.greenmail.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-greenmail
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "greenmail") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: smtp
+      port: 3025
+      targetPort: smtp
+    - name: imap
+      port: 3143
+      targetPort: imap
+    - name: imaps
+      port: 3993
+      targetPort: imaps
+    - name: api
+      port: 8080
+      targetPort: api
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "greenmail") | nindent 4 }}
+{{- end }}

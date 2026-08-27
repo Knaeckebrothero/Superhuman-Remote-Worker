@@ -93,4 +93,11 @@
   .app-chip__btn[data-size='md'] {
     min-height: v.$touch-target-min;
   }
+
+  // Selectable chips (filters / toggles) are primary tap targets — give them the
+  // full touch-target height on mobile regardless of size. Display-only tags
+  // (selectable=false) stay compact.
+  .app-chip__btn[data-selectable] {
+    min-height: v.$touch-target-min;
+  }
 }

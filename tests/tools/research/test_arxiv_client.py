@@ -1,7 +1,6 @@
 """Tests for arXiv client utility."""
 
 import sys
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,8 +14,21 @@ def mock_arxiv_module():
     """Create a mock arxiv module and inject it into sys.modules."""
     mock_mod = MagicMock()
     mock_mod.SortCriterion.Relevance = "relevance"
+    mock_mod.Client.return_value.results.return_value = []
     with patch.dict(sys.modules, {"arxiv": mock_mod}):
         yield mock_mod
+
+
+def test_installed_arxiv_package_exposes_client_results():
+    """Pin the API contract provided by the dependency installed in CI/images.
+
+    The old tests mocked ``Search.results`` and stayed green after arxiv 4.0
+    removed it.  This test imports the actual installed package without making
+    a network request.
+    """
+    import arxiv
+
+    assert callable(getattr(arxiv.Client, "results", None))
 
 
 class TestExtractArxivId:
@@ -55,8 +67,8 @@ class TestArxivClientSearch:
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = [mock_arxiv_result]
         mock_arxiv_module.Search.return_value = mock_search
+        mock_arxiv_module.Client.return_value.results.return_value = [mock_arxiv_result]
 
         papers = await client.search("attention mechanism", max_results=5)
 
@@ -66,13 +78,15 @@ class TestArxivClientSearch:
         assert paper.source == PaperSource.ARXIV
         assert paper.access_status == AccessStatus.OPEN_ACCESS
         assert paper.year == 2017
+        mock_arxiv_module.Client.return_value.results.assert_called_once_with(
+            mock_search
+        )
 
     @pytest.mark.asyncio
     async def test_search_empty_results(self, mock_arxiv_module):
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = []
         mock_arxiv_module.Search.return_value = mock_search
 
         papers = await client.search("nonexistent topic xyz")
@@ -83,13 +97,15 @@ class TestArxivClientSearch:
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = []
         mock_arxiv_module.Search.return_value = mock_search
 
         await client.search("test", max_results=25)
 
         mock_arxiv_module.Search.assert_called_once_with(
             query="test", max_results=25, sort_by="relevance"
+        )
+        mock_arxiv_module.Client.return_value.results.assert_called_once_with(
+            mock_search
         )
 
 
@@ -101,21 +117,23 @@ class TestArxivClientGetPaper:
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = [mock_arxiv_result]
         mock_arxiv_module.Search.return_value = mock_search
+        mock_arxiv_module.Client.return_value.results.return_value = [mock_arxiv_result]
 
         paper = await client.get_paper("1706.03762")
 
         assert paper is not None
         assert paper.title == "Attention Is All You Need"
         mock_arxiv_module.Search.assert_called_once_with(id_list=["1706.03762"])
+        mock_arxiv_module.Client.return_value.results.assert_called_once_with(
+            mock_search
+        )
 
     @pytest.mark.asyncio
     async def test_get_paper_not_found(self, mock_arxiv_module):
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = []
         mock_arxiv_module.Search.return_value = mock_search
 
         paper = await client.get_paper("0000.00000")
@@ -128,8 +146,8 @@ class TestArxivClientGetPaper:
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = [mock_arxiv_result]
         mock_arxiv_module.Search.return_value = mock_search
+        mock_arxiv_module.Client.return_value.results.return_value = [mock_arxiv_result]
 
         await client.get_paper("https://arxiv.org/abs/1706.03762v7")
 
@@ -146,8 +164,8 @@ class TestArxivClientDownload:
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = [mock_arxiv_result]
         mock_arxiv_module.Search.return_value = mock_search
+        mock_arxiv_module.Client.return_value.results.return_value = [mock_arxiv_result]
 
         result = await client.download("1706.03762", temp_docs_dir)
 
@@ -156,6 +174,9 @@ class TestArxivClientDownload:
         assert result.source == PaperSource.ARXIV
         assert result.paper is not None
         assert result.paper.title == "Attention Is All You Need"
+        mock_arxiv_module.Client.return_value.results.assert_called_once_with(
+            mock_search
+        )
         mock_arxiv_result.download_pdf.assert_called_once_with(
             dirpath=str(temp_docs_dir), filename="1706.03762.pdf"
         )
@@ -165,7 +186,6 @@ class TestArxivClientDownload:
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = []
         mock_arxiv_module.Search.return_value = mock_search
 
         result = await client.download("0000.00000", temp_docs_dir)
@@ -180,9 +200,9 @@ class TestArxivClientDownload:
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = [mock_arxiv_result]
         mock_arxiv_result.download_pdf.side_effect = Exception("Network error")
         mock_arxiv_module.Search.return_value = mock_search
+        mock_arxiv_module.Client.return_value.results.return_value = [mock_arxiv_result]
 
         result = await client.download("1706.03762", temp_docs_dir)
 
@@ -190,37 +210,32 @@ class TestArxivClientDownload:
         assert "Network error" in result.error
 
 
-class TestArxivClientRateLimit:
-    """Tests for ArxivClient rate limiting."""
+class TestArxivClientReuse:
+    """The official client owns request pacing and is reused by the wrapper."""
 
     @pytest.mark.asyncio
-    async def test_rate_limit_enforced(self, mock_arxiv_module):
-        client = ArxivClient(rate_limit_seconds=0.1)
+    async def test_reuses_one_client_across_requests(self, mock_arxiv_module):
+        client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = []
         mock_arxiv_module.Search.return_value = mock_search
 
-        start = time.time()
         await client.search("test1")
         await client.search("test2")
-        elapsed = time.time() - start
 
-        assert elapsed >= 0.1, "Second request should be delayed by rate limit"
+        mock_arxiv_module.Client.assert_called_once_with(delay_seconds=0)
+        assert mock_arxiv_module.Client.return_value.results.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_no_delay_on_first_request(self, mock_arxiv_module):
+    async def test_passes_rate_limit_to_official_client(self, mock_arxiv_module):
         client = ArxivClient(rate_limit_seconds=5.0)
 
         mock_search = MagicMock()
-        mock_search.results.return_value = []
         mock_arxiv_module.Search.return_value = mock_search
 
-        start = time.time()
         await client.search("test")
-        elapsed = time.time() - start
 
-        assert elapsed < 1.0, "First request should not be delayed"
+        mock_arxiv_module.Client.assert_called_once_with(delay_seconds=5.0)
 
 
 class TestArxivClientToPaper:

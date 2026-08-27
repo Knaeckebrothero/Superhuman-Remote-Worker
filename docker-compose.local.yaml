@@ -41,7 +41,9 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-srw}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./orchestrator/database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
+      # App schema is built from the migration chain (orchestrator startup +
+      # `python init.py`), not an initdb snapshot — the frozen schema.sql
+      # drifted from migrations. See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-srw}"]
       interval: 5s
@@ -74,24 +76,11 @@ services:
       POSTGRES_DB: ${VECTOR_POSTGRES_DB:-srw_vector}
     volumes:
       - postgres_vector_data:/var/lib/postgresql/data
-      - ./orchestrator/database/vector_schema.sql:/docker-entrypoint-initdb.d/001_vector_schema.sql:Z
+      # Vector schema is built from the migration chain, not an initdb snapshot.
+      # See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${VECTOR_POSTGRES_USER:-srw}"]
       interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
-  mongodb:
-    image: docker.io/library/mongo:7
-    container_name: srw-mongodb
-    environment:
-      MONGO_INITDB_DATABASE: srw_logs
-    volumes:
-      - mongodb_data:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
@@ -176,7 +165,10 @@ services:
       GITEA__server__ROOT_URL: "http://localhost:${GITEA_PORT:-3000}"
       GITEA__server__HTTP_PORT: "3000"
       GITEA__security__INSTALL_LOCK: "true"
-      GITEA__server__DISABLE_SSH: "true"
+      GITEA__server__DISABLE_SSH: "false"
+      GITEA__server__START_SSH_SERVER: "true"
+      GITEA__server__SSH_LISTEN_PORT: "2222"
+      GITEA__server__SSH_PORT: "${GITEA_SSH_PORT:-2222}"
       GITEA__service__DISABLE_REGISTRATION: "false"
       GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "false"
       GITEA__service__SHOW_REGISTRATION_BUTTON: "false"
@@ -231,6 +223,7 @@ services:
       - gitea_data:/var/lib/gitea
     ports:
       - "${GITEA_PORT:-3000}:3000"
+      - "${GITEA_SSH_PORT:-2222}:2222"
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/v1/version"]
       interval: 10s
@@ -318,14 +311,21 @@ services:
       # Core databases
       DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
       VECTOR_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
-      MONGODB_URL: mongodb://mongodb:27017/srw_logs
       WORKSPACE_PATH: /workspace
       # Gitea
       GITEA_URL: http://gitea:3000
       GITEA_INTERNAL_URL: http://gitea:3000
+      GITEA_SSH_INTERNAL_HOST: gitea
+      GITEA_SSH_INTERNAL_PORT: "2222"
+      GITEA_SSH_EXTERNAL_HOST: ${GITEA_SSH_EXTERNAL_HOST:-}
+      GITEA_SSH_EXTERNAL_PORT: ${GITEA_SSH_EXTERNAL_PORT:-2222}
       GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-srw}
       GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-srw_gitea}
       GITEA_OIDC_CLIENT_SECRET: ${GITEA_OIDC_CLIENT_SECRET:-}
+      KB_GIT_ALLOWED_HOSTS: ${KB_GIT_ALLOWED_HOSTS:-gitea:3000}
+      KB_GIT_SSH_KNOWN_HOSTS: ${KB_GIT_SSH_KNOWN_HOSTS:-}
+      KB_EXTERNAL_REINDEX_CONCURRENCY: ${KB_EXTERNAL_REINDEX_CONCURRENCY:-2}
+      KB_REINDEX_SWEEP_SECONDS: ${KB_REINDEX_SWEEP_SECONDS:-900}
       # Keycloak SSO
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_ISSUER_URL: "http://localhost:${KEYCLOAK_PORT:-8180}"
@@ -340,7 +340,46 @@ services:
       ADMIN_DISPLAY_NAME: ${ADMIN_DISPLAY_NAME:-Admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # MCP token verification
-      MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
+      MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
+      # Dark-shipped Canvas live-app capability; keep disabled until the
+      # isolated viewer-domain launch gates are satisfied.
+      CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
+      CANVAS_LIVE_PREVIEW_DENIED_PORTS: "${CANVAS_LIVE_PREVIEW_DENIED_PORTS:-}"
+      CANVAS_VIEWER_ENABLED: "${CANVAS_VIEWER_ENABLED:-false}"
+      CANVAS_VIEWER_DEPLOYMENT_PROFILE: "${CANVAS_VIEWER_DEPLOYMENT_PROFILE:-production}"
+      CANVAS_VIEWER_COOKIE_MODE: "${CANVAS_VIEWER_COOKIE_MODE:-}"
+      CANVAS_VIEWER_DOMAIN: "${CANVAS_VIEWER_DOMAIN:-}"
+      CANVAS_VIEWER_HOST_SUFFIX: "${CANVAS_VIEWER_HOST_SUFFIX:-}"
+      CANVAS_VIEWER_COCKPIT_ORIGINS: "${CANVAS_VIEWER_COCKPIT_ORIGINS:-}"
+      CANVAS_VIEWER_RAW_PATH_VERIFIED: "${CANVAS_VIEWER_RAW_PATH_VERIFIED:-false}"
+      CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED: "${CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED:-false}"
+      CANVAS_VIEWER_SESSION_TTL_SECONDS: "${CANVAS_VIEWER_SESSION_TTL_SECONDS:-900}"
+      CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS: "${CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS:-60}"
+      CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS: "${CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS:-1200}"
+      CANVAS_VIEWER_REVALIDATE_SECONDS: "${CANVAS_VIEWER_REVALIDATE_SECONDS:-15}"
+      CANVAS_VIEWER_MAX_CONNECTIONS: "${CANVAS_VIEWER_MAX_CONNECTIONS:-256}"
+      CANVAS_VIEWER_MAX_HTTP_PER_SESSION: "${CANVAS_VIEWER_MAX_HTTP_PER_SESSION:-16}"
+      CANVAS_VIEWER_MAX_HEADER_BYTES: "${CANVAS_VIEWER_MAX_HEADER_BYTES:-65536}"
+      CANVAS_VIEWER_MAX_HEADER_FIELDS: "${CANVAS_VIEWER_MAX_HEADER_FIELDS:-100}"
+      CANVAS_VIEWER_MAX_QUERY_BYTES: "${CANVAS_VIEWER_MAX_QUERY_BYTES:-16384}"
+      CANVAS_VIEWER_MAX_QUERY_FIELDS: "${CANVAS_VIEWER_MAX_QUERY_FIELDS:-256}"
+      CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES: "${CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES:-10485760}"
+      CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES: "${CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES:-104857600}"
+      CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS: "${CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS:-5}"
+      CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS: "${CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS:-60}"
+      CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS: "${CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS:-300}"
+      # Opt-in read-only Office Canvas. Compose does not deploy Collabora;
+      # point the two Collabora URLs at an operator-managed instance.
+      COLLABORA_ENABLED: "${COLLABORA_ENABLED:-false}"
+      COLLABORA_INTERNAL_URL: "${COLLABORA_INTERNAL_URL:-}"
+      COLLABORA_PUBLIC_URL: "${COLLABORA_PUBLIC_URL:-}"
+      COLLABORA_WOPI_BASE_URL: "${COLLABORA_WOPI_BASE_URL:-http://orchestrator:8085}"
+      COLLABORA_COCKPIT_ORIGIN: "${COLLABORA_COCKPIT_ORIGIN:-http://localhost:${COCKPIT_PORT:-4000}}"
+      COLLABORA_TOKEN_TTL_SECONDS: "${COLLABORA_TOKEN_TTL_SECONDS:-36000}"
+      COLLABORA_DISCOVERY_CACHE_TTL_SECONDS: "${COLLABORA_DISCOVERY_CACHE_TTL_SECONDS:-21600}"
+      COLLABORA_DISCOVERY_TIMEOUT_SECONDS: "${COLLABORA_DISCOVERY_TIMEOUT_SECONDS:-5}"
+      CANVAS_MAX_OFFICE_BYTES: "${CANVAS_MAX_OFFICE_BYTES:-26214400}"
+      SESSION_JWT_SECRET: "${SESSION_JWT_SECRET:-}"
       # AES-GCM encryption at rest for stored credentials
       # (user_api_keys / project_api_keys / system_api_keys / llm_endpoints)
       APP_ENCRYPTION_KEY: "${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY required — generate with: python -c 'import secrets,base64; print(base64.b64encode(secrets.token_bytes(32)).decode())'}"
@@ -402,14 +441,39 @@ services:
       # VM lifecycle (optional)
       NATS_URL: ${NATS_URL:-nats://nats:4222}
       # Docker Compose mode — workspace/VM pool (ignored when k8s is available)
-      WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1,workspace-2,workspace-3,workspace-4,workspace-5}
+      WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1:30022,workspace-2:30022,workspace-3:30022,workspace-4:30022,workspace-5:30022}
+      WORKSPACE_HOST_KEY_FINGERPRINTS: ${WORKSPACE_HOST_KEY_FINGERPRINTS:-}
+      DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS: ${DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS:-}
+      SSH_KEY_PATH: /run/secrets/ssh/id_ed25519
+      DOCKER_WORKSPACE_TRUSTED_DEV_REUSE: ${DOCKER_WORKSPACE_TRUSTED_DEV_REUSE:-false}
       VM_HOSTS: ${VM_HOSTS:-}
       # Orchestrator settings
       AUTO_ASSIGN_ENABLED: ${AUTO_ASSIGN_ENABLED:-true}
+      # Infrastructure metering Slice 0 dark-launch gates (all off by default).
+      INFRASTRUCTURE_METERING_V2_READS_ENABLED: "${INFRASTRUCTURE_METERING_V2_READS_ENABLED:-false}"
+      INFRASTRUCTURE_METERING_COLLECTOR_ENABLED: "${INFRASTRUCTURE_METERING_COLLECTOR_ENABLED:-false}"
+      INFRASTRUCTURE_METERING_SHADOW_ENABLED: "${INFRASTRUCTURE_METERING_SHADOW_ENABLED:-false}"
+      INFRASTRUCTURE_METERING_PUBLICATION_ENABLED: "${INFRASTRUCTURE_METERING_PUBLICATION_ENABLED:-false}"
+      INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID: "${INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID:-}"
+      INFRASTRUCTURE_METERING_DEPLOYMENT_MODE: "${INFRASTRUCTURE_METERING_DEPLOYMENT_MODE:-dedicated}"
+      INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST: "${INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST:-}"
+      INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS: "${INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS:-300}"
+      INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS: "${INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS:-900}"
+      INFRASTRUCTURE_METERING_LIST_PAGE_SIZE: "${INFRASTRUCTURE_METERING_LIST_PAGE_SIZE:-500}"
+      INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY: "${INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY:-2}"
+      INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE: "${INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE:-10000}"
+      INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS: "${INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS:-50000}"
+      INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES: "${INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES:-67108864}"
+      INFRASTRUCTURE_METERING_INGESTION_TICKET_TTL_SECONDS: "${INFRASTRUCTURE_METERING_INGESTION_TICKET_TTL_SECONDS:-600}"
+      INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS: "${INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS:-7}"
+      INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS: "${INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS:-35}"
+      INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS: "${INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS:-300}"
+      INFRASTRUCTURE_METERING_INGESTION_KEY: "${INFRASTRUCTURE_METERING_INGESTION_KEY:-}"
       # Logging
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - workspace_data:/workspace:z
+      - ssh_keys:/run/secrets/ssh:ro
     ports:
       - "${ORCHESTRATOR_PORT:-8085}:8085"
     depends_on:
@@ -417,10 +481,10 @@ services:
         condition: service_healthy
       postgres-vector:
         condition: service_healthy
-      mongodb:
-        condition: service_healthy
       gitea:
         condition: service_healthy
+      ssh-keygen:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8085/api/health"]
       interval: 10s
@@ -428,21 +492,132 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Development-only reconciler for the gateway's restricted database login.
+  # Administrator credentials terminate here and never reach the public
+  # wildcard-origin process.
+  canvas-gateway-role:
+    image: docker.io/library/postgres:15
+    container_name: srw-canvas-gateway-role
+    profiles: ["canvas-viewer"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-srw}
+      PGUSER: ${POSTGRES_USER:-srw}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-srw_password}
+      CANVAS_VIEWER_POSTGRES_USER: ${CANVAS_VIEWER_POSTGRES_USER:-srw_canvas_gateway}
+      CANVAS_VIEWER_POSTGRES_PASSWORD: ${CANVAS_VIEWER_POSTGRES_PASSWORD:-srw_canvas_gateway_password}
+    command:
+      - sh
+      - -ec
+      - |
+        if [ "$${#CANVAS_VIEWER_POSTGRES_PASSWORD}" -lt 16 ]; then
+          echo "Canvas gateway database password must contain at least 16 characters" >&2
+          exit 1
+        fi
+        exec psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
+          --file /etc/srw-canvas-db/provision.sql
+    volumes:
+      - ./helm/files/canvas-viewer-role.sql:/etc/srw-canvas-db/provision.sql:ro
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    restart: "no"
+
+  # Internal-only Canvas origin gateway. It is profile-gated and has no host
+  # port; a separate wildcard TLS edge remains an explicit launch blocker.
+  canvas-gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.orchestrator
+    image: srw-orchestrator:local
+    container_name: srw-canvas-gateway
+    profiles: ["canvas-viewer"]
+    command:
+      - uvicorn
+      - canvas_gateway:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8086"
+      - --http
+      - h11
+      - --no-access-log
+    environment:
+      PORT: 8086
+      CANVAS_VIEWER_POSTGRES_USER: ${CANVAS_VIEWER_POSTGRES_USER:-srw_canvas_gateway}
+      CANVAS_VIEWER_POSTGRES_PASSWORD: ${CANVAS_VIEWER_POSTGRES_PASSWORD:-srw_canvas_gateway_password}
+      CANVAS_VIEWER_POSTGRES_HOST: postgres
+      CANVAS_VIEWER_POSTGRES_PORT: "5432"
+      CANVAS_VIEWER_POSTGRES_DB: ${POSTGRES_DB:-srw}
+      CANVAS_VIEWER_POSTGRES_MIN_CONNECTIONS: "1"
+      CANVAS_VIEWER_POSTGRES_MAX_CONNECTIONS: "4"
+      CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
+      CANVAS_VIEWER_ENABLED: "${CANVAS_VIEWER_ENABLED:-false}"
+      CANVAS_VIEWER_DEPLOYMENT_PROFILE: "${CANVAS_VIEWER_DEPLOYMENT_PROFILE:-production}"
+      CANVAS_VIEWER_COOKIE_MODE: "${CANVAS_VIEWER_COOKIE_MODE:-}"
+      CANVAS_VIEWER_DOMAIN: "${CANVAS_VIEWER_DOMAIN:-}"
+      CANVAS_VIEWER_HOST_SUFFIX: "${CANVAS_VIEWER_HOST_SUFFIX:-}"
+      CANVAS_VIEWER_COCKPIT_ORIGINS: "${CANVAS_VIEWER_COCKPIT_ORIGINS:-}"
+      CANVAS_VIEWER_RAW_PATH_VERIFIED: "${CANVAS_VIEWER_RAW_PATH_VERIFIED:-false}"
+      CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED: "${CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED:-false}"
+      CANVAS_VIEWER_SESSION_TTL_SECONDS: "${CANVAS_VIEWER_SESSION_TTL_SECONDS:-900}"
+      CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS: "${CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS:-60}"
+      CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS: "${CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS:-1200}"
+      CANVAS_VIEWER_REVALIDATE_SECONDS: "${CANVAS_VIEWER_REVALIDATE_SECONDS:-15}"
+      CANVAS_VIEWER_MAX_CONNECTIONS: "${CANVAS_VIEWER_MAX_CONNECTIONS:-256}"
+      CANVAS_VIEWER_MAX_HTTP_PER_SESSION: "${CANVAS_VIEWER_MAX_HTTP_PER_SESSION:-16}"
+      CANVAS_VIEWER_MAX_HEADER_BYTES: "${CANVAS_VIEWER_MAX_HEADER_BYTES:-65536}"
+      CANVAS_VIEWER_MAX_HEADER_FIELDS: "${CANVAS_VIEWER_MAX_HEADER_FIELDS:-100}"
+      CANVAS_VIEWER_MAX_QUERY_BYTES: "${CANVAS_VIEWER_MAX_QUERY_BYTES:-16384}"
+      CANVAS_VIEWER_MAX_QUERY_FIELDS: "${CANVAS_VIEWER_MAX_QUERY_FIELDS:-256}"
+      CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES: "${CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES:-10485760}"
+      CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES: "${CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES:-104857600}"
+      CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS: "${CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS:-5}"
+      CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS: "${CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS:-60}"
+      CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS: "${CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS:-300}"
+      SSH_KEY_PATH: /run/secrets/ssh/id_ed25519
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ssh_keys:/run/secrets/ssh:ro
+    expose:
+      - "8086"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+      canvas-gateway-role:
+        condition: service_completed_successfully
+      ssh-keygen:
+        condition: service_completed_successfully
+    # Override the orchestrator image's /api/health probe: this image runs the
+    # dedicated gateway ASGI app, which intentionally has no orchestrator API.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 8086), timeout=2).close()"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
   agent:
     build:
       context: .
       dockerfile: docker/Dockerfile.agent
-      args:
-        CITATION_ENGINE_PATH: CitationEngine
     image: srw-agent:local
     environment:
-      AGENT_CONFIG: ${AGENT_CONFIG:-defaults}
+      AGENT_CONFIG: ${AGENT_CONFIG:-worker_base}
       AGENT_PORT: 8001
       # Core databases
       DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
       VECTOR_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
-      MONGODB_URL: mongodb://mongodb:27017/srw_logs
       ORCHESTRATOR_URL: http://orchestrator:8085
+      # Shared only with trusted agent/MCP callers of internal routes.
+      MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
+      CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
       WORKSPACE_PATH: /workspace
       # LLM routing
       LLM_BASE_URL: ${LLM_BASE_URL:-}
@@ -464,14 +639,12 @@ services:
       # Browser automation
       BROWSER_LLM_MODEL: ${BROWSER_LLM_MODEL:-gpt-4o-mini}
       BROWSER_LLM_BASE_URL: ${BROWSER_LLM_BASE_URL:-}
-      # Citation Engine
-      CITATION_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
+      # Citation Engine — uses the shared vector store (VECTOR_POSTGRES_*) +
+      # SRW's EMBEDDING_* service; no separate citation DB or embedding config.
+      # Only the verifier LLM config remains (moves to the aux model in Phase 2).
       CITATION_LLM_URL: ${CITATION_LLM_URL:-}
       CITATION_LLM_MODEL: ${CITATION_LLM_MODEL:-gpt-4o}
       CITATION_REASONING_LEVEL: ${CITATION_REASONING_LEVEL:-high}
-      CITATION_EMBEDDING_MODEL: ${CITATION_EMBEDDING_MODEL:-qwen3-embedding-8b}
-      CITATION_EMBEDDING_URL: ${CITATION_EMBEDDING_URL:-}
-      CITATION_EMBEDDING_KEY: ${CITATION_EMBEDDING_KEY:-}
       # Embedding routing
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
@@ -550,7 +723,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -568,7 +741,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -586,7 +759,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -604,7 +777,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -622,7 +795,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -642,7 +815,7 @@ services:
       COCKPIT_API_URL: http://orchestrator:8085
       MCP_TRANSPORT: http
       MCP_PORT: 8055
-      MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
+      MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
     ports:
       - "${MCP_PORT:-8055}:8055"
     depends_on:
@@ -663,6 +836,11 @@ services:
     container_name: srw-cockpit
     environment:
       PORT: 4000
+      CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
+      CANVAS_VIEWER_ENABLED: "${CANVAS_VIEWER_ENABLED:-false}"
+      CANVAS_VIEWER_HOST_SUFFIX: "${CANVAS_VIEWER_HOST_SUFFIX:-}"
+      COLLABORA_ENABLED: "${COLLABORA_ENABLED:-false}"
+      COLLABORA_PUBLIC_URL: "${COLLABORA_PUBLIC_URL:-}"
     ports:
       - "${COCKPIT_PORT:-4000}:4000"
     depends_on:
@@ -735,24 +913,6 @@ services:
       retries: 5
     restart: unless-stopped
 
-  mongo-express:
-    image: docker.io/library/mongo-express:latest
-    container_name: srw-mongo-express
-    environment:
-      ME_CONFIG_MONGODB_SERVER: mongodb
-      ME_CONFIG_BASICAUTH: "false"
-    ports:
-      - "${MONGO_EXPRESS_PORT:-8081}:8081"
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   # ---------------------------------------------------------------------------
   # Codex OAuth Proxy (optional — for codex/* models via ChatGPT subscription)
   # ---------------------------------------------------------------------------
@@ -807,8 +967,6 @@ volumes:
     name: srw_postgres_keycloak_data
   postgres_vector_data:
     name: srw_postgres_vector_data
-  mongodb_data:
-    name: srw_mongodb_data
   neo4j_data:
     name: srw_neo4j_data
   nats_data:

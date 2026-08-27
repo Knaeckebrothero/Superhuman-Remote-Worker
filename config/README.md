@@ -6,15 +6,16 @@ This directory contains agent configuration files and templates.
 
 ```
 config/
-├── defaults.yaml                # Framework defaults (all configs extend this)
+├── worker_base.yaml             # Conservative inheritance base for worker experts
+├── session_base.yaml            # Conservative inheritance base for session experts
 ├── schema.json                  # JSON Schema for config validation
 ├── prompt_matrix.yaml           # Base prompt matrix (model family → filename)
 ├── instruction_matrix.yaml      # Base instruction matrix (model family → filename)
 ├── settings_matrix.yaml         # Model-family-specific inference params & context limits
 ├── README.md                    # This file
-├── experts/                     # Pre-built agent roles (developer, scholar, critic)
+├── experts/                     # Bundled roles and application-default seed bundles
 │   └── <expert>/
-│       ├── config.yaml              # Agent config (extends defaults)
+│       ├── config.yaml              # Expert overlay (extends one mode base)
 │       ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
 │       └── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
 ├── prompts/                     # Prompt templates (system prompt, phase prompts)
@@ -32,7 +33,10 @@ config/
 │   ├── persona_minimax_m3.txt             # MiniMax M3 persona
 │   ├── strategic_minimax_m3.txt           # MiniMax M3 strategic prompt
 │   ├── tactical_minimax_m3.txt            # MiniMax M3 tactical prompt
-│   └── summarization_prompt_minimax_m3.txt # MiniMax M3 summarization
+│   ├── summarization_prompt_minimax_m3.txt # MiniMax M3 summarization
+│   ├── systemprompt_glm.txt                # GLM-5.2 worker system prompt
+│   ├── systemprompt_interactive_glm.txt    # GLM-5.2 persistent-chat system prompt
+│   └── persona_glm.txt                     # GLM-5.2 persona
 └── templates/                   # Instruction templates (non-prompt files)
     ├── instructions.md                  # Default agent instructions
     ├── instructions_minimax.md          # MiniMax M2.7-optimized instructions
@@ -49,11 +53,11 @@ config/
 
 ### Option 1: Single File Config
 
-Create a YAML file that extends defaults:
+Create a worker YAML file that extends the worker mode base:
 
 ```yaml
 # yaml-language-server: $schema=schema.json
-$extends: defaults
+$extends: worker_base
 
 agent_id: my_agent
 display_name: My Custom Agent
@@ -73,6 +77,11 @@ Save as `config/my_agent.yaml` and run:
 python agent.py --config my_agent
 ```
 
+Persistent/session experts use `$extends: session_base` instead. The legacy
+names `default`, `defaults`, `persistent_default`, and `persistent_defaults`
+remain accepted as compatibility aliases, but new configs should use the
+explicit mode-base names.
+
 ### Option 2: Directory Config (with prompt overrides)
 
 For configs that need custom prompts or instructions, create a directory:
@@ -80,7 +89,7 @@ For configs that need custom prompts or instructions, create a directory:
 ```
 config/
 └── my_agent/
-    ├── config.yaml              # Agent config (extends defaults)
+    ├── config.yaml              # Expert overlay (extends a mode base)
     ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
     ├── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
     ├── instructions.md          # Custom instructions (optional)
@@ -196,7 +205,7 @@ tools:
     - next_phase_todos      # Stage todos for next tactical phase
     - todo_complete          # Mark current todo done
     - todo_list              # List current todos
-    - todo_rewind            # Roll back failed todo
+    - request_replan         # End the phase early and re-plan, keeping all work
     - mark_complete          # Signal phase/task completion
     - job_complete           # Signal final completion (strategic only)
 
@@ -209,9 +218,11 @@ tools:
     - search_papers          # Search arXiv or Semantic Scholar
     - download_paper         # Download PDF (arXiv → Unpaywall → browser fallback)
     - get_paper_info         # Paper metadata via Semantic Scholar
-    - browse_website         # AI browser automation (browser-use)
-    - download_from_website  # Download files via browser automation
     - research_topic         # Multi-database literature search + download
+    # NOTE: browse_website / download_from_website were removed from the
+    # registry — the agent drives the browser itself via the browser_direct
+    # group below. Names listed here must exist in TOOL_REGISTRY; an unknown
+    # name fails the whole batch load (tests/test_config_tool_names_are_registered.py).
 
   # Citation management (src/tools/citation/)
   citation:
@@ -230,7 +241,7 @@ tools:
   # Database tool categories (src/tools/graph/, sql/, mongodb/)
   # These are injected/stripped automatically by the orchestrator based on
   # which datasources are attached to the job. Usually left empty in config.
-  # See docs/datasources.md for details.
+  # See knowledge-base/knowledge/datasources.md for details.
   graph: []      # Neo4j: execute_cypher_query, get_database_schema
   sql: []        # PostgreSQL: sql_query, sql_schema, sql_execute
   mongodb: []    # MongoDB: mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update
@@ -246,7 +257,15 @@ tools:
   # Enable in critic config for approve/return capabilities.
   evaluation: []
 
-  # Workspace version control (src/tools/git/)
+  # Version control (src/tools/git/) — reads the job's own repo by default and
+  # an attached repository datasource with repo="<clone-dir>".
+  #
+  # ONLY BOUND WHEN THE AGENT HAS NO SHELL TOOLS. If `shell` above is
+  # non-empty, ToolsConfig.__post_init__ (src/core/loader.py) drops this whole
+  # group: a shell can run git against any repository in the workspace, and
+  # granting both gives the agent two ways to ask one question — the weaker of
+  # which silently answers about a different repo. Shell-having agents should
+  # be told to run `git ...` (and `git -C repos/<name> ...`) instead.
   git:
     - git_log
     - git_show
@@ -269,7 +288,9 @@ tools:
     - cite_document
 ```
 
-See `defaults.yaml` for the full default tool set.
+See `worker_base.yaml` and `session_base.yaml` for the conservative inherited
+tool surfaces. Privileged and orchestration-oriented groups such as shell,
+delegation, automations, and loops are opt-in at the expert layer.
 
 ### Research & Browser Configuration
 
@@ -282,14 +303,19 @@ research:
     port: 1080            # Proxy port
 
 browser:
-  headless: true          # Run browser without GUI
-  timeout: 60000          # Navigation timeout (ms)
-  use_vision: false       # DOM-based (default) vs screenshot-based navigation
+  snapshot:
+    include_screenshot: auto  # "auto" (if model is multimodal) | true | false
+    max_dom_chars: 40000      # Truncate DOM text beyond this
+  security:
+    allowed_domains: []       # Empty = allow all domains
+    blocked_domains: []
+    blocked_schemes: ["file", "javascript", "data"]
 ```
 
-Proxy can also be set via environment variables: `RESEARCH_PROXY_TYPE`, `RESEARCH_PROXY_HOST`, `RESEARCH_PROXY_PORT`, `RESEARCH_PROXY_USER`, `RESEARCH_PROXY_PASS`.
+The browser itself runs on the workspace (`browser-exec` daemon) — the agent
+pod never executes Chromium. See `knowledge-base/knowledge/features/browser_workspace_executor.md`.
 
-Browser LLM is configured separately: `BROWSER_LLM_MODEL` (default: `gpt-4o-mini`), `BROWSER_LLM_API_KEY`, `BROWSER_LLM_BASE_URL`.
+Proxy can also be set via environment variables: `RESEARCH_PROXY_TYPE`, `RESEARCH_PROXY_HOST`, `RESEARCH_PROXY_PORT`, `RESEARCH_PROXY_USER`, `RESEARCH_PROXY_PASS`.
 
 ### Database Connections
 
@@ -298,7 +324,7 @@ connections:
   postgres: true
 ```
 
-External datasources (Neo4j, MongoDB, additional PostgreSQL) are managed through the datasource connector system. See `docs/datasources.md`.
+External datasources (Neo4j, MongoDB, additional PostgreSQL) are managed through the datasource connector system. See `knowledge-base/knowledge/datasources.md`.
 
 ### Multi-Stage Config Pipeline (Database Tools)
 
@@ -325,8 +351,9 @@ limits:
   message_count_threshold: 300
   # Model-dependent (set in settings_matrix.yaml, NOT here):
   # context_threshold_tokens, model_max_context_tokens,
-  # summarization_safe_limit, summarization_chunk_size,
   # message_count_min_tokens
+  # (summarization budgets are not config leaves — they are computed at call
+  # time from the auxiliary model's window, see src/core/summarizer.py)
 
 context_management:
   compact_on_archive: true
@@ -384,7 +411,7 @@ verification:
 
 ### Memory Light
 
-Opt-in recall system backed by PostgreSQL (pgvector hybrid search). Stores and retrieves insights across context compactions. See `docs/features/memory_light.md` for full design.
+Opt-in recall system backed by PostgreSQL (pgvector hybrid search). Stores and retrieves insights across context compactions. See `knowledge-base/knowledge/features/memory_light.md` for full design.
 
 ```yaml
 memory:
@@ -397,7 +424,8 @@ memory:
 
 ## Inheritance
 
-Configs use `$extends: defaults` to inherit from `defaults.yaml`. Deep merge applies:
+Configs use `$extends: worker_base` or `$extends: session_base` to inherit the
+appropriate execution-mode fallback. Deep merge applies:
 - Objects (dicts): Recursively merged
 - Arrays (lists): Override replaces entirely
 - Scalars: Override replaces
@@ -406,7 +434,7 @@ Configs use `$extends: defaults` to inherit from `defaults.yaml`. Deep merge app
 Example clearing an inherited array:
 
 ```yaml
-$extends: defaults
+$extends: worker_base
 
 tools:
   research: null  # Clears all research tools
@@ -425,7 +453,7 @@ This works with VS Code + Red Hat YAML extension.
 ## Running Agents
 
 ```bash
-# Use defaults
+# Use the worker framework base directly (normally a named expert is selected)
 python agent.py
 
 # Use custom config

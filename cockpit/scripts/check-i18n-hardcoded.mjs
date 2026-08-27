@@ -9,7 +9,7 @@
  * Escape hatch: add `// i18n-exempt` on the same line to silence.
  *
  * Allowlisted paths (admin / non-user-facing):
- *   - src/app/debug/**
+ *   - src/app/workbench/**
  *   - src/app/shared/components/statistics/**
  *   - *.spec.ts, test-setup.ts
  */
@@ -22,7 +22,7 @@ const root = resolve(here, '..');
 const scanRoot = resolve(root, 'src', 'app');
 
 const ALLOWLIST_DIRS = [
-  resolve(scanRoot, 'debug'),
+  resolve(scanRoot, 'workbench'),
   resolve(scanRoot, 'shared', 'components', 'statistics'),
 ];
 

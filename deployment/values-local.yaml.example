@@ -1,0 +1,434 @@
+# =============================================================================
+# Local development overlay — TEMPLATE
+# =============================================================================
+# This file is committed to git. Copy it to `values-local.yaml` (gitignored)
+# and fill in your LLM provider keys before installing.
+#
+#   cp deployment/values-local.yaml.example deployment/values-local.yaml
+#   $EDITOR deployment/values-local.yaml   # paste at least one LLM key
+#   helm dependency build ./helm
+#   helm install srw ./helm -n srw --create-namespace -f deployment/values-local.yaml
+#
+# Everything else here is dev-only defaults that just work after `helm install`:
+#   - All credentials are stub/dev passwords (NOT for production)
+#   - APP_ENCRYPTION_KEY is a fixed dev key — local DB only, regenerate with
+#     `openssl rand -base64 32` if you want a unique one per machine
+#   - The Keycloak realm ships with a pre-seeded `test`/`test` user that has
+#     `admin` + `user` roles — log into the cockpit straight away with that
+#   - TLS via mkcert + cert-manager CAIssuer (set up out of band; see README)
+#   - Agent pool: no warm/buffer slots (spin up on demand)
+#   - Database storage trimmed for a single-dev cluster
+# =============================================================================
+
+license:
+  acceptTerms: true
+
+fullnameOverride: srw
+
+global:
+  domain: "localhost"
+  # Uncomment if your GHCR images are private:
+  # imagePullSecrets:
+  #   - name: ghcr-pull-secret
+
+# Image override — use ONLY when GHCR `:latest` is older than the chart on
+# `develop` HEAD (rare; CI rebuilds on every push). The README troubleshooting
+# section has the docker build + k3d image import commands.
+# image:
+#   orchestrator:
+#     repository: docker.io/library/srw-orchestrator
+#     tag: local-fix
+#     pullPolicy: IfNotPresent
+#   cockpit:
+#     repository: docker.io/library/srw-cockpit
+#     tag: local-fix
+#     pullPolicy: IfNotPresent
+#   agent:
+#     repository: docker.io/library/srw-agent
+#     tag: local-fix
+#     pullPolicy: IfNotPresent
+
+# -----------------------------------------------------------------------------
+# Cockpit BFF — HTTPS via mkcert CAIssuer, cookies are Secure. Domain left
+# empty = host-only cookies. `Domain=.localhost` triggers a "public suffix"
+# rejection in some browsers; host-only avoids it and still works because the
+# cockpit's API calls go directly to api.localhost (no cross-host cookie share).
+# -----------------------------------------------------------------------------
+auth:
+  bff:
+    cookieSecure: "1"
+    cookieDomain: ""
+    # Same-origin path routing on the cockpit ingress. The cockpit and the
+    # orchestrator BFF share an origin → the session cookie is first-party →
+    # works in Brave/Firefox without disabling their 3rd-party cookie blockers.
+    sameOriginApi: true
+    cookieSamesite: "lax"
+
+# -----------------------------------------------------------------------------
+# Secrets — chart-managed (dev only). Production uses ESO/Vault.
+# -----------------------------------------------------------------------------
+externalSecrets:
+  enabled: false
+
+secrets:
+  create: true
+  values:
+    # Crypto root — encrypts API keys at rest. Fixed dev key here is fine
+    # because nothing real is stored in your local DB. Regenerate if you want:
+    # openssl rand -base64 32
+    APP_ENCRYPTION_KEY: "B9THPyad3JGXoycrYu4vn90FUogTP+URXFQxPQLB3CU="
+
+    # LLM provider keys — paste at least one for the agent to actually work
+    OPENAI_API_KEY: ""
+    ANTHROPIC_API_KEY: ""
+    GROQ_API_KEY: ""
+
+    # Web search key for the agent's web_search / extract / crawl / map tools.
+    # Tavily is a search engine, not an LLM — it is NOT DB-seeded; this value
+    # flows through the `srw` Secret into agent pods via envFrom. Get a key at
+    # https://app.tavily.com (free tier available), then `helm upgrade`.
+    TAVILY_API_KEY: ""
+
+    # ElevenLabs API key for the premium TTS read-aloud voice provider (accented,
+    # expressive voices + Voice Library). One account per deployment; the key
+    # stays orchestrator-side (TTS is orchestrator-only, never fanned out to
+    # agents). Leave blank to skip — Kokoro/OpenAI still work. Get a key at
+    # https://elevenlabs.io, then `helm upgrade`. See
+    # knowledge-base/knowledge/features/tts_vendor_providers.md for registering the voice model row.
+    ELEVENLABS_API_KEY: ""
+
+    # App DBs (dev passwords, never rotate locally)
+    POSTGRES_USER: "srw"
+    POSTGRES_PASSWORD: "dev_pg_password"
+    VECTOR_POSTGRES_USER: "srw"
+    VECTOR_POSTGRES_PASSWORD: "dev_pgvector_password"
+    AUDIT_POSTGRES_USER: "srw"
+    AUDIT_POSTGRES_PASSWORD: "dev_auditdb_password"
+    NEO4J_USERNAME: "neo4j"
+    NEO4J_PASSWORD: "dev_neo4j_password_noslash"
+
+    # Keycloak — KC_REALM_ADMIN_PASSWORD is set as the `test` user's password
+    # on every pod restart by the chart's postStart hook. Keeping it as "test"
+    # gives you the test/test login.
+    KEYCLOAK_ADMIN_USER: "admin"
+    KEYCLOAK_ADMIN_PASSWORD: "dev_kc_admin"
+    KC_ADMIN_USER: "admin"
+    KC_ADMIN_PASSWORD: "dev_kc_admin"
+    KC_DB_PASSWORD: "dev_kc_db_password"
+    KC_REALM_ADMIN_PASSWORD: "test"
+    KC_CLIENT_SECRET: "dev_kc_client_secret"
+
+    # Gitea bootstrap admin
+    GITEA_ADMIN_USER: "srw-admin"
+    GITEA_ADMIN_PASSWORD: "dev_gitea_admin"
+
+    # OIDC client secrets — only the ones whose service is enabled.
+    # gitea + mcp are on by default; nextcloud is the local cloud backend
+    # (nextcloud.enabled=true below) so its secret is REQUIRED. The opencloud
+    # entry is a realm-export placeholder stub (OpenCloud itself is disabled
+    # below). Add PGADMIN_OIDC_CLIENT_SECRET only with `pgadmin.enabled=true`.
+    GITEA_OIDC_CLIENT_SECRET: "dev_gitea_oidc_secret"
+    MCP_OIDC_CLIENT_SECRET: "dev_mcp_oidc_secret"
+    NEXTCLOUD_OIDC_CLIENT_SECRET: "dev_nextcloud_oidc_secret"
+    OPENCLOUD_KEYCLOAK_CLIENT_SECRET: "dev_opencloud_oidc"
+
+    # Cloud service account (agent's cloud user; Keycloak bootstrap reads
+    # these regardless of which cloud backend is enabled)
+    CLOUD_SERVICE_USER: "agent"
+    CLOUD_SERVICE_PASSWORD: "dev_cloud_password"
+
+    # Nextcloud (main-cloud backend on local k3d — see nextcloud: block below).
+    # The same Secret feeds both the Nextcloud pod (its setup hook creates the
+    # agent-service user with NEXTCLOUD_AGENT_PASSWORD) and the orchestrator
+    # (admin = OCS/groupfolders, agent = WebDAV). They MUST match.
+    NEXTCLOUD_ADMIN_PASSWORD: "dev_nc_admin"
+    NEXTCLOUD_AGENT_PASSWORD: "dev_nc_agent"
+    # S3 keys unused while nextcloud.objectStore.enabled=false (filesystem on PVC).
+    NEXTCLOUD_S3_ACCESS_KEY: "stub"
+    NEXTCLOUD_S3_SECRET_KEY: "stub"
+
+    # Object store — the bundled Garage store (on by default: garage.enabled
+    # is auto, meaning "run it unless you set s3.endpoint"; values-tilt.yaml
+    # keeps that input blank) auto-generates native-format keys in this Secret
+    # at render time (SNAPSHOT_S3_* + VIRTUAL_WORKSPACE_S3_*, both buckets), so
+    # do NOT set them here. The chart preserves each valid ID/secret pair
+    # atomically and rejects implicit rotation; Garage IDs must be "GK"+24 hex.
+    # Only supply these values when Garage is disabled in favor of external S3.
+
+    # Email/notifications/integrations — chart refs are gated/optional, so
+    # entries here are only required when you flip `email.enabled=true` or wire
+    # up a webhook/integration.
+    DISCORD_WEBHOOK_URL: ""
+    SLACK_WEBHOOK_URL: ""
+    NTFY_TOKEN: ""
+    DEFAULT_DS_WEBDAV_USERNAME: ""
+    DEFAULT_DS_WEBDAV_PASSWORD: ""
+    CODEX_MANAGEMENT_KEY: "dev_codex_key"
+    MCP_INTERNAL_KEY: "dev_mcp_internal_key"
+    # Fixed admin MCP token, seeded into the DB at orchestrator startup + on
+    # first admin login (gated on this var). Lets the committed .mcp.json.example
+    # authenticate against the local cluster out of the box. Dev-only — never
+    # set this in prod (admins mint tokens via the cockpit there).
+    MCP_DEV_TOKEN: "srw_dev_localtoken_do_not_use_in_production"
+
+# -----------------------------------------------------------------------------
+# MCP — expose under the cockpit host so the agent reaches it at
+# https://localhost/mcp (no dedicated mcp.localhost cert/DNS needed).
+# -----------------------------------------------------------------------------
+mcp:
+  exposeOnRootHost: true
+
+# -----------------------------------------------------------------------------
+# Ingress — TLS via mkcert CAIssuer (must be created out of band first)
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: true
+    issuerName: mkcert-issuer
+
+# Dynamic Canvas live workspace applications remain gated. The chart now knows
+# how to render an internal-only gateway, but deliberately provides no wildcard
+# viewer ingress/TLS; file viewing/editing is unaffected. For an isolated local
+# edge test, the chart can generate and reconcile its fixed restricted DB role.
+canvas:
+  livePreview:
+    enabled: false
+    deniedPorts: []
+    viewer:
+      enabled: false
+      deploymentProfile: development
+      cookieMode: ""
+      domain: ""
+      hostSuffix: ""
+      cockpitOrigins: []
+      pslBoundaryVerified: false
+      database:
+        username: "srw_canvas_gateway"
+        credentials:
+          # Keep false while the viewer is disabled. A development-only enabled
+          # viewer may set create=true together with provisionRole=true.
+          create: false
+          existingSecret: ""
+          vaultPath: ""
+          passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
+        provisionRole: false
+        pool:
+          min: 1
+          max: 4
+      # Keep these empty while disabled. Enabling requires both selectors to
+      # identify an already-provisioned local wildcard edge.
+      networkPolicy:
+        edgeNamespaceSelector: {}
+        edgePodSelector: {}
+        extraEgress: []
+
+# -----------------------------------------------------------------------------
+# Agent pool — no warm/buffer slots; agents spin up on demand only
+# -----------------------------------------------------------------------------
+agent:
+  # Keep ordinary local jobs pinned unless a developer explicitly exercises
+  # the stateless-default path alongside the stateless worker admission gate.
+  stateless:
+    worker:
+      defaultEnabled: false
+  pool:
+    minAgents: "0"
+    buffer: "0"
+    reservedSessionSlots: "0"
+    reservedJobSlots: "0"
+    maxAgents: "3"
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+# -----------------------------------------------------------------------------
+# Resource trims — keep chart defaults for everything not listed
+# -----------------------------------------------------------------------------
+orchestrator:
+  # One replica on k3d: half the footprint, one pod to roll per rebuild, no
+  # leader-election noise. This now MATCHES the chart default (1) — kept
+  # explicit so a future default change cannot silently double the footprint.
+  replicas: 1
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+databases:
+  postgres:
+    storageSize: "5Gi"
+  vector:
+    storageSize: "5Gi"
+  audit:
+    storageSize: "2Gi"
+  gitea:
+    storageSize: "2Gi"
+  neo4j:
+    # Disabled for a lighter dev stack (JVM + ~1Gi working memory + 5Gi PVC).
+    # The configmap drops the Neo4j URL and the orchestrator degrades to
+    # kg=None — knowledge-graph/OKF-KB features are OFF locally. Re-enable
+    # when working on KG features.
+    enabled: false
+    storageSize: "5Gi"
+  keycloak:
+    storageSize: "2Gi"
+
+# -----------------------------------------------------------------------------
+# Codex OAuth proxy (CLIProxyAPI) — transport for gpt-5.x / Codex subscription
+# models. OFF for a lighter dev stack. Flip enabled to reproduce/debug
+# Codex-routed issues locally; the orchestrator already points CODEX_PROXY_URL
+# at the in-cluster service and reads CODEX_MANAGEMENT_KEY from the dev secret
+# above. Image pinned to match dev (chart default is :latest, which drifts
+# daily). Post-deploy needs a one-time OpenAI OAuth login via Admin → Models →
+# Codex login (tokens persist in the codex-proxy-auth PVC).
+# -----------------------------------------------------------------------------
+codexProxy:
+  enabled: false
+  image: docker.io/eceasy/cli-proxy-api:v7.2.61
+
+# -----------------------------------------------------------------------------
+# GreenMail — test-only IMAP/SMTP server for the `email` datasource. OFF by
+# default; flip on when working on email tools, then seed fixture mail with
+#   kubectl --context=k3d-srw -n srw port-forward svc/srw-greenmail 3143:3143 &
+#   python scripts/seed_greenmail.py
+# -----------------------------------------------------------------------------
+# test:
+#   greenmail:
+#     enabled: true
+
+# -----------------------------------------------------------------------------
+# Workspace PVC — single-node k3d uses local-path, which is RWO-only.
+#
+# networkPolicy.extraEgress: in-cluster Traefik hairpin — lets workspace
+# pods reach the PUBLIC https://*.localhost URLs, which coredns-custom
+# resolves to the Traefik ClusterIP; inside the cluster CIDRs the tier
+# policies deny. This re-allows exactly the Traefik pods (post-DNAT pod
+# ports: websecure=8443, web=8000). Real deployments resolve the public
+# hostname externally and don't need this. Needed for any flow that uses
+# the public cloud URL instead of the internal service (e.g. VM-runtime
+# rclone mounts).
+# -----------------------------------------------------------------------------
+workspace:
+  accessMode: "ReadWriteOnce"
+  storageSize: "10Gi"
+  # k3d ships only the local-path storage class (no Longhorn). Per-workspace
+  # PVCs (Branch a) must target it, else they hang Pending against the
+  # non-existent longhorn-ephemeral default. local-path is Delete-reclaim +
+  # WaitForFirstConsumer (binds when the pod schedules) — both fine here.
+  ephemeralStorageClass: "local-path"
+  # Branch (a) E2E: PVC-back workspaces so files survive pod crashes. Covers
+  # jobs AND sessions — a session also gets a second claim for its agent pod
+  # (`pvc-agent-s-*`), and BOTH session claims are held until the thread row is
+  # deleted (an `ended` thread is resumable). On a laptop k3d node that means
+  # workspace PVCs accumulate with retained threads; delete threads you are
+  # done with, or `kubectl -n srw delete pvc -l srw.io/component=agent-workspace`
+  # between experiments. Set false to go back to emptyDir.
+  pvcEnabled: true
+  networkPolicy:
+    extraEgress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: traefik
+        ports:
+          - protocol: TCP
+            port: 8443
+          - protocol: TCP
+            port: 8000
+
+# -----------------------------------------------------------------------------
+# Session router — direct-WS session endpoints. The orchestrator mints a JWT
+# at /api/sessions/{tid}/connection that the cockpit uses to open the WS to
+# the agent pod. Without a SESSION_JWT_SECRET, /connection 500s and sessions
+# never come up.
+#
+#   kubectl -n srw create secret generic srw-session-jwt \
+#     --from-literal=jwt-secret="$(openssl rand -base64 48 | tr -d '\n' | head -c 64)"
+#
+# `ingressHost: localhost` keeps the WS same-origin with the cockpit (matches
+# the `/p` route already in the cockpit ingress).
+# `tlsSecretName: srw-cockpit-tls` reuses the mkcert cert so per-session
+# Ingresses land on the same websecure entrypoint.
+# -----------------------------------------------------------------------------
+sessionRouter:
+  jwtSecretName: "srw-session-jwt"
+  jwtSecretKey: "jwt-secret"
+  jwtTtlSeconds: 60
+  ingressHost: "localhost"
+  ingressClass: "traefik"
+  tlsSecretName: "srw-cockpit-tls"
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: "websecure"
+    traefik.ingress.kubernetes.io/router.tls: "true"
+
+# -----------------------------------------------------------------------------
+# Main cloud backend — Nextcloud ONLY on local k3d. With opencloud.enabled=false
+# below, the configmap selects MAIN_CLOUD_BACKEND=nextcloud and the
+# orchestrator's NEXTCLOUD_* env block turns on. replicas:1 (chart default is
+# 0). objectStore.enabled:false stores files on the PVC (no MinIO in k3d).
+#
+# Protected cloud (RO mounts): engage enforces a groupfolders >= 20.1.2 CVE
+# floor (ro_probe.check_version_floors). The Nextcloud setup hook runs
+# `occ app:update groupfolders` so an existing install gets bumped past it —
+# see helm/templates/services/nextcloud.yaml.
+# -----------------------------------------------------------------------------
+nextcloud:
+  enabled: true
+  internal: true
+  replicas: 1
+  objectStore:
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# OpenCloud — REMOVED from the local stack: Nextcloud (above) is the only
+# cloud backend on k3d. The chart default is enabled:true and the configmap
+# prefers opencloud over nextcloud, so this override must stay to keep it off.
+# -----------------------------------------------------------------------------
+opencloud:
+  enabled: false
+
+logLevel: "DEBUG"
+# Local k3d keeps human-readable logs ("json" once Loki lands — see
+# knowledge-base/knowledge/features/centralized_logging.md).
+logFormat: "text"
+
+# --- VM workspaces on the local k3d cluster (optional) -----------------------
+# Run `scripts/local-kubevirt-up.sh` first (KubeVirt + CDI on k3d, KVM passthrough,
+# smoke test), create the two Secrets below, then uncomment. Tilt applies values
+# on the next image rebuild, not on save (see tilt_inner_loop_dev.md).
+#
+#   kubectl -n srw create secret generic srw-vm-lifecycle-hmac \
+#     --from-literal=VM_LIFECYCLE_HMAC_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+#   # srw-vm-ssh-key is minted by scripts/local-dev-up.sh
+#
+# vm:
+#   mode: same-cluster
+#   lifecycleAuthSecretName: srw-vm-lifecycle-hmac
+#   preflight:
+#     enabled: true
+# vmController:
+#   # Tilt builds srw-vm-controller from vm/controller and injects image.* itself.
+#   # The VM image is only built by CI — pin a published sha tag:
+#   defaultVmImage: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-XXXXXXX
+#   defaultCpu: 4
+#   defaultMemory: 8Gi
+#   maxConcurrentVms: 2
+#   vmStorageClass: local-path
+#   vmDiskSize: 20Gi
+#   goldenImage:
+#     enabled: true
+# agent:
+#   tailscale:
+#     enabled: false

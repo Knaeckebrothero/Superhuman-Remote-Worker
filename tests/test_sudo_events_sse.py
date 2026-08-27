@@ -7,7 +7,7 @@ The endpoint is `main.sudo_sse_events`. We test the integration by:
   3. Iterating the StreamingResponse body and asserting which events
      made it through the filter
 
-The filter itself (`user_can_access_job`) has unit coverage in
+The filter itself (`user_can_access_job_or_thread`) has unit coverage in
 test_security_access.py; this file confirms the wiring at the endpoint.
 """
 
@@ -75,6 +75,61 @@ def _build_request_mock(queue_drained_event: asyncio.Event):
 
 
 class TestSudoSseFilter:
+    @pytest.mark.asyncio
+    async def test_thread_owner_sees_thread_event(
+        self, user_a, thread_a, thread_b, fake_db
+    ):
+        from main import sudo_sse_events
+
+        queue: asyncio.Queue = asyncio.Queue()
+        await queue.put(
+            ("new_request", {"id": "owned", "thread_id": str(thread_a["id"])})
+        )
+        await queue.put(
+            ("new_request", {"id": "other", "thread_id": str(thread_b["id"])})
+        )
+        request = MagicMock(cookies={}, headers={})
+        request.is_disconnected = AsyncMock(side_effect=lambda: queue.empty())
+
+        with _patch_caller_and_db(user_a, fake_db):
+            with patch("main.sudo_gate.subscribe_sse", lambda: queue):
+                with patch("main.sudo_gate.unsubscribe_sse", lambda q: None):
+                    response = await sudo_sse_events(request)
+                    chunks = [chunk async for chunk in response.body_iterator]
+
+        text = b"".join(
+            chunk.encode() if isinstance(chunk, str) else chunk for chunk in chunks
+        ).decode()
+        assert '"id": "owned"' in text
+        assert '"id": "other"' not in text
+
+    @pytest.mark.asyncio
+    async def test_thread_owner_can_list_and_get_thread_sudo_request(
+        self, user_a, thread_a, fake_db
+    ):
+        from main import get_sudo_request, list_sudo_requests
+
+        row = {
+            "id": "thread-sudo",
+            "job_id": None,
+            "thread_id": str(thread_a["id"]),
+        }
+        request = MagicMock(cookies={}, headers={})
+        with _patch_caller_and_db(user_a, fake_db):
+            with patch("main.sudo_gate.list_requests", AsyncMock(return_value=[row])):
+                listed = await list_sudo_requests(
+                    request,
+                    job_id=None,
+                    status=None,
+                    request_type=None,
+                    limit=50,
+                )
+            with patch("main.sudo_gate.get_request", AsyncMock(return_value=row)):
+                fetched = await get_sudo_request(request, "thread-sudo")
+
+        assert listed == [row]
+        assert fetched == row
+
     @pytest.mark.asyncio
     async def test_user_sees_only_own_jobs_events(self, user_a, job_a, job_b, fake_db):
         """user_a should see events for job_a (owned), not for job_b."""

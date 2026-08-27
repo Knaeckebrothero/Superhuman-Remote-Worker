@@ -1,19 +1,32 @@
-import {ChangeDetectionStrategy, Component, computed, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, computed, DestroyRef, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
+import {MarkdownComponent} from 'ngx-markdown';
+import {stripMarkdown} from '../../core/util/strip-markdown';
+import {effectiveJobStatus} from '../../core/util/job-status';
 import {ApiService} from '../../core/services/api.service';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
+import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
+import {ViewportService} from '../../core/services/viewport.service';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
+import {AppDialogComponent} from '../../ui/dialog';
 import {AppInputComponent} from '../../ui/input';
+import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSelectComponent} from '../../ui/select';
 import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppBadgeComponent} from '../../ui/badge';
 import {AppFormFieldComponent} from '../../ui/form-field';
+import {ProjectLoopComponent} from './project-loop.component';
+import {ProjectOfficerComponent} from './project-officer.component';
+import {ProjectBacklogComponent} from './project-backlog.component';
+import {ExternalImageDirective} from '../../ui/external-image';
 import {
     Datasource,
     Expert,
@@ -22,15 +35,17 @@ import {
     KnowledgeNoteDetail,
     KnowledgeSummary,
     Project,
+    ProjectArchiveReport,
     ProjectDatasource,
     ProjectMember,
     ProjectMemberRole,
     ProjectRepoRole,
     ProjectRepository,
+    ProjectStatus,
     User,
 } from '../../core/models/api.model';
 
-type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'settings';
+type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'loop' | 'centurion' | 'settings';
 
 @Component({
   selector: 'app-project-detail-page',
@@ -43,12 +58,19 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     AppSpinnerComponent,
     AppButtonComponent,
     AppIconButtonComponent,
+    AppDialogComponent,
     AppInputComponent,
+    AppInlineEditableTextComponent,
     AppTextareaComponent,
     AppSelectComponent,
     AppCheckboxComponent,
     AppBadgeComponent,
     AppFormFieldComponent,
+    MarkdownComponent,
+    ExternalImageDirective,
+    ProjectLoopComponent,
+    ProjectOfficerComponent,
+    ProjectBacklogComponent,
   ],
   template: `
     <div class="page-container">
@@ -72,7 +94,21 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
             <app-icon size="sm">arrow_back</app-icon>
           </app-icon-button>
           <div class="header-info">
-            <h1 class="page-title">{{ proj.name }}</h1>
+            <h1 class="page-title">
+              @if (isArchived()) {
+                <!-- An archived project takes a status-only PATCH, so a rename
+                     is refused whole. Do not offer the control at all rather
+                     than let the title be typed into and then snap back. -->
+                <span class="page-title-static" [title]="proj.name">{{ proj.name }}</span>
+              } @else {
+                <app-inline-editable-text
+                  [value]="proj.name"
+                  [clickToEdit]="true"
+                  [ariaLabel]="'common.rename' | transloco"
+                  (save)="onRenameProject($event)"
+                />
+              }
+            </h1>
             <div class="header-badges">
               @if (proj.is_default) {
                 <app-badge tone="accent" size="xs" [uppercase]="true">
@@ -86,9 +122,13 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           </div>
         </div>
 
+        @if (renameError(); as message) {
+          <p class="edit-error" role="alert">{{ message }}</p>
+        }
+
         <!-- Tabs -->
         <div class="tab-bar">
-          @for (t of tabList; track t.id) {
+          @for (t of tabList(); track t.id) {
             <button
               class="tab-btn"
               [class.active]="activeTab() === t.id"
@@ -132,7 +172,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               </div>
               <div class="stats-row">
                 <div class="stat-card">
-                  <span class="stat-value">{{ jobs().length }}</span>
+                  <span class="stat-value">{{ proj.job_count ?? jobs().length }}</span>
                   <span class="stat-label">{{ 'projectDetail.overview.statsJobs' | transloco }}</span>
                 </div>
                 <div class="stat-card">
@@ -158,6 +198,14 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <label>{{ 'projectDetail.overview.created' | transloco }}</label>
                 <p class="detail-value mono">{{ formatDate(proj.created_at) }}</p>
               </div>
+              @if (isArchived()) {
+                <p class="archived-note" role="note">
+                  {{ 'projectDetail.overview.archivedReadOnly' | transloco }}
+                </p>
+              }
+              @if (editError(); as message) {
+                <p class="edit-error" role="alert">{{ message }}</p>
+              }
               <div class="overview-actions">
                 @if (isEditingOverview()) {
                   <app-button variant="primary" size="md" (clicked)="saveOverview()">
@@ -167,9 +215,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     {{ 'projectDetail.overview.cancel' | transloco }}
                   </app-button>
                 } @else {
-                  <app-button variant="ghost" size="md" (clicked)="startEditOverview()">
-                    {{ 'projectDetail.overview.edit' | transloco }}
-                  </app-button>
+                  @if (!isArchived()) {
+                    <app-button variant="ghost" size="md" (clicked)="startEditOverview()">
+                      {{ 'projectDetail.overview.edit' | transloco }}
+                    </app-button>
+                  }
                   <app-button variant="ghost" size="md" (clicked)="openAutomationsForProject()">
                     {{ 'projectDetail.overview.manageAutomations' | transloco }}
                   </app-button>
@@ -209,17 +259,23 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     @for (job of jobs(); track job.id) {
                       <tr>
                         <td>
-                          <span class="status-badge" [class]="'status-' + job.status">
-                            {{ job.status }}
+                          <span class="status-badge" [class]="'status-' + effectiveJobStatus(job)">
+                            {{ 'jobs.status.' + effectiveJobStatus(job) | transloco }}
                           </span>
                         </td>
                         <td class="desc-cell">{{ truncate(job.description, 60) }}</td>
                         <td class="mono">{{ job.config_name }}</td>
-                        <td class="mono">{{ job.branch_name || '-' }}</td>
+                        <td class="mono">
+                          @if (job.repo_name) {
+                            {{ job.repo_name }}&#64;{{ job.branch_name || 'main' }}
+                          } @else {
+                            -
+                          }
+                        </td>
                         <td>
-                          @if (job.merge_status) {
-                            <span class="merge-badge" [class]="'merge-' + job.merge_status">
-                              {{ job.merge_status }}
+                          @if (job.delivery_status || job.merge_status) {
+                            <span class="merge-badge" [class]="'merge-' + (job.delivery_status || job.merge_status)">
+                              {{ job.delivery_status || job.merge_status }}
                             </span>
                           } @else {
                             <span class="text-muted">-</span>
@@ -237,6 +293,64 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           <!-- KNOWLEDGE TAB -->
           @if (activeTab() === 'knowledge') {
             <div class="kb-section">
+              <!-- No vault yet: offer to point this project at a knowledge
+                   base connector. Replacing an existing vault is deliberately
+                   not offered — there is no approved note/history migration
+                   (external_forge_knowledge_base.md §8.2). -->
+              @if (!hasKnowledgeRepo()) {
+                <div class="kb-attach">
+                  <div class="kb-attach-title">
+                    {{ 'projectDetail.knowledge.attachTitle' | transloco }}
+                  </div>
+                  <p class="kb-attach-hint">
+                    {{ 'projectDetail.knowledge.attachHint' | transloco }}
+                  </p>
+                  @if (kbConnectors().length === 0) {
+                    <p class="kb-attach-hint">
+                      {{ 'projectDetail.knowledge.attachNoConnectors' | transloco }}
+                    </p>
+                    <app-button variant="secondary" size="sm" (clicked)="openConnectors()">
+                      {{ 'projectDetail.knowledge.attachCreateConnector' | transloco }}
+                    </app-button>
+                  } @else {
+                    <div class="kb-attach-row">
+                      <app-select
+                        size="sm"
+                        [fullWidth]="false"
+                        [value]="kbAttachSelection()"
+                        (changed)="kbAttachSelection.set($event ?? '')"
+                      >
+                        <option value="">
+                          {{ 'projectDetail.knowledge.attachSelectPlaceholder' | transloco }}
+                        </option>
+                        @for (connector of kbConnectors(); track connector.id) {
+                          <option [value]="connector.id">{{ connector.name }}</option>
+                        }
+                      </app-select>
+                      <app-button
+                        variant="primary"
+                        size="sm"
+                        [disabled]="!kbAttachSelection() || isAttachingKb()"
+                        (clicked)="attachKnowledgeConnector()"
+                      >
+                        {{ (isAttachingKb()
+                              ? 'projectDetail.knowledge.attachSubmitting'
+                              : 'projectDetail.knowledge.attachSubmit') | transloco }}
+                      </app-button>
+                    </div>
+                    <p class="kb-attach-hint">
+                      {{ 'projectDetail.knowledge.attachAdoptHint' | transloco }}
+                    </p>
+                  }
+                  @if (kbAttachError()) {
+                    <p class="kb-attach-error" role="alert">{{ kbAttachError() }}</p>
+                  }
+                </div>
+              }
+              <!-- Stats + search/filters act on the list; on mobile, hide them while a
+                   single note is open so the note isn't buried under chrome. Desktop
+                   keeps them visible (master/detail, plenty of vertical room). -->
+              @if (!viewport.isMobile() || !kbSelectedNote()) {
               <!-- Summary Stats -->
               @if (kbSummary(); as summary) {
                 <div class="kb-stats-row">
@@ -309,6 +423,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   {{ 'projectDetail.knowledge.export' | transloco }}
                 </app-button>
               </div>
+              }
 
               <!-- Note Detail View -->
               @if (kbSelectedNote(); as note) {
@@ -352,7 +467,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       }
                     </div>
                   }
-                  <div class="kb-detail-content">{{ note.content }}</div>
+                  <div class="kb-detail-content"><markdown [data]="note.content"></markdown></div>
                   @if (note.relationships && note.relationships.length > 0) {
                     <div class="kb-relationships">
                       <h4>{{ 'projectDetail.knowledge.relationships' | transloco }}</h4>
@@ -386,7 +501,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                           <span class="kb-note-status" [attr.data-status]="note.status">{{ note.status }}</span>
                         </div>
                         @if (note.content_preview) {
-                          <div class="kb-note-preview">{{ truncate(note.content_preview, 180) }}</div>
+                          <div class="kb-note-preview">{{ notePreview(note.content_preview) }}</div>
                         }
                         <div class="kb-note-footer">
                           @if (note.tags && note.tags.length > 0) {
@@ -423,25 +538,66 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
             <div class="table-section">
               <!-- Link Datasource Form -->
               <div class="inline-form">
+                <app-input
+                  class="datasource-search"
+                  size="sm"
+                  [value]="datasourceCandidateSearch()"
+                  (valueChange)="onDatasourceCandidateSearch($event)"
+                  [placeholder]="'projectDetail.datasources.searchPlaceholder' | transloco"
+                  [disabled]="datasourceCandidatesLoading()"
+                />
                 <app-select
                   size="sm"
                   [value]="dsLinkId()"
                   (changed)="dsLinkId.set($event ?? '')"
+                  [disabled]="datasourceCandidatesLoading() || datasourceCandidatesError()"
                 >
                   <option value="">{{ 'projectDetail.datasources.selectPlaceholder' | transloco }}</option>
                   @for (ds of availableDatasources(); track ds.id) {
-                    <option [value]="ds.id">{{ ds.name }} ({{ ds.type }})</option>
+                    <option [value]="ds.id">
+                      {{ ds.name }} ({{ 'datasources.filter.' + ds.type | transloco }})
+                    </option>
                   }
                 </app-select>
                 <app-button
                   variant="primary"
                   size="sm"
-                  [disabled]="!dsLinkId()"
+                  [disabled]="!dsLinkId() || datasourceCandidatesLoading() || datasourceCandidatesError()"
                   (clicked)="linkDatasource()"
                 >
                   {{ 'projectDetail.datasources.link' | transloco }}
                 </app-button>
               </div>
+              @if (datasourceCandidatesLoading()) {
+                <div class="datasource-candidate-state">
+                  <app-spinner size="sm" />
+                  <span>{{ 'projectDetail.datasources.loadingCandidates' | transloco }}</span>
+                </div>
+              } @else if (datasourceCandidatesError()) {
+                <div class="datasource-candidate-state error" role="alert">
+                  <span>{{ 'projectDetail.datasources.candidatesLoadFailed' | transloco }}</span>
+                  <app-button variant="secondary" size="sm" (clicked)="loadDatasourceCandidates()">
+                    {{ 'projectDetail.datasources.retry' | transloco }}
+                  </app-button>
+                </div>
+              } @else if (availableDatasources().length === 0) {
+                <div class="datasource-candidate-state">
+                  {{ 'projectDetail.datasources.noCandidates' | transloco }}
+                </div>
+              }
+              @if (datasourceCandidatesNextCursor() && !datasourceCandidatesError()) {
+                <div class="datasource-candidate-actions">
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    [loading]="datasourceCandidatesLoadingMore()"
+                    [disabled]="datasourceCandidatesLoadingMore()"
+                    (clicked)="loadMoreDatasourceCandidates()"
+                  >
+                    {{ 'datasources.catalog.loadMore' | transloco }}
+                  </app-button>
+                </div>
+              }
 
               @if (projectDatasources().length === 0) {
                 <div class="empty-inline">{{ 'projectDetail.datasources.empty' | transloco }}</div>
@@ -462,7 +618,9 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       <tr>
                         <td>{{ ds.name }}</td>
                         <td>
-                          <span class="role-badge" [class]="'role-' + ds.type">{{ ds.type }}</span>
+                          <span class="role-badge" [class]="'role-' + ds.type">
+                            {{ 'datasources.filter.' + ds.type | transloco }}
+                          </span>
                         </td>
                         <td>
                           <app-input
@@ -473,15 +631,25 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                           />
                         </td>
                         <td>
-                          <app-select
-                            size="sm"
-                            [value]="boolToText(ds.project_read_only)"
-                            (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
-                          >
-                            <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
-                            <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
-                            <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
-                          </app-select>
+                          @if (ds.type === 'kb') {
+                            <app-badge
+                              tone="info"
+                              size="sm"
+                              [title]="'projectDetail.datasources.accessKbReadOnlyHint' | transloco"
+                            >
+                              {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
+                            </app-badge>
+                          } @else {
+                            <app-select
+                              size="sm"
+                              [value]="boolToText(ds.project_read_only)"
+                              (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
+                            >
+                              <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
+                              <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
+                              <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
+                            </app-select>
+                          }
                         </td>
                         <td>
                           <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
@@ -520,7 +688,6 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   [value]="repoRole()"
                   (changed)="onRepoRoleChange($event)"
                 >
-                  <option value="jobs">{{ 'projectDetail.repos.roleJobs' | transloco }}</option>
                   <option value="source">{{ 'projectDetail.repos.roleSource' | transloco }}</option>
                   <option value="reference">{{ 'projectDetail.repos.roleReference' | transloco }}</option>
                 </app-select>
@@ -576,9 +743,16 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                         <td>{{ (repo.read_only ? 'projectDetail.repos.yes' : 'projectDetail.repos.no') | transloco }}</td>
                         <td>{{ (repo.is_managed ? 'projectDetail.repos.yes' : 'projectDetail.repos.no') | transloco }}</td>
                         <td>
-                          <app-button variant="danger" size="sm" (clicked)="removeRepo(repo.id)">
-                            {{ 'projectDetail.repos.remove' | transloco }}
-                          </app-button>
+                          <!-- The jobs repo is the project's own repo; the API
+                               rejects removing it (400). Don't offer a button
+                               that can only fail. -->
+                          @if (repo.role !== 'jobs') {
+                            <app-button variant="danger" size="sm" (clicked)="removeRepo(repo.id)">
+                              {{ 'projectDetail.repos.remove' | transloco }}
+                            </app-button>
+                          } @else {
+                            <span class="text-muted">{{ 'projectDetail.repos.protected' | transloco }}</span>
+                          }
                         </td>
                       </tr>
                     }
@@ -600,7 +774,6 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               } @else if (projectExperts().length === 0) {
                 <div class="empty-inline">
                   {{ 'projectDetail.experts.emptyPrefix' | transloco }}
-                  <code>experts/</code> {{ 'projectDetail.experts.emptySuffix' | transloco }}
                 </div>
               } @else {
                 <div class="expert-grid">
@@ -719,15 +892,47 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           }
 
           <!-- SETTINGS TAB -->
+          <!-- Loop + Centurion are gated on unattended_operations. The tab
+               buttons are already filtered out below; these guards additionally
+               cover a grant revoked while the tab is open (capabilities reload)
+               so the surface disappears rather than lingering. -->
+          @if (activeTab() === 'loop' && canRunUnattendedOperations()) {
+            <app-project-loop [projectId]="project()?.id ?? ''" />
+            <app-project-backlog [projectId]="project()?.id ?? ''" />
+          }
+
+          @if (activeTab() === 'centurion' && canRunUnattendedOperations()) {
+            <app-project-officer
+              [projectId]="project()?.id ?? ''"
+              [projectName]="project()?.name ?? ''"
+            />
+          }
+
           @if (activeTab() === 'settings') {
             <div class="settings-section">
+              <!-- Archived is read-only, not hidden: every value below stays
+                   legible and stops being editable, and this names the one
+                   click that gives them back. Letting the user type and then
+                   eat a 409 is the failure this replaces. Only the Danger Zone
+                   stays live, because unarchiving is the way out. -->
+              @if (isArchived()) {
+                <p class="archived-note" role="note">
+                  {{ 'projectDetail.settings.archivedReadOnly' | transloco }}
+                </p>
+              }
+              <!-- Any of the four groups below can be refused, so the refusal
+                   belongs to the panel rather than to one of them. -->
+              @if (editError(); as message) {
+                <p class="edit-error" role="alert">{{ message }}</p>
+              }
+
               <!-- General -->
               <div class="settings-group">
                 <h3 class="settings-heading">{{ 'projectDetail.settings.general' | transloco }}</h3>
                 <app-form-field [label]="'projectDetail.settings.projectName' | transloco">
                   <app-input
                     [value]="settingsName()"
-                    [disabled]="proj.is_default"
+                    [disabled]="proj.is_default || isArchived()"
                     (changed)="settingsName.set($event)"
                   />
                 </app-form-field>
@@ -735,6 +940,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <app-input
                     [placeholder]="'projectDetail.settings.configPlaceholder' | transloco"
                     [value]="settingsConfigName()"
+                    [disabled]="isArchived()"
                     (changed)="settingsConfigName.set($event)"
                   />
                 </app-form-field>
@@ -743,7 +949,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     variant="primary"
                     size="sm"
                     [loading]="isSavingSettings()"
-                    [disabled]="isSavingSettings()"
+                    [disabled]="isSavingSettings() || isArchived()"
                     (clicked)="saveSettings()"
                   >
                     {{ 'projectDetail.settings.save' | transloco }}
@@ -756,6 +962,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <h3 class="settings-heading">{{ 'projectDetail.settings.memory' | transloco }}</h3>
                 <app-checkbox
                   [checked]="projectMemoryShared()"
+                  [disabled]="isArchived()"
                   (changed)="toggleProjectMemory($event)"
                 >
                   {{ 'projectDetail.settings.shareMemories' | transloco }}
@@ -772,6 +979,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <app-form-field [label]="'projectDetail.settings.networkTier' | transloco">
                     <app-select
                       [value]="settingsNetworkTier()"
+                      [disabled]="isArchived()"
                       (changed)="onNetworkTierChange($event ?? '')"
                     >
                       <option value="internet-only">{{ 'projectDetail.settings.networkTierInternetOnly' | transloco }}</option>
@@ -797,6 +1005,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   </div>
                   <app-checkbox
                     [checked]="settingsCloudReadOnly()"
+                    [disabled]="isArchived()"
                     (changed)="toggleCloudReadOnly($event)"
                   >
                     {{ 'projectDetail.settings.readOnlyAgent' | transloco }}
@@ -820,7 +1029,33 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   </p>
                 } @else {
                   <div class="danger-actions">
-                    @if (proj.status === 'active') {
+                    @if (lifecycleError(); as message) {
+                      <p class="lifecycle-error" role="alert">{{ message }}</p>
+                    }
+                    @if (archiveReport(); as report) {
+                      <p class="lifecycle-note" role="status">{{ report }}</p>
+                    }
+                    @if (proj.status === 'archived') {
+                      <!-- The way back. Reads, detaching and unarchiving all stay
+                           possible on an archived project; only new work is
+                           refused, or archiving would be a trap. -->
+                      <div class="danger-row">
+                        <div class="danger-info">
+                          <span class="danger-title">{{ 'projectDetail.settings.unarchiveTitle' | transloco }}</span>
+                          <span class="danger-desc">
+                            {{ 'projectDetail.settings.unarchiveDesc' | transloco }}
+                          </span>
+                        </div>
+                        <app-button
+                          variant="ghost"
+                          size="sm"
+                          [disabled]="lifecycleBusy()"
+                          (clicked)="confirmUnarchive()"
+                        >
+                          {{ 'projectDetail.settings.unarchive' | transloco }}
+                        </app-button>
+                      </div>
+                    } @else {
                       <div class="danger-row">
                         <div class="danger-info">
                           <span class="danger-title">{{ 'projectDetail.settings.archiveTitle' | transloco }}</span>
@@ -828,7 +1063,12 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                             {{ 'projectDetail.settings.archiveDesc' | transloco }}
                           </span>
                         </div>
-                        <app-button variant="ghost" size="sm" (clicked)="archiveProject()">
+                        <app-button
+                          variant="ghost"
+                          size="sm"
+                          [disabled]="lifecycleBusy()"
+                          (clicked)="confirmArchive()"
+                        >
                           {{ 'projectDetail.settings.archive' | transloco }}
                         </app-button>
                       </div>
@@ -851,6 +1091,33 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           }
         </div>
       }
+
+      <!-- Lifecycle confirmation. A native confirm() cannot be themed, cannot
+           be translated by the app's own catalogue, and is what the rest of the
+           app has already moved off. -->
+      <app-dialog
+        [open]="pendingLifecycle() !== null"
+        [title]="(pendingLifecycle() === 'archived'
+          ? 'projectDetail.settings.archiveConfirmTitle'
+          : 'projectDetail.settings.unarchiveConfirmTitle') | transloco"
+        (closed)="pendingLifecycle.set(null)"
+      >
+        <p>
+          {{ (pendingLifecycle() === 'archived'
+            ? 'projectDetail.settings.archiveConfirm'
+            : 'projectDetail.settings.unarchiveConfirm') | transloco }}
+        </p>
+        <div appDialogActions>
+          <app-button variant="secondary" (clicked)="pendingLifecycle.set(null)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="primary" [disabled]="lifecycleBusy()" (clicked)="applyLifecycle()">
+            {{ (pendingLifecycle() === 'archived'
+              ? 'projectDetail.settings.archive'
+              : 'projectDetail.settings.unarchive') | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
     </div>
   `,
   styles: [`
@@ -858,7 +1125,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
     .page-container {
       padding: 24px;
-      max-width: 1200px;
+      max-width: var(--content-max-width-wide);
       margin: 0 auto;
       overflow-x: hidden;
     }
@@ -880,6 +1147,37 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     }
 
     .header-badges { display: flex; gap: 6px; }
+
+    /* The archived title: the same one-line, ellipsised shape the inline
+       rename control renders, minus the affordance. */
+    .page-title-static {
+      display: inline-block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: bottom;
+    }
+
+    /* A refused write, wherever the user was when it was refused. */
+    .edit-error {
+      margin: 0 0 12px 0;
+      padding: 8px 12px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      color: var(--danger);
+      font-size: 12px;
+    }
+
+    .archived-note {
+      margin: 0;
+      padding: 8px 12px;
+      border-radius: var(--radius-control);
+      background: var(--surface-0);
+      color: var(--text-secondary);
+      font-size: 12px;
+      line-height: 1.4;
+    }
 
     /* Tabs */
     .tab-bar {
@@ -993,7 +1291,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       margin-top: 4px;
     }
 
-    .overview-actions { display: flex; gap: 8px; align-items: center; }
+    .overview-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
     .mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
 
@@ -1063,6 +1361,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .status-failed { background: var(--danger-tint); color: var(--danger); }
     .status-cancelled { background: var(--surface-0); color: var(--text-muted); }
     .status-pending_review { background: var(--warning-tint); color: var(--warning); }
+    .status-blocked_undelivered { background: var(--warning-tint); color: var(--warning); }
 
     /* Merge badges */
     .merge-badge {
@@ -1077,6 +1376,14 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .merge-conflict { background: var(--danger-tint); color: var(--danger); }
     .merge-skipped { background: var(--surface-0); color: var(--text-muted); }
     .merge-pending { background: var(--warning-tint); color: var(--warning); }
+    .merge-empty { background: var(--warning-tint); color: var(--warning); }
+    .merge-merge-failed { background: var(--danger-tint); color: var(--danger); }
+    .merge-cloud-applied { background: var(--success-tint); color: var(--success); }
+    .merge-no-changes,
+    .merge-cloud-rejected { background: var(--surface-0); color: var(--text-muted); }
+    .merge-cloud-conflict,
+    .merge-cloud-partial,
+    .merge-cloud-unavailable { background: var(--danger-tint); color: var(--danger); }
 
     /* Role badges */
     .role-badge {
@@ -1104,6 +1411,20 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       border-radius: var(--radius-surface);
       flex-wrap: wrap;
     }
+
+    .datasource-search { min-width: 180px; flex: 1 1 220px; }
+
+    .datasource-candidate-state {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+
+    .datasource-candidate-state.error { color: var(--danger); }
+
+    .datasource-candidate-actions { display: flex; justify-content: flex-start; }
 
     /* User cell */
     .user-cell {
@@ -1221,6 +1542,25 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
     .danger-actions { display: flex; flex-direction: column; gap: 12px; }
 
+    .lifecycle-error {
+      margin: 0;
+      padding: 8px 12px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      color: var(--danger);
+      font-size: 12px;
+    }
+
+    .lifecycle-note {
+      margin: 0;
+      padding: 8px 12px;
+      border-radius: var(--radius-control);
+      background: var(--surface-0);
+      color: var(--text-secondary);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
     .danger-row {
       display: flex;
       align-items: center;
@@ -1249,6 +1589,31 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
     /* Knowledge Base */
     .kb-section { display: flex; flex-direction: column; gap: 16px; }
+
+    .kb-attach {
+      display: flex; flex-direction: column; gap: 8px;
+      background: var(--panel-bg);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-surface);
+      padding: 14px;
+    }
+
+    .kb-attach-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+
+    .kb-attach-hint {
+      margin: 0;
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.45;
+    }
+
+    .kb-attach-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+    .kb-attach-error {
+      margin: 0;
+      font-size: 12px;
+      color: var(--danger);
+    }
 
     .kb-stats-row {
       display: flex; gap: 12px; flex-wrap: wrap;
@@ -1390,8 +1755,94 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .kb-detail-content {
       font-size: 13px; line-height: 1.7;
       color: var(--text-primary);
-      white-space: pre-wrap; word-wrap: break-word;
+      word-wrap: break-word;
     }
+
+    /* Rendered markdown — mirrors the chat renderer's cascade so KB notes
+       read the same as agent messages. */
+    .kb-detail-content ::ng-deep > :first-child { margin-top: 0; }
+    .kb-detail-content ::ng-deep > :last-child { margin-bottom: 0; }
+
+    .kb-detail-content ::ng-deep p { margin: 8px 0; }
+
+    .kb-detail-content ::ng-deep h1,
+    .kb-detail-content ::ng-deep h2,
+    .kb-detail-content ::ng-deep h3,
+    .kb-detail-content ::ng-deep h4,
+    .kb-detail-content ::ng-deep h5,
+    .kb-detail-content ::ng-deep h6 {
+      color: var(--text-primary);
+      font-weight: 700; line-height: 1.3;
+      margin: 16px 0 8px 0;
+    }
+
+    .kb-detail-content ::ng-deep h1 { font-size: 18px; }
+    .kb-detail-content ::ng-deep h2 { font-size: 16px; }
+    .kb-detail-content ::ng-deep h3 { font-size: 14px; }
+    .kb-detail-content ::ng-deep h4,
+    .kb-detail-content ::ng-deep h5,
+    .kb-detail-content ::ng-deep h6 {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .kb-detail-content ::ng-deep ul,
+    .kb-detail-content ::ng-deep ol {
+      margin: 6px 0; padding-left: 20px;
+    }
+    .kb-detail-content ::ng-deep ul { list-style-type: disc; }
+    .kb-detail-content ::ng-deep ol { list-style-type: decimal; }
+    .kb-detail-content ::ng-deep li { margin: 3px 0; }
+    .kb-detail-content ::ng-deep li > ul,
+    .kb-detail-content ::ng-deep li > ol { margin: 2px 0; }
+
+    .kb-detail-content ::ng-deep code {
+      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+      padding: 1px 5px; border-radius: var(--radius-tag);
+      font-family: 'JetBrains Mono', monospace; font-size: 0.9em;
+    }
+
+    .kb-detail-content ::ng-deep pre {
+      background: var(--surface-0);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-surface);
+      padding: 12px 16px; margin: 8px 0;
+      overflow-x: auto;
+      font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.5;
+    }
+    .kb-detail-content ::ng-deep pre code { background: transparent; padding: 0; }
+
+    .kb-detail-content ::ng-deep blockquote {
+      border-left: 3px solid var(--accent-color);
+      margin: 8px 0; padding: 4px 12px;
+      color: var(--text-secondary);
+    }
+
+    .kb-detail-content ::ng-deep a { color: var(--info); text-decoration: none; }
+    .kb-detail-content ::ng-deep a:hover { text-decoration: underline; }
+
+    .kb-detail-content ::ng-deep table {
+      border-collapse: collapse;
+      display: block; width: max-content; max-width: 100%;
+      overflow-x: auto; margin: 8px 0; font-size: 12px;
+    }
+    .kb-detail-content ::ng-deep th,
+    .kb-detail-content ::ng-deep td {
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--border-color);
+      text-align: left;
+    }
+    .kb-detail-content ::ng-deep th {
+      font-weight: 600; color: var(--accent-color);
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    }
+
+    .kb-detail-content ::ng-deep hr {
+      border: none; border-top: 1px solid var(--border-color);
+      margin: 16px 0;
+    }
+
+    .kb-detail-content ::ng-deep img { max-width: 100%; height: auto; }
 
     .kb-relationships {
       margin-top: 16px; padding-top: 16px;
@@ -1456,8 +1907,8 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       .data-table { min-width: 500px; }
 
       .inline-form { flex-direction: column; align-items: stretch; }
-      .kb-stats-row { flex-direction: column; }
-      .kb-toolbar { flex-direction: column; gap: 8px; }
+      .kb-stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+      .kb-toolbar { flex-direction: column; align-items: stretch; gap: 8px; }
     }
   `],
 })
@@ -1465,12 +1916,48 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly api = inject(ApiService);
+  private readonly capabilities = inject(CapabilitiesService);
   private readonly userService = inject(UserService);
   private readonly transloco = inject(TranslocoService);
+  private readonly errors = inject(ErrorMessageService);
+  private readonly destroyRef = inject(DestroyRef);
+  protected readonly viewport = inject(ViewportService);
+  readonly effectiveJobStatus = effectiveJobStatus;
 
   readonly project = signal<Project | null>(null);
+  /** Which lifecycle change the confirmation dialog is holding, if any. */
+  readonly pendingLifecycle = signal<ProjectStatus | null>(null);
+  readonly lifecycleBusy = signal(false);
+  /** The server's own refusal — for an archived project that is a 409 naming
+   *  the fix, which is exactly the sentence worth showing. */
+  readonly lifecycleError = signal<string | null>(null);
+  /** What archiving quiesced on the way through. */
+  readonly archiveReport = signal<string | null>(null);
+  /**
+   * Archived means read-only apart from `status`: the server accepts a
+   * status-only PATCH and refuses any other field whole with a 409. The UI
+   * prevents rather than reports — the fields stay visible and stop being
+   * editable — and the error signals below cover the case prevention cannot,
+   * which is another tab archiving the project while this form is open.
+   */
+  readonly isArchived = computed(() => this.project()?.status === 'archived');
+  /** A refused rename. Lives beside the header, where the rename is. */
+  readonly renameError = signal<string | null>(null);
+  /** A refused overview or settings save. The two panels are different tabs,
+   *  so one signal never renders twice at once. */
+  readonly editError = signal<string | null>(null);
   readonly jobs = signal<Job[]>([]);
   readonly repos = signal<ProjectRepository[]>([]);
+  /** A project has at most one writable vault, and it is never replaced in
+   *  place, so this is what decides whether attaching is offered at all. */
+  readonly hasKnowledgeRepo = computed(() =>
+    this.repos().some((repo) => repo.role === 'knowledge'),
+  );
+  /** Knowledge base connectors this project could adopt as its vault. */
+  readonly kbConnectors = signal<Datasource[]>([]);
+  readonly kbAttachSelection = signal('');
+  readonly isAttachingKb = signal(false);
+  readonly kbAttachError = signal('');
   readonly members = signal<ProjectMember[]>([]);
   readonly isLoading = signal(false);
   readonly activeTab = signal<Tab>('overview');
@@ -1483,7 +1970,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   // Repos tab
   readonly repoName = signal('');
   readonly repoUrl = signal('');
-  readonly repoRole = signal<ProjectRepoRole>('jobs');
+  readonly repoRole = signal<Extract<ProjectRepoRole, 'source' | 'reference'>>('source');
   readonly repoReadOnly = signal(false);
   readonly repoCreateManaged = signal(false);
 
@@ -1505,10 +1992,24 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly projectDatasources = signal<ProjectDatasource[]>([]);
   readonly allDatasources = signal<Datasource[]>([]);
   readonly dsLinkId = signal('');
+  readonly datasourceCandidateSearch = signal('');
+  readonly datasourceCandidatesLoading = signal(false);
+  readonly datasourceCandidatesLoadingMore = signal(false);
+  readonly datasourceCandidatesError = signal(false);
+  readonly datasourceCandidatesNextCursor = signal<string | null>(null);
+  private datasourceCandidatesRequestSerial = 0;
+  private datasourceCandidateSearchTimer: ReturnType<typeof setTimeout> | null = null;
 
   readonly availableDatasources = computed(() => {
     const linked = new Set(this.projectDatasources().map((d) => d.id));
-    return this.allDatasources().filter((d) => !linked.has(d.id));
+    const query = this.datasourceCandidateSearch().trim().toLocaleLowerCase();
+    return this.allDatasources().filter((d) => {
+      if (linked.has(d.id)) return false;
+      if (!this.canLinkDatasourceCandidate(d)) return false;
+      if (!query) return true;
+      return [d.name, d.description ?? '', d.type]
+        .some(value => value.toLocaleLowerCase().includes(query));
+    });
   });
 
   // Experts tab
@@ -1523,13 +2024,13 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly isSavingSettings = signal(false);
   /** Admin-only fields (e.g. workspace network tier) are hidden unless this is true. */
   readonly isAdmin = computed(() => !!this.userService.currentUser()?.is_admin);
-  /** Framework defaults from GET /api/experts/defaults — used as fallback for toggles. */
+  /** Worker mode base from GET /api/experts/worker_base — toggle fallback. */
   private readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly projectMemoryShared = computed(() => {
     const p = this.project();
     const val = (p?.default_config_override as any)?.memory?.project_scoped;
     if (typeof val === 'boolean') return val;
-    // Fall back to framework default from defaults.yaml
+    // Fall back to the conservative worker mode base.
     const defaults = this.frameworkDefaults();
     const defaultVal = (defaults?.['memory'] as any)?.['project_scoped'];
     return typeof defaultVal === 'boolean' ? defaultVal : true;
@@ -1545,7 +2046,13 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly kbFilterType = signal('');
   readonly kbFilterStatus = signal('');
 
-  readonly tabList: { id: Tab; labelKey: string }[] = [
+  /** True when the caller may run project loops and commission an officer.
+   * Fails closed while capabilities load, so the two tabs appear only once
+   * entitlement is proven. */
+  readonly canRunUnattendedOperations = this.capabilities.canRunUnattendedOperations;
+
+  /** Tabs that are always available, in display order. */
+  private readonly baseTabs: { id: Tab; labelKey: string }[] = [
     { id: 'overview', labelKey: 'projectDetail.tabs.overview' },
     { id: 'jobs', labelKey: 'projectDetail.tabs.jobs' },
     { id: 'knowledge', labelKey: 'projectDetail.tabs.knowledge' },
@@ -1553,20 +2060,47 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     { id: 'repos', labelKey: 'projectDetail.tabs.repos' },
     { id: 'experts', labelKey: 'projectDetail.tabs.experts' },
     { id: 'members', labelKey: 'projectDetail.tabs.members' },
+    { id: 'loop', labelKey: 'projectDetail.tabs.loop' },
+    { id: 'centurion', labelKey: 'projectDetail.tabs.centurion' },
     { id: 'settings', labelKey: 'projectDetail.tabs.settings' },
   ];
+
+  /** `baseTabs` minus the unattended-operations surfaces when the caller lacks
+   * the grant. Hiding rather than disabling: there is nothing useful to show a
+   * user who cannot start either one, and the orchestrator refuses the writes
+   * either way. */
+  readonly tabList = computed(() =>
+    this.canRunUnattendedOperations()
+      ? this.baseTabs
+      : this.baseTabs.filter((t) => t.id !== 'loop' && t.id !== 'centurion'),
+  );
 
   private projectId = '';
   private refreshInterval: ReturnType<typeof setInterval> | null = null;
 
   ngOnInit(): void {
+    // Start with the legacy list while capabilities are unresolved. If the v1
+    // contract becomes available (or is withdrawn after a reload), replace
+    // the candidate set from the matching source without mixing responses.
+    let lastPolicyAvailability = this.capabilities.datasourceScopeAutoAttachAvailable();
+    this.capabilities.datasourceScopeAutoAttachAvailability$
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe((available) => {
+        if (available === lastPolicyAvailability) return;
+        lastPolicyAvailability = available;
+        if (this.datasourceCandidateSearchTimer) {
+          clearTimeout(this.datasourceCandidateSearchTimer);
+          this.datasourceCandidateSearchTimer = null;
+        }
+        if (this.projectId) this.loadDatasourceCandidates(true);
+      });
     this.route.paramMap.subscribe((params) => {
       this.projectId = params.get('id') ?? '';
       if (this.projectId) this.loadAll();
     });
     this.api.getUsers().subscribe((users) => this.allUsers.set(users));
-    // Load framework defaults so toggles reflect the actual base config
-    this.api.getExpertDetail('defaults').subscribe((d) => {
+    // Load the worker base so project job toggles reflect the actual fallback.
+    this.api.getExpertDetail('worker_base').subscribe((d) => {
       if (d?.config) this.frameworkDefaults.set(d.config);
     });
 
@@ -1579,6 +2113,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     if (this.refreshInterval) clearInterval(this.refreshInterval);
+    if (this.datasourceCandidateSearchTimer) {
+      clearTimeout(this.datasourceCandidateSearchTimer);
+    }
   }
 
   goBack(): void {
@@ -1611,7 +2148,60 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   loadRepos(): void {
-    this.api.getProjectRepositories(this.projectId).subscribe((r) => this.repos.set(r));
+    this.api.getProjectRepositories(this.projectId).subscribe((r) => {
+      this.repos.set(r);
+      // Only a vault-less project can attach one, so the candidate list is
+      // fetched only for those.
+      if (!this.hasKnowledgeRepo()) this.loadKbConnectors();
+    });
+  }
+
+  private loadKbConnectors(): void {
+    this.api.getDatasources(undefined, 'kb').subscribe({
+      next: (connectors) => {
+        // The server-owned marker means some project already adopted it;
+        // offering it here could only ever produce a 409.
+        this.kbConnectors.set(
+          connectors.filter((connector) => !connector.config?.native_project_id),
+        );
+      },
+      error: () => this.kbConnectors.set([]),
+    });
+  }
+
+  openConnectors(): void {
+    this.router.navigate(['/datasources']);
+  }
+
+  /** Hand the selected connector to this project as its writable vault. The
+   *  connector already carries the repository, branch and PAT; the request
+   *  names nothing else. */
+  attachKnowledgeConnector(): void {
+    const datasourceId = this.kbAttachSelection();
+    if (!datasourceId || this.isAttachingKb()) return;
+    this.isAttachingKb.set(true);
+    this.kbAttachError.set('');
+    this.api.attachProjectKnowledgeRepository(this.projectId, {datasource_id: datasourceId}).subscribe({
+      next: (result) => {
+        this.isAttachingKb.set(false);
+        if (!result) {
+          this.kbAttachError.set(this.transloco.translate('projectDetail.knowledge.attachFailed'));
+          return;
+        }
+        this.kbAttachSelection.set('');
+        this.loadRepos();
+        this.loadKBSummary();
+      },
+      error: (err: unknown) => {
+        this.isAttachingKb.set(false);
+        const detail = (err as {error?: {detail?: unknown}} | null)?.error?.detail;
+        this.kbAttachError.set(
+          typeof detail === 'string' && detail
+            ? detail
+            : this.transloco.translate('projectDetail.knowledge.attachFailed'),
+        );
+      },
+    });
   }
 
   loadMembers(): void {
@@ -1631,14 +2221,141 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   // Datasources
   loadProjectDatasources(): void {
-    this.api.getProjectDatasources(this.projectId).subscribe((ds) => this.projectDatasources.set(ds));
-    this.api.getDatasources().subscribe((ds) => this.allDatasources.set(ds));
+    this.api.getProjectDatasources(this.projectId).subscribe((ds) => {
+      this.projectDatasources.set(ds);
+      this.reconcileDatasourceSelection();
+    });
+    this.loadDatasourceCandidates();
+  }
+
+  /** Load connector candidates from the rollout-appropriate contract. V1 is
+   * target-aware and paginated; older orchestrators keep the legacy visible
+   * connector list and client-side search. */
+  loadDatasourceCandidates(reset = true): void {
+    if (!this.projectId) return;
+    const policyAvailable = this.capabilities.datasourceScopeAutoAttachAvailable();
+    if (!reset && !policyAvailable) return;
+    const cursor = reset ? null : this.datasourceCandidatesNextCursor();
+    if (!reset && !cursor) return;
+
+    const serial = ++this.datasourceCandidatesRequestSerial;
+    if (reset) {
+      this.datasourceCandidatesLoading.set(true);
+      this.datasourceCandidatesLoadingMore.set(false);
+      this.datasourceCandidatesNextCursor.set(null);
+    } else {
+      this.datasourceCandidatesLoadingMore.set(true);
+    }
+    this.datasourceCandidatesError.set(false);
+
+    if (!policyAvailable) {
+      this.api.getDatasources().subscribe({
+        next: (datasources) => {
+          if (serial !== this.datasourceCandidatesRequestSerial) return;
+          this.allDatasources.set(datasources);
+          this.datasourceCandidatesLoading.set(false);
+          this.datasourceCandidatesLoadingMore.set(false);
+          this.datasourceCandidatesNextCursor.set(null);
+          this.reconcileDatasourceSelection();
+        },
+        error: () => {
+          if (serial !== this.datasourceCandidatesRequestSerial) return;
+          this.allDatasources.set([]);
+          this.dsLinkId.set('');
+          this.datasourceCandidatesLoading.set(false);
+          this.datasourceCandidatesLoadingMore.set(false);
+          this.datasourceCandidatesNextCursor.set(null);
+        },
+      });
+      return;
+    }
+
+    this.api.getLinkableProjectDatasources(this.projectId, {
+      q: this.datasourceCandidateSearch().trim() || undefined,
+      cursor: cursor ?? undefined,
+      limit: 50,
+    }).subscribe({
+      next: (response) => {
+        if (serial !== this.datasourceCandidatesRequestSerial) return;
+        const previous = reset ? [] : this.allDatasources();
+        this.allDatasources.set([
+          ...previous,
+          ...response.items.filter(
+            incoming => !previous.some(existing => existing.id === incoming.id),
+          ),
+        ]);
+        this.datasourceCandidatesNextCursor.set(response.next_cursor);
+        this.datasourceCandidatesLoading.set(false);
+        this.datasourceCandidatesLoadingMore.set(false);
+        this.reconcileDatasourceSelection();
+      },
+      error: () => {
+        if (serial !== this.datasourceCandidatesRequestSerial) return;
+        // Fail closed: never leave stale candidate rows selectable after an
+        // authorization-aware v1 request fails.
+        this.allDatasources.set([]);
+        this.dsLinkId.set('');
+        this.datasourceCandidatesNextCursor.set(null);
+        this.datasourceCandidatesLoading.set(false);
+        this.datasourceCandidatesLoadingMore.set(false);
+        this.datasourceCandidatesError.set(true);
+      },
+    });
+  }
+
+  loadMoreDatasourceCandidates(): void {
+    this.loadDatasourceCandidates(false);
+  }
+
+  onDatasourceCandidateSearch(value: string): void {
+    this.datasourceCandidateSearch.set(value);
+    this.reconcileDatasourceSelection();
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) return;
+
+    if (this.datasourceCandidateSearchTimer) {
+      clearTimeout(this.datasourceCandidateSearchTimer);
+    }
+    // Invalidate any older page immediately; the delayed request owns the
+    // loading flags and only its serial may publish results.
+    this.datasourceCandidatesRequestSerial += 1;
+    this.datasourceCandidatesLoading.set(true);
+    this.datasourceCandidatesLoadingMore.set(false);
+    this.datasourceCandidatesError.set(false);
+    this.datasourceCandidatesNextCursor.set(null);
+    this.datasourceCandidateSearchTimer = setTimeout(() => {
+      this.datasourceCandidateSearchTimer = null;
+      this.loadDatasourceCandidates(true);
+    }, 250);
+  }
+
+  private reconcileDatasourceSelection(): void {
+    const selected = this.dsLinkId();
+    if (selected && !this.availableDatasources().some(ds => ds.id === selected)) {
+      this.dsLinkId.set('');
+    }
+  }
+
+  /** Defence in depth for stale/mixed-version responses. The v1 endpoint is
+   * authoritative, while the legacy list was only visibility-filtered. These
+   * mirror the connector-side link rules before a row becomes selectable. */
+  private canLinkDatasourceCandidate(datasource: Datasource): boolean {
+    if (datasource.config?.native_project_id) return false;
+    const user = this.userService.currentUser();
+    if (!user) return false;
+    if (user.is_admin || datasource.created_by === user.id) return true;
+    return datasource.is_global === true && (datasource.scope_mode ?? 'all') === 'all';
   }
 
   linkDatasource(): void {
     const dsId = this.dsLinkId();
     if (!dsId) return;
-    this.api.linkProjectDatasource(this.projectId, dsId).subscribe((res) => {
+    const datasource = this.availableDatasources().find((ds) => ds.id === dsId);
+    if (!datasource) {
+      this.dsLinkId.set('');
+      return;
+    }
+    const settings = datasource?.type === 'kb' ? {read_only: true} : {};
+    this.api.linkProjectDatasource(this.projectId, dsId, settings).subscribe((res) => {
       if (res) {
         this.dsLinkId.set('');
         this.loadProjectDatasources();
@@ -1655,6 +2372,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   updateDatasourceReadOnly(datasourceId: string, value: string): void {
+    if (this.projectDatasources().some((ds) => ds.id === datasourceId && ds.type === 'kb')) {
+      return;
+    }
     const readOnly = value === '' ? null : value === 'true';
     this.api.updateProjectDatasource(this.projectId, datasourceId, { read_only: readOnly }).subscribe((res) => {
       if (res) this.loadProjectDatasources();
@@ -1670,6 +2390,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   // Overview
   startEditOverview(): void {
+    if (this.isArchived()) return;
     const p = this.project();
     this.editDescription.set(p?.description ?? '');
     this.editGoal.set(p?.goal ?? '');
@@ -1678,17 +2399,21 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   cancelEditOverview(): void {
     this.isEditingOverview.set(false);
+    this.editError.set(null);
   }
 
   saveOverview(): void {
-    this.api.updateProject(this.projectId, {
+    if (this.isArchived()) return;
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, {
       description: this.editDescription(),
       goal: this.editGoal(),
-    }).subscribe((res) => {
-      if (res) {
+    }).subscribe({
+      next: () => {
         this.isEditingOverview.set(false);
         this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
-      }
+      },
+      error: (err: unknown) => this.reportEditFailure(err),
     });
   }
 
@@ -1719,7 +2444,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   onRepoRoleChange(value: string | null): void {
-    if (value) this.repoRole.set(value as ProjectRepoRole);
+    if (value === 'source' || value === 'reference') this.repoRole.set(value);
   }
 
   // Members
@@ -1759,7 +2484,14 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   // Settings
+  //
+  // Every write below carries a field other than `status`, which is exactly
+  // what an archived project refuses (409, whole request). Each one is gated on
+  // `isArchived()` so it is never attempted, and each one goes through
+  // `updateProjectFields` so that the race prevention cannot cover — another
+  // tab archiving between load and save — is reported instead of swallowed.
   saveSettings(): void {
+    if (this.isArchived()) return;
     const update: Record<string, string> = {};
     const p = this.project();
     const name = this.settingsName().trim();
@@ -1770,57 +2502,160 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     }
     if (Object.keys(update).length === 0) return;
     this.isSavingSettings.set(true);
-    this.api.updateProject(this.projectId, update).subscribe({
-      next: (res) => {
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, update).subscribe({
+      next: () => {
         this.isSavingSettings.set(false);
-        if (res) this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
+        this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
       },
-      error: () => this.isSavingSettings.set(false),
+      error: (err: unknown) => {
+        this.isSavingSettings.set(false);
+        this.reportEditFailure(err);
+      },
+    });
+  }
+
+  onRenameProject(name: string): void {
+    const p = this.project();
+    if (!p || !name || name === p.name || this.isArchived()) return;
+    const previous = p.name;
+    this.renameError.set(null);
+    // Optimistic: reflect the new name immediately, revert if the PATCH fails.
+    this.project.set({...p, name});
+    this.api.updateProjectFields(this.projectId, {name}).subscribe({
+      error: (err: unknown) => {
+        const cur = this.project();
+        if (cur) this.project.set({...cur, name: previous});
+        // A revert with no explanation is the bug this closes: the title used
+        // to snap back and say nothing.
+        this.renameError.set(this.errors.translate(err, 'errors.projects.renameFailed'));
+      },
     });
   }
 
   toggleProjectMemory(checked: boolean): void {
     const p = this.project();
-    if (!p) return;
+    if (!p || this.isArchived()) return;
     const existing = (p.default_config_override ?? {}) as Record<string, any>;
     const override = {
       ...existing,
       memory: { ...(existing['memory'] ?? {}), project_scoped: checked },
     };
-    this.api.updateProject(this.projectId, { default_config_override: override }).subscribe((res) => {
-      if (res) this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, { default_config_override: override }).subscribe({
+      next: () => this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj)),
+      error: (err: unknown) => this.reportEditFailure(err),
     });
   }
 
   toggleCloudReadOnly(checked: boolean): void {
+    if (this.isArchived()) return;
+    const previous = this.settingsCloudReadOnly();
     this.settingsCloudReadOnly.set(checked);
-    this.api.updateProject(this.projectId, { cloud_storage_read_only: checked }).subscribe((res) => {
-      if (res) this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, { cloud_storage_read_only: checked }).subscribe({
+      next: () => this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj)),
+      error: (err: unknown) => {
+        this.settingsCloudReadOnly.set(previous);
+        this.reportEditFailure(err);
+      },
     });
   }
 
   onNetworkTierChange(value: string): void {
     if (value !== 'internet-only' && value !== 'home-allowed') return;
+    if (this.isArchived()) return;
     const previous = this.settingsNetworkTier();
     if (value === previous) return;
     this.settingsNetworkTier.set(value);
-    this.api.updateProject(this.projectId, { network_tier: value }).subscribe({
-      next: (res) => {
-        if (res) {
-          this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
-        }
+    this.editError.set(null);
+    this.api.updateProjectFields(this.projectId, { network_tier: value }).subscribe({
+      next: () => {
+        this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
       },
-      error: () => {
+      error: (err: unknown) => {
         this.settingsNetworkTier.set(previous);
+        this.reportEditFailure(err);
       },
     });
   }
 
-  archiveProject(): void {
-    if (!confirm(this.transloco.translate('projectDetail.settings.archiveConfirm'))) return;
-    this.api.updateProject(this.projectId, { status: 'archived' }).subscribe((res) => {
-      if (res) this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
+  /** One place for "the server refused this edit". The 409 an archived project
+   *  answers with is a plain-string `detail` naming the remedy, so it is
+   *  rendered verbatim; anything else falls back to a translated line. */
+  private reportEditFailure(err: unknown): void {
+    this.editError.set(this.errors.translate(err, 'errors.projects.updateFailed'));
+  }
+
+  confirmArchive(): void {
+    this.lifecycleError.set(null);
+    this.archiveReport.set(null);
+    this.pendingLifecycle.set('archived');
+  }
+
+  confirmUnarchive(): void {
+    this.lifecycleError.set(null);
+    this.archiveReport.set(null);
+    this.pendingLifecycle.set('active');
+  }
+
+  /**
+   * The one PATCH an archived project still accepts, and the one whose refusal
+   * the user has to be able to read: this went through `updateProject`, whose
+   * `catchError(() => of(null))` erased the body, under a subscribe with no
+   * error callback at all — so a 409 landed as a no-op that looked like a
+   * click that did not register.
+   */
+  applyLifecycle(): void {
+    const status = this.pendingLifecycle();
+    if (!status || this.lifecycleBusy()) return;
+    this.lifecycleBusy.set(true);
+    this.lifecycleError.set(null);
+    this.api.setProjectStatus(this.projectId, status).subscribe({
+      next: (report) => {
+        this.lifecycleBusy.set(false);
+        this.pendingLifecycle.set(null);
+        if (status === 'archived') this.archiveReport.set(this.describeArchive(report));
+        this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
+      },
+      error: (err: unknown) => {
+        this.lifecycleBusy.set(false);
+        this.pendingLifecycle.set(null);
+        this.lifecycleError.set(
+          this.errors.translate(
+            err,
+            status === 'archived'
+              ? 'errors.projects.archiveFailed'
+              : 'errors.projects.unarchiveFailed',
+          ),
+        );
+      },
     });
+  }
+
+  /** Archiving quiesces the project's unattended machinery rather than
+   *  refusing, so say what it stopped — a loop that silently paused is the
+   *  kind of thing a user finds out about a week later. */
+  private describeArchive(report: ProjectArchiveReport | null): string {
+    const parts = [this.transloco.translate('projectDetail.settings.archivedReportBase')];
+    if (report?.loop_paused) {
+      parts.push(this.transloco.translate('projectDetail.settings.archivedReportLoop'));
+    }
+    if (report?.officer_held) {
+      parts.push(this.transloco.translate('projectDetail.settings.archivedReportOfficer'));
+    }
+    const parked = report?.jobs_parked ?? 0;
+    if (parked > 0) {
+      parts.push(
+        this.transloco.translate(
+          parked === 1
+            ? 'projectDetail.settings.archivedReportJobsOne'
+            : 'projectDetail.settings.archivedReportJobs',
+          {count: parked},
+        ),
+      );
+    }
+    return parts.join(' ');
   }
 
   deleteProject(): void {
@@ -1831,7 +2666,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   createJobInProject(): void {
-    this.router.navigate(['/'], { queryParams: { project: this.projectId } });
+    this.router.navigate(['/jobs/new'], { queryParams: { project: this.projectId } });
   }
 
   /** Cross-link to the Automations page with this project preselected.
@@ -1957,7 +2792,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     switch (status) {
       case 'active': return 'success';
       case 'archived': return 'neutral';
-      case 'deleted': return 'danger';
       default: return 'neutral';
     }
   }
@@ -1969,6 +2803,11 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   truncate(text: string | undefined, max: number): string {
     if (!text) return '';
     return text.length <= max ? text : text.slice(0, max) + '...';
+  }
+
+  /** Flatten a note's Markdown to plain prose, then truncate, for the card preview. */
+  notePreview(text: string | undefined): string {
+    return this.truncate(stripMarkdown(text), 180);
   }
 
   formatDate(dateString: string): string {

@@ -1,0 +1,102 @@
+{{- if (include "srw.dbRendersStatefulset" (dict "context" . "key" "gitea")) }}
+# Dedicated PostgreSQL for the bundled Gitea's metadata (users, orgs, repo
+# rows, issues, PRs, OIDC login source). Git objects stay on the Gitea PVC.
+#
+# Same shape as the Keycloak DB: the Postgres superuser IS the Gitea DB user —
+# POSTGRES_USER=gitea, POSTGRES_DB=gitea — so there is no init script, no
+# postStart hook, and no separate role provisioning.
+#
+# NOTE: component label is short ("giteadb") so the StatefulSet name stays
+# under 52 chars — the controller-revision-hash label adds "-<10char>"
+# (11 chars), and total label value must be <= 63 chars.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-giteadb-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "giteadb") | nindent 4 }}
+  annotations:
+    # Losing this volume means losing every repo/user row while the git objects
+    # survive on the Gitea PVC — an inconsistent state that is far worse than a
+    # clean reinstall. Keep it across `helm uninstall`.
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.databases.gitea.storageClass }}
+  storageClassName: {{ .Values.databases.gitea.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.databases.gitea.storageSize }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "srw.fullname" . }}-giteadb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "giteadb") | nindent 4 }}
+spec:
+  serviceName: {{ include "srw.fullname" . }}-giteadb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "giteadb") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "giteadb") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres
+          image: {{ .Values.databases.gitea.image }}
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "gitea"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GITEA_DB_PASSWORD
+            - name: POSTGRES_DB
+              value: "gitea"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gitea"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gitea"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.databases.gitea.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-giteadb-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-giteadb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "giteadb") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "giteadb") | nindent 4 }}
+{{- end }}

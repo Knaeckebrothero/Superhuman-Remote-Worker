@@ -107,7 +107,7 @@ def get_initial_strategic_todos(
         PredefinedTodo(
             id=3,
             content=(
-                "Divide the plan into phases, where each phase contains 5-20 "
+                "Divide the plan into phases, where each phase contains 2-20 "
                 "concrete, actionable todos."
             ),
         ),
@@ -542,7 +542,9 @@ def freeze_for_review(
                 f"Frozen at {phase_type} phase {phase_number} boundary",
                 allow_empty=True,
             )
-            git_mgr.push()
+            _push_job_ending_state(
+                git_mgr, job_id, freeze_data, "phase-boundary freeze"
+            )
         except Exception as e:
             logger.warning(f"[{job_id}] Git push failed at freeze: {e}")
 
@@ -665,37 +667,42 @@ def _finalize_with_verdict(
     """
     verdict_type = verdict.get("_verdict")
     target_job_id = verdict.get("_target_job_id", "unknown")
+    # `verdict` is the module-level mirror populated by
+    # evaluation_tools._submit_verdict AFTER the orchestrator has durably
+    # recorded the round (src/tools/evaluation/evaluation_tools.py). Its
+    # shape is the ledger's own vocabulary — `round` + `open_findings` — not
+    # a `report`/`strengths`/`minor_notes`/`feedback`/`issues`/`severity`
+    # shape; nothing populates those keys any more, so reading them here
+    # silently rendered the freeze (and output/critic_verdict.json) blank.
+    round_num = verdict.get("round")
+    open_findings = verdict.get("open_findings") or []
 
-    if verdict_type == "approved":
+    if verdict_type in ("approved", "returned"):
         freeze_data = {
+            # Critics no longer park in 'waiting' between rounds: a fresh
+            # critic is spawned every round from the target's ledger
+            # (orchestrator's _trigger_verification_on_complete), so a
+            # 'returned' critic has nothing left to wait FOR. Both verdicts
+            # freeze the critic as an ordinary completed subjob;
+            # determine_job_status reads this value directly as the
+            # critic's OWN status — it has no bearing on the TARGET job,
+            # which orchestrator/main.py's _handle_critic_verdict_on_complete
+            # resolves separately from the same ledger.
             "status": "completed",
             "freeze_type": "verdict",
-            "verdict": "approved",
+            "verdict": verdict_type,
             "target_job_id": target_job_id,
-            "report": verdict.get("report", ""),
-            "strengths": verdict.get("strengths", []),
-            "minor_notes": verdict.get("minor_notes", []),
+            "round": round_num,
+            "open_findings": open_findings,
             "timestamp": datetime.now().isoformat(),
             "job_id": job_id,
         }
-        goal_achieved = True
-        log_msg = f"[{job_id}] Critic verdict: APPROVED target job {target_job_id}"
-
-    elif verdict_type == "returned":
-        freeze_data = {
-            "status": "waiting",
-            "freeze_type": "verdict",
-            "verdict": "returned",
-            "target_job_id": target_job_id,
-            "feedback": verdict.get("_feedback", ""),
-            "feedback_raw": verdict.get("feedback_raw", ""),
-            "issues": verdict.get("issues", []),
-            "severity": verdict.get("severity", "medium"),
-            "timestamp": datetime.now().isoformat(),
-            "job_id": job_id,
-        }
-        goal_achieved = False
-        log_msg = f"[{job_id}] Critic verdict: RETURNED target job {target_job_id} with feedback"
+        goal_achieved = verdict_type == "approved"
+        log_msg = (
+            f"[{job_id}] Critic verdict: {verdict_type.upper()} target job "
+            f"{target_job_id} (round {round_num}, "
+            f"{len(open_findings)} open finding(s))"
+        )
 
     else:
         # Unknown verdict type — warn and fall through to normal completion
@@ -731,7 +738,7 @@ def _finalize_with_verdict(
                 f"Critic verdict: {verdict_type} for target {target_job_id}",
                 allow_empty=True,
             )
-            git_mgr.push()
+            _push_job_ending_state(git_mgr, job_id, freeze_data, "critic verdict")
         except Exception as e:
             logger.warning(f"[{job_id}] Git push failed at verdict: {e}")
 
@@ -756,6 +763,110 @@ def _finalize_with_verdict(
         },
         freeze_data=freeze_data,
     )
+
+
+# Set on a freeze/completion record when the job-ending push did not land.
+# ABSENT means delivered — nothing ever writes these False, so a reader can
+# treat presence as the signal without worrying about which writer ran.
+DELIVERY_FAILED_KEY = "delivery_failed"
+DELIVERY_ERROR_KEY = "delivery_error"
+
+
+def _push_job_ending_state(
+    git_mgr,
+    job_id: str,
+    record: Optional[dict],
+    label: str,
+) -> bool:
+    """Push at a job-ending boundary, and record it loudly when it fails.
+
+    ``GitManager.push()`` returns False on failure and every job-ending caller
+    here used to discard it, so a job whose deliverables never left the pod
+    finished indistinguishable from one that delivered cleanly — reporting
+    success at confidence 1.0 while the pod was reclaimed with the only copy of
+    the work. A parser regression made every push of a whole job fail exactly
+    that way, 26 times, invisibly, for a day
+    (knowledge-history/done/git_push_fails_silently_via_workspace_backend.md).
+
+    The push is deliberately NOT retried: ``push()`` already logs its own
+    reason, and the pod is going away either way. The point is that the failure
+    reaches the freeze record the ORCHESTRATOR stores, so the critic, the
+    deliverable gate and the cockpit can distinguish "the repository is empty
+    because delivery failed" from "the repository is empty because the agent
+    produced nothing" — two states that look identical from outside and call
+    for opposite responses.
+
+    ``push()`` returns False for three different reasons and only one is a lost
+    deliverable, so the other two are screened out first. Marking a job with no
+    remote — a legitimate configuration — as undelivered would be a false alarm
+    on every such run, which is worse than the silence being replaced.
+
+    Like ``_capture_content_tree``, the marker reaches only the returned
+    ``record``, never the on-disk JSON: the file is written and committed
+    before the push whose outcome this is. That is unavoidable and harmless —
+    the orchestrator's copy is the one that outlives the pod.
+
+    Returns:
+        True if the push landed. False for a real failure *and* for the
+        screened-out cases, which are not failures — read ``record`` for the
+        distinction, not this value.
+    """
+    if not (git_mgr and getattr(git_mgr, "is_active", False)):
+        return False
+    try:
+        if not git_mgr.has_remote("origin"):
+            return False
+    except Exception:  # noqa: BLE001 — a probe failure is not a delivery failure
+        return False
+
+    if git_mgr.push():
+        return True
+
+    logger.error(
+        f"[{job_id}] {label}: the final git push did NOT land. The workspace is "
+        f"now the only copy of this job's deliverables, and its pod is about to "
+        f"be reclaimed. The reason is in the git push warning logged just above."
+    )
+    if record is not None:
+        record[DELIVERY_FAILED_KEY] = True
+        record[DELIVERY_ERROR_KEY] = (
+            f"The job-ending git push failed at {label}. Deliverables were not "
+            f"delivered to the job repository, so the repository is empty or "
+            f"stale by failure — not because none were produced."
+        )
+    return False
+
+
+def _capture_content_tree(workspace: "WorkspaceManager") -> Optional[str]:
+    """Best-effort content hash for verification's no-progress detection.
+
+    Consumed by ``_verification_gate_decision`` (orchestrator/main.py): when a
+    later round records the same ``content_tree`` as this one while findings
+    are still open, the target produced nothing and the job escalates to a
+    human instead of spawning another critic.
+
+    MUST be called AFTER the final commit/push, not before: the value is a
+    hash of what is COMMITTED, and the whole point is that it stays equal
+    across two rounds that delivered identical content. Reading a commit SHA
+    beforehand (the previous shape) could never satisfy that — the freeze
+    commit runs with ``allow_empty=True``, so HEAD always moves.
+
+    Because it is captured after the file is written, the on-disk
+    ``job_frozen.json`` / ``job_completion.json`` does not carry the key; only
+    the returned ``freeze_data`` (what the orchestrator persists) does. That
+    is unavoidable — a file cannot contain the hash of a tree containing
+    itself — and harmless: nothing reads the key off disk.
+
+    Never raises: WorkspaceManager.get_content_tree already swallows its own
+    errors, but the call site stays defensive too, and ``workspace`` may be
+    falsy here (finalize_job already guards for that on the git path).
+    """
+    if not workspace:
+        return None
+    try:
+        return workspace.get_content_tree()
+    except Exception:  # noqa: BLE001 — best-effort, see docstring
+        return None
 
 
 def finalize_job(
@@ -792,58 +903,116 @@ def finalize_job(
     job_id = state.get("job_id", "unknown")
     autonomy = getattr(config, "autonomy", "partial") if config else "partial"
 
-    # Check for deferred verdict data (from critic evaluation tools)
+    # Check for deferred verdict data (from critic evaluation tools). The
+    # module dict is a process cache; the checkpointed ``verdict_decision``
+    # channel (mirrored by the audited tool node) recovers a restarted
+    # critic's verdict so its freeze carries the real verdict instead of
+    # falling into the no-verdict escalation below. The ledger on the TARGET
+    # job stays authoritative either way (_resolve_critic_outcome).
     verdict = get_verdict_data(job_id)
+    if not verdict:
+        state_verdict = state.get("verdict_decision")
+        if isinstance(state_verdict, dict) and state_verdict:
+            logger.info(
+                f"[{job_id}] Recovered critic verdict from graph state "
+                f"(process cache empty after restart)"
+            )
+            verdict = state_verdict
     if verdict:
         clear_verdict_data(job_id)
         # Also clear final_phase_data if set (evaluation tools set it to trigger finalize_job)
         clear_final_phase_data(job_id)
         return _finalize_with_verdict(state, workspace, todo_manager, verdict, job_id)
 
-    # Edge case: critic job reached finalize_job without verdict data.
-    # This means the critic called job_complete instead of an evaluation tool.
-    # Treat as implicit approval so the target job doesn't get stuck in "reviewing".
+    # Edge case: critic job reached finalize_job without verdict data. This
+    # means the critic called job_complete instead of approve_job_verdict /
+    # return_job_with_feedback. A missing verdict must NEVER be read as
+    # approval (CWE-636 — the exact defect this fail-closed design removes).
+    # Log a refusal and fall through to the NORMAL (non-verdict) completion
+    # path below: no "verdict" key anywhere in freeze_data, so the
+    # orchestrator's _resolve_critic_outcome (a fresh lookup on the TARGET's
+    # own ledger, keyed by this critic_job_id) finds no round and escalates
+    # the target to a human instead of silently advancing it.
     metadata = state.get("metadata") or {}
     if metadata.get("verification_target"):
-        target_job_id = metadata["verification_target"]
-        logger.warning(
-            f"[{job_id}] Critic job finalizing WITHOUT verdict data. "
-            f"The critic called job_complete instead of approve_job/return_job_with_feedback. "
-            f"Synthesizing implicit approval for target job {target_job_id}."
-        )
-        final_data = get_final_phase_data(job_id)
-        clear_final_phase_data(job_id)
-        implicit_verdict = {
-            "_verdict": "approved",
-            "_target_job_id": target_job_id,
-            "report": (final_data or {}).get(
-                "summary",
-                "Critic completed without explicit verdict — implicit approval.",
-            ),
-            "strengths": [],
-            "minor_notes": [
-                "Critic used job_complete instead of approve_job — treated as implicit approval."
-            ],
-        }
-        return _finalize_with_verdict(
-            state, workspace, todo_manager, implicit_verdict, job_id
+        logger.error(
+            f"[{job_id}] Critic finalizing WITHOUT a recorded verdict. "
+            f"NOT synthesizing an approval — the orchestrator will escalate "
+            f"target {metadata['verification_target']} to a human."
         )
 
-    # Get the final phase data (set by job_complete tool)
+    # Get the final phase data. Durable-first order: the process dict is only
+    # a cache — after a restart the checkpointed ``completion_decision``
+    # channel (mirrored by the audited tool node when job_complete journaled
+    # the decision) is what survives; resume hydration re-seeds the dict from
+    # the DB record before the graph even runs.
     final_data = get_final_phase_data(job_id)
+    if not final_data:
+        state_decision = state.get("completion_decision")
+        if isinstance(state_decision, dict) and state_decision:
+            logger.info(
+                f"[{job_id}] Recovered completion decision from graph state "
+                f"(process cache empty after restart, tool_call_id="
+                f"{state_decision.get('tool_call_id')})"
+            )
+            final_data = state_decision
 
     if not final_data:
-        # Fallback data if not found (shouldn't happen)
-        logger.warning(f"[{job_id}] No final phase data found, using defaults")
-        final_data = {
-            "summary": "Job completed",
-            "deliverables": [],
-            "confidence": 1.0,
-            "job_id": job_id,
-        }
+        if metadata.get("verification_target"):
+            # No-verdict critic (the ERROR above already fired): complete with
+            # an HONEST minimal report so the orchestrator's ledger lookup
+            # escalates the target. This is the fail-closed design — but the
+            # report must say what actually happened, not fabricate a
+            # confident "Job completed" with an empty deliverable list.
+            final_data = {
+                "summary": (
+                    "Critic finished without a durably recorded verdict; "
+                    "the orchestrator will escalate the target for manual "
+                    "review."
+                ),
+                "deliverables": [],
+                "confidence": 0.0,
+                "job_id": job_id,
+            }
+        else:
+            # Worker with NO recorded decision anywhere (cache, graph state,
+            # resume hydration). Fabricating a placeholder report here is the
+            # exact defect of knowledge-base/knowledge/issues/
+            # job_finalization_decisions_held_only_in_process_memory.md —
+            # fail loudly back to the model instead, which re-issues
+            # job_complete (journaled + idempotent) and recovers.
+            logger.error(
+                f"[{job_id}] Finalization triggered but NO completion "
+                f"decision was found (process cache, graph state and resume "
+                f"hydration all empty). Refusing to fabricate a completion "
+                f"report."
+            )
+            return reject_transition(
+                state,
+                "Cannot finalize: no recorded completion decision was found "
+                "for this job. Call job_complete again with your summary, "
+                "deliverables and confidence to finish the job.",
+            )
 
     # Clear the final phase data
     clear_final_phase_data(job_id)
+
+    # Best-effort HEAD commit, recorded for diagnostics and for ledger rows
+    # written before ``content_tree`` existed. It is NOT the progress signal:
+    # both freeze branches below commit with ``allow_empty=True``, so HEAD
+    # moves on every round no matter what the agent produced — read here,
+    # BEFORE that commit, it was doubly unusable. ``content_tree`` (captured
+    # after the final commit/push, see ``_capture_content_tree``) is what
+    # ``_verification_gate_decision`` actually compares. Must never raise or
+    # block completion — get_head_commit() already swallows its own errors,
+    # but the call site stays defensive too (this function already treats
+    # `workspace` as possibly falsy below, for the git commit/push step).
+    head_commit = None
+    if workspace:
+        try:
+            head_commit = workspace.get_head_commit()
+        except Exception:  # noqa: BLE001 — best-effort, see comment above
+            pass
 
     if autonomy == "full":
         # Full autonomy: auto-complete without freezing
@@ -854,9 +1023,14 @@ def finalize_job(
             "deliverables": final_data.get("deliverables", []),
             "confidence": final_data.get("confidence", 1.0),
             "job_id": job_id,
+            "head_commit": head_commit,
         }
         if "notes" in final_data:
             completion_data["notes"] = final_data["notes"]
+        if "evidence" in final_data:
+            # E4: declared evidence entries ride the completion contract to
+            # the orchestrator, which resolves and pins them server-side.
+            completion_data["evidence"] = final_data["evidence"]
 
         output_path = "output/job_completion.json"
         workspace.write_file(
@@ -875,13 +1049,19 @@ def finalize_job(
                 git_mgr.commit("Job completed (autonomy=full)", allow_empty=True)
                 phase_num = state.get("phase_number", 0)
                 short_id = job_id[:8]
-                git_mgr.tag(
-                    f"{short_id}-job-completed-phase-{phase_num}",
-                    "Job auto-completed (full autonomy)",
+                tag_name = f"{short_id}-job-completed-phase-{phase_num}"
+                tag_ok = git_mgr.tag(tag_name, "Job auto-completed (full autonomy)")
+                _push_job_ending_state(
+                    git_mgr, job_id, completion_data, "job completion"
                 )
-                git_mgr.push()
+                if tag_ok:
+                    git_mgr.push_ref(f"refs/tags/{tag_name}")
             except Exception as e:
                 logger.warning(f"[{job_id}] Final git push failed: {e}")
+
+        # AFTER the final commit/push, so the hash covers what was actually
+        # delivered. See _capture_content_tree for why it is not in the file.
+        completion_data["content_tree"] = _capture_content_tree(workspace)
 
         # Archive todos
         if todo_manager:
@@ -917,10 +1097,15 @@ def finalize_job(
         "deliverables": final_data.get("deliverables", []),
         "confidence": final_data.get("confidence", 1.0),
         "job_id": job_id,
+        "head_commit": head_commit,
     }
 
     if "notes" in final_data:
         freeze_data["notes"] = final_data["notes"]
+    if "evidence" in final_data:
+        # E4: declared evidence entries ride the freeze to the orchestrator,
+        # which resolves and pins them server-side at completion.
+        freeze_data["evidence"] = final_data["evidence"]
 
     # Write to output/job_frozen.json
     output_path = "output/job_frozen.json"
@@ -942,13 +1127,17 @@ def finalize_job(
             git_mgr.commit("Job frozen for review", allow_empty=True)
             phase_num = state.get("phase_number", 0)
             short_id = job_id[:8]
-            git_mgr.tag(
-                f"{short_id}-job-frozen-phase-{phase_num}",
-                "Job frozen for human review",
-            )
-            git_mgr.push()
+            tag_name = f"{short_id}-job-frozen-phase-{phase_num}"
+            tag_ok = git_mgr.tag(tag_name, "Job frozen for human review")
+            _push_job_ending_state(git_mgr, job_id, freeze_data, "job freeze")
+            if tag_ok:
+                git_mgr.push_ref(f"refs/tags/{tag_name}")
         except Exception as e:
             logger.warning(f"[{job_id}] Final git push failed: {e}")
+
+    # AFTER the final commit/push, so the hash covers what was actually
+    # delivered. See _capture_content_tree for why it is not in the file.
+    freeze_data["content_tree"] = _capture_content_tree(workspace)
 
     # Archive todos if any remain
     if todo_manager:
@@ -999,17 +1188,13 @@ def _complete_phase_with_git(
         job_id: Job UUID (used to namespace tags in shared repos)
     """
     git_mgr = workspace.git_manager
+
     if not git_mgr or not git_mgr.is_active:
         return
 
     try:
-        # Create tag for completed phase (namespaced by job short ID)
-        short_id = job_id[:8]
-        tag_name = f"{short_id}-phase-{phase_number}-{phase_type}-complete"
-        git_mgr.tag(tag_name, f"Phase {phase_number} {phase_type} complete")
-        logger.debug(f"Created git tag: {tag_name}")
-
-        # Commit any pending changes from this phase
+        # Commit any pending changes from this phase first so the tag marks
+        # the completion commit itself
         commit_msg = (
             f"[Phase {phase_number} {phase_type.title()}] Complete - "
             f"archived {todos_archived} todos"
@@ -1017,14 +1202,77 @@ def _complete_phase_with_git(
         git_mgr.commit(commit_msg, allow_empty=True)
         logger.debug(f"Committed phase completion: {commit_msg}")
 
-        # Push to remote for workspace delivery
+        # Tag the completion commit (namespaced by job short ID, create-once)
+        short_id = job_id[:8]
+        tag_name = f"{short_id}-phase-{phase_number}-{phase_type}-complete"
+        tag_ok = git_mgr.tag(tag_name, f"Phase {phase_number} {phase_type} complete")
+        logger.debug(f"Tagged phase completion: {tag_name} (ok={tag_ok})")
+
+        # Push to remote for workspace delivery, then deliver the tag as an
+        # exact ref; on a tag invariant violation the ref stays local
         branch = git_mgr.current_branch()
         logger.debug(f"Pushing phase completion to branch: {branch}")
         git_mgr.push()
+        if tag_ok:
+            git_mgr.push_ref(f"refs/tags/{tag_name}")
 
     except Exception as e:
         logger.warning(f"Git operations failed during phase transition: {e}")
         # Don't fail the transition - git is optional
+
+
+def push_evidence_snapshot(
+    workspace: Optional["WorkspaceManager"],
+    reason: str,
+    job_id: str = "unknown",
+) -> bool:
+    """Best-effort commit+push of the workspace as-is before a stop tears it down.
+
+    Pushes to the job's Gitea branch otherwise happen only at phase-0 seed,
+    phase boundaries, freeze and finalize — per-todo completion commits are
+    local-only. Cancelling (or pausing/draining) a job mid-phase therefore
+    destroyed everything since the last boundary push, and workspace reaping
+    then erased it permanently (P1-D of
+    knowledge-base/knowledge/issues/officer_blind_reads_and_worker_bureaucracy.md).
+
+    Unlike ``_complete_phase_with_git`` this is not a phase ritual: no tag,
+    no archive — just stage-all + commit (skipped when the tree is clean) +
+    push (skipped when nothing is unpushed). Never raises; failures are
+    logged at warning and the caller's teardown proceeds regardless.
+
+    Args:
+        workspace: WorkspaceManager with git_manager (may be None/uninitialized)
+        reason: Why the job is stopping (e.g. "cancel", "pause")
+        job_id: Job UUID for log correlation
+
+    Returns:
+        True if a push succeeded, False otherwise (including all skip paths)
+    """
+    git_mgr = workspace.git_manager if workspace else None
+    if not git_mgr or not git_mgr.is_active:
+        return False
+
+    try:
+        committed = git_mgr.commit(
+            f"Evidence snapshot: job stopped (reason={reason})", allow_empty=False
+        )
+        # A clean tree can still carry unpushed per-todo commits — push
+        # whenever anything would otherwise be lost with the workspace.
+        if not committed and not git_mgr.has_unpushed_commits():
+            logger.debug(f"[{job_id}] No evidence to push on {reason} — skipping")
+            return False
+        pushed = git_mgr.push()
+        if pushed:
+            logger.info(f"[{job_id}] Evidence snapshot pushed before stop ({reason})")
+        else:
+            logger.warning(
+                f"[{job_id}] Evidence snapshot push failed on {reason} — work "
+                f"since the last boundary push exists only on the workspace"
+            )
+        return pushed
+    except Exception as e:
+        logger.warning(f"[{job_id}] Evidence snapshot on {reason} failed: {e}")
+        return False
 
 
 def on_strategic_phase_complete(
@@ -1062,8 +1310,10 @@ def on_strategic_phase_complete(
         state: Current agent state
         workspace: WorkspaceManager for file access
         todo_manager: TodoManager for loading todos
-        min_todos: Minimum todos required (default: 5, used by staging)
-        max_todos: Maximum todos allowed (default: 20, used by staging)
+        min_todos: Todo floor quoted in agent-facing messages. Enforcement
+            happens in TodoManager.stage_tactical_todos, whose floor is
+            wired from config.phase_settings at construction (src/agent.py).
+        max_todos: Todo ceiling quoted in agent-facing messages (see above).
 
     Returns:
         TransitionResult indicating success/failure with state updates
@@ -1073,18 +1323,22 @@ def on_strategic_phase_complete(
     job_id = state.get("job_id", "unknown")
     phase_number = state.get("phase_number", 0)
 
-    # Check if this is the final phase (job_complete was called)
+    # Check if this is the final phase (job_complete was called). The process
+    # dict is a cache; ``is_final_phase`` and ``completion_decision`` are the
+    # checkpointed mirrors written by the audited tool node when the decision
+    # was durably journaled — they make this trigger survive a restart.
     is_final = state.get("is_final_phase", False)
-    final_data = get_final_phase_data(job_id)
+    final_data = get_final_phase_data(job_id) or state.get("completion_decision")
 
     if is_final or final_data:
         logger.info(f"[{job_id}] Final phase detected, completing job")
         return finalize_job(state, workspace, todo_manager, config=config)
 
-    # Check for deferred verdict data (critic evaluation tools)
+    # Check for deferred verdict data (critic evaluation tools; same
+    # cache-plus-checkpointed-mirror pattern as above)
     from ..tools.evaluation.evaluation_tools import get_verdict_data
 
-    verdict_data = get_verdict_data(job_id)
+    verdict_data = get_verdict_data(job_id) or state.get("verdict_decision")
     if verdict_data:
         logger.info(f"[{job_id}] Verdict detected, finalizing critic job")
         return finalize_job(state, workspace, todo_manager, config=config)
@@ -1107,7 +1361,7 @@ def on_strategic_phase_complete(
         return reject_transition(
             state,
             "No todos staged for the next phase. "
-            "Use next_phase_todos tool to create 5-20 tasks first, "
+            f"Use next_phase_todos tool to create {min_todos}-{max_todos} tasks first, "
             "or call job_complete if the plan is fully executed.",
         )
 

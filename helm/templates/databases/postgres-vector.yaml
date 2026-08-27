@@ -1,4 +1,4 @@
-{{- if and .Values.databases.vector.enabled .Values.databases.vector.internal }}
+{{- if (include "srw.dbRendersStatefulset" (dict "context" . "key" "vector")) }}
 # Vector Database (pgvector) — Citations, Embeddings, Memories, Knowledge Index
 #
 # Separate PostgreSQL instance with pgvector extension for all vector operations.
@@ -72,12 +72,18 @@ spec:
               mountPath: /var/lib/postgresql/data
           livenessProbe:
             exec:
-              command: ["pg_isready", "-U", "srw"]
+              # -d postgres: probe the always-present maintenance DB. Without
+              # -d, pg_isready defaults the dbname to the user (srw), which does
+              # not exist on this server (DB is srw_vector) — the server logged
+              # "FATAL: database \"srw\" does not exist" on every probe. The
+              # probe passed regardless (server was accepting connections); this
+              # only silences the spurious FATAL log line.
+              command: ["pg_isready", "-U", "srw", "-d", "postgres"]
             initialDelaySeconds: 30
             periodSeconds: 10
           readinessProbe:
             exec:
-              command: ["pg_isready", "-U", "srw"]
+              command: ["pg_isready", "-U", "srw", "-d", "postgres"]
             initialDelaySeconds: 5
             periodSeconds: 5
           resources:

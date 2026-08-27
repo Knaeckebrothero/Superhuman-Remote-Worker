@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=schema.json
-$extends: persistent_defaults
+$extends: session_base
 
 agent_id: interactive
 display_name: Interactive Assistant
@@ -14,6 +14,7 @@ tools:
   workspace:
     - read_file
     - write_file
+    - use_skill
     - list_files
     - search_files
   research:
@@ -21,11 +22,14 @@ tools:
   shell:
     - run_command
     - shell_read
-  git:
-    - git_log
-    - git_status
-    - git_diff
+  # git: intentionally absent. This agent has shell tools, and
+  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # whenever shell is present — a shell can run git against ANY repository in
+  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+  # here would advertise tools the pod never binds.
   orchestrator: [ ]
+  agent_catalog: [ ]
+  workflows: [ ]
   core: [ ]
   citation: [ ]
   graph: [ ]

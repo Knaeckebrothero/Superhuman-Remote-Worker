@@ -19,7 +19,11 @@
 #
 # WORKSPACE_HOSTS and SSH_KEY_PATH are auto-detected by the orchestrator
 # when the dev compose SSH key (.dev/ssh-keys/id_ed25519) exists on disk.
-# No manual exports needed — see DockerProvisioner.connect().
+# That is sufficient for one initial lease only. Release quarantines an
+# unpinned endpoint because cleanup will not connect without a verified host
+# key. Repeated same-trust dev reuse requires exact
+# WORKSPACE_HOST_KEY_FINGERPRINTS plus
+# DOCKER_WORKSPACE_TRUSTED_DEV_REUSE=true; see .env.example.
 #
 # The orchestrator auto-detects Docker Compose mode (k8s API unreachable)
 # and assigns workspace containers from the pool defined by WORKSPACE_HOSTS.
@@ -27,10 +31,10 @@
 # the production remote backend path.
 #
 # Start only databases (no workspaces):
-#   podman-compose -f docker-compose.dev.yaml up -d postgres postgres-vector mongodb
+#   podman-compose -f docker-compose.dev.yaml up -d postgres postgres-vector
 #
 # Start databases + MCP:
-#   podman-compose -f docker-compose.dev.yaml up -d postgres postgres-vector mongodb mcp
+#   podman-compose -f docker-compose.dev.yaml up -d postgres postgres-vector mcp
 #
 # Start Codex OAuth proxy (for codex/* models via ChatGPT subscription):
 #   podman-compose -f docker-compose.dev.yaml up -d codex-proxy
@@ -50,7 +54,9 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-srw}
     volumes:
       - postgres_dev_data:/var/lib/postgresql/data
-      - ./orchestrator/database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
+      # App schema is built from the migration chain (orchestrator startup +
+      # `python init.py`), not an initdb snapshot — the frozen schema.sql
+      # drifted from migrations. See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
@@ -83,27 +89,13 @@ services:
       POSTGRES_DB: ${VECTOR_POSTGRES_DB:-srw_vector}
     volumes:
       - postgres_vector_dev_data:/var/lib/postgresql/data
-      - ./orchestrator/database/vector_schema.sql:/docker-entrypoint-initdb.d/001_vector_schema.sql:Z
+      # Vector schema is built from the migration chain, not an initdb snapshot.
+      # See knowledge-base/knowledge/features/database_roadmap.md Phase 2b.
     ports:
       - "${VECTOR_POSTGRES_PORT:-5433}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${VECTOR_POSTGRES_USER:-srw}"]
       interval: 5s
-      timeout: 5s
-      retries: 5
-
-  mongodb:
-    image: docker.io/library/mongo:7
-    container_name: srw-mongodb
-    environment:
-      MONGO_INITDB_DATABASE: srw_logs
-    volumes:
-      - mongodb_dev_data:/data/db
-    ports:
-      - "${MONGODB_PORT:-27017}:27017"
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
       timeout: 5s
       retries: 5
 
@@ -138,19 +130,6 @@ services:
       timeout: 5s
       retries: 5
 
-  mongo-express:
-    image: docker.io/library/mongo-express:latest
-    container_name: srw-mongo-express
-    environment:
-      ME_CONFIG_MONGODB_SERVER: mongodb
-      ME_CONFIG_BASICAUTH: "false"
-    ports:
-      - "${MONGO_EXPRESS_PORT:-8081}:8081"
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    restart: unless-stopped
-
   nats:
     image: docker.io/nats:2.10-alpine
     container_name: srw-nats
@@ -176,7 +155,10 @@ services:
       GITEA__server__ROOT_URL: http://localhost:3000
       GITEA__server__HTTP_PORT: "3000"
       GITEA__security__INSTALL_LOCK: "true"
-      GITEA__server__DISABLE_SSH: "true"
+      GITEA__server__DISABLE_SSH: "false"
+      GITEA__server__START_SSH_SERVER: "true"
+      GITEA__server__SSH_LISTEN_PORT: "2222"
+      GITEA__server__SSH_PORT: "${GITEA_SSH_PORT:-2222}"
       GITEA__service__DISABLE_REGISTRATION: "false"
       GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "false"
       GITEA__service__SHOW_REGISTRATION_BUTTON: "false"
@@ -231,6 +213,7 @@ services:
       - gitea_dev_data:/var/lib/gitea
     ports:
       - "${GITEA_PORT:-3000}:3000"
+      - "${GITEA_SSH_PORT:-2222}:2222"
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/v1/version"]
       interval: 10s
@@ -318,6 +301,64 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # Internal authority-creating lane for protected RO-reader attempts. The
+  # orchestrator still uses the ordinary Nextcloud URL for reads and cleanup;
+  # only the five signed, deadline-bounded POSTs enter this FPM pool.
+  nextcloud-protected-effect-fpm:
+    profiles: ["nextcloud"]
+    image: docker.io/library/nextcloud:31-fpm
+    container_name: srw-nextcloud-protected-effect-fpm
+    entrypoint: ["/bin/sh", "/opt/srw-protected-effect/start-fpm.sh"]
+    environment:
+      # Empty is allowed at Compose interpolation time so unrelated profiles
+      # still start; start-fpm.sh fails this service closed if the key is absent.
+      NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY: "${NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY:-}"
+      NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256: "${NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256:-b983c636dba971706dfc027896f1156ee45d4f40a5d87ae7b7cfa8edaa55e237}"
+      NEXTCLOUD_PROTECTED_EFFECT_QUEUE_BOUND_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_QUEUE_BOUND_SECONDS:-30}"
+      NEXTCLOUD_PROTECTED_EFFECT_HANDLER_BOUND_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_HANDLER_BOUND_SECONDS:-10}"
+      NEXTCLOUD_PROTECTED_EFFECT_CLOCK_SKEW_BOUND_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_CLOCK_SKEW_BOUND_SECONDS:-2}"
+      NEXTCLOUD_PROTECTED_EFFECT_SAFETY_MARGIN_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_SAFETY_MARGIN_SECONDS:-5}"
+      NEXTCLOUD_PROTECTED_EFFECT_CAPABILITY_MAX_AGE_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_CAPABILITY_MAX_AGE_SECONDS:-5}"
+      NEXTCLOUD_PROTECTED_EFFECT_MAX_CHILDREN: "${NEXTCLOUD_PROTECTED_EFFECT_MAX_CHILDREN:-2}"
+    volumes:
+      - nextcloud_dev_data:/var/www/html
+      - nextcloud_protected_effect_run:/run/srw-nextcloud
+      - ./helm/files/nextcloud-protected-effect:/opt/srw-protected-effect:ro,Z
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/srw-nextcloud/protected-effect.sock"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  nextcloud-protected-effect:
+    profiles: ["nextcloud"]
+    image: docker.io/library/nginx:1.27-alpine-slim
+    container_name: srw-nextcloud-protected-effect
+    entrypoint: ["nginx", "-g", "daemon off;", "-c", "/opt/srw-protected-effect/nginx.conf"]
+    volumes:
+      - nextcloud_protected_effect_run:/run/srw-nextcloud
+      - ./helm/files/nextcloud-protected-effect:/opt/srw-protected-effect:ro,Z
+    ports:
+      - "${NEXTCLOUD_PROTECTED_EFFECT_PORT:-8801}:8080"
+    depends_on:
+      nextcloud-protected-effect-fpm:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O /dev/null
+          --header='X-SRW-Backend-Instance: 99999999-9999-4999-8999-999999999999'
+          http://localhost:8080/index.php/apps/srw_protected_effect/api/v1/capability
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   # OpenCloud — greenfield main-cloud default since Phase 3. Runs by default
   # in `podman-compose -f docker-compose.dev.yaml up -d`. The orchestrator
   # (running on the host with hot-reload) reaches it at http://localhost:9200.
@@ -327,7 +368,7 @@ services:
   #   ./docker/keycloak/setup-opencloud-client.sh
   # That script creates `opencloud-web` + `opencloud-orchestrator` and adds
   # the service account to the `opencloud-admin` group. It is idempotent
-  # and safe to re-run. See docs/operations/opencloud-bootstrap.md.
+  # and safe to re-run. See knowledge-base/knowledge/operations/opencloud-bootstrap.md.
   opencloud:
     image: docker.io/opencloudeu/opencloud:latest
     container_name: srw-opencloud
@@ -361,7 +402,7 @@ services:
       # orchestrator + browser both reach it via host loopback.
       PROXY_HTTP_ADDR: "127.0.0.1:9200"
       PROXY_ENABLE_BASIC_AUTH: "false"
-      # CRITICAL: sub-claim is required (see docs/operations/opencloud-bootstrap.md §4).
+      # CRITICAL: sub-claim is required (see knowledge-base/knowledge/operations/opencloud-bootstrap.md §4).
       PROXY_USER_OIDC_CLAIM: "sub"
       # External IdP (Keycloak) — disables the internal IDP.
       OC_EXCLUDE_RUN_SERVICES: "idp"
@@ -403,7 +444,7 @@ services:
       COCKPIT_API_URL: http://localhost:8085
       MCP_TRANSPORT: http
       MCP_PORT: ${MCP_PORT:-8055}
-      MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
+      MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:${MCP_PORT:-8055}/health')"]
       interval: 10s
@@ -433,15 +474,50 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
+  # GreenMail — test-only mail server for the `email` datasource
+  # ---------------------------------------------------------------------------
+  # Disposable IMAP+IMAPS+SMTP(+S) server backing the email datasource
+  # integration tests (knowledge-base/knowledge/features/email_datasource.md §Testing). Auth is
+  # disabled: any user/password pair works and mailboxes are created on first
+  # use; all state is in-memory (a restart wipes it). Seed folders + fixture
+  # mails with: python scripts/seed_greenmail.py
+  # Deliberately separate from the Keycloak SMTP wiring above (Proton Bridge
+  # on the host) — that path sends real mail; this one never does.
+  greenmail:
+    image: docker.io/greenmail/standalone:2.1.11
+    container_name: srw-greenmail
+    environment:
+      GREENMAIL_OPTS: '-Dgreenmail.setup.test.all -Dgreenmail.auth.disabled -Dgreenmail.hostname=0.0.0.0'
+    ports:
+      - "${GREENMAIL_SMTP_PORT:-3025}:3025"
+      - "${GREENMAIL_IMAP_PORT:-3143}:3143"
+      - "${GREENMAIL_IMAPS_PORT:-3993}:3993"
+      # REST API — host 8081, NOT 8080 (the agent's job API binds 8080 when
+      # running bare-metal on the host).
+      - "${GREENMAIL_API_PORT:-8081}:8080"
+    healthcheck:
+      # Image is a bare JRE (no wget/curl); bash /dev/tcp probes the REST port.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
   # Workspace containers (Docker Compose mode)
   # ---------------------------------------------------------------------------
   # Pre-provisioned workspaces that the locally-running orchestrator assigns
   # to jobs via DockerProvisioner.  SSH ports are published to the host so
   # the locally-running agent can reach them.
   #
-  # Set in .env or export before starting the orchestrator:
+  # Connection coordinates are auto-detected for an initial lease. For
+  # repeated, same-trust dev reuse, set in .env or export before starting the
+  # orchestrator (SSH cleanup is a convenience, not a tenant reset):
   #   WORKSPACE_HOSTS=localhost:2201,localhost:2202,localhost:2203
   #   SSH_KEY_PATH=.dev/ssh-keys/id_ed25519
+  #   WORKSPACE_HOST_KEY_FINGERPRINTS=localhost:2201=SHA256:...,localhost:2202=SHA256:...,localhost:2203=SHA256:...
+  #   DOCKER_WORKSPACE_TRUSTED_DEV_REUSE=true
   ssh-keygen:
     image: docker.io/library/alpine:3
     container_name: srw-ssh-keygen
@@ -473,10 +549,10 @@ services:
     volumes:
       - ./.dev/ssh-keys:/tmp/ssh-pubkey:ro
     ports:
-      - "${WORKSPACE_1_SSH_PORT:-2201}:22"
+      - "${WORKSPACE_1_SSH_PORT:-2201}:30022"
       - "${WORKSPACE_1_IDE_PORT:-18081}:8080"
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -499,10 +575,10 @@ services:
     volumes:
       - ./.dev/ssh-keys:/tmp/ssh-pubkey:ro
     ports:
-      - "${WORKSPACE_2_SSH_PORT:-2202}:22"
+      - "${WORKSPACE_2_SSH_PORT:-2202}:30022"
       - "${WORKSPACE_2_IDE_PORT:-18082}:8080"
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -525,10 +601,10 @@ services:
     volumes:
       - ./.dev/ssh-keys:/tmp/ssh-pubkey:ro
     ports:
-      - "${WORKSPACE_3_SSH_PORT:-2203}:22"
+      - "${WORKSPACE_3_SSH_PORT:-2203}:30022"
       - "${WORKSPACE_3_IDE_PORT:-18083}:8080"
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -625,8 +701,6 @@ volumes:
     name: srw_postgres_keycloak_dev_data
   postgres_vector_dev_data:
     name: srw_postgres_vector_dev_data
-  mongodb_dev_data:
-    name: srw_mongodb_dev_data
   neo4j_dev_data:
     name: srw_neo4j_dev_data
   nats_dev_data:
@@ -635,6 +709,8 @@ volumes:
     name: srw_gitea_dev_data
   nextcloud_dev_data:
     name: srw_nextcloud_dev_data
+  nextcloud_protected_effect_run:
+    name: srw_nextcloud_protected_effect_run
   opencloud_dev_data:
     name: srw_opencloud_dev_data
   opencloud_dev_config:

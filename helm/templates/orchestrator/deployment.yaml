@@ -1,3 +1,7 @@
+{{- $runtimeAuthorityCutover := .Values.orchestrator.runtimeAuthorityMigrationMaintenanceAck | default false -}}
+{{- if and $runtimeAuthorityCutover (ne (lower (toString (.Values.agent.requirePinnedStatusIdentity | default "true"))) "true") -}}
+{{- fail "orchestrator.runtimeAuthorityMigrationMaintenanceAck requires agent.requirePinnedStatusIdentity=true" -}}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,6 +14,8 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.orchestrator.replicas }}
+  strategy:
+    type: {{ ternary "Recreate" "RollingUpdate" $runtimeAuthorityCutover }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 6 }}
@@ -17,8 +23,11 @@ spec:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 8 }}
+      annotations:
+        checksum/infrastructure-metering-gates: {{ toJson .Values.infrastructureMetering | sha256sum | quote }}
     spec:
       serviceAccountName: {{ include "srw.fullname" . }}-orchestrator
+      terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -27,35 +36,42 @@ spec:
         {{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
         - name: wait-for-postgres
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-postgres 5432; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.postgresHost" . }} 5432; do sleep 2; done"]
         {{- end }}
         {{- if and .Values.databases.vector.enabled .Values.databases.vector.internal }}
         - name: wait-for-pgvector
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-pgvector 5432; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.vectorPostgresHost" . }} 5432; do sleep 2; done"]
         {{- end }}
-        {{- if and .Values.databases.mongodb.enabled .Values.databases.mongodb.internal }}
-        - name: wait-for-mongodb
+        {{- if and .Values.databases.audit.enabled .Values.databases.audit.internal }}
+        - name: wait-for-auditdb
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-mongodb 27017; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.auditPostgresHost" . }} 5432; do sleep 2; done"]
         {{- end }}
         {{- if and .Values.gitea.enabled .Values.gitea.internal }}
         - name: wait-for-gitea
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-gitea 3000; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-gitea 3000; do sleep 2; done"]
         {{- end }}
         {{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
         - name: wait-for-keycloak
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-keycloak 8080; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-keycloak 8080; do sleep 2; done"]
         {{- end }}
       containers:
         - name: orchestrator
-          image: "{{ .Values.image.orchestrator.repository }}:{{ .Values.image.orchestrator.tag }}"
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
           imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
           ports:
             - containerPort: 8085
           env:
+            # Migration 0185 is intentionally not rolling-compatible.  An
+            # existing database accepts it only after the operator drains old
+            # pinned/agent writers and acknowledges the named maintenance
+            # gate; the same value switches this Deployment to Recreate so no
+            # old orchestrator overlaps the migration transaction.
+            - name: MIGRATION_MAINTENANCE_GATES
+              value: {{ ternary "pinned-runtime-authority-v1" "" $runtimeAuthorityCutover | quote }}
             - name: PORT
               value: "8085"
             # License acceptance — orchestrator refuses to start if not "true"
@@ -102,6 +118,242 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: POSTGRES_DB
+            # libpq TLS mode for this store's DSN. Explicit env because the
+            # orchestrator does NOT envFrom the shared ConfigMap (see above) --
+            # the ConfigMap key alone would never reach the process. Agent pods
+            # DO envFrom it and inherit the same key for free.
+            - name: POSTGRES_SSLMODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_SSLMODE
+            # DB-backed experts: orchestrator uses explicit env (not envFrom), so
+            # the configmap flag must be referenced here too (agents get it via
+            # envFrom on the provisioner-built pods).
+            - name: EXPERTS_DB_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: EXPERTS_DB_ENABLED
+            - name: SKILLS_DB_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SKILLS_DB_ENABLED
+            - name: PRODUCT_CAPABILITIES_ENDPOINT_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: PRODUCT_CAPABILITIES_ENDPOINT_ENABLED
+            - name: SRW_DEPLOYMENT_PROVENANCE_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_DEPLOYMENT_PROVENANCE_JSON
+            - name: MCP_DATASOURCES_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MCP_DATASOURCES_ENABLED
+            - name: MCP_STDIO_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MCP_STDIO_ENABLED
+            - name: DATASOURCE_DEFAULTS_ON_OMISSION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: DATASOURCE_DEFAULTS_ON_OMISSION
+            - name: DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED
+            - name: PROTECTED_CLOUD_MODE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: PROTECTED_CLOUD_MODE_ENABLED
+            - name: REQUIRE_PINNED_STATUS_IDENTITY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: REQUIRE_PINNED_STATUS_IDENTITY
+            - name: CANVAS_LIVE_PREVIEW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_LIVE_PREVIEW_ENABLED
+            - name: CANVAS_LIVE_PREVIEW_DENIED_PORTS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_LIVE_PREVIEW_DENIED_PORTS
+            - name: CANVAS_SHARED_BROWSER_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_SHARED_BROWSER_ENABLED
+            # Browser viewer control plane. The positive capability requires
+            # both Canvas gates plus the validated deployment attestations;
+            # default values remain false/empty.
+            - name: CANVAS_VIEWER_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_ENABLED
+            - name: CANVAS_VIEWER_DEPLOYMENT_PROFILE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_DEPLOYMENT_PROFILE
+            - name: CANVAS_VIEWER_COOKIE_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_COOKIE_MODE
+            - name: CANVAS_VIEWER_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_DOMAIN
+            - name: CANVAS_VIEWER_HOST_SUFFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_HOST_SUFFIX
+            - name: CANVAS_VIEWER_COCKPIT_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_COCKPIT_ORIGINS
+            - name: CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED
+            - name: CANVAS_VIEWER_SESSION_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_SESSION_TTL_SECONDS
+            - name: CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS
+            - name: CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS
+            - name: CANVAS_VIEWER_REVALIDATE_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_REVALIDATE_SECONDS
+            - name: CANVAS_VIEWER_MAX_CONNECTIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_CONNECTIONS
+            - name: CANVAS_VIEWER_MAX_HTTP_PER_SESSION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_HTTP_PER_SESSION
+            - name: CANVAS_VIEWER_MAX_HEADER_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_HEADER_BYTES
+            - name: CANVAS_VIEWER_MAX_HEADER_FIELDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_HEADER_FIELDS
+            - name: CANVAS_VIEWER_MAX_QUERY_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_QUERY_BYTES
+            - name: CANVAS_VIEWER_MAX_QUERY_FIELDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_QUERY_FIELDS
+            - name: CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES
+            - name: CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES
+            - name: CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS
+            - name: CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS
+            - name: CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS
+            # Read-only Office Canvas / Collabora discovery and WOPI host.
+            - name: COLLABORA_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_ENABLED
+            - name: COLLABORA_INTERNAL_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_INTERNAL_URL
+            - name: COLLABORA_PUBLIC_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_PUBLIC_URL
+            - name: COLLABORA_WOPI_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_WOPI_BASE_URL
+            - name: COLLABORA_COCKPIT_ORIGIN
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_COCKPIT_ORIGIN
+            - name: COLLABORA_TOKEN_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_TOKEN_TTL_SECONDS
+            - name: COLLABORA_DISCOVERY_CACHE_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_DISCOVERY_CACHE_TTL_SECONDS
+            - name: COLLABORA_DISCOVERY_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_DISCOVERY_TIMEOUT_SECONDS
+            - name: CANVAS_MAX_OFFICE_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_MAX_OFFICE_BYTES
             - name: VECTOR_POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -127,11 +379,120 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: VECTOR_POSTGRES_DB
-            - name: MONGODB_URL
+            - name: VECTOR_POSTGRES_SSLMODE
               valueFrom:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
-                  key: MONGODB_URL
+                  key: VECTOR_POSTGRES_SSLMODE
+            - name: AUDIT_POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: AUDIT_POSTGRES_USER
+            - name: AUDIT_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: AUDIT_POSTGRES_PASSWORD
+            - name: AUDIT_POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AUDIT_POSTGRES_HOST
+            - name: AUDIT_POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AUDIT_POSTGRES_PORT
+            - name: AUDIT_POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AUDIT_POSTGRES_DB
+            - name: AUDIT_POSTGRES_SSLMODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AUDIT_POSTGRES_SSLMODE
+            # Per-store asyncpg pool sizing. Explicit env (the orchestrator does
+            # NOT envFrom the shared ConfigMap), sourced from orchestrator.dbPool
+            # so the control/vector/audit pools size independently. These are
+            # deliberately NOT the ConfigMap's POSTGRES_*_CONNECTIONS keys —
+            # those carry the small AGENT-pod sizing (agent.dbPool) that must not
+            # reach the orchestrator.
+            - name: POSTGRES_MIN_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.app.min | quote }}
+            - name: POSTGRES_MAX_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.app.max | quote }}
+            - name: VECTOR_POSTGRES_MIN_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.vector.min | quote }}
+            - name: VECTOR_POSTGRES_MAX_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.vector.max | quote }}
+            - name: AUDIT_POSTGRES_MIN_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.audit.min | quote }}
+            - name: AUDIT_POSTGRES_MAX_CONNECTIONS
+              value: {{ .Values.orchestrator.dbPool.audit.max | quote }}
+            # Checkpointer backend (sqlite|postgres). The orchestrator reads it to
+            # prune LangGraph checkpoints on terminal jobs; it uses explicit env
+            # (not envFrom), so the ConfigMap key must be referenced here too
+            # (agents get it via envFrom on the provisioner-built pods).
+            - name: CHECKPOINTER_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CHECKPOINTER_BACKEND
+            # Session admission reads the exact gate that renders the generic
+            # executor Deployment, so an admitted session always has a pool.
+            # Worker-job admission remains independent. All values come from
+            # one ConfigMap so the control and execution planes agree.
+            - name: STATELESS_SESSION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: STATELESS_SESSION_ENABLED
+            - name: STATELESS_WORKER_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: STATELESS_WORKER_ENABLED
+            - name: STATELESS_WORKER_DEFAULT_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: STATELESS_WORKER_DEFAULT_ENABLED
+            # Durable completion admission and the finalizer/drain must flip as
+            # one gate. Stateless agents inherit this same ConfigMap key via
+            # envFrom, while the orchestrator intentionally uses an explicit
+            # reference so its independently-sized DB env stays isolated.
+            - name: COMPLETION_COMMANDS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COMPLETION_COMMANDS_ENABLED
+            - name: COMPLETION_STATUS_REORDER_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COMPLETION_STATUS_REORDER_ENABLED
+            - name: COMPLETION_FINALIZER_INLINE_DELAY_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COMPLETION_FINALIZER_INLINE_DELAY_SECONDS
+            - name: WORKER_BATCH_MIN_WALL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKER_BATCH_MIN_WALL_SECONDS
+            # LLM-outage/cooldown pause budget (12h default). Must equal the value
+            # every agent pod reads via envFrom on the shared ConfigMap, so the
+            # orchestrator references the same key here (it does not envFrom).
+            # knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md
+            - name: LLM_OUTAGE_CEILING_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LLM_OUTAGE_CEILING_SECONDS
             - name: WORKSPACE_PATH
               valueFrom:
                 configMapKeyRef:
@@ -142,6 +503,39 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_STORAGE_CLASS
+            # Branch (a): PVC-backed workspaces, jobs AND sessions. The
+            # orchestrator runs the dispatcher's create_workspace, the session
+            # agent provisioner (which gates its own pvc-agent-s-* claim on the
+            # SAME WORKSPACE_PVC_ENABLED flag) and the lifecycle reaper, so it
+            # must see these. The deployment maps configmap keys explicitly
+            # (not envFrom), so new keys need an entry here to reach the pod.
+            - name: WORKSPACE_PVC_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_PVC_ENABLED
+            - name: WORKSPACE_PVC_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_PVC_SIZE
+            - name: WORKSPACE_REATTACH_READY_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_REATTACH_READY_TIMEOUT
+            - name: WORKSPACE_REATTACH_FRESH_FALLBACK
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_REATTACH_FRESH_FALLBACK
+            # Reclaim-on-idle (Task 7): the orchestrator runs
+            # suspend_thread_workspace, so it must see this flag too.
+            - name: WORKSPACE_RECLAIM_ON_IDLE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_RECLAIM_ON_IDLE
             # Gitea
             - name: GITEA_URL
               valueFrom:
@@ -163,6 +557,26 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: GITEA_INTERNAL_URL
+            - name: GITEA_SSH_INTERNAL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: GITEA_SSH_INTERNAL_HOST
+            - name: GITEA_SSH_INTERNAL_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: GITEA_SSH_INTERNAL_PORT
+            - name: GITEA_SSH_EXTERNAL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: GITEA_SSH_EXTERNAL_HOST
+            - name: GITEA_SSH_EXTERNAL_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: GITEA_SSH_EXTERNAL_PORT
             - name: GITEA_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -208,7 +622,7 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: {{ if .Values.keycloak.internal }}KEYCLOAK_ADMIN_PASSWORD{{ else }}KC_ADMIN_PASSWORD{{ end }}
                   optional: true
-            # Cookie BFF — see docs/features/auth_bff_and_api_tokens.md.
+            # Cookie BFF — see knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
             # KEYCLOAK_CLIENT_ID + the SRW_* knobs come from the ConfigMap;
             # KC_CLIENT_SECRET is pulled from the runtime srw Secret (synced
             # from the same Vault path as MCP_OIDC_CLIENT_SECRET et al.).
@@ -262,7 +676,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SRW_ACCESS_TOKEN_REFRESH_SKEW_S
-            # Session router config (docs/features/direct_session_websockets.md)
+            # Session router config (knowledge-base/knowledge/features/direct_session_websockets.md)
             - name: SESSION_JWT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -296,13 +710,28 @@ spec:
               value: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) | quote }}
             - name: SESSION_JWT_SECRET_KEY
               value: {{ .Values.sessionRouter.jwtSecretKey | default "jwt-secret" | quote }}
-            # MCP auth (only when mcp pod is deployed)
-            {{- if .Values.mcp.enabled }}
+            # Shared internal auth for MCP and dynamically-provisioned agents.
+            # Optional preserves graceful degradation when an externally
+            # managed Secret has not enabled delegated internal calls yet.
             - name: MCP_INTERNAL_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_INTERNAL_KEY
+                  optional: true
+            {{- if .Values.mcp.enabled }}
+            # MCP_DEV_TOKEN — dev-only fixed admin MCP token. When set, the
+            # orchestrator seeds this exact token for the admin user at startup
+            # and on first admin login (init._seed_admin_mcp_token) so a
+            # committed .mcp.json works out of the box against a local cluster.
+            # optional:true and unset in prod values — prod admins mint tokens
+            # via the cockpit, and an unset var means no auto-seed.
+            - name: MCP_DEV_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: MCP_DEV_TOKEN
+                  optional: true
             {{- end }}
             # CORS
             - name: CORS_ORIGINS
@@ -319,7 +748,7 @@ spec:
             # Instruction Builder
             # BUILDER_API_KEY removed — _create_builder_llm now resolves the
             # provider key from system_api_keys (seeded via the llm-seed-job).
-            # See docs/api_key_resolution.md for the wire-format vs config-source
+            # See knowledge-base/knowledge/api_key_resolution.md for the wire-format vs config-source
             # split.
             #
             # TAVILY_API_KEY — the builder's web_search tool (builder_search.py)
@@ -333,6 +762,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: TAVILY_API_KEY
+                  optional: true
+            # ELEVENLABS_API_KEY — one ElevenLabs account per deployment for the
+            # TTS read-aloud voice provider (knowledge-base/knowledge/features/tts_vendor_providers.md).
+            # TTS runs in-process here (orchestrator-only), so the orchestrator
+            # reads the key directly; it is NOT fanned out to agent/workspace pods.
+            # The adapter (services/tts.py) also accepts the key via the
+            # `elevenlabs` system_api_keys row when seeded — this env is the
+            # simpler Tavily-style path. optional:true so installs without an
+            # ElevenLabs account still start.
+            - name: ELEVENLABS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: ELEVENLABS_API_KEY
                   optional: true
             # BUILDER_MODEL + BUILDER_LLM_PROVIDER removed in chunk 7 of
             # models_yaml_removal — both resolved from the catalog at
@@ -410,6 +853,38 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_AGENT_PASSWORD
                   optional: true
+            {{- if and .Values.nextcloud.enabled .Values.nextcloud.protectedEffect.enabled }}
+            - name: NEXTCLOUD_PROTECTED_EFFECT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEXTCLOUD_PROTECTED_EFFECT_URL
+                  optional: false
+            - name: NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256
+                  optional: false
+            - name: NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.nextcloudProtectedEffectSecretName" . }}
+                  key: NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY
+                  optional: false
+            {{- end }}
+            - name: NEXTCLOUD_RCLONE_USER_HOME_USERNAME
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEXTCLOUD_RCLONE_USER_HOME_USERNAME
+                  optional: true
+            - name: NEXTCLOUD_RCLONE_USER_HOME_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_RCLONE_USER_HOME_PASSWORD
+                  optional: true
             {{- end }}
             # Default WebDAV datasource (optional)
             - name: DEFAULT_DS_WEBDAV_URL
@@ -449,6 +924,64 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: MAIN_CLOUD_BACKEND
                   optional: true
+            - name: CLOUD_WORKSPACE_DRIVER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CLOUD_WORKSPACE_DRIVER
+            - name: CLOUD_RCLONE_ALLOW_CONTAINER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CLOUD_RCLONE_ALLOW_CONTAINER
+                  optional: true
+            # Virtual workspace tier (no_workspace_agent_mode.md §4/§5). type/root
+            # are non-secret (ConfigMap); for s3 the credentials come from the
+            # bundled Secret (VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID /
+            # _SECRET_ACCESS_KEY). All optional — absent keys leave the tier
+            # disabled.
+            - name: VIRTUAL_WORKSPACE_RCLONE_TYPE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_RCLONE_TYPE
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_RCLONE_ROOT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_RCLONE_ROOT
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_S3_ENDPOINT
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_S3_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_S3_REGION
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_S3_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VIRTUAL_WORKSPACE_S3_PROVIDER
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID
+                  optional: true
+            - name: VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY
+                  optional: true
             {{- if or .Values.opencloud.enabled (eq (default "" .Values.cloud.externalBackend) "opencloud") }}
             # OpenCloud — bundled (opencloud.enabled=true) or external
             # (cloud.externalBackend=opencloud). Skipped entirely otherwise so
@@ -484,6 +1017,12 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
                   optional: true
+            - name: OPENCLOUD_MOUNT_INSECURE_TLS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OPENCLOUD_MOUNT_INSECURE_TLS
+                  optional: true
             {{- end }}
             # External cloud service account (used with cloud.externalBackend)
             - name: CLOUD_SERVICE_USER
@@ -507,17 +1046,17 @@ spec:
             # S3 credentials are optional — when absent the orchestrator
             # detects "no S3" via empty S3_ENDPOINT and disables snapshots
             # / external IDE session storage.
-            - name: S3_ACCESS_KEY
+            - name: SNAPSHOT_S3_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: S3_ACCESS_KEY
+                  key: SNAPSHOT_S3_ACCESS_KEY_ID
                   optional: true
-            - name: S3_SECRET_KEY
+            - name: SNAPSHOT_S3_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: S3_SECRET_KEY
+                  key: SNAPSHOT_S3_SECRET_ACCESS_KEY
                   optional: true
             - name: S3_BUCKET
               valueFrom:
@@ -539,6 +1078,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SNAPSHOT_RETENTION_DAYS
+            # Opt-in fail-closed object-store policy (read at lifespan startup).
+            - name: OBJECT_STORE_REQUIRED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OBJECT_STORE_REQUIRED
             # IDE sessions
             - name: IDE_SESSION_IDLE_TIMEOUT
               valueFrom:
@@ -681,6 +1226,12 @@ spec:
                   key: NTFY_TOKEN
                   optional: true
             # VM lifecycle (optional)
+            - name: VM_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VM_MODE
+            {{- if eq (include "srw.vmMode" .) "external" }}
             - name: NATS_URL
               valueFrom:
                 configMapKeyRef:
@@ -693,12 +1244,21 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: ORCHESTRATOR_ID
                   optional: true
-            - name: VM_TEMPLATE_PATH
+            {{- end }}
+            {{- if and (include "srw.vmSameCluster" .) (include "srw.vmLifecycleAuthSecretName" .) }}
+            - name: VM_LIFECYCLE_HMAC_SECRET
               valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: VM_TEMPLATE_PATH
-                  optional: true
+                secretKeyRef:
+                  name: {{ include "srw.vmLifecycleAuthSecretName" . | quote }}
+                  key: {{ .Values.vm.lifecycleAuthSecretKey | quote }}
+            {{- else if and (eq (include "srw.vmMode" .) "external") (include "srw.vmLifecycleAuthSecretName" .) }}
+            - name: VM_LIFECYCLE_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.vmLifecycleAuthSecretName" . | quote }}
+                  key: {{ ternary .Values.vm.lifecycleAuthSecretKey (.Values.infrastructureMetering.vmLifecycleAuthSecretKey | default "VM_LIFECYCLE_HMAC_SECRET") (not (empty .Values.vm.lifecycleAuthSecretName)) | quote }}
+            {{- end }}
+            {{- if include "srw.vmSameCluster" . }}
             - name: VM_NAMESPACE
               valueFrom:
                 configMapKeyRef:
@@ -710,6 +1270,13 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: VM_CONTROLLER_URL
+                  optional: true
+            {{- end }}
+            - name: VM_PERSISTENT_ROOTDISK
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VM_PERSISTENT_ROOTDISK
                   optional: true
             # Workspace containers
             - name: WORKSPACE_IMAGE
@@ -723,6 +1290,18 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_NAMESPACE
+                  optional: true
+            - name: WORKSPACE_FUSE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_FUSE_ENABLED
+                  optional: true
+            - name: WORKSPACE_FUSE_PRIVILEGED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_FUSE_PRIVILEGED
                   optional: true
             - name: OPERATOR_HOME_ALLOWED_EMAIL
               valueFrom:
@@ -750,7 +1329,7 @@ spec:
             # Chart-standard labels for dynamically-provisioned agent pods.
             # The chart's database NetworkPolicies match on these labels;
             # without them, dynamic agent pods are blocked from reaching
-            # postgres/pgvector/mongodb/neo4j.
+            # postgres/pgvector/neo4j.
             - name: AGENT_LABEL_NAME
               value: {{ include "srw.name" . | quote }}
             - name: AGENT_LABEL_INSTANCE
@@ -772,6 +1351,23 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: PERSISTENT_AGENT_IMAGE
                   optional: true
+            - name: PERSISTENT_AGENT_IMAGE_PULL_POLICY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: PERSISTENT_AGENT_IMAGE_PULL_POLICY
+                  optional: true
+            - name: PERSISTENT_AGENT_RECONCILIATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: PERSISTENT_AGENT_RECONCILIATION_ENABLED
+            - name: OFFICER_RUNTIME_VERIFICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OFFICER_RUNTIME_VERIFICATION_ENABLED
+            {{- if eq (include "srw.vmMode" .) "external" }}
             # Agent tailscale sidecar gate (consumed by AgentProvisioner)
             - name: AGENT_TAILSCALE_ENABLED
               valueFrom:
@@ -791,6 +1387,7 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: HEADSCALE_URL
                   optional: true
+            {{- end }}
             # Codex OAuth Proxy
             - name: CODEX_PROXY_URL
               value: "http://{{ include "srw.fullname" . }}-codex-proxy:8317"
@@ -809,6 +1406,258 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: AUTO_ASSIGN_ENABLED
+            # Infrastructure metering Slice 0 dark-launch gates. All default
+            # off; setting them does not grant Kubernetes RBAC.
+            - name: INFRASTRUCTURE_METERING_V2_READS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_V2_READS_ENABLED
+            - name: INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED
+            - name: INFRASTRUCTURE_METERING_COLLECTOR_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_COLLECTOR_ENABLED
+            - name: INFRASTRUCTURE_METERING_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_CUTOVER_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_CUTOVER_ENABLED
+            - name: INFRASTRUCTURE_METERING_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_AGENT_POD_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_AGENT_POD_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_PVC_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_PVC_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_PV_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_PV_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED
+            - name: INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID
+            - name: INFRASTRUCTURE_METERING_VM_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VM_NAMESPACE
+            - name: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION
+            - name: INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON
+            - name: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
+            - name: INFRASTRUCTURE_METERING_DEPLOYMENT_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_DEPLOYMENT_MODE
+            - name: INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST
+            - name: INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS
+            - name: INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS
+            - name: INFRASTRUCTURE_METERING_LIST_PAGE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_LIST_PAGE_SIZE
+            - name: INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY
+            - name: INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE
+            - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS
+            - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES
+            - name: INFRASTRUCTURE_METERING_INGESTION_TICKET_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_INGESTION_TICKET_TTL_SECONDS
+            - name: INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS
+            - name: INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS
+            - name: INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS
+            - name: INFRASTRUCTURE_METERING_INGESTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infrastructureMetering.ingestionSecretName | default (printf "%s-infra-ingestion" (include "srw.fullname" .) | trunc 63 | trimSuffix "-") }}
+                  key: {{ .Values.infrastructureMetering.ingestionSecretKey | default "INFRASTRUCTURE_METERING_INGESTION_KEY" }}
+                  optional: {{ not .Values.infrastructureMetering.collectorEnabled }}
+            - name: INFRASTRUCTURE_METERING_VMI_INGESTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infrastructureMetering.vmIngestionSecretName | default "unused-vmi-metering-secret" }}
+                  key: {{ .Values.infrastructureMetering.vmIngestionSecretKey | default "INFRASTRUCTURE_METERING_VMI_INGESTION_KEY" }}
+                  optional: {{ not .Values.infrastructureMetering.vmInventoryEnabled }}
+            - name: INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infrastructureMetering.vmStorageIngestionSecretName | default "unused-vm-storage-metering-secret" }}
+                  key: {{ .Values.infrastructureMetering.vmStorageIngestionSecretKey | default "INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY" }}
+                  optional: {{ not (or (.Values.infrastructureMetering.vmPvcInventoryEnabled | default false) (.Values.infrastructureMetering.vmPvInventoryEnabled | default false)) }}
+            {{- with .Values.orchestrator.kbGitAllowedHosts }}
+            - name: KB_GIT_ALLOWED_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.orchestrator.kbGitSshKnownHosts }}
+            - name: KB_GIT_SSH_KNOWN_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
+            - name: KB_EXTERNAL_REINDEX_CONCURRENCY
+              value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
+            - name: KB_REINDEX_SWEEP_SECONDS
+              value: {{ .Values.orchestrator.kbReindexSweepSeconds | quote }}
             # Agent pool sizing (AgentProvisioner)
             - name: MAX_AGENTS
               valueFrom:
@@ -841,6 +1690,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LOG_LEVEL
+            - name: LOG_FORMAT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LOG_FORMAT
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -848,18 +1702,31 @@ spec:
               mountPath: /run/secrets/vm-ssh-key
               subPath: ssh-privatekey
               readOnly: true
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep {{ .Values.orchestrator.preStopDrainSeconds }}"]
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: 8085
+            periodSeconds: 5
+            failureThreshold: 30
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /api/health
               port: 8085
-            initialDelaySeconds: 30
             periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /api/health
               port: 8085
-            initialDelaySeconds: 10
             periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
           resources:
             {{- toYaml .Values.orchestrator.resources | nindent 12 }}
       volumes:
@@ -869,16 +1736,21 @@ spec:
         - name: vm-ssh-key
           secret:
             secretName: {{ include "srw.vmSshKeySecretName" . }}
-            # 0444 (read for owner/group/other) so the orchestrator container,
-            # which runs as the non-root `srw` user (uid 999) baked into
-            # docker/Dockerfile.orchestrator, can read the key. The secret is
-            # owned root:root and the orchestrator pod is single-purpose, so
-            # world-readable inside this container is acceptable. Required by
-            # services/thread_uploads.py (paramiko SFTP for live thread
-            # workspace uploads). NOTE: OpenSSH's CLI rejects group/world-
-            # readable keys — services/{ide_session,snapshot_service}.py shell
-            # out to `ssh -i` and would need `-o StrictModes=no` (or an
-            # initContainer-staged copy) before they can use this key. They
-            # don't today, so this change unblocks paramiko but does not by
-            # itself fix the system-`ssh` paths.
+            # 0444 (world-readable) so the non-root `srw` user the orchestrator
+            # runs as in prod (USER srw, docker/Dockerfile.orchestrator) can read
+            # this root:root-owned key. The pod is single-purpose, so world-
+            # readable in-container is acceptable. Required by
+            # services/thread_uploads.py (paramiko SFTP for live thread uploads).
+            #
+            # Do NOT lower this to 0400: a non-root process cannot read a
+            # root-owned 0400 file — that breaks prod, including the paramiko
+            # path above.
+            #
+            # Every SSH caller resolves this mount through
+            # services.resolve_ssh_key_path(). When the projected file is not a
+            # runtime-owned private file (including root-running Tilt), the
+            # resolver atomically stages a process-owned 0600 copy and returns
+            # that path. This keeps the readable 0444 mount required by the
+            # non-root production image without relying on OpenSSH's
+            # owner-dependent permission exception.
             defaultMode: 0444

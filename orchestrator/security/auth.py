@@ -2,7 +2,7 @@
 
 Four auth paths, tried in this order:
 1. ``srw_session`` cookie — cookie BFF; mid-stream access-token refresh is
-   transparent. See docs/features/auth_bff_and_api_tokens.md.
+   transparent. See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
 2. Bearer token (OIDC) — Keycloak access token. Transitional during the
    cockpit cutover; will remain for direct API consumers and for tests.
 3. X-MCP-Token — API tokens for Claude Code / CLI clients (unchanged).
@@ -34,7 +34,7 @@ SESSION_COOKIE = "srw_session"
 # regular user. The un-shadowed privilege flag is preserved on
 # ``real_is_admin`` so ``_require_admin`` (and the eventual
 # ``security.access.require_admin``) keep admin-only endpoints reachable.
-# Design: docs/features/admin_view_as_user.md.
+# Design: knowledge-base/knowledge/features/admin_view_as_user.md.
 VIEW_AS_HEADER = "X-Admin-View-As"
 
 
@@ -89,13 +89,17 @@ async def get_current_user(request: Request, db) -> dict:
 
     Returns the full user record (id, display_name, avatar_color, email,
     default_project_id, is_admin, is_approved, keycloak_sub, created_at).
-    The ``is_approved`` flag is derived from the access token's realm
-    roles on every request, so granting/revoking the role in Keycloak
-    takes effect immediately (cookie path: at most one ``access_token``
-    refresh later).
+    The ``is_approved`` flag comes from the ``users.is_approved`` column
+    (app-side admission), OR-combined with the legacy Keycloak ``user`` role
+    during the transition. Because it's checked per request, an admin
+    suspending a user takes effect immediately (cookie path: at most one
+    ``access_token`` refresh later).
 
     Raises:
         HTTPException 401 if not authenticated or all paths fail.
+        HTTPException 503 if the cookie path needed a Keycloak token refresh
+            and Keycloak was unreachable/broken — the session is kept alive
+            and the client should retry, not re-login.
     """
     # Path 1: cookie BFF.
     session_id = request.cookies.get(SESSION_COOKIE)
@@ -137,9 +141,16 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
     cookie gets cleared via the standard /auth/me round-trip.
 
     Refreshes the stored access token mid-session when it's within
-    ``SRW_ACCESS_TOKEN_REFRESH_SKEW_S`` of expiry. A refresh failure
-    (KC down, refresh token revoked) deletes the session row and
-    returns None.
+    ``SRW_ACCESS_TOKEN_REFRESH_SKEW_S`` of expiry, and re-validates with
+    Keycloak (the same refresh) once the session has been idle past
+    ``SRW_SESSION_IDLE_TIMEOUT_S`` rather than deleting it: the BFF session
+    is a renewable lease over the KC SSO session, so an idle-but-still-valid
+    session is renewed instead of force-logging the user out (which would
+    lose unsent work). A *definitive* refresh rejection (SSO ended, refresh
+    token revoked) deletes the session row and returns None; an unreachable
+    or broken KC keeps the row and raises 503 for this request instead (see
+    ``_refresh_session_in_place``). The absolute lifetime cap remains a hard
+    stop with no refresh attempt.
     """
     sess = await db.get_srw_session(session_id)
     if not sess:
@@ -149,12 +160,24 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
         # Past absolute lifetime — refresh attempts would just bounce.
         await db.delete_srw_session(session_id)
         return None
-    if sess["last_seen_at"] + _idle_timeout() <= now:
-        await db.delete_srw_session(session_id)
-        return None
-
+    # Idle OR access token near expiry → re-validate with Keycloak by
+    # refreshing in place. On idle this proves the SSO session is still alive
+    # instead of blind-deleting a session KC still considers valid: the idle
+    # window becomes a re-validation checkpoint, not a logout, so an idle user
+    # stops being force-logged-out (and losing unsent work) mid-session. A
+    # genuine KC rejection (SSO ended / refresh token revoked) deletes the row
+    # inside _refresh_session_in_place and returns None → clean re-login.
+    #
+    # CONCURRENCY INVARIANT: a tab refocus can fan out several requests that all
+    # hit this branch and refresh with the SAME refresh_token. That is safe ONLY
+    # while Keycloak refresh-token rotation is OFF (revokeRefreshToken=false — the
+    # realm default and our config in helm/ + HomeLab). Do NOT enable rotation
+    # without first serializing refresh per session (asyncio.Lock keyed by
+    # session_id, re-reading the row inside the lock).
     access_token = sess["access_token"]
-    if sess["access_expires_at"] - now <= _refresh_skew():
+    idle_expired = sess["last_seen_at"] + _idle_timeout() <= now
+    near_expiry = sess["access_expires_at"] - now <= _refresh_skew()
+    if idle_expired or near_expiry:
         access_token = await _refresh_session_in_place(sess, db)
         if access_token is None:
             return None
@@ -187,22 +210,51 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
 async def _refresh_session_in_place(sess: dict, db) -> str | None:
     """Refresh KC tokens and write them back to the session row.
 
-    Returns the new access token on success; None if the refresh fails
-    (and the caller should treat the session as dead).
+    Returns the new access token on success. Returns None only when Keycloak
+    definitively rejected the refresh (400 ``invalid_grant``: SSO session
+    ended / refresh token revoked) — the row is deleted and the caller treats
+    the session as dead → clean re-login.
+
+    When Keycloak is unreachable or otherwise broken (network error, 5xx,
+    malformed body, client misconfig like ``invalid_client``), the row is
+    KEPT and 503 is raised instead: the KC SSO session is in all likelihood
+    still valid, and deleting the row would permanently log every active user
+    out after any KC outage longer than one access-token lifespan (~15 min).
+    This way the request fails retryably and sessions resume on their own
+    once KC is back. The grace is bounded by KC's own timeouts: if the outage
+    outlives the refresh token, the next refresh IS an ``invalid_grant`` and
+    the row dies then.
     """
     try:
         tokens = await kc_bff_client.refresh(sess["refresh_token"])
     except KeycloakClientError as e:
-        logger.info("Session %s refresh failed (%s) — deleting", sess["id"], e)
-        await db.delete_srw_session(sess["id"])
-        return None
+        if e.definitive_rejection:
+            logger.info("Session %s refresh rejected (%s) — deleting", sess["id"], e)
+            await db.delete_srw_session(sess["id"])
+            return None
+        logger.warning(
+            "Session %s refresh failed transiently (%s) — keeping session",
+            sess["id"],
+            e,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service temporarily unavailable",
+        ) from e
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token") or sess["refresh_token"]
     expires_in = tokens.get("expires_in")
     if not access_token or not expires_in:
-        logger.warning("Session %s refresh returned malformed payload", sess["id"])
-        await db.delete_srw_session(sess["id"])
-        return None
+        # KC answered 200 with an unusable body — server-side breakage, not a
+        # grant rejection. Same posture as unreachable: keep the row, 503.
+        logger.warning(
+            "Session %s refresh returned malformed payload — keeping session",
+            sess["id"],
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service temporarily unavailable",
+        )
     new_access_expires_at = datetime.now(UTC) + timedelta(seconds=int(expires_in))
     await db.refresh_srw_session_tokens(
         sess["id"],
@@ -211,14 +263,28 @@ async def _refresh_session_in_place(sess: dict, db) -> str | None:
         access_expires_at=new_access_expires_at,
         id_token=tokens.get("id_token"),
     )
+    # Keep the in-memory session authoritative for the rest of this request —
+    # the caller still reads sess["id_token"] (and may read other token fields)
+    # after we return. Without this, an idle-triggered refresh would leave the
+    # stale id_token in sess for the downstream identity-claim merge.
+    sess["access_token"] = access_token
+    sess["refresh_token"] = refresh_token
+    sess["access_expires_at"] = new_access_expires_at
+    if tokens.get("id_token"):
+        sess["id_token"] = tokens["id_token"]
     return access_token
 
 
 async def _resolve_user_from_claims(claims: dict, db) -> dict:
     """JIT-provision (or sync) the local user row from Keycloak claims.
 
-    Shared between cookie and Bearer paths. ``is_approved`` and
-    ``preferred_username`` are attached as transient fields (not in DB).
+    Shared between cookie and Bearer paths. Admission lives in the
+    ``users.is_approved`` column now (app-side admission): this function reads
+    that flag and OR-combines it with the legacy ``user`` realm role during the
+    transition window, writing the DB flag through for legacy role-holders on
+    their first request after deploy. ``preferred_username`` is persisted to
+    the row (approval-time provisioning needs it). The returned ``is_approved``
+    / ``preferred_username`` keys carry the effective values for this request.
     """
     sub = claims["sub"]
     email = claims.get("email", "")
@@ -230,7 +296,12 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
     )
     realm_roles = claims.get("realm_access", {}).get("roles", [])
     is_admin = "admin" in realm_roles
-    is_approved = "user" in realm_roles or is_admin
+    # Keycloak answers authn only; admission lives in users.is_approved.
+    # `role_approved` is the legacy signal (the `user` realm role, or admin).
+    # During the transition it still grants access AND drives the write-through
+    # that migrates legacy role-holders onto the DB flag.
+    role_approved = "user" in realm_roles or is_admin
+    preferred_username = claims.get("preferred_username")
 
     user = await db.get_user_by_keycloak_sub(sub)
     if user:
@@ -241,6 +312,16 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             needs_update["display_name"] = display_name
         if user.get("is_admin") != is_admin:
             needs_update["is_admin"] = is_admin
+        if preferred_username and user.get("preferred_username") != preferred_username:
+            needs_update["preferred_username"] = preferred_username
+        db_approved = bool(user.get("is_approved"))
+        # Write-through migration: a legacy role-holder still FALSE in the DB
+        # self-migrates on this request. Never the reverse — absence of the
+        # role does not clear the flag (suspension is admin-driven only).
+        if role_approved and not db_approved:
+            needs_update["is_approved"] = True
+            needs_update["approved_at"] = datetime.now(UTC)
+            needs_update["approved_by"] = None
         if needs_update:
             async with db.acquire() as conn:
                 set_clause = ", ".join(
@@ -255,8 +336,13 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             logger.info(
                 "Updated user %s from OIDC claims: %s", sub, list(needs_update.keys())
             )
-        user["is_approved"] = is_approved
-        user["preferred_username"] = claims.get("preferred_username")
+            if needs_update.get("is_admin"):
+                # Promotion to admin: seed max-level grants so the grants data
+                # (and UI) reflect the bypass instead of an empty list that
+                # reads as "no permission". Existing admins: migration 0049.
+                await db.seed_admin_grants(str(user["id"]))
+        user["is_approved"] = db_approved or role_approved
+        user["preferred_username"] = preferred_username
         return user
 
     # First login — create local user row + seed cloud/Gitea in the background.
@@ -265,34 +351,114 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
         email=email,
         display_name=display_name,
         is_admin=is_admin,
+        is_approved=role_approved,
+        preferred_username=preferred_username,
     )
+    if is_admin and user.get("id"):
+        # First login of an admin: seed max-level grants (see promotion path).
+        await db.seed_admin_grants(str(user["id"]))
+    # Effective approval reflects the OR-merge inside upsert: an admin-created
+    # or pre-seeded row can already be approved without carrying the role.
+    effective_approved = bool(user.get("is_approved"))
     logger.info(
         "JIT-provisioned user %s (sub=%s, admin=%s, approved=%s)",
         display_name,
         sub,
         is_admin,
-        is_approved,
+        effective_approved,
     )
+    if effective_approved:
+        # Approved on first login (admin, or a legacy `user` role-holder):
+        # pre-provision cloud + Gitea so their first thread/repo finds them.
+        asyncio.create_task(
+            _ensure_cloud_user(
+                sub=sub,
+                issuer=claims.get("iss", ""),
+                email=email,
+                display_name=display_name,
+                preferred_username=preferred_username,
+            )
+        )
+        asyncio.create_task(
+            _ensure_gitea_user(
+                sub=sub,
+                email=email,
+                preferred_username=preferred_username,
+                display_name=display_name,
+            )
+        )
+    else:
+        # New registrant is pending — do NOT provision cloud/Gitea accounts
+        # for someone no admin has admitted (closes the pre-approval resource
+        # leak). Provisioning runs at approval time instead, via
+        # ensure_user_provisioned. Tell the admins there's someone to review.
+        asyncio.create_task(_notify_admins_of_registration(user, email))
+    # Dev-only: the moment the admin user first exists, seed the fixed dev MCP
+    # token so a committed .mcp.json authenticates without a manual mint or an
+    # orchestrator restart. Gated on MCP_DEV_TOKEN (unset in prod → skipped);
+    # the function is idempotent and the startup seed in main.py covers restarts.
+    if is_admin and os.environ.get("MCP_DEV_TOKEN", "").strip():
+        from init import _seed_admin_mcp_token
+
+        asyncio.create_task(_seed_admin_mcp_token(db))
+    user["is_approved"] = effective_approved
+    user["preferred_username"] = preferred_username
+    return user
+
+
+async def ensure_user_provisioned(user_row: dict) -> None:
+    """Fire cloud + Gitea ensure-user for an approved user from row data.
+
+    Approval-time provisioning for app-side admission. The JIT ensures only
+    fire for users approved at first login; an app-side-approved user never
+    re-triggers them (the Keycloak ``user`` role is never assigned, so every
+    later login takes the existing-user branch). This is therefore the
+    provisioning path for users admitted via the cockpit. Both ensures are
+    idempotent, so re-running for an already-provisioned user is harmless.
+
+    Best-effort and non-blocking: the two ensures swallow and log their own
+    errors. A row without a ``keycloak_sub`` (admin-created / pre-OIDC) is
+    skipped — it provisions on its owner's first real OIDC login instead.
+    """
+    sub = (user_row.get("keycloak_sub") or "").strip()
+    if not sub:
+        return
+    email = user_row.get("email") or ""
+    display_name = user_row.get("display_name") or (
+        email.split("@")[0] if email else "User"
+    )
+    preferred_username = user_row.get("preferred_username")
     asyncio.create_task(
         _ensure_cloud_user(
             sub=sub,
-            issuer=claims.get("iss", ""),
+            issuer="",  # resolved from the backend's configured issuer
             email=email,
             display_name=display_name,
-            preferred_username=claims.get("preferred_username"),
+            preferred_username=preferred_username,
         )
     )
     asyncio.create_task(
         _ensure_gitea_user(
             sub=sub,
             email=email,
-            preferred_username=claims.get("preferred_username"),
+            preferred_username=preferred_username,
             display_name=display_name,
         )
     )
-    user["is_approved"] = is_approved
-    user["preferred_username"] = claims.get("preferred_username")
-    return user
+
+
+async def _notify_admins_of_registration(user: dict, email: str) -> None:
+    """Best-effort: tell admins a new user registered and is awaiting approval."""
+    try:
+        from services.notification_service import notification_service
+
+        await notification_service.notify_admins_user_registered(
+            new_user_id=str(user["id"]),
+            display_name=user.get("display_name"),
+            email=email or None,
+        )
+    except Exception as e:
+        logger.warning("Registration notify failed: %s", e)
 
 
 async def _resolve_pat(token: str, request: Request, db) -> dict:
@@ -305,10 +471,9 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
 
     Returns the user dict with ``auth_method='pat'``, ``scopes`` (the
     PAT's action scopes from the row), and ``token_id`` for downstream
-    introspection. ``is_approved`` is forced True — a PAT could only have
-    been issued by an already-approved user via the cockpit, so role
-    revocation that follows would need to revoke the token, not silently
-    leave it usable.
+    introspection. Admission flows from the user row (``is_approved``): the
+    force-True is gone so that suspending a user also kills their PATs — if
+    the owner is no longer approved, the token stops working on the next call.
     """
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
     row = await db.get_auth_token_by_hash(digest)
@@ -323,7 +488,6 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
     user["auth_method"] = "pat"
     user["scopes"] = list(row.get("scopes") or [])
     user["token_id"] = str(row["id"])
-    user["is_approved"] = True
     return user
 
 
@@ -337,7 +501,8 @@ async def _resolve_legacy_mcp_token(token: str, request: Request, db) -> dict:
     token in the Authorization header — the consolidated auth surface
     advertised in the design doc.
 
-    Forces ``is_approved=True`` for the same reason as ``_resolve_pat``.
+    Admission flows from the user row for the same reason as ``_resolve_pat``
+    — suspending a user must also disable their MCP tokens.
     """
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
     row = await db.get_auth_token_by_hash(digest)
@@ -356,7 +521,6 @@ async def _resolve_legacy_mcp_token(token: str, request: Request, db) -> dict:
     legacy_scope = row.get("scope") or ""
     user["scopes"] = [legacy_scope] if legacy_scope else []
     user["token_id"] = str(row["id"])
-    user["is_approved"] = True
     return user
 
 
@@ -392,13 +556,15 @@ async def _ensure_cloud_user(
         from main import main_cloud_router  # noqa: PLC0415
 
         # Fresh per-owner provisioning — resolve via the owner seam, not
-        # ``.active`` directly (Issue 16, docs/issues/main_cloud.md).
+        # ``.active`` directly (Issue 16, knowledge-base/knowledge/issues/main_cloud.md).
         backend = main_cloud_router.for_owner({"keycloak_sub": sub, "email": email})
         if not backend.is_initialized:
             return
         await backend.ensure_user(
             sub=sub,
-            issuer=issuer,
+            # No OIDC claims at approval time → fall back to the backend's
+            # configured Keycloak issuer.
+            issuer=issuer or getattr(backend, "_keycloak_issuer", "") or "",
             email=email,
             display_name=display_name,
             preferred_username=preferred_username,
@@ -469,7 +635,9 @@ async def _get_user_from_mcp_headers(request: Request, db) -> dict:
     if mcp_user_id and expected_key and internal_key == expected_key:
         user = await db.get_user(mcp_user_id)
         if user:
-            user["is_approved"] = True  # MCP tokens are pre-validated
+            # Admission flows from the user row — a suspended owner's MCP
+            # access stops here too (the header only proves the MCP server
+            # validated the token, not that the user is still admitted).
             user["auth_method"] = "mcp"
             mcp_scope = request.headers.get("X-MCP-Scope")
             user["scopes"] = [mcp_scope] if mcp_scope else []
@@ -480,27 +648,28 @@ async def _get_user_from_mcp_headers(request: Request, db) -> dict:
 
 
 async def require_approved_user(request: Request, db) -> dict:
-    """Like get_current_user but raises 403 if the user lacks the 'user' role.
+    """Like get_current_user but raises 403 if the user isn't approved.
 
-    Use this for all endpoints that require an approved account.
-    /api/auth/me should use get_current_user directly so the cockpit can
-    display a "pending approval" message.
+    Approval is the ``users.is_approved`` flag (app-side admission), resolved
+    onto the user dict by the auth path. Use this for all endpoints that
+    require an admitted account. /api/auth/me should use get_current_user
+    directly so the cockpit can display its "pending approval" screen.
 
     Admin shadow ("view as user"): when an admin request carries
     ``X-Admin-View-As: user``, the returned dict has ``is_admin=False`` so
-    visibility helpers (``user_visible_project_ids``, ``get_visible_jobs``,
+    visibility helpers (``user_visible_project_ids``, ``query_jobs``,
     ``user_can_access_datasource``) narrow as if the caller were a regular
     user. The un-shadowed privilege flag is preserved on ``real_is_admin``
     so ``_require_admin`` keeps admin-only endpoints reachable while the
     shadow is on. The header is a no-op for non-admin callers — they get
     ``real_is_admin=False`` for parity. Design:
-    docs/features/admin_view_as_user.md.
+    knowledge-base/knowledge/features/admin_view_as_user.md.
     """
     user = await get_current_user(request, db)
     if not user.get("is_approved"):
         raise HTTPException(
             status_code=403,
-            detail="Account pending approval. An administrator must assign you the 'user' role.",
+            detail="Account pending approval. An administrator must approve your account.",
         )
     view_as = request.headers.get(VIEW_AS_HEADER, "").lower()
     if view_as == "user" and user.get("is_admin"):
@@ -521,7 +690,14 @@ async def resolve_ws_user(ws, db) -> dict | None:
     session_id = ws.cookies.get(SESSION_COOKIE)
     if not session_id:
         return None
-    return await _resolve_from_cookie(session_id, db)
+    try:
+        return await _resolve_from_cookie(session_id, db)
+    except HTTPException:
+        # KC-unavailable surfaces as 503 from the refresh path; a WS
+        # handshake has no HTTP response to carry it. Map to None so the
+        # caller closes 4401 and the client retries — the session row was
+        # kept, so the retry succeeds once KC is back.
+        return None
 
 
 async def cleanup_expired_tokens(db, shutdown_event: asyncio.Event) -> None:
@@ -544,7 +720,7 @@ async def cleanup_expired_tokens(db, shutdown_event: asyncio.Event) -> None:
 
 
 async def cleanup_expired_sessions(db, shutdown_event: asyncio.Event) -> None:
-    """Background task: prune dead BFF session rows and consumed pre-auth state.
+    """Prune dead BFF, pre-auth, and dependent Canvas viewer state.
 
     Hourly cadence matches cleanup_expired_tokens. Idle-timeout enforcement
     is handled by the per-request validator; this loop only removes rows
@@ -555,7 +731,15 @@ async def cleanup_expired_sessions(db, shutdown_event: asyncio.Event) -> None:
         try:
             await db.cleanup_expired_srw_sessions()
             await db.cleanup_expired_srw_pre_auth()
-            logger.debug("Expired BFF sessions / pre-auth state cleanup completed")
+            # Lazy import keeps the core authentication dependency direction
+            # unchanged. Viewer cleanup is safe while the feature is disabled:
+            # it removes only already-expired hashed credentials/presence rows.
+            from services.canvas_viewer_sessions import CanvasViewerSessionService
+
+            await CanvasViewerSessionService(db).cleanup()
+            logger.debug(
+                "Expired BFF sessions / pre-auth / Canvas viewer cleanup completed"
+            )
         except Exception as e:
             logger.error("Error cleaning up BFF sessions: %s", e)
 

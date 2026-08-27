@@ -1,3 +1,290 @@
+{{- $remoteIngress := .Values.infrastructureMetering.remoteIngress | default dict -}}
+{{- if and (.Values.agent.stateless.worker.enabled | default false) (not (.Values.agent.stateless.enabled | default false)) }}
+{{- fail "agent.stateless.worker.enabled requires agent.stateless.enabled so worker_batch units have a stateless executor pool" }}
+{{- end }}
+{{- if and (.Values.orchestrator.completionStatusReorderEnabled | default false) (not (.Values.orchestrator.completionCommandsEnabled | default false)) }}
+{{- fail "orchestrator.completionStatusReorderEnabled requires orchestrator.completionCommandsEnabled" }}
+{{- end }}
+{{- $vmPvcInventory := .Values.infrastructureMetering.vmPvcInventoryEnabled | default false -}}
+{{- $vmPvInventory := .Values.infrastructureMetering.vmPvInventoryEnabled | default false -}}
+{{- $remoteInventory := or (.Values.infrastructureMetering.vmInventoryEnabled | default false) $vmPvcInventory $vmPvInventory -}}
+{{- $remoteStorageInventory := or $vmPvcInventory $vmPvInventory -}}
+{{- $primaryIngestionSecretName := .Values.infrastructureMetering.ingestionSecretName | default (printf "%s-infra-ingestion" (include "srw.fullname" .) | trunc 63 | trimSuffix "-") -}}
+{{- $vmLifecycleAuthSecretName := include "srw.vmLifecycleAuthSecretName" . -}}
+{{- /* Same-cluster VMs are inventoried by this cluster's own identity; external mode
+     must name the remote VM cluster explicitly, so the defaults apply only here. */ -}}
+{{- $vmMeteringStableClusterId := .Values.infrastructureMetering.vmStableClusterId -}}
+{{- $vmMeteringNamespace := .Values.infrastructureMetering.vmNamespace -}}
+{{- if include "srw.vmSameCluster" . -}}
+{{- $vmMeteringStableClusterId = $vmMeteringStableClusterId | default .Values.infrastructureMetering.stableClusterId -}}
+{{- $vmMeteringNamespace = $vmMeteringNamespace | default .Release.Namespace -}}
+{{- end -}}
+{{- $volumeIdentitySecretName := .Values.infrastructureMetering.volumeIdentitySecretName | default (printf "%s-infra-volume-identity" (include "srw.fullname" .) | trunc 63 | trimSuffix "-") -}}
+{{- if $vmLifecycleAuthSecretName }}
+{{- if eq $vmLifecycleAuthSecretName (include "srw.secretName" .) }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if eq $vmLifecycleAuthSecretName $primaryIngestionSecretName }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from ingestionSecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.vmIngestionSecretName (eq $vmLifecycleAuthSecretName .Values.infrastructureMetering.vmIngestionSecretName) }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from vmIngestionSecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.vmStorageIngestionSecretName (eq $vmLifecycleAuthSecretName .Values.infrastructureMetering.vmStorageIngestionSecretName) }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from vmStorageIngestionSecretName" }}
+{{- end }}
+{{- if eq $vmLifecycleAuthSecretName $volumeIdentitySecretName }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from volumeIdentitySecretName" }}
+{{- end }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.shadowEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
+{{- fail "infrastructureMetering.shadowEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.pvcInventoryEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
+{{- fail "infrastructureMetering.pvcInventoryEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.pvInventoryEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
+{{- fail "infrastructureMetering.pvInventoryEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.pvInventoryEnabled (not .Values.infrastructureMetering.volumeIdentityKeyVersion) }}
+{{- fail "infrastructureMetering.pvInventoryEnabled requires volumeIdentityKeyVersion" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled (not .Values.secrets.create) (not .Values.infrastructureMetering.ingestionSecretName) }}
+{{- fail "infrastructureMetering.collectorEnabled requires ingestionSecretName outside chart-managed secret mode" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled .Values.infrastructureMetering.ingestionSecretName (eq .Values.infrastructureMetering.ingestionSecretName (include "srw.secretName" .)) }}
+{{- fail "infrastructureMetering.ingestionSecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.pvInventoryEnabled (not .Values.secrets.create) (not .Values.infrastructureMetering.volumeIdentitySecretName) }}
+{{- fail "infrastructureMetering.pvInventoryEnabled requires volumeIdentitySecretName outside chart-managed secret mode" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.pvInventoryEnabled .Values.infrastructureMetering.volumeIdentitySecretName (eq .Values.infrastructureMetering.volumeIdentitySecretName (include "srw.secretName" .)) }}
+{{- fail "infrastructureMetering.volumeIdentitySecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvcShadowEnabled }}
+{{- if not .Values.infrastructureMetering.pvcInventoryEnabled }}
+{{- fail "infrastructureMetering.pvcShadowEnabled requires pvcInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.pvcShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvShadowEnabled }}
+{{- if not .Values.infrastructureMetering.pvInventoryEnabled }}
+{{- fail "infrastructureMetering.pvShadowEnabled requires pvInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.pvShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvcPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.pvcPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.pvcShadowEnabled }}
+{{- fail "infrastructureMetering.pvcPublicationEnabled requires pvcShadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.pvPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.pvShadowEnabled }}
+{{- fail "infrastructureMetering.pvPublicationEnabled requires pvShadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if or .Values.infrastructureMetering.idePodShadowEnabled .Values.infrastructureMetering.agentPodShadowEnabled }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering IDE/agent Pod shadow gates require collectorEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering IDE/agent Pod shadow gates require shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.idePodPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.idePodPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.idePodShadowEnabled }}
+{{- fail "infrastructureMetering.idePodPublicationEnabled requires idePodShadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.agentPodPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.agentPodPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.agentPodShadowEnabled }}
+{{- fail "infrastructureMetering.agentPodPublicationEnabled requires agentPodShadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmInventoryEnabled }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering.vmInventoryEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if and (not (include "srw.vmSameCluster" .)) (not .Values.infrastructureMetering.vmStableClusterId) }}
+{{- fail "infrastructureMetering.vmInventoryEnabled requires vmStableClusterId" }}
+{{- end }}
+{{- if and (not (include "srw.vmSameCluster" .)) (not .Values.infrastructureMetering.vmNamespace) }}
+{{- fail "infrastructureMetering.vmInventoryEnabled requires vmNamespace" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmIngestionSecretName }}
+{{- fail "infrastructureMetering.vmInventoryEnabled requires vmIngestionSecretName" }}
+{{- end }}
+{{- if eq .Values.infrastructureMetering.vmIngestionSecretName (include "srw.secretName" .) }}
+{{- fail "infrastructureMetering.vmIngestionSecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if eq .Values.infrastructureMetering.vmIngestionSecretName $primaryIngestionSecretName }}
+{{- fail "infrastructureMetering.vmIngestionSecretName must be separate from ingestionSecretName" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmShadowEnabled }}
+{{- if not .Values.infrastructureMetering.vmInventoryEnabled }}
+{{- fail "infrastructureMetering.vmShadowEnabled requires vmInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.vmShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.vmPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmShadowEnabled }}
+{{- fail "infrastructureMetering.vmPublicationEnabled requires vmShadowEnabled" }}
+{{- end }}
+{{- if not $vmLifecycleAuthSecretName }}
+{{- fail "infrastructureMetering.vmPublicationEnabled requires vmLifecycleAuthSecretName" }}
+{{- end }}
+{{- end }}
+{{- if $remoteStorageInventory }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering remote storage inventory requires collectorEnabled" }}
+{{- end }}
+{{- if and (not (include "srw.vmSameCluster" .)) (not .Values.infrastructureMetering.vmStableClusterId) }}
+{{- fail "infrastructureMetering remote storage inventory requires vmStableClusterId" }}
+{{- end }}
+{{- if and (not (include "srw.vmSameCluster" .)) (not .Values.infrastructureMetering.vmNamespace) }}
+{{- fail "infrastructureMetering remote storage inventory requires vmNamespace" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmStorageIngestionSecretName }}
+{{- fail "infrastructureMetering remote storage inventory requires vmStorageIngestionSecretName" }}
+{{- end }}
+{{- if eq .Values.infrastructureMetering.vmStorageIngestionSecretName (include "srw.secretName" .) }}
+{{- fail "infrastructureMetering.vmStorageIngestionSecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if eq .Values.infrastructureMetering.vmStorageIngestionSecretName $primaryIngestionSecretName }}
+{{- fail "infrastructureMetering.vmStorageIngestionSecretName must be separate from ingestionSecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.vmIngestionSecretName (eq .Values.infrastructureMetering.vmStorageIngestionSecretName .Values.infrastructureMetering.vmIngestionSecretName) }}
+{{- fail "infrastructureMetering.vmStorageIngestionSecretName must be separate from vmIngestionSecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.volumeIdentitySecretName (eq .Values.infrastructureMetering.vmStorageIngestionSecretName .Values.infrastructureMetering.volumeIdentitySecretName) }}
+{{- fail "infrastructureMetering.vmStorageIngestionSecretName must be separate from volumeIdentitySecretName" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPvcShadowEnabled }}
+{{- if not $vmPvcInventory }}
+{{- fail "infrastructureMetering.vmPvcShadowEnabled requires vmPvcInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.vmPvcShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPvShadowEnabled }}
+{{- if not $vmPvInventory }}
+{{- fail "infrastructureMetering.vmPvShadowEnabled requires vmPvInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.vmPvShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPvcPublicationEnabled }}
+{{- if not (.Values.infrastructureMetering.vmPvcShadowEnabled | default false) }}
+{{- fail "infrastructureMetering.vmPvcPublicationEnabled requires vmPvcShadowEnabled" }}
+{{- end }}
+{{- if not (.Values.infrastructureMetering.publicationEnabled | default false) }}
+{{- fail "infrastructureMetering.vmPvcPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not $vmLifecycleAuthSecretName }}
+{{- fail "infrastructureMetering.vmPvcPublicationEnabled requires vmLifecycleAuthSecretName" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPvPublicationEnabled }}
+{{- if not (.Values.infrastructureMetering.vmPvShadowEnabled | default false) }}
+{{- fail "infrastructureMetering.vmPvPublicationEnabled requires vmPvShadowEnabled" }}
+{{- end }}
+{{- if not (.Values.infrastructureMetering.publicationEnabled | default false) }}
+{{- fail "infrastructureMetering.vmPvPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not $vmLifecycleAuthSecretName }}
+{{- fail "infrastructureMetering.vmPvPublicationEnabled requires vmLifecycleAuthSecretName" }}
+{{- end }}
+{{- end }}
+{{- if $vmPvInventory }}
+{{- if not (.Values.infrastructureMetering.vmPvClusterWideRbacAcknowledged | default false) }}
+{{- fail "infrastructureMetering.vmPvInventoryEnabled requires vmPvClusterWideRbacAcknowledged=true because Kubernetes PV reads are cluster-wide" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.volumeIdentityKeyVersion }}
+{{- fail "infrastructureMetering.vmPvInventoryEnabled requires volumeIdentityKeyVersion" }}
+{{- end }}
+{{- end }}
+{{- if ($remoteIngress.enabled | default false) }}
+{{- if not $remoteInventory }}
+{{- fail "infrastructureMetering.remoteIngress.enabled requires at least one remote VM inventory gate" }}
+{{- end }}
+{{- if not .Values.ingress.enabled }}
+{{- fail "infrastructureMetering.remoteIngress.enabled requires ingress.enabled" }}
+{{- end }}
+{{- if ne (.Values.ingress.className | default "traefik") "traefik" }}
+{{- fail "infrastructureMetering.remoteIngress.enabled currently requires Traefik" }}
+{{- end }}
+{{- if not .Values.ingress.tls.enabled }}
+{{- fail "infrastructureMetering.remoteIngress.enabled requires ingress TLS" }}
+{{- end }}
+{{- if not $remoteIngress.sourceCidrs }}
+{{- fail "infrastructureMetering.remoteIngress.enabled requires sourceCidrs" }}
+{{- end }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.sourceAwareReadsEnabled (not .Values.infrastructureMetering.v2ReadsEnabled) }}
+{{- fail "infrastructureMetering.sourceAwareReadsEnabled requires v2ReadsEnabled" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled (not .Values.infrastructureMetering.stableClusterId) }}
+{{- fail "infrastructureMetering.collectorEnabled requires stableClusterId" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled (ne (.Values.infrastructureMetering.deploymentMode | default "dedicated") "dedicated") }}
+{{- fail "infrastructureMetering.collectorEnabled currently requires deploymentMode=dedicated" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled (not .Values.infrastructureMetering.networkPolicy.enabled) (not .Values.infrastructureMetering.networkPolicy.allowUnrestrictedEgress) }}
+{{- fail "infrastructureMetering.collectorEnabled requires networkPolicy.enabled or explicit networkPolicy.allowUnrestrictedEgress=true" }}
+{{- end }}
+{{- if lt (int .Values.infrastructureMetering.staleAfterSeconds) (int .Values.infrastructureMetering.relistIntervalSeconds) }}
+{{- fail "infrastructureMetering.staleAfterSeconds must be greater than or equal to relistIntervalSeconds" }}
+{{- end }}
+{{- if lt (int .Values.infrastructureMetering.diagnosticRetentionDays) (int .Values.infrastructureMetering.snapshotItemRetentionDays) }}
+{{- fail "infrastructureMetering.diagnosticRetentionDays must be greater than or equal to snapshotItemRetentionDays" }}
+{{- end }}
+{{- if .Values.infrastructureMetering.publicationEnabled }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering.publicationEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.publicationEnabled requires shadowEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.stableClusterId }}
+{{- fail "infrastructureMetering.publicationEnabled requires stableClusterId" }}
+{{- end }}
+{{- end }}
+{{- if or .Values.infrastructureMetering.cutoverEnabled .Values.infrastructureMetering.sourceAwareReadsEnabled }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering cutover/source-aware reads require collectorEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering cutover/source-aware reads require shadowEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.stableClusterId }}
+{{- fail "infrastructureMetering cutover/source-aware reads require stableClusterId" }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -13,33 +300,118 @@ data:
   POSTGRES_HOST: {{ include "srw.postgresHost" . | quote }}
   POSTGRES_PORT: {{ include "srw.postgresPort" . | quote }}
   POSTGRES_DB: {{ include "srw.postgresDb" . | quote }}
+  POSTGRES_SSLMODE: {{ .Values.databases.postgres.sslMode | default "prefer" | quote }}
 
   # Vector DB — non-secret connection parts. Composed with
   # VECTOR_POSTGRES_USER/VECTOR_POSTGRES_PASSWORD from the Secret.
   VECTOR_POSTGRES_HOST: {{ include "srw.vectorPostgresHost" . | quote }}
   VECTOR_POSTGRES_PORT: {{ include "srw.vectorPostgresPort" . | quote }}
   VECTOR_POSTGRES_DB: {{ include "srw.vectorPostgresDb" . | quote }}
+  VECTOR_POSTGRES_SSLMODE: {{ .Values.databases.vector.sslMode | default "prefer" | quote }}
 
-  # Citation Engine DB — runs on the pgvector instance under its own role
-  # (srw_citations) and dedicated database (citation_engine). Composed with
-  # CITATION_POSTGRES_USER/PASSWORD from the Secret.
-  CITATION_POSTGRES_HOST: {{ include "srw.vectorPostgresHost" . | quote }}
-  CITATION_POSTGRES_PORT: {{ include "srw.vectorPostgresPort" . | quote }}
-  CITATION_POSTGRES_DB: {{ "citation_engine" | quote }}
+  # Audit DB (srw-auditdb) — non-secret connection parts. Composed with
+  # AUDIT_POSTGRES_USER/AUDIT_POSTGRES_PASSWORD from the Secret. Agent pods
+  # inherit this ConfigMap via envFrom, so the audit writer reaches them too.
+  AUDIT_POSTGRES_HOST: {{ include "srw.auditPostgresHost" . | quote }}
+  AUDIT_POSTGRES_PORT: {{ include "srw.auditPostgresPort" . | quote }}
+  AUDIT_POSTGRES_DB: {{ include "srw.auditPostgresDb" . | quote }}
+  AUDIT_POSTGRES_SSLMODE: {{ .Values.databases.audit.sslMode | default "prefer" | quote }}
 
-  # MongoDB
-  MONGODB_URL: {{ include "srw.mongodbUrl" . | quote }}
+  # App-DB asyncpg pool sizing for provisioned agent pods, which inherit this
+  # ConfigMap via envFrom. Kept SMALL on purpose: the connection multiplier is
+  # agent COUNT (maxAgents), so a fat per-agent pool exhausts the app DB's
+  # max_connections. The agent's vector pool reads the same POSTGRES_* env, so
+  # this one knob bounds both. The ORCHESTRATOR does NOT envFrom this ConfigMap
+  # — it sizes its own (larger) control/vector/audit pools via explicit env in
+  # orchestrator/deployment.yaml, so these agent-scale values never reach it.
+  POSTGRES_MIN_CONNECTIONS: {{ .Values.agent.dbPool.app.min | quote }}
+  POSTGRES_MAX_CONNECTIONS: {{ .Values.agent.dbPool.app.max | quote }}
+
+  # Active checkpointer backend (sqlite|postgres). Worker agents read it to pick
+  # the LangGraph checkpointer (postgres = shared Postgres, cross-pod resume);
+  # the orchestrator reads it to prune checkpoints on terminal. Agents inherit
+  # via envFrom; the orchestrator gets it as an explicit env (see
+  # orchestrator/deployment.yaml). Default postgres (cross-pod resume on);
+  # set checkpointer.backend=sqlite to fall back to the legacy pod-local store.
+  CHECKPOINTER_BACKEND: {{ .Values.checkpointer.backend | default "postgres" | quote }}
+
+  # The generic stateless executor gate is also the session-admission gate.
+  # Keeping one rendered value prevents admission without an executor pool.
+  # Worker *admission* remains separately gated so enabling stateless sessions
+  # cannot silently move new jobs off the pinned dispatcher. Executor-mode
+  # pods keep claiming durable worker_batch residue after admission is closed.
+  # Agents inherit these keys via envFrom; the orchestrator references them
+  # explicitly from this same ConfigMap.
+  STATELESS_SESSION_ENABLED: {{ .Values.agent.stateless.enabled | default false | quote }}
+  STATELESS_WORKER_ENABLED: {{ .Values.agent.stateless.worker.enabled | default false | quote }}
+  STATELESS_WORKER_DEFAULT_ENABLED: {{ .Values.agent.stateless.worker.defaultEnabled | default false | quote }}
+  COMPLETION_COMMANDS_ENABLED: {{ .Values.orchestrator.completionCommandsEnabled | default false | quote }}
+  # Admission policy is persisted per command; this value never reorders an
+  # already accepted row after a restart or rollback.
+  COMPLETION_STATUS_REORDER_ENABLED: {{ .Values.orchestrator.completionStatusReorderEnabled | default false | quote }}
+  COMPLETION_FINALIZER_INLINE_DELAY_SECONDS: {{ .Values.orchestrator.completionFinalizerInlineDelaySeconds | default 0 | quote }}
+  # Two-stage rollout fence for the interim dedicated Officer-pod owner.
+  PERSISTENT_AGENT_RECONCILIATION_ENABLED: {{ .Values.orchestrator.persistentAgentReconciliationEnabled | default false | quote }}
+  # Reader-first rollout gate for terminal direct-human input cancellation.
+  # Provisioned pinned agents inherit this ConfigMap via envFrom.
+  PERSISTENT_INPUT_CANCELLATION_ENABLED: {{ .Values.agent.persistentInputCancellationEnabled | default false | quote }}
+  # Admin-only exact-binding longevity/fault verification seam. Dark in every
+  # normal profile and consumed only by the orchestrator.
+  OFFICER_RUNTIME_VERIFICATION_ENABLED: {{ .Values.orchestrator.officerRuntimeVerificationEnabled | default false | quote }}
+  WORKER_BATCH_MIN_WALL_SECONDS: {{ .Values.agent.stateless.worker.batchMinWallSeconds | default 300 | quote }}
+
+  # Reject pickle fallback in LangGraph checkpoint serialization. This is
+  # required for every worker process that can read shared Postgres state.
+  LANGGRAPH_STRICT_MSGPACK: "true"
+
+  # LLM-outage/cooldown pause budget (seconds; default 12h). Read by BOTH the
+  # orchestrator give-up ceiling (evaluate_llm_outage) AND every agent pod's
+  # cooldown pause-vs-fail-fast cutoff (src/graph.py _COOLDOWN_MAX_PAUSE_SECONDS)
+  # — they MUST agree, so both read this one ConfigMap key. Agents inherit via
+  # envFrom; the orchestrator references it explicitly (see
+  # orchestrator/deployment.yaml). knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md
+  LLM_OUTAGE_CEILING_SECONDS: {{ .Values.llmOutage.ceilingSeconds | default 43200 | quote }}
+
+  # (Citations live in the vector store — srw_vector — reached through the
+  # agent's shared VECTOR_POSTGRES_* pool. No separate citation DB/role/DSN.
+  # See knowledge-history/done/citation_engine_integration.md.)
 
   # Gitea
   GITEA_URL: {{ include "srw.gitUrl" . | quote }}
   GITEA_INTERNAL_URL: {{ include "srw.giteaInternalUrl" . | quote }}
+  {{- if .Values.gitea.ssh.enabled }}
+  GITEA_SSH_INTERNAL_HOST: {{ default (ternary (printf "%s-gitea" (include "srw.fullname" .)) "" .Values.gitea.internal) .Values.gitea.ssh.internalHost | quote }}
+  GITEA_SSH_INTERNAL_PORT: {{ .Values.gitea.ssh.internalPort | quote }}
+  GITEA_SSH_EXTERNAL_HOST: {{ .Values.gitea.ssh.externalHost | quote }}
+  GITEA_SSH_EXTERNAL_PORT: {{ .Values.gitea.ssh.externalPort | quote }}
+  {{- else }}
+  GITEA_SSH_INTERNAL_HOST: ""
+  GITEA_SSH_INTERNAL_PORT: "0"
+  GITEA_SSH_EXTERNAL_HOST: ""
+  GITEA_SSH_EXTERNAL_PORT: "0"
+  {{- end }}
 
   # Orchestrator
   ORCHESTRATOR_URL: {{ printf "http://%s:8085" (include "srw.serviceName" (dict "context" . "component" "orchestrator")) | quote }}
+  # Public component declarations only. Agent pods inherit this ConfigMap;
+  # the orchestrator references this key explicitly.
+  SRW_DEPLOYMENT_PROVENANCE_JSON: {{ include "srw.deploymentProvenanceJson" . | quote }}
 
   # Workspace
   WORKSPACE_PATH: {{ "/workspace" | quote }}
   WORKSPACE_STORAGE_CLASS: {{ .Values.workspace.ephemeralStorageClass | default "longhorn-ephemeral" | quote }}
+  WORKSPACE_PVC_ENABLED: {{ .Values.workspace.pvcEnabled | default false | quote }}
+  WORKSPACE_PVC_SIZE: {{ .Values.workspace.pvcSize | default "10Gi" | quote }}
+  # Single-replica node-loss fallback (Phase 3b): extended reattach ready-wait
+  # (gives a transient node reboot time to recover before discarding) + the
+  # data-destructive discard kill-switch.
+  WORKSPACE_REATTACH_READY_TIMEOUT: {{ .Values.workspace.reattachReadyTimeout | default 180 | quote }}
+  WORKSPACE_REATTACH_FRESH_FALLBACK: {{ .Values.workspace.freshFallback | default true | quote }}
+  # Reclaim-on-idle (Task 7, opt-in, fail-safe): drop a session's workspace
+  # PVC on idle-suspend once its S3 snapshot verifies restorable. Default off
+  # keeps today's retain-on-idle behavior. See workspace_suspension.py and
+  # knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
+  WORKSPACE_RECLAIM_ON_IDLE: {{ .Values.workspace.reclaimOnIdle | default false | quote }}
 
   # Agent
   AGENT_CONFIG: {{ .Values.agent.config | quote }}
@@ -51,6 +423,91 @@ data:
   # (src/core/loader.py) via envFrom on this shared ConfigMap. Default-off
   # chart-wide (prod-safe); the dev/experimental values file turns it on.
   CONFIG_DB_OVERRIDES_ENABLED: {{ .Values.agent.configDbOverridesEnabled | default "false" | quote }}
+  # DB-backed experts (experts table). The orchestrator owns selection and
+  # resolved-config delivery; agents receive the flag through the shared
+  # ConfigMap for compatibility. Enabled because root creation resolves DB pointers;
+  # false is retained only as an emergency compatibility switch.
+  EXPERTS_DB_ENABLED: {{ .Values.agent.expertsDbEnabled | default "true" | quote }}
+  # DB-backed Agent Skills (skills + skill_files). Read by the orchestrator's
+  # skill CRUD/list endpoints. Default-off chart-wide (prod-safe); dev turns it on.
+  SKILLS_DB_ENABLED: {{ .Values.agent.skillsDbEnabled | default "false" | quote }}
+  # Emergency operator-only withdrawal of the immutable App Guide + reader.
+  # Negative/default-off by design; provisioned agent pods inherit this value
+  # via envFrom and expose operator_break_glass in persistent-agent health.
+  APP_GUIDE_BREAK_GLASS_DISABLED: {{ .Values.agent.appGuideBreakGlassDisabled | default "false" | quote }}
+  # Temporary operator-owned dark-launch gate for the authenticated M2
+  # product-capability endpoint. It is deliberately not a user preference.
+  PRODUCT_CAPABILITIES_ENDPOINT_ENABLED: {{ .Values.agent.productCapabilitiesEndpointEnabled | default "false" | quote }}
+  # Separate default-off canary for the persistent-session capability tool.
+  # Agent pods inherit it through envFrom; it does not enable the endpoint.
+  PRODUCT_CAPABILITIES_TOOL_ENABLED: {{ .Values.agent.productCapabilitiesToolEnabled | default "false" | quote }}
+  # User-added MCP servers. stdio is separately gated because it runs
+  # third-party commands inside dynamically provisioned agent pods.
+  MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}
+  MCP_STDIO_ENABLED: {{ .Values.agent.mcpStdioEnabled | default "false" | quote }}
+  # Compatibility gate for omitted datasource_ids on root REST/session work.
+  DATASOURCE_DEFAULTS_ON_OMISSION: {{ .Values.agent.datasourceDefaultsOnOmission | default "false" | quote }}
+  # Capability-advertisement gate for datasource project scope + auto-attach.
+  DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED: {{ .Values.agent.datasourceScopeAutoAttachV1Enabled | default "false" | quote }}
+  # Protected cloud mode: RO-reader provisioning + capture overlay. Read by the
+  # orchestrator's RO engage gate + reader reconciler. Default-off (prod-safe).
+  PROTECTED_CLOUD_MODE_ENABLED: {{ .Values.agent.protectedCloudModeEnabled | default "false" | quote }}
+  # Exact-owner lifecycle CAS. Migration 0185 uses a drained maintenance
+  # cutover, so every post-cutover pinned runtime must carry this identity.
+  REQUIRE_PINNED_STATUS_IDENTITY: {{ .Values.agent.requirePinnedStatusIdentity | default "true" | quote }}
+  # Dynamic Canvas workspace-port live preview master gate. The orchestrator
+  # derives the positive attach capability and rechecks every mutation; agents
+  # never infer support from this environment value. Provisioned agents inherit
+  # this shared ConfigMap, while the public-origin gateway uses its dedicated
+  # allowlisted ConfigMap and separate database credential Secret. The
+  # operator-owned edge and verified deployment attestations remain required.
+  CANVAS_LIVE_PREVIEW_ENABLED: {{ ternary "true" "false" .Values.canvas.livePreview.enabled | quote }}
+  CANVAS_LIVE_PREVIEW_DENIED_PORTS: {{ join "," .Values.canvas.livePreview.deniedPorts | quote }}
+  # Workspace-Chromium screencast/input relay. Dark by default.
+  CANVAS_SHARED_BROWSER_ENABLED: {{ ternary "true" "false" .Values.canvas.sharedBrowser.enabled | quote }}
+  # Browser-facing viewer gate and isolation attestations. These stay present
+  # but disabled/empty in ordinary installs so both the API capability and the
+  # separate gateway fail closed.
+  CANVAS_VIEWER_ENABLED: {{ ternary "true" "false" .Values.canvas.livePreview.viewer.enabled | quote }}
+  CANVAS_VIEWER_DEPLOYMENT_PROFILE: {{ .Values.canvas.livePreview.viewer.deploymentProfile | quote }}
+  CANVAS_VIEWER_COOKIE_MODE: {{ .Values.canvas.livePreview.viewer.cookieMode | quote }}
+  CANVAS_VIEWER_DOMAIN: {{ .Values.canvas.livePreview.viewer.domain | quote }}
+  CANVAS_VIEWER_HOST_SUFFIX: {{ .Values.canvas.livePreview.viewer.hostSuffix | quote }}
+  CANVAS_VIEWER_COCKPIT_ORIGINS: {{ join "," .Values.canvas.livePreview.viewer.cockpitOrigins | quote }}
+  CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED: {{ ternary "true" "false" .Values.canvas.livePreview.viewer.pslBoundaryVerified | quote }}
+  CANVAS_VIEWER_SESSION_TTL_SECONDS: {{ .Values.canvas.livePreview.viewer.sessionTtlSeconds | int | quote }}
+  CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS: {{ .Values.canvas.livePreview.viewer.bootstrapTtlSeconds | int | quote }}
+  CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS: {{ .Values.canvas.livePreview.viewer.attachmentTtlSeconds | int | quote }}
+  CANVAS_VIEWER_REVALIDATE_SECONDS: {{ .Values.canvas.livePreview.viewer.revalidateSeconds | int | quote }}
+  CANVAS_VIEWER_MAX_CONNECTIONS: {{ .Values.canvas.livePreview.viewer.limits.maxConnections | int | quote }}
+  CANVAS_VIEWER_MAX_HTTP_PER_SESSION: {{ .Values.canvas.livePreview.viewer.limits.maxHttpPerSession | int | quote }}
+  CANVAS_VIEWER_MAX_HEADER_BYTES: {{ .Values.canvas.livePreview.viewer.limits.maxHeaderBytes | int | quote }}
+  CANVAS_VIEWER_MAX_HEADER_FIELDS: {{ .Values.canvas.livePreview.viewer.limits.maxHeaderFields | int | quote }}
+  CANVAS_VIEWER_MAX_QUERY_BYTES: {{ .Values.canvas.livePreview.viewer.limits.maxQueryBytes | int | quote }}
+  CANVAS_VIEWER_MAX_QUERY_FIELDS: {{ .Values.canvas.livePreview.viewer.limits.maxQueryFields | int | quote }}
+  CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES: {{ .Values.canvas.livePreview.viewer.limits.maxRequestBodyBytes | int | quote }}
+  CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES: {{ .Values.canvas.livePreview.viewer.limits.maxResponseBodyBytes | int | quote }}
+  CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS: {{ .Values.canvas.livePreview.viewer.limits.connectTimeoutSeconds | int | quote }}
+  CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS: {{ .Values.canvas.livePreview.viewer.limits.idleTimeoutSeconds | int | quote }}
+  CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS: {{ .Values.canvas.livePreview.viewer.limits.exchangeTimeoutSeconds | int | quote }}
+  # Read-only Office Canvas / WOPI host. Values stay present but disabled or
+  # empty in ordinary installs so no capability is advertised accidentally.
+  COLLABORA_ENABLED: {{ ternary "true" "false" .Values.collabora.enabled | quote }}
+  COLLABORA_INTERNAL_URL: {{ include "srw.collaboraInternalUrl" . | quote }}
+  COLLABORA_PUBLIC_URL: {{ .Values.collabora.publicUrl | default "" | quote }}
+  COLLABORA_WOPI_BASE_URL: {{ include "srw.orchestratorInternalUrl" . | quote }}
+  COLLABORA_COCKPIT_ORIGIN: {{ include "srw.cockpitUrl" . | quote }}
+  COLLABORA_TOKEN_TTL_SECONDS: {{ .Values.collabora.tokenTtlSeconds | int | quote }}
+  COLLABORA_DISCOVERY_CACHE_TTL_SECONDS: {{ .Values.collabora.discoveryCacheTtlSeconds | int | quote }}
+  COLLABORA_DISCOVERY_TIMEOUT_SECONDS: {{ .Values.collabora.discoveryTimeoutSeconds | quote }}
+  CANVAS_MAX_OFFICE_BYTES: {{ .Values.collabora.maxOfficeBytes | int | quote }}
+  # Effective context ceiling for models routed via the system codex proxy
+  # (CLIProxyAPI / ChatGPT-OAuth backend), which caps context far below the
+  # models' true API windows and rejects larger inputs with `context_too_large`.
+  # Read by src/core/model_registry.py (_cap_context_window) at dispatch. Set 0 to
+  # disable the day OpenAI ships 1M-for-Codex. New sessions only (agents read env
+  # at pod start). See knowledge-base/knowledge/issues/codex_proxy_context_window_cap.md.
+  CODEX_CONTEXT_WINDOW_CAP: {{ .Values.agent.codexContextWindowCap | default 400000 | quote }}
 
   # OIDC / SSO — works with internal Keycloak or external OIDC provider
   KEYCLOAK_URL: {{ include "srw.keycloakInternalUrl" . | quote }}
@@ -65,7 +522,7 @@ data:
   {{- end }}
 
   # Cookie BFF — orchestrator-issued sessions for the cockpit.
-  # See docs/features/auth_bff_and_api_tokens.md.
+  # See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
   # When sameOriginApi=true, the BFF redirect lives on the cockpit origin
   # (path-routed to the orchestrator) so the OIDC callback and the cockpit
   # share an origin and the session cookie is first-party.
@@ -83,8 +540,10 @@ data:
   SRW_SESSION_ABSOLUTE_TIMEOUT_S: {{ .Values.auth.bff.sessionAbsoluteTimeoutSeconds | default 2592000 | int | quote }}
   SRW_ACCESS_TOKEN_REFRESH_SKEW_S: {{ .Values.auth.bff.accessTokenRefreshSkewSeconds | default 60 | int | quote }}
 
-  # CORS (orchestrator reads this for additional allowed origins)
-  CORS_ORIGINS: {{ include "srw.cockpitUrl" . | quote }}
+  # CORS (orchestrator reads this comma-separated list for allowed origins).
+  # Canonical cockpit URL first, then any ingress.cors.additionalOrigins (e.g.
+  # a legacy hostname kept as an alias during a domain migration).
+  CORS_ORIGINS: {{ concat (list (include "srw.cockpitUrl" .)) (.Values.ingress.cors.additionalOrigins | default list) | join "," | quote }}
 
   # Cockpit external URL (for deep links in emails/notifications)
   COCKPIT_EXTERNAL_URL: {{ include "srw.cockpitUrl" . | quote }}
@@ -97,22 +556,67 @@ data:
   #   - default_llm_models → admin-pinned per-capability defaults
   # Removed in chunk 7 of models_yaml_removal: VISION_MODEL, EMBEDDING_MODEL,
   # EMBEDDING_BASE_URL, CODEX_BASE_URL, BUILDER_LLM_PROVIDER. See
-  # docs/features/models_yaml_removal.md.
+  # knowledge-base/knowledge/features/models_yaml_removal.md.
   KEY_COOLDOWN_SECONDS: {{ .Values.llm.keyCooldownSeconds | quote }}
 
-  # Citation Engine — embedding lives outside the catalog table for now
-  # (separate code path; not gated by readiness). Stays env-driven. The
-  # citation DSN is composed from CITATION_POSTGRES_* above + the user/
-  # password from the Secret (no CITATION_DB_URL key needed in Vault).
-  CITATION_EMBEDDING_MODEL: {{ .Values.citation.embeddingModel | quote }}
-  CITATION_EMBEDDING_URL: {{ .Values.citation.embeddingUrl | quote }}
+  # (Citation embeddings now share SRW's EMBEDDING_* service — same 4096-dim
+  # qwen3-embedding-8b model that backs memory/KB — so there is no separate
+  # CITATION_EMBEDDING_* stack. See knowledge-history/done/citation_engine_integration.md.)
 
-  # Codex raw-response diagnostic capture
-  DEBUG_CODEX_RAW_RESPONSE: {{ "0" | quote }}
-  CODEX_RAW_DUMP_DIR: {{ "/app/logs/codex-raw" | quote }}
+  # Codex raw-response diagnostic capture. Agent pods inherit this via envFrom,
+  # so flipping llm.debugCodexRawResponse in values(-local).yaml enables the
+  # /v1/responses usage-block dump on the next freshly-provisioned agent pod.
+  DEBUG_CODEX_RAW_RESPONSE: {{ .Values.llm.debugCodexRawResponse | default "0" | quote }}
+  CODEX_RAW_DUMP_DIR: {{ .Values.llm.codexRawDumpDir | default "/app/logs/codex-raw" | quote }}
 
   # Orchestrator settings
   AUTO_ASSIGN_ENABLED: {{ .Values.orchestrator.autoAssignEnabled | quote }}
+  # Infrastructure metering gates and bounded Slice 1 collection settings.
+  INFRASTRUCTURE_METERING_V2_READS_ENABLED: {{ .Values.infrastructureMetering.v2ReadsEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED: {{ .Values.infrastructureMetering.sourceAwareReadsEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_COLLECTOR_ENABLED: {{ .Values.infrastructureMetering.collectorEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_SHADOW_ENABLED: {{ .Values.infrastructureMetering.shadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_CUTOVER_ENABLED: {{ .Values.infrastructureMetering.cutoverEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.publicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.pvcInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.pvInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED: {{ .Values.infrastructureMetering.pvcShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED: {{ .Values.infrastructureMetering.pvShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.pvcPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.pvPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED: {{ .Values.infrastructureMetering.idePodShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED: {{ .Values.infrastructureMetering.agentPodShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.idePodPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_AGENT_POD_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.agentPodPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.vmInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED: {{ .Values.infrastructureMetering.vmShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.vmPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.vmPvcInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.vmPvInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED: {{ .Values.infrastructureMetering.vmPvcShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED: {{ .Values.infrastructureMetering.vmPvShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PVC_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.vmPvcPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PV_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.vmPvPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED: {{ .Values.infrastructureMetering.vmPvClusterWideRbacAcknowledged | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID: {{ $vmMeteringStableClusterId | quote }}
+  INFRASTRUCTURE_METERING_VM_NAMESPACE: {{ $vmMeteringNamespace | quote }}
+  INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION: {{ .Values.infrastructureMetering.volumeIdentityKeyVersion | default "" | quote }}
+  INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON: {{ .Values.infrastructureMetering.volumeResourceMappings | default list | toJson | quote }}
+  INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID: {{ .Values.infrastructureMetering.stableClusterId | default "" | quote }}
+  INFRASTRUCTURE_METERING_DEPLOYMENT_MODE: {{ .Values.infrastructureMetering.deploymentMode | default "dedicated" | quote }}
+  INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST: {{ concat (list .Release.Namespace) (.Values.infrastructureMetering.namespaceAllowlist | default list) | uniq | join "," | quote }}
+  INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS: {{ .Values.infrastructureMetering.relistIntervalSeconds | default 300 | quote }}
+  INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS: {{ .Values.infrastructureMetering.staleAfterSeconds | default 900 | quote }}
+  INFRASTRUCTURE_METERING_MAX_COLLECTOR_CLOCK_SKEW_SECONDS: {{ .Values.infrastructureMetering.maxCollectorClockSkewSeconds | default 300 | quote }}
+  INFRASTRUCTURE_METERING_LIST_PAGE_SIZE: {{ .Values.infrastructureMetering.listPageSize | default 500 | quote }}
+  INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY: {{ .Values.infrastructureMetering.scopeConcurrency | default 2 | quote }}
+  INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE: {{ .Values.infrastructureMetering.watchQueueSize | default 10000 | quote }}
+  INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS: {{ .Values.infrastructureMetering.maxSnapshotItems | default 50000 | quote }}
+  INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES: {{ .Values.infrastructureMetering.maxSnapshotBytes | default 67108864 | int64 | quote }}
+  INFRASTRUCTURE_METERING_INGESTION_TICKET_TTL_SECONDS: {{ .Values.infrastructureMetering.ingestionTicketTtlSeconds | default 600 | quote }}
+  INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS: {{ .Values.infrastructureMetering.snapshotItemRetentionDays | default 7 | quote }}
+  INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS: {{ .Values.infrastructureMetering.diagnosticRetentionDays | default 35 | quote }}
+  INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS: {{ .Values.infrastructureMetering.cleanupIntervalSeconds | default 300 | quote }}
 
   # Neo4j — only the Bolt URL is non-secret. Both NEO4J_USERNAME and
   # NEO4J_PASSWORD live in the Secret/Vault, mirroring the POSTGRES_USER /
@@ -127,11 +631,14 @@ data:
   {{- end }}
 
   # S3 / Object Storage
-  S3_ENDPOINT: {{ .Values.s3.endpoint | quote }}
+  S3_ENDPOINT: {{ include "srw.effectiveS3Endpoint" . | quote }}
   S3_BUCKET: {{ .Values.s3.bucket | quote }}
   S3_REGION: {{ .Values.s3.region | quote }}
   SNAPSHOT_MAX_SIZE_GB: {{ .Values.s3.snapshotMaxSizeGb | quote }}
   SNAPSHOT_RETENTION_DAYS: {{ .Values.s3.snapshotRetentionDays | quote }}
+  # Opt-in fail-closed: when "true" the orchestrator refuses to start unless
+  # both object-store seams are configured (default warn-only).
+  OBJECT_STORE_REQUIRED: {{ .Values.s3.required | default false | quote }}
 
   # IDE sessions
   IDE_SESSION_IDLE_TIMEOUT: {{ .Values.ide.sessionIdleTimeout | quote }}
@@ -166,11 +673,36 @@ data:
   NEXTCLOUD_PUBLIC_URL: {{ include "srw.cloudUrl" . | quote }}
   NEXTCLOUD_ADMIN_USER: {{ "admin" | quote }}
   NEXTCLOUD_AGENT_USER: {{ "agent-service" | quote }}
+  {{- if .Values.nextcloud.protectedEffect.enabled }}
+  # Server-enforced bounded lane for the five attempt-scoped authority POSTs.
+  NEXTCLOUD_PROTECTED_EFFECT_URL: {{ printf "http://%s" (include "srw.nextcloudProtectedEffectName" .) | quote }}
+  NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
+  {{- end }}
 
   # Nextcloud / WebDAV datasource (optional)
   DEFAULT_DS_WEBDAV_URL: {{ printf "http://%s/remote.php/dav/files/admin/" (include "srw.serviceName" (dict "context" . "component" "nextcloud")) | quote }}
   DEFAULT_DS_WEBDAV_NAME: {{ "Nextcloud" | quote }}
   DEFAULT_DS_WEBDAV_READ_ONLY: {{ "false" | quote }}
+  {{- end }}
+
+  # Main-cloud workspace data plane. "sync" preserves the legacy eager clone
+  # path; "rclone_mount" asks supported agent runtimes to expose cloud folders
+  # through lazy rclone/FUSE mounts instead.
+  CLOUD_WORKSPACE_DRIVER: {{ .Values.cloud.workspaceDriver | default "rclone_mount" | quote }}
+  CLOUD_RCLONE_ALLOW_CONTAINER: {{ ternary "true" "false" .Values.cloud.rcloneMount.allowContainer | quote }}
+
+  # Virtual workspace tier (no_workspace_agent_mode.md §4/§5) — object store for
+  # `workspace.backend: virtual` agents. Empty type disables the tier (a virtual
+  # job/session then fails fast). For s3, endpoint/region/provider are non-secret
+  # (here); credentials are the Secret keys VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID /
+  # _SECRET_ACCESS_KEY, wired separately on the orchestrator pod.
+  VIRTUAL_WORKSPACE_RCLONE_TYPE: {{ include "srw.effectiveVwRcloneType" . | quote }}
+  VIRTUAL_WORKSPACE_RCLONE_ROOT: {{ include "srw.effectiveVwRcloneRoot" . | quote }}
+  VIRTUAL_WORKSPACE_S3_ENDPOINT: {{ include "srw.effectiveVwEndpoint" . | quote }}
+  VIRTUAL_WORKSPACE_S3_REGION: {{ .Values.virtualWorkspace.s3.region | default "us-east-1" | quote }}
+  VIRTUAL_WORKSPACE_S3_PROVIDER: {{ include "srw.effectiveVwProvider" . | quote }}
+  {{- if .Values.cloud.nextcloudRcloneUserHomeUsername }}
+  NEXTCLOUD_RCLONE_USER_HOME_USERNAME: {{ .Values.cloud.nextcloudRcloneUserHomeUsername | quote }}
   {{- end }}
 
   # Cloud backend — opencloud (bundled), nextcloud (bundled), external, or unset
@@ -180,6 +712,11 @@ data:
   OPENCLOUD_PUBLIC_URL: {{ include "srw.cloudUrl" . | quote }}
   OPENCLOUD_KEYCLOAK_ISSUER: {{ printf "%s/realms/%s" (include "srw.keycloakInternalUrl" .) .Values.keycloak.realm | quote }}
   OPENCLOUD_KEYCLOAK_CLIENT_ID: {{ "opencloud-orchestrator" | quote }}
+  {{- if .Values.opencloud.mountInsecureTls }}
+  # Local-dev only: rclone mounts skip TLS verification on the tus
+  # data-gateway hop (mkcert edge cert). Never enable on real deployments.
+  OPENCLOUD_MOUNT_INSECURE_TLS: "true"
+  {{- end }}
   {{- else if .Values.nextcloud.enabled }}
   MAIN_CLOUD_BACKEND: {{ "nextcloud" | quote }}
   {{- else if .Values.cloud.externalBackend }}
@@ -202,17 +739,30 @@ data:
   # NATS — when nats.internal=true, points at the in-cluster Service;
   # otherwise the user-supplied .Values.nats.url (empty disables VM lifecycle).
   NATS_URL: {{ include "srw.natsUrl" . | quote }}
+  VM_MODE: {{ include "srw.vmMode" . | quote }}
+  {{- if eq (include "srw.vmMode" .) "external" }}
   # Per-orchestrator id used to scope vm.lifecycle.* NATS subjects. Must match
   # the paired VM controller chart's orchestratorId.
   ORCHESTRATOR_ID: {{ include "srw.orchestratorId" . | quote }}
+  {{- end }}
 
-  # VM Controller (HTTP transport, same-cluster mode). Empty when
-  # vmController.enabled=false or transport=nats — orchestrator falls back
-  # to NATS / direct K8s in those cases.
+  {{- if include "srw.vmSameCluster" . }}
+  # VM Controller (HTTP transport, same-cluster mode).
   VM_CONTROLLER_URL: {{ include "srw.vmControllerUrl" . | quote }}
-  VM_NAMESPACE: {{ include "srw.vmControllerNamespace" . | quote }}
+  VM_NAMESPACE: {{ .Release.Namespace | quote }}
+  {{- end }}
 
-  # Headscale (mesh VPN coordination server)
+  # -- Persistent VM rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
+  # MUST mirror the VM controller's own vmController.persistentRootdisk.enabled
+  # (which may live in the separate helm-vm-cluster chart). The orchestrator
+  # reads this to decide whether a VM's files survive a teardown — notably
+  # whether VM session suspend may proceed without a snapshot. Enable the
+  # CONTROLLER first: turning it on here against a controller that still
+  # cascade-deletes disks would suspend sessions into nothing.
+  VM_PERSISTENT_ROOTDISK: {{ .Values.vmController.persistentRootdisk.enabled | default false | quote }}
+
+  {{- if eq (include "srw.vmMode" .) "external" }}
+  # Headscale and agent mesh are external-VM topology settings.
   HEADSCALE_URL: {{ include "srw.headscaleUrl" . | quote }}
 
   # Agent tailscale sidecar gate (read by AgentProvisioner). When "false",
@@ -220,10 +770,13 @@ data:
   AGENT_TAILSCALE_ENABLED: {{ .Values.agent.tailscale.enabled | quote }}
   # Sustained-dark window (seconds) for the agent tailscale sidecar liveness probe.
   AGENT_TAILSCALE_DARK_TIMEOUT_SECONDS: {{ .Values.agent.tailscale.darkTimeoutSeconds | default 600 | quote }}
+  {{- end }}
 
   # Workspace containers (per-job sandboxed execution environments)
-  WORKSPACE_IMAGE: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
+  WORKSPACE_IMAGE: {{ include "srw.imageRef" (dict "image" .Values.image.workspace) | quote }}
   WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
+  WORKSPACE_FUSE_ENABLED: {{ ternary "true" "false" .Values.workspace.fuse.enabled | quote }}
+  WORKSPACE_FUSE_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.fuse.privileged | quote }}
 
   # PR 3 — one-time seed knob for the homelab operator. Empty in SaaS deployments.
   # When set, orchestrator init flips this user's default project from
@@ -231,8 +784,9 @@ data:
   OPERATOR_HOME_ALLOWED_EMAIL: {{ .Values.workspace.networkPolicy.operatorHomeAllowedEmail | default "" | quote }}
 
   # Agent pods (on-demand via AgentProvisioner)
-  AGENT_IMAGE: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
-  PERSISTENT_AGENT_IMAGE: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
+  AGENT_IMAGE: {{ include "srw.imageRef" (dict "image" .Values.image.agent) | quote }}
+  PERSISTENT_AGENT_IMAGE: {{ include "srw.imageRef" (dict "image" .Values.image.agent) | quote }}
+  PERSISTENT_AGENT_IMAGE_PULL_POLICY: {{ .Values.image.agent.pullPolicy | quote }}
 
   # Agent pool sizing (AgentProvisioner)
   MAX_AGENTS: {{ .Values.agent.pool.maxAgents | quote }}
@@ -243,6 +797,9 @@ data:
 
   # Logging
   LOG_LEVEL: {{ .Values.logLevel | quote }}
+  # JSON structured logs for the aggregation pipeline (Alloy -> Loki); "text"
+  # for human-readable output. See knowledge-base/knowledge/features/centralized_logging.md.
+  LOG_FORMAT: {{ .Values.logFormat | default "text" | quote }}
 
   # License acceptance (enforced at runtime by orchestrator)
   LICENSE_TERMS_ACCEPTED: {{ .Values.license.acceptTerms | quote }}

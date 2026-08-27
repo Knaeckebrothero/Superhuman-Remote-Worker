@@ -83,6 +83,55 @@ ConfigMap name (used by all deployments that read from the shared configmap).
 {{- end }}
 
 {{/*
+First-party image reference. A real digest pin takes precedence over the
+display/update tag; an empty digest preserves the existing repository:tag
+behavior.
+Usage: {{ include "srw.imageRef" (dict "image" .Values.image.agent) }}
+*/}}
+{{- define "srw.imageRef" -}}
+{{- $digest := default "" .image.digest -}}
+{{- if $digest -}}
+{{- printf "%s@%s" .image.repository $digest -}}
+{{- else -}}
+{{- printf "%s:%s" .image.repository .image.tag -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Bounded public deployment provenance consumed by the orchestrator and
+dynamically provisioned agents. The image digest comes only from the same
+value that srw.imageRef uses, so a tag can never be reported as an artifact
+digest. MCP is omitted when its deployment is disabled.
+*/}}
+{{- define "srw.deploymentProvenanceJson" -}}
+{{- $root := . -}}
+{{- $components := dict -}}
+{{- range $name := list "orchestrator" "agent" "cockpit" "workspace" -}}
+  {{- $image := index $root.Values.image $name -}}
+  {{- $declaration := index $root.Values.provenance.components $name -}}
+  {{- $_ := set $components $name (dict
+      "source_revision" (default "" $declaration.sourceRevision)
+      "artifact_digest" (default "" $image.digest)
+      "release_version" (default "" $declaration.releaseVersion)
+    ) -}}
+{{- end -}}
+{{- if $root.Values.mcp.enabled -}}
+  {{- $image := $root.Values.image.mcp -}}
+  {{- $declaration := $root.Values.provenance.components.mcp -}}
+  {{- $_ := set $components "mcp" (dict
+      "source_revision" (default "" $declaration.sourceRevision)
+      "artifact_digest" (default "" $image.digest)
+      "release_version" (default "" $declaration.releaseVersion)
+    ) -}}
+{{- end -}}
+{{- dict
+    "source_url" (default "" $root.Values.provenance.sourceUrl)
+    "documentation_url" (default "" $root.Values.provenance.documentationUrl)
+    "components" $components
+  | toJson -}}
+{{- end }}
+
+{{/*
 VM controller — resource names + URLs. The controller can run in the same
 namespace as the orchestrator (vmController.namespace = .Release.Namespace)
 or in a dedicated namespace (the typical case). When enabled, the controller
@@ -98,7 +147,31 @@ exposes an HTTP API on Service `srw.vmControllerServiceName` port
 {{- end }}
 
 {{- define "srw.vmControllerNamespace" -}}
-{{- default .Release.Namespace .Values.vmController.namespace }}
+{{- .Release.Namespace }}
+{{- end }}
+
+{{/* Resolve the one-release vmController.enabled alias. */}}
+{{- define "srw.vmMode" -}}
+{{- $mode := .Values.vm.mode | default "off" -}}
+{{- if and .Values.vmController.enabled (eq $mode "off") -}}
+same-cluster
+{{- else -}}
+{{- $mode -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.vmSameCluster" -}}
+{{- if eq (include "srw.vmMode" .) "same-cluster" -}}true{{- end -}}
+{{- end }}
+
+{{- define "srw.orchestratorClusterUrl" -}}
+{{- printf "http://%s-orchestrator.%s.svc.cluster.local:8085" (include "srw.fullname" .) .Release.Namespace -}}
+{{- end }}
+
+{{- define "srw.vmLifecycleAuthSecretName" -}}
+{{- $legacy := .Values.infrastructureMetering.vmLifecycleAuthSecretName | default "" -}}
+{{- $name := .Values.vm.lifecycleAuthSecretName | default $legacy -}}
+{{- $name -}}
 {{- end }}
 
 {{/*
@@ -109,7 +182,7 @@ exported so the orchestrator's HTTP transport is available even though
 NATS takes priority.
 */}}
 {{- define "srw.vmControllerUrl" -}}
-{{- if and .Values.vmController.enabled (ne .Values.vmController.transport "nats") }}
+{{- if eq (include "srw.vmMode" .) "same-cluster" }}
 {{- printf "http://%s.%s.svc.cluster.local:%d"
     (include "srw.vmControllerServiceName" .)
     (include "srw.vmControllerNamespace" .)
@@ -141,6 +214,86 @@ Usage: {{ include "srw.serviceName" (dict "context" . "component" "postgres") }}
 */}}
 {{- define "srw.serviceName" -}}
 {{- printf "%s-%s" (include "srw.fullname" .context) .component }}
+{{- end }}
+
+{{/*
+Canonical, non-secret identity for the bundled Nextcloud protected-effect
+lane. The bundle digests make a verifier/runtime change a new configuration
+authority even when every timing knob remains unchanged.
+*/}}
+{{- define "srw.nextcloudProtectedEffectConfigJson" -}}
+{{- $effect := .Values.nextcloud.protectedEffect -}}
+{{- dict
+      "version" 1
+      "queue_bound_seconds" (int $effect.queueBoundSeconds)
+      "handler_bound_seconds" (int $effect.handlerBoundSeconds)
+      "clock_skew_bound_seconds" (int $effect.clockSkewBoundSeconds)
+      "safety_margin_seconds" (int $effect.safetyMarginSeconds)
+      "capability_max_age_seconds" (int $effect.capabilityMaxAgeSeconds)
+      "max_children" (int $effect.maxChildren)
+      "max_body_bytes" 65536
+      "common_sha256" (.Files.Get "files/nextcloud-protected-effect/common.php" | sha256sum)
+      "prepend_sha256" (.Files.Get "files/nextcloud-protected-effect/prepend.php" | sha256sum)
+      "capability_sha256" (.Files.Get "files/nextcloud-protected-effect/capability.php" | sha256sum)
+      "fpm_launcher_sha256" (.Files.Get "files/nextcloud-protected-effect/start-fpm.sh" | sha256sum)
+      "nginx_sha256" (.Files.Get "files/nextcloud-protected-effect/nginx.conf" | sha256sum)
+    | toJson -}}
+{{- end }}
+
+{{- define "srw.nextcloudProtectedEffectConfigSha256" -}}
+{{- include "srw.nextcloudProtectedEffectConfigJson" . | sha256sum -}}
+{{- end }}
+
+{{- define "srw.nextcloudProtectedEffectName" -}}
+{{- $base := include "srw.fullname" . | trunc 46 | trimSuffix "-" -}}
+{{- printf "%s-protected-effect" $base -}}
+{{- end }}
+
+{{- define "srw.nextcloudProtectedEffectSecretName" -}}
+{{- if .Values.nextcloud.protectedEffect.hmacSecretName -}}
+{{- .Values.nextcloud.protectedEffect.hmacSecretName -}}
+{{- else -}}
+{{- include "srw.nextcloudProtectedEffectName" . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.nextcloudProtectedEffectValidate" -}}
+{{- $effect := .Values.nextcloud.protectedEffect -}}
+{{- $protectedCloud := eq (lower (toString .Values.agent.protectedCloudModeEnabled)) "true" -}}
+{{- if and $protectedCloud .Values.nextcloud.enabled (not $effect.enabled) -}}
+  {{- fail "agent.protectedCloudModeEnabled=true with bundled Nextcloud requires nextcloud.protectedEffect.enabled=true" -}}
+{{- end -}}
+{{- if and $protectedCloud (eq (default "" .Values.cloud.externalBackend) "nextcloud") -}}
+  {{- fail "agent.protectedCloudModeEnabled=true is not supported for external Nextcloud without an attested server-enforced protected-effect lane" -}}
+{{- end -}}
+{{- if $effect.enabled -}}
+  {{- if not (and .Values.nextcloud.enabled .Values.nextcloud.internal) -}}
+    {{- fail "nextcloud.protectedEffect.enabled requires bundled nextcloud.enabled=true and nextcloud.internal=true; external Nextcloud is ineligible without an equivalent server-enforced effect lane" -}}
+  {{- end -}}
+  {{- if and .Values.externalSecrets.enabled (not $effect.hmacSecretName) (not $effect.hmacVaultPath) -}}
+    {{- fail "nextcloud.protectedEffect.enabled with External Secrets requires nextcloud.protectedEffect.hmacVaultPath (a dedicated path that is never imported into agent pods) or hmacSecretName" -}}
+  {{- end -}}
+  {{- if and (not .Values.externalSecrets.enabled) (not .Values.secrets.create) (not $effect.hmacSecretName) -}}
+    {{- fail "nextcloud.protectedEffect.enabled requires a dedicated hmacSecretName unless secrets.create or externalSecrets is managing the protected-effect Secret" -}}
+  {{- end -}}
+  {{- $timings := dict
+        "queueBoundSeconds" $effect.queueBoundSeconds
+        "handlerBoundSeconds" $effect.handlerBoundSeconds
+        "clockSkewBoundSeconds" $effect.clockSkewBoundSeconds
+        "safetyMarginSeconds" $effect.safetyMarginSeconds
+        "capabilityMaxAgeSeconds" $effect.capabilityMaxAgeSeconds -}}
+  {{- range $name, $value := $timings -}}
+    {{- if or (le (int $value) 0) (gt (int $value) 86400) -}}
+      {{- fail (printf "nextcloud.protectedEffect.%s must be an integer between 1 and 86400" $name) -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if gt (int $effect.handlerBoundSeconds) 60 -}}
+    {{- fail "nextcloud.protectedEffect.handlerBoundSeconds must not exceed the protected Nginx lane's 65-second read ceiling" -}}
+  {{- end -}}
+  {{- if or (le (int $effect.maxChildren) 0) (gt (int $effect.maxChildren) 64) -}}
+    {{- fail "nextcloud.protectedEffect.maxChildren must be an integer between 1 and 64" -}}
+  {{- end -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -212,6 +365,27 @@ the in-cluster CA bundle doesn't trust.
 {{- end }}
 
 {{/*
+Replicate the aliased official subchart's fullname helper so the orchestrator
+can fetch discovery over the exact generated ClusterIP Service name.
+*/}}
+{{- define "srw.collaboraServiceName" -}}
+{{- if .Values.collabora.fullnameOverride -}}
+{{- .Values.collabora.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default "collabora" .Values.collabora.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.collaboraInternalUrl" -}}
+{{- printf "http://%s:9980" (include "srw.collaboraServiceName" .) -}}
+{{- end }}
+
+{{/*
 Internal cluster URL for Keycloak — used by orchestrator for back-channel JWKS fetches.
 */}}
 {{- define "srw.keycloakInternalUrl" -}}
@@ -229,11 +403,79 @@ JDBC URL the bundled Keycloak uses to talk to its own Postgres. Resolves to the
 in-cluster `srw-keycloakdb` Service when databases.keycloak.internal is true,
 or to the operator-supplied externalUrl otherwise (e.g. managed Postgres).
 */}}
+{{/*
+Host of the Keycloak database, for anything that needs a hostname rather than
+a JDBC URL -- notably the wait-for-db init container, which polls it with nc.
+Internal only; in external mode the URL is opaque and there is nothing to wait
+for that the chart deployed.
+*/}}
+{{- define "srw.keycloakDbHost" -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.keycloak)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-keycloakdb%s" (include "srw.fullname" .) $suffix -}}
+{{- end }}
+
 {{- define "srw.keycloakDbJdbcUrl" -}}
 {{- if .Values.databases.keycloak.internal -}}
-jdbc:postgresql://{{ include "srw.fullname" . }}-keycloakdb:5432/keycloak
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.keycloak)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+jdbc:postgresql://{{ include "srw.fullname" . }}-keycloakdb{{ $suffix }}:5432/keycloak
 {{- else -}}
 {{- required "databases.keycloak.externalUrl is required when databases.keycloak.internal is false" .Values.databases.keycloak.externalUrl -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Connection parts the bundled Gitea uses for its metadata database when
+gitea.database.type is "postgres". Resolves to the in-cluster `srw-giteadb`
+Service when databases.gitea.internal is true, or to the operator-supplied
+external server otherwise. Credentials never appear here — Gitea reads
+GITEA__database__USER / __PASSWD from the Secret.
+*/}}
+{{- define "srw.giteaDbHost" -}}
+{{- if .Values.databases.gitea.internal -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.gitea)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-giteadb%s" (include "srw.fullname" .) $suffix -}}
+{{- else -}}
+{{- required "databases.gitea.externalHost is required when databases.gitea.internal is false" .Values.databases.gitea.externalHost -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.giteaDbPort" -}}
+{{- if .Values.databases.gitea.internal -}}
+5432
+{{- else -}}
+{{- .Values.databases.gitea.externalPort | default 5432 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.giteaDbName" -}}
+{{- if .Values.databases.gitea.internal -}}
+gitea
+{{- else -}}
+{{- .Values.databases.gitea.externalDb | default "gitea" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+True when the bundled Gitea should use Postgres for its metadata DB. Any value
+other than "sqlite3" is rejected loudly rather than silently falling back —
+a typo here would otherwise point a populated Gitea at a fresh database.
+*/}}
+{{- define "srw.giteaUsesPostgres" -}}
+{{- $type := .Values.gitea.database.type | default "postgres" -}}
+{{- if eq $type "postgres" -}}
+true
+{{- else if eq $type "sqlite3" -}}
+{{- else -}}
+{{- fail (printf "gitea.database.type must be \"postgres\" or \"sqlite3\", got %q" $type) -}}
 {{- end -}}
 {{- end }}
 
@@ -405,10 +647,6 @@ they're consumed only as ingress hosts and as window.env.* deep-links.
 {{- include "srw.host" (dict "context" . "key" "pgadmin" "default" "pgadmin") }}
 {{- end }}
 
-{{- define "srw.mongoHost" -}}
-{{- include "srw.host" (dict "context" . "key" "mongo" "default" "mongo") }}
-{{- end }}
-
 {{- define "srw.dozzleHost" -}}
 {{- include "srw.host" (dict "context" . "key" "dozzle" "default" "dozzle") }}
 {{- end }}
@@ -418,20 +656,30 @@ they're consumed only as ingress hosts and as window.env.* deep-links.
 {{- end }}
 
 {{/*
-Database connection parts — host/port/db for postgres + vector + citation.
+Database connection parts — host/port/db for postgres + vector.
 
 Credentials (user/password) live in the Secret only; the DSN is composed at
 runtime by the application (orchestrator/utils/db_url.py and src/utils/
 db_url.py). That avoids the redundancy + URL-encoding footgun of also
-shipping a DATABASE_URL/VECTOR_DB_URL/CITATION_DB_URL Vault key.
+shipping a DATABASE_URL/VECTOR_DB_URL Vault key.
 
 For external mode, set databases.<which>.externalHost/externalPort/
 externalDb in values; the chart still injects the host/port/db via
 ConfigMap, and only the credentials come from the Secret.
 */}}
+{{/*
+"-rw" ONLY at engine `cnpg`. While `migrating`, the import is still reading
+from the legacy Service and consumers are still writing to it -- repointing
+then would cut over before the data has arrived. External mode ignores the
+engine entirely: that hostname belongs to someone else.
+*/}}
 {{- define "srw.postgresHost" -}}
 {{- if .Values.databases.postgres.internal -}}
-{{- printf "%s-postgres" (include "srw.fullname" .) -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-postgres%s" (include "srw.fullname" .) $suffix -}}
 {{- else -}}
 {{- required "databases.postgres.externalHost is required when internal=false" .Values.databases.postgres.externalHost -}}
 {{- end -}}
@@ -453,9 +701,19 @@ srw
 {{- end -}}
 {{- end }}
 
+{{/*
+"-rw" ONLY at engine `cnpg`. While `migrating`, the import is still reading
+from the legacy Service and consumers are still writing to it -- repointing
+then would cut over before the data has arrived. External mode ignores the
+engine entirely: that hostname belongs to someone else.
+*/}}
 {{- define "srw.vectorPostgresHost" -}}
 {{- if .Values.databases.vector.internal -}}
-{{- printf "%s-pgvector" (include "srw.fullname" .) -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.vector)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-pgvector%s" (include "srw.fullname" .) $suffix -}}
 {{- else -}}
 {{- required "databases.vector.externalHost is required when internal=false" .Values.databases.vector.externalHost -}}
 {{- end -}}
@@ -478,14 +736,37 @@ srw_vector
 {{- end }}
 
 {{/*
-MongoDB URL — supports external mode (no auth in current setup, so URL is non-secret).
+"-rw" ONLY at engine `cnpg`. While `migrating`, the import is still reading
+from the legacy Service and consumers are still writing to it -- repointing
+then would cut over before the data has arrived. External mode ignores the
+engine entirely: that hostname belongs to someone else.
 */}}
-{{- define "srw.mongodbUrl" -}}
-{{- if .Values.databases.mongodb.internal }}
-{{- printf "mongodb://%s-mongodb:27017/srw_logs" (include "srw.fullname" .) }}
-{{- else }}
-{{- required "databases.mongodb.externalUrl is required when databases.mongodb.internal=false" .Values.databases.mongodb.externalUrl }}
+{{- define "srw.auditPostgresHost" -}}
+{{- if .Values.databases.audit.internal -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.audit)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-auditdb%s" (include "srw.fullname" .) $suffix -}}
+{{- else -}}
+{{- required "databases.audit.externalHost is required when internal=false" .Values.databases.audit.externalHost -}}
+{{- end -}}
 {{- end }}
+
+{{- define "srw.auditPostgresPort" -}}
+{{- if .Values.databases.audit.internal -}}
+5432
+{{- else -}}
+{{- .Values.databases.audit.externalPort | default 5432 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.auditPostgresDb" -}}
+{{- if .Values.databases.audit.internal -}}
+srw_audit
+{{- else -}}
+{{- .Values.databases.audit.externalDb | default "srw_audit" -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -497,4 +778,495 @@ Neo4j Bolt URL — internal cluster service or external URL.
 {{- else }}
 {{- required "databases.neo4j.externalUrl is required when databases.neo4j.internal=false" .Values.databases.neo4j.externalUrl }}
 {{- end }}
+{{- end }}
+
+{{/*
+Whether the bundled single-node object store runs.
+
+Tri-state on purpose. `true` and `false` are explicit operator decisions and
+always win. The default is null = AUTO: bring your own store by setting
+`s3.endpoint`, or say nothing and get the bundled one.
+
+Auto exists because every consumer of the object store fails SILENTLY without
+it — canvas durability keeps no copy, workspace snapshots never capture, the
+virtual tier stays unwired. "Operator said nothing" must therefore resolve to a
+working store rather than to a deployment that looks healthy and quietly
+forgets things.
+
+Keyed on `s3.endpoint` alone, not on the virtual-tier endpoint: it is the
+primary "do you already have an object store" signal, and an operator who has
+one can point both consumers at it. This also keeps the rule one comparison
+long, so a reader can predict the outcome without tracing the tier config.
+*/}}
+{{- define "srw.garageEnabled" -}}
+{{- if kindIs "invalid" .Values.garage.enabled -}}
+{{- if not (.Values.s3).endpoint -}}true{{- end -}}
+{{- else if .Values.garage.enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective S3 endpoint for snapshots. External (s3.endpoint) wins; otherwise the
+bundled Garage service when enabled; otherwise empty (snapshots disabled).
+*/}}
+{{- define "srw.effectiveS3Endpoint" -}}
+{{- if .Values.s3.endpoint -}}
+{{- .Values.s3.endpoint -}}
+{{- else if (include "srw.garageEnabled" .) -}}
+{{- printf "http://%s:3900" (include "srw.serviceName" (dict "context" . "component" "garage")) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective virtual-workspace S3 endpoint. External wins; else bundled Garage.
+*/}}
+{{- define "srw.effectiveVwEndpoint" -}}
+{{- if .Values.virtualWorkspace.s3.endpoint -}}
+{{- .Values.virtualWorkspace.s3.endpoint -}}
+{{- else if (include "srw.garageEnabled" .) -}}
+{{- printf "http://%s:3900" (include "srw.serviceName" (dict "context" . "component" "garage")) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective rclone backend type for the virtual tier. Explicit value wins; else
+"s3" when Garage is bundled; else "" (tier disabled).
+*/}}
+{{- define "srw.effectiveVwRcloneType" -}}
+{{- if .Values.virtualWorkspace.rclone.type -}}
+{{- .Values.virtualWorkspace.rclone.type -}}
+{{- else if (include "srw.garageEnabled" .) -}}
+{{- "s3" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective rclone root (bucket) for the virtual tier. Explicit value wins; else
+the bundled Garage workspace bucket.
+*/}}
+{{- define "srw.effectiveVwRcloneRoot" -}}
+{{- if .Values.virtualWorkspace.rclone.root -}}
+{{- .Values.virtualWorkspace.rclone.root -}}
+{{- else if (include "srw.garageEnabled" .) -}}
+{{- .Values.garage.buckets.workspaces -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective rclone S3 provider profile. When auto-wiring to bundled Garage (no
+external vw endpoint), use "Other" (Garage's rclone-compatible profile,
+path-style). Otherwise the configured provider (default "Minio").
+*/}}
+{{- define "srw.effectiveVwProvider" -}}
+{{- if and (include "srw.garageEnabled" .) (not .Values.virtualWorkspace.s3.endpoint) -}}
+{{- "Other" -}}
+{{- else -}}
+{{- .Values.virtualWorkspace.s3.provider | default "Minio" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective Secret name for the Canvas gateway's restricted PostgreSQL login.
+Chart-created and Vault/ESO sources use the stable chart-owned name; an
+operator-precreated Secret keeps its explicit name.
+*/}}
+{{- define "srw.canvasGatewayDatabaseSecretName" -}}
+{{- $credentials := .Values.canvas.livePreview.viewer.database.credentials -}}
+{{- if or $credentials.create (ne (trim $credentials.vaultPath) "") -}}
+{{- printf "%s-canvas-gateway-db" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- $credentials.existingSecret -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Keycloak SMTP port and STARTTLS flag for the realm bootstrap (kcadm).
+
+Both are WHITELISTS, not sanitizers: each emits either a literal drawn from a
+closed set, or the default. Nothing else can reach the rendered output, for
+any value of email.smtp.port / email.smtp.useTls -- nil, bool, int64,
+float64, string, map or slice, which is every Go kind Helm's loaders can
+produce (--set, --set-string, --set-json, a values file, --set key=null).
+
+Why a whitelist: four blacklist remedies shipped here and each one closed the
+case in front of it while opening another. `default` swallowed a real boolean
+false; `toString | default` then forwarded the literal "<nil>"; `kindIs
+"invalid"` let an empty string through verbatim; adding `eq (toString .) ""`
+let a whitespace-only string through. A blacklist is only ever as complete as
+the list of shapes someone thought to try.
+
+Why this is total, argued from structure rather than from a list of cases:
+  - `toString` is total: Sprig falls through to fmt's "%v" for every type,
+    nil included, so the guard always compares a string, never a bare Go
+    value that could error or format surprisingly.
+  - Membership is exact equality against a literal set (starttls), or a fully
+    anchored ASCII-digit match (port). Go's ^ and $ are start/end of TEXT
+    without (?m), so an embedded newline cannot slip past the anchors.
+  - The else-branch is the DEFAULT, not the input: an unrecognised value is
+    dropped, never forwarded.
+The output alphabet is therefore closed -- "true"/"false" for starttls, a
+decimal literal or "1025" for port -- under every input, including shapes
+nobody has tried yet. `trim` and `lower` only widen which inputs map to an
+intended value; they cannot widen that output.
+
+Why the fallback direction matters: Keycloak parses starttls with Java's
+Boolean.parseBoolean, which returns false for anything not literally "true"
+and does no trimming. Forwarding a meaningless value therefore DISABLES
+STARTTLS silently and puts the SMTP password on the wire in cleartext. Only
+true/false -- any case, surrounding whitespace tolerated -- count as the
+operator asking; every other shape means "did not ask", and gets the default.
+
+The closed alphabet also settles a second exposure FOR THESE TWO FIELDS: the
+text is rendered inside a double-quoted shell word in the Keycloak postStart
+hook, so before the whitelist a value containing a double quote was command
+injection, and one containing a newline broke the rendered manifest outright.
+
+Scope that claim to port and starttls only -- it says nothing about the hook.
+The same `$KC update` shell word also interpolates .Values.keycloak.realm and
+.Values.email.smtp.from raw, and those are still injectable today (verified:
+`--set-string 'email.smtp.from=a"; id; echo "'` renders a closing quote and a
+second command). Hardening them is a separate pre-existing item; these two
+helpers are the template for how, not evidence that it has been done.
+
+Two deliberate boundaries:
+  - `--set-string email.smtp.useTls=null` now yields the default instead of
+    the literal it used to forward. Helm's --set-string contract is untouched
+    (the value in .Values is still that 4-character string); the guard simply
+    does not recognise it as a boolean -- and forwarding it meant
+    parseBoolean == false, i.e. STARTTLS off without being asked.
+  - The port guard validates FORM, not policy. Any decimal literal passes,
+    including 0 (a real, explicitly-set value it must not swallow) and values
+    above 65535. Range is Keycloak's to reject, loudly, with the operator's
+    own number in the error; quietly substituting the dev mail-catcher port
+    would be the very bug this task exists to fix.
+*/}}
+{{- define "srw.keycloak.smtpStartTls" -}}
+{{- $canonical := lower (trim (toString .Values.email.smtp.useTls)) -}}
+{{- if has $canonical (list "true" "false") -}}{{ $canonical }}{{- else -}}true{{- end -}}
+{{- end -}}
+
+{{- define "srw.keycloak.smtpPort" -}}
+{{- $canonical := trim (toString .Values.email.smtp.port) -}}
+{{- if regexMatch "^[0-9]+$" $canonical -}}{{ $canonical }}{{- else -}}1025{{- end -}}
+{{- end -}}
+
+{{/*
+Resolved instance count for one database. Explicit `instances` wins; otherwise
+the profile decides. Everything downstream (anti-affinity, PDBs) reads THIS,
+never the profile name — a generated values file may set instances directly.
+Usage: {{ include "srw.dbInstances" (dict "context" . "db" .Values.databases.postgres) }}
+*/}}
+{{- define "srw.dbInstances" -}}
+{{- if .db.instances -}}
+{{- .db.instances -}}
+{{- else if eq .context.Values.databases.profile "ha" -}}
+2
+{{- else -}}
+1
+{{- end -}}
+{{- end }}
+
+{{/*
+Which implementation backs a database. Rejects typos loudly rather than
+silently falling back to the StatefulSet, which would strand a migrated
+Cluster's data behind an empty one.
+Usage: {{ include "srw.dbEngine" (dict "context" . "db" .Values.databases.postgres) }}
+*/}}
+{{- define "srw.dbEngine" -}}
+{{- $engine := .db.engine | default "statefulset" -}}
+{{- if not (has $engine (list "statefulset" "migrating" "cnpg")) -}}
+{{- fail (printf "databases.<name>.engine must be statefulset, migrating or cnpg, got %q" $engine) -}}
+{{- end -}}
+{{- $engine -}}
+{{- end }}
+
+{{/*
+Whether a bundled database is deployed by this chart at all, independent of
+which engine backs it. Gitea's and Keycloak's databases carry extra
+prerequisites (their own service must be bundled too), and those conditions
+are needed by four templates -- the StatefulSet, the Cluster, the credential
+Secret and the PDB. Duplicating them is how they drift.
+Usage: {{ include "srw.dbPrereqs" (dict "context" . "key" "postgres") }}
+*/}}
+{{- define "srw.dbPrereqs" -}}
+{{- $ctx := .context -}}
+{{- $db := index $ctx.Values.databases .key -}}
+{{- $ok := and $db.enabled $db.internal -}}
+{{- if eq .key "gitea" -}}
+{{- $ok = and $ok $ctx.Values.gitea.enabled $ctx.Values.gitea.internal (include "srw.giteaUsesPostgres" $ctx) -}}
+{{- else if eq .key "keycloak" -}}
+{{- $ok = and $ok $ctx.Values.keycloak.enabled $ctx.Values.keycloak.internal -}}
+{{- end -}}
+{{- if $ok -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Whether a database renders its CloudNativePG Cluster (engine cnpg or, during
+the transition, migrating). Empty string is falsey, so use it in an `if`.
+Usage: {{ if (include "srw.dbRendersCnpg" (dict "context" . "key" "postgres")) }}
+*/}}
+{{- define "srw.dbRendersCnpg" -}}
+{{- if include "srw.dbPrereqs" . -}}
+{{- $engine := include "srw.dbEngine" (dict "context" .context "db" (index .context.Values.databases .key)) -}}
+{{- if has $engine (list "migrating" "cnpg") -}}true{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether a database renders its bundled StatefulSet. `migrating` renders BOTH,
+so Phase 4 can import from the live Service before the StatefulSet goes away.
+Usage: {{ if (include "srw.dbRendersStatefulset" (dict "context" . "key" "postgres")) }}
+*/}}
+{{- define "srw.dbRendersStatefulset" -}}
+{{- if include "srw.dbPrereqs" . -}}
+{{- $engine := include "srw.dbEngine" (dict "context" .context "db" (index .context.Values.databases .key)) -}}
+{{- if has $engine (list "statefulset" "migrating") -}}true{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether a database's backups are on. Three things must hold: the release backs
+up at all, the database renders a CNPG Cluster (a StatefulSet has no plugin to
+hook), and the database has not opted out.
+Usage: {{ if (include "srw.dbBacksUp" (dict "context" . "key" "postgres")) }}
+*/}}
+{{/*
+True when backups go to an object store (Barman plugin + WAL archiving), as
+opposed to CSI volume snapshots. The two are mutually exclusive here on purpose:
+running both would archive WAL for a base backup the archive cannot be replayed
+onto without also configuring the object store.
+*/}}
+{{- define "srw.backupIsObjectStore" -}}
+{{- if eq .Values.databases.backup.method "objectstore" -}}true{{- end -}}
+{{- end }}
+
+{{- define "srw.dbBacksUp" -}}
+{{- if has .context.Values.databases.backup.method (list "objectstore" "volumeSnapshot") -}}
+{{- if include "srw.dbRendersCnpg" . -}}
+{{- $db := index .context.Values.databases .key -}}
+{{- if ne $db.backupEnabled false -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Secret holding the S3 credentials for backups. Defaults to the chart's own, so
+the keys ride the existing Vault bundle instead of a second ExternalSecret.
+*/}}
+{{- define "srw.backupSecretName" -}}
+{{- .Values.databases.backup.credentialsSecret | default (include "srw.secretName" .) -}}
+{{- end }}
+
+{{/*
+Whether ANY database backs up -- i.e. whether the ObjectStore is referenced by
+something. One that nothing references is litter, and would misreport the
+release as backed up.
+*/}}
+{{- define "srw.anyDbBacksUp" -}}
+{{- $any := "" -}}
+{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" -}}
+{{- if include "srw.dbBacksUp" (dict "context" $ "key" $key) -}}
+{{- $any = "true" -}}
+{{- end -}}
+{{- end -}}
+{{- $any -}}
+{{- end }}
+
+{{/*
+Whether ANY database renders a CNPG Cluster, for warnings that only apply once
+the data tier has actually moved.
+*/}}
+{{- define "srw.anyDbRendersCnpg" -}}
+{{- $any := "" -}}
+{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" -}}
+{{- if include "srw.dbRendersCnpg" (dict "context" $ "key" $key) -}}
+{{- $any = "true" -}}
+{{- end -}}
+{{- end -}}
+{{- $any -}}
+{{- end }}
+
+{{/*
+Backup warnings for NOTES.txt. A named template because `helm template` cannot
+render NOTES.txt at all and `helm install --dry-run` needs a live cluster with
+every CRD present -- so this is the only form the warnings can be tested in.
+Both warnings exist because the failure they describe is otherwise silent.
+*/}}
+{{- define "srw.backupNotes" -}}
+{{- if (include "srw.anyDbRendersCnpg" .) }}
+{{- if ne .Values.databases.backup.method "objectstore" }}
+
+  ⚠  DATABASES ARE RUNNING WITH NO BACKUPS
+
+     One or more databases run on CloudNativePG and databases.backup.method is
+     "none". There is no WAL archive and no base backup, so there is no
+     point-in-time recovery and no recovery at all from a lost volume.
+
+     Set databases.backup.method=objectstore and databases.backup.destinationPath,
+     and install the Barman Cloud plugin — this chart cannot install it, because
+     it is a raw manifest pinned to the operator's namespace. See
+     knowledge-base/knowledge/operations/cnpg_backup_runbook.md
+{{- else if and (include "srw.garageEnabled" .) (contains (printf "%s-garage" (include "srw.fullname" .)) .Values.databases.backup.endpointURL) }}
+
+  ⚠  BACKUPS POINT AT THIS RELEASE'S OWN OBJECT STORE
+
+     databases.backup.endpointURL resolves to the Garage service in this same
+     release. Garage here is a single node on a single PVC in the same cluster
+     as the databases it would be backing up, so a node loss, a storage-class
+     failure or a mistaken namespace delete takes the databases AND their
+     backups together.
+
+     This is worse than having no backups, because it looks like having them.
+     Point it at storage in a different failure domain.
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Convert a Kubernetes memory quantity to whole MiB.
+
+Helm has no unit-aware arithmetic, so this parses the suffix by hand. Only the
+suffixes Kubernetes actually accepts for memory are handled; anything else is a
+bare byte count. Returns an integer, so callers can `mul`/`div` it directly.
+
+PostgreSQL's "MB" is 1024*1024 bytes despite the name, so a MiB figure can be
+handed to a GUC as "<n>MB" with no conversion.
+*/}}
+{{- define "srw.quantityToMi" -}}
+{{- $q := . | toString -}}
+{{- if hasSuffix "Gi" $q -}}
+{{- mulf (trimSuffix "Gi" $q | float64) 1024 | int64 -}}
+{{- else if hasSuffix "Mi" $q -}}
+{{- trimSuffix "Mi" $q | float64 | int64 -}}
+{{- else if hasSuffix "Ki" $q -}}
+{{- divf (trimSuffix "Ki" $q | float64) 1024 | int64 -}}
+{{- else if hasSuffix "G" $q -}}
+{{- divf (mulf (trimSuffix "G" $q | float64) 1e9) 1048576 | int64 -}}
+{{- else if hasSuffix "M" $q -}}
+{{- divf (mulf (trimSuffix "M" $q | float64) 1e6) 1048576 | int64 -}}
+{{- else if hasSuffix "k" $q -}}
+{{- divf (mulf (trimSuffix "k" $q | float64) 1e3) 1048576 | int64 -}}
+{{- else -}}
+{{- divf ($q | float64) 1048576 | int64 -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The postgresql.parameters map for one CNPG Cluster.
+
+Exists as a helper, rather than inline in cnpg-cluster.yaml, because it MERGES
+three sources into one map: the connection budget, the memory GUCs derived from
+resources.limits.memory, and the operator's explicit per-database overrides.
+Rendering them as three separate blocks would emit duplicate YAML keys whenever
+an operator set one of the derived GUCs by hand.
+
+Precedence, lowest to highest: derived, then `parameters`. An explicit value
+always wins -- deriving is a floor for people who never think about it, not a
+ceiling on people who do.
+
+Why derive at all: CNPG ships a fixed shared_buffers of 128MB and does NOT
+scale it with the memory limit. Raising limits.memory alone therefore buys the
+database nothing, which is exactly the drift this fleet shipped with -- a 19 GB
+pgvector on a 12Gi limit was still running 128MB of buffers at an 84% cache hit
+ratio. Tying the two together makes that state unreachable.
+
+Takes: dict "context" $ $ "db" $db
+*/}}
+{{- define "srw.dbParameters" -}}
+{{- $db := .db -}}
+{{- $tuning := .context.Values.databases.tuning -}}
+{{- $params := dict "max_connections" ($db.maxConnections | default 100 | toString) -}}
+{{- $res := $db.cnpgResources | default $db.resources -}}
+{{- $lim := "" -}}
+{{- if $res -}}
+{{- if $res.limits -}}
+{{- $lim = $res.limits.memory | default "" -}}
+{{- end -}}
+{{- end -}}
+{{- if $lim -}}
+{{- $limMi := include "srw.quantityToMi" $lim | int64 -}}
+{{- if gt (int $tuning.sharedBuffersPercent) 0 -}}
+{{- $_ := set $params "shared_buffers" (printf "%dMB" (div (mul $limMi (int $tuning.sharedBuffersPercent)) 100)) -}}
+{{- end -}}
+{{- if gt (int $tuning.effectiveCacheSizePercent) 0 -}}
+{{- $_ := set $params "effective_cache_size" (printf "%dMB" (div (mul $limMi (int $tuning.effectiveCacheSizePercent)) 100)) -}}
+{{- end -}}
+{{- end -}}
+{{- range $key, $value := $db.parameters -}}
+{{- $_ := set $params $key ($value | toString) -}}
+{{- end -}}
+{{- if $lim -}}
+{{- include "srw.assertMemoryFits" (dict "params" $params "limitMi" (include "srw.quantityToMi" $lim | int64) "name" .name) -}}
+{{- end -}}
+{{- toYaml $params -}}
+{{- end }}
+
+{{/*
+Convert a PostgreSQL memory GUC value to whole MiB.
+
+PostgreSQL's own units, which are NOT Kubernetes' units: kB/MB/GB/TB, all
+binary, case-insensitive. A unit-less value is rejected rather than guessed --
+PostgreSQL reads it as the GUC's own base unit, which is 8kB blocks for
+shared_buffers but kB for maintenance_work_mem, so a silent guess here would be
+wrong for one of them and there is no way to tell which from the value alone.
+*/}}
+{{- define "srw.pgMemToMi" -}}
+{{- $q := . | toString | lower | replace " " "" -}}
+{{- if hasSuffix "tb" $q -}}
+{{- mulf (trimSuffix "tb" $q | float64) 1048576 | int64 -}}
+{{- else if hasSuffix "gb" $q -}}
+{{- mulf (trimSuffix "gb" $q | float64) 1024 | int64 -}}
+{{- else if hasSuffix "mb" $q -}}
+{{- trimSuffix "mb" $q | float64 | int64 -}}
+{{- else if hasSuffix "kb" $q -}}
+{{- divf (trimSuffix "kb" $q | float64) 1024 | int64 -}}
+{{- else -}}
+{{- fail (printf "PostgreSQL memory setting %q has no unit. Give it an explicit kB/MB/GB suffix: a bare number means 8kB blocks for shared_buffers but kB for maintenance_work_mem, and this chart will not guess which you meant." $q) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Refuse a memory configuration that cannot fit in its own limit.
+
+The failure this prevents is not a slow query, it is an OOM kill. shared_buffers
+is allocated for the life of the postmaster; maintenance_work_mem is allocated
+again by each CREATE INDEX/REINDEX/manual VACUUM; and autovacuum_work_mem --
+which DEFAULTS TO maintenance_work_mem when unset -- is allocated by each of
+autovacuum_max_workers workers simultaneously. The last of those is the one that
+surprises people: setting maintenance_work_mem to 2GB on a cluster with the
+default three autovacuum workers quietly authorises 6GB of autovacuum on top of
+shared_buffers, with nothing in the config that says 6GB anywhere.
+
+Deriving shared_buffers from the limit makes this reachable by editing only the
+LIMIT, so the invariant has to be enforced rather than documented.
+
+Only the certain-failure case fails the render: if the floor alone meets or
+exceeds the limit, no query has run yet and the budget is already gone.
+
+Takes: dict "params" $params "limitMi" $limitMi "name" <cluster name>
+*/}}
+{{- define "srw.assertMemoryFits" -}}
+{{- $p := .params -}}
+{{- $limitMi := .limitMi | int64 -}}
+{{- $sb := 0 -}}
+{{- if hasKey $p "shared_buffers" -}}
+{{- $sb = include "srw.pgMemToMi" (get $p "shared_buffers") | int64 -}}
+{{- end -}}
+{{- $mwm := 0 -}}
+{{- if hasKey $p "maintenance_work_mem" -}}
+{{- $mwm = include "srw.pgMemToMi" (get $p "maintenance_work_mem") | int64 -}}
+{{- end -}}
+{{- $workers := 3 -}}
+{{- if hasKey $p "autovacuum_max_workers" -}}
+{{- $workers = get $p "autovacuum_max_workers" | int -}}
+{{- end -}}
+{{- $avwm := $mwm -}}
+{{- if hasKey $p "autovacuum_work_mem" -}}
+{{- $avwm = include "srw.pgMemToMi" (get $p "autovacuum_work_mem") | int64 -}}
+{{- end -}}
+{{- $floor := add $sb $mwm (mul $avwm $workers) -}}
+{{- if ge (int $floor) (int $limitMi) -}}
+{{- fail (printf "database %s: shared_buffers (%dMi) + maintenance_work_mem (%dMi) + autovacuum_work_mem (%dMi x %d workers) = %dMi, which is at or above the memory limit of %dMi. That is an OOM kill during the first index build or autovacuum, not a slow one. Raise cnpgResources.limits.memory, lower databases.tuning.sharedBuffersPercent, or set autovacuum_work_mem explicitly -- it defaults to maintenance_work_mem, once per worker." .name $sb $mwm $avwm $workers $floor $limitMi) -}}
+{{- end -}}
 {{- end }}

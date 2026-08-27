@@ -159,10 +159,11 @@ describe('AutomationsPageComponent', () => {
 
   describe('ngOnInit project-filter wiring', () => {
     it('loads my automations when there is no ?project= param', () => {
-      const {component, automationsServiceMock} = createComponent();
+      const {component, automationsServiceMock, apiServiceMock} = createComponent();
       component.ngOnInit();
       expect(automationsServiceMock.loadMine).toHaveBeenCalledTimes(1);
       expect(automationsServiceMock.loadByProject).not.toHaveBeenCalled();
+      expect(apiServiceMock.getExperts).toHaveBeenCalledWith('worker');
       expect(component.projectFilter()).toBeNull();
     });
 
@@ -246,6 +247,62 @@ describe('AutomationsPageComponent', () => {
       // Mock transloco.translate returns the key — that's what we assert.
       expect(component.projectFilterDisplayName()).toBe(
         'automations.list.projectFilter.fallbackName',
+      );
+    });
+  });
+
+  describe('expert persistence contract', () => {
+    it('submits DB experts through expert_id with worker_base', () => {
+      const {component, automationsServiceMock, apiServiceMock} = createComponent();
+      apiServiceMock.getExperts.mockReturnValueOnce(
+        of([
+          {
+            id: 'dddddddd-dddd-dddd-dddd-dddddddddddd',
+            name: 'my-worker',
+            display_name: 'My Worker',
+            storage_kind: 'db',
+          },
+        ]),
+      );
+      component.ngOnInit();
+      component.openNewEditor();
+      component.updateEditor('name', 'Daily review');
+      component.updateEditor('prompt', 'Review the project.');
+
+      component.saveEditor();
+
+      expect(automationsServiceMock.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          expert: 'worker_base',
+          expert_id: 'dddddddd-dddd-dddd-dddd-dddddddddddd',
+        }),
+      );
+    });
+
+    it('submits bundled experts by config name and clears expert_id', () => {
+      const {component, automationsServiceMock, apiServiceMock} = createComponent();
+      apiServiceMock.getExperts.mockReturnValueOnce(
+        of([
+          {
+            id: 'scholar',
+            name: 'scholar',
+            display_name: 'Scholar',
+            storage_kind: 'bundled',
+          },
+        ]),
+      );
+      component.ngOnInit();
+      component.openNewEditor();
+      component.updateEditor('name', 'Daily review');
+      component.updateEditor('prompt', 'Review the project.');
+
+      component.saveEditor();
+
+      expect(automationsServiceMock.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          expert: 'scholar',
+          expert_id: null,
+        }),
       );
     });
   });

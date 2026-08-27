@@ -85,10 +85,14 @@ spec:
               args:
                 - |
                   set -eu
+                  # jsonpath '{.items[*]...}' yields an empty string (not an
+                  # out-of-bounds error) when no pod matches, so `set -eu` won't
+                  # abort before the guard below. awk picks the first name (the
+                  # rollout window can briefly show two Running opencloud pods).
                   POD=$(kubectl -n {{ .Release.Namespace }} get pod \
                     -l app.kubernetes.io/name={{ include "srw.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=opencloud \
                     --field-selector=status.phase=Running \
-                    -o jsonpath='{.items[0].metadata.name}')
+                    -o jsonpath='{.items[*].metadata.name}' | awk '{print $1}')
                   if [ -z "$POD" ]; then
                     echo "no running opencloud pod, skipping"
                     exit 0

@@ -1,7 +1,9 @@
 """Tests for the DescriptionManager — tool documentation generation and overrides.
 
-Tests docstring extraction, markdown generation, workspace doc writing,
-description overrides for deferred tools, and module-level convenience functions.
+Tests docstring extraction, markdown generation, description overrides for
+deferred tools, and module-level convenience functions. Markdown rendered here
+is served live from tools/ as a virtual directory
+(knowledge-base/knowledge/features/virtual_directories.md) rather than written to the workspace.
 """
 
 import pytest
@@ -136,44 +138,6 @@ class TestGenerateToolIndex:
         mgr = DescriptionManager()
         result = mgr.generate_tool_index(["__fake_tool__"])
         assert "Other" in result
-
-
-# =============================================================================
-# Workspace docs generation
-# =============================================================================
-
-
-class TestGenerateWorkspaceDocs:
-    """Tests for generate_workspace_docs."""
-
-    def test_creates_output_directory(self, tmp_path):
-        """Should create output dir if it doesn't exist."""
-        mgr = DescriptionManager()
-        output = tmp_path / "tools"
-        mgr.generate_workspace_docs(["read_file"], output)
-        assert output.exists()
-
-    def test_creates_readme(self, tmp_path):
-        """Should write README.md index."""
-        mgr = DescriptionManager()
-        output = tmp_path / "tools"
-        mgr.generate_workspace_docs(["read_file"], output)
-        assert (output / "README.md").exists()
-
-    def test_creates_tool_files(self, tmp_path):
-        """Should write individual tool .md files."""
-        mgr = DescriptionManager()
-        output = tmp_path / "tools"
-        mgr.generate_workspace_docs(["read_file", "write_file"], output)
-        assert (output / "read_file.md").exists()
-        assert (output / "write_file.md").exists()
-
-    def test_returns_file_count(self, tmp_path):
-        """Should return 1 (index) + N (tools)."""
-        mgr = DescriptionManager()
-        output = tmp_path / "tools"
-        count = mgr.generate_workspace_docs(["read_file", "write_file"], output)
-        assert count == 3  # README + 2 tool files
 
 
 # =============================================================================

@@ -158,10 +158,25 @@ def _make_mock_db(due_row: dict | None) -> MagicMock:
     db.advance_automation_after_fire = AsyncMock()
     db.skip_automation_fire = AsyncMock()
     db.auto_disable_automation = AsyncMock()
+    # Scheduled work resolves the stored owner's live connector defaults before
+    # creating the job. These tests have no connector fixtures, so model one
+    # active owner with an empty default set.
+    db.get_user = AsyncMock(
+        return_value={
+            "id": "33333333-3333-3333-3333-333333333333",
+            "is_approved": True,
+        }
+    )
+    db.user_is_member_of_projects = AsyncMock(return_value=True)
+    db.list_default_datasource_candidates = AsyncMock(return_value=[])
     # create_job is invoked by create_job_from_automation
     db.create_job = AsyncMock(
         return_value={"id": "11111111-1111-1111-1111-111111111111"}
     )
+    # An automation carrying a project_id is gated on that project's lifecycle
+    # state before the fire (see TestArchivedProjectSkipsTheFire). None reads
+    # as "no such project", which is not archived.
+    db.get_project = AsyncMock(return_value=None)
     return db
 
 
@@ -189,12 +204,13 @@ def _make_row(
     max_fires_per_day: int = 100,
     autonomy: str = "review",
     config_override: dict | None = None,
+    project_id: str | None = None,
 ) -> dict:
     """Mimics ``db.fetch_next_due_cron_automation`` output."""
     return {
         "id": "22222222-2222-2222-2222-222222222222",
         "owner_id": "33333333-3333-3333-3333-333333333333",
-        "project_id": None,
+        "project_id": project_id,
         "name": "test-automation",
         "cron_expr": cron_expr,
         "timezone": timezone_name,
@@ -209,6 +225,25 @@ def _make_row(
         "fires_today_date": fires_today_date,
         "max_fires_per_day": max_fires_per_day,
     }
+
+
+@pytest.fixture(autouse=True)
+def _stub_post_commit_provisioning(monkeypatch):
+    """Keep every cron unit test hermetic against the new post-commit
+    provisioning hook. ``_process_one_due_automation`` late-imports
+    ``provision_job_repo`` and pulls ``gitea_client`` / ``main_cloud_router``
+    from ``main``; stub both so the tests never import the full orchestrator
+    app or hit Gitea. Tests that assert on provisioning re-patch with their
+    own handle (last setattr wins).
+    """
+    import sys
+    import types
+
+    monkeypatch.setattr("services.job_provisioning.provision_job_repo", AsyncMock())
+    fake_main = types.ModuleType("main")
+    fake_main.gitea_client = MagicMock()
+    fake_main.main_cloud_router = MagicMock()
+    monkeypatch.setitem(sys.modules, "main", fake_main)
 
 
 class TestProcessOneDueAutomation:
@@ -448,3 +483,163 @@ class TestAutoDisableNotification:
 
         await _process_one_due_automation(db)
         notify_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Post-commit Gitea provisioning — fires once per cron fire, OUTSIDE the txn,
+# never on a skip/disable, and a provisioning failure never breaks the tick
+# or undoes the committed fire. This is the parity fix: cron-spawned jobs now
+# get a workspace repo like manual POST /api/jobs jobs.
+# ---------------------------------------------------------------------------
+
+
+def _patch_provisioning(monkeypatch, *, side_effect=None) -> AsyncMock:
+    """Re-patch the autouse provisioning stub with an assertable handle."""
+    provision_mock = AsyncMock(side_effect=side_effect)
+    monkeypatch.setattr("services.job_provisioning.provision_job_repo", provision_mock)
+    return provision_mock
+
+
+class TestPostCommitProvisioning:
+    @pytest.mark.asyncio
+    async def test_fire_provisions_created_job(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provision = _patch_provisioning(monkeypatch)
+        row = _make_row(next_run_at=datetime.now(timezone.utc))
+        db = _make_mock_db(due_row=row)
+
+        out = await _process_one_due_automation(db)
+
+        assert out is True
+        provision.assert_awaited_once()
+        kwargs = provision.await_args.kwargs
+        assert kwargs["job_row"] == {"id": "11111111-1111-1111-1111-111111111111"}
+        assert kwargs["postgres_db"] is db
+
+    @pytest.mark.asyncio
+    async def test_catchup_skip_does_not_provision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provision = _patch_provisioning(monkeypatch)
+        long_ago = datetime(2025, 1, 1, 0, 0, tzinfo=timezone.utc)
+        row = _make_row(next_run_at=long_ago, catchup_window_seconds=3600)
+        db = _make_mock_db(due_row=row)
+
+        await _process_one_due_automation(db)
+
+        provision.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_max_fires_disable_does_not_provision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provision = _patch_provisioning(monkeypatch)
+        now = datetime.now(timezone.utc)
+        row = _make_row(
+            next_run_at=now,
+            max_fires_per_day=5,
+            fires_today_count=5,
+            fires_today_date=now.date(),
+        )
+        db = _make_mock_db(due_row=row)
+
+        await _process_one_due_automation(db)
+
+        provision.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provisioning_failure_does_not_break_tick(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Gitea outage during provisioning must not crash the tick or
+        undo the committed fire."""
+        provision = _patch_provisioning(
+            monkeypatch, side_effect=RuntimeError("gitea down")
+        )
+        row = _make_row(next_run_at=datetime.now(timezone.utc))
+        db = _make_mock_db(due_row=row)
+
+        out = await _process_one_due_automation(db)
+
+        assert out is True
+        provision.assert_awaited_once()
+        db.advance_automation_after_fire.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Archived project — the fire is skipped, the automation stays enabled
+# ---------------------------------------------------------------------------
+#
+# knowledge-base/knowledge/features/project_and_job_list_filtering.md §4.3:
+# background paths skip and log, they never raise. A cron tick has no HTTP
+# caller to receive a 409, and auto-disabling the automation would silently
+# destroy the owner's configuration — the failure mode Jira's docs warn about,
+# where archiving a project makes its automation rules start failing.
+
+
+PROJECT_ARCHIVED = "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a"
+
+
+class TestArchivedProjectSkipsTheFire:
+    def _archived_db(self, row):
+        db = _make_mock_db(due_row=row)
+        db.get_project = AsyncMock(
+            return_value={"id": PROJECT_ARCHIVED, "status": "archived"}
+        )
+        return db
+
+    @pytest.mark.asyncio
+    async def test_no_job_is_created(self) -> None:
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc), project_id=PROJECT_ARCHIVED
+        )
+        db = self._archived_db(row)
+
+        await _process_one_due_automation(db)
+
+        db.create_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_automation_is_not_disabled(self) -> None:
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc), project_id=PROJECT_ARCHIVED
+        )
+        db = self._archived_db(row)
+
+        await _process_one_due_automation(db)
+
+        # Disabling would destroy the owner's configuration for a condition
+        # they can reverse in one click.
+        db.auto_disable_automation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_schedule_advances_so_the_row_is_not_reclaimed_forever(
+        self,
+    ) -> None:
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc), project_id=PROJECT_ARCHIVED
+        )
+        db = self._archived_db(row)
+
+        await _process_one_due_automation(db)
+
+        # Same lever the catch-up-window skip pulls: move next_run_at forward
+        # without recording a fire.
+        db.skip_automation_fire.assert_awaited_once()
+        db.advance_automation_after_fire.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_live_project_still_fires(self) -> None:
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc), project_id=PROJECT_ARCHIVED
+        )
+        db = _make_mock_db(due_row=row)
+        db.get_project = AsyncMock(
+            return_value={"id": PROJECT_ARCHIVED, "status": "active"}
+        )
+
+        await _process_one_due_automation(db)
+
+        db.create_job.assert_awaited_once()
+        db.advance_automation_after_fire.assert_awaited_once()

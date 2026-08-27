@@ -1,0 +1,106 @@
+{
+  "mcp": {
+    "job_control": [
+      "acknowledge_job_message",
+      "approve_job",
+      "assign_job",
+      "cancel_job",
+      "create_job",
+      "delete_job",
+      "escalate_job_message",
+      "pause_job",
+      "promote_job",
+      "reply_to_job_message",
+      "resume_job_with_feedback",
+      "send_message_to_job",
+      "steer_job"
+    ],
+    "job_inspection": [
+      "get_audit_bulk",
+      "get_audit_timerange",
+      "get_audit_trail",
+      "get_chat_bulk",
+      "get_chat_history",
+      "get_current_todos",
+      "get_frozen_job",
+      "get_job",
+      "get_job_completion_report",
+      "get_job_diff",
+      "get_job_file",
+      "get_job_log",
+      "get_job_progress",
+      "get_job_summary",
+      "get_llm_request",
+      "get_message_thread",
+      "get_shell_state",
+      "get_stuck_jobs",
+      "get_todo_archive",
+      "get_todos",
+      "get_workspace_overview",
+      "list_job_commits",
+      "list_job_evidence",
+      "list_job_files",
+      "list_jobs",
+      "list_llm_requests",
+      "list_message_threads",
+      "list_todo_archives",
+      "read_job_evidence",
+      "search_audit"
+    ]
+  },
+  "officer": {
+    "job_control": [
+      "acknowledge_job_message",
+      "approve_job",
+      "cancel_job",
+      "create_job",
+      "escalate_job_message",
+      "pause_job",
+      "reply_to_job_message",
+      "resume_job_with_feedback",
+      "send_message_to_job",
+      "steer_job"
+    ],
+    "job_inspection": [
+      "get_audit_trail",
+      "get_chat_history",
+      "get_current_todos",
+      "get_frozen_job",
+      "get_job",
+      "get_job_completion_report",
+      "get_job_log",
+      "get_job_progress",
+      "get_job_summary",
+      "get_llm_request",
+      "get_message_thread",
+      "get_stuck_jobs",
+      "get_todo_archive",
+      "get_todos",
+      "list_job_evidence",
+      "list_jobs",
+      "list_llm_requests",
+      "list_message_threads",
+      "list_todo_archives",
+      "read_job_evidence",
+      "search_audit"
+    ]
+  },
+  "session": {
+    "job_control": [
+      "approve_job",
+      "cancel_job",
+      "create_job",
+      "pause_job",
+      "resume_job_with_feedback"
+    ],
+    "job_inspection": [
+      "get_job",
+      "get_job_completion_report",
+      "get_job_file",
+      "list_job_evidence",
+      "list_job_files",
+      "list_jobs",
+      "read_job_evidence"
+    ]
+  }
+}

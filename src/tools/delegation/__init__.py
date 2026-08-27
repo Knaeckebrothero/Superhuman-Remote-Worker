@@ -1,10 +1,14 @@
 """Delegation toolkit — subagent spawning tools.
 
-Provides the `delegate_work` tool that allows agents to spawn 1-5 child jobs
-as git worktree branches. Children run in parallel; the parent suspends
-(checkpoint + wake) and resumes to review/merge results.
+Two primitives:
 
-See docs/features/subagent_delegation.md for the full design.
+- `delegate_work` / `resume_delegation_child` — the heavyweight path: spawn 1-5
+  child jobs as git worktree branches; the parent suspends (checkpoint + wake)
+  and resumes to review/merge results. See knowledge-base/knowledge/features/subagent_delegation.md.
+- `spawn_subagent` — the single agent-facing delegation primitive whose backend
+  (`heavy` = child jobs, `light` = throwaway in-process readers) is selected by
+  `delegation.mode`, not by the model. See
+  knowledge-base/knowledge/issues/delegation_light_mode_missing.md.
 """
 
 from typing import Any, Dict, List
@@ -21,13 +25,17 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
     Returns:
         List of LangChain tool functions
     """
-    from .delegate_work import create_delegation_tools as _create
+    from .delegate_work import create_delegation_tools as _create_heavy
+    from .spawn_subagent import create_spawn_subagent_tools
 
-    return _create(context)
+    tools = list(_create_heavy(context))
+    tools.extend(create_spawn_subagent_tools(context))
+    return tools
 
 
 def get_delegation_metadata() -> Dict[str, Dict[str, Any]]:
     """Get metadata for all delegation tools."""
     from .delegate_work import DELEGATION_TOOLS_METADATA
+    from .spawn_subagent import SPAWN_SUBAGENT_METADATA
 
-    return DELEGATION_TOOLS_METADATA
+    return {**DELEGATION_TOOLS_METADATA, **SPAWN_SUBAGENT_METADATA}

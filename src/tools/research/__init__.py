@@ -26,7 +26,7 @@ def create_research_tools(context: ToolContext) -> List[Any]:
 
     # Autonomous browser tools (browse_website / download_from_website) were
     # deprecated; the main agent drives the browser via the direct browser_*
-    # tools instead. See docs/features/browser_workspace_executor.md.
+    # tools instead. See knowledge-base/knowledge/features/browser_workspace_executor.md.
     tools = []
     tools.extend(create_web_tools(context))
     tools.extend(create_paper_tools(context))
@@ -43,7 +43,6 @@ def create_browser_direct_tools(context: ToolContext) -> List[Any]:
 
 def get_research_metadata() -> Dict[str, Dict[str, Any]]:
     """Get metadata for all research tools."""
-    from .browser import BROWSER_TOOLS_METADATA
     from .papers import PAPER_TOOLS_METADATA
     from .web import RESEARCH_TOOLS_METADATA
     from .workflow import WORKFLOW_TOOLS_METADATA
@@ -51,7 +50,6 @@ def get_research_metadata() -> Dict[str, Dict[str, Any]]:
     metadata = {}
     metadata.update(RESEARCH_TOOLS_METADATA)
     metadata.update(PAPER_TOOLS_METADATA)
-    metadata.update(BROWSER_TOOLS_METADATA)
     metadata.update(WORKFLOW_TOOLS_METADATA)
     return metadata
 

@@ -16,7 +16,8 @@ import json
 import logging
 import os
 import sys
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator, Optional
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, Optional
 
 import httpx
 from langchain_core.messages import AIMessageChunk
@@ -30,6 +31,18 @@ if TYPE_CHECKING:
     from .key_ring import KeyRing
 
 logger = logging.getLogger(__name__)
+
+# Request-scoped sink for live reasoning deltas. The SSE tap parses
+# ``reasoning_content`` off the wire (Chat Completions reasoning models —
+# gemma/DeepSeek/OpenRouter) below the LangChain layer that drops it, and only
+# the merged response surfaces it — *after* every answer token. A caller that
+# wants reasoning in true chronological order (before the answer) sets this
+# contextvar to a sync callback; the tap invokes it per delta as the bytes
+# arrive. Defaults to None ⇒ no live emission, identical to legacy behavior.
+# See knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
+_STREAM_REASONING_SINK: ContextVar[Optional[Callable[[str], None]]] = ContextVar(
+    "stream_reasoning_sink", default=None
+)
 
 # Token counting constants
 DEFAULT_MAX_CONTEXT_TOKENS = 100_000
@@ -62,7 +75,7 @@ def _dump_codex_raw_response(
 
     Diagnostic for the codex-proxy non-streaming failure mode where the
     proxy returns real LLM output but the agent ends up with an empty
-    AIMessage. See docs/issues/langchain_responses_api_streaming.md for
+    AIMessage. See knowledge-base/knowledge/issues/langchain_responses_api_streaming.md for
     background. Captures land in $CODEX_RAW_DUMP_DIR (default /tmp). All
     failures are silent — this must never break the live request path.
     """
@@ -105,6 +118,36 @@ def _dump_codex_raw_response(
         )
     except Exception as exc:
         logger.warning(f"Codex raw capture failed (non-fatal): {exc}")
+
+
+def _overflow_response_413(
+    request: Any, overflow: ContextOverflowError
+) -> httpx.Response:
+    """Convert a pre-flight context overflow into a non-retryable HTTP response.
+
+    Raising from inside ``send()`` gets wrapped into a retryable
+    ``openai.APIConnectionError`` by the SDK (``openai/_base_client.py``), so a
+    deterministic "request too big" failure was retried with backoff and
+    surfaced as a bare "Connection error." with the real cause buried in
+    ``__cause__`` — and ``persistent_graph`` misread it as "streaming not
+    supported". A synthetic 413 instead surfaces immediately as a typed,
+    non-retried ``APIStatusError`` carrying the real message; callers detect
+    it via ``code == "context_overflow"``.
+    See knowledge-base/knowledge/issues/session_silent_failure_audit.md #3.
+    """
+    return httpx.Response(
+        status_code=413,
+        request=request,
+        json={
+            "error": {
+                "message": overflow.message,
+                "type": "invalid_request_error",
+                "code": "context_overflow",
+                "token_count": overflow.token_count,
+                "limit": overflow.limit,
+            }
+        },
+    )
 
 
 def count_request_tokens(body: dict, model: str = "gpt-4") -> int:
@@ -425,6 +468,15 @@ class _SSEReasoningTap:
         text = _extract_reasoning_from_delta(delta or {})
         if text:
             self._parts.append(text)
+            # Emit live (before the answer tokens) if a caller installed a
+            # sink for this request. Best-effort: a sink failure must never
+            # break the stream the SDK is consuming through this tap.
+            sink = _STREAM_REASONING_SINK.get()
+            if sink is not None:
+                try:
+                    sink(text)
+                except Exception:  # noqa: BLE001 - never break the wire stream
+                    logger.debug("reasoning delta sink failed", exc_info=True)
 
 
 def _install_streaming_reasoning_tap(response: httpx.Response) -> _SSEReasoningTap:
@@ -513,6 +565,7 @@ class ReasoningCapturingClient(httpx.Client):
 
         # Token validation for LLM requests (Layer 0 safety check)
         if is_llm_request:
+            overflow: Optional[ContextOverflowError] = None
             try:
                 body = json.loads(request.content)
                 token_count = count_request_tokens(body, self._model)
@@ -525,13 +578,12 @@ class ReasoningCapturingClient(httpx.Client):
                         f"({token_count / self._max_context_tokens * 100:.1f}%)"
                     )
 
-                # Raise error if over limit
                 if token_count > self._max_context_tokens:
                     logger.error(
                         f"Context overflow at HTTP layer: "
                         f"{token_count:,} tokens exceeds limit of {self._max_context_tokens:,}"
                     )
-                    raise ContextOverflowError(
+                    overflow = ContextOverflowError(
                         token_count=token_count,
                         limit=self._max_context_tokens,
                         request_size_bytes=len(request.content),
@@ -540,12 +592,13 @@ class ReasoningCapturingClient(httpx.Client):
             except json.JSONDecodeError:
                 # Non-JSON request body, skip validation
                 logger.debug("Skipping token count for non-JSON request")
-            except ContextOverflowError:
-                # Re-raise our custom exception
-                raise
             except Exception as e:
                 # Log but don't fail on counting errors - let the request through
                 logger.warning(f"Token counting failed, allowing request: {e}")
+
+            if overflow is not None:
+                # Don't raise — return a synthetic 413 the SDK won't retry.
+                return _overflow_response_413(request, overflow)
 
         # Send the request
         response = super().send(request, **kwargs)
@@ -729,6 +782,7 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
 
         # Token validation for LLM requests (Layer 0 safety check)
         if is_llm_request:
+            overflow: Optional[ContextOverflowError] = None
             try:
                 body = json.loads(request.content)
                 token_count = count_request_tokens(body, self._model)
@@ -745,7 +799,7 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
                         f"Context overflow at HTTP layer: "
                         f"{token_count:,} tokens exceeds limit of {self._max_context_tokens:,}"
                     )
-                    raise ContextOverflowError(
+                    overflow = ContextOverflowError(
                         token_count=token_count,
                         limit=self._max_context_tokens,
                         request_size_bytes=len(request.content),
@@ -753,10 +807,12 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
 
             except json.JSONDecodeError:
                 logger.debug("Skipping token count for non-JSON request")
-            except ContextOverflowError:
-                raise
             except Exception as e:
                 logger.warning(f"Token counting failed, allowing request: {e}")
+
+            if overflow is not None:
+                # Don't raise — return a synthetic 413 the SDK won't retry.
+                return _overflow_response_413(request, overflow)
 
         # Send the request (async)
         response = await super().send(request, **kwargs)
@@ -789,7 +845,7 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         # Diagnostic: dump raw /v1/responses payloads when DEBUG_CODEX_RAW_RESPONSE=1.
         # The codex proxy + openai SDK Pydantic deserialization path can produce
         # empty AIMessages from non-empty proxy responses (see
-        # docs/issues/langchain_responses_api_streaming.md "Non-streaming failure
+        # knowledge-base/knowledge/issues/langchain_responses_api_streaming.md "Non-streaming failure
         # mode"). This capture lets us inspect what the proxy is actually
         # returning vs. what langchain ends up with. Non-streaming only —
         # accessing response.content on a streamed response would raise.

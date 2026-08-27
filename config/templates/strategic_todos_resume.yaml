@@ -74,7 +74,8 @@ todos:
       (1) Lists completed phases from the previous run (for context).
       (2) Creates corrective phases ordered by feedback severity (critical first).
       (3) Each corrective phase targets specific feedback items and files.
-      (4) Estimates todo count per phase (target 3-7 todos per phase).
+      (4) Prefers ONE corrective phase covering all the feedback; split into
+      several only where a later fix genuinely depends on an earlier one landing.
 
       REWRITE plan.md — the old plan is no longer relevant.
 
@@ -91,8 +92,6 @@ todos:
     content: >-
       CREATE CORRECTIVE TODOS: Call next_phase_todos with the first corrective phase.
 
-      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE invoking next_phase_todos.
-
       Create todos that:
       {% if has_tool("kb_search") -%}
       - Target specific feedback items from the feedback analysis note (use kb_search
@@ -106,17 +105,16 @@ todos:
       - Include a verification todo that checks the corrected output against
         the original feedback
 
-      Target 3-7 todos for the first corrective phase.
+      Cover all the feedback in one corrective phase where you can.
 
       CRITICAL: Do not call job_complete in this phase. You have not yet made
       the corrections — you are only planning them. job_complete should only be
       called after all corrective phases have been executed and verified.
 
-      COMPLETION CRITERIA: next_phase_todos called with 3-7 corrective todos
+      COMPLETION CRITERIA: next_phase_todos called with 2-5 corrective todos
       that trace to specific feedback items.
 
       INSTEAD OF: Calling job_complete now — corrections have not been made yet.
-      Instead of skipping reading todo_guide.md — the tool enforces this.
       Instead of vague todos — each must reference specific feedback and files.
       Instead of meta-todos for archiving, cleanup, or status updates — every
       todo must advance the actual corrections.

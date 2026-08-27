@@ -1,0 +1,145 @@
+# yaml-language-server: $schema=../../schema.json
+# Centurion — the standing officer of a project (knowledge-base/knowledge/features/centurion.md).
+# An always-on session with no local workspace. His job surface is the
+# ratified supervision split (officer_supervision_surface.md §3): control +
+# observability + bounded evidence, never the job_workspace object plane; his
+# output is judgment — dispatches, steering, verdicts, briefings. The officer
+# machinery (sleep tool, durable timer, watchdog, sitrep wakes) activates via
+# config_override.officer.enabled on the THREAD, not here: this same expert
+# also dresses conferences — interactive sessions wearing his identity —
+# which must stay ordinary sessions (centurion.md §2/S9).
+$extends: session_base
+
+agent_id: centurion
+display_name: Centurion
+description: |
+  Standing officer of a project: supervises its worker jobs, owns the
+  backlog, schedules and verifies work, and keeps the Legate informed at
+  the right level of urgency. Runs 24/7 on a wake/sleep cycle with no task
+  pressure — stewardship, not task execution. The default project's
+  centurion bears the title Primus Pilus.
+icon: shield
+color: "#f38ba8"
+tags:
+  - officer
+  - centurion
+  - manager
+  - persistent
+
+# Klug und faul, structurally: the lite tier removes every hands-on tool
+# (local files, shell, git, browser, canvas) at the backend filter, so
+# delegation is not a persona preference — it is the only path to getting work
+# done. The job reads below are control-plane supervision and bounded
+# evidence, not an officer workspace.
+workspace:
+  backend: none
+
+# The officer's OWN brain is deliberately NOT pinned here: catalogs differ per
+# deployment (k3d has no codex-proxy), and a model absent from the catalog
+# would brick every officer on that cluster. Set it at provision — the
+# Centurion tab's "Officer's own model" picker, or `model` in the create-thread
+# body — which lands in the thread's config_override.llm.model and outranks
+# every default. The intended brain is the SUBSCRIPTION model via codex-proxy
+# (centurion.md §3, e.g. gpt-5.6-sol): his cadence is ~48 warm-cache wakes/day,
+# a rounding error against measured surplus — and his judgment steers models
+# far stronger than any default. Leaving this unset means the account/base
+# default, which on most clusters is a small local model: fine for smoke
+# tests, wrong for a real command.
+
+# Officer cadence defaults; enabled stays false here (see header). The thread
+# override that provisions an officer flips enabled and may tighten bounds.
+# A slot roster (typed worker allocations) is also set per thread, e.g.
+#   officer:
+#     slots:
+#       line:  {count: 2, model: "MiniMax-M3", backend: "sandbox"}
+#       heavy: {count: 1, model: "gpt-5.6-sol", backend: "vm"}
+# With a roster, per-slot counts replace max_concurrent_workers and each
+# dispatch's model/backend is stamped server-side (officer_slots.py).
+officer:
+  enabled: false
+  sleep_min_minutes: 5
+  sleep_max_minutes: 60
+  max_concurrent_workers: 3
+  max_pages_per_day: 3
+  max_actions_per_wake: 10
+  daily_token_ceiling: 0
+
+tools:
+  # Non-job application context. sleep + notify_user arrive via the officer
+  # flag, not these lists.
+  orchestrator:
+    - get_session_context
+  # Explicit knowledge grant (officer_knowledge_plane.md §3, K2): the officer
+  # owns the project's knowledge plane, so the grant is reviewed here rather
+  # than inherited from whatever session_base happens to carry. Exactly these
+  # nine — kb_export is deliberately ABSENT: it is a workspace-oriented
+  # migration/export tool (needs a destination directory) and unrelated to
+  # knowledge gardening; index/lint/rebuild administration stays operator-side.
+  # The background-officer runtime ceiling (registry.apply_officer_tool_ceiling)
+  # additionally refuses kb_export even if a thread override re-grants it.
+  knowledge:
+    - kb_write
+    - kb_update
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+  # Officer job surface (officer_supervision_surface.md §3, E5): the reviewed
+  # grant mirrors the generated officer caller defaults exactly — 7 control +
+  # 18 observability + 3 evidence, zero job_workspace-plane reads. Arbitrary
+  # job-file/tree reads (get_job_file, list_job_files, workspace overview,
+  # shell state, unbounded diff/commit browsing) are the object plane in
+  # job-tool form: no longer claimed here, and the background-officer runtime
+  # ceiling (registry.apply_officer_tool_ceiling) refuses plane="job_workspace"
+  # even when a thread override names one. Thin published evidence means
+  # dispatching a tester/recon job, never falling back to a file browser.
+  # tests/test_centurion_supervision_grant.py pins these lists to
+  # caller_default_names("officer", ...) so a descriptor-policy change surfaces
+  # here as a reviewed diff instead of silent drift. (Explicit names, not
+  # `true`: policy expansion is lane-blind at config time — `true` resolves to
+  # the session-grantable subset, which would claim the two workspace-plane
+  # reads and could never claim the grant="explicit" officer tools.)
+  job_control:
+    - create_job
+    - approve_job
+    - resume_job_with_feedback
+    - cancel_job
+    - pause_job
+    - steer_job
+    - send_message_to_job
+    # Worker-message routing (officer_message_routing.md M3): answer, hand up,
+    # or close a worker's routed question — the officer's inbox actions.
+    - reply_to_job_message
+    - escalate_job_message
+    - acknowledge_job_message
+  job_inspection:
+    # Observability — control-plane truth (status, telemetry, recorded state).
+    - list_jobs
+    - get_job
+    - get_job_summary
+    - get_job_progress
+    - get_job_log
+    - get_frozen_job
+    - get_stuck_jobs
+    - get_current_todos
+    - get_todos
+    - get_todo_archive
+    - list_todo_archives
+    - list_message_threads
+    - get_message_thread
+    - get_audit_trail
+    - search_audit
+    - get_chat_history
+    - list_llm_requests
+    - get_llm_request
+    # Evidence — bounded, immutable disposition material (E4 manifest).
+    - get_job_completion_report
+    - list_job_evidence
+    - read_job_evidence
+  # Workers research; the officer judges. Dropping these keeps his toolset
+  # small enough that every wake's tool choice is obvious.
+  research: []
+  citation: []

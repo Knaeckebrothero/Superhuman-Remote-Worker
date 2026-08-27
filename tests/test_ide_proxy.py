@@ -3,6 +3,7 @@
 import json
 import os
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -378,12 +379,30 @@ class TestDeleteIdePod:
     async def test_delete_success(self):
         """Deletes IDE pod via K8s API."""
         from orchestrator.services.container_provisioner import ContainerProvisioner
+        from services.workspace_lifecycle import WorkspaceOwner
 
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
         provisioner._namespace = "test-ns"
         mock_api = MagicMock()
         provisioner._core_api = mock_api
+        owner = WorkspaceOwner.job("abc123456789")
+        runtime_uid = "11111111-1111-4111-8111-111111111111"
+        mock_api.read_namespaced_pod.return_value = SimpleNamespace(
+            metadata=SimpleNamespace(
+                name="ide-abc123456789",
+                namespace="test-ns",
+                uid=runtime_uid,
+                deletion_timestamp=None,
+                labels={
+                    "app": "srw-workspace",
+                    "srw/component": "ide-session",
+                    "srw.io/component": "agent-workspace",
+                    "srw/job-id": owner.id,
+                },
+            )
+        )
+        provisioner._delete_seed_configmap = AsyncMock(return_value=True)
 
         # Mock asyncio.to_thread to call the function synchronously
         async def fake_to_thread(fn, *args, **kwargs):
@@ -400,6 +419,7 @@ class TestDeleteIdePod:
             name="ide-abc123456789",
             namespace="test-ns",
             grace_period_seconds=5,
+            body={"preconditions": {"uid": runtime_uid}},
         )
 
     @pytest.mark.asyncio
@@ -415,7 +435,8 @@ class TestDeleteIdePod:
 
         exc = Exception("Not Found")
         exc.status = 404
-        mock_api.delete_namespaced_pod.side_effect = exc
+        mock_api.read_namespaced_pod.side_effect = exc
+        provisioner._delete_seed_configmap = AsyncMock(return_value=True)
 
         async def fake_to_thread(fn, *args, **kwargs):
             return fn(*args, **kwargs)
@@ -427,6 +448,7 @@ class TestDeleteIdePod:
             result = await provisioner.delete_ide_pod("job-1")
 
         assert result is True
+        mock_api.delete_namespaced_pod.assert_not_called()
 
 
 # =============================================================================

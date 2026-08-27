@@ -25,7 +25,10 @@ metadata:
     {{- include "srw.componentLabels" (dict "context" . "component" "gitea") | nindent 4 }}
 spec:
   serviceName: {{ include "srw.fullname" . }}-gitea
-  replicas: 1
+  # 0 quiesces the writer for a database cutover; never above 1 (exclusive lock
+  # on the data volume, no leader election). NOT `default 1` -- Helm's `default`
+  # treats 0 as empty, so the quiesce would silently render as 1.
+  replicas: {{ if kindIs "invalid" .Values.gitea.replicas }}1{{ else }}{{ .Values.gitea.replicas }}{{ end }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 6 }}
@@ -40,22 +43,162 @@ spec:
       {{- end }}
       securityContext:
         fsGroup: 1000
-      {{- if .Values.keycloak.internal }}
+      {{- if or .Values.keycloak.internal (include "srw.giteaUsesPostgres" .) }}
       initContainers:
+        {{- if .Values.keycloak.internal }}
         - name: wait-for-keycloak
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-keycloak 8080; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-keycloak 8080; do sleep 2; done"]
+        {{- end }}
+        {{- if (include "srw.giteaUsesPostgres" .) }}
+        - name: wait-for-giteadb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.giteaDbHost" . }} {{ include "srw.giteaDbPort" . }}; do sleep 2; done"]
+        # Refuse to start a Postgres-backed Gitea whose metadata is still in an
+        # un-migrated SQLite file. Without this, Gitea would happily initialize
+        # an empty schema and come up believing it is a fresh install while
+        # every existing repo sits orphaned on the PVC — recoverable only by
+        # noticing and flipping back. Passing means one of:
+        #   - no SQLite file on the PVC (fresh install), or
+        #   - Postgres already holds users (migration done).
+        - name: preflight-db-migration
+          image: {{ .Values.databases.gitea.image }}
+          command:
+            - sh
+            - -c
+            - |
+              SQLITE_DB=/var/lib/gitea/data/gitea.db
+              if [ ! -f "$SQLITE_DB" ]; then
+                echo "No SQLite database present — fresh Postgres install, proceeding."
+                exit 0
+              fi
+              # Separate "cannot reach/authenticate" from "reachable but empty"
+              # BEFORE counting users. Both make the count come back blank, but
+              # the remedies are unrelated — reporting an un-migrated database
+              # when the real fault is a missing GITEA_DB_PASSWORD (the common
+              # first-run failure on ESO/Vault clusters, where the chart cannot
+              # generate one) sends operators after a migration problem that
+              # does not exist.
+              if ! CONN_ERR=$(psql -tAc 'SELECT 1' 2>&1 >/dev/null); then
+                cat >&2 <<EOF
+              ============================================================
+              REFUSING TO START: cannot reach the Gitea metadata database.
+
+              psql could not connect to $PGUSER@$PGHOST:$PGPORT/$PGDATABASE:
+
+                $CONN_ERR
+
+              This is a connectivity/credential fault, NOT a migration state.
+              On ESO/Vault-backed clusters the usual cause is a missing or
+              wrong GITEA_DB_PASSWORD in the Vault bundle — the chart only
+              generates that key when secrets.create=true.
+              ============================================================
+              EOF
+                exit 1
+              fi
+              USERS=$(psql -tAc 'SELECT COUNT(*) FROM "user"' 2>/dev/null | tr -d '[:space:]')
+              # Blank or non-numeric now means "connected, no schema yet" only.
+              case "$USERS" in ''|*[!0-9]*) USERS=0 ;; esac
+              if [ "$USERS" -gt 0 ]; then
+                echo "Postgres already holds $USERS users — migration complete, proceeding."
+                exit 0
+              fi
+              cat >&2 <<'EOF'
+              ============================================================
+              REFUSING TO START: un-migrated Gitea metadata.
+
+              gitea.database.type is "postgres", but this instance still has
+              a SQLite database on its PVC and the target Postgres has no
+              users. Starting now would initialize an empty Gitea while the
+              existing repositories stay orphaned on disk.
+
+              Either migrate the data:
+                knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
+              or pin the old backend in your values overlay:
+                gitea:
+                  database:
+                    type: sqlite3
+              ============================================================
+              EOF
+              exit 1
+          env:
+            - name: PGHOST
+              value: {{ include "srw.giteaDbHost" . | quote }}
+            - name: PGPORT
+              value: {{ include "srw.giteaDbPort" . | quote }}
+            - name: PGDATABASE
+              value: {{ include "srw.giteaDbName" . | quote }}
+            - name: PGUSER
+              {{- if .Values.databases.gitea.internal }}
+              value: "gitea"
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GITEA_DB_USER
+              {{- end }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GITEA_DB_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/gitea
+        {{- end }}
       {{- end }}
       containers:
         - name: gitea
           image: {{ .Values.gitea.image }}
           ports:
             - containerPort: 3000
+              name: http
+            {{- if .Values.gitea.ssh.enabled }}
+            - containerPort: {{ .Values.gitea.ssh.internalPort }}
+              name: ssh
+            {{- end }}
           env:
+            {{- if (include "srw.giteaUsesPostgres" .) }}
+            - name: GITEA__database__DB_TYPE
+              value: "postgres"
+            - name: GITEA__database__HOST
+              value: "{{ include "srw.giteaDbHost" . }}:{{ include "srw.giteaDbPort" . }}"
+            - name: GITEA__database__NAME
+              value: {{ include "srw.giteaDbName" . | quote }}
+            - name: GITEA__database__USER
+              {{- if .Values.databases.gitea.internal }}
+              value: "gitea"
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GITEA_DB_USER
+              {{- end }}
+            - name: GITEA__database__PASSWD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GITEA_DB_PASSWORD
+            - name: GITEA__database__SSL_MODE
+              value: {{ .Values.databases.gitea.sslMode | default "disable" | quote }}
+            {{- else }}
             - name: GITEA__database__DB_TYPE
               value: "sqlite3"
             - name: GITEA__database__PATH
               value: "/var/lib/gitea/data/gitea.db"
+            # WAL instead of the DELETE-journal default: readers stop blocking
+            # the writer, and an ungraceful pod kill can't shred a mid-journal
+            # commit (HA checklist P1).
+            - name: GITEA__database__SQLITE_JOURNAL_MODE
+              value: "WAL"
+            {{- end }}
+            # Gitea never gc's repos by default — measured 61k loose objects
+            # across 427 repos with this off. `_0X2E_` is environment-to-ini's
+            # escape for a dot in the section name ([cron.git_gc_repos]).
+            - name: GITEA__cron_0X2E_git_gc_repos__ENABLED
+              value: "true"
+            - name: GITEA__cron_0X2E_git_gc_repos__SCHEDULE
+              value: "@weekly"
             - name: GITEA__server__ROOT_URL
               value: {{ include "srw.gitUrl" . | quote }}
             - name: GITEA__server__HTTP_PORT
@@ -63,7 +206,17 @@ spec:
             - name: GITEA__security__INSTALL_LOCK
               value: "true"
             - name: GITEA__server__DISABLE_SSH
+              value: {{ not .Values.gitea.ssh.enabled | quote }}
+            {{- if .Values.gitea.ssh.enabled }}
+            - name: GITEA__server__START_SSH_SERVER
               value: "true"
+            - name: GITEA__server__SSH_LISTEN_PORT
+              value: {{ .Values.gitea.ssh.internalPort | quote }}
+            - name: GITEA__server__SSH_DOMAIN
+              value: {{ default (printf "%s-gitea" (include "srw.fullname" .)) .Values.gitea.ssh.externalHost | quote }}
+            - name: GITEA__server__SSH_PORT
+              value: {{ ternary .Values.gitea.ssh.externalPort .Values.gitea.ssh.internalPort (ne (.Values.gitea.ssh.externalHost | default "") "") | quote }}
+            {{- end }}
             - name: GITEA__service__DISABLE_REGISTRATION
               value: "false"
             - name: GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION
@@ -131,6 +284,18 @@ spec:
                         --group-claim-name "groups" --admin-group "admin" \
                         --skip-local-2fa 2>/dev/null || true
                     fi
+                    # Re-assert the browser-facing auth URL on every start so a
+                    # global.domain flip (srw.authUrl) reaches the existing DB-stored
+                    # source — add-oauth above only fires when the source is missing.
+                    # The OAuth flow must START on Keycloak's canonical KC_HOSTNAME;
+                    # if it starts on a stale host, KC bounces the browser mid-flow to
+                    # KC_HOSTNAME and the transient auth-session cookie is lost →
+                    # temporarily_unavailable/authentication_expired. token/profile URLs
+                    # stay on the internal service (KI) and are unaffected by the flip.
+                    GKP="{{ include "srw.authUrl" . }}"; GR="{{ .Values.keycloak.realm }}"
+                    GAID=$(gitea admin auth list 2>/dev/null | grep -w "Keycloak" | awk '{print $1}' | head -1)
+                    [ -n "$GAID" ] && gitea admin auth update-oauth --id "$GAID" \
+                      --custom-auth-url "${GKP}/realms/${GR}/protocol/openid-connect/auth" 2>/dev/null || true
           volumeMounts:
             - name: data
               mountPath: /var/lib/gitea
@@ -162,8 +327,34 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-    - port: 3000
+    - name: http
+      port: 3000
       targetPort: 3000
+    {{- if .Values.gitea.ssh.enabled }}
+    - name: ssh
+      port: {{ .Values.gitea.ssh.internalPort }}
+      targetPort: ssh
+    {{- end }}
   selector:
     {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+{{- if and .Values.gitea.ssh.enabled .Values.gitea.ssh.externalService.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-gitea-ssh
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "gitea-ssh") | nindent 4 }}
+spec:
+  type: {{ .Values.gitea.ssh.externalService.type }}
+  ports:
+    - name: ssh
+      port: {{ .Values.gitea.ssh.externalPort }}
+      targetPort: ssh
+      {{- if and (eq .Values.gitea.ssh.externalService.type "NodePort") .Values.gitea.ssh.externalService.nodePort }}
+      nodePort: {{ .Values.gitea.ssh.externalService.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+{{- end }}
 {{- end }}

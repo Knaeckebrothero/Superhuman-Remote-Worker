@@ -19,20 +19,48 @@ controller generates short-lived auth keys via the Headscale API and injects
 them into cloud-init so VMs join the tailnet on boot. Agent pods run a
 Tailscale sidecar and route directly to VMs via 100.64.x.y addresses.
 
-See docs/features/headscale_mesh.md for the mesh VPN design.
-See docs/features/vm_backend.md (Phase 3) and docs/features/nats.md.
+See knowledge-base/knowledge/features/headscale_mesh.md for the mesh VPN design.
+See knowledge-base/knowledge/features/vm_backend.md (Phase 3) and knowledge-base/knowledge/features/nats.md.
 """
 
 import asyncio
+from collections import OrderedDict
+from collections.abc import Mapping
+import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import sys
+import time
+from datetime import datetime, timezone
+from uuid import UUID
 
 import yaml
 
 from headscale_client import HeadscaleClient
+
+try:
+    from .lifecycle_auth import (
+        AUTH_FIELD,
+        AUTH_VERSION,
+        configured_secret,
+        guest_token,
+        sign_payload,
+        unsigned_payload,
+        verify_payload,
+    )
+except ImportError:  # Standalone controller image executes controller.py directly.
+    from lifecycle_auth import (  # type: ignore[no-redef]
+        AUTH_FIELD,
+        AUTH_VERSION,
+        configured_secret,
+        guest_token,
+        sign_payload,
+        unsigned_payload,
+        verify_payload,
+    )
 
 _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 if _log_level == "DEBUG" and not os.environ.get("DEBUG_ALL"):
@@ -56,7 +84,22 @@ NATS_URL = os.environ.get("NATS_URL", "nats://nats-leaf.nats.svc.cluster.local:4
 # vm.lifecycle.create and provision duplicate VMs.
 ORCHESTRATOR_ID = os.environ.get("ORCHESTRATOR_ID", "").strip()
 VM_TEMPLATE_PATH = os.environ.get("VM_TEMPLATE_PATH", "/config/vm-template.yaml")
+VM_CLOUD_INIT_PATH = os.environ.get("VM_CLOUD_INIT_PATH", "/config/cloud-init.yaml")
 VM_NAMESPACE = os.environ.get("VM_NAMESPACE", "agent-vms")
+ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "").strip()
+VM_DEFAULT_NETWORK_TIER = os.environ.get("VM_DEFAULT_NETWORK_TIER", "").strip()
+VM_MAX_CONCURRENT = max(0, int(os.environ.get("VM_MAX_CONCURRENT", "0")))
+VM_NODE_SELECTOR = json.loads(os.environ.get("VM_NODE_SELECTOR", "{}") or "{}")
+VM_TOLERATIONS = json.loads(os.environ.get("VM_TOLERATIONS", "[]") or "[]")
+if not isinstance(VM_NODE_SELECTOR, dict) or not all(
+    isinstance(key, str) and isinstance(value, str)
+    for key, value in VM_NODE_SELECTOR.items()
+):
+    raise ValueError("VM_NODE_SELECTOR must be a JSON object with string values")
+if not isinstance(VM_TOLERATIONS, list) or not all(
+    isinstance(item, dict) for item in VM_TOLERATIONS
+):
+    raise ValueError("VM_TOLERATIONS must be a JSON array of objects")
 DEFAULT_VM_IMAGE = os.environ.get(
     "DEFAULT_VM_IMAGE",
     "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest",
@@ -66,16 +109,297 @@ DEFAULT_MEMORY = os.environ.get("DEFAULT_MEMORY", "4Gi")
 VM_STORAGE_CLASS = os.environ.get("VM_STORAGE_CLASS", "local-path")
 VM_DISK_SIZE = os.environ.get("VM_DISK_SIZE", "20Gi")
 
+# Golden-image boot acceleration
+# (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md). When enabled, the base
+# image is imported ONCE into a standalone "golden" DataVolume/PVC per image
+# digest, and each VM's root disk is a CDI clone of it (host-assisted local copy
+# on local-path) instead of a per-VM registry import. Off by default →
+# byte-for-byte the legacy registry-per-VM behaviour.
+VM_GOLDEN_IMAGE_ENABLED = os.environ.get(
+    "VM_GOLDEN_IMAGE_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes")
+# Golden PVC size; falls back to VM_DISK_SIZE so the clone target (also
+# VM_DISK_SIZE) is never smaller than its source.
+VM_GOLDEN_DISK_SIZE = os.environ.get("VM_GOLDEN_DISK_SIZE", "").strip() or VM_DISK_SIZE
+# Bounded wait for a golden import/clone to reach Succeeded (mirrors the agent's
+# VM_UPGRADE_POLL_TIMEOUT=900 cold-import budget).
+VM_GOLDEN_POLL_TIMEOUT = int(os.environ.get("VM_GOLDEN_POLL_TIMEOUT", "900"))
+VM_GOLDEN_GC_ENABLED = os.environ.get(
+    "VM_GOLDEN_GC_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+# Keep the N newest golden digests; GC older ones (mirrors CDI's importsToKeep).
+VM_GOLDEN_KEEP = int(os.environ.get("VM_GOLDEN_KEEP", "3"))
+VM_GOLDEN_GC_MIN_AGE_MINUTES = int(os.environ.get("VM_GOLDEN_GC_MIN_AGE_MINUTES", "30"))
+
+# Persistent rootdisks (knowledge-base/knowledge/features/vm_persistent_rootdisk.md). When enabled,
+# the VM's root disk is created as a STANDALONE DataVolume — same deterministic
+# name the template already renders — instead of via spec.dataVolumeTemplates.
+# Without an ownerRef it is not cascade-deleted with the VM, so a recreate
+# reattaches it by name: files intact, and the clone skipped entirely. Off by
+# default → byte-for-byte the legacy templated-disk behaviour.
+VM_PERSISTENT_ROOTDISK = os.environ.get(
+    "VM_PERSISTENT_ROOTDISK", "false"
+).strip().lower() in ("1", "true", "yes")
+# Orphan backstop for rootdisks whose entity the orchestrator no longer knows
+# (a dev DB reset, a deleted row) — the orchestrator's own kept-disk sweep
+# cannot see those. OFF by default on purpose: the controller has no DB, so it
+# cannot tell a leaked disk from the workspace of a session that has been
+# suspended for a long weekend. Enable it only where sessions are short-lived
+# or capacity is tight.
+VM_ROOTDISK_GC_ENABLED = os.environ.get(
+    "VM_ROOTDISK_GC_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes")
+# Generous: a kept disk is *supposed* to outlive its VM while a recovery is in
+# flight. No VM for this long means nobody is coming back for it.
+VM_ROOTDISK_ORPHAN_HOURS = int(os.environ.get("VM_ROOTDISK_ORPHAN_HOURS", "72"))
+# CDI creates the PVC asynchronously after a DataVolume/VM is admitted.  The
+# immutable PVC UID is the storage-metering ownership credential, so give the
+# controller a short bounded window to observe it before returning the create
+# result.  Failure is non-fatal for VM provisioning, but metering deliberately
+# leaves that rootdisk unattributed until a later create can attest the UID.
+VM_ROOTDISK_PVC_UID_ATTEMPTS = int(os.environ.get("VM_ROOTDISK_PVC_UID_ATTEMPTS", "20"))
+VM_ROOTDISK_PVC_UID_RETRY_SECONDS = float(
+    os.environ.get("VM_ROOTDISK_PVC_UID_RETRY_SECONDS", "0.25")
+)
+LIFECYCLE_LOCK_STRIPES = 256
+
 # Transport selection: nats | http | both. Defaults to nats so existing
 # deployment-vms/ Fleet bundles keep working without overrides.
 TRANSPORT = os.environ.get("TRANSPORT", "nats").lower()
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
+LIFECYCLE_HMAC_SECRET = configured_secret()
+LIFECYCLE_REPLAY_CACHE_SIZE = int(
+    os.environ.get("VM_LIFECYCLE_REPLAY_CACHE_SIZE", "10000")
+)
+LIFECYCLE_NONCE_TTL_SECONDS = max(
+    120, int(os.environ.get("VM_LIFECYCLE_NONCE_TTL_SECONDS", "300"))
+)
+LIFECYCLE_NONCE_GC_INTERVAL = max(
+    1, int(os.environ.get("VM_LIFECYCLE_NONCE_GC_INTERVAL", "100"))
+)
+LIFECYCLE_NONCE_GC_PAGE_LIMIT = min(
+    500, max(1, int(os.environ.get("VM_LIFECYCLE_NONCE_GC_PAGE_LIMIT", "100")))
+)
+LIFECYCLE_NONCE_GC_DELETE_LIMIT = min(
+    LIFECYCLE_NONCE_GC_PAGE_LIMIT,
+    max(1, int(os.environ.get("VM_LIFECYCLE_NONCE_GC_DELETE_LIMIT", "100"))),
+)
+_LIFECYCLE_NONCE_LABEL = "srw.io/vm-lifecycle-nonce"
 
 # KubeVirt API coordinates
 KUBEVIRT_GROUP = "kubevirt.io"
 KUBEVIRT_VERSION = "v1"
 KUBEVIRT_PLURAL = "virtualmachines"
+KUBEVIRT_VMI_PLURAL = "virtualmachineinstances"
+
+# CDI (Containerized Data Importer) API coordinates — golden DataVolumes
+CDI_GROUP = "cdi.kubevirt.io"
+CDI_VERSION = "v1beta1"
+CDI_PLURAL = "datavolumes"
+
+# The job description is free text — typed by users, generated by the loop
+# engine and automations — and lands in a JSON blob nested inside the VM
+# template's cloud-init `userData: |` block scalar. Raw substitution there is
+# unsafe twice over: a newline puts the continuation at column 1, dedenting out
+# of the block scalar and destroying the manifest (job 4435994d), while a quote
+# or backslash leaves valid YAML wrapping a corrupt job-config.json that
+# management-daemon.py discards with only a log.warning.
+#
+# Capped because the whole userData block has a hard 2048-byte KubeVirt limit
+# (inline cloudInitNoCloud) with only ~350 bytes of headroom. Nothing in the VM
+# reads this field — management-daemon.py is job-config.json's only consumer and
+# never looks at `description` — so truncating it costs nothing.
+MAX_DESCRIPTION_LEN = 200
+
+_OWNER_KINDS = frozenset({"job", "thread"})
+_PROVISION_GENERATION_ANNOTATION = "srw.io/provision-generation"
+_NETWORK_TIER_PATTERN = re.compile(r"^[a-z0-9-]{1,63}$")
+
+
+def _owner_identity(job_config: dict) -> tuple[str, str]:
+    """Return the validated, full application owner identity for one VM."""
+
+    owner_kind = job_config.get("entity_type", "job")
+    owner_id = job_config.get("job_id")
+    if owner_kind not in _OWNER_KINDS:
+        raise ValueError("entity_type must be 'job' or 'thread'")
+    if (
+        not isinstance(owner_id, str)
+        or not owner_id
+        or owner_id != owner_id.strip()
+        or len(owner_id) > 63
+        or any(character.isspace() for character in owner_id)
+    ):
+        raise ValueError("job_id is not a valid Kubernetes owner label")
+    return owner_kind, owner_id
+
+
+def _stamp_owner_identity(manifest: dict, owner_kind: str, owner_id: str) -> None:
+    """Stamp VM, VMI-template, and DataVolume/PVC-propagated owner labels."""
+
+    def stamp(metadata: dict) -> None:
+        labels = metadata.setdefault("labels", {})
+        labels["srw.io/owner-kind"] = owner_kind
+        labels["srw.io/owner-id"] = owner_id
+
+    metadata = manifest.setdefault("metadata", {})
+    stamp(metadata)
+    spec = manifest.setdefault("spec", {})
+    template = spec.setdefault("template", {})
+    stamp(template.setdefault("metadata", {}))
+    data_volume_templates = spec.get("dataVolumeTemplates", [])
+    if isinstance(data_volume_templates, list):
+        for data_volume_template in data_volume_templates:
+            if isinstance(data_volume_template, dict):
+                stamp(data_volume_template.setdefault("metadata", {}))
+
+
+def _provision_generation(value: object) -> str | None:
+    """Return only the canonical opaque generation format we mint."""
+
+    if not isinstance(value, str) or len(value) != 36:
+        return None
+    try:
+        parsed = UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if str(parsed) == value else None
+
+
+def _stamp_provision_generation(manifest: dict, generation: str) -> None:
+    """Bind a VM and its VMI template to one durable provision attempt."""
+
+    metadata = manifest.setdefault("metadata", {})
+    metadata.setdefault("annotations", {})[_PROVISION_GENERATION_ANNOTATION] = (
+        generation
+    )
+    template_metadata = (
+        manifest.setdefault("spec", {})
+        .setdefault("template", {})
+        .setdefault("metadata", {})
+    )
+    template_metadata.setdefault("annotations", {})[
+        _PROVISION_GENERATION_ANNOTATION
+    ] = generation
+
+
+def _admitted_provision_generation(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    metadata = value.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    annotations = metadata.get("annotations")
+    if not isinstance(annotations, Mapping):
+        return None
+    return _provision_generation(annotations.get(_PROVISION_GENERATION_ANNOTATION))
+
+
+def _authenticated_http_payload(
+    request, payload: Mapping[str, object], *, operation: str
+) -> dict:
+    """Attach the fixed HTTP query signature to a reconstructed payload."""
+
+    result = dict(payload)
+    signature_value = request.query.get("lifecycle_auth")
+    if signature_value is not None:
+        try:
+            issued_at = int(request.query.get("lifecycle_auth_issued_at", ""))
+        except (TypeError, ValueError):
+            issued_at = None
+        result[AUTH_FIELD] = {
+            "version": AUTH_VERSION,
+            "direction": "request",
+            "operation": operation,
+            "issued_at": issued_at,
+            "request_id": request.query.get("lifecycle_auth_request_id"),
+            "signature": signature_value,
+        }
+    return result
+
+
+def _lifecycle_request_id(payload: Mapping[str, object]) -> str | None:
+    auth = payload.get(AUTH_FIELD)
+    if not isinstance(auth, Mapping):
+        return None
+    value = auth.get("request_id")
+    return value if isinstance(value, str) else None
+
+
+def _admitted_vm_uid(value: object, *, expected_name: str) -> str | None:
+    """Extract one admitted VM UID without trusting a loose response shape."""
+
+    if not isinstance(value, Mapping):
+        return None
+    metadata = value.get("metadata")
+    if not isinstance(metadata, Mapping) or metadata.get("name") != expected_name:
+        return None
+    uid = metadata.get("uid")
+    if (
+        not isinstance(uid, str)
+        or not uid
+        or uid != uid.strip()
+        or len(uid) > 256
+        or any(character.isspace() for character in uid)
+    ):
+        return None
+    return uid
+
+
+def _safe_uid(value: object) -> str | None:
+    """Validate one opaque Kubernetes UID without interpreting its format."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 256
+        or any(character.isspace() for character in value)
+    ):
+        return None
+    return value
+
+
+def _admitted_pvc_uid(
+    value: object,
+    *,
+    expected_name: str,
+    expected_owner_id: str,
+    expected_owner_kind: str | None,
+) -> str | None:
+    """Extract a PVC UID only from the exact controller-owned root claim."""
+
+    if isinstance(value, Mapping):
+        metadata = value.get("metadata")
+    else:
+        metadata = getattr(value, "metadata", None)
+    if isinstance(metadata, Mapping):
+        name = metadata.get("name")
+        uid = metadata.get("uid")
+        labels = metadata.get("labels")
+    else:
+        name = getattr(metadata, "name", None)
+        uid = getattr(metadata, "uid", None)
+        labels = getattr(metadata, "labels", None)
+    if name != expected_name or not isinstance(labels, Mapping):
+        return None
+    if labels.get("srw.io/owner-id") != expected_owner_id:
+        return None
+    owner_kind = labels.get("srw.io/owner-kind")
+    if owner_kind not in _OWNER_KINDS or (
+        expected_owner_kind is not None and owner_kind != expected_owner_kind
+    ):
+        return None
+    if (
+        not isinstance(uid, str)
+        or not uid
+        or uid != uid.strip()
+        or len(uid) > 256
+        or any(character.isspace() for character in uid)
+    ):
+        return None
+    return uid
 
 
 class VMController:
@@ -85,9 +409,222 @@ class VMController:
         self.nc = None  # NATS client (when transport includes nats)
         self.http_runner = None  # aiohttp AppRunner (when transport includes http)
         self.k8s_client = None  # kubernetes CustomObjectsApi
+        self.core_api = None  # kubernetes CoreV1Api (read-only PVC identity)
+        self.coordination_api = None  # durable lifecycle replay claims
         self.template_text: str = ""  # Raw YAML template (for string substitution)
+        self.cloud_init_text: str = ""  # Optional Secret-backed cloud-init payload
         self.headscale = HeadscaleClient()
         self._shutdown = asyncio.Event()
+        self._seen_lifecycle_requests: OrderedDict[str, float] = OrderedDict()
+        self._lifecycle_nonce_claim_count = 0
+        self._lifecycle_nonce_gc_continue: str | None = None
+        # The chart runs one controller replica. A fixed-size striped lock set
+        # serializes create/delete for one reusable VM/rootdisk name without an
+        # unbounded per-job lock registry. This closes the absent-VM -> rootdisk
+        # purge race against a concurrent re-create in the same controller.
+        self._lifecycle_locks = tuple(
+            asyncio.Lock() for _ in range(LIFECYCLE_LOCK_STRIPES)
+        )
+        # Admission capacity is process-wide, not per entity. Holding this
+        # lock from the live-VM count through VirtualMachine admission makes
+        # VM_MAX_CONCURRENT a hard cap for concurrent creates.
+        self._capacity_lock = asyncio.Lock()
+
+    def _lifecycle_lock_for(self, entity_id: str) -> asyncio.Lock:
+        locks = getattr(self, "_lifecycle_locks", None)
+        if not locks:
+            # A few unit-test fixtures intentionally construct via __new__.
+            locks = tuple(asyncio.Lock() for _ in range(LIFECYCLE_LOCK_STRIPES))
+            self._lifecycle_locks = locks
+        digest = hashlib.sha256(entity_id.encode("utf-8")).digest()
+        return locks[int.from_bytes(digest[:8], "big") % len(locks)]
+
+    async def _verify_lifecycle_request(
+        self, payload: Mapping[str, object], operation: str, *, mutating: bool
+    ) -> bool:
+        """Verify freshness/MAC and durably claim mutating request nonces."""
+
+        if not verify_payload(
+            payload,
+            direction="request",
+            operation=operation,
+            secret=LIFECYCLE_HMAC_SECRET,
+        ):
+            return False
+        if LIFECYCLE_HMAC_SECRET is None or not mutating:
+            return True
+        auth = payload.get(AUTH_FIELD)
+        if not isinstance(auth, Mapping):
+            return False
+        request_id = auth.get("request_id")
+        if not isinstance(request_id, str):
+            return False
+        if not hasattr(self, "_seen_lifecycle_requests"):
+            self._seen_lifecycle_requests = OrderedDict()
+        now = time.monotonic()
+        oldest_allowed = now - 120.0
+        while self._seen_lifecycle_requests:
+            first_id, first_seen = next(iter(self._seen_lifecycle_requests.items()))
+            if first_seen >= oldest_allowed:
+                break
+            self._seen_lifecycle_requests.pop(first_id, None)
+        if request_id in self._seen_lifecycle_requests:
+            return False
+        if not await self._claim_lifecycle_nonce(request_id, operation):
+            return False
+        self._seen_lifecycle_requests[request_id] = now
+        while len(self._seen_lifecycle_requests) > max(1, LIFECYCLE_REPLAY_CACHE_SIZE):
+            self._seen_lifecycle_requests.popitem(last=False)
+        return True
+
+    async def _claim_lifecycle_nonce(self, request_id: str, operation: str) -> bool:
+        """Atomically consume one signed mutation nonce in Kubernetes.
+
+        A namespaced Lease survives controller restarts and is shared across
+        replicas. Kubernetes create is the compare-and-set: HTTP 409 means the
+        request UUID was already consumed. Any other API/RBAC failure rejects
+        the mutation instead of silently downgrading to the in-memory cache.
+        """
+
+        if self.coordination_api is None:
+            log.error("Lifecycle nonce store is unavailable; rejecting %s", operation)
+            return False
+        nonce_name = f"srw-vm-lifecycle-{UUID(request_id).hex}"
+        now = datetime.now(timezone.utc)
+        body = {
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": nonce_name,
+                "namespace": VM_NAMESPACE,
+                "labels": {_LIFECYCLE_NONCE_LABEL: "true"},
+            },
+            "spec": {
+                "holderIdentity": f"{operation}:{request_id}",
+                "acquireTime": now.isoformat().replace("+00:00", "Z"),
+                "leaseDurationSeconds": LIFECYCLE_NONCE_TTL_SECONDS,
+            },
+        }
+        try:
+            await asyncio.to_thread(
+                self.coordination_api.create_namespaced_lease,
+                namespace=VM_NAMESPACE,
+                body=body,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 409:
+                log.warning("Rejecting replayed VM lifecycle request %s", request_id)
+            else:
+                log.error(
+                    "Could not durably claim VM lifecycle request %s: %s",
+                    request_id,
+                    exc,
+                )
+            return False
+
+        self._lifecycle_nonce_claim_count = (
+            getattr(self, "_lifecycle_nonce_claim_count", 0) + 1
+        )
+        if self._lifecycle_nonce_claim_count % LIFECYCLE_NONCE_GC_INTERVAL == 0:
+            if not await self._gc_expired_lifecycle_nonces(now=now):
+                return False
+        return True
+
+    async def _gc_expired_lifecycle_nonces(
+        self, *, now: datetime | None = None
+    ) -> bool:
+        """Best-effort bounded-TTL cleanup, failing closed when it is due."""
+
+        if self.coordination_api is None:
+            return False
+        cutoff = (now or datetime.now(timezone.utc)).timestamp() - (
+            LIFECYCLE_NONCE_TTL_SECONDS
+        )
+        cursor = getattr(self, "_lifecycle_nonce_gc_continue", None)
+        list_kwargs = {
+            "namespace": VM_NAMESPACE,
+            "label_selector": f"{_LIFECYCLE_NONCE_LABEL}=true",
+            "limit": LIFECYCLE_NONCE_GC_PAGE_LIMIT,
+        }
+        if cursor:
+            list_kwargs["_continue"] = cursor
+        try:
+            response = await asyncio.to_thread(
+                self.coordination_api.list_namespaced_lease,
+                **list_kwargs,
+            )
+            items = (
+                response.get("items", [])
+                if isinstance(response, Mapping)
+                else getattr(response, "items", [])
+            )
+            response_metadata = (
+                response.get("metadata", {})
+                if isinstance(response, Mapping)
+                else getattr(response, "metadata", None)
+            )
+            if isinstance(response_metadata, Mapping):
+                next_cursor = response_metadata.get("continue")
+            else:
+                next_cursor = getattr(response_metadata, "_continue", None)
+            if not isinstance(next_cursor, str) or not next_cursor:
+                next_cursor = None
+            deleted = 0
+            page_exhausted = True
+            for lease in (items or [])[:LIFECYCLE_NONCE_GC_PAGE_LIMIT]:
+                metadata = (
+                    lease.get("metadata")
+                    if isinstance(lease, Mapping)
+                    else getattr(lease, "metadata", None)
+                )
+                if isinstance(metadata, Mapping):
+                    name = metadata.get("name")
+                    created_at = metadata.get("creationTimestamp")
+                else:
+                    name = getattr(metadata, "name", None)
+                    created_at = getattr(metadata, "creation_timestamp", None)
+                if not isinstance(name, str):
+                    continue
+                if isinstance(created_at, str):
+                    try:
+                        created_at = datetime.fromisoformat(
+                            created_at.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        continue
+                if not isinstance(created_at, datetime):
+                    continue
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if created_at.timestamp() > cutoff:
+                    continue
+                if deleted >= LIFECYCLE_NONCE_GC_DELETE_LIMIT:
+                    page_exhausted = False
+                    break
+                deletion_succeeded = True
+                try:
+                    await asyncio.to_thread(
+                        self.coordination_api.delete_namespaced_lease,
+                        name=name,
+                        namespace=VM_NAMESPACE,
+                        body={"apiVersion": "v1", "kind": "DeleteOptions"},
+                    )
+                except Exception as exc:
+                    if getattr(exc, "status", None) != 404:
+                        raise
+                    deletion_succeeded = False
+                if deletion_succeeded:
+                    deleted += 1
+            if page_exhausted:
+                self._lifecycle_nonce_gc_continue = next_cursor
+            return True
+        except Exception as exc:
+            if getattr(exc, "status", None) == 410:
+                self._lifecycle_nonce_gc_continue = None
+                log.info("VM lifecycle nonce GC cursor expired; restarting scan")
+                return True
+            log.error("VM lifecycle nonce garbage collection failed: %s", exc)
+            return False
 
     def load_template(self):
         """Load the VM template as raw text for placeholder substitution."""
@@ -99,7 +636,34 @@ class VMController:
         with open(path) as f:
             self.template_text = f.read()
 
+        cloud_init_path = VM_CLOUD_INIT_PATH
+        if os.path.exists(cloud_init_path):
+            with open(cloud_init_path) as f:
+                self.cloud_init_text = f.read()
+            log.info("Loaded cloud-init template from %s", cloud_init_path)
+        else:
+            # The parked external chart embeds userData in its VM template.
+            # Keeping this optional preserves that image/transport contract.
+            self.cloud_init_text = ""
+
         log.info("Loaded VM template from %s", path)
+
+    @staticmethod
+    def _escape_for_job_config(description: str) -> str:
+        """JSON-escape a description for the template's job-config.json blob.
+
+        Returns the escaped body without json.dumps' surrounding quotes, since
+        the template supplies those. Shrinks the raw text until its *escaped*
+        form fits MAX_DESCRIPTION_LEN, so an escape sequence is never cut in
+        half.
+
+        Keep in sync with the copy in orchestrator/services/vm_provisioner.py —
+        separate images, so the two cannot share code.
+        """
+        raw = description[:MAX_DESCRIPTION_LEN]
+        while raw and len(json.dumps(raw)[1:-1]) > MAX_DESCRIPTION_LEN:
+            raw = raw[:-1]
+        return json.dumps(raw)[1:-1]
 
     def render_template(self, job_config: dict, tailscale_auth_key: str = "") -> dict:
         """Render the VM template with job-specific values.
@@ -118,10 +682,36 @@ class VMController:
             Parsed YAML dict ready for the Kubernetes API.
         """
         headscale_url = os.environ.get("HEADSCALE_URL", "")
+        owner_kind, owner_id = _owner_identity(job_config)
+        # The orchestrator resolves the project's tier per job; the chart's
+        # VM_DEFAULT_NETWORK_TIER is only the fallback for payloads that omit it.
+        network_tier = (
+            str(job_config.get("network_tier") or "").strip()
+            or VM_DEFAULT_NETWORK_TIER
+            or "internet-only"
+        )
+        if not _NETWORK_TIER_PATTERN.fullmatch(network_tier):
+            raise ValueError("network_tier must match ^[a-z0-9-]{1,63}$")
+        orchestrator_url = (
+            ORCHESTRATOR_URL or str(job_config.get("orchestrator_url") or "").strip()
+        )
+        generation = _provision_generation(job_config.get("provision_generation"))
+        vm_auth_token = (
+            guest_token(
+                LIFECYCLE_HMAC_SECRET,
+                owner_kind,
+                owner_id,
+                generation,
+            )
+            if LIFECYCLE_HMAC_SECRET is not None and generation is not None
+            else ""
+        )
 
         replacements = {
             "${JOB_ID}": job_config["job_id"],
-            "${AGENT_CONFIG}": job_config.get("agent_config", "defaults"),
+            "${OWNER_KIND}": owner_kind,
+            "${OWNER_ID}": owner_id,
+            "${AGENT_CONFIG}": job_config.get("agent_config", "worker_base"),
             "${VM_IMAGE}": job_config.get("vm_image", DEFAULT_VM_IMAGE),
             "${CPU_CORES}": str(job_config.get("cpu_cores", DEFAULT_CPU)),
             "${MEMORY}": job_config.get("memory", DEFAULT_MEMORY),
@@ -133,20 +723,44 @@ class VMController:
             # cloud-init so the in-VM publishers reach this orchestrator's
             # scoped subscribe wildcards.
             "${ORCHESTRATOR_ID}": ORCHESTRATOR_ID,
-            "${DESCRIPTION}": job_config.get("description", ""),
+            "${DESCRIPTION}": self._escape_for_job_config(
+                job_config.get("description", "")
+            ),
             # CDI DataVolume storage
             "${VM_STORAGE_CLASS}": VM_STORAGE_CLASS,
             "${VM_DISK_SIZE}": VM_DISK_SIZE,
             # Headscale mesh VPN — VM joins tailnet on boot
             "${TAILSCALE_AUTH_KEY}": tailscale_auth_key,
             "${HEADSCALE_URL}": headscale_url,
+            # The Vault-backed chart branch injects this from its synced
+            # Secret. The inline-key branch contains no such placeholder, so
+            # an absent environment value is harmless there.
+            "${SSH_AUTHORIZED_KEY}": os.environ.get("SSH_AUTHORIZED_KEY", ""),
+            "${VM_AUTH_TOKEN}": vm_auth_token,
+            "${ORCHESTRATOR_URL}": orchestrator_url,
+            "${NETWORK_TIER}": network_tier,
         }
 
         rendered = self.template_text
         for placeholder, value in replacements.items():
             rendered = rendered.replace(placeholder, value)
 
-        return yaml.safe_load(rendered)
+        manifest = yaml.safe_load(rendered)
+        vmi_spec = manifest["spec"]["template"]["spec"]
+        if VM_NODE_SELECTOR:
+            vmi_spec["nodeSelector"] = dict(VM_NODE_SELECTOR)
+        if VM_TOLERATIONS:
+            vmi_spec["tolerations"] = list(VM_TOLERATIONS)
+        if cloud_init_text := getattr(self, "cloud_init_text", ""):
+            rendered_cloud_init = cloud_init_text
+            for placeholder, value in replacements.items():
+                rendered_cloud_init = rendered_cloud_init.replace(placeholder, value)
+            # Internal hand-off only; removed before the VM is sent to KubeVirt.
+            manifest["_srwCloudInitUserData"] = rendered_cloud_init
+        _stamp_owner_identity(manifest, owner_kind, owner_id)
+        if generation:
+            _stamp_provision_generation(manifest, generation)
+        return manifest
 
     def init_k8s(self):
         """Initialize the Kubernetes client using in-cluster config."""
@@ -154,6 +768,8 @@ class VMController:
 
         config.load_incluster_config()
         self.k8s_client = client.CustomObjectsApi()
+        self.core_api = client.CoreV1Api()
+        self.coordination_api = client.CoordinationV1Api()
         log.info("Kubernetes client initialized (in-cluster)")
 
     async def connect_nats(self):
@@ -187,77 +803,548 @@ class VMController:
     # payload. Both NATS and HTTP transports wrap these.
     # =========================================================================
 
+    async def _capacity_wait(self, vm_name: str) -> dict | None:
+        """Return waiting_capacity when the live VM cap is already occupied."""
+
+        if VM_MAX_CONCURRENT == 0:
+            return None
+        response = await asyncio.to_thread(
+            self.k8s_client.list_namespaced_custom_object,
+            group=KUBEVIRT_GROUP,
+            version=KUBEVIRT_VERSION,
+            namespace=VM_NAMESPACE,
+            plural=KUBEVIRT_PLURAL,
+        )
+        live_names = []
+        for item in response.get("items", []):
+            metadata = item.get("metadata", {})
+            name = metadata.get("name", "")
+            if (
+                name.startswith("agent-vm-")
+                and not name.startswith("agent-vm-golden-")
+                and not metadata.get("deletionTimestamp")
+            ):
+                live_names.append(name)
+        # A retried create for an admitted VM remains idempotent even at cap.
+        if vm_name in live_names or len(live_names) < VM_MAX_CONCURRENT:
+            return None
+        return {
+            "status": "waiting_capacity",
+            "running_vms": len(live_names),
+            "max_concurrent_vms": VM_MAX_CONCURRENT,
+        }
+
+    async def _ensure_cloud_init_secret(
+        self,
+        *,
+        job_id: str,
+        owner_kind: str,
+        generation: str | None,
+        user_data: str,
+    ) -> bool:
+        """Ensure the NoCloud Secret and report whether this call created it."""
+
+        from kubernetes.client.exceptions import ApiException
+
+        secret_name = f"agent-vm-{job_id}-cloudinit"
+        metadata: dict[str, object] = {
+            "name": secret_name,
+            "namespace": VM_NAMESPACE,
+            "labels": {
+                "srw.io/owner-kind": owner_kind,
+                "srw.io/owner-id": job_id,
+            },
+        }
+        if generation is not None:
+            metadata["annotations"] = {_PROVISION_GENERATION_ANNOTATION: generation}
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": metadata,
+            "type": "Opaque",
+            "stringData": {"userdata": user_data},
+        }
+        try:
+            await asyncio.to_thread(
+                self.core_api.create_namespaced_secret,
+                namespace=VM_NAMESPACE,
+                body=body,
+            )
+            return True
+        except ApiException as exc:
+            if exc.status != 409:
+                raise
+            existing = await asyncio.to_thread(
+                self.core_api.read_namespaced_secret,
+                name=secret_name,
+                namespace=VM_NAMESPACE,
+            )
+            existing_metadata = getattr(existing, "metadata", None)
+            labels = getattr(existing_metadata, "labels", None) or {}
+            annotations = getattr(existing_metadata, "annotations", None) or {}
+            if (
+                labels.get("srw.io/owner-kind") != owner_kind
+                or labels.get("srw.io/owner-id") != job_id
+                or (
+                    generation is not None
+                    and annotations.get(_PROVISION_GENERATION_ANNOTATION) != generation
+                )
+            ):
+                raise RuntimeError(
+                    "existing cloud-init Secret belongs to another VM generation"
+                ) from exc
+            return False
+
+    async def _patch_cloud_init_secret_owner(
+        self, *, job_id: str, vm_name: str, vm_uid: str
+    ) -> None:
+        """Make the admitted VirtualMachine own its token-bearing Secret."""
+
+        await asyncio.to_thread(
+            self.core_api.patch_namespaced_secret,
+            name=f"agent-vm-{job_id}-cloudinit",
+            namespace=VM_NAMESPACE,
+            body={
+                "metadata": {
+                    "ownerReferences": [
+                        {
+                            "apiVersion": "kubevirt.io/v1",
+                            "kind": "VirtualMachine",
+                            "name": vm_name,
+                            "uid": vm_uid,
+                            "controller": True,
+                            "blockOwnerDeletion": False,
+                        }
+                    ]
+                }
+            },
+        )
+
+    async def _delete_cloud_init_secret(self, job_id: str) -> None:
+        """Delete a VM's NoCloud Secret, tolerating an already-absent Secret."""
+
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            await asyncio.to_thread(
+                self.core_api.delete_namespaced_secret,
+                name=f"agent-vm-{job_id}-cloudinit",
+                namespace=VM_NAMESPACE,
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+
     async def _do_create(self, job_config: dict) -> dict:
         """Create a KubeVirt VirtualMachine for a job."""
+        job_id = job_config.get("job_id", "unknown")
+        async with self._lifecycle_lock_for(str(job_id)):
+            capacity_lock = getattr(self, "_capacity_lock", None)
+            if capacity_lock is None:
+                # A few unit-test fixtures intentionally construct via __new__.
+                capacity_lock = asyncio.Lock()
+                self._capacity_lock = capacity_lock
+            async with capacity_lock:
+                return await self._do_create_serialized(job_config)
+
+    async def _do_create_serialized(self, job_config: dict) -> dict:
+        """Create while holding the reusable entity-name lifecycle lock."""
         from kubernetes.client.exceptions import ApiException
 
         job_id = job_config.get("job_id", "unknown")
+        owner_kind, _ = _owner_identity(job_config)
+        generation = _provision_generation(job_config.get("provision_generation"))
+        if LIFECYCLE_HMAC_SECRET is not None and generation is None:
+            raise ValueError(
+                "authenticated VM create requires a canonical provision_generation"
+            )
         log.info("Creating VM for job %s", job_id)
 
+        capacity = await self._capacity_wait(f"agent-vm-{job_id}")
+        if capacity is not None:
+            result = {"job_id": job_id, **capacity}
+            if generation is not None:
+                result["provision_generation"] = generation
+            return result
+
+        # Golden-image acceleration: import the base image once into a shared
+        # golden PVC and clone the rootdisk from it, instead of a per-VM registry
+        # import. Runs on EVERY create (incl. crash-recovery re-dispatch).
+        #
+        # NON-BLOCKING: if the golden is still importing (a cold import after an
+        # agent-vm-base bump takes ~30 min — longer than every provisioning
+        # budget), return ``waiting_golden`` WITHOUT creating the VM. Blocking
+        # here (the old 900s wait) let the orchestrator recycle and re-create
+        # while stale handlers were still parked in the wait; when the golden
+        # finally succeeded, the racers collided in 409 AlreadyExists and failed
+        # two loop jobs. The orchestrator polls create until the golden is
+        # ready (see knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
+        # Checked FIRST so a poll doesn't mint a fresh Headscale auth key every
+        # ~30s for the whole import window.
+        #
+        # Golden-infra *errors* (not in-progress imports) leave golden_name
+        # None → the rendered manifest keeps its registry source (byte-for-byte
+        # legacy behaviour + fallback).
+        image = job_config.get("vm_image") or DEFAULT_VM_IMAGE
+        golden_name = None
+        if VM_GOLDEN_IMAGE_ENABLED:
+            waiting = None
+            try:
+                golden_name, waiting = await self._golden_state_nowait(image)
+            except Exception:
+                log.exception(
+                    "golden ensure failed for job %s — falling back to registry",
+                    job_id,
+                )
+            if waiting is not None:
+                log.info(
+                    "golden %s not ready for job %s (%s) — deferring VM create",
+                    waiting.get("golden"),
+                    job_id,
+                    waiting.get("golden_progress") or waiting.get("golden_phase"),
+                )
+                result = {"job_id": job_id, "status": "waiting_golden", **waiting}
+                if generation is not None:
+                    result["provision_generation"] = generation
+                return result
+
+        # Mesh VPN is how the orchestrator reaches the guest: a VM that boots
+        # without a pre-auth key never joins the tailnet, so its daemon
+        # registers with the QEMU-NAT address and ssh_ready=false forever. It
+        # looks alive (it heartbeats) but is unreachable, and burns the full
+        # provisioning budget — 3 × 10 min — before the job fails. Defer the
+        # create instead, mirroring waiting_golden: no VM is built, so the
+        # dispatcher polls without consuming a provision attempt. See
+        # knowledge-base/knowledge/issues/vm_controller_headscale_latch_kills_provisioning.md.
         tailscale_auth_key = ""
         if self.headscale.is_available:
             tailscale_auth_key = await self.headscale.create_auth_key(job_id) or ""
             if not tailscale_auth_key:
+                headscale_error = self.headscale.last_error or "Headscale unavailable"
                 log.warning(
-                    "Failed to get Headscale auth key for job %s — "
-                    "VM will boot without mesh VPN",
+                    "No Headscale auth key for job %s (%s) — deferring VM create; "
+                    "a keyless VM could never be reached",
                     job_id,
+                    headscale_error,
                 )
+                result = {
+                    "job_id": job_id,
+                    "status": "waiting_headscale",
+                    "headscale_error": headscale_error,
+                }
+                if generation is not None:
+                    result["provision_generation"] = generation
+                return result
+
+        if (
+            "${SSH_AUTHORIZED_KEY}" in getattr(self, "cloud_init_text", "")
+            and not os.environ.get("SSH_AUTHORIZED_KEY", "").strip()
+        ):
+            raise ValueError(
+                "SSH_AUTHORIZED_KEY must be non-empty for Secret-backed cloud-init"
+            )
 
         manifest = self.render_template(job_config, tailscale_auth_key)
+        cloud_init_user_data = manifest.pop("_srwCloudInitUserData", None)
         vm_name = manifest["metadata"]["name"]
+        if golden_name:
+            self._apply_clone_source(manifest, golden_name)
+
+        # Detach the rootdisk from the VM object so it outlives it. Must run
+        # AFTER the clone mutation above — it lifts the template's dataVolume
+        # spec as-is, clone source included.
+        if VM_PERSISTENT_ROOTDISK:
+            await self._ensure_rootdisk(manifest, job_id, owner_kind=owner_kind)
+
+        cloud_init_secret_created = False
+        if cloud_init_user_data is not None:
+            cloud_init_secret_created = await self._ensure_cloud_init_secret(
+                job_id=job_id,
+                owner_kind=owner_kind,
+                generation=generation,
+                user_data=cloud_init_user_data,
+            )
 
         max_retries = 12  # ~60s total
-        for attempt in range(max_retries + 1):
-            try:
-                self.k8s_client.create_namespaced_custom_object(
-                    group=KUBEVIRT_GROUP,
-                    version=KUBEVIRT_VERSION,
-                    namespace=VM_NAMESPACE,
-                    plural=KUBEVIRT_PLURAL,
-                    body=manifest,
-                )
-                break
-            except ApiException as e:
-                if e.status == 409 and "is being deleted" in (e.body or ""):
-                    if attempt < max_retries:
-                        log.info(
-                            "VM %s still being deleted, waiting... (attempt %d/%d)",
+        admitted_vm: object | None = None
+        try:
+            for attempt in range(max_retries + 1):
+                try:
+                    admitted_vm = await asyncio.to_thread(
+                        self.k8s_client.create_namespaced_custom_object,
+                        group=KUBEVIRT_GROUP,
+                        version=KUBEVIRT_VERSION,
+                        namespace=VM_NAMESPACE,
+                        plural=KUBEVIRT_PLURAL,
+                        body=manifest,
+                    )
+                    break
+                except ApiException as e:
+                    if e.status == 409 and "is being deleted" in (e.body or ""):
+                        if attempt < max_retries:
+                            log.info(
+                                "VM %s still being deleted, waiting... (attempt %d/%d)",
+                                vm_name,
+                                attempt + 1,
+                                max_retries,
+                            )
+                            await asyncio.sleep(5)
+                            continue
+                        log.error(
+                            "VM %s still being deleted after %d retries, giving up",
                             vm_name,
-                            attempt + 1,
                             max_retries,
                         )
-                        await asyncio.sleep(5)
-                        continue
-                    log.error(
-                        "VM %s still being deleted after %d retries, giving up",
-                        vm_name,
-                        max_retries,
-                    )
-                raise
+                    elif e.status == 409:
+                        # Plain AlreadyExists: the name is agent-vm-<job_id>, so a
+                        # live VM with this name IS this job's VM — a duplicate or
+                        # racing create lost to one that already succeeded. Treat
+                        # as idempotent success; propagating the 409 as a 'failed'
+                        # status parked two healthy loop jobs (see knowledge-base/knowledge/issues/
+                        # golden_image_cold_import_fails_inflight_vm_jobs.md §B).
+                        log.info(
+                            "VM %s already exists (job %s) — idempotent create",
+                            vm_name,
+                            job_id,
+                        )
+                        # A 409 response has no admitted object. Read the exact
+                        # existing VM so its immutable metadata.uid crosses the
+                        # transport boundary just like a successful create result.
+                        admitted_vm = await asyncio.to_thread(
+                            self.k8s_client.get_namespaced_custom_object,
+                            group=KUBEVIRT_GROUP,
+                            version=KUBEVIRT_VERSION,
+                            namespace=VM_NAMESPACE,
+                            plural=KUBEVIRT_PLURAL,
+                            name=vm_name,
+                        )
+                        admitted_generation = _admitted_provision_generation(
+                            admitted_vm
+                        )
+                        if generation is not None and admitted_generation != generation:
+                            raise RuntimeError(
+                                "existing VM belongs to another provision generation"
+                            )
+                        break
+                    raise
+        except Exception:
+            if cloud_init_secret_created:
+                await self._delete_cloud_init_secret(job_id)
+            raise
 
-        log.info("VM created: %s (job %s)", vm_name, job_id)
-        return {
-            "job_id": job_id,
-            "status": "created",
-            "vm_name": vm_name,
-            "namespace": VM_NAMESPACE,
-        }
-
-    async def _do_delete(self, job_id: str) -> dict:
-        """Delete a KubeVirt VirtualMachine for a job."""
-        from kubernetes.client.exceptions import ApiException
-
-        vm_name = f"agent-vm-{job_id}"
-        log.info("Deleting VM %s (job %s)", vm_name, job_id)
-
-        try:
-            self.k8s_client.delete_namespaced_custom_object(
+        vm_uid = _admitted_vm_uid(admitted_vm, expected_name=vm_name)
+        admitted_generation = _admitted_provision_generation(admitted_vm)
+        if vm_uid is None or (
+            generation is not None and admitted_generation != generation
+        ):
+            # CustomObjectsApi normally returns the admitted object on create.
+            # A defensive GET covers proxies/older clients that omit the body;
+            # failure remains fail-closed instead of publishing name-only
+            # ownership as exact.
+            admitted_vm = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
                 group=KUBEVIRT_GROUP,
                 version=KUBEVIRT_VERSION,
                 namespace=VM_NAMESPACE,
                 plural=KUBEVIRT_PLURAL,
                 name=vm_name,
+            )
+            vm_uid = _admitted_vm_uid(admitted_vm, expected_name=vm_name)
+            admitted_generation = _admitted_provision_generation(admitted_vm)
+        if vm_uid is None:
+            raise RuntimeError("Kubernetes admitted VM response lacks metadata.uid")
+        if generation is not None and admitted_generation != generation:
+            raise RuntimeError(
+                "Kubernetes admitted VM response has another provision generation"
+            )
+
+        if cloud_init_user_data is not None:
+            await self._patch_cloud_init_secret_owner(
+                job_id=job_id,
+                vm_name=vm_name,
+                vm_uid=vm_uid,
+            )
+
+        rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
+            _rootdisk_name(job_id),
+            owner_id=job_id,
+            owner_kind=owner_kind,
+            wait=True,
+        )
+
+        log.info("VM created: %s (job %s)", vm_name, job_id)
+
+        # Best-effort GC of stale goldens from previous image digests. Never the
+        # current image's golden, one a live VM references (in-flight clone), or
+        # one younger than the min age. Fire-and-forget so it can't delay create.
+        if VM_GOLDEN_IMAGE_ENABLED and VM_GOLDEN_GC_ENABLED and golden_name:
+            asyncio.create_task(self._gc_goldens_safe(image))
+
+        # Same fire-and-forget hook for orphaned rootdisks (opt-in — see
+        # VM_ROOTDISK_GC_ENABLED).
+        if VM_PERSISTENT_ROOTDISK and VM_ROOTDISK_GC_ENABLED:
+            asyncio.create_task(self._gc_rootdisks_safe())
+
+        result = {
+            "job_id": job_id,
+            "status": "created",
+            "vm_name": vm_name,
+            "vm_uid": vm_uid,
+            "namespace": VM_NAMESPACE,
+            "entity_type": owner_kind,
+        }
+        if admitted_generation is not None:
+            result["provision_generation"] = admitted_generation
+        if rootdisk_pvc_uid is not None:
+            result["rootdisk_pvc_uid"] = rootdisk_pvc_uid
+        return result
+
+    async def _do_delete(
+        self,
+        job_id: str,
+        purge_disk: bool = True,
+        provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
+        expected_rootdisk_pvc_uid: str | None = None,
+    ) -> dict:
+        """Delete a KubeVirt VirtualMachine for a job.
+
+        Create and delete share a bounded striped lock keyed by entity ID. In
+        particular, a delete that observes a missing old VM cannot purge the
+        reusable rootdisk name after a concurrent create has attached it.
+        """
+        async with self._lifecycle_lock_for(job_id):
+            return await self._do_delete_serialized(
+                job_id,
+                purge_disk=purge_disk,
+                provision_generation=provision_generation,
+                expected_vm_uid=expected_vm_uid,
+                expected_rootdisk_pvc_uid=expected_rootdisk_pvc_uid,
+            )
+
+    async def _do_delete_serialized(
+        self,
+        job_id: str,
+        purge_disk: bool = True,
+        provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
+        expected_rootdisk_pvc_uid: str | None = None,
+    ) -> dict:
+        """Delete while holding the reusable entity-name lifecycle lock.
+
+        ``purge_disk`` says whether this delete is terminal for the entity.
+        It defaults to True so an orchestrator that never sends the field gets
+        exactly today's semantics (VM gone, disk gone, tailnet node gone) —
+        only now the disk goes by explicit delete rather than ownerRef cascade,
+        which also cleans up disks left behind by a flag flip.
+
+        ``purge_disk=False`` means a recreate is expected (crash recovery, the
+        reconciler giving up on a dirty VM, a session suspending). Two things
+        are kept:
+
+        - the rootdisk DataVolume — the recovery artifact the next create
+          reattaches;
+        - the Headscale node — the kept disk still holds /var/lib/tailscale
+          state for it, so deleting the node would leave the recovered VM
+          reconnecting as a dead one (D3).
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        vm_name = f"agent-vm-{job_id}"
+        generation = _provision_generation(provision_generation)
+        admitted_generation = None
+        if LIFECYCLE_HMAC_SECRET is not None and generation is None:
+            raise ValueError(
+                "authenticated VM delete requires a canonical provision_generation"
+            )
+        log.info(
+            "Deleting VM %s (job %s, rootdisk=%s)",
+            vm_name,
+            job_id,
+            "purge" if purge_disk else "keep",
+        )
+
+        vm_already_absent = False
+        admitted_vm_uid = None
+        if generation is not None:
+            try:
+                current_vm = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_PLURAL,
+                    name=vm_name,
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    vm_already_absent = True
+                else:
+                    raise
+            else:
+                admitted_generation = _admitted_provision_generation(current_vm)
+                if admitted_generation != generation:
+                    raise RuntimeError(
+                        "refusing to delete a VM from another provision generation"
+                    )
+                admitted_vm_uid = _admitted_vm_uid(current_vm, expected_name=vm_name)
+                if admitted_vm_uid is None:
+                    raise RuntimeError(
+                        "refusing to delete a VM without its admitted immutable UID"
+                    )
+                if expected_vm_uid is not None and admitted_vm_uid != expected_vm_uid:
+                    raise RuntimeError("refusing to delete a superseded VM UID")
+
+        rootdisk = _rootdisk_name(job_id)
+        captured_rootdisk_absent = False
+        if expected_rootdisk_pvc_uid is not None:
+            rootdisk_known, observed_rootdisk_uid = await self._rootdisk_pvc_probe(
+                rootdisk,
+                owner_id=job_id,
+                owner_kind=None,
+                wait=False,
+            )
+            if not rootdisk_known:
+                raise RuntimeError(
+                    "captured rootdisk PVC identity is temporarily unknown"
+                )
+            if observed_rootdisk_uid is None:
+                # Response-loss replay: only the conjunction of absent VM,
+                # absent PVC, and absent DataVolume is exact completion.
+                captured_rootdisk_absent = bool(
+                    vm_already_absent and await self._get_dv(rootdisk) is None
+                )
+                if not captured_rootdisk_absent:
+                    raise RuntimeError(
+                        "captured rootdisk PVC is absent but teardown is incomplete"
+                    )
+            if observed_rootdisk_uid != expected_rootdisk_pvc_uid:
+                if not captured_rootdisk_absent:
+                    raise RuntimeError(
+                        "refusing to delete a superseded rootdisk PVC UID"
+                    )
+
+        try:
+            if vm_already_absent:
+                raise ApiException(status=404)
+            await asyncio.to_thread(
+                self.k8s_client.delete_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+                name=vm_name,
+                **(
+                    {
+                        "body": {
+                            "apiVersion": "v1",
+                            "kind": "DeleteOptions",
+                            "preconditions": {"uid": admitted_vm_uid},
+                        }
+                    }
+                    if admitted_vm_uid is not None
+                    else {}
+                ),
             )
         except ApiException as e:
             if e.status == 404:
@@ -265,34 +1352,833 @@ class VMController:
             else:
                 raise
 
-        if self.headscale.is_available:
-            await self.headscale.delete_node(job_id)
+        await self._delete_cloud_init_secret(job_id)
+
+        if purge_disk:
+            # Non-fatal: a disk we failed to delete is a leak the GC backstop
+            # catches, whereas raising here would strand the VM delete itself.
+            try:
+                if (
+                    expected_rootdisk_pvc_uid is not None
+                    and not captured_rootdisk_absent
+                ):
+                    await self._delete_captured_rootdisk(
+                        rootdisk,
+                        owner_id=job_id,
+                        expected_pvc_uid=expected_rootdisk_pvc_uid,
+                    )
+                elif not captured_rootdisk_absent:
+                    await self._delete_dv(rootdisk)
+            except Exception as e:
+                if expected_rootdisk_pvc_uid is not None:
+                    raise
+                log.warning("rootdisk purge failed for %s: %s", rootdisk, e)
+            if self.headscale.is_available:
+                await self.headscale.delete_node(job_id)
+        else:
+            log.info(
+                "rootdisk KEPT: %s (job %s) — Headscale node retained so the "
+                "recreated VM rejoins the tailnet as the same node",
+                rootdisk,
+                job_id,
+            )
 
         log.info("VM deleted: %s (job %s)", vm_name, job_id)
-        return {"job_id": job_id, "status": "deleted", "vm_name": vm_name}
+        result = {
+            "job_id": job_id,
+            "status": "deleted",
+            "vm_name": vm_name,
+            "rootdisk": "purged" if purge_disk else "kept",
+        }
+        if admitted_generation is not None:
+            result["provision_generation"] = admitted_generation
+            result["generation_evidence"] = "admitted-vm-metadata"
+        elif generation is not None:
+            # Idempotent already-absent delete: useful only as a CAS fence for
+            # diagnostics. It never accompanies VM/PVC identity fields.
+            result["provision_generation"] = generation
+            result["generation_evidence"] = "request-echo-vm-absent"
+        return result
 
-    async def _do_status(self, job_id: str) -> dict:
-        """Query KubeVirt for a VM's current status."""
-        vm_name = f"agent-vm-{job_id}"
-        vm = self.k8s_client.get_namespaced_custom_object(
+    async def _do_list(self, *, include_teardown_identity: bool = False) -> dict:
+        """Enumerate the agent VMs this controller manages.
+
+        Inventory source for the orchestrator's VM orphan sweep
+        (``VMInstanceManager.reap_orphans``): the orchestrator's own view is
+        derived from jobs/threads rows, so a VM whose row was deleted is
+        invisible to it — only the controller can still see it. Names encode
+        the owning entity (``agent-vm-<job-or-thread-uuid>``); golden
+        DataVolumes are a different plural and never appear here, but the
+        prefix is excluded anyway as defense-in-depth.
+        """
+        vms = await asyncio.to_thread(
+            self.k8s_client.list_namespaced_custom_object,
             group=KUBEVIRT_GROUP,
             version=KUBEVIRT_VERSION,
             namespace=VM_NAMESPACE,
             plural=KUBEVIRT_PLURAL,
-            name=vm_name,
         )
+        out = []
+        for item in vms.get("items", []):
+            meta = item.get("metadata", {})
+            name = meta.get("name", "")
+            if not name.startswith("agent-vm-") or name.startswith("agent-vm-golden-"):
+                continue
+            entity_id = name[len("agent-vm-") :]
+            inventory = {
+                "vm_name": name,
+                "entity_id": entity_id,
+                "created_at": meta.get("creationTimestamp"),
+                "phase": item.get("status", {}).get("printableStatus", "Unknown"),
+            }
+            if include_teardown_identity:
+                generation = _admitted_provision_generation(item)
+                vm_uid = _admitted_vm_uid(item, expected_name=name)
+                rootdisk_uid = await self._rootdisk_pvc_uid(
+                    _rootdisk_name(entity_id),
+                    owner_id=entity_id,
+                    owner_kind=None,
+                    wait=False,
+                )
+                if generation is not None:
+                    inventory["provision_generation"] = generation
+                if vm_uid is not None:
+                    inventory["vm_uid"] = vm_uid
+                if rootdisk_uid is not None:
+                    inventory["rootdisk_pvc_uid"] = rootdisk_uid
+            out.append(inventory)
+        return {"vms": out}
+
+    async def _do_status(
+        self,
+        job_id: str,
+        provision_generation: str | None = None,
+        *,
+        exact_absence: bool = False,
+    ) -> dict:
+        """Query KubeVirt for a VM's current status."""
+        from kubernetes.client.exceptions import ApiException
+
+        vm_name = f"agent-vm-{job_id}"
+        try:
+            vm = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+                name=vm_name,
+            )
+        except ApiException as exc:
+            if exc.status != 404 or not exact_absence:
+                raise
+            rootdisk_known, rootdisk_uid = await self._rootdisk_pvc_probe(
+                _rootdisk_name(job_id),
+                owner_id=job_id,
+                owner_kind=None,
+                wait=False,
+            )
+            return {
+                "job_id": job_id,
+                "status": "not_found",
+                "provision_generation": _provision_generation(provision_generation),
+                "rootdisk_identity_known": rootdisk_known,
+                **(
+                    {"rootdisk_pvc_uid": rootdisk_uid}
+                    if rootdisk_uid is not None
+                    else {}
+                ),
+            }
         status = vm.get("status", {})
+        metadata = vm.get("metadata", {})
+        labels = metadata.get("labels", {}) if isinstance(metadata, Mapping) else {}
+        vm_uid = _admitted_vm_uid(vm, expected_name=vm_name)
+        generation = _admitted_provision_generation(vm)
+        entity_type = (
+            labels.get("srw.io/owner-kind") if isinstance(labels, Mapping) else None
+        )
         conditions = status.get("conditions", [])
         ready = any(
             c.get("type") == "Ready" and c.get("status") == "True" for c in conditions
         )
-        return {
+        result = {
             "job_id": job_id,
             "vm_name": vm_name,
+            "namespace": VM_NAMESPACE,
             "ready": ready,
             "phase": status.get("printableStatus", "Unknown"),
             "created": status.get("created", False),
         }
+        if vm_uid is not None:
+            result["vm_uid"] = vm_uid
+        if generation is not None:
+            result["provision_generation"] = generation
+        if entity_type in _OWNER_KINDS:
+            result["entity_type"] = entity_type
+
+        try:
+            vmi = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_VMI_PLURAL,
+                name=vm_name,
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+        else:
+            vmi_status = vmi.get("status", {})
+            interfaces = vmi_status.get("interfaces") or []
+            pod_ip = interfaces[0].get("ipAddress") if interfaces else None
+            active_pods = vmi_status.get("activePods") or {}
+            active_pod_uid = next(iter(active_pods), None)
+            if active_pod_uid is None and self.core_api is not None:
+                pods = await asyncio.to_thread(
+                    self.core_api.list_namespaced_pod,
+                    namespace=VM_NAMESPACE,
+                    label_selector=f"vm.kubevirt.io/name={vm_name}",
+                )
+                items = getattr(pods, "items", None) or []
+                if isinstance(items, list) and items:
+                    active_pod_uid = getattr(items[0].metadata, "uid", None)
+            result["pod_ip"] = pod_ip
+            result["active_pod_uid"] = active_pod_uid
+        if exact_absence:
+            rootdisk_known, rootdisk_pvc_uid = await self._rootdisk_pvc_probe(
+                _rootdisk_name(job_id),
+                owner_id=job_id,
+                owner_kind=None,
+                wait=False,
+            )
+            result["rootdisk_identity_known"] = rootdisk_known
+        else:
+            # Preserve the ordinary status response/call shape.  Only the
+            # explicit teardown probe may publish an authenticated absence bit.
+            rootdisk_pvc_uid = await self._rootdisk_pvc_uid(
+                _rootdisk_name(job_id),
+                owner_id=job_id,
+                owner_kind=None,
+                wait=False,
+            )
+        if rootdisk_pvc_uid is not None:
+            result["rootdisk_pvc_uid"] = rootdisk_pvc_uid
+        return result
+
+    # =========================================================================
+    # Golden-image cloning
+    # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md)
+    #
+    # All K8s calls go through asyncio.to_thread — the kubernetes client is
+    # synchronous and a blocking poll here would stall every other NATS/HTTP
+    # handler on the event loop.
+    # =========================================================================
+
+    async def _rootdisk_pvc_uid(
+        self,
+        name: str,
+        *,
+        owner_id: str,
+        owner_kind: str | None,
+        wait: bool,
+    ) -> str | None:
+        """Read the immutable UID of the exact rootdisk PVC, fail-closed.
+
+        CDI materializes a PVC asynchronously.  Create waits for a bounded
+        number of reads; status checks make one read.  A missing/malformed or
+        owner-mismatched claim never crosses the controller boundary as an
+        authenticated identity.
+        """
+
+        _known, uid = await self._rootdisk_pvc_probe(
+            name,
+            owner_id=owner_id,
+            owner_kind=owner_kind,
+            wait=wait,
+        )
+        return uid
+
+    async def _rootdisk_pvc_probe(
+        self,
+        name: str,
+        *,
+        owner_id: str,
+        owner_kind: str | None,
+        wait: bool,
+    ) -> tuple[bool, str | None]:
+        """Return ``(known, uid)`` to distinguish 404 from API ambiguity."""
+
+        from kubernetes.client.exceptions import ApiException
+
+        if self.core_api is None:
+            log.warning(
+                "rootdisk PVC identity unavailable for %s: CoreV1Api is not initialized",
+                name,
+            )
+            return False, None
+        attempts = max(1, VM_ROOTDISK_PVC_UID_ATTEMPTS if wait else 1)
+        exact_absence = False
+        for attempt in range(attempts):
+            try:
+                pvc = await asyncio.to_thread(
+                    self.core_api.read_namespaced_persistent_volume_claim,
+                    name=name,
+                    namespace=VM_NAMESPACE,
+                )
+            except ApiException as exc:
+                if exc.status != 404:
+                    log.warning(
+                        "rootdisk PVC identity read failed for %s: %s", name, exc
+                    )
+                    return False, None
+                exact_absence = True
+            except Exception as exc:
+                log.warning("rootdisk PVC identity read failed for %s: %s", name, exc)
+                return False, None
+            else:
+                uid = _admitted_pvc_uid(
+                    pvc,
+                    expected_name=name,
+                    expected_owner_id=owner_id,
+                    expected_owner_kind=owner_kind,
+                )
+                if uid is not None:
+                    return True, uid
+                return False, None
+            if attempt + 1 < attempts and VM_ROOTDISK_PVC_UID_RETRY_SECONDS > 0:
+                await asyncio.sleep(VM_ROOTDISK_PVC_UID_RETRY_SECONDS)
+        if exact_absence:
+            return True, None
+        log.warning(
+            "rootdisk PVC %s was not admitted with the expected immutable identity; "
+            "storage attribution will remain unknown",
+            name,
+        )
+        return False, None
+
+    async def _get_dv(self, name: str) -> dict | None:
+        """GET a CDI DataVolume by name; None on 404."""
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            return await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                name=name,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+
+    async def _delete_captured_rootdisk(
+        self,
+        name: str,
+        *,
+        owner_id: str,
+        expected_pvc_uid: str,
+    ) -> None:
+        """Purge only the rootdisk whose immutable PVC UID was captured."""
+
+        if self.core_api is None:
+            raise RuntimeError("CoreV1Api is unavailable for captured rootdisk delete")
+        known, observed_uid = await self._rootdisk_pvc_probe(
+            name,
+            owner_id=owner_id,
+            owner_kind=None,
+            wait=False,
+        )
+        if not known:
+            raise RuntimeError("captured rootdisk PVC identity is unknown")
+        if observed_uid != expected_pvc_uid:
+            raise RuntimeError("refusing to delete a superseded rootdisk PVC UID")
+
+        # Bind the reusable DataVolume name to the exact object observed beside
+        # the captured PVC, then use Kubernetes UID preconditions on both
+        # deletes.  The explicit PVC delete makes the captured storage fence
+        # authoritative even if CDI cascade cleanup is delayed.
+        dv = await self._get_dv(name)
+        dv_uid = None
+        if dv is not None:
+            metadata = dv.get("metadata") if isinstance(dv, Mapping) else None
+            labels = metadata.get("labels") if isinstance(metadata, Mapping) else None
+            if (
+                not isinstance(metadata, Mapping)
+                or not isinstance(labels, Mapping)
+                or labels.get("srw.io/owner-id") != owner_id
+                or labels.get("srw.io/owner-kind") not in _OWNER_KINDS
+            ):
+                raise RuntimeError("rootdisk DataVolume ownership is not exact")
+            dv_uid = _safe_uid(metadata.get("uid"))
+            if dv_uid is None:
+                raise RuntimeError("rootdisk DataVolume UID is unavailable")
+            await self._delete_dv(name, expected_uid=dv_uid)
+
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            await asyncio.to_thread(
+                self.core_api.delete_namespaced_persistent_volume_claim,
+                name=name,
+                namespace=VM_NAMESPACE,
+                body={
+                    "apiVersion": "v1",
+                    "kind": "DeleteOptions",
+                    "preconditions": {"uid": expected_pvc_uid},
+                },
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+
+    async def _delete_dv(self, name: str, *, expected_uid: str | None = None) -> None:
+        """DELETE a CDI DataVolume (its PVC cascades); 404 is success."""
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            await asyncio.to_thread(
+                self.k8s_client.delete_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                name=name,
+                **(
+                    {
+                        "body": {
+                            "apiVersion": "v1",
+                            "kind": "DeleteOptions",
+                            "preconditions": {"uid": expected_uid},
+                        }
+                    }
+                    if expected_uid is not None
+                    else {}
+                ),
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+    async def _wait_dv_succeeded(self, name: str) -> bool:
+        """Poll a DataVolume until phase Succeeded (True); Failed/timeout → False."""
+        deadline = asyncio.get_running_loop().time() + VM_GOLDEN_POLL_TIMEOUT
+        while asyncio.get_running_loop().time() < deadline:
+            dv = await self._get_dv(name)
+            phase = ((dv or {}).get("status") or {}).get("phase", "")
+            if phase == "Succeeded":
+                return True
+            if phase == "Failed":
+                return False
+            await asyncio.sleep(5)
+        log.warning(
+            "golden %s did not reach Succeeded within %ds", name, VM_GOLDEN_POLL_TIMEOUT
+        )
+        return False
+
+    def _golden_dv_manifest(self, name: str, image: str) -> dict:
+        """Build a standalone golden DataVolume that imports ``image`` once.
+
+        Uses the explicit ``spec.pvc`` form with accessModes + volumeMode set —
+        local-path has no StorageProfile, so the size-only ``spec.storage``
+        inference form fails validation. ``bind.immediate`` forces populate on
+        WaitForFirstConsumer storage (the golden is never VM-mounted, so nothing
+        else would trigger it); ``deleteAfterCompletion:false`` keeps the DV
+        object as our reuse handle after CDI would otherwise GC it post-import.
+        """
+        return {
+            "apiVersion": f"{CDI_GROUP}/{CDI_VERSION}",
+            "kind": "DataVolume",
+            "metadata": {
+                "name": name,
+                "namespace": VM_NAMESPACE,
+                "labels": {
+                    "srw.io/golden-image": name.rsplit("-", 1)[-1],
+                    "srw.io/vm-image": _label_safe(image),
+                },
+                "annotations": {
+                    "cdi.kubevirt.io/storage.bind.immediate.requested": "true",
+                    "cdi.kubevirt.io/storage.deleteAfterCompletion": "false",
+                    "srw.io/vm-image-ref": image,
+                },
+            },
+            "spec": {
+                "source": {"registry": {"url": f"docker://{image}"}},
+                "pvc": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "volumeMode": "Filesystem",
+                    "storageClassName": VM_STORAGE_CLASS,
+                    "resources": {"requests": {"storage": VM_GOLDEN_DISK_SIZE}},
+                },
+            },
+        }
+
+    async def _ensure_golden(self, image: str) -> str | None:
+        """Ensure a Succeeded golden DataVolume for ``image``; return its name,
+        or None so the caller falls back to the legacy registry source.
+
+        Idempotent + concurrency-safe: the Kubernetes create-409 is the lock, so
+        parallel creates converge on one import. Called on EVERY create path,
+        including crash-recovery re-dispatch.
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        name = _golden_name(image)
+        dv = await self._get_dv(name)
+        phase = ((dv or {}).get("status") or {}).get("phase", "")
+
+        if dv and phase == "Succeeded":
+            return name
+        if dv and phase == "Failed":
+            log.warning("golden %s is Failed — recreating", name)
+            await self._delete_dv(name)
+            dv = None
+        if dv is not None:
+            # Importing / Pending / CloneScheduled / "" — already being built.
+            return name if await self._wait_dv_succeeded(name) else None
+
+        # Absent → create (409 = another create won the race; both then wait).
+        try:
+            await asyncio.to_thread(
+                self.k8s_client.create_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                body=self._golden_dv_manifest(name, image),
+            )
+            log.info("golden %s: importing %s (once)", name, image)
+        except ApiException as e:
+            if e.status != 409:
+                log.warning("golden %s create failed: %s", name, e)
+                return None
+        return name if await self._wait_dv_succeeded(name) else None
+
+    async def _golden_state_nowait(self, image: str) -> tuple[str | None, dict | None]:
+        """Non-blocking golden check for the VM create path.
+
+        Unlike ``_ensure_golden`` (kept for the pre-warm background task), this
+        never sleeps waiting for CDI: a create handler that blocks here for the
+        duration of a cold import (~30 min) outlives every orchestrator
+        provisioning budget and races later create attempts into 409
+        AlreadyExists collisions.
+
+        Returns ``(golden_name, waiting_payload)``:
+          (name, None)    → golden Succeeded; clone the rootdisk from it.
+          (None, payload) → golden import in flight (payload has ``golden`` /
+                            ``golden_phase`` / ``golden_progress``); the caller
+                            must NOT create the VM — the orchestrator polls
+                            create until the golden is ready.
+          (None, None)    → golden infra unusable (create rejected) → caller
+                            falls back to the legacy registry source.
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        name = _golden_name(image)
+        dv = await self._get_dv(name)
+        status = (dv or {}).get("status") or {}
+        phase = status.get("phase", "")
+
+        if dv and phase == "Succeeded":
+            return name, None
+        if dv and phase == "Failed":
+            log.warning("golden %s is Failed — recreating", name)
+            await self._delete_dv(name)
+            dv = None
+        if dv is not None:
+            # Importing / Pending / CloneScheduled / "" — being built.
+            return None, {
+                "golden": name,
+                "golden_phase": phase or "Pending",
+                "golden_progress": status.get("progress") or "",
+            }
+
+        # Absent → create (409 = another create won the race; both then poll).
+        try:
+            await asyncio.to_thread(
+                self.k8s_client.create_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                body=self._golden_dv_manifest(name, image),
+            )
+            log.info("golden %s: importing %s (once)", name, image)
+        except ApiException as e:
+            if e.status != 409:
+                log.warning("golden %s create failed: %s", name, e)
+                return None, None
+        return None, {
+            "golden": name,
+            "golden_phase": "Pending",
+            "golden_progress": "",
+        }
+
+    def _apply_clone_source(self, manifest: dict, golden_name: str) -> None:
+        """Mutate a rendered VM manifest so its rootdisk clones the golden PVC
+        instead of importing from the registry. Same namespace → no ``namespace``
+        key (avoids cross-namespace clone RBAC). Keeps the clone target
+        WaitForFirstConsumer (NO bind.immediate) so it binds on the VM's node.
+        """
+        dv_spec = manifest["spec"]["dataVolumeTemplates"][0]["spec"]
+        dv_spec["source"] = {"pvc": {"name": golden_name}}
+        # Clone target must match the golden's Filesystem volumeMode.
+        dv_spec.setdefault("storage", {})["volumeMode"] = "Filesystem"
+
+    async def _ensure_rootdisk(
+        self, manifest: dict, job_id: str, *, owner_kind: str = "job"
+    ) -> str:
+        """Detach the rootdisk from the VM object, creating it if absent.
+
+        Pops ``spec.dataVolumeTemplates`` from the rendered manifest and
+        ensures a standalone DataVolume with the same name and the same spec.
+        ``volumes[].dataVolume.name`` refers to the disk *by name*, so that
+        section needs no change: the VM binds to the standalone disk instead of
+        a templated, owner-referenced one, and the disk survives VM deletion.
+
+        Returns the rootdisk name. Raises if the disk cannot be ensured —
+        there is deliberately no fallback to the templated form, which would
+        silently reintroduce the cascade-delete this exists to remove.
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        dvts = manifest.get("spec", {}).pop("dataVolumeTemplates", None)
+        if not dvts:
+            raise RuntimeError(
+                f"VM_PERSISTENT_ROOTDISK is on but the rendered manifest for "
+                f"job {job_id} has no dataVolumeTemplates — refusing to create "
+                f"a VM whose rootdisk is undefined"
+            )
+        dvt = dvts[0]
+        name = (dvt.get("metadata") or {}).get("name") or _rootdisk_name(job_id)
+
+        # A templated DataVolume may omit spec.source.pvc.namespace — CDI
+        # defaults it from the owning VM. A standalone one may not: the webhook
+        # rejects it with 422 "spec.source.pvc.namespace: Required value", which
+        # failed every VM create the moment this flag was first flipped.
+        # _apply_clone_source leaves it out deliberately (its docstring: same
+        # namespace, no cross-namespace clone RBAC) and that stays true — the
+        # value is simply now stated rather than inferred.
+        source_pvc = ((dvt.get("spec") or {}).get("source") or {}).get("pvc")
+        if isinstance(source_pvc, dict) and not source_pvc.get("namespace"):
+            source_pvc["namespace"] = VM_NAMESPACE
+
+        dv = await self._get_dv(name)
+        phase = ((dv or {}).get("status") or {}).get("phase", "")
+        if dv and phase == "Succeeded":
+            # The recovery path: files are already there, and the ~3m27s clone
+            # is skipped entirely — recovery is faster than a fresh start.
+            log.info("rootdisk reattach: %s (job %s)", name, job_id)
+            return name
+        if dv and phase == "Failed":
+            log.warning("rootdisk %s is Failed — recreating", name)
+            await self._delete_dv(name)
+            dv = None
+        if dv is not None:
+            # Importing / Pending / CloneScheduled — a racing create is already
+            # building it, and KubeVirt gates VMI start on DV readiness anyway.
+            log.info("rootdisk %s in progress (%s) — adopting", name, phase or "?")
+            return name
+
+        template_labels = (dvt.get("metadata") or {}).get("labels") or {}
+        labels = dict(template_labels) if isinstance(template_labels, dict) else {}
+        labels.update(
+            {
+                "srw.io/rootdisk": "true",
+                "job-id": job_id,
+                "srw.io/owner-kind": owner_kind,
+                "srw.io/owner-id": job_id,
+            }
+        )
+        body = {
+            "apiVersion": f"{CDI_GROUP}/{CDI_VERSION}",
+            "kind": "DataVolume",
+            "metadata": {
+                "name": name,
+                "namespace": VM_NAMESPACE,
+                # srw.io/rootdisk drives the GC listing; job-id ties the disk
+                # back to its entity (job or thread — VM names are the same
+                # shape for both).
+                # CDI propagates these DataVolume labels to the generated root
+                # PVC, giving the claim the same explicit ownership hint.
+                "labels": labels,
+            },
+            # The template's own spec, clone mutation included. No
+            # bind.immediate annotation: a clone target must stay
+            # WaitForFirstConsumer so it binds on the VM's node.
+            "spec": dvt.get("spec", {}),
+        }
+        try:
+            await asyncio.to_thread(
+                self.k8s_client.create_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                body=body,
+            )
+            log.info("rootdisk created: %s (job %s)", name, job_id)
+        except ApiException as e:
+            if e.status != 409:
+                raise
+            log.info("rootdisk %s already exists — adopting", name)
+        return name
+
+    async def _gc_rootdisks_safe(self) -> None:
+        """Non-fatal wrapper around _gc_rootdisks for fire-and-forget scheduling."""
+        try:
+            await self._gc_rootdisks()
+        except Exception:
+            log.exception("rootdisk GC pass failed")
+
+    async def _gc_rootdisks(self) -> None:
+        """Delete orphaned rootdisk DataVolumes — no VirtualMachine, older than
+        VM_ROOTDISK_ORPHAN_HOURS.
+
+        Layer 3 of the rootdisk GC (knowledge-base/knowledge/features/vm_persistent_rootdisk.md D4),
+        and the only layer that can reach a disk whose entity row is gone from
+        the orchestrator's DB entirely.
+
+        Bails without deleting anything if the VM list fails: without it every
+        disk looks orphaned, and this is a destructive sweep.
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            resp = await asyncio.to_thread(
+                self.k8s_client.list_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                label_selector="srw.io/rootdisk",
+            )
+        except ApiException as e:
+            log.debug("rootdisk GC list failed: %s", e)
+            return
+        disks = resp.get("items", [])
+        if not disks:
+            return
+
+        try:
+            vms = await asyncio.to_thread(
+                self.k8s_client.list_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+            )
+        except ApiException as e:
+            log.debug("rootdisk GC VM list failed — skipping GC this pass: %s", e)
+            return
+        live = {
+            (vm.get("metadata") or {}).get("name")
+            for vm in vms.get("items", [])
+            if (vm.get("metadata") or {}).get("name")
+        }
+
+        max_age_minutes = VM_ROOTDISK_ORPHAN_HOURS * 60
+        for dv in disks:
+            name = (dv.get("metadata") or {}).get("name", "")
+            if not name.endswith("-rootdisk"):
+                continue
+            if name[: -len("-rootdisk")] in live:
+                continue  # its VM is back — a recovery in flight
+            if _age_minutes(dv) < max_age_minutes:
+                continue
+            try:
+                await self._delete_dv(name)
+                log.warning(
+                    "rootdisk GC: deleted orphan %s (no VM for >%dh)",
+                    name,
+                    VM_ROOTDISK_ORPHAN_HOURS,
+                )
+            except Exception as e:
+                log.warning("rootdisk GC: delete %s failed: %s", name, e)
+
+    async def _gc_goldens_safe(self, image: str) -> None:
+        """Non-fatal wrapper around _gc_goldens for fire-and-forget scheduling."""
+        try:
+            await self._gc_goldens(image)
+        except Exception:
+            log.exception("golden GC pass failed")
+
+    async def _gc_goldens(self, current_image: str) -> None:
+        """Delete stale golden DataVolumes, keeping the newest N digests. Never
+        touch the current image's golden, one a live VM still references (its
+        in-flight clone reads the source pod), or one younger than the min age.
+        Deletes the DataVolume only — its PVC cascades (the controller has no
+        CoreV1Api / PVC permissions by design).
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            resp = await asyncio.to_thread(
+                self.k8s_client.list_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                label_selector="srw.io/golden-image",
+            )
+        except ApiException as e:
+            log.debug("golden GC list failed: %s", e)
+            return
+        goldens = resp.get("items", [])
+        if len(goldens) <= VM_GOLDEN_KEEP:
+            return
+
+        # In-use = any golden a live VM's rootdisk was cloned from.
+        in_use: set[str] = set()
+        try:
+            vms = await asyncio.to_thread(
+                self.k8s_client.list_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+            )
+        except ApiException as e:
+            log.debug("golden GC VM list failed — skipping GC this pass: %s", e)
+            return
+        for vm in vms.get("items", []):
+            for dvt in vm.get("spec", {}).get("dataVolumeTemplates", []):
+                pvc = (dvt.get("spec", {}).get("source", {}) or {}).get("pvc")
+                if pvc and pvc.get("name"):
+                    in_use.add(pvc["name"])
+
+        current = _golden_name(current_image)
+        goldens.sort(
+            key=lambda g: g.get("metadata", {}).get("creationTimestamp", ""),
+            reverse=True,
+        )
+        for g in goldens[VM_GOLDEN_KEEP:]:
+            name = g.get("metadata", {}).get("name", "")
+            if not name or name == current or name in in_use:
+                continue
+            if _age_minutes(g) < VM_GOLDEN_GC_MIN_AGE_MINUTES:
+                continue
+            try:
+                await self._delete_dv(name)
+                log.info("golden GC: deleted stale %s", name)
+            except Exception as e:
+                log.warning("golden GC: delete %s failed: %s", name, e)
+
+    async def _prewarm_golden(self) -> None:
+        """Best-effort: import the default image's golden before the first job,
+        so the first VM doesn't pay the one-time import on its critical path.
+        """
+        try:
+            name = await self._ensure_golden(DEFAULT_VM_IMAGE)
+            if name:
+                log.info("golden pre-warm ready: %s", name)
+            else:
+                log.warning("golden pre-warm did not complete (non-fatal)")
+        except Exception:
+            log.exception("golden pre-warm failed (non-fatal)")
 
     # =========================================================================
     # NATS transport
@@ -300,40 +2186,138 @@ class VMController:
 
     async def handle_create(self, msg):
         """vm.lifecycle.create → _do_create + publish vm.lifecycle.status."""
+        request_generation = None
+        request_id = None
         try:
             job_config = json.loads(msg.data.decode())
+            if not isinstance(
+                job_config, Mapping
+            ) or not await self._verify_lifecycle_request(
+                job_config, "create", mutating=True
+            ):
+                raise PermissionError("invalid VM lifecycle create authentication")
+            request_id = _lifecycle_request_id(job_config)
+            job_config = unsigned_payload(job_config)
+            request_generation = _provision_generation(
+                job_config.get("provision_generation")
+            )
             result = await self._do_create(job_config)
-            await self._publish_status(result["job_id"], result)
+            await self._publish_status(
+                result["job_id"],
+                result,
+                operation="create",
+                correlation_id=request_id,
+            )
+        except PermissionError:
+            log.warning("Dropping unauthenticated VM lifecycle create request")
         except Exception as e:
             job_id = _safe_job_id(msg.data)
             log.exception("Failed to create VM for job %s", job_id)
+            error_result = {
+                "job_id": job_id,
+                "status": "failed",
+                "error": str(e),
+            }
+            if request_generation is not None:
+                error_result["provision_generation"] = request_generation
             await self._publish_status(
-                job_id, {"job_id": job_id, "status": "failed", "error": str(e)}
+                job_id,
+                error_result,
+                operation="create",
+                correlation_id=request_id,
             )
 
     async def handle_delete(self, msg):
         """vm.lifecycle.delete → _do_delete + publish vm.lifecycle.status."""
+        request_generation = None
+        request_id = None
         try:
             data = json.loads(msg.data.decode())
-            result = await self._do_delete(data["job_id"])
-            await self._publish_status(result["job_id"], result)
+            if not isinstance(
+                data, Mapping
+            ) or not await self._verify_lifecycle_request(
+                data, "delete", mutating=True
+            ):
+                raise PermissionError("invalid VM lifecycle delete authentication")
+            request_id = _lifecycle_request_id(data)
+            data = unsigned_payload(data)
+            request_generation = _provision_generation(data.get("provision_generation"))
+            # Absent field → purge, so an un-upgraded orchestrator keeps exact
+            # current semantics.
+            delete_kwargs = {
+                "purge_disk": data.get("purge_disk", True) is not False,
+                "provision_generation": data.get("provision_generation"),
+            }
+            if data.get("expected_vm_uid") is not None:
+                delete_kwargs["expected_vm_uid"] = data["expected_vm_uid"]
+            if data.get("expected_rootdisk_pvc_uid") is not None:
+                delete_kwargs["expected_rootdisk_pvc_uid"] = data[
+                    "expected_rootdisk_pvc_uid"
+                ]
+            result = await self._do_delete(data["job_id"], **delete_kwargs)
+            await self._publish_status(
+                result["job_id"],
+                result,
+                operation="delete",
+                correlation_id=request_id,
+            )
+        except PermissionError:
+            log.warning("Dropping unauthenticated VM lifecycle delete request")
         except Exception as e:
             job_id = _safe_job_id(msg.data)
             log.exception("Failed to delete VM for job %s", job_id)
+            error_result = {
+                "job_id": job_id,
+                "status": "delete_failed",
+                "error": str(e),
+            }
+            if request_generation is not None:
+                error_result["provision_generation"] = request_generation
             await self._publish_status(
                 job_id,
-                {"job_id": job_id, "status": "delete_failed", "error": str(e)},
+                error_result,
+                operation="delete",
+                correlation_id=request_id,
             )
 
     async def handle_status_query(self, msg):
         """vm.lifecycle.get → _do_status (request/reply or status publish)."""
+        request_generation = None
+        request_id = None
         try:
             data = json.loads(msg.data.decode())
-            response = await self._do_status(data["job_id"])
+            if not isinstance(
+                data, Mapping
+            ) or not await self._verify_lifecycle_request(
+                data, "status", mutating=False
+            ):
+                raise PermissionError("invalid VM lifecycle status authentication")
+            request_id = _lifecycle_request_id(data)
+            data = unsigned_payload(data)
+            request_generation = _provision_generation(data.get("provision_generation"))
+            response = await self._do_status(
+                data["job_id"],
+                provision_generation=request_generation,
+                exact_absence=data.get("exact_absence") is True,
+            )
+            response = sign_payload(
+                response,
+                direction="response",
+                operation="status",
+                secret=LIFECYCLE_HMAC_SECRET,
+                correlation_id=request_id,
+            )
             if msg.reply:
                 await self.nc.publish(msg.reply, json.dumps(response).encode())
             else:
-                await self._publish_status(response["job_id"], response)
+                await self._publish_status(
+                    response["job_id"],
+                    response,
+                    operation="status",
+                    correlation_id=request_id,
+                )
+        except PermissionError:
+            log.warning("Dropping unauthenticated VM lifecycle status request")
         except Exception as e:
             job_id = _safe_job_id(msg.data)
             error_response = {
@@ -341,10 +2325,64 @@ class VMController:
                 "status": "query_failed",
                 "error": str(e),
             }
+            if request_generation is not None:
+                error_response["provision_generation"] = request_generation
             if msg.reply:
-                await self.nc.publish(msg.reply, json.dumps(error_response).encode())
+                signed_error = sign_payload(
+                    error_response,
+                    direction="response",
+                    operation="status",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                )
+                await self.nc.publish(msg.reply, json.dumps(signed_error).encode())
             else:
-                await self._publish_status(job_id, error_response)
+                await self._publish_status(
+                    job_id,
+                    error_response,
+                    operation="status",
+                    correlation_id=request_id,
+                )
+
+    async def handle_list(self, msg):
+        """vm.lifecycle.list → _do_list (request/reply only).
+
+        A list is only meaningful as a reply to the asker; there is no
+        status-publish fallback like the other handlers have.
+        """
+        try:
+            data = json.loads(msg.data.decode())
+            if not isinstance(
+                data, Mapping
+            ) or not await self._verify_lifecycle_request(data, "list", mutating=False):
+                raise PermissionError("invalid VM lifecycle list authentication")
+            request_id = _lifecycle_request_id(data)
+            unsigned = unsigned_payload(data)
+            response = sign_payload(
+                await self._do_list(
+                    include_teardown_identity=(
+                        unsigned.get("include_teardown_identity") is True
+                    )
+                ),
+                direction="response",
+                operation="list",
+                secret=LIFECYCLE_HMAC_SECRET,
+                correlation_id=request_id,
+            )
+        except PermissionError:
+            log.warning("Dropping unauthenticated VM lifecycle list request")
+            return
+        except Exception as e:
+            log.exception("Failed to list VMs")
+            response = sign_payload(
+                {"status": "list_failed", "error": str(e)},
+                direction="response",
+                operation="list",
+                secret=LIFECYCLE_HMAC_SECRET,
+                correlation_id=(request_id if "request_id" in locals() else None),
+            )
+        if msg.reply:
+            await self.nc.publish(msg.reply, json.dumps(response).encode())
 
     # =========================================================================
     # HTTP transport (aiohttp)
@@ -361,36 +2399,132 @@ class VMController:
 
         if not payload.get("job_id"):
             return web.json_response({"error": "job_id required"}, status=400)
+        if not isinstance(payload, Mapping) or not await self._verify_lifecycle_request(
+            payload, "create", mutating=True
+        ):
+            return web.json_response({"error": "authentication failed"}, status=401)
+        request_id = _lifecycle_request_id(payload)
+        payload = unsigned_payload(payload)
+        request_generation = _provision_generation(payload.get("provision_generation"))
 
         try:
             result = await self._do_create(payload)
-            return web.json_response(result, status=200)
+            return web.json_response(
+                sign_payload(
+                    result,
+                    direction="response",
+                    operation="create",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
+                status=200,
+            )
         except Exception as e:
             log.exception("HTTP create failed for job %s", payload.get("job_id"))
+            error_result = {
+                "job_id": payload.get("job_id", "unknown"),
+                "status": "failed",
+                "error": str(e),
+            }
+            if request_generation is not None:
+                error_result["provision_generation"] = request_generation
             return web.json_response(
-                {
-                    "job_id": payload.get("job_id", "unknown"),
-                    "status": "failed",
-                    "error": str(e),
-                },
+                sign_payload(
+                    error_result,
+                    direction="response",
+                    operation="create",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
                 status=500,
             )
 
     async def http_delete(self, request):
-        """DELETE /vms/{job_id} — returns the result dict."""
+        """DELETE /vms/{job_id}[?purge_disk=false] — returns the result dict."""
         from aiohttp import web
 
         job_id = request.match_info.get("job_id")
         if not job_id:
             return web.json_response({"error": "job_id required"}, status=400)
 
+        # Query param rather than a body: DELETE bodies are awkward for both
+        # httpx and aiohttp, and the intent is a single boolean.
+        purge_disk = str(request.query.get("purge_disk", "true")).lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        request_payload = _authenticated_http_payload(
+            request,
+            {
+                "job_id": job_id,
+                "purge_disk": purge_disk,
+                "provision_generation": request.query.get("provision_generation"),
+                **(
+                    {"expected_vm_uid": request.query.get("expected_vm_uid")}
+                    if request.query.get("expected_vm_uid") is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "expected_rootdisk_pvc_uid": request.query.get(
+                            "expected_rootdisk_pvc_uid"
+                        )
+                    }
+                    if request.query.get("expected_rootdisk_pvc_uid") is not None
+                    else {}
+                ),
+            },
+            operation="delete",
+        )
+        if not await self._verify_lifecycle_request(
+            request_payload, "delete", mutating=True
+        ):
+            return web.json_response({"error": "authentication failed"}, status=401)
+        request_id = _lifecycle_request_id(request_payload)
+        request_payload = unsigned_payload(request_payload)
+
         try:
-            result = await self._do_delete(job_id)
-            return web.json_response(result, status=200)
+            delete_kwargs = {
+                "purge_disk": purge_disk,
+                "provision_generation": request_payload.get("provision_generation"),
+            }
+            if request_payload.get("expected_vm_uid") is not None:
+                delete_kwargs["expected_vm_uid"] = request_payload["expected_vm_uid"]
+            if request_payload.get("expected_rootdisk_pvc_uid") is not None:
+                delete_kwargs["expected_rootdisk_pvc_uid"] = request_payload[
+                    "expected_rootdisk_pvc_uid"
+                ]
+            result = await self._do_delete(job_id, **delete_kwargs)
+            return web.json_response(
+                sign_payload(
+                    result,
+                    direction="response",
+                    operation="delete",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
+                status=200,
+            )
         except Exception as e:
             log.exception("HTTP delete failed for job %s", job_id)
+            error_result = {
+                "job_id": job_id,
+                "status": "delete_failed",
+                "error": str(e),
+            }
+            if generation := _provision_generation(
+                request_payload.get("provision_generation")
+            ):
+                error_result["provision_generation"] = generation
             return web.json_response(
-                {"job_id": job_id, "status": "delete_failed", "error": str(e)},
+                sign_payload(
+                    error_result,
+                    direction="response",
+                    operation="delete",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
                 status=500,
             )
 
@@ -401,20 +2535,125 @@ class VMController:
         job_id = request.match_info.get("job_id")
         if not job_id:
             return web.json_response({"error": "job_id required"}, status=400)
+        exact_absence = (
+            str(request.query.get("exact_absence", "false")).lower() == "true"
+        )
+        request_payload = _authenticated_http_payload(
+            request,
+            {
+                "job_id": job_id,
+                "provision_generation": request.query.get("provision_generation"),
+                **({"exact_absence": True} if exact_absence else {}),
+            },
+            operation="status",
+        )
+        if not await self._verify_lifecycle_request(
+            request_payload, "status", mutating=False
+        ):
+            return web.json_response({"error": "authentication failed"}, status=401)
+        request_id = _lifecycle_request_id(request_payload)
 
         try:
-            result = await self._do_status(job_id)
-            return web.json_response(result, status=200)
+            result = await self._do_status(
+                job_id,
+                provision_generation=request_payload.get("provision_generation"),
+                exact_absence=request_payload.get("exact_absence") is True,
+            )
+            return web.json_response(
+                sign_payload(
+                    result,
+                    direction="response",
+                    operation="status",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
+                status=200,
+            )
         except Exception as e:
             from kubernetes.client.exceptions import ApiException
 
             if isinstance(e, ApiException) and e.status == 404:
+                not_found = {
+                    "job_id": job_id,
+                    "status": "not_found",
+                }
+                if generation := _provision_generation(
+                    request_payload.get("provision_generation")
+                ):
+                    not_found["provision_generation"] = generation
                 return web.json_response(
-                    {"job_id": job_id, "status": "not_found"}, status=404
+                    sign_payload(
+                        not_found,
+                        direction="response",
+                        operation="status",
+                        secret=LIFECYCLE_HMAC_SECRET,
+                        correlation_id=request_id,
+                    ),
+                    status=404,
                 )
             log.debug("HTTP status query failed for job %s: %s", job_id, e)
+            error_result = {
+                "job_id": job_id,
+                "status": "query_failed",
+                "error": str(e),
+            }
+            if generation := _provision_generation(
+                request_payload.get("provision_generation")
+            ):
+                error_result["provision_generation"] = generation
             return web.json_response(
-                {"job_id": job_id, "status": "query_failed", "error": str(e)},
+                sign_payload(
+                    error_result,
+                    direction="response",
+                    operation="status",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
+                status=500,
+            )
+
+    async def http_list(self, request):
+        """GET /vms — enumerate managed agent VMs (orphan-sweep inventory)."""
+        from aiohttp import web
+
+        include_teardown_identity = (
+            str(request.query.get("include_teardown_identity", "false")).lower()
+            == "true"
+        )
+        request_payload = _authenticated_http_payload(
+            request,
+            ({"include_teardown_identity": True} if include_teardown_identity else {}),
+            operation="list",
+        )
+        if not await self._verify_lifecycle_request(
+            request_payload, "list", mutating=False
+        ):
+            return web.json_response({"error": "authentication failed"}, status=401)
+        request_id = _lifecycle_request_id(request_payload)
+        try:
+            result = await self._do_list(
+                include_teardown_identity=include_teardown_identity
+            )
+            return web.json_response(
+                sign_payload(
+                    result,
+                    direction="response",
+                    operation="list",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
+                status=200,
+            )
+        except Exception as e:
+            log.exception("HTTP list failed")
+            return web.json_response(
+                sign_payload(
+                    {"status": "list_failed", "error": str(e)},
+                    direction="response",
+                    operation="list",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
                 status=500,
             )
 
@@ -424,7 +2663,14 @@ class VMController:
 
         return web.json_response({"status": "ok"})
 
-    async def _publish_status(self, job_id: str, payload: dict):
+    async def _publish_status(
+        self,
+        job_id: str,
+        payload: dict,
+        *,
+        operation: str = "status",
+        correlation_id: str | None = None,
+    ):
         """Publish a status message on vm.lifecycle.status.{ORCHESTRATOR_ID}
         (NATS only)."""
         if not self.nc:
@@ -432,7 +2678,15 @@ class VMController:
         try:
             await self.nc.publish(
                 f"vm.lifecycle.status.{ORCHESTRATOR_ID}",
-                json.dumps(payload).encode(),
+                json.dumps(
+                    sign_payload(
+                        payload,
+                        direction="response",
+                        operation=operation,
+                        secret=LIFECYCLE_HMAC_SECRET,
+                        correlation_id=correlation_id,
+                    )
+                ).encode(),
             )
         except Exception:
             log.exception("Failed to publish status for job %s", job_id)
@@ -443,6 +2697,7 @@ class VMController:
 
         app = web.Application()
         app.router.add_post("/vms", self.http_create)
+        app.router.add_get("/vms", self.http_list)
         app.router.add_delete("/vms/{job_id}", self.http_delete)
         app.router.add_get("/vms/{job_id}", self.http_status)
         app.router.add_get("/healthz", self.http_health)
@@ -466,6 +2721,11 @@ class VMController:
         self.init_k8s()
         await self.headscale.init()
 
+        # Pre-warm the default image's golden so the first job doesn't pay the
+        # one-time import on its critical path (best-effort, non-blocking).
+        if VM_GOLDEN_IMAGE_ENABLED:
+            asyncio.create_task(self._prewarm_golden())
+
         if TRANSPORT in ("nats", "both"):
             if not ORCHESTRATOR_ID:
                 log.error(
@@ -484,8 +2744,9 @@ class VMController:
             await self.nc.subscribe(
                 f"vm.lifecycle.get{suffix}", cb=self.handle_status_query
             )
+            await self.nc.subscribe(f"vm.lifecycle.list{suffix}", cb=self.handle_list)
             log.info(
-                "Subscribed to vm.lifecycle.{create,delete,get}.%s — waiting for NATS requests",
+                "Subscribed to vm.lifecycle.{create,delete,get,list}.%s — waiting for NATS requests",
                 ORCHESTRATOR_ID,
             )
 
@@ -515,6 +2776,42 @@ def _safe_job_id(data: bytes) -> str:
         return json.loads(data.decode()).get("job_id", "unknown")
     except Exception:
         return "unknown"
+
+
+def _rootdisk_name(job_id: str) -> str:
+    """The rootdisk DataVolume name — identical to what the VM template renders,
+    so ``volumes[].dataVolume.name`` never has to change. Entity-agnostic: the
+    controller only sees an id, and VM names are ``agent-vm-<id>`` for both jobs
+    and sessions.
+    """
+    return f"agent-vm-{job_id}-rootdisk"
+
+
+def _golden_name(image: str) -> str:
+    """Deterministic, DNS-safe golden PVC name from an image ref (content-keyed
+    on the full ref so a new base-image sha yields a new golden)."""
+    digest = hashlib.sha256(image.encode()).hexdigest()[:12]
+    return f"agent-vm-golden-{digest}"
+
+
+def _label_safe(image: str) -> str:
+    """Sanitize an image ref into a <=63-char Kubernetes label value."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", image)
+    return safe[-63:].strip("_.-") or "unknown"
+
+
+def _age_minutes(obj: dict) -> float:
+    """Age in minutes of a K8s object from its creationTimestamp; 0 if unknown."""
+    ts = obj.get("metadata", {}).get("creationTimestamp")
+    if not ts:
+        return 0.0
+    try:
+        created = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except (ValueError, TypeError):
+        return 0.0
+    return (datetime.now(timezone.utc) - created).total_seconds() / 60.0
 
 
 def main():

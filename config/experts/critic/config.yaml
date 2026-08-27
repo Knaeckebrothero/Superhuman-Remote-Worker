@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Critic - Proactive code review, quality gating, idea rejection
-$extends: defaults
+$extends: worker_base
 
 agent_id: critic
 display_name: Critic
@@ -14,6 +14,14 @@ tags:
   - review
   - quality
   - gating
+
+# Light subagent delegation: throwaway in-process evidence gatherers via
+# spawn_subagent. Verification fan-out is the driving use case — subagents
+# gather evidence, the critic renders the verdict. Reader model = llm.subagent
+# tier (falls back to llm.tactical).
+delegation:
+  enabled: true
+  mode: light
 
 workspace:
   structure:
@@ -36,21 +44,20 @@ tools:
     - next_phase_todos
     - todo_complete
     - todo_list
-    - todo_rewind
+    - request_replan
     - mark_complete
     - job_complete
   shell:
     - run_command
+    - cancel_command
   # evaluation: injected via config_override for verification subjobs only
-  git:
-    - git_log
-    - git_show
-    - git_diff
-    - git_status
-    - git_tags
+  # git: intentionally absent. This agent has shell tools, and
+  # ToolsConfig.__post_init__ (src/core/loader.py) suppresses the git_* group
+  # whenever shell is present — a shell can run git against ANY repository in
+  # the workspace, including repos/<name>/, which git_* cannot. Declaring them
+  # here would advertise tools the pod never binds.
   delegation:
-    - delegate_work
-    - resume_delegation_child
+    - spawn_subagent
   # SQL injected when system datasource attached (for querying job data)
   sql: []
   # Not needed

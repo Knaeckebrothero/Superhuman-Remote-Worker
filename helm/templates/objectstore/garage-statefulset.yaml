@@ -1,0 +1,106 @@
+{{- if (include "srw.garageEnabled" .) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-garage-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "garage") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.garage.storageClass }}
+  storageClassName: {{ .Values.garage.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.garage.dataStorageSize }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "srw.fullname" . }}-garage
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "garage") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
+spec:
+  serviceName: {{ include "srw.fullname" . }}-garage
+  # Fixed at 1 — the single-node layout the bootstrap Job assigns supports one
+  # node only. Intentionally not derived from .Values.garage.replicas.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "garage") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "garage") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/objectstore/garage-config.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: garage
+          image: {{ .Values.garage.image }}
+          # The dxflrs/garage image sets no ENTRYPOINT, so the binary path must
+          # be explicit — `args: ["server"]` alone execs "server" and fails
+          # with "executable file not found in $PATH".
+          command: ["/garage"]
+          args: ["server"]
+          ports:
+            - name: s3
+              containerPort: 3900
+            - name: rpc
+              containerPort: 3901
+            - name: admin
+              containerPort: 3903
+          env:
+            - name: GARAGE_RPC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GARAGE_RPC_SECRET
+            - name: GARAGE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GARAGE_ADMIN_TOKEN
+            # Config file is a ConfigMap mount (0644); it holds NO secrets, but
+            # Garage still refuses world-readable config unless told otherwise.
+            - name: GARAGE_ALLOW_WORLD_READABLE_SECRETS
+              value: "true"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/garage.toml
+              subPath: garage.toml
+            - name: data
+              mountPath: /var/lib/garage
+          # TCP, NOT httpGet /health — /health returns 503 until a layout is
+          # applied, which would deadlock the bootstrap Job (see plan constraints).
+          readinessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.garage.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "srw.fullname" . }}-garage-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-garage-data
+{{- end }}

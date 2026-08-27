@@ -3,9 +3,11 @@
 Tests the read tracking mechanism and enforcement in workspace tools.
 """
 
+import io
 import pytest
 import tempfile
 import sys
+import zipfile
 from pathlib import Path
 
 # Add project root to path
@@ -120,13 +122,198 @@ class TestReadFileTracking:
         assert tool_context.was_recently_read("test.md")
         assert "Hello, world!" in result
 
-    def test_read_file_error_does_not_record(self, workspace_tools, tool_context):
+    def test_read_file_error_reports_resolved_path_and_search_hint(
+        self,
+        workspace_tools,
+        workspace_manager,
+        tool_context,
+    ):
         """Test that failed reads are not recorded."""
         read_file = workspace_tools["read_file"]
         result = read_file.invoke({"path": "nonexistent.md"})
 
         assert "Error" in result
+        assert str(workspace_manager.get_path("nonexistent.md")) in result
+        assert 'you passed "nonexistent.md"' in result
+        assert "search_files" in result
         assert not tool_context.was_recently_read("nonexistent.md")
+
+    def test_read_file_race_uses_same_resolved_not_found_message(
+        self,
+        workspace_tools,
+        workspace_manager,
+        monkeypatch,
+    ):
+        """A file removed after exists() gets the same actionable error."""
+        monkeypatch.setattr(workspace_manager, "exists", lambda _path: True)
+
+        result = workspace_tools["read_file"].invoke({"path": "vanished.txt"})
+
+        assert str(workspace_manager.get_path("vanished.txt")) in result
+        assert "search_files" in result
+
+
+class TestReadFileBinaryAndArchiveHandling:
+    """read_file must diagnose binary content honestly instead of leaking a
+    raw UTF-8 codec error.
+
+    Regression coverage for knowledge-base/knowledge/issues/session_uploads_never_extract_archives.md:
+    a zip attached to a session was unreadable because read_file's only
+    fallback for undecodable bytes was `f"Error: {str(e)}"` — the bare
+    UnicodeDecodeError message.
+    """
+
+    def _make_zip(self, entries: dict[str, bytes]) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, data in entries.items():
+                zf.writestr(name, data)
+        return buf.getvalue()
+
+    def test_read_file_on_zip_returns_entry_listing(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
+        data = self._make_zip(
+            {
+                "cover_letter.txt": b"Dear hiring manager...",
+                "photo.jpg": b"\xff\xd8\xff\xe0fakejpegbytes",
+            }
+        )
+        workspace_manager.backend.write_file("bundle.zip", data)
+
+        result = workspace_tools["read_file"].invoke({"path": "bundle.zip"})
+
+        assert "cover_letter.txt" in result
+        assert "photo.jpg" in result
+        assert "2" in result  # entry count
+        assert "codec" not in result
+        assert "utf-8" not in result.lower()
+        assert not result.startswith("Error")
+        assert tool_context.was_recently_read("bundle.zip")
+
+    def test_read_file_on_zip_reports_entry_sizes(
+        self, workspace_tools, workspace_manager
+    ):
+        data = self._make_zip({"notes.txt": b"x" * 1234})
+        workspace_manager.backend.write_file("notes.zip", data)
+
+        result = workspace_tools["read_file"].invoke({"path": "notes.zip"})
+
+        assert "1,234" in result or "1234" in result
+
+    def test_read_file_on_zip_skips_directories_dotfiles_and_macosx(
+        self, workspace_tools, workspace_manager
+    ):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("real.txt", b"hello")
+            zf.writestr("dir/", b"")
+            zf.writestr(".hidden", b"secret")
+            zf.writestr("__MACOSX/._real.txt", b"junk")
+        workspace_manager.backend.write_file("mixed.zip", buf.getvalue())
+
+        result = workspace_tools["read_file"].invoke({"path": "mixed.zip"})
+
+        assert "real.txt" in result
+        assert ".hidden" not in result
+        assert "__MACOSX" not in result
+
+    def test_read_file_on_corrupt_zip_returns_binary_message_not_codec_error(
+        self, workspace_tools, workspace_manager
+    ):
+        garbage = b"this is not actually a zip file, just some bytes\xdd\xdd"
+        workspace_manager.backend.write_file("broken.zip", garbage)
+
+        result = workspace_tools["read_file"].invoke({"path": "broken.zip"})
+
+        assert result == f"[binary file: broken.zip, {len(garbage)} bytes]"
+        assert "codec" not in result
+
+    def test_read_file_on_refused_zip_surfaces_the_upload_seams_note(
+        self, workspace_tools, workspace_manager
+    ):
+        """Review finding 2: a zip the session-upload seam refused to
+        extract (cap/traversal) still *parses fine* as a zip, so without
+        checking for the sidecar note, read_file would show a normal,
+        successful-looking entry listing with nothing indicating that none
+        of these members are actually separately readable — the exact dead
+        end from the motivating incident, recreated one layer down.
+        """
+        from src.tools.workspace.files import ZIP_REFUSAL_NOTE_SUFFIX
+
+        data = self._make_zip({"cover_letter.txt": b"...", "photos/big.bin": b"..."})
+        workspace_manager.backend.write_file("bundle.zip", data)
+        workspace_manager.backend.write_file(
+            f"bundle.zip{ZIP_REFUSAL_NOTE_SUFFIX}",
+            b"Extraction refused: uncompressed contents exceed the "
+            b"314572800-byte total limit\n\nThis archive's original bytes "
+            b"are stored as-is.",
+        )
+
+        result = workspace_tools["read_file"].invoke({"path": "bundle.zip"})
+
+        # The refusal is front and center, not buried or absent.
+        assert result.startswith("Extraction refused:")
+        assert "314572800-byte total limit" in result
+        # The (still accurate) entry listing follows it rather than being
+        # replaced — the agent can still see what's inside.
+        assert "cover_letter.txt" in result
+        assert "photos/big.bin" in result
+
+    def test_read_file_on_ordinary_zip_has_no_refusal_note_prefix(
+        self, workspace_tools, workspace_manager
+    ):
+        """No sidecar note present (the overwhelming majority of zips,
+        including every one that isn't a refused session upload) — read_file
+        must not invent a refusal that didn't happen."""
+        data = self._make_zip({"a.txt": b"hello"})
+        workspace_manager.backend.write_file("normal.zip", data)
+
+        result = workspace_tools["read_file"].invoke({"path": "normal.zip"})
+
+        assert "Extraction refused" not in result
+        assert "a.txt" in result
+
+    def test_read_file_on_arbitrary_binary_returns_binary_message(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
+        data = b"\xff\xfe\x00\x01\x02binary\xdd\xdd"
+        workspace_manager.backend.write_file("blob.dat", data)
+
+        result = workspace_tools["read_file"].invoke({"path": "blob.dat"})
+
+        assert result == f"[binary file: blob.dat, {len(data)} bytes]"
+        assert "codec" not in result
+        assert tool_context.was_recently_read("blob.dat")
+
+    def test_read_file_on_text_file_is_unaffected(
+        self, workspace_tools, workspace_manager
+    ):
+        """Plain UTF-8 content must still go through the normal text path."""
+        workspace_manager.write_file("plain.txt", "hello world")
+
+        result = workspace_tools["read_file"].invoke({"path": "plain.txt"})
+
+        assert "hello world" in result
+        assert "binary file" not in result
+
+    def test_read_file_on_docx_is_not_reported_as_binary(
+        self, workspace_tools, workspace_manager
+    ):
+        """The near-miss the incident report calls out: DOCX must keep
+        working exactly as before — only archives/other binaries are new."""
+        docx = pytest.importorskip("docx")
+
+        document = docx.Document()
+        document.add_paragraph("Hello from a real docx.")
+        buf = io.BytesIO()
+        document.save(buf)
+        workspace_manager.backend.write_file("letter.docx", buf.getvalue())
+
+        result = workspace_tools["read_file"].invoke({"path": "letter.docx"})
+
+        assert "binary file" not in result
+        assert "Hello from a real docx" in result
 
 
 class TestEditFileReadRequirement:
@@ -145,6 +332,22 @@ class TestEditFileReadRequirement:
 
         assert "Error" in result
         assert "read_file" in result.lower()
+
+    def test_missing_file_reports_resolved_path_and_search_hint(
+        self,
+        workspace_tools,
+        workspace_manager,
+    ):
+        result = workspace_tools["edit_file"].invoke(
+            {
+                "path": "missing.md",
+                "old_string": "old",
+                "new_string": "new",
+            }
+        )
+
+        assert str(workspace_manager.get_path("missing.md")) in result
+        assert "search_files" in result
 
     def test_edit_file_works_after_read(self, workspace_tools, workspace_manager):
         """Test that edit_file works after reading."""
@@ -166,6 +369,26 @@ class TestEditFileReadRequirement:
         # Verify the change
         content = workspace_manager.read_file("test.md")
         assert "Goodbye, world!" in content
+
+    def test_edit_file_requires_fresh_read_after_out_of_band_change(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
+        workspace_manager.write_file("test.md", "Agent observed this")
+        workspace_tools["read_file"].invoke({"path": "test.md"})
+
+        # Simulate a Canvas/user save while the WS invalidation is unavailable.
+        workspace_manager.write_file("test.md", "User changed this")
+        result = workspace_tools["edit_file"].invoke(
+            {
+                "path": "test.md",
+                "old_string": "User",
+                "new_string": "Agent",
+            }
+        )
+
+        assert "read_file" in result.lower()
+        assert workspace_manager.read_file("test.md") == "User changed this"
+        assert not tool_context.was_recently_read("test.md")
 
 
 class TestEditFilePositionModes:
@@ -216,7 +439,14 @@ class TestEditFilePositionModes:
         assert content == "Line 1\nLine 2"
 
     def test_edit_file_position_invalid_fails(self, workspace_tools, workspace_manager):
-        """Test that invalid position values fail."""
+        """Test that invalid position values fail.
+
+        ``position`` is now Literal["start", "end"], so the schema rejects an
+        off-vocabulary value before the body runs — the model cannot emit it at
+        all. The body's own check remains for callers that skip the schema.
+        """
+        from pydantic import ValidationError
+
         # Create a test file
         workspace_manager.write_file("test.md", "Content")
 
@@ -224,16 +454,22 @@ class TestEditFilePositionModes:
         read_file = workspace_tools["read_file"]
         read_file.invoke({"path": "test.md"})
 
-        # Try invalid position
         edit_file = workspace_tools["edit_file"]
-        result = edit_file.invoke(
-            {
-                "path": "test.md",
-                "new_string": "New",
-                "position": "middle",  # Invalid
-            }
-        )
 
+        # Schema layer: rejected up front, file untouched.
+        with pytest.raises(ValidationError):
+            edit_file.invoke(
+                {
+                    "path": "test.md",
+                    "new_string": "New",
+                    "position": "middle",  # Invalid
+                }
+            )
+        assert workspace_manager.read_file("test.md") == "Content"
+
+        # Body layer: still a clean error, never a silent fall-through to
+        # replace mode.
+        result = edit_file.func(path="test.md", new_string="New", position="middle")
         assert "Error" in result
         assert "Invalid position" in result
 
@@ -315,6 +551,27 @@ class TestWriteFileReadRequirement:
         # Verify the change
         content = workspace_manager.read_file("test.md")
         assert content == "New content"
+
+    def test_write_file_requires_fresh_read_after_out_of_band_change(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
+        workspace_manager.write_file("test.md", "Visible line\nAgent observed this")
+        workspace_tools["read_file"].invoke(
+            {"path": "test.md", "offset": 1, "limit": 1}
+        )
+
+        # The content hash is the integrity guard when no live invalidation was
+        # delivered. It covers the full text, not only the displayed line range.
+        workspace_manager.write_file("test.md", "Visible line\nUser changed this")
+        result = workspace_tools["write_file"].invoke(
+            {"path": "test.md", "content": "Agent overwrite"}
+        )
+
+        assert "read_file" in result.lower()
+        assert workspace_manager.read_file("test.md") == (
+            "Visible line\nUser changed this"
+        )
+        assert not tool_context.was_recently_read("test.md")
 
 
 class TestAppendFileRemoved:

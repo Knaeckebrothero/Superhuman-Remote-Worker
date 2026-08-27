@@ -5,7 +5,7 @@
 
 import { AuditEntry } from './audit.model';
 import { ChatEntry } from './chat.model';
-import { GraphDelta } from '../../debug/graph.model';
+import { GraphDelta } from '../../workbench/graph.model';
 
 /**
  * Cached audit entry with job context and index for efficient retrieval.
@@ -100,7 +100,17 @@ export interface CachedThreadMessage {
   role: string;
   content: string | null;
   tool_calls:
-    | { name: string; args: Record<string, unknown>; id: string; decision?: 'approved' | 'denied' }[]
+    | {
+          name: string;
+          args: Record<string, unknown>;
+          id: string;
+          // Raw backend status. Everything except 'denied' is a gate that
+          // was never answered — 'expired' (TTL, or swept at turn end),
+          // 'interrupted' (Stop), 'unavailable' (the wait itself failed).
+          // Persisted distinctly so a reload can render neither a refusal
+          // the user never made nor a call that never ran as completed.
+          decision?: string;
+      }[]
     | null;
   turn_number: number | null;
   tool_call_id?: string | null;

@@ -4,15 +4,15 @@
 # =============================================================================
 #
 # Exercises the full local flow:
-#   mock_plugin.py → sudo-gated daemon → NATS → mock_orchestrator.py
+#   mock_plugin.py → sudo-gated daemon → HTTP or NATS → mock_orchestrator.py
 #
 # Prerequisites:
-#   - NATS server running locally (nats://127.0.0.1:4222)
-#   - sudo-gated binary compiled (make -C ../../sudo-gated)
-#   - Python 3 with nats-py installed (pip install nats-py)
+#   - sudo-gated binary compiled (make -C vm/sudo-daemon)
+#   - NATS server + nats-py only for the optional legacy NATS leg
 #
 # Run from the repo root or from sudo-gated/test/:
-#   bash sudo-gated/test/integration_test.sh
+#   bash vm/sudo-daemon/test/integration_test.sh
+#   bash vm/sudo-daemon/test/integration_test.sh --http-only  # no NATS needed
 #
 # For real sudo testing on a VM, use integration_test_vm.sh instead.
 # =============================================================================
@@ -20,12 +20,21 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DAEMON_BIN="$REPO_ROOT/sudo-gated/sudo-gated"
+MODULE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DAEMON_BIN="$MODULE_DIR/sudo-gated"
 SOCKET_PATH="/tmp/sudo-gated-test-$$.sock"
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
+HTTP_ONLY=false
+if [ "${1:-}" = "--http-only" ]; then
+    HTTP_ONLY=true
+fi
+HTTP_PORT=$((18000 + $$ % 1000))
+HTTP_TOKEN="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 MOCK_ORCH_PID=""
+HTTP_ORCH_PID=""
 DAEMON_PID=""
+TEMP_CONFIG=""
+HTTP_TEMP_CONFIG=""
 PASS=0
 FAIL=0
 
@@ -39,8 +48,9 @@ cleanup() {
     echo ""
     echo "--- Cleaning up ---"
     [ -n "$MOCK_ORCH_PID" ] && kill "$MOCK_ORCH_PID" 2>/dev/null || true
+    [ -n "$HTTP_ORCH_PID" ] && kill "$HTTP_ORCH_PID" 2>/dev/null || true
     [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
-    rm -f "$SOCKET_PATH"
+    rm -f "$SOCKET_PATH" "$TEMP_CONFIG" "$HTTP_TEMP_CONFIG"
     wait 2>/dev/null || true
     echo -e "\n=== Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC} ==="
     [ "$FAIL" -eq 0 ] && exit 0 || exit 1
@@ -80,8 +90,73 @@ assert_fail() {
 echo "=== Sudo Approval Gate — Integration Tests ==="
 echo ""
 
-# Check NATS connectivity
 echo "--- Pre-flight checks ---"
+# Check daemon binary
+if [ ! -x "$DAEMON_BIN" ]; then
+    echo -e "${YELLOW}Daemon binary not found at $DAEMON_BIN, trying go build...${NC}"
+    if command -v go &>/dev/null; then
+        (cd "$MODULE_DIR" && CGO_ENABLED=0 go build -o sudo-gated ./cmd/sudo-gated/)
+    else
+        echo -e "${RED}ERROR: Go not installed and binary not found${NC}"
+        exit 1
+    fi
+fi
+echo "  Daemon binary: $DAEMON_BIN"
+echo ""
+
+# =============================================================================
+# HTTP transport leg (standalone; no NATS server or nats-py required)
+# =============================================================================
+
+echo "--- HTTP transport: approval without NATS ---"
+HTTP_TEMP_CONFIG=$(mktemp /tmp/sudo-gated-http-test-XXXXXX.yaml)
+cat > "$HTTP_TEMP_CONFIG" <<EOF
+socket_path: $SOCKET_PATH
+nats:
+  url: ""
+orchestrator:
+  url: ""
+  token: ""
+timeouts:
+  nats_request: 10s
+  socket_read: 5s
+  graceful_shutdown: 5s
+log_level: debug
+EOF
+
+python3 "$SCRIPT_DIR/mock_orchestrator.py" \
+    --http "$HTTP_PORT" --token "$HTTP_TOKEN" --mode approve &
+HTTP_ORCH_PID=$!
+sleep 0.5
+
+ORCHESTRATOR_URL="http://127.0.0.1:$HTTP_PORT" \
+VM_AUTH_TOKEN="$HTTP_TOKEN" \
+ENTITY_ID="11111111-1111-4111-8111-111111111111" \
+JOB_ID="11111111-1111-4111-8111-111111111111" \
+VM_ID="agent-vm-11111111-1111-4111-8111-111111111111" \
+"$DAEMON_BIN" --skip-verify --config "$HTTP_TEMP_CONFIG" \
+    2>/tmp/sudo-gated-http-test.log &
+DAEMON_PID=$!
+sleep 1
+
+assert_ok "HTTP daemon started" kill -0 "$DAEMON_PID"
+assert_ok "HTTP approval flow" \
+    python3 "$SCRIPT_DIR/mock_plugin.py" --socket "$SOCKET_PATH" "apt-get install curl"
+
+kill "$DAEMON_PID" "$HTTP_ORCH_PID" 2>/dev/null || true
+wait "$DAEMON_PID" "$HTTP_ORCH_PID" 2>/dev/null || true
+DAEMON_PID=""
+HTTP_ORCH_PID=""
+rm -f "$SOCKET_PATH" "$HTTP_TEMP_CONFIG"
+HTTP_TEMP_CONFIG=""
+
+if [ "$HTTP_ONLY" = true ]; then
+    echo ""
+    echo "--- HTTP-only integration complete ---"
+    exit 0
+fi
+
+# The remaining groups exercise the unchanged external NATS transport.
 if ! python3 -c "
 import asyncio, nats
 async def check():
@@ -90,23 +165,11 @@ async def check():
 asyncio.run(check())
 " 2>/dev/null; then
     echo -e "${RED}ERROR: Cannot connect to NATS at $NATS_URL${NC}"
-    echo "Start NATS first: podman-compose -f docker-compose.dev.yaml up -d nats"
+    echo "Run with --http-only, or start NATS: podman-compose -f docker-compose.dev.yaml up -d nats"
+    FAIL=$((FAIL + 1))
     exit 1
 fi
 echo "  NATS: connected"
-
-# Check daemon binary
-if [ ! -x "$DAEMON_BIN" ]; then
-    echo -e "${YELLOW}Daemon binary not found at $DAEMON_BIN, trying go build...${NC}"
-    if command -v go &>/dev/null; then
-        (cd "$REPO_ROOT/sudo-gated" && CGO_ENABLED=0 go build -o sudo-gated ./cmd/sudo-gated/)
-    else
-        echo -e "${RED}ERROR: Go not installed and binary not found${NC}"
-        exit 1
-    fi
-fi
-echo "  Daemon binary: $DAEMON_BIN"
-echo ""
 
 # =============================================================================
 # Test 1: Basic approval flow

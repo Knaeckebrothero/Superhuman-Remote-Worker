@@ -78,15 +78,19 @@ def test_clear_overrides(monkeypatch):
     assert loader._db_lookup("prompts", "gemma", "persona") is None
 
 
-def test_matrix_load_prefers_override_then_bundled(monkeypatch):
+def test_matrix_load_prefers_override_then_bundled(monkeypatch, tmp_path):
     _reset()
     monkeypatch.setenv("CONFIG_DB_OVERRIDES_ENABLED", "true")
     from src.core.loader import PromptMatrixResolver
 
     resolver = PromptMatrixResolver(None, "gemma")
     # Stub the bundled path so the test doesn't depend on real config files.
-    monkeypatch.setattr(resolver, "resolve_filename", lambda et: "persona.txt")
-    monkeypatch.setattr(resolver._file_resolver, "load", lambda fn: "BUNDLED")
+    # load() reads bundled content via _resolve_path().read_text() (location-
+    # primary resolution), so point that at a temp file rather than the shipped
+    # persona.txt.
+    bundled = tmp_path / "persona.txt"
+    bundled.write_text("BUNDLED", encoding="utf-8")
+    monkeypatch.setattr(resolver, "_resolve_path", lambda et: bundled)
 
     loader.set_config_overrides(
         [

@@ -3,6 +3,7 @@
 import textwrap
 from unittest.mock import patch
 
+import pytest
 
 from src.core.loader import (
     AgentConfig,
@@ -14,6 +15,7 @@ from src.core.loader import (
     get_phase_system_prompt,
     load_base_system_prompt,
     load_phase_component,
+    render_placeholders,
 )
 from src.core.model_registry import family_of
 
@@ -58,11 +60,20 @@ class TestFamilyOf:
         # `codex` substring + `gpt-5` prefix as codex, not bare gpt-5.
         assert family_of("codex/gpt-5.3-codex") == "codex"
 
+    def test_mistral(self):
+        # Mistral 3 family incl. Codestral and the `-latest` aliases. Native
+        # api.mistral.ai serves bare ids; OpenRouter's `mistralai/` prefix is
+        # stripped by the heuristic before matching.
+        assert family_of("mistral-large-latest") == "mistral"
+        assert family_of("mistral-medium-latest") == "mistral"
+        assert family_of("mistral-small-latest") == "mistral"
+        assert family_of("codestral-latest") == "mistral"
+        assert family_of("openrouter/mistralai/mistral-large") == "mistral"
+
     def test_unknown_model_returns_default(self):
         # After heuristic fallback kicks in, unrecognized IDs still fall through
         # to 'default'. Use an ID with no known substring match.
         assert family_of("some-unknown-model") == "default"
-        assert family_of("mistral-large") == "default"
 
     def test_unknown_returns_custom_default(self):
         """Callers can override the 'unknown' fallback."""
@@ -109,6 +120,11 @@ class TestDetectReasoningMethod:
     def test_unknown_returns_api(self):
         # Unknown → family 'default' → 'api'.
         assert detect_reasoning_method("some-unknown-model") == "api"
+
+    def test_glm_returns_api(self):
+        # GLM-5.2 (OpenRouter) uses the standard reasoning API param; family
+        # 'glm' must fall through to 'api', i.e. NOT be added to the "none" tuple.
+        assert detect_reasoning_method("openrouter/z-ai/glm-5.2") == "api"
 
     def test_explicit_override(self):
         assert (
@@ -459,6 +475,79 @@ class TestDefaultResolution:
 
 
 # =============================================================================
+# render_placeholders: literal braces in trusted prose must survive render
+# (regression: product-qa tactical.txt `{py,sh,md}` hard-failed jobs via
+#  str.format KeyError at phase render — vault issues/ brace-format crash)
+# =============================================================================
+
+
+class TestRenderPlaceholders:
+    """The prompt assembler substitutes only an explicit allow-list of tokens;
+    every other brace is literal prose (CSS, repro-path hints, JSON) and must
+    pass through untouched instead of raising KeyError."""
+
+    def test_known_token_substitutes(self):
+        assert (
+            render_placeholders("phase {phase_number}", phase_number="2") == "phase 2"
+        )
+
+    def test_literal_brace_survives(self):
+        # The exact pattern that crashed the loop job.
+        text = "save repro under output/repros/NNN_slug.{py,sh,md}"
+        assert render_placeholders(text, phase_number="2") == text
+
+    def test_css_colon_brace_survives(self):
+        # A colon inside braces is the case a lenient str.format_map would still
+        # choke on (parsed as a format spec) — render_placeholders leaves it be.
+        css = "  :root { --app-bg: #1e1e2e; }"
+        assert render_placeholders(css, phase_number="2") == css
+
+    def test_single_pass_no_reexpansion(self):
+        # A placeholder appearing inside a substituted value is NOT re-expanded
+        # (matches str.format's single-pass semantics).
+        out = render_placeholders(
+            "n={agent_display_name} b={prompt_content}",
+            agent_display_name="Ada",
+            prompt_content="literal {agent_display_name} kept",
+        )
+        assert out == "n=Ada b=literal {agent_display_name} kept"
+
+    def test_allowlisted_token_without_value_left_literal(self):
+        assert (
+            render_placeholders("keep {phase_number}", agent_display_name="x")
+            == "keep {phase_number}"
+        )
+
+    def test_non_allowlisted_token_always_literal(self):
+        assert render_placeholders("{tool_name} x", phase_number="1") == "{tool_name} x"
+
+    def test_end_to_end_tactical_prompt_with_literal_braces(self, tmp_path):
+        """get_phase_system_prompt renders a tactical prompt whose prose holds a
+        literal `{py,sh,md}` AND a guardrail-style `{phase_number}` — the token
+        substitutes, the literal brace survives, and nothing raises."""
+        config = AgentConfig(agent_id="test", display_name="QA Agent")
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_prompts = tmp_path / "config" / "prompts"
+            config_prompts.mkdir(parents=True)
+            (config_prompts / "systemprompt.txt").write_text(
+                "{agent_display_name}\n{prompt_content}"
+            )
+            (config_prompts / "tactical.txt").write_text(
+                "Tactical phase {phase_number}. "
+                "Save a repro under output/repros/NNN_slug.{py,sh,md}."
+            )
+
+            result = get_phase_system_prompt(
+                config=config,
+                is_strategic=False,
+                phase_number=2,
+            )
+            assert "QA Agent" in result
+            assert "Tactical phase 2." in result  # {phase_number} substituted
+            assert "{py,sh,md}" in result  # literal brace survived
+
+
+# =============================================================================
 # Integration: PromptMatrixResolver.load() with real files
 # =============================================================================
 
@@ -530,6 +619,172 @@ class TestPromptMatrixResolverLoad:
 
             resolver = PromptMatrixResolver(model_family="default")
             assert resolver.exists("nonexistent_type") is False
+
+
+# =============================================================================
+# Location-primary resolution — regression cover for family-variant shadowing
+# (knowledge-base/knowledge/issues/expert_prompts_shadowed_by_family_variants.md)
+# =============================================================================
+
+
+class TestLocationPrimaryResolution:
+    """An expert (deployment-dir) file outranks a framework file; family-specific
+    is tried before base WITHIN each dir. Order:
+    expert/<family> -> expert/<base> -> framework/<family> -> framework/<base>.
+    """
+
+    GEMMA_MATRIX = textwrap.dedent("""\
+        gemma:
+          prompts:
+            persona: persona_gemma.txt
+            strategic: strategic_gemma.txt
+            tactical: tactical_gemma.txt
+    """)
+
+    @pytest.mark.parametrize("entry_type", ["persona", "strategic", "tactical"])
+    def test_expert_base_beats_framework_family_variant(self, tmp_path, entry_type):
+        """THE bug: expert ships only <type>.txt; base matrix maps the family to
+        <type>_gemma.txt which exists in the framework dir. The expert's base
+        file must win (it never did before this fix)."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / f"{entry_type}.txt").write_text(f"expert base {entry_type}")
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / f"{entry_type}.txt").write_text(f"framework base {entry_type}")
+            (prompts / f"{entry_type}_gemma.txt").write_text(
+                f"framework gemma {entry_type}"
+            )
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.load(entry_type) == f"expert base {entry_type}"
+
+    def test_expert_family_variant_wins_rank1(self, tmp_path):
+        """Expert that ships its own family variant gets it (rank 1)."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "persona.txt").write_text("expert base")
+        (expert_dir / "persona_gemma.txt").write_text("expert gemma")
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona_gemma.txt").write_text("framework gemma")
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.load("persona") == "expert gemma"
+
+    def test_expert_empty_uses_framework_family_rank3(self, tmp_path):
+        """Expert overrides nothing -> framework family variant (rank 3)."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona.txt").write_text("framework base")
+            (prompts / "persona_gemma.txt").write_text("framework gemma")
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.load("persona") == "framework gemma"
+
+    def test_no_family_variant_uses_framework_base_rank4(self, tmp_path):
+        """Family with no variant -> framework base (rank 4)."""
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            prompts = tmp_path / "config" / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona.txt").write_text("framework base")
+
+            resolver = PromptMatrixResolver(model_family="gemma")
+            assert resolver.load("persona") == "framework base"
+
+    def test_expert_matrix_remap_respected(self, tmp_path):
+        """An expert model_config_matrix override names a custom file; it's used
+        from the expert dir (proves _resolve_path consumes resolve_filename)."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "custom_persona.txt").write_text("expert custom")
+        (expert_dir / "model_config_matrix.yaml").write_text(
+            textwrap.dedent("""\
+            gemma:
+              prompts:
+                persona: custom_persona.txt
+        """)
+        )
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona_gemma.txt").write_text("framework gemma")
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.load("persona") == "expert custom"
+
+    def test_deployment_dir_none_is_framework_only(self, tmp_path):
+        """deployment_dir=None (sessions/admin) -> framework chain, no crash."""
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            prompts = config_dir / "prompts"
+            prompts.mkdir(parents=True)
+            (prompts / "persona.txt").write_text("framework base")
+            (prompts / "persona_gemma.txt").write_text("framework gemma")
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(model_family="gemma")
+            assert resolver.load("persona") == "framework gemma"
+
+    def test_db_override_short_circuits_before_files(self, tmp_path):
+        """A DB config override wins over any file; bundled_only bypasses it and
+        reads the expert base via location-primary resolution."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "persona.txt").write_text("expert base persona")
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            (tmp_path / "config" / "prompts").mkdir(parents=True)
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="default"
+            )
+            with patch("src.core.loader._db_lookup", return_value="DB OVERRIDE"):
+                assert resolver.load("persona") == "DB OVERRIDE"
+                assert (
+                    resolver.load("persona", bundled_only=True) == "expert base persona"
+                )
+
+    def test_exists_true_for_expert_base_on_gemma(self, tmp_path):
+        """exists() finds the expert base even when the matrix names a (missing)
+        family variant."""
+        expert_dir = tmp_path / "expert"
+        expert_dir.mkdir()
+        (expert_dir / "persona.txt").write_text("expert base")
+
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_dir = tmp_path / "config"
+            (config_dir / "prompts").mkdir(parents=True)
+            (config_dir / "model_config_matrix.yaml").write_text(self.GEMMA_MATRIX)
+
+            resolver = PromptMatrixResolver(
+                deployment_dir=str(expert_dir), model_family="gemma"
+            )
+            assert resolver.exists("persona") is True
 
 
 # =============================================================================

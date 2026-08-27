@@ -28,7 +28,7 @@ async def test_marker_written_to_thread_context_on_success():
     ):
         proc = MagicMock()
         proc.stdout.read = AsyncMock(side_effect=[b"data", b""])
-        proc.stderr.read = AsyncMock(return_value=b"")
+        proc.stderr.read = AsyncMock(side_effect=[b""])
         proc.wait = AsyncMock(return_value=0)
         proc.returncode = 0
         cse.return_value = proc
@@ -44,6 +44,11 @@ async def test_marker_written_to_thread_context_on_success():
     svc._db.merge_thread_workspace_context.assert_any_await(
         "t1", {"last_snapshot_turns": 7}
     )
+    # Verify capture tar command includes xattrs/acls for overlay whiteout round-trip
+    ssh_argv = cse.call_args.args
+    tar_cmd = ssh_argv[-1]  # remote command is last positional arg
+    assert "--xattrs" in tar_cmd
+    assert "--acls" in tar_cmd
 
 
 @pytest.mark.asyncio
@@ -64,7 +69,7 @@ async def test_no_marker_write_when_work_marker_none():
     ):
         proc = MagicMock()
         proc.stdout.read = AsyncMock(side_effect=[b"data", b""])
-        proc.stderr.read = AsyncMock(return_value=b"")
+        proc.stderr.read = AsyncMock(side_effect=[b""])
         proc.wait = AsyncMock(return_value=0)
         proc.returncode = 0
         cse.return_value = proc

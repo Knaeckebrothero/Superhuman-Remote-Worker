@@ -13,15 +13,87 @@ Usage:
         git_mgr.tag("phase-1-tactical-complete")
 """
 
+import base64
+import binascii
+import hashlib
 import logging
 import posixpath
 import shlex
 import shutil
 import subprocess
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
+
+# A jobs-repo clone can outlive a single shell_run wait (hard-capped at 600s
+# in shell_manager.HARD_TIMEOUT_CAP_SECONDS); the shell then reports the
+# command as "still running" — explicitly not an error. clone() keeps waiting
+# on the tab up to the overall deadline and verifies the on-disk result,
+# instead of abandoning a healthy transfer and colliding retries into the
+# busy tab (job 65ba6be8).
+_CLONE_SHELL_TIMEOUT_SECONDS = 600
+_CLONE_WAIT_DEADLINE_SECONDS = 1800
+_CLONE_POLL_INTERVAL_SECONDS = 10.0
+
+# Fixed markers from shell_manager's STILL_RUNNING_*/COLLIDING_COMMAND
+# templates. Neither matches the blocked-on-interactive-prompt template,
+# which is a genuine failure (a credential prompt means bad auth).
+_STILL_RUNNING_MARKER = "--- still running ---"
+_COLLIDING_MARKER = "previous command still running"
+
+_UNDO_REQUEST_TRAILER = "SRW-Control-Request"
+_UNDO_PREPARE_TRAILER = "SRW-Undo-Prepare"
+_UNDO_SOURCE_TRAILER = "SRW-Undo-Source"
+_UNDO_TARGET_TRAILER = "SRW-Undo-Target"
+_GIT_NUL_INTEGRITY_FRAME = "SRW-Git-NUL-Integrity"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceUndoCommit:
+    """One idempotent workspace-undo effect recovered from Git history."""
+
+    request_id: UUID
+    commit_sha: str
+    source_sha: str
+    target_sha: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceUndoPreparation:
+    """Request-specific pre-restore snapshot recovered from Git history."""
+
+    request_id: UUID
+    commit_sha: str
+    target_sha: str
+
+
+class WorkspaceUndoInvariantViolation(RuntimeError):
+    """Git contains an ambiguous or malformed marker for one undo request."""
+
+
+class TagInvariantViolation(RuntimeError):
+    """A phase-boundary tag already exists at a different commit.
+
+    Phase tags are audit boundaries: once created they must never move.
+    Carries the tag name plus both commits for diagnostics.
+    """
+
+    def __init__(
+        self,
+        tag_name: str,
+        existing_sha: Optional[str],
+        head_sha: Optional[str],
+    ):
+        self.tag_name = tag_name
+        self.existing_sha = existing_sha
+        self.head_sha = head_sha
+        super().__init__(
+            f"tag {tag_name} already at {existing_sha}, HEAD is {head_sha}"
+        )
 
 
 class GitManager:
@@ -93,6 +165,21 @@ class GitManager:
             )
             return self._backend.exists(git_path)
         return (self._workspace_path / ".git").exists()
+
+    def _inactive_reason(self) -> str:
+        """Explain why :attr:`is_active` is False, for diagnostic logging.
+
+        Mirrors the branches in ``is_active``. Kept separate so the hot path
+        stays a plain boolean and only failures pay for the string.
+        """
+        if not self._git_available:
+            return "git binary unavailable"
+        if self._use_backend:
+            git_path = (
+                posixpath.join(self._remote_cwd, ".git") if self._remote_cwd else ".git"
+            )
+            return f"no {git_path} on the workspace backend"
+        return f"no .git at {self._workspace_path}"
 
     @property
     def workspace_path(self) -> Path:
@@ -236,6 +323,402 @@ class GitManager:
             logger.error(f"Failed to commit: {e}")
             return False
 
+    def restore_tree(self, commit_sha: str) -> bool:
+        """Make worktree + index exactly match ``commit_sha``'s tree.
+
+        Forward restore for session rewind: HEAD does not move (no
+        ``reset --hard`` — that would strand the branch behind the Gitea
+        remote and break the fast-forward push). ``read-tree -u --reset``
+        is the one porcelain-adjacent verb that also DELETES files that are
+        tracked now but absent at the target (``checkout <sha> -- .``
+        leaves them behind). The caller commits the abandoned state first,
+        so everything current is tracked and nothing is lost.
+
+        Returns True on success; False on any git failure (bad SHA,
+        inactive repo). Does not commit — callers follow with commit().
+        """
+        if not self.is_active:
+            logger.debug("Git not active, skipping restore_tree")
+            return False
+        try:
+            result = self._run_git(["read-tree", "-u", "--reset", commit_sha])
+            if result.returncode != 0:
+                logger.warning(f"git read-tree failed: {result.stderr}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Failed to restore tree: {e}")
+            return False
+
+    @staticmethod
+    def _full_git_oid(value: object) -> bool:
+        """Accept full SHA-1 or SHA-256 object IDs, never abbreviations."""
+
+        return (
+            isinstance(value, str)
+            and len(value) in {40, 64}
+            and all(char in "0123456789abcdef" for char in value)
+        )
+
+    def _undo_marked_commits(self, marker: str) -> list[tuple[str, str]]:
+        """Return ``(commit SHA, message)`` pairs matching an undo marker.
+
+        Do not encode record boundaries with ``%x00`` here. Remote Git runs
+        through the tmux-backed workspace shell, whose line-oriented capture
+        drops NUL bytes. Concatenating ``%H`` and ``%B`` across that transport
+        made an existing preparation look absent and let a retry append a
+        second commit for the same request UUID.
+
+        Candidate SHAs are therefore fetched one-per-line, then each message
+        is read in its own command. Full object IDs make the boundary
+        unambiguous without relying on any byte the transport may normalize.
+        A transport/inspection failure is an invariant failure, not an empty
+        result: callers must retry rather than create another idempotency
+        marker on uncertain history.
+        """
+
+        try:
+            result = self._run_git(
+                [
+                    "log",
+                    "HEAD",
+                    "--format=%H",
+                    "--fixed-strings",
+                    f"--grep={marker}",
+                ]
+            )
+        except Exception as exc:
+            raise WorkspaceUndoInvariantViolation(
+                f"could not inspect Git history for undo marker {marker}"
+            ) from exc
+        if result.returncode != 0:
+            raise WorkspaceUndoInvariantViolation(
+                f"could not inspect Git history for undo marker {marker}"
+            )
+
+        commit_shas = [line.strip() for line in result.stdout.splitlines() if line]
+        if any(not self._full_git_oid(commit_sha) for commit_sha in commit_shas):
+            raise WorkspaceUndoInvariantViolation(
+                f"Git returned a malformed commit for undo marker {marker}"
+            )
+
+        commits: list[tuple[str, str]] = []
+        for commit_sha in commit_shas:
+            try:
+                message_result = self._run_git(
+                    ["show", "--no-patch", "--format=%B", commit_sha]
+                )
+            except Exception as exc:
+                raise WorkspaceUndoInvariantViolation(
+                    f"could not inspect undo marker commit {commit_sha}"
+                ) from exc
+            if message_result.returncode != 0:
+                raise WorkspaceUndoInvariantViolation(
+                    f"could not inspect undo marker commit {commit_sha}"
+                )
+            commits.append((commit_sha, message_result.stdout))
+        return commits
+
+    def trees_match(self, first_ref: str, second_ref: str) -> bool:
+        """Return whether two refs resolve to the exact same Git tree."""
+
+        first = self.resolve_tree(first_ref)
+        second = self.resolve_tree(second_ref)
+        return first is not None and first == second
+
+    def resolve_tree(self, ref: str) -> Optional[str]:
+        """Resolve one commit-ish to its full tree object ID."""
+
+        if not self.is_active:
+            return None
+        try:
+            result = self._run_git(["rev-parse", f"{ref}^{{tree}}"])
+            value = result.stdout.strip()
+            return (
+                value if result.returncode == 0 and self._full_git_oid(value) else None
+            )
+        except Exception:
+            return None
+
+    def is_ancestor(self, ancestor_ref: str, descendant_ref: str) -> bool:
+        """Return whether ``ancestor_ref`` is reachable from ``descendant_ref``."""
+
+        if not self.is_active:
+            return False
+        try:
+            result = self._run_git(
+                ["merge-base", "--is-ancestor", ancestor_ref, descendant_ref]
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def workspace_matches_tree(self, ref: str) -> bool:
+        """Return whether the tracked worktree/index already equals ``ref``.
+
+        This detects the narrow crash window after ``restore_tree`` changed the
+        index/worktree but before the idempotency commit was created. Ignored
+        runtime files are outside Git undo by design; non-ignored untracked
+        paths make the comparison fail closed.
+        """
+
+        if not self.is_active:
+            return False
+        try:
+            worktree = self._run_git(["diff", "--quiet", ref, "--"])
+            index = self._run_git(["diff", "--cached", "--quiet", ref, "--"])
+            untracked = self._run_git_nul_records(
+                ["ls-files", "--others", "--exclude-standard", "-z"]
+            )
+            return (
+                worktree.returncode == 0 and index.returncode == 0 and untracked == []
+            )
+        except Exception:
+            return False
+
+    def commit_workspace_undo_preparation(
+        self,
+        *,
+        request_id: UUID | str,
+        target_sha: str,
+    ) -> Optional[str]:
+        """Snapshot the pre-undo state with a strict request/target marker."""
+
+        try:
+            canonical_request_id = UUID(str(request_id))
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if not self._full_git_oid(target_sha) or self.resolve_tree(target_sha) is None:
+            return None
+
+        message = (
+            f"Prepare workspace undo to {target_sha[:12]}\n\n"
+            f"{_UNDO_PREPARE_TRAILER}: {canonical_request_id}\n"
+            f"{_UNDO_TARGET_TRAILER}: {target_sha}"
+        )
+        if not self.commit(message, allow_empty=True):
+            return None
+        commit_sha = self.get_current_commit()
+        if not self._full_git_oid(commit_sha):
+            return None
+        try:
+            preparation = self.find_workspace_undo_preparation(canonical_request_id)
+        except WorkspaceUndoInvariantViolation:
+            return None
+        if preparation is None or preparation.commit_sha != commit_sha:
+            return None
+        return commit_sha
+
+    def find_workspace_undo_preparation(
+        self, request_id: UUID | str
+    ) -> Optional[WorkspaceUndoPreparation]:
+        """Recover the unique validated preparation for one request UUID."""
+
+        if not self.is_active:
+            return None
+        try:
+            canonical_request_id = UUID(str(request_id))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        marker = f"{_UNDO_PREPARE_TRAILER}: {canonical_request_id}"
+        recovered: list[WorkspaceUndoPreparation] = []
+        recovered_trees: list[str] = []
+        for commit_sha, message in self._undo_marked_commits(marker):
+            prepare_values = [
+                line[len(f"{_UNDO_PREPARE_TRAILER}: ") :]
+                for line in message.splitlines()
+                if line.startswith(f"{_UNDO_PREPARE_TRAILER}: ")
+            ]
+            if str(canonical_request_id) not in prepare_values:
+                continue
+            target_values = [
+                line[len(f"{_UNDO_TARGET_TRAILER}: ") :]
+                for line in message.splitlines()
+                if line.startswith(f"{_UNDO_TARGET_TRAILER}: ")
+            ]
+            if (
+                prepare_values != [str(canonical_request_id)]
+                or len(target_values) != 1
+                or not self._full_git_oid(commit_sha)
+                or not self._full_git_oid(target_values[0])
+                or (commit_tree := self.resolve_tree(commit_sha)) is None
+                or self.resolve_tree(target_values[0]) is None
+            ):
+                raise WorkspaceUndoInvariantViolation(
+                    "malformed Git preparation for workspace undo "
+                    f"{canonical_request_id}"
+                )
+            recovered.append(
+                WorkspaceUndoPreparation(
+                    request_id=canonical_request_id,
+                    commit_sha=commit_sha,
+                    target_sha=target_values[0],
+                )
+            )
+            recovered_trees.append(commit_tree)
+
+        if len(recovered) > 1:
+            # A buggy remote lookup could append the same preparation again.
+            # This is safe to converge only when every reachable marker names
+            # the exact same request/target and snapshots the identical tree.
+            # ``git log`` is newest-first, so retain the newest reachable
+            # preparation. Any target or tree disagreement remains ambiguous.
+            if (
+                len({preparation.target_sha for preparation in recovered}) != 1
+                or len(set(recovered_trees)) != 1
+            ):
+                raise WorkspaceUndoInvariantViolation(
+                    "conflicting Git preparations for workspace undo "
+                    f"{canonical_request_id}"
+                )
+        return recovered[0] if recovered else None
+
+    def commit_workspace_undo(
+        self,
+        *,
+        request_id: UUID | str,
+        source_sha: str,
+        target_sha: str,
+    ) -> Optional[str]:
+        """Commit an already-restored tree with its durable request marker.
+
+        The marker and target tree become durable in one Git object creation.
+        A crash can therefore leave either no marker (safe to finish/retry) or
+        a complete marker whose tree is independently verified on recovery.
+        """
+
+        try:
+            canonical_request_id = UUID(str(request_id))
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if not (
+            self._full_git_oid(source_sha)
+            and self._full_git_oid(target_sha)
+            and self.workspace_matches_tree(target_sha)
+        ):
+            return None
+
+        message = (
+            f"Workspace undo to {target_sha[:12]}\n\n"
+            f"{_UNDO_REQUEST_TRAILER}: {canonical_request_id}\n"
+            f"{_UNDO_SOURCE_TRAILER}: {source_sha}\n"
+            f"{_UNDO_TARGET_TRAILER}: {target_sha}"
+        )
+        if not self.commit(message, allow_empty=True):
+            return None
+        commit_sha = self.get_current_commit()
+        if not self._full_git_oid(commit_sha) or not self.trees_match(
+            commit_sha, target_sha
+        ):
+            return None
+        return commit_sha
+
+    def find_workspace_undo_commit(
+        self, request_id: UUID | str
+    ) -> Optional[WorkspaceUndoCommit]:
+        """Recover the unique, tree-verified effect for an undo request.
+
+        Search is restricted to ``HEAD`` history. A marker on an unrelated ref
+        cannot authorize acknowledgement, while later empty/system commits are
+        harmless because the marked commit remains an ancestor. Multiple valid
+        effects for one request are an invariant violation and fail loudly.
+        """
+
+        if not self.is_active:
+            return None
+        try:
+            canonical_request_id = UUID(str(request_id))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        marker = f"{_UNDO_REQUEST_TRAILER}: {canonical_request_id}"
+        recovered: list[WorkspaceUndoCommit] = []
+        for commit_sha, message in self._undo_marked_commits(marker):
+            trailers: dict[str, list[str]] = {}
+            for line in message.splitlines():
+                for key in (
+                    _UNDO_REQUEST_TRAILER,
+                    _UNDO_SOURCE_TRAILER,
+                    _UNDO_TARGET_TRAILER,
+                ):
+                    prefix = f"{key}: "
+                    if line.startswith(prefix):
+                        trailers.setdefault(key, []).append(line[len(prefix) :])
+
+            request_values = trailers.get(_UNDO_REQUEST_TRAILER, [])
+            if str(canonical_request_id) not in request_values:
+                continue
+            source_values = trailers.get(_UNDO_SOURCE_TRAILER, [])
+            target_values = trailers.get(_UNDO_TARGET_TRAILER, [])
+            if (
+                request_values != [str(canonical_request_id)]
+                or len(source_values) != 1
+                or len(target_values) != 1
+                or not self._full_git_oid(commit_sha)
+                or not self._full_git_oid(source_values[0])
+                or not self._full_git_oid(target_values[0])
+                or not self.trees_match(commit_sha, target_values[0])
+                or not self.is_ancestor(source_values[0], commit_sha)
+            ):
+                raise WorkspaceUndoInvariantViolation(
+                    f"malformed Git marker for workspace undo {canonical_request_id}"
+                )
+            recovered.append(
+                WorkspaceUndoCommit(
+                    request_id=canonical_request_id,
+                    commit_sha=commit_sha,
+                    source_sha=source_values[0],
+                    target_sha=target_values[0],
+                )
+            )
+
+        if len(recovered) > 1:
+            raise WorkspaceUndoInvariantViolation(
+                f"multiple Git effects for workspace undo {canonical_request_id}"
+            )
+        return recovered[0] if recovered else None
+
+    def find_latest_workspace_undo_commit(self) -> Optional[WorkspaceUndoCommit]:
+        """Return the newest validated undo marker reachable from ``HEAD``.
+
+        The marker's exact target is the logical undo cursor while HEAD still
+        has that target tree. Parsing delegates to the request-specific
+        recovery path so uniqueness, ancestry, and tree verification stay one
+        invariant rather than two subtly different implementations.
+        """
+
+        if not self.is_active:
+            return None
+        for commit_sha, message in self._undo_marked_commits(
+            f"{_UNDO_REQUEST_TRAILER}:"
+        ):
+            request_values = [
+                line[len(f"{_UNDO_REQUEST_TRAILER}: ") :]
+                for line in message.splitlines()
+                if line.startswith(f"{_UNDO_REQUEST_TRAILER}: ")
+            ]
+            # A prose mention can satisfy git --grep without being a trailer.
+            if not request_values:
+                continue
+            if len(request_values) != 1:
+                raise WorkspaceUndoInvariantViolation(
+                    "latest workspace undo marker has ambiguous request identity"
+                )
+            try:
+                request_id = UUID(request_values[0])
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise WorkspaceUndoInvariantViolation(
+                    "latest workspace undo marker has invalid request identity"
+                ) from exc
+            effect = self.find_workspace_undo_commit(request_id)
+            if effect is None or effect.commit_sha != commit_sha:
+                raise WorkspaceUndoInvariantViolation(
+                    f"latest workspace undo marker {request_id} is inconsistent"
+                )
+            return effect
+        return None
+
     def log(self, max_count: int = 10, oneline: bool = True) -> str:
         """Get commit history.
 
@@ -348,6 +831,28 @@ class GitManager:
         except Exception as e:
             return f"Error getting diff: {e}"
 
+    def changed_paths(self, ref1: str, ref2: str) -> list[str]:
+        """Return paths whose tree entries differ between two commits.
+
+        Session undo uses this only for its acknowledgement payload.  The
+        actual restore remains :meth:`restore_tree`; failure to enumerate must
+        never weaken or partially substitute for that operation.
+        """
+
+        if not self.is_active:
+            return []
+        try:
+            paths = self._run_git_nul_records(
+                ["diff", "--name-only", "-z", str(ref1), str(ref2)]
+            )
+            if paths is None:
+                logger.warning("git diff --name-only failed")
+                return []
+            return paths
+        except Exception as e:
+            logger.warning("Failed to list changed paths: %s", e)
+            return []
+
     def status(self) -> str:
         """Get current status with clear dirty/clean indication.
 
@@ -444,21 +949,39 @@ class GitManager:
             return False
 
     def tag(self, tag_name: str, message: Optional[str] = None) -> bool:
-        """Create a git tag at current HEAD.
+        """Create a git tag at current HEAD (create-once, never moved).
+
+        Phase tags are audit boundaries: if the tag already exists at the
+        current HEAD commit this is a no-op; if it exists at a different
+        commit the call logs a TagInvariantViolation and refuses to move it.
 
         Args:
             tag_name: Tag name (e.g., "phase-2-tactical-complete")
             message: Optional tag message (creates annotated tag if provided)
 
         Returns:
-            True if successful, False otherwise
+            True if the tag exists at HEAD (created or already there),
+            False otherwise
         """
         if not self.is_active:
             logger.debug("Git not active, skipping tag")
             return False
 
         try:
-            args = ["tag", "-f"]
+            existing_sha = self.resolve_tag_commit(tag_name)
+            if existing_sha:
+                head_sha = self.get_current_commit()
+                if existing_sha == head_sha:
+                    logger.debug(f"Tag {tag_name} already at {head_sha}, no-op")
+                    return True
+                violation = TagInvariantViolation(tag_name, existing_sha, head_sha)
+                logger.error(
+                    f"Phase tag invariant violation: {violation} "
+                    f"— refusing to move an audit boundary"
+                )
+                return False
+
+            args = ["tag"]
             if message:
                 args.extend(["-a", tag_name, "-m", message])
             else:
@@ -475,6 +998,35 @@ class GitManager:
         except Exception as e:
             logger.error(f"Failed to create tag: {e}")
             return False
+
+    def resolve_tag_commit(self, tag_name: str) -> Optional[str]:
+        """Resolve a tag to the commit SHA it points at.
+
+        Dereferences annotated tags to the tagged commit.
+
+        Args:
+            tag_name: Tag name to resolve
+
+        Returns:
+            Commit SHA, or None if the tag doesn't exist (or on error)
+        """
+        if not self.is_active:
+            return None
+
+        try:
+            result = self._run_git(
+                [
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/tags/{tag_name}" + "^{commit}",
+                ]
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip() or None
+        except Exception:
+            return None
 
     def list_tags(self, pattern: Optional[str] = None) -> List[str]:
         """List git tags, optionally filtered by pattern.
@@ -563,6 +1115,146 @@ class GitManager:
         except Exception:
             return None
 
+    def get_current_commit(self) -> str | None:
+        """Get the current HEAD commit SHA.
+
+        Used as a progress-detection heuristic (e.g. the critic verdict
+        tools): callers must treat failure as "unknown", not an error.
+
+        Returns:
+            Full commit SHA, or None if not in a git repo or on any error.
+        """
+        if not self.is_active:
+            return None
+
+        try:
+            result = self._run_git(["rev-parse", "HEAD"])
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
+    def rev_parse(self, ref: str) -> str | None:
+        """Resolve a ref (e.g. "HEAD", "origin/main") to a commit SHA.
+
+        Returns:
+            Full commit SHA, or None if the ref does not resolve.
+        """
+        if not self.is_active:
+            return None
+
+        try:
+            result = self._run_git(["rev-parse", ref])
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
+    # Paths that are not part of what a round PRODUCED. Each changes on every
+    # round regardless of the agent's output, so counting them makes the
+    # content hash differ between two byte-identical rounds — reintroducing
+    # exactly the inertness ``get_content_tree`` exists to remove.
+    #
+    # Entries ending in "/" match by PREFIX, everything else exactly.
+    #
+    # That rule is NOT the same as "not delivered to the user", and the
+    # difference matters for the last entry:
+    #
+    # - output/job_{completion,frozen}.json carry a fresh ``timestamp``.
+    # - archive/ holds ``todos_phase_{N}_{type}_{TIMESTAMP}.md``, written by
+    #   ``TodoManager.archive`` (src/managers/todo.py) which ``finalize_job``
+    #   calls AFTER this hash is captured — so round N's archive is a NEW
+    #   tracked path staged by round N+1's ``git add -A``. That alone made the
+    #   guard inert for any job whose agent used todos, i.e. essentially all
+    #   of them, and it is invisible to any test that mocks the TodoManager.
+    #   (It is also in ``SYNC_IGNORE_PATTERNS``, i.e. never delivered — but
+    #   that is a coincidence, not the reason. See below.)
+    # - feedback.md is written into the workspace ROOT by
+    #   ``restore_from_feedback`` (src/graph.py) on every feedback resume —
+    #   which is exactly what a RETURNED verification round triggers, via
+    #   ``_internal_resume_job``. It lands between round N's capture and round
+    #   N+1's, so it is a new tracked path in N+1 and the guard could never
+    #   fire on the first repeated return.
+    #
+    #   Note it IS delivered to the user (deliberately absent from
+    #   ``SYNC_IGNORE_PATTERNS``). It is excluded here because it is the
+    #   round's INPUT — the critic's feedback, handed TO the agent — not
+    #   anything the agent produced in response. Do not generalise this list
+    #   as "the undelivered files"; that reading would be wrong here and would
+    #   licence excluding real deliverables.
+    #
+    # Every entry was found empirically, by diffing `ls-tree` round-over-round
+    # against a real workspace driven through a full return cycle. Do not add
+    # to it by guess: each entry costs detection sensitivity, and a wrong one
+    # blinds the guard to real work.
+    NON_DELIVERABLE_PATHS = (
+        "output/job_completion.json",
+        "output/job_frozen.json",
+        "archive/",
+        "feedback.md",
+    )
+
+    def get_content_tree(self, exclude: Optional[Iterable[str]] = None) -> str | None:
+        """Stable hash of the committed workspace CONTENT at HEAD.
+
+        This is the progress signal the verification gate compares between
+        rounds ("did the deliverable actually change?"). Unlike a commit SHA
+        it is content-addressed, which is what makes it usable:
+
+        - **Invariant under empty commits.** Both freeze branches of
+          ``finalize_job`` and every phase boundary call
+          ``commit(..., allow_empty=True)`` unconditionally, so HEAD moves on
+          every round no matter what. A guard keyed on the commit SHA can
+          therefore never fire whenever workspace git versioning is on — the
+          default.
+        - **Invariant under a re-clone.** When a round's ``push()`` fails and
+          the pod is recycled, the workspace re-clones from the remote and
+          HEAD reverts to an older commit. A commit comparison reads that
+          infrastructure hiccup as "no progress" and escalates BACKWARDS; the
+          content hash is unchanged as long as the content is.
+
+        Derived from ``git ls-tree -r HEAD`` (mode/type/blob-sha/path for
+        every tracked file) rather than ``rev-parse HEAD^{tree}`` so that the
+        agent's own run bookkeeping can be excluded — see
+        ``NON_DELIVERABLE_PATHS``.
+
+        Args:
+            exclude: Repo-relative paths to leave out of the hash. An entry
+                ending in ``/`` matches by prefix, everything else exactly.
+                Defaults to ``NON_DELIVERABLE_PATHS``; pass ``()`` to hash
+                everything tracked.
+
+        Returns:
+            Hex digest, or None if not in a git repo or on any error. Like
+            :meth:`get_current_commit`, callers must treat failure as
+            "unknown", not as an error — it must never raise.
+        """
+        if not self.is_active:
+            return None
+
+        try:
+            result = self._run_git(["ls-tree", "-r", "HEAD"])
+            if result.returncode != 0:
+                return None
+            listing = result.stdout or ""
+        except Exception:
+            return None
+
+        patterns = self.NON_DELIVERABLE_PATHS if exclude is None else tuple(exclude)
+        exact = {p for p in patterns if not p.endswith("/")}
+        prefixes = tuple(p for p in patterns if p.endswith("/"))
+
+        kept: List[str] = []
+        for line in listing.splitlines():
+            # "<mode> <type> <sha>\t<path>"
+            path = line.split("\t", 1)[1] if "\t" in line else ""
+            if path in exact or path.startswith(prefixes):
+                continue
+            kept.append(line)
+
+        # ls-tree -r already emits a stable order; sorting pins it so the
+        # digest can never depend on git's output ordering.
+        kept.sort()
+        return hashlib.sha256("\n".join(kept).encode("utf-8")).hexdigest()
+
     # =========================================================================
     # Remote Operations
     # =========================================================================
@@ -584,6 +1276,22 @@ class GitManager:
             return result.returncode == 0
         except Exception:
             return False
+
+    def remote_url(self, name: str = "origin") -> Optional[str]:
+        """Return the URL of a named remote, or None when unset/unreadable.
+
+        Args:
+            name: Remote name (default: "origin")
+        """
+        if not self.is_active:
+            return None
+        try:
+            result = self._run_git(["remote", "get-url", name])
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
 
     def add_remote(self, name: str, url: str) -> bool:
         """Add or update a git remote.
@@ -622,28 +1330,61 @@ class GitManager:
             return False
 
     def push(
-        self, remote: str = "origin", branch: Optional[str] = None, tags: bool = True
+        self, remote: str = "origin", branch: Optional[str] = None, tags: bool = False
     ) -> bool:
         """Push commits and optionally tags to remote.
 
-        Gracefully returns False if no remote is configured.
+        Gracefully returns False if git is inactive, no remote is configured,
+        or no branch was given while HEAD is detached. All of those are
+        *logged at WARNING* — the first two used to return silently, which is
+        how job bbce4bed lost a deliverable: every phase-boundary push
+        returned False across 8 phases and left no trace anywhere, because five
+        of the six call sites also discard the return value. See
+        knowledge-base/knowledge/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
+
+        Tag delivery is normally per-ref via push_ref() so one rejected
+        historical tag can't spoil every subsequent push; tags=True remains
+        available for explicitly pushing all tags.
 
         Args:
             remote: Remote name (default: "origin")
-            branch: Branch to push (auto-detected if None)
-            tags: Also push tags (default: True)
+            branch: Branch to push (auto-detected if None; a detached HEAD
+                cannot be auto-detected and is refused)
+            tags: Also push all tags (default: False)
 
         Returns:
             True if push succeeded, False otherwise
         """
-        if not self.is_active or not self.has_remote(remote):
+        if not self.is_active:
+            logger.warning(f"push skipped — git not active: {self._inactive_reason()}")
+            return False
+        if not self.has_remote(remote):
+            logger.warning(
+                f"push skipped — no '{remote}' remote configured "
+                f"(at {self._remote_cwd or self._workspace_path})"
+            )
             return False
 
         try:
-            # Auto-detect branch
+            # Auto-detect branch. Refuse on an EMPTY result too, not just a
+            # non-zero exit: a detached HEAD reports success with no output.
+            # This used to fall back to "main", which pushes a STALE main —
+            # reporting success while delivering none of the work at HEAD.
+            # No caller relies on the guess: the workspace repo is never
+            # deliberately detached (rewind restores via `checkout <sha> -- .`
+            # precisely to keep HEAD on its branch).
             if branch is None:
                 result = self._run_git(["branch", "--show-current"])
-                branch = result.stdout.strip() if result.returncode == 0 else "main"
+                detected = result.stdout.strip() if result.returncode == 0 else ""
+                if not detected:
+                    logger.warning(
+                        "push refused — HEAD is detached (or the current "
+                        "branch could not be read) at "
+                        f"{self._remote_cwd or self._workspace_path} and no "
+                        "branch was given; refusing to guess 'main'"
+                    )
+                    return False
+                branch = detected
 
             # Push branch
             result = self._run_git(
@@ -669,6 +1410,44 @@ class GitManager:
 
         except Exception as e:
             logger.warning(f"Push failed: {e}")
+            return False
+
+    def push_ref(self, ref: str, remote: str = "origin") -> bool:
+        """Push a single exact ref (e.g. "refs/tags/<name>") to the remote.
+
+        Delivers phase-boundary tags one at a time instead of spraying every
+        historical tag via ``git push --tags``.
+
+        Args:
+            ref: Fully qualified ref to push (e.g. "refs/tags/<name>")
+            remote: Remote name (default: "origin")
+
+        Returns:
+            True if the push succeeded, False otherwise
+        """
+        if not self.is_active:
+            logger.warning(
+                f"push_ref skipped — git not active: {self._inactive_reason()}"
+            )
+            return False
+        if not self.has_remote(remote):
+            logger.warning(
+                f"push_ref skipped — no '{remote}' remote configured "
+                f"(at {self._remote_cwd or self._workspace_path})"
+            )
+            return False
+
+        try:
+            result = self._run_git(["push", remote, f"{ref}:{ref}"], timeout=120)
+            if result.returncode != 0:
+                logger.warning(f"git push {ref} failed: {result.stderr}")
+                return False
+
+            logger.debug(f"Pushed {ref} to {remote}")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Push of {ref} failed: {e}")
             return False
 
     def has_unpushed_commits(
@@ -782,13 +1561,20 @@ class GitManager:
                     remote_target = backend.root
 
                 cmd = f"git clone {shlex.quote(url)} {shlex.quote(remote_target)}"
-                output = backend.shell_run(cmd, timeout=120, tab_name="git")
+                output = backend.shell_run(
+                    cmd, timeout=_CLONE_SHELL_TIMEOUT_SECONDS, tab_name="git"
+                )
 
-                # Parse exit code
                 first_line = output.split("\n", 1)[0].strip()
                 if not first_line.startswith("Exit code: 0"):
-                    logger.warning(f"git clone failed for {masked}: {output}")
-                    return None
+                    if cls._clone_in_flight(output):
+                        if not cls._wait_for_remote_clone(
+                            backend, remote_target, masked
+                        ):
+                            return None
+                    else:
+                        logger.warning(f"git clone failed for {masked}: {output}")
+                        return None
 
                 mgr = cls(target_path, backend=backend, remote_cwd=remote_cwd)
                 mgr._run_git(["config", "user.email", "agent@workspace.local"])
@@ -803,6 +1589,57 @@ class GitManager:
 
         # --- Local subprocess path (no backend) ---
 
+        return cls._clone_local(url, target_path, masked)
+
+    @staticmethod
+    def _clone_in_flight(output: str) -> bool:
+        """True when shell_run reports the clone alive, not failed: either the
+        wait cap expired mid-transfer, or the tab was already busy (a retry
+        landing while an earlier clone still runs) and the command was never
+        executed."""
+        first_line = output.split("\n", 1)[0].strip()
+        if first_line.startswith("Exit code: -1") and _STILL_RUNNING_MARKER in output:
+            return True
+        return _COLLIDING_MARKER in output and "NOT executed" in output
+
+    @classmethod
+    def _wait_for_remote_clone(cls, backend, remote_target: str, masked: str) -> bool:
+        """Wait for an in-flight clone on the 'git' tab to finish, then verify.
+
+        Polls with a probe that the busy tab rejects until the clone exits;
+        once it runs, the probe's answer — is there a git repo at the target —
+        is ground truth for whether the clone (whoever started it) succeeded.
+        """
+        probe = f"git -C {shlex.quote(remote_target)} rev-parse --git-dir"
+        deadline = time.monotonic() + _CLONE_WAIT_DEADLINE_SECONDS
+        logger.info(
+            f"Clone of {masked} still transferring; waiting up to "
+            f"{_CLONE_WAIT_DEADLINE_SECONDS}s for it to finish"
+        )
+        while time.monotonic() < deadline:
+            time.sleep(_CLONE_POLL_INTERVAL_SECONDS)
+            output = backend.shell_run(probe, timeout=60, tab_name="git")
+            if cls._clone_in_flight(output):
+                continue
+            first_line = output.split("\n", 1)[0].strip()
+            if first_line.startswith("Exit code: 0"):
+                logger.info(f"In-flight clone of {masked} completed")
+                return True
+            logger.warning(
+                f"Awaited clone of {masked} finished without a usable repo: {output}"
+            )
+            return False
+        logger.warning(
+            f"Gave up on clone of {masked} after {_CLONE_WAIT_DEADLINE_SECONDS}s "
+            "— the git tab never freed up"
+        )
+        return False
+
+    @classmethod
+    def _clone_local(
+        cls, url: str, target_path: Path, masked: str
+    ) -> Optional["GitManager"]:
+        """Clone via a local git subprocess (no backend)."""
         if shutil.which("git") is None:
             logger.warning("Cannot clone: git not available")
             return None
@@ -945,6 +1782,112 @@ class GitManager:
                 cmd, returncode=1, stdout="", stderr=str(e)
             )
 
+    def _run_git_nul_records(
+        self,
+        args: List[str],
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> Optional[list[str]]:
+        """Run Git and decode its NUL-delimited path records losslessly.
+
+        Git's ``-z`` formats are required for filenames containing newlines.
+        The tmux-backed remote shell is line-oriented, though, and strips raw
+        NUL bytes. On a backend, base64 therefore wraps the byte stream before
+        it crosses that transport; GitManager decodes it locally and validates
+        the terminal record delimiter. The local subprocess path retains its
+        historical direct ``-z`` behavior.
+
+        Returns ``None`` on command/transport/decoding failure, otherwise the
+        exact path records (with embedded newlines preserved).
+        """
+
+        if not self._use_backend:
+            cmd = ["git"] + args
+            try:
+                result = subprocess.run(
+                    cmd,
+                    cwd=self._workspace_path,
+                    capture_output=True,
+                    text=False,
+                    timeout=timeout,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                logger.error("Local Git path command failed: %s", exc)
+                return None
+            if result.returncode != 0:
+                return None
+            raw_payload = result.stdout
+        else:
+            cmd_str = "git " + " ".join(shlex.quote(arg) for arg in args)
+            encoded_cmd = (
+                '( _srw_git_tmp=$(mktemp "${TMPDIR:-/tmp}/srw-git-nul.XXXXXX") '
+                "|| exit 1; "
+                "trap 'rm -f -- \"$_srw_git_tmp\"' EXIT; "
+                "trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; "
+                f'{cmd_str} >"$_srw_git_tmp"; '
+                "_srw_git_rc=$?; "
+                '[ "$_srw_git_rc" -eq 0 ] || exit "$_srw_git_rc"; '
+                '_srw_git_len=$(wc -c <"$_srw_git_tmp") || exit 1; '
+                '_srw_git_sha=$(sha256sum "$_srw_git_tmp") || exit 1; '
+                "_srw_git_sha=${_srw_git_sha%% *}; "
+                'base64 "$_srw_git_tmp" || exit 1; '
+                f"printf '{_GIT_NUL_INTEGRITY_FRAME} %s %s\\n' "
+                '"$_srw_git_len" "$_srw_git_sha"; )'
+            )
+            try:
+                output = self._backend.shell_run(
+                    encoded_cmd,
+                    timeout=timeout,
+                    tab_name="git",
+                    working_dir=self._remote_cwd,
+                )
+                encoded_result = self._parse_shell_run_output(output, args)
+            except Exception as exc:
+                logger.error("Backend Git path command failed: %s", exc)
+                return None
+            if encoded_result.returncode != 0:
+                return None
+
+            lines = encoded_result.stdout.splitlines()
+            while lines and not lines[-1].strip():
+                lines.pop()
+            if not lines:
+                logger.error("Backend Git path output lacked its integrity frame")
+                return None
+            frame_parts = lines.pop().split()
+            if (
+                len(frame_parts) != 3
+                or frame_parts[0] != _GIT_NUL_INTEGRITY_FRAME
+                or not frame_parts[1].isdigit()
+                or len(frame_parts[2]) != 64
+                or any(char not in "0123456789abcdef" for char in frame_parts[2])
+            ):
+                logger.error("Backend Git path output had an invalid integrity frame")
+                return None
+            expected_length = int(frame_parts[1])
+            expected_sha256 = frame_parts[2]
+            encoded = "".join(line.strip() for line in lines if line.strip())
+            try:
+                raw_payload = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                logger.error("Backend Git path output was not valid base64")
+                return None
+            if (
+                len(raw_payload) != expected_length
+                or hashlib.sha256(raw_payload).hexdigest() != expected_sha256
+            ):
+                logger.error("Backend Git path output failed its integrity frame")
+                return None
+
+        if not raw_payload:
+            return []
+        if not raw_payload.endswith(b"\x00"):
+            logger.error("Git -z path output ended without its record delimiter")
+            return None
+        return [
+            record.decode("utf-8", errors="surrogateescape")
+            for record in raw_payload[:-1].split(b"\x00")
+        ]
+
     def _parse_shell_run_output(
         self, output: str, args: Optional[List[str]] = None
     ) -> subprocess.CompletedProcess:
@@ -988,19 +1931,37 @@ class GitManager:
                 exit_code = 1
 
             rest = lines[1] if len(lines) > 1 else ""
-            stdout_marker = "--- stdout ---\n"
-            if rest.startswith(stdout_marker):
-                stdout = rest[len(stdout_marker) :]
-            elif rest.strip() == "(no output)":
-                stdout = ""
-            else:
-                stdout = rest
 
+            # Locate the payload marker rather than assuming it is the first
+            # line. The backend prepends header lines before it — `CWD:` since
+            # f41970ae — and the old `rest.startswith(...)` check fell through
+            # to `stdout = rest`, handing callers the banner as command output.
+            # That is how push() came to invoke
+            # `git push -u origin "CWD: /…\n--- stdout ---\nmain"`, failing with
+            # `invalid refspec` on every phase boundary. See
+            # knowledge-base/knowledge/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md
+            stdout_marker = "--- stdout ---\n"
+            marker_at = rest.find(stdout_marker)
+            if marker_at != -1:
+                stdout = rest[marker_at + len(stdout_marker) :]
+            else:
+                # No payload marker: drop known header lines, then recheck for
+                # the empty sentinel (which the header also displaced).
+                body = "\n".join(
+                    ln for ln in rest.split("\n") if not ln.startswith("CWD:")
+                ).strip()
+                stdout = "" if body == "(no output)" else body
+
+            # The backend merges stdout and stderr into one stream, so on
+            # failure the diagnosis is in `stdout`. Mirror it into `stderr` too:
+            # callers log `result.stderr` on failure, and hardcoding "" is why
+            # the real breakage surfaced for a day as `git push failed: ` with
+            # nothing after the colon.
             return subprocess.CompletedProcess(
                 args=cmd,
                 returncode=exit_code,
                 stdout=stdout,
-                stderr="",
+                stderr="" if exit_code == 0 else stdout,
             )
 
         # No "Exit code:" prefix — timeout, stall, or other error

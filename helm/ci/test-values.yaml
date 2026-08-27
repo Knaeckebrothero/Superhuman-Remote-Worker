@@ -5,6 +5,11 @@ license:
 global:
   domain: "test.example.com"
 
+# CI models an externally managed collector-only signing Secret. It must never
+# resolve to the main application Secret consumed by dynamic agent Pods.
+infrastructureMetering:
+  ingestionSecretName: "test-infra-metering-ingestion"
+
 externalSecrets:
   enabled: true
   vaultPath: "test/secrets"
@@ -13,10 +18,12 @@ externalSecrets:
 headscale:
   enabled: true
 
-pgadmin:
-  enabled: true
+vm:
+  mode: external
 
-mongoExpress:
+orchestratorId: test-orchestrator
+
+pgadmin:
   enabled: true
 
 dozzle:
@@ -24,6 +31,10 @@ dozzle:
 
 codexProxy:
   enabled: true
+
+test:
+  greenmail:
+    enabled: true
 
 agent:
   tailscale:

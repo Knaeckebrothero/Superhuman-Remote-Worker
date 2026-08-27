@@ -16,21 +16,36 @@ Selection logic:
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
-from typing import Any, Optional
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Optional
+from uuid import UUID, uuid4
 
+from services import resolve_ssh_key_path, workspace_metering
+from services.ssh_helpers import (
+    SSHPrivateKeyError,
+    wait_for_agent_ssh,
+    workspace_private_key_fingerprint,
+)
+from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
 
 try:
     from kubernetes import client as k8s_client, config as k8s_config
+    from kubernetes.stream import stream as k8s_stream
 
     K8S_AVAILABLE = True
 except ImportError:
     k8s_client = None
     k8s_config = None
+    k8s_stream = None
     K8S_AVAILABLE = False
 
 
@@ -40,13 +55,189 @@ except ImportError:
 # in 0016_project_network_tier.sql is the source of truth for valid names.
 DEFAULT_NETWORK_TIER = "internet-only"
 
+# Private control-plane attestation paired with the stable workspace backing
+# generation. Unlike the PVC-backed generation, this value changes whenever
+# Kubernetes replaces the workspace pod.
+WORKSPACE_RUNTIME_INCARNATION_KEY = "_runtime_incarnation"
+WORKSPACE_RUNTIME_CREATION_KEY = "_stateless_runtime_creation"
+WORKSPACE_RUNTIME_CREATION_ANNOTATION = "srw.io/runtime-creation-generation"
+WORKSPACE_PROVISION_ATTEMPT_LABEL = "srw.io/workspace-provision-attempt"
+WORKSPACE_PROVISION_GENERATION_LABEL = "srw.io/runtime-generation"
+WORKSPACE_PROVISION_FENCE_LABEL = "srw.io/workspace-provision-fence"
+PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS = int(
+    os.getenv("PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS", "30")
+)
+PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS = int(
+    os.getenv("PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS", "600")
+)
+# Bump whenever any rendered pinned PVC/ConfigMap/Pod/Service field changes.
+# The durable fingerprint makes cross-process replay fail closed unless the
+# complete create contract is byte-for-byte equivalent; it is not a loose
+# config checksum.
+PINNED_WORKSPACE_PROVISION_RENDER_CONTRACT_VERSION = 2
+if PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS < 1:
+    raise RuntimeError("PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS must be positive")
+if PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS < (
+    PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS + 60
+):
+    raise RuntimeError(
+        "PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS must exceed the bounded "
+        "Kubernetes mutation timeout by at least 60 seconds"
+    )
+_UNSPECIFIED_RESOURCE_BINDING = object()
+
+
+class WorkspaceSSHAuthenticationError(RuntimeError):
+    """A K8s-ready workspace rejected the configured SSH identity."""
+
+
+class WorkspaceRuntimeAuthorityError(RuntimeError):
+    """A deterministic Pod name no longer identifies the authorized runtime."""
+
+
+@dataclass(frozen=True)
+class WorkspaceRuntimeAttestation:
+    """Exact control-plane identity for one live workspace SSH endpoint."""
+
+    backing_id: str
+    workspace_generation: str
+    runtime_incarnation: str
+    ssh_host_key_fingerprint: str
+    host: str
+    pod_ip: str
+    port: int = 30022
+
+
+@dataclass(frozen=True)
+class WorkspaceTeardownIdentity:
+    """Immutable Kubernetes identities captured before terminal teardown.
+
+    A deterministic resource name is not authority: Kubernetes may recreate a
+    Pod, PVC, or Service with the same name after a finalizer crash.  S36 keeps
+    this fixed-cardinality record in the completion effect intent and every
+    destructive call later carries the corresponding UID precondition.
+    """
+
+    pod_uid: str | None
+    pvc_uid: str | None
+    service_uid: str | None
+    pod_ip: str | None = None
+    ssh_host_key_fingerprint: str | None = None
+    ssh_port: int = 30022
+
+
+def _canonical_runtime_uuid(value: Any, *, label: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError(f"{label} is invalid")
+    try:
+        parsed = UUID(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is invalid") from exc
+    canonical = str(parsed)
+    if value != canonical:
+        raise ValueError(f"{label} is invalid")
+    return canonical
+
+
+def _resource_field(resource: Any, *names: str) -> Any:
+    """Read one Kubernetes model/dict field without MagicMock coercion."""
+
+    for name in names:
+        if isinstance(resource, dict):
+            if name in resource:
+                return resource[name]
+        elif resource is not None and hasattr(resource, name):
+            return getattr(resource, name)
+    return None
+
+
+def _all_pod_container_statuses_terminated(pod: Any) -> bool:
+    """Prove every declared/observed Pod container has terminated.
+
+    Kubernetes reports regular, restartable-init, and ephemeral/debug
+    containers in separate status arrays. Looking only at
+    ``container_statuses`` can therefore declare a Pod quiescent while an init
+    sidecar or injected debug container is still running. Missing status for a
+    declared container is equally ambiguous. Only a non-empty, complete set of
+    exact terminated states is positive proof.
+    """
+
+    status_obj = getattr(pod, "status", None)
+    spec_obj = getattr(pod, "spec", None)
+    observed_any = False
+    for status_field, spec_field in (
+        ("container_statuses", "containers"),
+        ("init_container_statuses", "init_containers"),
+        ("ephemeral_container_statuses", "ephemeral_containers"),
+    ):
+        raw_statuses = getattr(status_obj, status_field, None)
+        if raw_statuses is None:
+            statuses: list[Any] = []
+        elif isinstance(raw_statuses, (list, tuple)):
+            statuses = list(raw_statuses)
+        else:
+            return False
+
+        raw_declared = getattr(spec_obj, spec_field, None)
+        if isinstance(raw_declared, (list, tuple)) and raw_declared:
+            declared_names = {
+                str(getattr(container, "name", "") or "") for container in raw_declared
+            }
+            observed_names = {
+                str(getattr(container, "name", "") or "") for container in statuses
+            }
+            if "" in declared_names or declared_names != observed_names:
+                return False
+
+        if statuses:
+            observed_any = True
+        if any(
+            getattr(getattr(container, "state", None), "terminated", None) is None
+            for container in statuses
+        ):
+            return False
+    return observed_any
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _pvc_name_for(owner: WorkspaceOwner) -> str:
+    """Deterministic PVC name for an owner's workspace volume.
+
+    The SINGLE source of truth for both the create side (``create_workspace``)
+    and the reclaim side (``delete_workspace_pvc``, and through it the lifecycle
+    GC). Neither side may spell the name itself: a create/delete drift is the
+    worst failure mode in this file — it silently leaks volumes until the
+    storage quota rejects new PVCs with a 403 and provisioning fails closed, or
+    it deletes some other owner's data.
+
+    Jobs keep the historical ``pvc-workspace-<id[:12]>``; sessions get
+    ``pvc-ws-thread-<id[:12]>``, mirroring the pod-name split in
+    ``WorkspaceOwner.pod_name``. Truncation matches the pod name so the two
+    stay legible side by side in ``kubectl get pod,pvc``.
+    """
+    prefix = "pvc-workspace" if owner.kind == "job" else "pvc-ws-thread"
+    return f"{prefix}-{owner.id[:12]}"
+
 
 class ContainerProvisioner:
     """Workspace container provisioner using Kubernetes CoreV1Api.
 
-    Creates per-job pods with SSH server + code-server. Workspace data is
-    stored on PVCs so it survives pod crashes. PVCs are deleted on final
-    cleanup (job completion/cancellation) but retained during suspension.
+    Creates per-owner pods (job or session) with SSH server + code-server.
+    Workspace storage is ``emptyDir`` by default (dies with the pod). When
+    ``WORKSPACE_PVC_ENABLED`` is set, BOTH kinds are PVC-backed (Branch a): the
+    volume is named after the owner UUID (``_pvc_name_for``), survives pod
+    crashes, and reattaches by that deterministic name on recreate. PVCs are
+    reclaimed when the owning work reaches a terminal state (completed/failed/
+    cancelled job; a session only once its thread is genuinely done, since an
+    ``ended`` thread is still resumable) and retained across idle reaps,
+    suspend/restore and crash recovery.
+    See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
     """
 
     def __init__(self):
@@ -65,8 +256,51 @@ class ContainerProvisioner:
         self._ssh_secret_name: str = os.environ.get(
             "WORKSPACE_SSH_SECRET", "vm-ssh-key"
         )
+        self._ssh_auth_ready_timeout: float = float(
+            os.environ.get("WORKSPACE_SSH_AUTH_READY_TIMEOUT_S", "30")
+        )
+        self._ssh_auth_connect_timeout: int = int(
+            os.environ.get("WORKSPACE_SSH_AUTH_CONNECT_TIMEOUT_S", "5")
+        )
+        self._ssh_auth_poll_interval: float = float(
+            os.environ.get("WORKSPACE_SSH_AUTH_POLL_INTERVAL_S", "2")
+        )
         self._storage_class: str = os.environ.get(
             "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
+        )
+        # Branch (a): PVC-backed workspaces. Default off → emptyDir (today's
+        # behavior). Covers BOTH owner kinds. Sessions were scoped out in v1 on
+        # the theory that they rehydrate from Postgres — but Postgres only holds
+        # the conversation, not the working tree, and a session's pod is reaped
+        # when it goes idle while the thread stays resumable. On emptyDir the
+        # user reopens a session whose files silently vanished. The PVC name is
+        # deterministic on the owner UUID (``_pvc_name_for``), so a recreated pod
+        # reattaches the same volume; GC happens when the owning work is
+        # terminal. See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
+        self._pvc_enabled: bool = _env_flag("WORKSPACE_PVC_ENABLED", False)
+        self._pvc_size: str = os.environ.get("WORKSPACE_PVC_SIZE", "10Gi")
+        # Single-replica node-loss fallback (Phase 3b). A REATTACH gets this
+        # longer ready-wait so a transient node reboot (the replica's node coming
+        # back) recovers without discarding data; past it, a still-wedged reattach
+        # whose holdup is a volume-attach failure means the lone replica's node is
+        # gone — discard the PVC and recover onto a fresh volume (the agent then
+        # clones from Gitea + resumes the checkpoint; unpushed files are lost).
+        # `_fresh_fallback_enabled` is the kill-switch (the discard is the only
+        # data-destructive recovery path, so keep it disablable).
+        self._reattach_ready_timeout: int = int(
+            os.environ.get("WORKSPACE_REATTACH_READY_TIMEOUT", "180")
+        )
+        self._fresh_fallback_enabled: bool = _env_flag(
+            "WORKSPACE_REATTACH_FRESH_FALLBACK", True
+        )
+        # rclone-backed cloud workspaces are the default container path. They
+        # need FUSE inside the workspace pod because the agent shell runs there.
+        self._fuse_enabled: bool = _env_flag("WORKSPACE_FUSE_ENABLED", True)
+        # In k3d/containerd and many managed clusters, /dev/fuse + SYS_ADMIN is
+        # still not enough because the default runtime profile blocks FUSE
+        # mounts. Keep this explicit so restricted deployments can opt out.
+        self._fuse_privileged: bool = self._fuse_enabled and _env_flag(
+            "WORKSPACE_FUSE_PRIVILEGED", True
         )
 
     @property
@@ -152,6 +386,204 @@ class ContainerProvisioner:
     # Public API
     # =========================================================================
 
+    async def attest_workspace_runtime(
+        self, owner: WorkspaceOwner
+    ) -> WorkspaceRuntimeAttestation:
+        """Attest the exact live backing, Pod, endpoint, and SSH host identity.
+
+        This is deliberately a fresh control-plane read, not a projection of
+        ``jobs.context``.  The immutable Pod/PVC/Service/seed ownership checks
+        and the host-key exec are performed by ``_trusted_pod_ssh_identity``;
+        its post-exec re-reads close deterministic-name replacement races.
+        """
+
+        if not self._k8s_available or self._core_api is None:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Kubernetes authority is unavailable"
+            )
+
+        expected_network_tier = await self._resolve_network_tier(
+            owner.id, kind=owner.network_tier_kind
+        )
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod authority probe failed"
+            ) from exc
+
+        runtime_incarnation = self._require_workspace_pod_owner(
+            pod,
+            owner=owner,
+            allow_owner_unlabeled=False,
+            expected_network_tier=expected_network_tier,
+        )
+        status = getattr(pod, "status", None)
+        pod_ip = str(getattr(status, "pod_ip", "") or "")
+        container_statuses = getattr(status, "container_statuses", None)
+        if (
+            getattr(status, "phase", None) != "Running"
+            or not pod_ip
+            or not isinstance(container_statuses, (list, tuple))
+            or not container_statuses
+            or any(
+                getattr(item, "ready", None) is not True for item in container_statuses
+            )
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod is not exactly Kubernetes-ready"
+            )
+
+        pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
+        try:
+            (
+                backing_id,
+                fingerprint,
+                confirmed_runtime,
+            ) = await self._trusted_pod_ssh_identity(
+                owner.pod_name,
+                pvc_name=pvc_name,
+                expected_owner=owner,
+                expected_runtime_incarnation=runtime_incarnation,
+                expected_network_tier=expected_network_tier,
+            )
+        except WorkspaceRuntimeAuthorityError:
+            raise
+        except Exception as exc:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace SSH identity attestation failed"
+            ) from exc
+
+        if confirmed_runtime != runtime_incarnation:
+            raise WorkspaceRuntimeAuthorityError("workspace Pod UID changed")
+        expected_backing_kind = "pvc" if pvc_name else "pod"
+        expected_prefix = f"k8s-{expected_backing_kind}:{self._namespace}:"
+        if not backing_id.startswith(expected_prefix):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace backing identity is malformed"
+            )
+        try:
+            workspace_generation = _canonical_runtime_uuid(
+                backing_id.removeprefix(expected_prefix),
+                label="workspace backing UID",
+            )
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+        if re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fingerprint) is None:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace SSH host-key fingerprint is malformed"
+            )
+
+        return WorkspaceRuntimeAttestation(
+            backing_id=backing_id,
+            workspace_generation=workspace_generation,
+            runtime_incarnation=runtime_incarnation,
+            ssh_host_key_fingerprint=fingerprint,
+            host=self._workspace_dns(owner) if pvc_name else pod_ip,
+            pod_ip=pod_ip,
+        )
+
+    async def create_pinned_thread_workspace(
+        self,
+        thread_id: str,
+        *,
+        cpu: str = "500m",
+        memory: str = "1Gi",
+        cpu_limit: str = "2000m",
+        memory_limit: str = "4Gi",
+        image: Optional[str] = None,
+        runtime_lock_held: bool = False,
+    ) -> bool:
+        """Create one pinned workspace under its cross-replica lifecycle lock.
+
+        Route reads are not effect authority.  This wrapper refreshes the
+        exact ``(T, G, agent, attach, workspace, binding)`` snapshot while the
+        same advisory lock used by End/Resume is held, then delegates to the
+        row-locked provision-intent admission in :meth:`create_workspace`.
+        """
+
+        if self._db is None:
+            return False
+        if not runtime_lock_held:
+            lock_impl = getattr(type(self._db), "thread_advisory_lock", None)
+            if not callable(lock_impl):
+                return False
+            async with lock_impl(self._db, thread_id) as lock_owner:
+                if not lock_owner:
+                    return False
+                return await self.create_pinned_thread_workspace(
+                    thread_id,
+                    cpu=cpu,
+                    memory=memory,
+                    cpu_limit=cpu_limit,
+                    memory_limit=memory_limit,
+                    image=image,
+                    runtime_lock_held=True,
+                )
+
+        current = await self._db.get_thread(thread_id)
+        if (
+            not isinstance(current, Mapping)
+            or current.get("execution_lane") != "pinned"
+        ):
+            return False
+        try:
+            runtime_generation = _canonical_runtime_uuid(
+                str(current.get("runtime_generation") or ""),
+                label="pinned workspace runtime generation",
+            )
+        except ValueError:
+            return False
+        if current.get("runtime_retirement_token") is not None or str(
+            current.get("status") or ""
+        ) not in {"created", "active", "awaiting_user", "suspended"}:
+            return False
+        agent_id = current.get("agent_id")
+        attach_token = current.get("runtime_attach_token")
+        if (agent_id is None) != (attach_token is None):
+            return False
+
+        metadata = current.get("metadata")
+        metadata = {} if metadata is None else metadata
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                return False
+        if not isinstance(metadata, Mapping):
+            return False
+        raw_workspace = metadata.get("workspace_container")
+        raw_binding = metadata.get("_workspace_binding")
+        if not all(
+            value is None or isinstance(value, Mapping)
+            for value in (raw_workspace, raw_binding)
+        ):
+            return False
+        return await self.create_workspace(
+            WorkspaceOwner.session(thread_id),
+            cpu=cpu,
+            memory=memory,
+            cpu_limit=cpu_limit,
+            memory_limit=memory_limit,
+            image=image,
+            pinned_runtime_generation=runtime_generation,
+            pinned_agent_id=str(agent_id) if agent_id is not None else None,
+            pinned_attach_token=(
+                str(attach_token) if attach_token is not None else None
+            ),
+            expected_workspace_context=(
+                dict(raw_workspace) if raw_workspace is not None else None
+            ),
+            expected_binding_context=(
+                dict(raw_binding) if raw_binding is not None else None
+            ),
+            pinned_runtime_lock_held=True,
+        )
+
     async def create_workspace(
         self,
         owner: WorkspaceOwner,
@@ -160,6 +592,15 @@ class ContainerProvisioner:
         cpu_limit: str = "2000m",
         memory_limit: str = "4Gi",
         image: Optional[str] = None,
+        fresh: bool = False,
+        stateless_creation_generation: str | None = None,
+        allow_stateless_create: bool = False,
+        pinned_runtime_generation: str | None = None,
+        pinned_agent_id: str | None = None,
+        pinned_attach_token: str | None = None,
+        expected_workspace_context: dict[str, Any] | None = None,
+        expected_binding_context: dict[str, Any] | None = None,
+        pinned_runtime_lock_held: bool = False,
     ) -> bool:
         """Create a workspace container for a job or persistent thread.
 
@@ -170,6 +611,9 @@ class ContainerProvisioner:
             cpu_limit: CPU limit.
             memory_limit: Memory limit.
             image: Workspace image override (defaults to WORKSPACE_IMAGE env).
+            fresh: Single-replica node-loss recovery (Phase 3b) — force a clean
+                empty PVC by deleting any existing (wedged) one first, instead of
+                reattaching it. Set only by the internal fallback below.
 
         Returns:
             True if pod creation succeeded, False otherwise.
@@ -177,23 +621,414 @@ class ContainerProvisioner:
         if not self._k8s_available:
             return False
 
+        strict_stateless = stateless_creation_generation is not None
+        strict_pinned = pinned_runtime_generation is not None
+        if strict_stateless and strict_pinned:
+            return False
+        if not strict_stateless and owner.kind == "session":
+            lane_impl = (
+                getattr(
+                    type(self._db),
+                    "stateless_thread_workspace_creation_requires_authority",
+                    None,
+                )
+                if self._db is not None
+                else None
+            )
+            try:
+                requires_authority = (
+                    await lane_impl(self._db, owner.id) if callable(lane_impl) else None
+                )
+            except Exception:
+                requires_authority = None
+            if requires_authority is not False or not strict_pinned:
+                logger.error(
+                    "Direct workspace create refused without exact lane "
+                    "authority for thread %s",
+                    owner.id,
+                )
+                return False
+            if (
+                self._db is None
+                or not pinned_runtime_lock_held
+                or fresh
+                or (pinned_agent_id is None) != (pinned_attach_token is None)
+            ):
+                return False
+            try:
+                pinned_runtime_generation = _canonical_runtime_uuid(
+                    pinned_runtime_generation,
+                    label="pinned workspace runtime generation",
+                )
+                if pinned_agent_id is not None:
+                    pinned_agent_id = _canonical_runtime_uuid(
+                        pinned_agent_id,
+                        label="pinned workspace agent",
+                    )
+                    pinned_attach_token = _canonical_runtime_uuid(
+                        pinned_attach_token,
+                        label="pinned workspace attach token",
+                    )
+            except ValueError:
+                return False
+        if strict_stateless:
+            if owner.kind != "session" or self._db is None:
+                return False
+            if fresh:
+                return False
+            try:
+                stateless_creation_generation = _canonical_runtime_uuid(
+                    stateless_creation_generation,
+                    label="stateless workspace creation generation",
+                )
+            except ValueError:
+                return False
+            if type(allow_stateless_create) is not bool:
+                return False
+            if not allow_stateless_create:
+                return await self.continue_stateless_workspace_creation(
+                    owner,
+                    generation=stateless_creation_generation,
+                    expected_runtime_incarnation=None,
+                    cpu=cpu,
+                    memory=memory,
+                    cpu_limit=cpu_limit,
+                    memory_limit=memory_limit,
+                    image=image,
+                )
+            validate_impl = getattr(
+                type(self._db),
+                "validate_stateless_thread_workspace_creation_attempt",
+                None,
+            )
+            if not callable(validate_impl) or not await validate_impl(
+                self._db,
+                owner.id,
+                generation=stateless_creation_generation,
+                attempted=False,
+            ):
+                return False
+
         pod_name = owner.pod_name
         workspace_image = image or self._workspace_image
         network_tier = await self._resolve_network_tier(
             owner.id, kind=owner.network_tier_kind
         )
 
-        # Seed the user's saved code-server config (theme/keybindings/snippets)
-        # into the pod before it starts. Best-effort — never blocks provisioning.
+        # Resolve every deterministic Kubernetes name before the first create.
+        # Reads/config rendering are side-effect free; the row-locked pinned
+        # intent below is the effect admission boundary for PVC, ConfigMap,
+        # Pod, and Service alike.
         seed_files = await self._resolve_ide_seed_files(owner)
         seed_exts = await self._resolve_ide_extensions(owner)
-        seed_needs_state = await self._resolve_ide_needs_state(owner, seed_exts)
-        seed_cm = await self._create_seed_configmap(
-            pod_name, seed_files, seed_exts, needs_state=seed_needs_state
+        seed_needs_state = (
+            False
+            if strict_stateless
+            else await self._resolve_ide_needs_state(owner, seed_exts)
         )
+        pvc_name: Optional[str] = _pvc_name_for(owner) if self._pvc_enabled else None
+        seed_cm_name = (
+            self._seed_configmap_name(pod_name) if seed_files or seed_exts else None
+        )
+        service_name = owner.pod_name if pvc_name is not None else None
+        manifest_fingerprint = self._pinned_workspace_provision_fingerprint(
+            owner=owner,
+            pod_name=pod_name,
+            pvc_name=pvc_name,
+            seed_configmap_name=seed_cm_name,
+            service_name=service_name,
+            network_tier=network_tier,
+            workspace_image=workspace_image,
+            cpu=cpu,
+            memory=memory,
+            cpu_limit=cpu_limit,
+            memory_limit=memory_limit,
+            seed_files=seed_files,
+            seed_extensions=seed_exts,
+            seed_needs_state=seed_needs_state,
+        )
+        pinned_intent: dict[str, Any] | None = None
+        pinned_attempt_id: str | None = None
+        pinned_pod_uid: str | None = None
+        pinned_pvc_uid: str | None = None
+        pinned_seed_configmap_uid: str | None = None
+        pinned_service_uid: str | None = None
+        retained_service_uid: str | None = None
+        if strict_pinned:
+            captured_attempt_id: str | None = None
+            if isinstance(expected_workspace_context, Mapping):
+                raw_attempt = expected_workspace_context.get(
+                    "_workspace_provision_attempt"
+                )
+                raw_generation = expected_workspace_context.get(
+                    "_workspace_provision_generation"
+                )
+                if raw_attempt is not None or raw_generation is not None:
+                    try:
+                        captured_attempt_id = _canonical_runtime_uuid(
+                            raw_attempt,
+                            label="pinned workspace provision attempt",
+                        )
+                        captured_generation = _canonical_runtime_uuid(
+                            raw_generation,
+                            label="pinned workspace provision generation",
+                        )
+                    except ValueError:
+                        return False
+                    if captured_generation != pinned_runtime_generation:
+                        return False
+            if service_name is not None:
+                try:
+                    existing_service = await asyncio.to_thread(
+                        self._core_api.read_namespaced_service,
+                        name=service_name,
+                        namespace=self._namespace,
+                    )
+                except Exception as exc:
+                    if getattr(exc, "status", None) != 404:
+                        return False
+                else:
+                    if captured_attempt_id is not None:
+                        try:
+                            self._require_pinned_workspace_resource_identity(
+                                existing_service,
+                                resource="service",
+                                owner=owner,
+                                expected_name=service_name,
+                                expected_runtime_generation=(pinned_runtime_generation),
+                                expected_attempt_id=captured_attempt_id,
+                            )
+                        except WorkspaceRuntimeAuthorityError:
+                            try:
+                                retained_service_uid = (
+                                    self._require_stateless_service_identity(
+                                        existing_service,
+                                        owner=owner,
+                                    )
+                                )
+                            except WorkspaceRuntimeAuthorityError:
+                                return False
+                    else:
+                        try:
+                            retained_service_uid = (
+                                self._require_stateless_service_identity(
+                                    existing_service,
+                                    owner=owner,
+                                )
+                            )
+                        except WorkspaceRuntimeAuthorityError:
+                            return False
+            reserve_impl = getattr(
+                type(self._db),
+                "reserve_pinned_thread_workspace_provision_intent",
+                None,
+            )
+            if not callable(reserve_impl):
+                return False
+            proposed_attempt = str(uuid4())
+            pinned_intent = await reserve_impl(
+                self._db,
+                owner.id,
+                expected_runtime_generation=pinned_runtime_generation,
+                expected_agent_id=pinned_agent_id,
+                expected_attach_token=pinned_attach_token,
+                expected_workspace_context=expected_workspace_context,
+                expected_binding_context=expected_binding_context,
+                attempt_id=proposed_attempt,
+                namespace=self._namespace,
+                pod_name=pod_name,
+                pvc_name=pvc_name,
+                seed_configmap_name=seed_cm_name,
+                service_name=service_name,
+                retained_service_uid=retained_service_uid,
+                network_tier=network_tier,
+                manifest_fingerprint=manifest_fingerprint,
+            )
+            if not isinstance(pinned_intent, dict):
+                return False
+            pinned_attempt_id = str(pinned_intent.get("attempt_id") or "")
+            if not (
+                pinned_attempt_id
+                and str(pinned_intent.get("runtime_generation") or "")
+                == pinned_runtime_generation
+                and str(pinned_intent.get("pod_name") or "") == pod_name
+                and (pinned_intent.get("pvc_name") or None) == pvc_name
+                and (pinned_intent.get("seed_configmap_name") or None) == seed_cm_name
+                and (pinned_intent.get("service_name") or None) == service_name
+            ):
+                return False
 
-        # emptyDir by default — storage dies with the pod, no cleanup needed.
-        # Each job/session gets a fresh container; isolation is the pod boundary.
+        # Workspace storage (Branch a): PVC-backed for BOTH owner kinds when
+        # WORKSPACE_PVC_ENABLED — the volume is named by the owner UUID, survives
+        # pod crashes, and reattaches by that deterministic name on recreate
+        # (drift recovery, suspend/restore, give_up all funnel back through
+        # create_workspace, so 409-reuse here IS the resume path). Sessions need
+        # this at least as much as jobs: their pod is reaped on idle while the
+        # thread stays resumable, so emptyDir destroys the working tree of state
+        # a user can still reopen. Otherwise emptyDir — storage dies with the
+        # pod; isolation is the pod boundary. Created BEFORE the seed ConfigMap
+        # so a PVC failure leaves nothing to clean up — it is the provisioning
+        # prerequisite (and it fails closed: never silently downgrade to
+        # emptyDir, that would trade a visible failure for silent data loss).
+        pvc_reattach = False
+        if self._pvc_enabled:
+            # Fresh recovery (Phase 3b single-replica fallback): the prior reattach
+            # was wedged because the PVC's only replica is on a dead node. Delete
+            # the stuck PVC (and wait for it to release) so the create below makes
+            # a brand-new empty volume under the same deterministic name.
+            if fresh:
+                if not await self._delete_pvc_and_wait(
+                    pvc_name,
+                    expected_owner=owner,
+                ):
+                    return False
+            retained_pvc_uid = (
+                str((pinned_intent or {}).get("retained_pvc_uid") or "") or None
+            )
+            if strict_pinned and retained_pvc_uid is not None:
+                try:
+                    retained_claim = await asyncio.to_thread(
+                        self._core_api.read_namespaced_persistent_volume_claim,
+                        name=pvc_name,
+                        namespace=self._namespace,
+                    )
+                    observed_retained_uid = self._require_stateless_pvc_identity(
+                        retained_claim,
+                        owner=owner,
+                        pvc_name=pvc_name,
+                    )
+                except Exception:
+                    return False
+                pvc_status = (
+                    "reused" if observed_retained_uid == retained_pvc_uid else None
+                )
+            else:
+                pvc_labels = {owner.label_key: owner.id}
+                if strict_pinned:
+                    pvc_labels.update(
+                        {
+                            WORKSPACE_PROVISION_ATTEMPT_LABEL: pinned_attempt_id,
+                            WORKSPACE_PROVISION_GENERATION_LABEL: (
+                                pinned_runtime_generation
+                            ),
+                        }
+                    )
+                pvc_status = await self._create_pvc(
+                    pvc_name,
+                    size=self._pvc_size,
+                    # Owner label lets the backstop reaper resolve PVC → owner.
+                    labels=pvc_labels,
+                    expected_owner=owner,
+                )
+            if not pvc_status:
+                logger.error(
+                    "Workspace PVC create failed for %s %s — aborting provision",
+                    owner.kind,
+                    owner.id,
+                )
+                if not strict_stateless and not strict_pinned:
+                    await self._set_context(
+                        owner, {"status": "failed", "error": "PVC creation failed"}
+                    )
+                return False
+            if strict_pinned:
+                try:
+                    pinned_claim = await asyncio.to_thread(
+                        self._core_api.read_namespaced_persistent_volume_claim,
+                        name=pvc_name,
+                        namespace=self._namespace,
+                    )
+                    pvc_uid = self._require_pinned_workspace_resource_identity(
+                        pinned_claim,
+                        resource="pvc",
+                        owner=owner,
+                        expected_name=pvc_name,
+                        expected_runtime_generation=pinned_runtime_generation,
+                        expected_attempt_id=pinned_attempt_id,
+                        retained_uid=retained_pvc_uid,
+                    )
+                except Exception:
+                    return False
+                publish_impl = getattr(
+                    type(self._db),
+                    "publish_pinned_thread_workspace_provision_resource",
+                    None,
+                )
+                if not callable(publish_impl) or not await publish_impl(
+                    self._db,
+                    owner.id,
+                    expected_runtime_generation=pinned_runtime_generation,
+                    attempt_id=pinned_attempt_id,
+                    resource="pvc",
+                    resource_uid=pvc_uid,
+                ):
+                    return False
+                pinned_pvc_uid = pvc_uid
+            # "reused" (409) = an EXISTING volume reattached — the only case where
+            # the single-replica node-loss wedge can occur. `fresh` recreates a NEW
+            # volume, so it is never itself a reattach (prevents the fallback below
+            # from re-firing → no recursion).
+            pvc_reattach = pvc_status == "reused" and not fresh
+
+        try:
+            seed_cm = await self._create_seed_configmap(
+                pod_name,
+                seed_files,
+                seed_exts,
+                needs_state=seed_needs_state,
+                expected_owner=owner,
+                expected_creation_generation=(
+                    stateless_creation_generation if strict_stateless else None
+                ),
+                expected_provision_attempt=(
+                    pinned_attempt_id if strict_pinned else None
+                ),
+                expected_runtime_generation=(
+                    pinned_runtime_generation if strict_pinned else None
+                ),
+            )
+        except WorkspaceRuntimeAuthorityError as error:
+            logger.error(
+                "Stateless seed ConfigMap preparation failed for %s: %s",
+                owner.id,
+                error,
+            )
+            return False
+        if strict_pinned and seed_cm_name is not None:
+            if seed_cm != seed_cm_name:
+                return False
+            try:
+                pinned_seed = await asyncio.to_thread(
+                    self._core_api.read_namespaced_config_map,
+                    name=seed_cm_name,
+                    namespace=self._namespace,
+                )
+                seed_uid = self._require_pinned_workspace_resource_identity(
+                    pinned_seed,
+                    resource="seed_configmap",
+                    owner=owner,
+                    expected_name=seed_cm_name,
+                    expected_runtime_generation=pinned_runtime_generation,
+                    expected_attempt_id=pinned_attempt_id,
+                )
+            except Exception:
+                return False
+            publish_impl = getattr(
+                type(self._db),
+                "publish_pinned_thread_workspace_provision_resource",
+                None,
+            )
+            if not callable(publish_impl) or not await publish_impl(
+                self._db,
+                owner.id,
+                expected_runtime_generation=pinned_runtime_generation,
+                attempt_id=pinned_attempt_id,
+                resource="seed_configmap",
+                resource_uid=seed_uid,
+            ):
+                return False
+            pinned_seed_configmap_uid = seed_uid
+
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
             owner=owner,
@@ -203,39 +1038,526 @@ class ContainerProvisioner:
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
             network_tier=network_tier,
+            pvc_name=pvc_name,
             seed_configmap=seed_cm,
+            stateless_creation_generation=stateless_creation_generation,
+            pinned_runtime_generation=(
+                pinned_runtime_generation if strict_pinned else None
+            ),
+            pinned_provision_attempt=(pinned_attempt_id if strict_pinned else None),
         )
 
+        # Once the durable false->true attempt CAS is submitted, its outcome is
+        # the authority boundary for the one permitted Kubernetes create. A
+        # timeout/cancellation/non-409 error can occur after the apiserver has
+        # accepted an exact Pod that already references this ConfigMap. Never
+        # delete the seed on that ambiguous side of the edge: all retries are
+        # read/adopt-only and cannot recreate it. Exact terminal workspace
+        # cleanup owns the deterministic ConfigMap thereafter.
+        stateless_attempt_may_have_committed = False
+        existing_seed_bound = False
+        reused_existing_pod = False
+        metered_cpu, metered_memory = cpu, memory
         try:
-            created_pod = await asyncio.to_thread(
-                self._core_api.create_namespaced_pod,
-                namespace=self._namespace,
-                body=pod_manifest,
-            )
+            if strict_stateless:
+                claim_impl = getattr(
+                    type(self._db),
+                    "claim_stateless_thread_workspace_creation_attempt",
+                    None,
+                )
+                if not callable(claim_impl):
+                    return False
+                stateless_attempt_may_have_committed = True
+                if not await claim_impl(
+                    self._db,
+                    owner.id,
+                    generation=stateless_creation_generation,
+                ):
+                    return False
+                created_pod = await self._create_stateless_pod_once(
+                    owner,
+                    pod_manifest,
+                    generation=stateless_creation_generation,
+                    expected_network_tier=network_tier,
+                    expected_pvc_name=pvc_name,
+                    expected_seed_configmap=seed_cm,
+                )
+                if created_pod is None:
+                    return False
+                runtime_incarnation = self._require_stateless_pod_identity(
+                    created_pod,
+                    owner=owner,
+                    generation=stateless_creation_generation,
+                    expected_network_tier=network_tier,
+                    expected_pvc_name=pvc_name,
+                    expected_seed_configmap=seed_cm,
+                )
+                metered_cpu, metered_memory = (
+                    self._workspace_resource_requests_from_pod(created_pod)
+                )
+                publish_impl = getattr(
+                    type(self._db),
+                    "publish_stateless_thread_workspace_runtime",
+                    None,
+                )
+                if not callable(publish_impl) or not await publish_impl(
+                    self._db,
+                    owner.id,
+                    generation=stateless_creation_generation,
+                    runtime_incarnation=runtime_incarnation,
+                    pod_name=pod_name,
+                    namespace=self._namespace,
+                ):
+                    logger.error(
+                        "Lost stateless runtime publication authority for thread %s",
+                        owner.id,
+                    )
+                    return False
+            else:
+                (
+                    created_pod,
+                    reused_existing_pod,
+                ) = await self._create_pod_resolving_teardown(
+                    pod_manifest,
+                    pod_name,
+                    owner=owner,
+                    expected_provision_attempt=(
+                        pinned_attempt_id if strict_pinned else None
+                    ),
+                    expected_runtime_generation=(
+                        pinned_runtime_generation if strict_pinned else None
+                    ),
+                )
+                if created_pod is None:
+                    return False
+                runtime_incarnation = self._require_workspace_pod_owner(
+                    created_pod,
+                    owner=owner,
+                    allow_owner_unlabeled=False,
+                    expected_network_tier=network_tier,
+                )
+                if strict_pinned:
+                    runtime_incarnation = (
+                        self._require_pinned_workspace_resource_identity(
+                            created_pod,
+                            resource="pod",
+                            owner=owner,
+                            expected_name=pod_name,
+                            expected_runtime_generation=pinned_runtime_generation,
+                            expected_attempt_id=pinned_attempt_id,
+                        )
+                    )
+                    publish_impl = getattr(
+                        type(self._db),
+                        "publish_pinned_thread_workspace_provision_resource",
+                        None,
+                    )
+                    if not callable(publish_impl) or not await publish_impl(
+                        self._db,
+                        owner.id,
+                        expected_runtime_generation=pinned_runtime_generation,
+                        attempt_id=pinned_attempt_id,
+                        resource="pod",
+                        resource_uid=runtime_incarnation,
+                    ):
+                        return False
+                    pinned_pod_uid = runtime_incarnation
+                observed_seed = self._require_stateless_pod_storage_binding(
+                    created_pod,
+                    owner=owner,
+                    expected_pvc_name=pvc_name,
+                    expected_seed_configmap=(
+                        _UNSPECIFIED_RESOURCE_BINDING
+                        if reused_existing_pod
+                        else seed_cm
+                    ),
+                )
+                if reused_existing_pod:
+                    if observed_seed is not None:
+                        existing_seed_bound = True
+                        seed_configmap = await asyncio.to_thread(
+                            self._core_api.read_namespaced_config_map,
+                            name=observed_seed,
+                            namespace=self._namespace,
+                        )
+                        try:
+                            self._require_stateless_seed_configmap_identity(
+                                seed_configmap,
+                                owner=owner,
+                                pod_name=pod_name,
+                            )
+                        except WorkspaceRuntimeAuthorityError:
+                            await self._require_legacy_seed_configmap_migration(
+                                seed_configmap,
+                                owner=owner,
+                                pod_name=pod_name,
+                            )
+                        seed_cm = observed_seed
+                    elif seed_cm is not None:
+                        if not await self._delete_seed_configmap(
+                            pod_name,
+                            expected_owner=owner,
+                        ):
+                            return False
+                        seed_cm = None
             # Make the pod own the seed ConfigMap so K8s GCs it on teardown.
-            await self._adopt_configmap(seed_cm, created_pod)
+            # created_pod is None only for the idempotent live-pod case, where
+            # the existing pod already owns its (same-named) ConfigMap.
+            if created_pod is not None:
+                adopted_seed = await self._adopt_configmap(
+                    seed_cm,
+                    created_pod,
+                    expected_owner=owner,
+                    expected_creation_generation=(
+                        stateless_creation_generation if strict_stateless else None
+                    ),
+                    expected_provision_attempt=(
+                        pinned_attempt_id if strict_pinned else None
+                    ),
+                    expected_runtime_generation=(
+                        pinned_runtime_generation if strict_pinned else None
+                    ),
+                )
+                if adopted_seed is not True:
+                    return False
+            # PVC-backed workspaces (jobs AND sessions) get a stable headless
+            # Service so the agent dials a constant DNS name that survives pod
+            # recreates (reattach/recovery) instead of an ephemeral pod IP. Same
+            # gate as the PVC; kept across idle reaps, dropped on release.
+            if pvc_name:
+                retained_service = (
+                    str((pinned_intent or {}).get("retained_service_uid") or "") or None
+                )
+                service_created = bool(retained_service) if strict_pinned else False
+                if not service_created:
+                    service_created = await self._create_service(
+                        owner,
+                        require_exact_owner=True,
+                        expected_provision_attempt=(
+                            pinned_attempt_id if strict_pinned else None
+                        ),
+                        expected_runtime_generation=(
+                            pinned_runtime_generation if strict_pinned else None
+                        ),
+                    )
+                if not service_created:
+                    # Ready publishes this stable DNS name. Preserve the exact
+                    # UID+attempt marker until the idempotent Service exists;
+                    # continuation retries it without another Pod create.
+                    return False
+                if strict_pinned:
+                    try:
+                        pinned_service = await asyncio.to_thread(
+                            self._core_api.read_namespaced_service,
+                            name=owner.pod_name,
+                            namespace=self._namespace,
+                        )
+                        service_uid = self._require_pinned_workspace_resource_identity(
+                            pinned_service,
+                            resource="service",
+                            owner=owner,
+                            expected_name=owner.pod_name,
+                            expected_runtime_generation=(pinned_runtime_generation),
+                            expected_attempt_id=pinned_attempt_id,
+                            retained_uid=(
+                                str(
+                                    (pinned_intent or {}).get("retained_service_uid")
+                                    or ""
+                                )
+                                or None
+                            ),
+                        )
+                    except Exception:
+                        return False
+                    publish_impl = getattr(
+                        type(self._db),
+                        "publish_pinned_thread_workspace_provision_resource",
+                        None,
+                    )
+                    if not callable(publish_impl) or not await publish_impl(
+                        self._db,
+                        owner.id,
+                        expected_runtime_generation=pinned_runtime_generation,
+                        attempt_id=pinned_attempt_id,
+                        resource="service",
+                        resource_uid=service_uid,
+                    ):
+                        return False
+                    pinned_service_uid = service_uid
             logger.info(
                 "Workspace container created: %s (%s %s)",
                 pod_name,
                 owner.kind,
                 owner.id,
             )
-            await self._set_context(
-                owner,
-                {
-                    "status": "created",
-                    "pod_name": pod_name,
-                    "namespace": self._namespace,
-                },
-            )
-
-            # Wait for pod IP (poll until ready or timeout)
-            pod_ip = await self._wait_for_ready(pod_name, timeout=120)
-            if pod_ip:
+            if not strict_stateless and not strict_pinned:
                 await self._set_context(
                     owner,
-                    {"status": "ready", "pod_ip": pod_ip, "port": 30022},
+                    {
+                        "status": "created",
+                        "provisioner": "k8s",
+                        "pod_name": pod_name,
+                        "namespace": self._namespace,
+                        **(
+                            {
+                                CANVAS_WORKSPACE_GENERATION_KEY: None,
+                                WORKSPACE_RUNTIME_INCARNATION_KEY: (
+                                    runtime_incarnation
+                                ),
+                            }
+                            if owner.kind == "session"
+                            else {}
+                        ),
+                    },
                 )
+
+            # Open a compute-metering interval (Slice 4b) — best-effort, billed on
+            # the accepted Pod's immutable requests for strict stateless
+            # runtimes. Admission may mutate those values, and a later retry
+            # must not bill using caller/config drift. Pinned/job behavior keeps
+            # its legacy requested-value semantics.
+            await workspace_metering.open_interval(
+                self._db,
+                owner,
+                tier="sandbox",
+                cpu=metered_cpu,
+                memory=metered_memory,
+            )
+
+            # Wait for pod IP. A reattach gets the longer window so a transient
+            # node reboot recovers without discarding data; a fresh create keeps
+            # the standard 120s.
+            ready_timeout = self._reattach_ready_timeout if pvc_reattach else 120
+            pod_ip = await self._wait_for_ready(
+                pod_name,
+                timeout=ready_timeout,
+                expected_owner=owner,
+                expected_runtime_incarnation=runtime_incarnation,
+                expected_creation_generation=(
+                    stateless_creation_generation if strict_stateless else None
+                ),
+                expected_network_tier=network_tier,
+                expected_pvc_name=pvc_name,
+                expected_seed_configmap=seed_cm,
+            )
+            if pod_ip:
+                if seed_cm is not None:
+                    ready_seed = await asyncio.to_thread(
+                        self._core_api.read_namespaced_config_map,
+                        name=seed_cm,
+                        namespace=self._namespace,
+                    )
+                    self._require_stateless_seed_configmap_identity(
+                        ready_seed,
+                        owner=owner,
+                        generation=(
+                            stateless_creation_generation if strict_stateless else None
+                        ),
+                        pod_name=pod_name,
+                    )
+                    self._require_seed_configmap_pod_owner_reference(
+                        ready_seed,
+                        pod_name=pod_name,
+                        runtime_incarnation=runtime_incarnation,
+                    )
+                if pvc_name is not None:
+                    ready_claim = await asyncio.to_thread(
+                        self._core_api.read_namespaced_persistent_volume_claim,
+                        name=pvc_name,
+                        namespace=self._namespace,
+                    )
+                    self._require_stateless_pvc_identity(
+                        ready_claim,
+                        owner=owner,
+                        pvc_name=pvc_name,
+                    )
+                    ready_service = await asyncio.to_thread(
+                        self._core_api.read_namespaced_service,
+                        name=owner.pod_name,
+                        namespace=self._namespace,
+                    )
+                    self._require_stateless_service_identity(
+                        ready_service,
+                        owner=owner,
+                    )
+                canvas_generation = None
+                if owner.kind == "session" and self._db:
+                    try:
+                        # Now that sessions can be PVC-backed, this resolves the
+                        # trusted identity to the VOLUME (`k8s-pvc:…`) rather
+                        # than the pod — which is the point: the backing_id (and
+                        # so the Canvas workspace_generation) stops churning on
+                        # every pod recreate. A session that predates the PVC
+                        # switch re-binds once, from pod UID to PVC UID.
+                        (
+                            backing_id,
+                            fingerprint,
+                            trusted_runtime_incarnation,
+                        ) = await self._trusted_pod_ssh_identity(
+                            pod_name,
+                            pvc_name=pvc_name,
+                            expected_owner=owner,
+                            expected_runtime_incarnation=(
+                                pinned_pod_uid if strict_pinned else runtime_incarnation
+                            ),
+                            expected_creation_generation=(
+                                stateless_creation_generation
+                                if strict_stateless
+                                else None
+                            ),
+                            expected_network_tier=network_tier,
+                            expected_seed_configmap=seed_cm,
+                            expected_pvc_uid=(
+                                pinned_pvc_uid if strict_pinned else None
+                            ),
+                            expected_provision_attempt=(
+                                pinned_attempt_id if strict_pinned else None
+                            ),
+                            expected_runtime_generation=(
+                                pinned_runtime_generation if strict_pinned else None
+                            ),
+                            expected_seed_configmap_uid=(
+                                pinned_seed_configmap_uid if strict_pinned else None
+                            ),
+                            expected_service_uid=(
+                                pinned_service_uid if strict_pinned else None
+                            ),
+                            expected_retained_pvc_uid=(
+                                str((pinned_intent or {}).get("retained_pvc_uid") or "")
+                                or None
+                                if strict_pinned
+                                else None
+                            ),
+                            expected_retained_service_uid=(
+                                str(
+                                    (pinned_intent or {}).get("retained_service_uid")
+                                    or ""
+                                )
+                                or None
+                                if strict_pinned
+                                else None
+                            ),
+                        )
+                        if strict_stateless:
+                            complete_impl = getattr(
+                                type(self._db),
+                                "complete_stateless_thread_workspace_creation",
+                                None,
+                            )
+                            completed = (
+                                await complete_impl(
+                                    self._db,
+                                    owner.id,
+                                    generation=stateless_creation_generation,
+                                    runtime_incarnation=(trusted_runtime_incarnation),
+                                    backing_id=backing_id,
+                                    ssh_host_key_fingerprint=fingerprint,
+                                    pod_ip=pod_ip,
+                                    port=30022,
+                                    host=(
+                                        self._workspace_dns(owner) if pvc_name else None
+                                    ),
+                                )
+                                if callable(complete_impl)
+                                else None
+                            )
+                            if not completed:
+                                logger.error(
+                                    "Lost exact Ready publication authority for "
+                                    "stateless thread %s",
+                                    owner.id,
+                                )
+                                return False
+                            canvas_generation = completed.get("workspace_generation")
+                            runtime_incarnation = trusted_runtime_incarnation
+                        elif strict_pinned:
+                            complete_impl = getattr(
+                                type(self._db),
+                                "complete_pinned_thread_workspace_provision_intent",
+                                None,
+                            )
+                            completed = (
+                                await complete_impl(
+                                    self._db,
+                                    owner.id,
+                                    expected_runtime_generation=(
+                                        pinned_runtime_generation
+                                    ),
+                                    attempt_id=pinned_attempt_id,
+                                    expected_pod_uid=pinned_pod_uid,
+                                    expected_pvc_uid=pinned_pvc_uid,
+                                    expected_seed_configmap_uid=(
+                                        pinned_seed_configmap_uid
+                                    ),
+                                    expected_service_uid=pinned_service_uid,
+                                    pod_ip=pod_ip,
+                                    ssh_host_key_fingerprint=fingerprint,
+                                    port=30022,
+                                )
+                                if callable(complete_impl)
+                                else None
+                            )
+                            if not isinstance(completed, dict):
+                                logger.error(
+                                    "Lost exact Ready publication authority for "
+                                    "pinned thread %s",
+                                    owner.id,
+                                )
+                                return False
+                            if (
+                                str(completed.get("runtime_incarnation") or "")
+                                != trusted_runtime_incarnation
+                                or str(completed.get("backing_id") or "") != backing_id
+                            ):
+                                return False
+                            canvas_generation = completed.get("workspace_generation")
+                            runtime_incarnation = trusted_runtime_incarnation
+                        else:
+                            binding = await self._db.bind_thread_workspace_backing(
+                                owner.id,
+                                backing_kind="remote",
+                                backing_id=backing_id,
+                                ssh_host_key_fingerprint=fingerprint,
+                            )
+                            if binding:
+                                canvas_generation = binding.get("workspace_generation")
+                                if canvas_generation:
+                                    runtime_incarnation = trusted_runtime_incarnation
+                    except Exception:
+                        # Legacy workspaces may remain usable while Canvas fails
+                        # closed.  A strict attempt has not published Ready yet:
+                        # treating this as success strands its durable planned
+                        # intent and lets callers skip the only continuation path.
+                        logger.exception(
+                            "Failed to bind trusted Canvas SSH identity for session %s",
+                            owner.id,
+                        )
+                        if strict_stateless or strict_pinned:
+                            return False
+                ready_ctx = {
+                    "status": "ready",
+                    "provisioner": "k8s",
+                    "pod_ip": pod_ip,
+                    "port": 30022,
+                }
+                if owner.kind == "job":
+                    # Jobs do not use the Canvas backing bind, but their worker
+                    # bundle still needs immutable endpoint provenance.  This
+                    # is the exact Pod UID already verified above and used by
+                    # deletion/reattach fencing.
+                    ready_ctx[WORKSPACE_RUNTIME_INCARNATION_KEY] = runtime_incarnation
+                if owner.kind == "session":
+                    # Pair this endpoint with the exact binding minted above.
+                    # A failed/missing bind publishes null and Canvas fails closed.
+                    ready_ctx[CANVAS_WORKSPACE_GENERATION_KEY] = canvas_generation
+                    ready_ctx[WORKSPACE_RUNTIME_INCARNATION_KEY] = runtime_incarnation
+                # Hand the agent the STABLE Service DNS (not the ephemeral IP) so
+                # a reattached/recovered pod is reachable at the same address.
+                # The dispatch + resume paths prefer this `host` over `pod_ip`.
+                if pvc_name:
+                    ready_ctx["host"] = self._workspace_dns(owner)
+                if not strict_stateless and not strict_pinned:
+                    await self._set_context(owner, ready_ctx)
                 logger.info(
                     "Workspace container ready: %s @ %s (%s %s)",
                     pod_name,
@@ -243,9 +1565,54 @@ class ContainerProvisioner:
                     owner.kind,
                     owner.id,
                 )
-                # Stream license/globalStorage state in (Phase B); fire-and-forget
-                # so it never blocks provisioning. No-ops when S3 is unavailable.
-                asyncio.create_task(self._seed_workspace_state(owner, pod_ip))
+                # The legacy Phase-B SFTP task is name-based and detached from
+                # lifecycle authority. Do not let it outlive a stateless Ready
+                # CAS and race a replacement or terminal retirement.
+                if not strict_stateless and not strict_pinned:
+                    asyncio.create_task(self._seed_workspace_state(owner, pod_ip))
+            elif (
+                not strict_stateless
+                and not strict_pinned
+                and pvc_reattach
+                and self._fresh_fallback_enabled
+                and await self._pod_volume_attach_failing(pod_name)
+            ):
+                # Single-replica node-loss fallback (Phase 3b): the reattached
+                # volume can't attach here and won't until the dead node holding
+                # its lone replica returns. Discard the wedged PVC and recover onto
+                # a FRESH empty volume — the agent then clones from Gitea and
+                # resumes the Postgres checkpoint (unpushed working-tree files are
+                # lost: the accepted cost of single-replica + node loss). Recurses
+                # once with fresh=True, which creates a NEW volume (not a reattach),
+                # so this branch cannot re-fire.
+                logger.warning(
+                    "Workspace %s reattach wedged — volume unattachable (likely a "
+                    "dead node holding the single replica). Discarding the PVC and "
+                    "recovering onto a fresh volume; unpushed files are lost (%s %s)",
+                    pod_name,
+                    owner.kind,
+                    owner.id,
+                )
+                try:
+                    await self.delete_workspace(owner)
+                except Exception:
+                    logger.exception(
+                        "Error deleting wedged pod before fresh recovery (%s)",
+                        pod_name,
+                    )
+                fresh_ok = await self.create_workspace(
+                    owner,
+                    cpu=cpu,
+                    memory=memory,
+                    cpu_limit=cpu_limit,
+                    memory_limit=memory_limit,
+                    image=image,
+                    fresh=True,
+                )
+                # Record that the working tree was reset (observability for the
+                # dispatch/UI: this resume starts from the last push, not the disk).
+                await self._set_context(owner, {"workspace_reset": True})
+                return fresh_ok
             else:
                 logger.warning(
                     "Workspace container created but not ready within timeout: %s (%s %s)",
@@ -253,7 +1620,10 @@ class ContainerProvisioner:
                     owner.kind,
                     owner.id,
                 )
-                await self._set_context(owner, {"status": "creating"})
+                if not strict_stateless and not strict_pinned:
+                    await self._set_context(owner, {"status": "creating"})
+                else:
+                    return False
 
             return True
         except Exception as e:
@@ -263,15 +1633,1059 @@ class ContainerProvisioner:
                 owner.id,
                 e,
             )
-            # Don't leave the seed ConfigMap orphaned if the pod never came up.
-            await self._delete_seed_configmap(pod_name)
-            await self._set_context(
+            # Legacy/job failures can discard an unreferenced seed. For a
+            # submitted stateless attempt, API acceptance is ambiguous and the
+            # exact Pod may already depend on it; preserve it for read/adopt
+            # continuation and let terminal workspace cleanup remove it.
+            if not (
+                existing_seed_bound
+                or reused_existing_pod
+                or (strict_stateless and stateless_attempt_may_have_committed)
+                or strict_pinned
+            ):
+                await self._delete_seed_configmap(
+                    pod_name,
+                    expected_owner=owner,
+                )
+            if not strict_stateless and not strict_pinned:
+                await self._set_context(
+                    owner,
+                    {"status": "failed", "error": str(e)},
+                )
+            return False
+
+    async def prepare_stateless_workspace_recreation(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        expected_runtime_incarnation: str,
+        mode: str,
+    ) -> str | None:
+        """Rotate create authority only after the caller proves exact-terminal.
+
+        The marker is persisted before the UID-preconditioned delete.  Its
+        attempt bit remains false until create_workspace has completed all
+        non-Pod preparation, so a crash before Pod actuation remains safely
+        recoverable by a later lifecycle owner.
+        """
+
+        if owner.kind != "session" or not self._k8s_available or self._db is None:
+            return None
+        try:
+            expected_runtime_incarnation = _canonical_runtime_uuid(
+                expected_runtime_incarnation,
+                label="stateless workspace runtime incarnation",
+            )
+        except ValueError:
+            return None
+        if mode not in {"create", "restore"}:
+            return None
+        if (
+            await self.workspace_pod_authority(
                 owner,
-                {"status": "failed", "error": str(e)},
+                expected_runtime_incarnation=expected_runtime_incarnation,
+            )
+            != "exact_terminal"
+        ):
+            return None
+        prepare_impl = getattr(
+            type(self._db), "prepare_stateless_thread_workspace_creation", None
+        )
+        if not callable(prepare_impl):
+            return None
+        generation = str(uuid4())
+        plan = await prepare_impl(
+            self._db,
+            owner.id,
+            proposed_generation=generation,
+            mode=mode,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+        )
+        if (
+            not isinstance(plan, dict)
+            or plan.get("state") != "prepared"
+            or not isinstance(plan.get("creation"), dict)
+            or plan["creation"].get("generation") != generation
+            or plan["creation"].get("attempted") is not False
+        ):
+            return None
+        deleted = await self._delete_prepared_terminal_workspace_runtime(
+            owner,
+            generation=generation,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+        )
+        return generation if deleted is True else None
+
+    async def finalize_stateless_workspace_recreation_deletion(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        generation: str,
+        expected_runtime_incarnation: str,
+    ) -> bool:
+        """Recover the DB edge after a proven-terminal delete reached 404."""
+
+        if owner.kind != "session" or self._db is None:
+            return False
+        try:
+            generation = _canonical_runtime_uuid(
+                generation,
+                label="stateless workspace creation generation",
+            )
+            expected_runtime_incarnation = _canonical_runtime_uuid(
+                expected_runtime_incarnation,
+                label="stateless workspace runtime incarnation",
+            )
+        except ValueError:
+            return False
+        if (
+            await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+            )
+            != "exact_absent"
+        ):
+            return False
+        return await self._clear_prepared_terminal_workspace_runtime(
+            owner,
+            generation=generation,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+        )
+
+    async def _delete_prepared_terminal_workspace_runtime(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        generation: str,
+        expected_runtime_incarnation: str,
+    ) -> bool:
+        """UID-delete and observe 404 before clearing durable runtime identity."""
+
+        validate_impl = getattr(
+            type(self._db),
+            "validate_stateless_thread_workspace_creation_attempt",
+            None,
+        )
+        if not callable(validate_impl) or not await validate_impl(
+            self._db,
+            owner.id,
+            generation=generation,
+            attempted=False,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+        ):
+            return False
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+                grace_period_seconds=10,
+                body={"preconditions": {"uid": expected_runtime_incarnation}},
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) != 404:
+                return False
+        if not await self._wait_for_exact_workspace_pod_absent(
+            owner,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+            timeout=30,
+        ):
+            # Keep both the old UID and the unattempted marker durable. A later
+            # exact-absent retry can finish the guarded clear; no caller can
+            # consume the one-shot create while the old object remains.
+            return False
+        return await self._clear_prepared_terminal_workspace_runtime(
+            owner,
+            generation=generation,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+        )
+
+    async def _wait_for_exact_workspace_pod_absent(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        expected_runtime_incarnation: str,
+        timeout: float,
+    ) -> bool:
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                pod = await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) == 404:
+                    return True
+                return False
+            observed = str(getattr(getattr(pod, "metadata", None), "uid", "") or "")
+            if observed != expected_runtime_incarnation:
+                return False
+            await asyncio.sleep(1)
+        return False
+
+    async def _clear_prepared_terminal_workspace_runtime(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        generation: str,
+        expected_runtime_incarnation: str,
+    ) -> bool:
+        # The deterministic seed may not have an ownerReference when the
+        # original create response was lost. Remove it only after exact Pod
+        # absence, but before exposing the replacement attempt.
+        if not await self._delete_seed_configmap(
+            owner.pod_name,
+            expected_owner=owner,
+            expected_pod_uid=expected_runtime_incarnation,
+        ):
+            return False
+        clear_impl = getattr(
+            type(self._db),
+            "clear_stateless_thread_workspace_runtime_for_recreation",
+            None,
+        )
+        if not callable(clear_impl) or not await clear_impl(
+            self._db,
+            owner.id,
+            generation=generation,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+        ):
+            return False
+        await workspace_metering.close_interval(self._db, owner)
+        return True
+
+    async def continue_stateless_workspace_creation(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        generation: str,
+        expected_runtime_incarnation: str | None,
+        cpu: str = "500m",
+        memory: str = "1Gi",
+        cpu_limit: str = "2000m",
+        memory_limit: str = "4Gi",
+        image: Optional[str] = None,
+    ) -> bool:
+        """Resume one attempted create without ever issuing create-by-name."""
+
+        del cpu_limit, memory_limit, image
+        if owner.kind != "session" or not self._k8s_available or self._db is None:
+            return False
+        try:
+            generation = _canonical_runtime_uuid(
+                generation,
+                label="stateless workspace creation generation",
+            )
+            expected_runtime = (
+                _canonical_runtime_uuid(
+                    expected_runtime_incarnation,
+                    label="stateless workspace runtime incarnation",
+                )
+                if expected_runtime_incarnation is not None
+                else None
+            )
+        except ValueError:
+            return False
+        validate_impl = getattr(
+            type(self._db),
+            "validate_stateless_thread_workspace_creation_attempt",
+            None,
+        )
+        if not callable(validate_impl) or not await validate_impl(
+            self._db,
+            owner.id,
+            generation=generation,
+            attempted=True,
+            expected_runtime_incarnation=expected_runtime,
+        ):
+            return False
+        try:
+            network_tier = await self._resolve_network_tier(
+                owner.id,
+                kind=owner.network_tier_kind,
+            )
+            pod = await self._read_stateless_creation_pod(
+                owner,
+                generation=generation,
+                expected_runtime_incarnation=expected_runtime,
+                expected_network_tier=network_tier,
+                expected_pvc_name=_UNSPECIFIED_RESOURCE_BINDING,
+                expected_seed_configmap=_UNSPECIFIED_RESOURCE_BINDING,
+            )
+            if pod is None:
+                # Once attempted, Kubernetes absence is an absorbing safe hold:
+                # the original API call might have reached a partitioned node.
+                return False
+            runtime_incarnation = self._require_stateless_pod_identity(
+                pod,
+                owner=owner,
+                generation=generation,
+                expected_runtime_incarnation=expected_runtime,
+                expected_network_tier=network_tier,
+                expected_pvc_name=_UNSPECIFIED_RESOURCE_BINDING,
+                expected_seed_configmap=_UNSPECIFIED_RESOURCE_BINDING,
+            )
+            pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
+            actual_cpu, actual_memory = self._workspace_resource_requests_from_pod(pod)
+            pvc_uid: str | None = None
+            pvc_storage_class: str | None = None
+            if pvc_name is not None:
+                claim = await asyncio.to_thread(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+                pvc_uid = self._require_stateless_pvc_identity(
+                    claim,
+                    owner=owner,
+                    pvc_name=pvc_name,
+                    allow_any_storage_class=True,
+                )
+                pvc_storage_class = str(
+                    getattr(getattr(claim, "spec", None), "storage_class_name", "")
+                    or ""
+                )
+            seed_configmap = self._require_stateless_pod_storage_binding(
+                pod,
+                owner=owner,
+                expected_pvc_name=pvc_name,
+                expected_seed_configmap=_UNSPECIFIED_RESOURCE_BINDING,
+            )
+            publish_impl = getattr(
+                type(self._db),
+                "publish_stateless_thread_workspace_runtime",
+                None,
+            )
+            if not callable(publish_impl) or not await publish_impl(
+                self._db,
+                owner.id,
+                generation=generation,
+                runtime_incarnation=runtime_incarnation,
+                pod_name=owner.pod_name,
+                namespace=self._namespace,
+            ):
+                return False
+
+            if (
+                await self._adopt_configmap(
+                    seed_configmap,
+                    pod,
+                    expected_owner=owner,
+                    expected_creation_generation=generation,
+                )
+                is not True
+            ):
+                return False
+
+            if pvc_name and not await self._create_service(
+                owner,
+                require_exact_owner=True,
+            ):
+                return False
+            await workspace_metering.open_interval(
+                self._db,
+                owner,
+                tier="sandbox",
+                cpu=actual_cpu,
+                memory=actual_memory,
+            )
+            ready_timeout = self._reattach_ready_timeout if pvc_name else 120
+            pod_ip = await self._wait_for_ready(
+                owner.pod_name,
+                timeout=ready_timeout,
+                expected_owner=owner,
+                expected_runtime_incarnation=runtime_incarnation,
+                expected_creation_generation=generation,
+                expected_network_tier=network_tier,
+                expected_pvc_name=pvc_name,
+                expected_seed_configmap=seed_configmap,
+            )
+            if not pod_ip:
+                return True
+            (
+                backing_id,
+                fingerprint,
+                trusted_runtime,
+            ) = await self._trusted_pod_ssh_identity(
+                owner.pod_name,
+                pvc_name=pvc_name,
+                expected_owner=owner,
+                expected_runtime_incarnation=runtime_incarnation,
+                expected_creation_generation=generation,
+                expected_network_tier=network_tier,
+                expected_seed_configmap=seed_configmap,
+                expected_pvc_uid=pvc_uid,
+                expected_pvc_storage_class=pvc_storage_class,
+            )
+            complete_impl = getattr(
+                type(self._db),
+                "complete_stateless_thread_workspace_creation",
+                None,
+            )
+            completed = (
+                await complete_impl(
+                    self._db,
+                    owner.id,
+                    generation=generation,
+                    runtime_incarnation=trusted_runtime,
+                    backing_id=backing_id,
+                    ssh_host_key_fingerprint=fingerprint,
+                    pod_ip=pod_ip,
+                    port=30022,
+                    host=self._workspace_dns(owner) if pvc_name else None,
+                )
+                if callable(complete_impl)
+                else None
+            )
+            if not completed:
+                return False
+            logger.info(
+                "Stateless workspace create continued to Ready: %s (%s)",
+                owner.pod_name,
+                owner.id,
+            )
+            # Phase-B seeding is intentionally skipped for stateless sessions:
+            # its legacy SFTP task is name-based, unpinned, and detached from
+            # lifecycle authority. Pinned/job behavior remains unchanged.
+            return True
+        except (WorkspaceRuntimeAuthorityError, WorkspaceSSHAuthenticationError):
+            return False
+        except Exception:
+            logger.exception(
+                "Failed to continue exact stateless workspace %s", owner.id
             )
             return False
 
-    async def delete_workspace(self, owner: WorkspaceOwner) -> bool:
+    async def _read_stateless_creation_pod(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        generation: str,
+        expected_runtime_incarnation: str | None,
+        expected_network_tier: str,
+        expected_pvc_name: str | None,
+        expected_seed_configmap: str | None | object,
+    ) -> Any | None:
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return None
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod authority probe failed"
+            ) from exc
+        self._require_stateless_pod_identity(
+            pod,
+            owner=owner,
+            generation=generation,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+            expected_network_tier=expected_network_tier,
+            expected_pvc_name=expected_pvc_name,
+            expected_seed_configmap=expected_seed_configmap,
+        )
+        seed_configmap = self._require_stateless_pod_storage_binding(
+            pod,
+            owner=owner,
+            expected_pvc_name=expected_pvc_name,
+            expected_seed_configmap=expected_seed_configmap,
+        )
+        if seed_configmap is not None:
+            try:
+                configmap = await asyncio.to_thread(
+                    self._core_api.read_namespaced_config_map,
+                    name=seed_configmap,
+                    namespace=self._namespace,
+                )
+                self._require_stateless_seed_configmap_identity(
+                    configmap,
+                    owner=owner,
+                    generation=generation,
+                )
+            except Exception as error:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace seed ConfigMap authority changed"
+                ) from error
+        if _all_pod_container_statuses_terminated(pod):
+            raise WorkspaceRuntimeAuthorityError("authorized workspace Pod is terminal")
+        return pod
+
+    async def _create_stateless_pod_once(
+        self,
+        owner: WorkspaceOwner,
+        pod_manifest: dict,
+        *,
+        generation: str,
+        expected_network_tier: str,
+        expected_pvc_name: str | None,
+        expected_seed_configmap: str | None,
+    ) -> Any | None:
+        """Issue the one authorized create, adopting only its exact response."""
+
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.create_namespaced_pod,
+                namespace=self._namespace,
+                body=pod_manifest,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) != 409:
+                raise
+            # A client-side retry may surface 409 after the original create
+            # reached the apiserver.  Adopt only the exact annotated object;
+            # never wait out or replace an unrelated deterministic-name Pod.
+            return await self._read_stateless_creation_pod(
+                owner,
+                generation=generation,
+                expected_runtime_incarnation=None,
+                expected_network_tier=expected_network_tier,
+                expected_pvc_name=expected_pvc_name,
+                expected_seed_configmap=expected_seed_configmap,
+            )
+        if pod is None:
+            # Some Kubernetes mocks/clients omit the response body. Re-read the
+            # object, still under the exact annotation/owner fence.
+            return await self._read_stateless_creation_pod(
+                owner,
+                generation=generation,
+                expected_runtime_incarnation=None,
+                expected_network_tier=expected_network_tier,
+                expected_pvc_name=expected_pvc_name,
+                expected_seed_configmap=expected_seed_configmap,
+            )
+        self._require_stateless_pod_identity(
+            pod,
+            owner=owner,
+            generation=generation,
+            expected_network_tier=expected_network_tier,
+            expected_pvc_name=expected_pvc_name,
+            expected_seed_configmap=expected_seed_configmap,
+        )
+        return pod
+
+    def _require_stateless_pod_identity(
+        self,
+        pod: Any,
+        *,
+        owner: WorkspaceOwner,
+        generation: str,
+        expected_runtime_incarnation: str | None = None,
+        expected_network_tier: str | None = None,
+        expected_pvc_name: str | None | object = _UNSPECIFIED_RESOURCE_BINDING,
+        expected_seed_configmap: str | None | object = (_UNSPECIFIED_RESOURCE_BINDING),
+    ) -> str:
+        metadata = getattr(pod, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        annotations = getattr(metadata, "annotations", None)
+        opposite_owner_label = (
+            "srw/job-id" if owner.kind == "session" else "srw/thread-id"
+        )
+        if not isinstance(labels, dict) or not isinstance(annotations, dict):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod identity metadata is malformed"
+            )
+        if (
+            str(getattr(metadata, "name", "") or "") != owner.pod_name
+            or str(getattr(metadata, "namespace", "") or "") != self._namespace
+            or labels.get(owner.label_key) != owner.id
+            or labels.get("app") != "srw-workspace"
+            or labels.get("srw/component") != owner.component_label
+            or labels.get("srw.io/component") != "agent-workspace"
+            or WORKSPACE_PROVISION_FENCE_LABEL in labels
+            or opposite_owner_label in labels
+            or (
+                expected_network_tier is not None
+                and labels.get("srw.io/network-tier") != expected_network_tier
+            )
+            or annotations.get(WORKSPACE_RUNTIME_CREATION_ANNOTATION) != generation
+            or getattr(metadata, "deletion_timestamp", None) is not None
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod owner or creation authority changed"
+            )
+        self._require_stateless_pod_storage_binding(
+            pod,
+            owner=owner,
+            expected_pvc_name=expected_pvc_name,
+            expected_seed_configmap=expected_seed_configmap,
+        )
+        try:
+            runtime_incarnation = _canonical_runtime_uuid(
+                str(getattr(metadata, "uid", "") or ""),
+                label="workspace Pod UID",
+            )
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+        if (
+            expected_runtime_incarnation is not None
+            and runtime_incarnation != expected_runtime_incarnation
+        ):
+            raise WorkspaceRuntimeAuthorityError("workspace Pod UID changed")
+        return runtime_incarnation
+
+    def _require_workspace_pod_owner(
+        self,
+        pod: Any,
+        *,
+        owner: WorkspaceOwner,
+        allow_owner_unlabeled: bool,
+        allow_terminating: bool = False,
+        expected_network_tier: str | None = None,
+        expected_pod_name: str | None = None,
+        expected_component: str | None = None,
+    ) -> str:
+        """Fence deterministic-name Pod reuse/deletion across owner prefixes."""
+
+        metadata = getattr(pod, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        observed_namespace = getattr(metadata, "namespace", None)
+        if (
+            str(getattr(metadata, "name", "") or "")
+            != (expected_pod_name or owner.pod_name)
+            or (
+                isinstance(observed_namespace, str)
+                and observed_namespace
+                and observed_namespace != self._namespace
+            )
+            or (not allow_owner_unlabeled and observed_namespace != self._namespace)
+            or (
+                not allow_terminating
+                and getattr(metadata, "deletion_timestamp", None) is not None
+            )
+        ):
+            raise WorkspaceRuntimeAuthorityError("workspace Pod identity changed")
+        if not isinstance(labels, dict):
+            if labels is not None or not allow_owner_unlabeled:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod owner labels are malformed"
+                )
+        else:
+            owner_labels_present = any(
+                key in labels for key in ("srw/job-id", "srw/thread-id")
+            )
+            if not owner_labels_present:
+                if not allow_owner_unlabeled:
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace Pod owner labels are missing"
+                    )
+            elif (
+                labels.get(owner.label_key) != owner.id
+                or ("srw/job-id" if owner.kind == "session" else "srw/thread-id")
+                in labels
+                or labels.get("app") != "srw-workspace"
+                or labels.get("srw/component")
+                != (expected_component or owner.component_label)
+                or labels.get("srw.io/component") != "agent-workspace"
+                or WORKSPACE_PROVISION_FENCE_LABEL in labels
+                or (
+                    expected_network_tier is not None
+                    and labels.get("srw.io/network-tier") != expected_network_tier
+                )
+            ):
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod belongs to another owner"
+                )
+        try:
+            return _canonical_runtime_uuid(
+                str(getattr(metadata, "uid", "") or ""),
+                label="workspace Pod UID",
+            )
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+
+    def _require_stateless_pod_storage_binding(
+        self,
+        pod: Any,
+        *,
+        owner: WorkspaceOwner,
+        expected_pvc_name: str | None | object,
+        expected_seed_configmap: str | None | object,
+        expected_pod_name: str | None = None,
+    ) -> str | None:
+        spec = getattr(pod, "spec", None)
+        volumes = getattr(spec, "volumes", None)
+        containers = getattr(spec, "containers", None)
+        if not isinstance(volumes, (list, tuple)) or not isinstance(
+            containers, (list, tuple)
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod storage declaration is malformed"
+            )
+        workspace_volumes = [
+            volume
+            for volume in volumes
+            if _resource_field(volume, "name") == "workspace-data"
+        ]
+        workspace_containers = [
+            container
+            for container in containers
+            if _resource_field(container, "name") == "workspace"
+        ]
+        if len(workspace_volumes) != 1 or len(workspace_containers) != 1:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod storage identity changed"
+            )
+        workspace_volume = workspace_volumes[0]
+        pvc_source = _resource_field(
+            workspace_volume,
+            "persistent_volume_claim",
+            "persistentVolumeClaim",
+        )
+        empty_dir_source = _resource_field(
+            workspace_volume,
+            "empty_dir",
+            "emptyDir",
+        )
+        if expected_pvc_name is _UNSPECIFIED_RESOURCE_BINDING:
+            observed_claim_name = (
+                _resource_field(pvc_source, "claim_name", "claimName")
+                if pvc_source is not None
+                else None
+            )
+            if (pvc_source is None) == (empty_dir_source is None) or (
+                pvc_source is not None
+                and (
+                    observed_claim_name != _pvc_name_for(owner)
+                    or _resource_field(pvc_source, "read_only", "readOnly")
+                    not in {None, False}
+                )
+            ):
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod storage source changed"
+                )
+        else:
+            if expected_pvc_name is None:
+                if empty_dir_source is None or pvc_source is not None:
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace Pod emptyDir binding changed"
+                    )
+            elif (
+                pvc_source is None
+                or empty_dir_source is not None
+                or _resource_field(pvc_source, "claim_name", "claimName")
+                != expected_pvc_name
+                or _resource_field(pvc_source, "read_only", "readOnly")
+                not in {None, False}
+            ):
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod PVC binding changed"
+                )
+
+        # Volume names are only aliases; the source is the storage authority.
+        # Admission or a sidecar must not add a second name for the same PVC and
+        # consume it outside the workspace container.
+        observed_claim_name = (
+            _resource_field(pvc_source, "claim_name", "claimName")
+            if pvc_source is not None
+            else None
+        )
+        workspace_source_names = {
+            str(_resource_field(volume, "name") or "")
+            for volume in volumes
+            if observed_claim_name is not None
+            and _resource_field(
+                _resource_field(
+                    volume,
+                    "persistent_volume_claim",
+                    "persistentVolumeClaim",
+                ),
+                "claim_name",
+                "claimName",
+            )
+            == observed_claim_name
+        }
+        if observed_claim_name is not None and workspace_source_names != {
+            "workspace-data"
+        }:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod PVC source has an alias"
+            )
+        mounts = _resource_field(
+            workspace_containers[0],
+            "volume_mounts",
+            "volumeMounts",
+        )
+        if not isinstance(mounts, (list, tuple)):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod volume mounts are malformed"
+            )
+        workspace_mounts = [
+            mount
+            for mount in mounts
+            if _resource_field(mount, "name") == "workspace-data"
+        ]
+        if (
+            len(workspace_mounts) != 1
+            or _resource_field(workspace_mounts[0], "mount_path", "mountPath")
+            != "/home/agent-host"
+            or _resource_field(workspace_mounts[0], "sub_path", "subPath")
+            not in {None, ""}
+            or _resource_field(
+                workspace_mounts[0],
+                "sub_path_expr",
+                "subPathExpr",
+            )
+            not in {None, ""}
+            or _resource_field(workspace_mounts[0], "read_only", "readOnly")
+            not in {None, False}
+            or _resource_field(
+                workspace_mounts[0],
+                "mount_propagation",
+                "mountPropagation",
+            )
+            is not None
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod workspace mount changed"
+            )
+
+        workspace_devices = (
+            _resource_field(
+                workspace_containers[0],
+                "volume_devices",
+                "volumeDevices",
+            )
+            or []
+        )
+        if not isinstance(workspace_devices, (list, tuple)) or any(
+            _resource_field(device, "name") in workspace_source_names
+            or _resource_field(device, "name") == "workspace-data"
+            for device in workspace_devices
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod workspace volume device changed"
+            )
+
+        seed_volumes = [
+            volume
+            for volume in volumes
+            if _resource_field(volume, "name") == "code-server-config"
+        ]
+        seed_mounts = [
+            mount
+            for mount in mounts
+            if _resource_field(mount, "name") == "code-server-config"
+        ]
+        deterministic_seed_name = self._seed_configmap_name(
+            expected_pod_name or owner.pod_name
+        )
+        seed_source_names = {
+            str(_resource_field(volume, "name") or "")
+            for volume in volumes
+            if _resource_field(
+                _resource_field(volume, "config_map", "configMap"),
+                "name",
+            )
+            == deterministic_seed_name
+        }
+        if seed_source_names and seed_source_names != {"code-server-config"}:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod seed ConfigMap source has an alias"
+            )
+        sensitive_volume_names = {
+            "workspace-data",
+            "code-server-config",
+            *workspace_source_names,
+            *seed_source_names,
+        }
+        for container_field in (
+            "containers",
+            "init_containers",
+            "ephemeral_containers",
+        ):
+            raw_containers = getattr(spec, container_field, None) or []
+            if not isinstance(raw_containers, (list, tuple)):
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod container declaration is malformed"
+                )
+            for container in raw_containers:
+                if container is workspace_containers[0]:
+                    continue
+                for mount in (
+                    _resource_field(
+                        container,
+                        "volume_mounts",
+                        "volumeMounts",
+                    )
+                    or []
+                ):
+                    if _resource_field(mount, "name") in sensitive_volume_names:
+                        raise WorkspaceRuntimeAuthorityError(
+                            "workspace Pod storage has another consumer"
+                        )
+                for device in (
+                    _resource_field(
+                        container,
+                        "volume_devices",
+                        "volumeDevices",
+                    )
+                    or []
+                ):
+                    if _resource_field(device, "name") in sensitive_volume_names:
+                        raise WorkspaceRuntimeAuthorityError(
+                            "workspace Pod storage has another consumer"
+                        )
+        if not seed_volumes and not seed_mounts:
+            if (
+                expected_seed_configmap is not _UNSPECIFIED_RESOURCE_BINDING
+                and expected_seed_configmap is not None
+            ):
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod seed ConfigMap binding disappeared"
+                )
+            return None
+        if len(seed_volumes) != 1 or len(seed_mounts) != 1:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod seed ConfigMap binding changed"
+            )
+        config_map_source = _resource_field(
+            seed_volumes[0],
+            "config_map",
+            "configMap",
+        )
+        seed_name = _resource_field(config_map_source, "name")
+        deterministic_name = deterministic_seed_name
+        if (
+            config_map_source is None
+            or seed_name != deterministic_name
+            or _resource_field(seed_mounts[0], "mount_path", "mountPath")
+            != "/mnt/code-server-config"
+            or _resource_field(seed_mounts[0], "read_only", "readOnly") is not True
+            or _resource_field(seed_mounts[0], "sub_path", "subPath") not in {None, ""}
+            or _resource_field(seed_mounts[0], "sub_path_expr", "subPathExpr")
+            not in {None, ""}
+            or (
+                expected_seed_configmap is not _UNSPECIFIED_RESOURCE_BINDING
+                and expected_seed_configmap != seed_name
+            )
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod seed ConfigMap binding changed"
+            )
+
+        return str(seed_name)
+
+    def _workspace_pvc_name_from_pod(
+        self,
+        pod: Any,
+        *,
+        owner: WorkspaceOwner,
+    ) -> str | None:
+        """Return an exact Pod's immutable storage plan after validating it."""
+
+        self._require_stateless_pod_storage_binding(
+            pod,
+            owner=owner,
+            expected_pvc_name=_UNSPECIFIED_RESOURCE_BINDING,
+            expected_seed_configmap=_UNSPECIFIED_RESOURCE_BINDING,
+        )
+        spec = getattr(pod, "spec", None)
+        volumes = getattr(spec, "volumes", None) or []
+        workspace_volume = next(
+            volume
+            for volume in volumes
+            if _resource_field(volume, "name") == "workspace-data"
+        )
+        pvc_source = _resource_field(
+            workspace_volume,
+            "persistent_volume_claim",
+            "persistentVolumeClaim",
+        )
+        if pvc_source is None:
+            return None
+        return str(_resource_field(pvc_source, "claim_name", "claimName"))
+
+    def _workspace_resource_requests_from_pod(self, pod: Any) -> tuple[str, str]:
+        containers = getattr(getattr(pod, "spec", None), "containers", None)
+        if not isinstance(containers, (list, tuple)):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod resource declaration is malformed"
+            )
+        workspaces = [
+            container
+            for container in containers
+            if _resource_field(container, "name") == "workspace"
+        ]
+        if len(workspaces) != 1:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod resource identity changed"
+            )
+        requests = _resource_field(
+            _resource_field(workspaces[0], "resources"),
+            "requests",
+        )
+        if not isinstance(requests, dict):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod resource requests are malformed"
+            )
+        cpu = requests.get("cpu")
+        memory = requests.get("memory")
+        if not all(
+            isinstance(value, str) and value and "\x00" not in value
+            for value in (cpu, memory)
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod resource requests are malformed"
+            )
+        return cpu, memory
+
+    def _require_workspace_pod_connection_identity(
+        self,
+        pod: Any,
+        *,
+        owner: WorkspaceOwner,
+        expected_runtime_incarnation: str,
+        expected_creation_generation: str | None,
+        expected_network_tier: str | None,
+        expected_pvc_name: str | None | object,
+        expected_seed_configmap: str | None | object,
+        expected_pod_name: str | None = None,
+        expected_component: str | None = None,
+    ) -> str:
+        if expected_creation_generation is not None:
+            return self._require_stateless_pod_identity(
+                pod,
+                owner=owner,
+                generation=expected_creation_generation,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+                expected_network_tier=expected_network_tier,
+                expected_pvc_name=expected_pvc_name,
+                expected_seed_configmap=expected_seed_configmap,
+            )
+        observed_runtime = self._require_workspace_pod_owner(
+            pod,
+            owner=owner,
+            allow_owner_unlabeled=False,
+            expected_network_tier=expected_network_tier,
+            expected_pod_name=expected_pod_name,
+            expected_component=expected_component,
+        )
+        if observed_runtime != expected_runtime_incarnation:
+            raise WorkspaceRuntimeAuthorityError("workspace Pod UID changed")
+        self._require_stateless_pod_storage_binding(
+            pod,
+            owner=owner,
+            expected_pvc_name=expected_pvc_name,
+            expected_seed_configmap=expected_seed_configmap,
+            expected_pod_name=expected_pod_name,
+        )
+        return observed_runtime
+
+    async def delete_workspace(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        expected_runtime_incarnation: str | None = None,
+        wait_for_exact_absence: bool = False,
+        exact_absence_timeout_seconds: float = 30.0,
+        captured_teardown_uid: str | None = None,
+        defer_context_clear: bool = False,
+    ) -> bool:
         """Delete the workspace container for a job or persistent thread.
 
         Returns:
@@ -279,148 +2693,1427 @@ class ContainerProvisioner:
         """
         if not self._k8s_available:
             return False
+        if wait_for_exact_absence and expected_runtime_incarnation is None:
+            return False
+        if captured_teardown_uid is not None and (
+            expected_runtime_incarnation != captured_teardown_uid
+        ):
+            return False
 
         pod_name = owner.pod_name
-
+        already_absent = False
+        observed_runtime_uid: str | None = None
         try:
-            await asyncio.to_thread(
-                self._core_api.delete_namespaced_pod,
+            observed_pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
                 name=pod_name,
                 namespace=self._namespace,
-                grace_period_seconds=10,
             )
-            logger.info(
-                "Workspace container deleted: %s (%s %s)",
-                pod_name,
-                owner.kind,
-                owner.id,
+            observed_runtime_uid = self._require_workspace_pod_owner(
+                observed_pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
             )
-            await self._delete_seed_configmap(pod_name)
-            await self._set_context(owner, {"status": "deleted"})
-            return True
+            if expected_runtime_incarnation is not None and observed_runtime_uid != str(
+                expected_runtime_incarnation
+            ):
+                return False
+        except Exception as error:
+            if getattr(error, "status", None) == 404:
+                if wait_for_exact_absence:
+                    return False
+                already_absent = True
+            else:
+                logger.error(
+                    "Refusing workspace Pod cleanup for %s %s: %s",
+                    owner.kind,
+                    owner.id,
+                    error,
+                )
+                return False
+        try:
+            if not already_absent:
+                delete_body: dict[str, Any] = {
+                    "preconditions": {"uid": observed_runtime_uid}
+                }
+                if captured_teardown_uid is not None:
+                    # Some apiservers do not honor the query parameter alone.
+                    # Carry the same bound in DeleteOptions for durable S36 so
+                    # it cannot inherit the Pod's ordinary 120-second grace
+                    # and outlive the pinned agent's 60-second report timeout.
+                    # Legacy/default-off callers retain their exact body.
+                    delete_body["gracePeriodSeconds"] = 10
+                await asyncio.to_thread(
+                    self._core_api.delete_namespaced_pod,
+                    name=pod_name,
+                    namespace=self._namespace,
+                    grace_period_seconds=10,
+                    body=delete_body,
+                )
+                logger.info(
+                    "Workspace container deletion accepted: %s (%s %s)",
+                    pod_name,
+                    owner.kind,
+                    owner.id,
+                )
         except Exception as e:
-            # 404 is fine — pod already gone
             if hasattr(e, "status") and e.status == 404:
+                already_absent = True
                 logger.debug(
                     "Workspace container already deleted: %s (%s %s)",
                     pod_name,
                     owner.kind,
                     owner.id,
                 )
-                return True
-            logger.error(
-                "Failed to delete workspace container for %s %s: %s",
-                owner.kind,
-                owner.id,
-                e,
-            )
+            elif (
+                hasattr(e, "status")
+                and e.status == 409
+                and captured_teardown_uid is not None
+            ):
+                # The apiserver applied the UID precondition atomically. A
+                # conflict means the captured Pod is gone and a same-name
+                # replacement now owns the name; never mutate that replacement
+                # or its durable endpoint context.
+                logger.debug(
+                    "Captured workspace Pod already gone; preserving replacement: "
+                    "%s (%s %s)",
+                    pod_name,
+                    owner.kind,
+                    owner.id,
+                )
+                # The captured Pod is gone, but this grouped teardown must not
+                # interpret that as authority over the captured PVC/Service:
+                # the replacement may already be using those same objects.
+                # Returning False makes S36 preserve the entire resource set.
+                return False
+            else:
+                logger.error(
+                    "Failed to delete workspace container for %s %s: %s",
+                    owner.kind,
+                    owner.id,
+                    e,
+                )
+                return False
+
+        if wait_for_exact_absence and not already_absent:
+            if not await self._wait_for_exact_workspace_pod_absent(
+                owner,
+                expected_runtime_incarnation=str(expected_runtime_incarnation),
+                timeout=exact_absence_timeout_seconds,
+            ):
+                # DELETE acceptance is not runtime absence. Keep the immutable
+                # UID and endpoint durable so terminal retirement cannot settle
+                # or Resume consume a new one-shot create against a terminating
+                # same-name object.
+                return False
+
+        seed_deleted = await self._delete_seed_configmap(
+            pod_name,
+            expected_owner=owner,
+            expected_pod_uid=observed_runtime_uid,
+        )
+        if wait_for_exact_absence and not seed_deleted:
             return False
+        # A 404 (or the exact wait above) is now authoritative. Clear any stale
+        # ready endpoint only after the object is gone; otherwise immediate
+        # Resume can race the terminating old name and consume its one attempt.
+        if not defer_context_clear:
+            await self._set_context(
+                owner,
+                {
+                    "status": "deleted",
+                    "pod_ip": None,
+                    **(
+                        {WORKSPACE_RUNTIME_INCARNATION_KEY: None}
+                        if owner.kind == "session"
+                        else {}
+                    ),
+                },
+            )
+        await workspace_metering.close_interval(self._db, owner)
+        return True
 
-    async def delete_workspace_pvc(self, owner: WorkspaceOwner) -> bool:
-        """Delete the PVC for a job or thread workspace if one exists.
+    async def delete_workspace_pvc(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        require_exact_owner: bool = False,
+        expected_uid: str | None = None,
+    ) -> bool:
+        """Reclaim the PVC backing a job or session workspace, if one exists.
 
-        With emptyDir (default), there is no PVC — storage dies with the pod.
-        This method is kept for backward compatibility: it cleans up PVCs
-        from workspaces created before the emptyDir switch.
+        Both names are LIVE under ``WORKSPACE_PVC_ENABLED`` — jobs are
+        ``pvc-workspace-*`` and sessions ``pvc-ws-thread-*`` — so this is the
+        reclaim half of provisioning, not legacy cleanup. The name comes from
+        ``_pvc_name_for``, the same helper ``create_workspace`` uses, so the
+        create and delete sides cannot drift onto different volumes.
+
+        Destructive and irreversible: call it only when the owning work is
+        genuinely finished. An emptyDir workspace has no PVC, and a PVC already
+        gone is a 404 — both are idempotent successes.
         """
-        if owner.kind == "job":
-            pvc_name = f"pvc-workspace-{owner.id[:12]}"
+        delete_kwargs: dict[str, Any] = {
+            "expected_owner": owner if require_exact_owner else None,
+        }
+        if expected_uid is not None:
+            delete_kwargs["expected_uid"] = expected_uid
+        return await self._delete_pvc(_pvc_name_for(owner), **delete_kwargs)
+
+    async def capture_workspace_teardown_identity(
+        self,
+        owner: WorkspaceOwner,
+    ) -> WorkspaceTeardownIdentity:
+        """Capture S36's exact Pod/PVC/Service identities without SSH.
+
+        A Pod 404 does not imply that its PVC and Service are gone. In that
+        case ``pod_uid`` is ``None`` and the residual deterministic resources
+        are captured independently under their full owner/spec authority. The
+        Pod name is re-read after those captures so a concurrent replacement
+        cannot donate its PVC or Service identity to this teardown intent.
+        Every ambiguous API failure raises rather than granting cleanup.
+        """
+
+        if not self._k8s_available:
+            raise WorkspaceRuntimeAuthorityError(
+                "Kubernetes workspace identity capture is unavailable"
+            )
+        pod_absent = False
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                pod_absent = True
+                pod_uid = None
+                pvc_name = _pvc_name_for(owner)
+            else:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod identity capture failed"
+                ) from exc
         else:
-            pvc_name = f"pvc-ws-thread-{owner.id[:12]}"
-        return await self._delete_pvc(pvc_name)
+            pod_uid = self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+            )
+            pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
 
-    async def release_workspace(self, job_id: str) -> bool:
-        """Snapshot a job workspace to S3, then delete the pod.
-
-        K8s pods use emptyDir so data dies with the pod. Snapshotting before
-        deletion enables resume support (a new pod can restore from S3).
-
-        Returns:
-            True if deletion succeeded (snapshot failure is non-fatal).
-        """
-        owner = WorkspaceOwner.job(job_id)
-        # Get pod IP for SSH-based snapshot
-        status = await self.get_workspace_status(owner)
-        if (
-            self._snapshot_service
-            and self._snapshot_service.is_available
-            and status
-            and status.get("pod_ip")
-            and status.get("ready")
-        ):
+        pvc_uid: str | None = None
+        if pvc_name is not None:
             try:
-                await self._snapshot_service.capture_vm_snapshot(
-                    job_id=job_id,
-                    ssh_host=status["pod_ip"],
-                    ssh_port=30022,
-                    source_type="pod",
+                claim = await asyncio.to_thread(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
                 )
-                logger.info(
-                    "Workspace snapshot captured for job %s before release", job_id
-                )
-            except Exception:
-                logger.exception(
-                    "Workspace snapshot failed for job %s — deleting anyway", job_id
+            except Exception as exc:
+                if not (pod_absent and getattr(exc, "status", None) == 404):
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace PVC identity capture failed"
+                    ) from exc
+            else:
+                pvc_uid = self._require_stateless_pvc_identity(
+                    claim,
+                    owner=owner,
+                    pvc_name=pvc_name,
+                    allow_any_storage_class=True,
                 )
 
-        deleted = await self.delete_workspace(owner)
-        await self.delete_workspace_pvc(owner)
-        return deleted
+        service_uid: str | None
+        try:
+            service = await asyncio.to_thread(
+                self._core_api.read_namespaced_service,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                service_uid = None
+            else:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Service identity capture failed"
+                ) from exc
+        else:
+            service_uid = self._require_stateless_service_identity(service, owner=owner)
 
-    async def release_thread_workspace(self, thread_id: str) -> bool:
-        """Snapshot a thread workspace to S3, then delete the pod.
+        if pod_absent:
+            # The first 404 and this final 404 bracket the residual captures.
+            # Any same-name Pod observed here may already consume those
+            # resources, so its appearance makes the whole capture ambiguous.
+            try:
+                await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) != 404:
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace Pod absence recheck failed"
+                    ) from exc
+            else:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod appeared during teardown identity capture"
+                )
+        else:
+            # Bracket the PVC/Service reads with the exact Pod UID. Without
+            # this second read, a same-name replacement could donate its
+            # freshly-created named resources to the old teardown intent.
+            try:
+                confirmed_pod = await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+                confirmed_uid = self._require_workspace_pod_owner(
+                    confirmed_pod,
+                    owner=owner,
+                    allow_owner_unlabeled=False,
+                    allow_terminating=True,
+                )
+            except Exception as exc:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod identity recheck failed"
+                ) from exc
+            if confirmed_uid != pod_uid:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace Pod changed during teardown identity capture"
+                )
+
+        return WorkspaceTeardownIdentity(
+            pod_uid=pod_uid,
+            pvc_uid=pvc_uid,
+            service_uid=service_uid,
+        )
+
+    async def capture_terminal_workspace_identity(
+        self,
+        owner: WorkspaceOwner,
+    ) -> WorkspaceTeardownIdentity:
+        """Capture S36's UID tuple plus the exact SSH snapshot authority."""
+
+        attestation = await self.attest_workspace_runtime(owner)
+        identity = await self.capture_workspace_teardown_identity(owner)
+        if identity.pod_uid != attestation.runtime_incarnation:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Pod changed between SSH and teardown attestation"
+            )
+        return WorkspaceTeardownIdentity(
+            pod_uid=identity.pod_uid,
+            pvc_uid=identity.pvc_uid,
+            service_uid=identity.service_uid,
+            pod_ip=attestation.pod_ip,
+            ssh_host_key_fingerprint=attestation.ssh_host_key_fingerprint,
+            ssh_port=attestation.port,
+        )
+
+    async def classify_workspace_teardown_identity(
+        self,
+        owner: WorkspaceOwner,
+        identity: WorkspaceTeardownIdentity,
+    ) -> str:
+        """Classify a failed captured release without adopting stable names.
+
+        ``identity_superseded`` is reserved for a proven Pod/PVC/Service UID
+        replacement.  API ambiguity remains ``unknown`` so the S36 journal
+        retries; exact captured or absent resources remain ``matched``.
+        """
+
+        if not self._k8s_available:
+            return "unknown"
+        if identity.pod_uid is None:
+            pod_authority = (
+                "exact_absent"
+                if await self._captured_teardown_pod_is_absent(owner)
+                else "unknown"
+            )
+        else:
+            pod_authority = await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=identity.pod_uid,
+            )
+        if pod_authority == "replacement":
+            return "identity_superseded"
+        if pod_authority == "unknown":
+            return "unknown"
+
+        async def _resource_matches(
+            *,
+            expected_uid: str | None,
+            read: Callable[[], Awaitable[Any]],
+            authenticate: Callable[[Any], str],
+        ) -> str:
+            try:
+                resource = await read()
+            except Exception as exc:
+                return "matched" if getattr(exc, "status", None) == 404 else "unknown"
+            try:
+                observed_uid = authenticate(resource)
+            except WorkspaceRuntimeAuthorityError:
+                return "identity_superseded"
+            if expected_uid is None or observed_uid != expected_uid:
+                return "identity_superseded"
+            return "matched"
+
+        async def _read_pvc() -> Any:
+            return await asyncio.to_thread(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=_pvc_name_for(owner),
+                namespace=self._namespace,
+            )
+
+        async def _read_service() -> Any:
+            return await asyncio.to_thread(
+                self._core_api.read_namespaced_service,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+
+        pvc = await _resource_matches(
+            expected_uid=identity.pvc_uid,
+            read=_read_pvc,
+            authenticate=lambda resource: self._require_stateless_pvc_identity(
+                resource,
+                owner=owner,
+                pvc_name=_pvc_name_for(owner),
+                allow_any_storage_class=True,
+            ),
+        )
+        if pvc != "matched":
+            return pvc
+        return await _resource_matches(
+            expected_uid=identity.service_uid,
+            read=_read_service,
+            authenticate=lambda resource: self._require_stateless_service_identity(
+                resource,
+                owner=owner,
+            ),
+        )
+
+    async def release_workspace(
+        self,
+        owner: "WorkspaceOwner",
+        *,
+        reclaim_volume: bool = True,
+        require_snapshot: bool = False,
+        expected_runtime_incarnation: str | None = None,
+        expected_host_key_fingerprint: str | None = None,
+        on_snapshot_captured: Callable[[], Awaitable[bool]] | None = None,
+        capture_snapshot: bool = True,
+        strict_terminal_snapshot: bool = False,
+        terminal_snapshot_generation: str | None = None,
+        terminal_snapshot_created_at: str | None = None,
+        strict: bool = False,
+        teardown_identity: WorkspaceTeardownIdentity | None = None,
+        exact_absence_timeout_seconds: float = 30.0,
+    ) -> bool:
+        """Snapshot a workspace to S3, then delete the pod (and, by default, its PVC).
+
+        Owner-keyed: serves both jobs and sessions. On an emptyDir workspace the
+        data dies with the pod, so snapshotting first is what enables resume (a
+        fresh pod restores from S3). Snapshot failure is non-fatal.
+
+        Args:
+            reclaim_volume: When False, keep the PVC — snapshot and delete the
+                pod (and its Service), but leave the volume so a later recreate
+                reattaches the real working tree instead of an S3 approximation.
+                Required for a PVC-backed session: an ``ended`` thread is still
+                RESUMABLE, so unconditionally deleting its volume is data
+                destruction on live state a user can legitimately reopen. Pass
+                True (the default) only when the owning work is truly terminal.
+            exact_absence_timeout_seconds: Maximum time to prove the exact Pod
+                UID absent after Kubernetes accepts a strict delete. Existing
+                callers retain the historical 30-second bound; captured S36
+                supplies 45 seconds around its explicit 10-second grace.
+
+        The headless Service is dropped either way: it is 409-idempotent to
+        recreate on the next ``create_workspace``, so unlike the volume it costs
+        nothing to lose.
 
         Returns:
-            True if deletion succeeded (snapshot failure is non-fatal).
+            True if pod deletion succeeded.
         """
         if not self._k8s_available:
             return False
 
-        owner = WorkspaceOwner.session(thread_id)
-        pod_name = owner.pod_name
+        if teardown_identity is not None:
+            return await self._release_captured_workspace(
+                owner,
+                teardown_identity,
+                reclaim_volume=reclaim_volume,
+                require_snapshot=require_snapshot,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+                expected_host_key_fingerprint=expected_host_key_fingerprint,
+                on_snapshot_captured=on_snapshot_captured,
+                capture_snapshot=capture_snapshot,
+                strict_terminal_snapshot=strict_terminal_snapshot,
+                terminal_snapshot_generation=terminal_snapshot_generation,
+                terminal_snapshot_created_at=terminal_snapshot_created_at,
+                strict=strict,
+                exact_absence_timeout_seconds=exact_absence_timeout_seconds,
+            )
 
-        # Get pod IP for snapshot
-        try:
-            pod = await asyncio.to_thread(
-                self._core_api.read_namespaced_pod,
-                name=pod_name,
-                namespace=self._namespace,
+        if expected_runtime_incarnation is not None:
+            # Shell retirement and archive are two separate network effects.
+            # Re-prove the exact Pod UID at their handoff so a replacement at
+            # the stable Service name is never captured or deleted as the old
+            # runtime.
+            exact_live = await self.workspace_pod_live(
+                owner,
+                expected_runtime_incarnation=expected_runtime_incarnation,
             )
-            pod_ip = pod.status.pod_ip
-            ready = pod.status.container_statuses and all(
-                cs.ready for cs in pod.status.container_statuses
+            if exact_live is not True:
+                logger.warning(
+                    "Workspace runtime changed before strict release for %s %s",
+                    owner.kind,
+                    owner.id,
+                )
+                return False
+
+        status = await self.get_workspace_status(owner)
+        if expected_runtime_incarnation is not None and (
+            status is None
+            or str(status.get("runtime_incarnation") or "")
+            != str(expected_runtime_incarnation)
+        ):
+            return False
+        effective_runtime_incarnation = (
+            str(expected_runtime_incarnation)
+            if expected_runtime_incarnation is not None
+            else str((status or {}).get("runtime_incarnation") or "")
+        )
+        if not effective_runtime_incarnation:
+            return False
+        if (
+            await self.workspace_pod_live(
+                owner,
+                expected_runtime_incarnation=effective_runtime_incarnation,
             )
-        except Exception:
-            pod_ip = None
-            ready = False
+            is not True
+        ):
+            return False
+        pod_ip = status.get("pod_ip") if status else None
+        ready = status.get("ready") if status else False
 
         if (
-            self._snapshot_service
+            capture_snapshot
+            and self._snapshot_service
             and self._snapshot_service.is_available
             and pod_ip
             and ready
         ):
             try:
-                await self._snapshot_service.capture_vm_snapshot(
-                    job_id=thread_id,
-                    ssh_host=pod_ip,
-                    ssh_port=30022,
-                    source_type="pod",
-                    entity_type="threads",
+                capture_kwargs: dict[str, Any] = {
+                    "job_id": owner.id,
+                    "ssh_host": pod_ip,
+                    "ssh_port": 30022,
+                    "source_type": "pod",
+                    "entity_type": ("threads" if owner.kind == "session" else "jobs"),
+                    "expected_host_key_fingerprint": expected_host_key_fingerprint,
+                }
+                if strict_terminal_snapshot:
+                    capture_kwargs["strict_terminal"] = True
+                captured = bool(
+                    await self._snapshot_service.capture_vm_snapshot(**capture_kwargs)
                 )
-                logger.info(
-                    "Workspace snapshot captured for thread %s before release",
-                    thread_id,
+                if captured:
+                    if (
+                        on_snapshot_captured is not None
+                        and not await on_snapshot_captured()
+                    ):
+                        logger.error(
+                            "Snapshot acknowledgement lost lifecycle authority "
+                            "for %s %s",
+                            owner.kind,
+                            owner.id,
+                        )
+                        return False
+                    logger.info(
+                        "Workspace snapshot captured for %s %s before release",
+                        owner.kind,
+                        owner.id,
+                    )
+                elif require_snapshot:
+                    logger.error(
+                        "Required workspace snapshot was not captured for %s %s",
+                        owner.kind,
+                        owner.id,
+                    )
+                    return False
+            except Exception:
+                if require_snapshot:
+                    logger.exception(
+                        "Required workspace snapshot failed for %s %s",
+                        owner.kind,
+                        owner.id,
+                    )
+                    return False
+                logger.exception(
+                    "Workspace snapshot failed for %s %s — deleting anyway",
+                    owner.kind,
+                    owner.id,
+                )
+        elif require_snapshot:
+            logger.error(
+                "Required workspace snapshot is unavailable for %s %s",
+                owner.kind,
+                owner.id,
+            )
+            return False
+
+        if (
+            await self.workspace_pod_live(
+                owner,
+                expected_runtime_incarnation=effective_runtime_incarnation,
+            )
+            is not True
+        ):
+            return False
+        delete_kwargs = {
+            "expected_runtime_incarnation": effective_runtime_incarnation,
+            **(
+                {
+                    "wait_for_exact_absence": True,
+                    "exact_absence_timeout_seconds": exact_absence_timeout_seconds,
+                }
+                if strict
+                else {}
+            ),
+        }
+        deleted = await self.delete_workspace(owner, **delete_kwargs)
+        if not deleted:
+            return False
+        volume_deleted = True
+        if reclaim_volume:
+            volume_deleted = await self.delete_workspace_pvc(
+                owner,
+                require_exact_owner=True,
+            )
+        service_deleted = await self._delete_service(
+            owner,
+            require_exact_owner=True,
+        )
+        if strict:
+            return bool(volume_deleted and service_deleted)
+        return True
+
+    async def _release_captured_workspace(
+        self,
+        owner: WorkspaceOwner,
+        identity: WorkspaceTeardownIdentity,
+        *,
+        reclaim_volume: bool,
+        require_snapshot: bool,
+        expected_runtime_incarnation: str | None,
+        expected_host_key_fingerprint: str | None,
+        on_snapshot_captured: Callable[[], Awaitable[bool]] | None,
+        capture_snapshot: bool,
+        strict_terminal_snapshot: bool,
+        terminal_snapshot_generation: str | None,
+        terminal_snapshot_created_at: str | None,
+        strict: bool,
+        exact_absence_timeout_seconds: float,
+    ) -> bool:
+        """Release only the Kubernetes objects captured in an S36 intent."""
+
+        if (
+            expected_runtime_incarnation is not None
+            and expected_runtime_incarnation != identity.pod_uid
+        ):
+            return False
+        if expected_host_key_fingerprint is not None and (
+            expected_host_key_fingerprint != identity.ssh_host_key_fingerprint
+        ):
+            return False
+
+        snapshot_captured = False
+        if require_snapshot:
+            if (
+                not strict_terminal_snapshot
+                or identity.pod_uid is None
+                or not identity.pod_ip
+                or not identity.ssh_host_key_fingerprint
+                or terminal_snapshot_generation is None
+                or terminal_snapshot_created_at is None
+                or not self._snapshot_service
+                or not self._snapshot_service.is_available
+            ):
+                return False
+            (
+                snapshot_captured,
+                _,
+            ) = await self._snapshot_service.reconcile_terminal_snapshot_generation(
+                owner.id,
+                terminal_generation=terminal_snapshot_generation,
+                entity_type=("threads" if owner.kind == "session" else "jobs"),
+                expected_runtime_incarnation=identity.pod_uid,
+                expected_host_key_fingerprint=(identity.ssh_host_key_fingerprint),
+            )
+        if identity.pod_uid is None:
+            if (
+                require_snapshot and not snapshot_captured
+            ) or not await self._captured_teardown_pod_is_absent(owner):
+                return False
+            authority = "exact_absent"
+        else:
+            authority = await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=identity.pod_uid,
+            )
+            if authority == "unknown":
+                return False
+            if authority == "replacement":
+                # A same-name successor may legitimately reuse the captured
+                # PVC and Service.  Preserve the entire resource set; proving
+                # only that the old Pod UID is gone is not teardown authority
+                # over resources attached to its replacement.
+                return False
+
+            if authority == "exact_live":
+                status = await self.get_workspace_status(owner)
+                if (
+                    status is None
+                    or str(status.get("runtime_incarnation") or "") != identity.pod_uid
+                ):
+                    return False
+                pod_ip = status.get("pod_ip")
+                ready = status.get("ready")
+                if identity.pod_ip is not None and pod_ip != identity.pod_ip:
+                    return False
+                if (
+                    not snapshot_captured
+                    and capture_snapshot
+                    and self._snapshot_service
+                    and self._snapshot_service.is_available
+                    and pod_ip
+                    and ready
+                ):
+                    capture_kwargs: dict[str, Any] = {
+                        "job_id": owner.id,
+                        "ssh_host": identity.pod_ip or pod_ip,
+                        "ssh_port": identity.ssh_port,
+                        "source_type": "pod",
+                        "entity_type": (
+                            "threads" if owner.kind == "session" else "jobs"
+                        ),
+                        "expected_host_key_fingerprint": (
+                            identity.ssh_host_key_fingerprint
+                        ),
+                    }
+                    if strict_terminal_snapshot:
+                        capture_kwargs["strict_terminal"] = True
+                    if terminal_snapshot_generation is not None:
+                        capture_kwargs.update(
+                            {
+                                "terminal_generation": terminal_snapshot_generation,
+                                "terminal_created_at": terminal_snapshot_created_at,
+                                "expected_runtime_incarnation": identity.pod_uid,
+                            }
+                        )
+                    try:
+                        captured = bool(
+                            await self._snapshot_service.capture_vm_snapshot(
+                                **capture_kwargs
+                            )
+                        )
+                    except Exception:
+                        if require_snapshot:
+                            logger.exception(
+                                "Required captured workspace snapshot failed for %s %s",
+                                owner.kind,
+                                owner.id,
+                            )
+                            return False
+                        logger.exception(
+                            "Captured workspace snapshot failed for %s %s",
+                            owner.kind,
+                            owner.id,
+                        )
+                        captured = False
+                    if captured and on_snapshot_captured is not None:
+                        if not await on_snapshot_captured():
+                            return False
+                    if not captured and require_snapshot:
+                        return False
+                    snapshot_captured = snapshot_captured or captured
+                elif require_snapshot and not snapshot_captured:
+                    return False
+            elif require_snapshot and not snapshot_captured:
+                # A terminal/absent/replacement Pod can no longer produce the
+                # required final snapshot. Never call SSH through the stable name.
+                return False
+
+        if require_snapshot and not snapshot_captured:
+            return False
+
+        # Re-probe at the snapshot/delete handoff. Replacement and 404 prove
+        # the captured Pod is gone; neither permits deleting the current name.
+        if identity.pod_uid is None:
+            if not await self._captured_teardown_pod_is_absent(owner):
+                return False
+            authority = "exact_absent"
+        else:
+            authority = await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=identity.pod_uid,
+            )
+            if authority in {"unknown", "replacement"}:
+                return False
+        pod_deleted = True
+        if authority in {"exact_live", "exact_terminal"}:
+            pod_deleted = await self.delete_workspace(
+                owner,
+                expected_runtime_incarnation=identity.pod_uid,
+                captured_teardown_uid=identity.pod_uid,
+                **(
+                    {
+                        "wait_for_exact_absence": True,
+                        "exact_absence_timeout_seconds": (
+                            exact_absence_timeout_seconds
+                        ),
+                    }
+                    if strict
+                    else {}
+                ),
+            )
+        if not pod_deleted:
+            return False
+
+        volume_deleted = True
+        if reclaim_volume and identity.pvc_uid is not None:
+            volume_deleted = await self.delete_workspace_pvc(
+                owner,
+                require_exact_owner=True,
+                expected_uid=identity.pvc_uid,
+            )
+        service_deleted = True
+        if identity.service_uid is not None:
+            service_deleted = await self._delete_service(
+                owner,
+                require_exact_owner=True,
+                expected_uid=identity.service_uid,
+            )
+        if strict:
+            return bool(volume_deleted and service_deleted)
+        return True
+
+    async def _captured_teardown_pod_is_absent(
+        self,
+        owner: WorkspaceOwner,
+    ) -> bool:
+        """Re-prove a Pod-less S36 intent without adopting a same-name Pod."""
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404
+        return False
+
+    async def release_absent_workspace(
+        self,
+        owner: "WorkspaceOwner",
+        *,
+        reclaim_volume: bool = False,
+        expected_runtime_incarnation: str | None = None,
+        strict: bool = False,
+    ) -> bool:
+        """Finish cleanup only after Kubernetes proves the Pod exactly absent.
+
+        The caller must already hold terminal lifecycle authority preventing a
+        same-name successor from being admitted.  This method independently
+        requires an ``exact_absent`` Pod-authority result (a Kubernetes 404)
+        before it clears stale context or mutates the Service/PVC.  A live or
+        terminal object, a replacement UID, and an ambiguous API result all
+        fail closed without effects.
+        """
+
+        if not self._k8s_available:
+            return False
+        authority = await self.workspace_pod_authority(
+            owner,
+            expected_runtime_incarnation=str(expected_runtime_incarnation or ""),
+        )
+        if authority != "exact_absent":
+            logger.warning(
+                "Refusing absent-workspace cleanup for %s %s: Pod authority "
+                "is %s for retired runtime %r",
+                owner.kind,
+                owner.id,
+                authority,
+                expected_runtime_incarnation,
+            )
+            return False
+
+        # Mirror delete_workspace's 404 branch: absence still needs to clear a
+        # stale ready endpoint and close its metering interval.  This happens
+        # only after the tri-state probe above has distinguished 404 from API
+        # failure; get_workspace_status() deliberately cannot make that claim.
+        seed_deleted = await self._delete_seed_configmap(
+            owner.pod_name,
+            expected_owner=owner,
+            expected_pod_uid=expected_runtime_incarnation,
+        )
+        if strict and not seed_deleted:
+            return False
+
+        await self._set_context(
+            owner,
+            {
+                "status": "deleted",
+                "pod_ip": None,
+                **(
+                    {WORKSPACE_RUNTIME_INCARNATION_KEY: None}
+                    if owner.kind == "session"
+                    else {}
+                ),
+            },
+        )
+        await workspace_metering.close_interval(self._db, owner)
+
+        volume_deleted = True
+        if reclaim_volume:
+            volume_deleted = await self.delete_workspace_pvc(
+                owner,
+                require_exact_owner=True,
+            )
+        service_deleted = await self._delete_service(
+            owner,
+            require_exact_owner=True,
+        )
+        if strict:
+            return bool(seed_deleted and volume_deleted and service_deleted)
+        return True
+
+    def _workspace_provision_fence_labels(
+        self,
+        *,
+        owner: WorkspaceOwner,
+        runtime_generation: str,
+        attempt_id: str,
+        resource: str,
+    ) -> dict[str, str]:
+        component = {
+            "pod": "workspace-provision-fence-pod",
+            "pvc": "workspace-provision-fence-pvc",
+            "seed_configmap": "workspace-provision-fence-seed",
+            "service": "workspace-provision-fence-svc",
+        }[resource]
+        return {
+            # Fence objects deliberately do not satisfy any ordinary workspace,
+            # lifecycle-reaper, adoption, or routing selector.  The exact
+            # post-horizon UID GC below is their sole deletion owner.
+            "app": "srw-workspace-fence",
+            "srw/component": component,
+            "srw.io/component": "workspace-provision-fence",
+            owner.label_key: owner.id,
+            WORKSPACE_PROVISION_ATTEMPT_LABEL: attempt_id,
+            WORKSPACE_PROVISION_GENERATION_LABEL: runtime_generation,
+            WORKSPACE_PROVISION_FENCE_LABEL: "true",
+        }
+
+    async def _workspace_provision_resource_authority(
+        self,
+        *,
+        owner: WorkspaceOwner,
+        resource: str,
+        name: str,
+        namespace: str,
+        runtime_generation: str,
+        attempt_id: str,
+        network_tier: str,
+    ) -> dict[str, str | None]:
+        readers = {
+            "pod": self._core_api.read_namespaced_pod,
+            "pvc": self._core_api.read_namespaced_persistent_volume_claim,
+            "seed_configmap": self._core_api.read_namespaced_config_map,
+            "service": self._core_api.read_namespaced_service,
+        }
+        reader = readers.get(resource)
+        if reader is None or not self._k8s_available:
+            return {"state": "unknown", "uid": None}
+        try:
+            observed = await asyncio.to_thread(
+                reader,
+                name=name,
+                namespace=namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return {"state": "exact_absent", "uid": None}
+            return {"state": "unknown", "uid": None}
+        metadata = getattr(observed, "metadata", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
+        uid = str(getattr(metadata, "uid", "") or "")
+        exact = bool(
+            uid
+            and str(getattr(metadata, "name", "") or "") == name
+            and str(getattr(metadata, "namespace", "") or "") == namespace
+            and labels.get(owner.label_key) == owner.id
+            and labels.get(WORKSPACE_PROVISION_ATTEMPT_LABEL) == attempt_id
+            and labels.get(WORKSPACE_PROVISION_GENERATION_LABEL) == runtime_generation
+        )
+        if not exact:
+            return {"state": "replacement", "uid": None}
+        if getattr(metadata, "deletion_timestamp", None) is not None:
+            return {"state": "exact_deleting", "uid": uid}
+        opposite_owner = "srw/job-id" if owner.kind == "session" else "srw/thread-id"
+        fence_labels = self._workspace_provision_fence_labels(
+            owner=owner,
+            runtime_generation=runtime_generation,
+            attempt_id=attempt_id,
+            resource=resource,
+        )
+        normal_component = {
+            "pod": owner.component_label,
+            "pvc": "workspace-pvc",
+            "seed_configmap": "workspace-seed",
+            "service": "workspace-svc",
+        }[resource]
+        fence = labels.get(WORKSPACE_PROVISION_FENCE_LABEL) == "true"
+        if (
+            opposite_owner in labels
+            or (
+                fence
+                and any(labels.get(key) != value for key, value in fence_labels.items())
+            )
+            or (
+                not fence
+                and (
+                    WORKSPACE_PROVISION_FENCE_LABEL in labels
+                    or labels.get("app") != "srw-workspace"
+                    or labels.get("srw/component") != normal_component
+                    or labels.get("srw.io/component") != "agent-workspace"
+                    or (
+                        resource == "pod"
+                        and labels.get("srw.io/network-tier") != network_tier
+                    )
+                )
+            )
+        ):
+            return {"state": "replacement", "uid": None}
+        return {"state": "exact_fence" if fence else "exact_original", "uid": uid}
+
+    async def _delete_workspace_provision_resource_exact(
+        self, *, resource: str, name: str, namespace: str, uid: str
+    ) -> bool:
+        deleters = {
+            "pod": self._core_api.delete_namespaced_pod,
+            "pvc": self._core_api.delete_namespaced_persistent_volume_claim,
+            "seed_configmap": self._core_api.delete_namespaced_config_map,
+            "service": self._core_api.delete_namespaced_service,
+        }
+        deleter = deleters.get(resource)
+        if deleter is None or not name or not uid:
+            return False
+        kwargs: dict[str, Any] = {
+            "name": name,
+            "namespace": namespace,
+            "body": {"preconditions": {"uid": uid}},
+        }
+        if resource == "pod":
+            kwargs["grace_period_seconds"] = 0
+        try:
+            await asyncio.to_thread(deleter, **kwargs)
+            return True
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return True
+            # A 409 is an exact-UID precondition refusal.  The caller observes
+            # the name again and must classify the replacement before proceeding.
+            return False
+
+    async def _wait_workspace_provision_resource_absent(
+        self,
+        *,
+        resource: str,
+        name: str,
+        namespace: str,
+        expected_uid: str,
+    ) -> bool:
+        """Wait for exact deletion without accepting a same-name replacement."""
+
+        readers = {
+            "pod": self._core_api.read_namespaced_pod,
+            "pvc": self._core_api.read_namespaced_persistent_volume_claim,
+            "seed_configmap": self._core_api.read_namespaced_config_map,
+            "service": self._core_api.read_namespaced_service,
+        }
+        reader = readers.get(resource)
+        if reader is None or not name or not expected_uid:
+            return False
+        for _ in range(40):
+            try:
+                observed = await asyncio.to_thread(
+                    reader,
+                    name=name,
+                    namespace=namespace,
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) == 404:
+                    return True
+                return False
+            observed_uid = str(
+                getattr(getattr(observed, "metadata", None), "uid", "") or ""
+            )
+            if observed_uid != expected_uid:
+                return False
+            await asyncio.sleep(0.25)
+        return False
+
+    def _workspace_provision_fence_manifest(
+        self,
+        *,
+        owner: WorkspaceOwner,
+        resource: str,
+        name: str,
+        namespace: str,
+        runtime_generation: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        labels = self._workspace_provision_fence_labels(
+            owner=owner,
+            runtime_generation=runtime_generation,
+            attempt_id=attempt_id,
+            resource=resource,
+        )
+        metadata = {
+            "name": name,
+            "namespace": namespace,
+            "labels": labels,
+        }
+        if resource == "pod":
+            return {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": metadata,
+                "spec": {
+                    "automountServiceAccountToken": False,
+                    "restartPolicy": "Never",
+                    "schedulerName": "srw-retirement-fence",
+                    "containers": [
+                        {
+                            "name": "fence",
+                            "image": self._workspace_image,
+                            "command": ["/bin/sh", "-c", "exit 0"],
+                        }
+                    ],
+                },
+            }
+        if resource == "pvc":
+            return {
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": metadata,
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "",
+                    "resources": {"requests": {"storage": "1Mi"}},
+                },
+            }
+        if resource == "seed_configmap":
+            return {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": metadata,
+                "data": {},
+            }
+        if resource == "service":
+            return {
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": metadata,
+                "spec": {
+                    "clusterIP": "None",
+                    "selector": {
+                        "srw.io/workspace-fence-never": attempt_id,
+                    },
+                },
+            }
+        raise WorkspaceRuntimeAuthorityError(
+            "workspace provision fence kind is invalid"
+        )
+
+    async def _fence_workspace_provision_resource(
+        self,
+        *,
+        owner: WorkspaceOwner,
+        resource: str,
+        name: str,
+        namespace: str,
+        runtime_generation: str,
+        attempt_id: str,
+        network_tier: str,
+    ) -> str | None:
+        creators = {
+            "pod": self._core_api.create_namespaced_pod,
+            "pvc": self._core_api.create_namespaced_persistent_volume_claim,
+            "seed_configmap": self._core_api.create_namespaced_config_map,
+            "service": self._core_api.create_namespaced_service,
+        }
+        creator = creators.get(resource)
+        if creator is None:
+            return None
+        manifest = self._workspace_provision_fence_manifest(
+            owner=owner,
+            resource=resource,
+            name=name,
+            namespace=namespace,
+            runtime_generation=runtime_generation,
+            attempt_id=attempt_id,
+        )
+        # Each pass either wins the name with the fence or deletes the exact
+        # original UID.  A foreign replacement, ambiguous observation, or a
+        # deletion that does not become visible fails closed for leader retry.
+        for _ in range(4):
+            try:
+                created = await asyncio.to_thread(
+                    creator,
+                    namespace=namespace,
+                    body=manifest,
+                    _request_timeout=(
+                        5,
+                        PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS,
+                    ),
+                )
+                uid = str(getattr(getattr(created, "metadata", None), "uid", "") or "")
+                if not uid:
+                    observed = await self._workspace_provision_resource_authority(
+                        owner=owner,
+                        resource=resource,
+                        name=name,
+                        namespace=namespace,
+                        runtime_generation=runtime_generation,
+                        attempt_id=attempt_id,
+                        network_tier=network_tier,
+                    )
+                    return (
+                        str(observed.get("uid") or "") or None
+                        if observed.get("state") == "exact_fence"
+                        else None
+                    )
+                observed = await self._workspace_provision_resource_authority(
+                    owner=owner,
+                    resource=resource,
+                    name=name,
+                    namespace=namespace,
+                    runtime_generation=runtime_generation,
+                    attempt_id=attempt_id,
+                    network_tier=network_tier,
+                )
+                return (
+                    uid
+                    if observed.get("state") == "exact_fence"
+                    and str(observed.get("uid") or "") == uid
+                    else None
                 )
             except Exception:
-                logger.exception(
-                    "Workspace snapshot failed for thread %s — deleting anyway",
-                    thread_id,
+                observed = await self._workspace_provision_resource_authority(
+                    owner=owner,
+                    resource=resource,
+                    name=name,
+                    namespace=namespace,
+                    runtime_generation=runtime_generation,
+                    attempt_id=attempt_id,
+                    network_tier=network_tier,
                 )
+                state = observed.get("state")
+                observed_uid = str(observed.get("uid") or "")
+                if state == "exact_fence" and observed_uid:
+                    return observed_uid
+                if state != "exact_original" or not observed_uid:
+                    return None
+                if not await self._delete_workspace_provision_resource_exact(
+                    resource=resource,
+                    name=name,
+                    namespace=namespace,
+                    uid=observed_uid,
+                ):
+                    return None
+                for _wait in range(20):
+                    after = await self._workspace_provision_resource_authority(
+                        owner=owner,
+                        resource=resource,
+                        name=name,
+                        namespace=namespace,
+                        runtime_generation=runtime_generation,
+                        attempt_id=attempt_id,
+                        network_tier=network_tier,
+                    )
+                    if after.get("state") == "exact_absent":
+                        break
+                    if after.get("state") in {"replacement", "unknown"}:
+                        return None
+                    await asyncio.sleep(0.25)
+                else:
+                    return None
+        return None
 
-        deleted = await self.delete_workspace(owner)
-        await self.delete_workspace_pvc(owner)
-        return deleted
+    async def fence_pinned_workspace_provision_intent(
+        self,
+        intent: Mapping[str, Any],
+        *,
+        permanent: bool,
+    ) -> dict[str, str | None] | None:
+        """Close every potential create from one revoked pinned attempt."""
+
+        try:
+            thread_id = str(UUID(str(intent.get("thread_id") or "")))
+            runtime_generation = str(UUID(str(intent.get("runtime_generation") or "")))
+            attempt_id = str(UUID(str(intent.get("attempt_id") or "")))
+        except (TypeError, ValueError):
+            return None
+        namespace = str(intent.get("namespace") or "").strip()
+        network_tier = str(intent.get("network_tier") or "").strip()
+        if not namespace or not network_tier:
+            return None
+        owner = WorkspaceOwner.session(thread_id)
+        names = {
+            "pod": str(intent.get("pod_name") or "") or None,
+            "pvc": str(intent.get("pvc_name") or "") or None,
+            "seed_configmap": (str(intent.get("seed_configmap_name") or "") or None),
+            "service": str(intent.get("service_name") or "") or None,
+        }
+        retained = {
+            "pvc": str(intent.get("retained_pvc_uid") or "") or None,
+            "service": str(intent.get("retained_service_uid") or "") or None,
+        }
+        status = str(intent.get("status") or "")
+        if status not in {"revoking", "fenced", "retired"}:
+            return None
+        if not names["pod"]:
+            return None
+        fences: dict[str, str | None] = {
+            "fence_pod_uid": str(intent.get("fence_pod_uid") or "") or None,
+            "fence_pvc_uid": str(intent.get("fence_pvc_uid") or "") or None,
+            "fence_configmap_uid": (
+                str(intent.get("fence_configmap_uid") or "") or None
+            ),
+            "fence_service_uid": (str(intent.get("fence_service_uid") or "") or None),
+        }
+        fence_fields = {
+            "pod": "fence_pod_uid",
+            "pvc": "fence_pvc_uid",
+            "seed_configmap": "fence_configmap_uid",
+            "service": "fence_service_uid",
+        }
+        for resource, name in names.items():
+            if name is None:
+                continue
+            fence_field = fence_fields[resource]
+            existing_fence_uid = fences.get(fence_field)
+            if status != "retired" and existing_fence_uid is not None:
+                observed = await self._workspace_provision_resource_authority(
+                    owner=owner,
+                    resource=resource,
+                    name=name,
+                    namespace=namespace,
+                    runtime_generation=runtime_generation,
+                    attempt_id=attempt_id,
+                    network_tier=network_tier,
+                )
+                if not (
+                    observed.get("state") == "exact_fence"
+                    and str(observed.get("uid") or "") == existing_fence_uid
+                ):
+                    return None
+                continue
+            retained_uid = retained.get(resource)
+            if retained_uid is not None:
+                if not permanent:
+                    continue
+                # The namespace is immutable provision authority captured before
+                # the first create.  Never redirect a retirement to today's
+                # configured namespace (``_delete_pvc``/``_delete_service`` use
+                # ``self._namespace``); an operator namespace change must not
+                # leave the captured PVC/Service live or delete a same-name
+                # replacement elsewhere.
+                deleted = await self._delete_workspace_provision_resource_exact(
+                    resource=resource,
+                    name=name,
+                    namespace=namespace,
+                    uid=retained_uid,
+                )
+                if (
+                    not deleted
+                    or not await self._wait_workspace_provision_resource_absent(
+                        resource=resource,
+                        name=name,
+                        namespace=namespace,
+                        expected_uid=retained_uid,
+                    )
+                ):
+                    return None
+                # This attempt never submitted CREATE for a retained object.
+                # Once its other fences have survived the request horizon, an
+                # exact UID delete followed by observed absence is causal proof
+                # for a permanent follow-up; do not create an unrecorded fence
+                # after the intent is terminal.
+                if status == "retired":
+                    continue
+            if status == "retired":
+                continue
+            fence_uid = await self._fence_workspace_provision_resource(
+                owner=owner,
+                resource=resource,
+                name=name,
+                namespace=namespace,
+                runtime_generation=runtime_generation,
+                attempt_id=attempt_id,
+                network_tier=network_tier,
+            )
+            if not fence_uid:
+                return None
+            fences[fence_field] = fence_uid
+        return fences
+
+    async def delete_pinned_workspace_provision_fences_exact(
+        self, intent: Mapping[str, Any]
+    ) -> bool:
+        """GC only the recorded post-horizon fence UIDs."""
+
+        names = {
+            "pod": str(intent.get("pod_name") or "") or None,
+            "pvc": str(intent.get("pvc_name") or "") or None,
+            "seed_configmap": (str(intent.get("seed_configmap_name") or "") or None),
+            "service": str(intent.get("service_name") or "") or None,
+        }
+        namespace = str(intent.get("namespace") or "").strip()
+        if not namespace:
+            return False
+        fence_fields = {
+            "pod": "fence_pod_uid",
+            "pvc": "fence_pvc_uid",
+            "seed_configmap": "fence_configmap_uid",
+            "service": "fence_service_uid",
+        }
+        for resource, name in names.items():
+            uid = str(intent.get(fence_fields[resource]) or "") or None
+            if name is None or uid is None:
+                continue
+            if not await self._delete_workspace_provision_resource_exact(
+                resource=resource,
+                name=name,
+                namespace=namespace,
+                uid=uid,
+            ):
+                return False
+            if not await self._wait_workspace_provision_resource_absent(
+                resource=resource,
+                name=name,
+                namespace=namespace,
+                expected_uid=uid,
+            ):
+                return False
+        return True
 
     async def get_workspace_status(self, owner: WorkspaceOwner) -> Optional[dict]:
         """Query the workspace container status.
@@ -439,6 +4132,12 @@ class ContainerProvisioner:
                 name=pod_name,
                 namespace=self._namespace,
             )
+            self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+            )
             phase = pod.status.phase  # Pending, Running, Succeeded, Failed
             pod_ip = pod.status.pod_ip
 
@@ -452,6 +4151,9 @@ class ContainerProvisioner:
                 "phase": phase,
                 "pod_ip": pod_ip,
                 "ready": ready,
+                "runtime_incarnation": str(
+                    getattr(getattr(pod, "metadata", None), "uid", "") or ""
+                ),
             }
         except Exception as e:
             if hasattr(e, "status") and e.status == 404:
@@ -463,6 +4165,264 @@ class ContainerProvisioner:
                 e,
             )
             return None
+
+    async def get_last_termination(self, owner: WorkspaceOwner) -> Optional[dict]:
+        """Read the workspace pod's terminated-container cause, for legibility.
+
+        Called on workspace loss BEFORE ``delete_workspace`` (while the Failed
+        pod tombstone still exists) so a resource kill surfaces its true cause
+        (``OOMKilled`` / ``Evicted``) instead of the opaque downstream SSH error
+        the agent happened to hit. Mirrors the agent-pod reap classifier in
+        ``agent_provisioner`` — the kill reason lives in ``state.terminated`` or,
+        if the container restarted, ``last_state.terminated``.
+
+        Returns ``{phase, pod_reason, container_reason, exit_code, signal}`` or
+        ``None`` when the pod is already gone (404) or K8s is unavailable.
+        """
+        if not self._k8s_available:
+            return None
+        pod_name = owner.pod_name
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as e:
+            if getattr(e, "status", None) == 404:
+                return None
+            logger.debug(
+                "Termination read failed for %s %s: %s", owner.kind, owner.id, e
+            )
+            return None
+        try:
+            self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+            )
+        except WorkspaceRuntimeAuthorityError:
+            return None
+
+        status = pod.status
+        exit_code: Any = None
+        container_reason: Any = None
+        signal: Any = None
+        for cs in getattr(status, "container_statuses", None) or []:
+            if cs.name != "workspace":
+                continue
+            terminated = getattr(getattr(cs, "state", None), "terminated", None)
+            if terminated is None:
+                # Container restarted (e.g. OOMKilled then restarted): the kill
+                # reason lives in last_state.terminated, not state.
+                terminated = getattr(
+                    getattr(cs, "last_state", None), "terminated", None
+                )
+            if terminated is not None:
+                exit_code = getattr(terminated, "exit_code", None)
+                container_reason = getattr(terminated, "reason", None)
+                signal = getattr(terminated, "signal", None)
+            break
+        return {
+            "phase": getattr(status, "phase", None),
+            # pod-level status.reason is "Evicted" on node-pressure eviction
+            "pod_reason": getattr(status, "reason", None),
+            "container_reason": container_reason,
+            "exit_code": exit_code,
+            "signal": signal,
+        }
+
+    async def workspace_pod_live(
+        self,
+        owner: "WorkspaceOwner",
+        *,
+        expected_runtime_incarnation: str | None = None,
+    ) -> Optional[bool]:
+        """Drift probe: is the owner's exact workspace pod actually alive?
+
+        Returns:
+            ``True``  — pod exists and is ``Running``/``Pending`` (usable or
+                        still coming up), and its Kubernetes UID matches
+                        ``expected_runtime_incarnation`` when supplied.
+            ``False`` — pod is confirmed gone (404), or a terminal tombstone
+                        whose containers are all terminated. A same-name
+                        replacement is also not the requested incarnation.
+            ``None``  — can't tell: no k8s client, or a transient API error.
+
+        Mutation callers MUST treat ``None`` as "assume live" so a probe blip
+        (or a non-k8s backend) never triggers a false recreate of a healthy
+        workspace. Credential-delivery callers may instead fail closed without
+        mutating durable state.
+        """
+        if not self._k8s_available:
+            return None
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as e:
+            if getattr(e, "status", None) == 404:
+                return False
+            logger.debug(
+                "workspace_pod_live probe failed for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
+            return None
+        try:
+            self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+            )
+        except WorkspaceRuntimeAuthorityError:
+            return False
+        if (
+            getattr(getattr(pod, "metadata", None), "deletion_timestamp", None)
+            is not None
+        ):
+            # A terminating Pod may retain running containers throughout its
+            # grace period. It is neither stable-live nor quiescence proof.
+            return None
+        phase = getattr(pod.status, "phase", None)
+        if expected_runtime_incarnation is not None:
+            runtime_incarnation = str(getattr(pod.metadata, "uid", "") or "")
+            if runtime_incarnation != str(expected_runtime_incarnation):
+                return False
+        if phase in ("Running", "Pending"):
+            return True
+        if phase in ("Failed", "Succeeded"):
+            statuses = getattr(pod.status, "container_statuses", None) or []
+            if statuses and all(
+                getattr(getattr(status, "state", None), "terminated", None) is not None
+                for status in statuses
+            ):
+                return False
+        # Unknown, missing status, or a terminal-looking Pod without complete
+        # container termination evidence remains ambiguous under partitions.
+        return None
+
+    async def workspace_pod_authority(
+        self,
+        owner: "WorkspaceOwner",
+        *,
+        expected_runtime_incarnation: str,
+    ) -> str:
+        """Classify one exact terminal Pod authority without conflating drift.
+
+        Returns ``exact_live``, ``exact_terminal``, ``exact_absent``,
+        ``replacement``, or ``unknown``.  API-object absence is distinct from
+        an observed exact UID whose containers are all terminated: only the
+        latter proves resident processes have stopped.
+        """
+
+        if not self._k8s_available:
+            return "unknown"
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return "exact_absent"
+            return "unknown"
+        observed = str(getattr(getattr(pod, "metadata", None), "uid", "") or "")
+        try:
+            self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+            )
+        except WorkspaceRuntimeAuthorityError:
+            return "replacement"
+        if observed != str(expected_runtime_incarnation):
+            return "replacement"
+        phase = getattr(pod.status, "phase", None)
+        if _all_pod_container_statuses_terminated(pod):
+            return "exact_terminal"
+        if getattr(pod.metadata, "deletion_timestamp", None) is not None:
+            return "unknown"
+        if phase in ("Running", "Pending"):
+            return "exact_live"
+        return "unknown"
+
+    async def wait_for_workspace_code_server(
+        self,
+        owner: "WorkspaceOwner",
+        *,
+        expected_runtime_incarnation: str,
+        timeout: float = 45.0,
+    ) -> bool:
+        """Prove code-server answers from one exact workspace Pod UID.
+
+        Kubernetes readiness currently attests SSH.  A delivered warm-attach
+        abort's all-UID zero proof also kills code-server, so successor
+        recovery has the stronger obligation to recreate the Pod and verify
+        the IDE listener before publishing G2 provisioning.  The Pod identity
+        is checked both before and after the HTTP probe; replacement, absence,
+        or an ambiguous control-plane read fails closed.
+        """
+
+        if not self._k8s_available:
+            return False
+        try:
+            expected_runtime_incarnation = str(UUID(str(expected_runtime_incarnation)))
+        except (TypeError, ValueError):
+            return False
+
+        import httpx
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout))
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            while loop.time() < deadline:
+                try:
+                    if (
+                        await self.workspace_pod_authority(
+                            owner,
+                            expected_runtime_incarnation=(expected_runtime_incarnation),
+                        )
+                        != "exact_live"
+                    ):
+                        return False
+                    pod = await asyncio.to_thread(
+                        self._core_api.read_namespaced_pod,
+                        name=owner.pod_name,
+                        namespace=self._namespace,
+                    )
+                    observed = self._require_workspace_pod_owner(
+                        pod,
+                        owner=owner,
+                        allow_owner_unlabeled=False,
+                    )
+                    if observed != expected_runtime_incarnation:
+                        return False
+                    pod_ip = str(getattr(pod.status, "pod_ip", "") or "")
+                    if not pod_ip:
+                        return False
+                    response = await client.get(f"http://{pod_ip}:38080/healthz")
+                    if response.status_code < 500:
+                        return (
+                            await self.workspace_pod_authority(
+                                owner,
+                                expected_runtime_incarnation=(
+                                    expected_runtime_incarnation
+                                ),
+                            )
+                            == "exact_live"
+                        )
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+        return False
 
     # =========================================================================
     # IDE session pods (on-demand code-server for workspace browsing)
@@ -501,7 +4461,11 @@ class ContainerProvisioner:
         seed_exts = await self._resolve_ide_extensions(owner)
         seed_needs_state = await self._resolve_ide_needs_state(owner, seed_exts)
         seed_cm = await self._create_seed_configmap(
-            pod_name, seed_files, seed_exts, needs_state=seed_needs_state
+            pod_name,
+            seed_files,
+            seed_exts,
+            needs_state=seed_needs_state,
+            expected_owner=owner,
         )
 
         pod_manifest = self._build_pod_manifest(
@@ -520,15 +4484,104 @@ class ContainerProvisioner:
         pod_manifest["metadata"]["labels"]["srw/component"] = "ide-session"
 
         try:
-            created_pod = await asyncio.to_thread(
-                self._core_api.create_namespaced_pod,
-                namespace=self._namespace,
-                body=pod_manifest,
+            reused_existing_pod = False
+            try:
+                created_pod = await asyncio.to_thread(
+                    self._core_api.create_namespaced_pod,
+                    namespace=self._namespace,
+                    body=pod_manifest,
+                )
+                if created_pod is None:
+                    created_pod = await asyncio.to_thread(
+                        self._core_api.read_namespaced_pod,
+                        name=pod_name,
+                        namespace=self._namespace,
+                    )
+                runtime_incarnation = self._require_workspace_pod_owner(
+                    created_pod,
+                    owner=owner,
+                    allow_owner_unlabeled=False,
+                    expected_network_tier=network_tier,
+                    expected_pod_name=pod_name,
+                    expected_component="ide-session",
+                )
+            except Exception as create_error:
+                if getattr(create_error, "status", None) != 409:
+                    raise
+                reused_existing_pod = True
+                created_pod = await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=pod_name,
+                    namespace=self._namespace,
+                )
+                runtime_incarnation = self._require_workspace_pod_owner(
+                    created_pod,
+                    owner=owner,
+                    allow_owner_unlabeled=False,
+                    expected_network_tier=network_tier,
+                    expected_pod_name=pod_name,
+                    expected_component="ide-session",
+                )
+            observed_seed = self._require_stateless_pod_storage_binding(
+                created_pod,
+                owner=owner,
+                expected_pvc_name=None,
+                expected_seed_configmap=(
+                    _UNSPECIFIED_RESOURCE_BINDING if reused_existing_pod else seed_cm
+                ),
+                expected_pod_name=pod_name,
             )
-            await self._adopt_configmap(seed_cm, created_pod)
+            if reused_existing_pod:
+                # Settings can drift while an exact-owner IDE Pod remains
+                # live. Its immutable mount plan, not today's desired seed,
+                # remains authoritative. Never delete an incumbent-bound CM.
+                if observed_seed is not None:
+                    existing_seed = await asyncio.to_thread(
+                        self._core_api.read_namespaced_config_map,
+                        name=observed_seed,
+                        namespace=self._namespace,
+                    )
+                    try:
+                        self._require_stateless_seed_configmap_identity(
+                            existing_seed,
+                            owner=owner,
+                            pod_name=pod_name,
+                        )
+                    except WorkspaceRuntimeAuthorityError:
+                        await self._require_legacy_seed_configmap_migration(
+                            existing_seed,
+                            owner=owner,
+                            pod_name=pod_name,
+                        )
+                elif seed_cm is not None:
+                    if not await self._delete_seed_configmap(
+                        pod_name,
+                        expected_owner=owner,
+                    ):
+                        return None
+                seed_cm = observed_seed
+            elif (
+                await self._adopt_configmap(
+                    seed_cm,
+                    created_pod,
+                    expected_owner=owner,
+                )
+                is not True
+            ):
+                return None
             logger.info("IDE pod created: %s (job %s)", pod_name, job_id)
 
-            pod_ip = await self._wait_for_ready(pod_name, timeout=90)
+            pod_ip = await self._wait_for_ready(
+                pod_name,
+                timeout=90,
+                expected_owner=owner,
+                expected_runtime_incarnation=runtime_incarnation,
+                expected_network_tier=network_tier,
+                expected_pvc_name=None,
+                expected_seed_configmap=seed_cm,
+                expected_pod_name=pod_name,
+                expected_component="ide-session",
+            )
             if pod_ip:
                 logger.info("IDE pod ready: %s @ %s (job %s)", pod_name, pod_ip, job_id)
                 # Stream license/globalStorage state in (Phase B); fire-and-forget.
@@ -542,11 +4595,6 @@ class ContainerProvisioner:
             )
             return None
         except Exception as e:
-            # 409 Conflict = pod already exists (idempotent retry)
-            if hasattr(e, "status") and e.status == 409:
-                logger.info("IDE pod already exists: %s (job %s)", pod_name, job_id)
-                pod_ip = await self._wait_for_ready(pod_name, timeout=90)
-                return pod_ip
             logger.error("Failed to create IDE pod for job %s: %s", job_id, e)
             return None
 
@@ -560,21 +4608,50 @@ class ContainerProvisioner:
             return False
 
         pod_name = f"ide-{job_id[:12]}"
+        owner = WorkspaceOwner.job(job_id)
+        runtime_uid: str | None = None
+        already_absent = False
 
         try:
-            await asyncio.to_thread(
-                self._core_api.delete_namespaced_pod,
-                name=pod_name,
-                namespace=self._namespace,
-                grace_period_seconds=5,
-            )
+            try:
+                pod = await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=pod_name,
+                    namespace=self._namespace,
+                )
+                runtime_uid = self._require_workspace_pod_owner(
+                    pod,
+                    owner=owner,
+                    allow_owner_unlabeled=False,
+                    allow_terminating=True,
+                    expected_pod_name=pod_name,
+                    expected_component="ide-session",
+                )
+            except Exception as read_error:
+                if getattr(read_error, "status", None) != 404:
+                    raise
+                already_absent = True
+            if not already_absent:
+                await asyncio.to_thread(
+                    self._core_api.delete_namespaced_pod,
+                    name=pod_name,
+                    namespace=self._namespace,
+                    grace_period_seconds=5,
+                    body={"preconditions": {"uid": runtime_uid}},
+                )
             logger.info("IDE pod deleted: %s (job %s)", pod_name, job_id)
-            await self._delete_seed_configmap(pod_name)
-            return True
+            return await self._delete_seed_configmap(
+                pod_name,
+                expected_owner=owner,
+                expected_pod_uid=runtime_uid,
+            )
         except Exception as e:
             if hasattr(e, "status") and e.status == 404:
-                await self._delete_seed_configmap(pod_name)
-                return True
+                return await self._delete_seed_configmap(
+                    pod_name,
+                    expected_owner=owner,
+                    expected_pod_uid=runtime_uid,
+                )
             logger.error("Failed to delete IDE pod for job %s: %s", job_id, e)
             return False
 
@@ -583,11 +4660,20 @@ class ContainerProvisioner:
     # =========================================================================
 
     async def _create_pvc(
-        self, pvc_name: str, size: str = "10Gi", labels: Optional[dict] = None
-    ) -> bool:
-        """Create a PVC for workspace data. Idempotent — 409 treated as success."""
+        self,
+        pvc_name: str,
+        size: str = "10Gi",
+        labels: Optional[dict] = None,
+        *,
+        expected_owner: WorkspaceOwner | None = None,
+    ) -> Optional[str]:
+        """Create a PVC for workspace data. Idempotent.
+
+        Returns ``"created"`` for a new volume, ``"reused"`` if the PVC already
+        existed (409 — i.e. a reattach), or ``None`` on failure.
+        """
         if not self._k8s_available:
-            return False
+            return None
 
         pvc_labels = {
             "app": "srw-workspace",
@@ -613,41 +4699,682 @@ class ContainerProvisioner:
         }
 
         try:
-            await asyncio.to_thread(
+            created = await asyncio.to_thread(
                 self._core_api.create_namespaced_persistent_volume_claim,
                 namespace=self._namespace,
                 body=pvc_manifest,
+                _request_timeout=(
+                    5,
+                    PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS,
+                ),
             )
+            if expected_owner is not None:
+                try:
+                    claim = created or await asyncio.to_thread(
+                        self._core_api.read_namespaced_persistent_volume_claim,
+                        name=pvc_name,
+                        namespace=self._namespace,
+                    )
+                    self._require_stateless_pvc_identity(
+                        claim,
+                        owner=expected_owner,
+                        pvc_name=pvc_name,
+                    )
+                except Exception as authority_error:
+                    logger.error(
+                        "Stateless workspace PVC authority failed for %s %s: %s",
+                        expected_owner.kind,
+                        expected_owner.id,
+                        authority_error,
+                    )
+                    return None
             logger.info(
                 "PVC created: %s (storageClass=%s)", pvc_name, self._storage_class
             )
-            return True
+            return "created"
         except Exception as e:
             if hasattr(e, "status") and e.status == 409:
+                if expected_owner is not None:
+                    try:
+                        existing = await asyncio.to_thread(
+                            self._core_api.read_namespaced_persistent_volume_claim,
+                            name=pvc_name,
+                            namespace=self._namespace,
+                        )
+                        self._require_stateless_pvc_identity(
+                            existing,
+                            owner=expected_owner,
+                            pvc_name=pvc_name,
+                        )
+                    except Exception as authority_error:
+                        logger.error(
+                            "Refusing stateless PVC reuse for %s %s: %s",
+                            expected_owner.kind,
+                            expected_owner.id,
+                            authority_error,
+                        )
+                        return None
                 logger.debug("PVC already exists: %s", pvc_name)
-                return True
+                return "reused"
+            # A 403 here is the workspace capacity guard (Phase 3a): the
+            # orchestrator SA is allowed to create PVCs, so the only Forbidden
+            # it hits is a ResourceQuota "exceeded quota" rejection. Surface it
+            # distinctly so an operator/alert can tell "fleet at capacity" from a
+            # genuine infra failure. The caller still fails closed (no emptyDir
+            # fallback) — capacity exhaustion must not silently drop durability.
+            if hasattr(e, "status") and e.status == 403:
+                logger.error(
+                    "Workspace capacity quota exceeded — PVC %s rejected by "
+                    "ResourceQuota; raise workspace.resourceQuota.maxStorage/"
+                    "maxCount or wait for jobs to free PVCs: %s",
+                    pvc_name,
+                    getattr(e, "body", e),
+                )
+                return None
             logger.error("Failed to create PVC %s: %s", pvc_name, e)
-            return False
+            return None
 
-    async def _delete_pvc(self, pvc_name: str) -> bool:
+    def _require_stateless_pvc_identity(
+        self,
+        claim: Any,
+        *,
+        owner: WorkspaceOwner,
+        pvc_name: str,
+        expected_storage_class: str | None = None,
+        allow_any_storage_class: bool = False,
+    ) -> str:
+        """Bind a reused PVC to the full stateless owner, not its name prefix."""
+
+        metadata = getattr(claim, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        opposite_owner_label = (
+            "srw/job-id" if owner.kind == "session" else "srw/thread-id"
+        )
+        agent_claim = pvc_name.startswith("pvc-agent-s-")
+        expected_app = "srw-agent" if agent_claim else "srw-workspace"
+        expected_component = "agent-workspace-pvc" if agent_claim else "workspace-pvc"
+        if (
+            str(getattr(metadata, "name", "") or "") != pvc_name
+            or str(getattr(metadata, "namespace", "") or "") != self._namespace
+            or getattr(metadata, "deletion_timestamp", None) is not None
+            or not isinstance(labels, dict)
+            or labels.get(owner.label_key) != owner.id
+            or labels.get("app") != expected_app
+            or labels.get("srw/component") != expected_component
+            or labels.get("srw.io/component") != "agent-workspace"
+            or WORKSPACE_PROVISION_FENCE_LABEL in labels
+            or opposite_owner_label in labels
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace PVC owner authority changed"
+            )
+        spec = getattr(claim, "spec", None)
+        access_modes = getattr(spec, "access_modes", None)
+        observed_storage_class = getattr(spec, "storage_class_name", None)
+        required_storage_class = expected_storage_class or self._storage_class
+        if (
+            not isinstance(access_modes, (list, tuple))
+            or list(access_modes) != ["ReadWriteOnce"]
+            or (
+                not allow_any_storage_class
+                and observed_storage_class != required_storage_class
+            )
+            or (
+                allow_any_storage_class
+                and (
+                    not isinstance(observed_storage_class, str)
+                    or not observed_storage_class
+                    or "\x00" in observed_storage_class
+                )
+            )
+            or getattr(spec, "volume_mode", None) not in {None, "Filesystem"}
+            or getattr(spec, "selector", None) is not None
+            or getattr(spec, "data_source", None) is not None
+            or getattr(spec, "data_source_ref", None) is not None
+        ):
+            raise WorkspaceRuntimeAuthorityError("workspace PVC spec changed")
+        try:
+            return _canonical_runtime_uuid(
+                str(getattr(metadata, "uid", "") or ""),
+                label="workspace PVC UID",
+            )
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+
+    async def _delete_pvc(
+        self,
+        pvc_name: str,
+        *,
+        expected_owner: WorkspaceOwner | None = None,
+        expected_uid: str | None = None,
+    ) -> bool:
         """Delete a PVC. Idempotent — 404 treated as success."""
         if not self._k8s_available:
             return False
+
+        claim_uid: str | None = None
+        if expected_owner is not None:
+            try:
+                claim = await asyncio.to_thread(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+                claim_uid = self._require_stateless_pvc_identity(
+                    claim,
+                    owner=expected_owner,
+                    pvc_name=pvc_name,
+                )
+                if expected_uid is not None and claim_uid != expected_uid:
+                    logger.info(
+                        "Captured workspace PVC %s is already gone; refusing "
+                        "same-name replacement UID %s",
+                        expected_uid,
+                        claim_uid,
+                    )
+                    return True
+            except Exception as error:
+                if getattr(error, "status", None) == 404:
+                    return True
+                logger.error(
+                    "Refusing stateless PVC cleanup for %s %s: %s",
+                    expected_owner.kind,
+                    expected_owner.id,
+                    error,
+                )
+                return False
 
         try:
             await asyncio.to_thread(
                 self._core_api.delete_namespaced_persistent_volume_claim,
                 name=pvc_name,
                 namespace=self._namespace,
+                **(
+                    {"body": {"preconditions": {"uid": claim_uid}}}
+                    if claim_uid is not None
+                    else {}
+                ),
             )
+            if expected_owner is not None:
+                try:
+                    current_claim = await asyncio.to_thread(
+                        self._core_api.read_namespaced_persistent_volume_claim,
+                        name=pvc_name,
+                        namespace=self._namespace,
+                    )
+                except Exception as error:
+                    if getattr(error, "status", None) == 404:
+                        logger.info("PVC deleted: %s", pvc_name)
+                        return True
+                else:
+                    try:
+                        current_uid = self._require_stateless_pvc_identity(
+                            current_claim,
+                            owner=expected_owner,
+                            pvc_name=pvc_name,
+                        )
+                    except Exception:
+                        current_uid = None
+                    if expected_uid is not None and current_uid != expected_uid:
+                        return True
+                return False
             logger.info("PVC deleted: %s", pvc_name)
             return True
         except Exception as e:
-            if hasattr(e, "status") and e.status == 404:
+            if hasattr(e, "status") and e.status in (
+                {404, 409} if expected_uid is not None else {404}
+            ):
                 logger.debug("PVC already deleted: %s", pvc_name)
                 return True
             logger.error("Failed to delete PVC %s: %s", pvc_name, e)
             return False
+
+    async def _delete_pvc_and_wait(
+        self,
+        pvc_name: str,
+        timeout: int = 90,
+        *,
+        expected_owner: WorkspaceOwner | None = None,
+    ) -> bool:
+        """Delete a PVC and wait (bounded) for it to fully release.
+
+        The single-replica fallback recreates a fresh PVC under the SAME
+        deterministic name, so the old (wedged) one must be gone first — else the
+        create 409-reuses the dead volume. Best-effort: on timeout we proceed
+        anyway (the recreate's 409 path is still safe, just not fresh).
+        """
+        if not self._k8s_available:
+            return False
+        if not await self._delete_pvc(pvc_name, expected_owner=expected_owner):
+            return False
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                await asyncio.to_thread(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+            except Exception as e:
+                if hasattr(e, "status") and e.status == 404:
+                    return True  # fully released
+            await asyncio.sleep(2)
+        logger.warning(
+            "PVC %s still present after %ss — refusing fresh recovery",
+            pvc_name,
+            timeout,
+        )
+        return False
+
+    async def _pod_volume_attach_failing(self, pod_name: str) -> bool:
+        """True if the pod is wedged on a PVC volume that won't attach/mount.
+
+        The single-replica node-loss fallback uses this to CONFIRM — before
+        discarding a PVC (the only data-destructive recovery path) — that the
+        holdup really is the volume (its lone replica on a dead node), not an
+        unrelated stall (image pull, resource pressure, scheduling). Substrate-
+        generic: matches the Kubernetes attach/mount failure events rather than
+        any Longhorn-specific state, so it also covers Ceph / EBS / etc.
+        """
+        if not self._k8s_available:
+            return False
+        try:
+            events = await asyncio.to_thread(
+                self._core_api.list_namespaced_event,
+                namespace=self._namespace,
+                field_selector=f"involvedObject.name={pod_name}",
+            )
+        except Exception:
+            logger.exception("Could not read events for pod %s", pod_name)
+            return False
+        for ev in getattr(events, "items", None) or []:
+            reason = getattr(ev, "reason", "") or ""
+            message = (getattr(ev, "message", "") or "").lower()
+            if (
+                reason in ("FailedAttachVolume", "FailedMount")
+                or "multi-attach" in message
+            ):
+                return True
+        return False
+
+    async def _create_service(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        require_exact_owner: bool = False,
+        expected_provision_attempt: str | None = None,
+        expected_runtime_generation: str | None = None,
+        retained_uid: str | None = None,
+    ) -> bool:
+        """Create a headless Service giving the workspace a STABLE DNS name.
+
+        The pod IP changes on every recreate; the agent caches its SSH dial
+        target, so a recreated pod (PVC reattach / crash recovery) leaves the
+        agent dialing a dead IP and the work churns to fail-loud (see
+        knowledge-base/knowledge/issues/workspace_reattach_ephemeral_ip_reconnect_churn.md). A
+        headless Service named after the pod gives a stable address
+        ``<pod_name>.<ns>.svc:30022`` that always resolves (selector-matched) to
+        the *current* pod — so reattach/recovery reconnects with no IP
+        propagation. Headless (clusterIP=None) keeps traffic pod->pod (no DNAT),
+        so workspace NetworkPolicies are unaffected, and DNS only resolves to a
+        Ready pod (closes the sshd-readiness gap). Idempotent — 409 = success.
+        Created with the PVC (both owner kinds) and kept across idle reaps;
+        dropped on release/terminal. Cheap to lose — the next create_workspace
+        recreates it — which is why ``release_workspace`` may drop the Service
+        while KEEPING a still-resumable owner's PVC.
+        """
+        if not self._k8s_available:
+            return False
+        if (
+            (expected_provision_attempt is None)
+            != (expected_runtime_generation is None)
+            or retained_uid is not None
+            and expected_provision_attempt is None
+        ):
+            return False
+        svc_name = owner.pod_name  # DNS: <svc_name>.<ns>.svc.cluster.local
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": svc_name,
+                "namespace": self._namespace,
+                "labels": {
+                    "app": "srw-workspace",
+                    "srw/component": "workspace-svc",
+                    "srw.io/component": "agent-workspace",
+                    owner.label_key: owner.id,
+                    **(
+                        {
+                            WORKSPACE_PROVISION_ATTEMPT_LABEL: (
+                                expected_provision_attempt
+                            ),
+                            WORKSPACE_PROVISION_GENERATION_LABEL: (
+                                expected_runtime_generation
+                            ),
+                        }
+                        if expected_provision_attempt is not None
+                        else {}
+                    ),
+                },
+            },
+            "spec": {
+                "clusterIP": "None",  # headless → A-record to the current pod IP
+                "selector": {"app": "srw-workspace", owner.label_key: owner.id},
+                "ports": [
+                    {
+                        "name": "ssh",
+                        "port": 30022,
+                        "targetPort": 30022,
+                        "protocol": "TCP",
+                    },
+                    {
+                        "name": "code-server",
+                        "port": 38080,
+                        "targetPort": 38080,
+                        "protocol": "TCP",
+                    },
+                    {
+                        "name": "cdp",
+                        "port": 9222,
+                        "targetPort": 9222,
+                        "protocol": "TCP",
+                    },
+                ],
+            },
+        }
+        try:
+            created = await asyncio.to_thread(
+                self._core_api.create_namespaced_service,
+                namespace=self._namespace,
+                body=manifest,
+                _request_timeout=(
+                    5,
+                    PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS,
+                ),
+            )
+            if require_exact_owner:
+                try:
+                    service = created or await asyncio.to_thread(
+                        self._core_api.read_namespaced_service,
+                        name=svc_name,
+                        namespace=self._namespace,
+                    )
+                    if expected_provision_attempt is not None:
+                        self._require_pinned_workspace_resource_identity(
+                            service,
+                            resource="service",
+                            owner=owner,
+                            expected_name=svc_name,
+                            expected_runtime_generation=expected_runtime_generation,
+                            expected_attempt_id=expected_provision_attempt,
+                            retained_uid=retained_uid,
+                        )
+                    else:
+                        self._require_stateless_service_identity(service, owner=owner)
+                except Exception as authority_error:
+                    logger.error(
+                        "Stateless workspace Service authority failed for %s: %s",
+                        owner.id,
+                        authority_error,
+                    )
+                    return False
+            logger.info("Workspace Service created: %s", svc_name)
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 409:
+                if require_exact_owner:
+                    try:
+                        service = await asyncio.to_thread(
+                            self._core_api.read_namespaced_service,
+                            name=svc_name,
+                            namespace=self._namespace,
+                        )
+                        if expected_provision_attempt is not None:
+                            self._require_pinned_workspace_resource_identity(
+                                service,
+                                resource="service",
+                                owner=owner,
+                                expected_name=svc_name,
+                                expected_runtime_generation=(
+                                    expected_runtime_generation
+                                ),
+                                expected_attempt_id=expected_provision_attempt,
+                                retained_uid=retained_uid,
+                            )
+                        else:
+                            self._require_stateless_service_identity(
+                                service, owner=owner
+                            )
+                    except Exception as authority_error:
+                        logger.error(
+                            "Refusing stateless Service reuse for %s: %s",
+                            owner.id,
+                            authority_error,
+                        )
+                        return False
+                logger.debug("Workspace Service already exists: %s", svc_name)
+                return True
+            logger.error("Failed to create workspace Service %s: %s", svc_name, e)
+            return False
+
+    async def _delete_service(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        require_exact_owner: bool = False,
+        expected_uid: str | None = None,
+    ) -> bool:
+        """Delete the workspace's headless Service. Idempotent — 404 = success."""
+        if not self._k8s_available:
+            return False
+        svc_name = owner.pod_name
+        service_uid: str | None = None
+        if require_exact_owner:
+            try:
+                service = await asyncio.to_thread(
+                    self._core_api.read_namespaced_service,
+                    name=svc_name,
+                    namespace=self._namespace,
+                )
+                service_uid = self._require_stateless_service_identity(
+                    service, owner=owner
+                )
+                if expected_uid is not None and service_uid != expected_uid:
+                    logger.info(
+                        "Captured workspace Service %s is already gone; refusing "
+                        "same-name replacement UID %s",
+                        expected_uid,
+                        service_uid,
+                    )
+                    return True
+            except Exception as e:
+                if getattr(e, "status", None) == 404:
+                    return True
+                logger.error(
+                    "Refusing stateless Service cleanup for %s: %s", owner.id, e
+                )
+                return False
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_service,
+                name=svc_name,
+                namespace=self._namespace,
+                **(
+                    {"body": {"preconditions": {"uid": service_uid}}}
+                    if service_uid is not None
+                    else {}
+                ),
+            )
+            if require_exact_owner:
+                try:
+                    current_service = await asyncio.to_thread(
+                        self._core_api.read_namespaced_service,
+                        name=svc_name,
+                        namespace=self._namespace,
+                    )
+                except Exception as e:
+                    if getattr(e, "status", None) == 404:
+                        logger.info("Workspace Service deleted: %s", svc_name)
+                        return True
+                else:
+                    try:
+                        current_uid = self._require_stateless_service_identity(
+                            current_service, owner=owner
+                        )
+                    except Exception:
+                        current_uid = None
+                    if expected_uid is not None and current_uid != expected_uid:
+                        return True
+                return False
+            logger.info("Workspace Service deleted: %s", svc_name)
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status in (
+                {404, 409} if expected_uid is not None else {404}
+            ):
+                logger.debug("Workspace Service already deleted: %s", svc_name)
+                return True
+            logger.error("Failed to delete workspace Service %s: %s", svc_name, e)
+            return False
+
+    def _require_stateless_service_identity(
+        self,
+        service: Any,
+        *,
+        owner: WorkspaceOwner,
+    ) -> str:
+        metadata = getattr(service, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        opposite_owner_label = (
+            "srw/job-id" if owner.kind == "session" else "srw/thread-id"
+        )
+        if (
+            str(getattr(metadata, "name", "") or "") != owner.pod_name
+            or str(getattr(metadata, "namespace", "") or "") != self._namespace
+            or getattr(metadata, "deletion_timestamp", None) is not None
+            or not isinstance(labels, dict)
+            or labels.get(owner.label_key) != owner.id
+            or labels.get("app") != "srw-workspace"
+            or labels.get("srw/component") != "workspace-svc"
+            or labels.get("srw.io/component") != "agent-workspace"
+            or WORKSPACE_PROVISION_FENCE_LABEL in labels
+            or opposite_owner_label in labels
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace Service owner authority changed"
+            )
+        spec = getattr(service, "spec", None)
+        selector = getattr(spec, "selector", None)
+        ports = getattr(spec, "ports", None)
+        if not isinstance(ports, (list, tuple)):
+            raise WorkspaceRuntimeAuthorityError("workspace Service spec changed")
+        observed_ports = {
+            (
+                str(getattr(port, "name", "") or ""),
+                getattr(port, "port", None),
+                getattr(port, "target_port", None),
+                getattr(port, "protocol", None),
+            )
+            for port in ports
+        }
+        expected_ports = {
+            ("ssh", 30022, 30022, "TCP"),
+            ("code-server", 38080, 38080, "TCP"),
+            ("cdp", 9222, 9222, "TCP"),
+        }
+        if (
+            getattr(spec, "cluster_ip", None) != "None"
+            or selector != {"app": "srw-workspace", owner.label_key: owner.id}
+            or observed_ports != expected_ports
+            or getattr(spec, "type", None) not in {None, "ClusterIP"}
+        ):
+            raise WorkspaceRuntimeAuthorityError("workspace Service spec changed")
+        try:
+            return _canonical_runtime_uuid(
+                str(getattr(metadata, "uid", "") or ""),
+                label="workspace Service UID",
+            )
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+
+    def _require_pinned_workspace_resource_identity(
+        self,
+        resource_object: Any,
+        *,
+        resource: str,
+        owner: WorkspaceOwner,
+        expected_name: str,
+        expected_runtime_generation: str,
+        expected_attempt_id: str,
+        retained_uid: str | None = None,
+    ) -> str:
+        """Prove one pinned create result belongs to its durable attempt.
+
+        A retained PVC/Service predates the attempt and is admitted only by its
+        already-captured immutable UID.  Every newly creatable object must carry
+        the exact T/G/attempt labels written before the API call.
+        """
+
+        if resource == "pod":
+            uid = self._require_workspace_pod_owner(
+                resource_object,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=False,
+                expected_pod_name=expected_name,
+            )
+        elif resource == "pvc":
+            uid = self._require_stateless_pvc_identity(
+                resource_object,
+                owner=owner,
+                pvc_name=expected_name,
+            )
+        elif resource == "seed_configmap":
+            uid = self._require_stateless_seed_configmap_identity(
+                resource_object,
+                owner=owner,
+                pod_name=owner.pod_name,
+            )
+        elif resource == "service":
+            uid = self._require_stateless_service_identity(
+                resource_object,
+                owner=owner,
+            )
+        else:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace provision resource kind is invalid"
+            )
+        if (
+            str(getattr(getattr(resource_object, "metadata", None), "name", "") or "")
+            != expected_name
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace provision resource name changed"
+            )
+        if retained_uid is not None:
+            if uid != str(retained_uid):
+                raise WorkspaceRuntimeAuthorityError(
+                    "retained workspace resource identity changed"
+                )
+            return uid
+        labels = dict(
+            getattr(getattr(resource_object, "metadata", None), "labels", None) or {}
+        )
+        if (
+            labels.get(WORKSPACE_PROVISION_ATTEMPT_LABEL) != str(expected_attempt_id)
+            or labels.get(WORKSPACE_PROVISION_GENERATION_LABEL)
+            != str(expected_runtime_generation)
+            or labels.get(owner.label_key) != owner.id
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace provision attempt identity changed"
+            )
+        return uid
+
+    def _workspace_dns(self, owner: WorkspaceOwner) -> str:
+        """Stable in-cluster DNS for the workspace's headless Service."""
+        return f"{owner.pod_name}.{self._namespace}.svc.cluster.local"
 
     def _build_workspace_labels(
         self, owner: WorkspaceOwner, network_tier: str = DEFAULT_NETWORK_TIER
@@ -657,10 +5384,10 @@ class ContainerProvisioner:
             owner.label_key: owner.id,
             "srw/component": owner.component_label,
             # Fleet-wide selector shared with KubeVirt VM workspaces.
-            # See docs/features/workspace_network_policy_unification.md
+            # See knowledge-base/knowledge/features/workspace_network_policy_unification.md
             "srw.io/component": "agent-workspace",
             # Per-project egress tier — selected by one NetworkPolicy per
-            # tier in helm. See docs/features/workspace_network_isolation.md §3.
+            # tier in helm. See knowledge-base/knowledge/features/workspace_network_isolation.md §3.
             "srw.io/network-tier": network_tier,
         }
         # Phase 2a: build SHA label parity with agent pods. Lets the
@@ -669,6 +5396,78 @@ class ContainerProvisioner:
         if ":sha-" in self._workspace_image:
             labels["srw/build-sha"] = self._workspace_image.rsplit(":sha-", 1)[-1]
         return labels
+
+    def _pinned_workspace_provision_fingerprint(
+        self,
+        *,
+        owner: WorkspaceOwner,
+        pod_name: str,
+        pvc_name: str | None,
+        seed_configmap_name: str | None,
+        service_name: str | None,
+        network_tier: str,
+        workspace_image: str,
+        cpu: str,
+        memory: str,
+        cpu_limit: str,
+        memory_limit: str,
+        seed_files: Mapping[str, Any],
+        seed_extensions: Mapping[str, Any],
+        seed_needs_state: bool,
+    ) -> str:
+        """Digest the complete deterministic pinned create rendering contract.
+
+        The intent stores only this digest, so a retry may replay an unresolved
+        attempt only while every manifest-affecting input is still exact.  A
+        deployment/config drift returns no admission from the DB and leaves the
+        old attempt for the retirement/fence reconciler; it must never silently
+        render a different object under the old attempt identity.
+        """
+
+        contract = {
+            "render_contract_version": (
+                PINNED_WORKSPACE_PROVISION_RENDER_CONTRACT_VERSION
+            ),
+            "owner_kind": owner.kind,
+            "owner_id": owner.id,
+            "namespace": self._namespace,
+            "pod_name": pod_name,
+            "pvc_name": pvc_name,
+            "seed_configmap_name": seed_configmap_name,
+            "service_name": service_name,
+            "network_tier": network_tier,
+            "workspace_image": workspace_image,
+            # _build_workspace_labels derives srw/build-sha from the configured
+            # default image even when a caller supplies an image override.
+            "workspace_label_image": self._workspace_image,
+            "cpu": cpu,
+            "memory": memory,
+            "cpu_limit": cpu_limit,
+            "memory_limit": memory_limit,
+            "pvc_size": self._pvc_size if pvc_name is not None else None,
+            "storage_class": self._storage_class if pvc_name is not None else None,
+            "fuse_enabled": self._fuse_enabled,
+            "fuse_privileged": self._fuse_privileged,
+            "workspace_capabilities": self._workspace_capabilities(),
+            "ssh_secret_name": self._ssh_secret_name,
+            "seed_files": seed_files,
+            "seed_extensions": seed_extensions,
+            "seed_needs_state": seed_needs_state,
+            # These manifests are static today, but explicit versions make a
+            # future field change review-visible even when its inputs do not.
+            "pvc_manifest_contract": 1,
+            "seed_configmap_manifest_contract": 1,
+            "pod_manifest_contract": 1,
+            "service_manifest_contract": 1,
+        }
+        return hashlib.sha256(
+            json.dumps(
+                contract,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
 
     async def _resolve_network_tier(self, work_id: str, kind: str) -> str:
         """Resolve the egress tier for a job/thread, falling back to the default.
@@ -837,6 +5636,11 @@ class ContainerProvisioner:
         files: dict,
         extensions: Optional[dict] = None,
         needs_state: bool = False,
+        *,
+        expected_owner: WorkspaceOwner | None = None,
+        expected_creation_generation: str | None = None,
+        expected_provision_attempt: str | None = None,
+        expected_runtime_generation: str | None = None,
     ) -> Optional[str]:
         """Create a ConfigMap carrying a self-contained ``seed.sh`` for the pod.
 
@@ -849,6 +5653,27 @@ class ContainerProvisioner:
         """
         if (not files and not extensions) or not self._core_api:
             return None
+        if expected_owner is None and expected_creation_generation is not None:
+            raise WorkspaceRuntimeAuthorityError(
+                "stateless seed ConfigMap authority is incomplete"
+            )
+        if (
+            (expected_provision_attempt is None)
+            != (expected_runtime_generation is None)
+            or expected_provision_attempt is not None
+            and expected_owner is None
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "pinned seed ConfigMap authority is incomplete"
+            )
+        if expected_creation_generation is not None:
+            try:
+                expected_creation_generation = _canonical_runtime_uuid(
+                    expected_creation_generation,
+                    label="stateless workspace creation generation",
+                )
+            except ValueError as exc:
+                raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
         from services.ide_settings import (
             build_extension_install_script,
             build_seed_script,
@@ -866,52 +5691,326 @@ class ContainerProvisioner:
         body = {
             "apiVersion": "v1",
             "kind": "ConfigMap",
-            "metadata": {"name": cm_name, "namespace": self._namespace},
+            "metadata": {
+                "name": cm_name,
+                "namespace": self._namespace,
+                **(
+                    {
+                        "labels": {
+                            "app": "srw-workspace",
+                            "srw/component": "workspace-seed",
+                            "srw.io/component": "agent-workspace",
+                            expected_owner.label_key: expected_owner.id,
+                            **(
+                                {
+                                    WORKSPACE_PROVISION_ATTEMPT_LABEL: (
+                                        expected_provision_attempt
+                                    ),
+                                    WORKSPACE_PROVISION_GENERATION_LABEL: (
+                                        expected_runtime_generation
+                                    ),
+                                }
+                                if expected_provision_attempt is not None
+                                else {}
+                            ),
+                        },
+                        **(
+                            {
+                                "annotations": {
+                                    WORKSPACE_RUNTIME_CREATION_ANNOTATION: (
+                                        expected_creation_generation
+                                    )
+                                }
+                            }
+                            if expected_creation_generation is not None
+                            else {}
+                        ),
+                    }
+                    if expected_owner is not None
+                    else {}
+                ),
+            },
             "data": data,
         }
         try:
-            await asyncio.to_thread(
+            created = await asyncio.to_thread(
                 self._core_api.create_namespaced_config_map,
                 namespace=self._namespace,
                 body=body,
+                _request_timeout=(
+                    5,
+                    PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS,
+                ),
             )
+            if expected_owner is not None:
+                observed = created or await asyncio.to_thread(
+                    self._core_api.read_namespaced_config_map,
+                    name=cm_name,
+                    namespace=self._namespace,
+                )
+                self._require_stateless_seed_configmap_identity(
+                    observed,
+                    owner=expected_owner,
+                    generation=expected_creation_generation,
+                    pod_name=pod_name,
+                )
+                if expected_provision_attempt is not None:
+                    self._require_pinned_workspace_resource_identity(
+                        observed,
+                        resource="seed_configmap",
+                        owner=expected_owner,
+                        expected_name=cm_name,
+                        expected_runtime_generation=expected_runtime_generation,
+                        expected_attempt_id=expected_provision_attempt,
+                    )
             return cm_name
         except Exception as e:
             if getattr(e, "status", None) == 409:
                 # Stale ConfigMap from a prior attempt — refresh its contents.
                 try:
-                    await asyncio.to_thread(
+                    if expected_owner is not None:
+                        existing = await asyncio.to_thread(
+                            self._core_api.read_namespaced_config_map,
+                            name=cm_name,
+                            namespace=self._namespace,
+                        )
+                        try:
+                            self._require_stateless_seed_configmap_identity(
+                                existing,
+                                owner=expected_owner,
+                                generation=expected_creation_generation,
+                                pod_name=pod_name,
+                            )
+                        except WorkspaceRuntimeAuthorityError:
+                            if expected_creation_generation is not None:
+                                raise
+                            await self._require_legacy_seed_configmap_migration(
+                                existing,
+                                owner=expected_owner,
+                                pod_name=pod_name,
+                            )
+                        if expected_provision_attempt is not None:
+                            self._require_pinned_workspace_resource_identity(
+                                existing,
+                                resource="seed_configmap",
+                                owner=expected_owner,
+                                expected_name=cm_name,
+                                expected_runtime_generation=(
+                                    expected_runtime_generation
+                                ),
+                                expected_attempt_id=expected_provision_attempt,
+                            )
+                        resource_version = str(
+                            getattr(
+                                getattr(existing, "metadata", None),
+                                "resource_version",
+                                "",
+                            )
+                            or ""
+                        )
+                        if not resource_version:
+                            raise WorkspaceRuntimeAuthorityError(
+                                "workspace seed ConfigMap resource version is missing"
+                            )
+                        body["metadata"]["resourceVersion"] = resource_version
+                    replaced = await asyncio.to_thread(
                         self._core_api.replace_namespaced_config_map,
                         name=cm_name,
                         namespace=self._namespace,
                         body=body,
                     )
+                    if expected_owner is not None:
+                        observed = replaced or await asyncio.to_thread(
+                            self._core_api.read_namespaced_config_map,
+                            name=cm_name,
+                            namespace=self._namespace,
+                        )
+                        self._require_stateless_seed_configmap_identity(
+                            observed,
+                            owner=expected_owner,
+                            generation=expected_creation_generation,
+                            pod_name=pod_name,
+                        )
+                        if expected_provision_attempt is not None:
+                            self._require_pinned_workspace_resource_identity(
+                                observed,
+                                resource="seed_configmap",
+                                owner=expected_owner,
+                                expected_name=cm_name,
+                                expected_runtime_generation=(
+                                    expected_runtime_generation
+                                ),
+                                expected_attempt_id=expected_provision_attempt,
+                            )
                     return cm_name
                 except Exception as e2:
+                    if expected_owner is not None:
+                        raise WorkspaceRuntimeAuthorityError(
+                            "workspace seed ConfigMap authority changed"
+                        ) from e2
                     logger.warning(
                         "ide seed: replace configmap %s failed: %s", cm_name, e2
                     )
                     return None
+            if isinstance(e, WorkspaceRuntimeAuthorityError):
+                raise
+            if (
+                expected_creation_generation is not None
+                or expected_provision_attempt is not None
+            ):
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace seed ConfigMap create failed"
+                ) from e
             logger.warning("ide seed: create configmap %s failed: %s", cm_name, e)
             return None
 
-    async def _adopt_configmap(self, cm_name: Optional[str], pod_obj: Any) -> None:
+    async def _adopt_configmap(
+        self,
+        cm_name: Optional[str],
+        pod_obj: Any,
+        *,
+        expected_owner: WorkspaceOwner | None = None,
+        expected_creation_generation: str | None = None,
+        expected_provision_attempt: str | None = None,
+        expected_runtime_generation: str | None = None,
+    ) -> bool:
         """Set the pod as the ConfigMap's owner so K8s GCs it on teardown.
 
         Best-effort: a failure here just means we fall back to the explicit
         delete in ``delete_workspace``/``delete_ide_pod``.
         """
-        if not cm_name or not self._core_api or pod_obj is None:
-            return
+        if not cm_name:
+            return True
+        if (expected_provision_attempt is None) != (
+            expected_runtime_generation is None
+        ):
+            return False
+        if not self._core_api or pod_obj is None:
+            return False
         try:
             uid = pod_obj.metadata.uid
             name = pod_obj.metadata.name
         except Exception:
-            return
+            return False
         if not uid:
-            return
+            return False
+        configmap_uid: str | None = None
+        resource_version: str | None = None
+        if expected_owner is not None:
+            try:
+                pod_labels = getattr(getattr(pod_obj, "metadata", None), "labels", None)
+                opposite_owner_label = (
+                    "srw/job-id"
+                    if expected_owner.kind == "session"
+                    else "srw/thread-id"
+                )
+                if (
+                    str(name or "")
+                    not in {expected_owner.pod_name, f"ide-{expected_owner.id[:12]}"}
+                    or not isinstance(pod_labels, dict)
+                    or pod_labels.get(expected_owner.label_key) != expected_owner.id
+                    or opposite_owner_label in pod_labels
+                    or expected_provision_attempt is not None
+                    and (
+                        pod_labels.get(WORKSPACE_PROVISION_ATTEMPT_LABEL)
+                        != expected_provision_attempt
+                        or pod_labels.get(WORKSPACE_PROVISION_GENERATION_LABEL)
+                        != expected_runtime_generation
+                    )
+                ):
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace Pod owner changed before ConfigMap adoption"
+                    )
+                configmap = await asyncio.to_thread(
+                    self._core_api.read_namespaced_config_map,
+                    name=cm_name,
+                    namespace=self._namespace,
+                )
+                try:
+                    configmap_uid = self._require_stateless_seed_configmap_identity(
+                        configmap,
+                        owner=expected_owner,
+                        generation=expected_creation_generation,
+                        pod_name=str(name),
+                    )
+                except WorkspaceRuntimeAuthorityError:
+                    if expected_creation_generation is not None:
+                        raise
+                    await self._require_legacy_seed_configmap_migration(
+                        configmap,
+                        owner=expected_owner,
+                        pod_name=str(name),
+                    )
+                    configmap_uid = _canonical_runtime_uuid(
+                        str(
+                            getattr(
+                                getattr(configmap, "metadata", None),
+                                "uid",
+                                "",
+                            )
+                            or ""
+                        ),
+                        label="workspace seed ConfigMap UID",
+                    )
+                if expected_provision_attempt is not None:
+                    configmap_uid = self._require_pinned_workspace_resource_identity(
+                        configmap,
+                        resource="seed_configmap",
+                        owner=expected_owner,
+                        expected_name=cm_name,
+                        expected_runtime_generation=(expected_runtime_generation),
+                        expected_attempt_id=expected_provision_attempt,
+                    )
+                resource_version = str(
+                    getattr(
+                        getattr(configmap, "metadata", None),
+                        "resource_version",
+                        "",
+                    )
+                    or ""
+                )
+                if not resource_version:
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace seed ConfigMap resource version is missing"
+                    )
+            except Exception as error:
+                logger.error(
+                    "Refusing workspace seed ConfigMap adoption for %s: %s",
+                    expected_owner.id,
+                    error,
+                )
+                return False
         patch = {
             "metadata": {
+                **(
+                    {"resourceVersion": resource_version}
+                    if resource_version is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "labels": {
+                            "app": "srw-workspace",
+                            "srw/component": "workspace-seed",
+                            "srw.io/component": "agent-workspace",
+                            expected_owner.label_key: expected_owner.id,
+                            **(
+                                {
+                                    WORKSPACE_PROVISION_ATTEMPT_LABEL: (
+                                        expected_provision_attempt
+                                    ),
+                                    WORKSPACE_PROVISION_GENERATION_LABEL: (
+                                        expected_runtime_generation
+                                    ),
+                                }
+                                if expected_provision_attempt is not None
+                                else {}
+                            ),
+                        }
+                    }
+                    if expected_owner is not None
+                    else {}
+                ),
                 "ownerReferences": [
                     {
                         "apiVersion": "v1",
@@ -921,7 +6020,7 @@ class ContainerProvisioner:
                         "controller": True,
                         "blockOwnerDeletion": False,
                     }
-                ]
+                ],
             }
         }
         try:
@@ -931,23 +6030,307 @@ class ContainerProvisioner:
                 namespace=self._namespace,
                 body=patch,
             )
+            if expected_owner is not None:
+                confirmed = await asyncio.to_thread(
+                    self._core_api.read_namespaced_config_map,
+                    name=cm_name,
+                    namespace=self._namespace,
+                )
+                if (
+                    self._require_stateless_seed_configmap_identity(
+                        confirmed,
+                        owner=expected_owner,
+                        generation=expected_creation_generation,
+                        pod_name=str(name),
+                    )
+                    != configmap_uid
+                ):
+                    return False
+                if expected_provision_attempt is not None:
+                    if (
+                        self._require_pinned_workspace_resource_identity(
+                            confirmed,
+                            resource="seed_configmap",
+                            owner=expected_owner,
+                            expected_name=cm_name,
+                            expected_runtime_generation=(expected_runtime_generation),
+                            expected_attempt_id=expected_provision_attempt,
+                        )
+                        != configmap_uid
+                    ):
+                        return False
+                owner_references = getattr(
+                    getattr(confirmed, "metadata", None),
+                    "owner_references",
+                    None,
+                )
+                if not isinstance(owner_references, (list, tuple)) or not any(
+                    str(_resource_field(reference, "uid") or "") == str(uid)
+                    and str(_resource_field(reference, "name") or "") == str(name)
+                    and _resource_field(reference, "controller") is True
+                    for reference in owner_references
+                ):
+                    return False
+            return True
         except Exception as e:
             logger.debug("ide seed: adopt configmap %s failed: %s", cm_name, e)
+            return False
 
-    async def _delete_seed_configmap(self, pod_name: str) -> None:
-        """Delete a pod's seed ConfigMap (idempotent; ignores 404)."""
+    async def _delete_seed_configmap(
+        self,
+        pod_name: str,
+        *,
+        expected_owner: WorkspaceOwner | None = None,
+        expected_pod_uid: str | None = None,
+    ) -> bool:
+        """Delete a pod's seed ConfigMap with an explicit residue result."""
         if not self._core_api:
-            return
+            return False
         cm_name = self._seed_configmap_name(pod_name)
+        configmap_uid: str | None = None
+        if expected_owner is not None:
+            try:
+                configmap = await asyncio.to_thread(
+                    self._core_api.read_namespaced_config_map,
+                    name=cm_name,
+                    namespace=self._namespace,
+                )
+                try:
+                    configmap_uid = self._require_stateless_seed_configmap_identity(
+                        configmap,
+                        owner=expected_owner,
+                        pod_name=pod_name,
+                    )
+                except WorkspaceRuntimeAuthorityError:
+                    if expected_pod_uid is None:
+                        raise
+                    configmap_uid = (
+                        self._require_legacy_seed_configmap_delete_authority(
+                            configmap,
+                            pod_name=pod_name,
+                            expected_pod_uid=expected_pod_uid,
+                        )
+                    )
+            except Exception as error:
+                if getattr(error, "status", None) == 404:
+                    return True
+                logger.error(
+                    "Refusing stateless seed ConfigMap cleanup for %s: %s",
+                    expected_owner.id,
+                    error,
+                )
+                return False
         try:
             await asyncio.to_thread(
                 self._core_api.delete_namespaced_config_map,
                 name=cm_name,
                 namespace=self._namespace,
+                **(
+                    {"body": {"preconditions": {"uid": configmap_uid}}}
+                    if configmap_uid is not None
+                    else {}
+                ),
             )
+            if expected_owner is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._core_api.read_namespaced_config_map,
+                        name=cm_name,
+                        namespace=self._namespace,
+                    )
+                except Exception as error:
+                    if getattr(error, "status", None) == 404:
+                        return True
+                return False
+            return True
         except Exception as e:
-            if getattr(e, "status", None) != 404:
-                logger.debug("ide seed: delete configmap %s failed: %s", cm_name, e)
+            if getattr(e, "status", None) == 404:
+                return True
+            logger.debug("ide seed: delete configmap %s failed: %s", cm_name, e)
+            return False
+
+    def _require_stateless_seed_configmap_identity(
+        self,
+        configmap: Any,
+        *,
+        owner: WorkspaceOwner,
+        generation: str | None = None,
+        pod_name: str | None = None,
+    ) -> str:
+        metadata = getattr(configmap, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        annotations = getattr(metadata, "annotations", None)
+        opposite_owner_label = (
+            "srw/job-id" if owner.kind == "session" else "srw/thread-id"
+        )
+        observed_generation: Any = (
+            annotations.get(WORKSPACE_RUNTIME_CREATION_ANNOTATION)
+            if isinstance(annotations, dict)
+            else None
+        )
+        if observed_generation is not None or generation is not None:
+            try:
+                observed_generation = _canonical_runtime_uuid(
+                    observed_generation,
+                    label="workspace seed ConfigMap creation generation",
+                )
+            except ValueError as exc:
+                raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+        if (
+            str(getattr(metadata, "name", "") or "")
+            != self._seed_configmap_name(pod_name or owner.pod_name)
+            or str(getattr(metadata, "namespace", "") or "") != self._namespace
+            or getattr(metadata, "deletion_timestamp", None) is not None
+            or not isinstance(labels, dict)
+            or labels.get(owner.label_key) != owner.id
+            or labels.get("app") != "srw-workspace"
+            or labels.get("srw/component") != "workspace-seed"
+            or labels.get("srw.io/component") != "agent-workspace"
+            or WORKSPACE_PROVISION_FENCE_LABEL in labels
+            or opposite_owner_label in labels
+            or (generation is not None and observed_generation != generation)
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace seed ConfigMap owner authority changed"
+            )
+        try:
+            return _canonical_runtime_uuid(
+                str(getattr(metadata, "uid", "") or ""),
+                label="workspace seed ConfigMap UID",
+            )
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+
+    async def _require_legacy_seed_configmap_migration(
+        self,
+        configmap: Any,
+        *,
+        owner: WorkspaceOwner,
+        pod_name: str,
+    ) -> None:
+        """Prove the one supported unlabeled HEAD seed before relabeling it."""
+
+        metadata = getattr(configmap, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        annotations = getattr(metadata, "annotations", None)
+        if labels not in (None, {}) or annotations not in (None, {}):
+            raise WorkspaceRuntimeAuthorityError(
+                "legacy workspace seed ConfigMap is not migration-safe"
+            )
+        expected_pod_uid = self._legacy_seed_configmap_controller_uid(
+            configmap,
+            pod_name=pod_name,
+        )
+        pod = await asyncio.to_thread(
+            self._core_api.read_namespaced_pod,
+            name=pod_name,
+            namespace=self._namespace,
+        )
+        component = "ide-session" if pod_name.startswith("ide-") else None
+        observed_pod_uid = self._require_workspace_pod_owner(
+            pod,
+            owner=owner,
+            allow_owner_unlabeled=False,
+            expected_pod_name=pod_name,
+            expected_component=component,
+        )
+        if observed_pod_uid != expected_pod_uid:
+            raise WorkspaceRuntimeAuthorityError(
+                "legacy workspace seed ConfigMap Pod UID changed"
+            )
+        if not str(getattr(metadata, "resource_version", "") or ""):
+            raise WorkspaceRuntimeAuthorityError(
+                "legacy workspace seed ConfigMap resource version is missing"
+            )
+
+    def _require_legacy_seed_configmap_delete_authority(
+        self,
+        configmap: Any,
+        *,
+        pod_name: str,
+        expected_pod_uid: str,
+    ) -> str:
+        metadata = getattr(configmap, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        annotations = getattr(metadata, "annotations", None)
+        if labels not in (None, {}) or annotations not in (None, {}):
+            raise WorkspaceRuntimeAuthorityError(
+                "legacy workspace seed ConfigMap is not deletion-safe"
+            )
+        if (
+            self._legacy_seed_configmap_controller_uid(
+                configmap,
+                pod_name=pod_name,
+            )
+            != expected_pod_uid
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "legacy workspace seed ConfigMap Pod UID changed"
+            )
+        try:
+            return _canonical_runtime_uuid(
+                str(getattr(metadata, "uid", "") or ""),
+                label="workspace seed ConfigMap UID",
+            )
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+
+    def _legacy_seed_configmap_controller_uid(
+        self,
+        configmap: Any,
+        *,
+        pod_name: str,
+    ) -> str:
+        metadata = getattr(configmap, "metadata", None)
+        if (
+            str(getattr(metadata, "name", "") or "")
+            != self._seed_configmap_name(pod_name)
+            or str(getattr(metadata, "namespace", "") or "") != self._namespace
+            or getattr(metadata, "deletion_timestamp", None) is not None
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "legacy workspace seed ConfigMap identity changed"
+            )
+        references = getattr(metadata, "owner_references", None)
+        matching = [
+            reference
+            for reference in references or []
+            if str(_resource_field(reference, "name") or "") == pod_name
+            and _resource_field(reference, "controller") is True
+        ]
+        if len(matching) != 1:
+            raise WorkspaceRuntimeAuthorityError(
+                "legacy workspace seed ConfigMap owner reference is invalid"
+            )
+        try:
+            return _canonical_runtime_uuid(
+                str(_resource_field(matching[0], "uid") or ""),
+                label="workspace seed ConfigMap Pod UID",
+            )
+        except ValueError as exc:
+            raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+
+    def _require_seed_configmap_pod_owner_reference(
+        self,
+        configmap: Any,
+        *,
+        pod_name: str,
+        runtime_incarnation: str,
+    ) -> None:
+        references = getattr(
+            getattr(configmap, "metadata", None),
+            "owner_references",
+            None,
+        )
+        if not isinstance(references, (list, tuple)) or not any(
+            str(_resource_field(reference, "uid") or "") == runtime_incarnation
+            and str(_resource_field(reference, "name") or "") == pod_name
+            and _resource_field(reference, "controller") is True
+            for reference in references
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace seed ConfigMap Pod ownership changed"
+            )
 
     def _build_pod_manifest(
         self,
@@ -961,6 +6344,9 @@ class ContainerProvisioner:
         network_tier: str = DEFAULT_NETWORK_TIER,
         pvc_name: Optional[str] = None,
         seed_configmap: Optional[str] = None,
+        stateless_creation_generation: str | None = None,
+        pinned_runtime_generation: str | None = None,
+        pinned_provision_attempt: str | None = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a workspace container.
 
@@ -983,6 +6369,15 @@ class ContainerProvisioner:
                 # ever clean them up.
                 "annotations": {
                     "srw.io/managed-by": "lifecycle-reconciler",
+                    **(
+                        {
+                            WORKSPACE_RUNTIME_CREATION_ANNOTATION: (
+                                stateless_creation_generation
+                            )
+                        }
+                        if stateless_creation_generation is not None
+                        else {}
+                    ),
                 },
             },
             "spec": {
@@ -1002,7 +6397,11 @@ class ContainerProvisioner:
                 # Pod-level security: run SSHD as root for user session
                 # management (su to agent-host), but restrict everything else.
                 "securityContext": {
-                    "seccompProfile": {"type": "RuntimeDefault"},
+                    "seccompProfile": {
+                        "type": "Unconfined"
+                        if self._fuse_privileged
+                        else "RuntimeDefault"
+                    },
                 },
                 "containers": [
                     {
@@ -1013,6 +6412,24 @@ class ContainerProvisioner:
                             {"containerPort": 38080, "name": "code-server"},
                             {"containerPort": 9222, "name": "cdp"},
                         ],
+                        "env": [
+                            {
+                                "name": "SRW_WORKSPACE_OWNER_KIND",
+                                "value": owner.kind,
+                            },
+                            {
+                                "name": "SRW_WORKSPACE_OWNER_ID",
+                                "value": owner.id,
+                            },
+                            {
+                                "name": "SRW_WORKSPACE_RUNTIME_UID",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "fieldPath": "metadata.uid",
+                                    }
+                                },
+                            },
+                        ],
                         "resources": {
                             "requests": {"cpu": cpu, "memory": memory},
                             "limits": {
@@ -1020,12 +6437,14 @@ class ContainerProvisioner:
                                 "memory": memory_limit,
                             },
                         },
-                        # Container security hardening:
+                        # Container security profile:
                         # - Drop all capabilities, add back only what SSHD needs
+                        #   plus SYS_ADMIN for rclone/FUSE mounts when enabled.
                         # - SETUID/SETGID: user session switching
                         # - NET_BIND_SERVICE: bind to privileged ports (<1024)
                         # - CHOWN/DAC_OVERRIDE/FOWNER: file ownership for sessions
                         # - SYS_CHROOT: SSHD privilege separation
+                        # - SYS_ADMIN: required for container FUSE mounts
                         # - KILL: signal management
                         # - AUDIT_WRITE: PAM audit logging
                         # - allowPrivilegeEscalation: true (required for SSHD setuid)
@@ -1033,17 +6452,7 @@ class ContainerProvisioner:
                         "securityContext": {
                             "capabilities": {
                                 "drop": ["ALL"],
-                                "add": [
-                                    "CHOWN",
-                                    "DAC_OVERRIDE",
-                                    "FOWNER",
-                                    "SETGID",
-                                    "SETUID",
-                                    "NET_BIND_SERVICE",
-                                    "SYS_CHROOT",
-                                    "KILL",
-                                    "AUDIT_WRITE",
-                                ],
+                                "add": self._workspace_capabilities(),
                             },
                             "allowPrivilegeEscalation": True,
                         },
@@ -1056,6 +6465,10 @@ class ContainerProvisioner:
                                 "name": "ssh-pubkey",
                                 "mountPath": "/tmp/ssh-pubkey",
                                 "readOnly": True,
+                            },
+                            {
+                                "name": "workspace-identity",
+                                "mountPath": "/var/lib/srw-system",
                             },
                         ],
                         "readinessProbe": {
@@ -1094,9 +6507,41 @@ class ContainerProvisioner:
                             "defaultMode": 0o600,
                         },
                     },
+                    {
+                        "name": "workspace-identity",
+                        "emptyDir": {},
+                    },
                 ],
             },
         }
+        if pinned_provision_attempt is not None:
+            if pinned_runtime_generation is None:
+                raise WorkspaceRuntimeAuthorityError(
+                    "pinned workspace Pod authority is incomplete"
+                )
+            manifest["metadata"]["labels"].update(
+                {
+                    WORKSPACE_PROVISION_ATTEMPT_LABEL: pinned_provision_attempt,
+                    WORKSPACE_PROVISION_GENERATION_LABEL: pinned_runtime_generation,
+                }
+            )
+        if self._fuse_enabled:
+            if self._fuse_privileged:
+                manifest["spec"]["containers"][0]["securityContext"]["privileged"] = (
+                    True
+                )
+            manifest["spec"]["containers"][0]["volumeMounts"].append(
+                {
+                    "name": "dev-fuse",
+                    "mountPath": "/dev/fuse",
+                }
+            )
+            manifest["spec"]["volumes"].append(
+                {
+                    "name": "dev-fuse",
+                    "hostPath": {"path": "/dev/fuse", "type": "CharDevice"},
+                }
+            )
         if seed_configmap:
             manifest["spec"]["containers"][0]["volumeMounts"].append(
                 {
@@ -1113,11 +6558,203 @@ class ContainerProvisioner:
             )
         return manifest
 
-    async def _wait_for_ready(self, pod_name: str, timeout: int = 120) -> Optional[str]:
-        """Poll until the workspace pod is Running and has an IP.
+    def _workspace_capabilities(self) -> list[str]:
+        capabilities = [
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "SETGID",
+            "SETUID",
+            "NET_BIND_SERVICE",
+            "SYS_CHROOT",
+            "KILL",
+            "AUDIT_WRITE",
+        ]
+        if self._fuse_enabled:
+            capabilities.append("SYS_ADMIN")
+        return capabilities
+
+    async def _create_pod_resolving_teardown(
+        self,
+        pod_manifest: dict,
+        pod_name: str,
+        *,
+        owner: WorkspaceOwner,
+        expected_provision_attempt: str | None = None,
+        expected_runtime_generation: str | None = None,
+    ) -> tuple[Any, bool]:
+        """Create the workspace pod, resolving a suspend/resume teardown race.
+
+        Returns ``(pod, reused_existing)`` so the caller retains the incumbent
+        UID and its actual seed-volume binding across a 409 retry.
+
+        The race this fixes (issue
+        ``session_agent_drift_drain_kills_idle_sessions``, option c): a
+        just-suspended session leaves its old workspace pod — same
+        deterministic name (``ws-thread-<tid>``) — ``Terminating`` inside its
+        delete grace window. A fast resume (drift-drain → suspend → user
+        sends a message seconds later) then 409s on create, which previously
+        bubbled to the dispatcher as a failed restore and surfaced to the
+        user as a 503 "session ended". We distinguish:
+
+          * incumbent pod ``Terminating`` (``deletion_timestamp`` set, or
+            already 404 by the time we look) → wait for it to fully
+            disappear, then create the fresh pod;
+          * incumbent pod live (no deletion timestamp) → genuine idempotent
+            hit, adopt it (mirrors the IDE-pod path).
+        """
+        if (expected_provision_attempt is None) != (
+            expected_runtime_generation is None
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "pinned workspace Pod authority is incomplete"
+            )
+
+        def _require_created_identity(pod: Any) -> str:
+            if expected_provision_attempt is not None:
+                return self._require_pinned_workspace_resource_identity(
+                    pod,
+                    resource="pod",
+                    owner=owner,
+                    expected_name=pod_name,
+                    expected_runtime_generation=expected_runtime_generation,
+                    expected_attempt_id=expected_provision_attempt,
+                )
+            return self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                expected_network_tier=(
+                    pod_manifest.get("metadata", {})
+                    .get("labels", {})
+                    .get("srw.io/network-tier")
+                ),
+            )
+
+        try:
+            created = await asyncio.to_thread(
+                self._core_api.create_namespaced_pod,
+                namespace=self._namespace,
+                body=pod_manifest,
+                _request_timeout=(
+                    5,
+                    PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS,
+                ),
+            )
+            if created is None:
+                created = await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=pod_name,
+                    namespace=self._namespace,
+                )
+            _require_created_identity(created)
+            return created, False
+        except Exception as e:
+            if getattr(e, "status", None) != 409:
+                raise
+
+        # 409 — inspect the incumbent pod sharing this deterministic name.
+        try:
+            existing = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as e:
+            if getattr(e, "status", None) != 404:
+                raise
+            existing = None  # vanished between create and read — recreate below
+
+        if existing is not None:
+            self._require_workspace_pod_owner(
+                existing,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                allow_terminating=True,
+            )
+
+        terminating = (
+            existing is None or existing.metadata.deletion_timestamp is not None
+        )
+        if not terminating:
+            _require_created_identity(existing)
+            # Live pod already present (two creates raced for one owner) —
+            # treat as idempotent; the existing pod owns its ConfigMap.
+            logger.info(
+                "Workspace pod %s already exists and is live — adopting", pod_name
+            )
+            return existing, True
+
+        # Old pod still draining its delete grace (suspend→resume race).
+        # Wait it out, then create the fresh pod on the freed name.
+        logger.info(
+            "Workspace pod %s is terminating (suspend/resume race) — waiting "
+            "for teardown before recreate",
+            pod_name,
+        )
+        if not await self._wait_for_pod_gone(pod_name, timeout=30):
+            raise RuntimeError(
+                f"workspace pod {pod_name} still terminating after 30s; "
+                "cannot recreate for resume"
+            )
+        created = await asyncio.to_thread(
+            self._core_api.create_namespaced_pod,
+            namespace=self._namespace,
+            body=pod_manifest,
+            _request_timeout=(
+                5,
+                PINNED_K8S_MUTATION_REQUEST_TIMEOUT_SECONDS,
+            ),
+        )
+        if created is None:
+            created = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+        _require_created_identity(created)
+        return created, False
+
+    async def _wait_for_pod_gone(self, pod_name: str, timeout: int = 30) -> bool:
+        """Poll until the named pod no longer exists (404). True if gone."""
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as e:
+                if getattr(e, "status", None) == 404:
+                    return True
+                # Transient read error — keep polling until the deadline.
+            await asyncio.sleep(1)
+        return False
+
+    async def _wait_for_ready(
+        self,
+        pod_name: str,
+        timeout: int = 120,
+        *,
+        expected_owner: WorkspaceOwner | None = None,
+        expected_runtime_incarnation: str | None = None,
+        expected_creation_generation: str | None = None,
+        expected_network_tier: str | None = None,
+        expected_pvc_name: str | None | object = _UNSPECIFIED_RESOURCE_BINDING,
+        expected_seed_configmap: str | None | object = (_UNSPECIFIED_RESOURCE_BINDING),
+        expected_pod_name: str | None = None,
+        expected_component: str | None = None,
+    ) -> Optional[str]:
+        """Poll until the pod is ready and accepts the configured SSH key.
 
         Returns:
-            Pod IP if ready, None if timeout.
+            Pod IP after authenticated readiness, None on Kubernetes timeout.
+
+        Raises:
+            WorkspaceSSHAuthenticationError: the pod is Kubernetes-ready but
+                the configured private key is unusable or authentication does
+                not succeed within its bounded readiness window.
         """
         deadline = asyncio.get_event_loop().time() + timeout
 
@@ -1128,18 +6765,469 @@ class ContainerProvisioner:
                     name=pod_name,
                     namespace=self._namespace,
                 )
+                if expected_owner is not None:
+                    if expected_runtime_incarnation is None:
+                        raise WorkspaceRuntimeAuthorityError(
+                            "workspace runtime incarnation is missing"
+                        )
+                    self._require_workspace_pod_connection_identity(
+                        pod,
+                        owner=expected_owner,
+                        expected_runtime_incarnation=expected_runtime_incarnation,
+                        expected_creation_generation=expected_creation_generation,
+                        expected_network_tier=expected_network_tier,
+                        expected_pvc_name=expected_pvc_name,
+                        expected_seed_configmap=expected_seed_configmap,
+                        expected_pod_name=expected_pod_name,
+                        expected_component=expected_component,
+                    )
                 if pod.status.phase == "Running" and pod.status.pod_ip:
                     # Check container readiness
                     if pod.status.container_statuses and all(
                         cs.ready for cs in pod.status.container_statuses
                     ):
-                        return pod.status.pod_ip
+                        key_path = resolve_ssh_key_path()
+                        try:
+                            fingerprint = workspace_private_key_fingerprint(key_path)
+                        except SSHPrivateKeyError as exc:
+                            raise WorkspaceSSHAuthenticationError(str(exc)) from exc
+
+                        ready, attempts, last_error = await wait_for_agent_ssh(
+                            pod.status.pod_ip,
+                            30022,
+                            deadline_s=self._ssh_auth_ready_timeout,
+                            connect_timeout_s=self._ssh_auth_connect_timeout,
+                            interval_s=self._ssh_auth_poll_interval,
+                            key_path=key_path,
+                        )
+                        if ready:
+                            if expected_owner is not None:
+                                confirmed = await asyncio.to_thread(
+                                    self._core_api.read_namespaced_pod,
+                                    name=pod_name,
+                                    namespace=self._namespace,
+                                )
+                                self._require_workspace_pod_connection_identity(
+                                    confirmed,
+                                    owner=expected_owner,
+                                    expected_runtime_incarnation=(
+                                        expected_runtime_incarnation
+                                    ),
+                                    expected_creation_generation=(
+                                        expected_creation_generation
+                                    ),
+                                    expected_network_tier=expected_network_tier,
+                                    expected_pvc_name=expected_pvc_name,
+                                    expected_seed_configmap=(expected_seed_configmap),
+                                    expected_pod_name=expected_pod_name,
+                                    expected_component=expected_component,
+                                )
+                            logger.info(
+                                "Workspace SSH authenticated: %s @ %s:30022 "
+                                "(attempts=%d, key=%s)",
+                                pod_name,
+                                pod.status.pod_ip,
+                                attempts,
+                                fingerprint,
+                            )
+                            return pod.status.pod_ip
+                        raise WorkspaceSSHAuthenticationError(
+                            "Workspace pod became Kubernetes-ready but rejected "
+                            f"the configured SSH key after {attempts} attempt(s) "
+                            f"(key={fingerprint}): {last_error or 'authentication failed'}"
+                        )
+            except WorkspaceSSHAuthenticationError:
+                raise
+            except WorkspaceRuntimeAuthorityError:
+                raise
             except Exception:
                 pass
 
             await asyncio.sleep(2)
 
         return None
+
+    async def _trusted_pod_ssh_identity(
+        self,
+        pod_name: str,
+        *,
+        pvc_name: str | None = None,
+        expected_owner: WorkspaceOwner | None = None,
+        expected_runtime_incarnation: str | None = None,
+        expected_creation_generation: str | None = None,
+        expected_network_tier: str | None = None,
+        expected_seed_configmap: str | None | object = (_UNSPECIFIED_RESOURCE_BINDING),
+        expected_pvc_uid: str | None = None,
+        expected_pvc_storage_class: str | None = None,
+        expected_provision_attempt: str | None = None,
+        expected_runtime_generation: str | None = None,
+        expected_seed_configmap_uid: str | None = None,
+        expected_service_uid: str | None = None,
+        expected_retained_pvc_uid: str | None = None,
+        expected_retained_service_uid: str | None = None,
+    ) -> tuple[str, str, str]:
+        """Read backing identity, host key, and Pod UID from the control plane."""
+
+        if self._core_api is None or k8s_stream is None:
+            raise RuntimeError("Kubernetes exec transport is unavailable")
+        pinned_attempt = expected_provision_attempt is not None
+        if pinned_attempt != (expected_runtime_generation is not None) or (
+            not pinned_attempt
+            and any(
+                value is not None
+                for value in (
+                    expected_seed_configmap_uid,
+                    expected_service_uid,
+                    expected_retained_pvc_uid,
+                    expected_retained_service_uid,
+                )
+            )
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace provision attestation authority is incomplete"
+            )
+        if pinned_attempt:
+            if expected_owner is None or expected_runtime_incarnation is None:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace provision attestation owner is incomplete"
+                )
+            if expected_seed_configmap is _UNSPECIFIED_RESOURCE_BINDING or not (
+                expected_seed_configmap is None
+                or isinstance(expected_seed_configmap, str)
+                and bool(expected_seed_configmap)
+            ):
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace provision ConfigMap authority is incomplete"
+                )
+            if (
+                (pvc_name is None) != (expected_pvc_uid is None)
+                or (pvc_name is None) != (expected_service_uid is None)
+                or (expected_seed_configmap is None)
+                != (expected_seed_configmap_uid is None)
+                or pvc_name is None
+                and (
+                    expected_retained_pvc_uid is not None
+                    or expected_retained_service_uid is not None
+                )
+            ):
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace provision resource UID authority is incomplete"
+                )
+            try:
+                expected_provision_attempt = _canonical_runtime_uuid(
+                    expected_provision_attempt,
+                    label="workspace provision attempt",
+                )
+                expected_runtime_generation = _canonical_runtime_uuid(
+                    expected_runtime_generation,
+                    label="workspace provision runtime generation",
+                )
+                expected_runtime_incarnation = _canonical_runtime_uuid(
+                    expected_runtime_incarnation,
+                    label="workspace provision Pod UID",
+                )
+                for label, value in (
+                    ("workspace provision PVC UID", expected_pvc_uid),
+                    (
+                        "workspace provision seed ConfigMap UID",
+                        expected_seed_configmap_uid,
+                    ),
+                    ("workspace provision Service UID", expected_service_uid),
+                    ("retained workspace PVC UID", expected_retained_pvc_uid),
+                    (
+                        "retained workspace Service UID",
+                        expected_retained_service_uid,
+                    ),
+                ):
+                    if value is not None:
+                        _canonical_runtime_uuid(value, label=label)
+            except ValueError as exc:
+                raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+        pod = await asyncio.to_thread(
+            self._core_api.read_namespaced_pod,
+            name=pod_name,
+            namespace=self._namespace,
+        )
+        if expected_owner is not None:
+            if expected_runtime_incarnation is None:
+                raise WorkspaceRuntimeAuthorityError(
+                    "workspace runtime incarnation is missing"
+                )
+            runtime_incarnation = self._require_workspace_pod_connection_identity(
+                pod,
+                owner=expected_owner,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+                expected_creation_generation=expected_creation_generation,
+                expected_network_tier=expected_network_tier,
+                expected_pvc_name=pvc_name,
+                expected_seed_configmap=expected_seed_configmap,
+            )
+            if pinned_attempt and (
+                self._require_pinned_workspace_resource_identity(
+                    pod,
+                    resource="pod",
+                    owner=expected_owner,
+                    expected_name=pod_name,
+                    expected_runtime_generation=str(expected_runtime_generation),
+                    expected_attempt_id=str(expected_provision_attempt),
+                )
+                != runtime_incarnation
+            ):
+                raise WorkspaceRuntimeAuthorityError("workspace Pod UID changed")
+        else:
+            runtime_incarnation = str(getattr(pod.metadata, "uid", "") or "")
+        if not runtime_incarnation:
+            raise RuntimeError("workspace pod has no Kubernetes UID")
+        trusted_seed_uid: str | None = None
+        seed_configmap = None
+        if expected_owner is not None:
+            seed_configmap = self._require_stateless_pod_storage_binding(
+                pod,
+                owner=expected_owner,
+                expected_pvc_name=pvc_name,
+                expected_seed_configmap=expected_seed_configmap,
+            )
+            if seed_configmap is not None:
+                seed = await asyncio.to_thread(
+                    self._core_api.read_namespaced_config_map,
+                    name=seed_configmap,
+                    namespace=self._namespace,
+                )
+                trusted_seed_uid = (
+                    self._require_pinned_workspace_resource_identity(
+                        seed,
+                        resource="seed_configmap",
+                        owner=expected_owner,
+                        expected_name=seed_configmap,
+                        expected_runtime_generation=str(expected_runtime_generation),
+                        expected_attempt_id=str(expected_provision_attempt),
+                    )
+                    if pinned_attempt
+                    else self._require_stateless_seed_configmap_identity(
+                        seed,
+                        owner=expected_owner,
+                        generation=expected_creation_generation,
+                    )
+                )
+                if pinned_attempt and (
+                    expected_seed_configmap_uid is None
+                    or trusted_seed_uid != expected_seed_configmap_uid
+                ):
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace seed ConfigMap UID changed"
+                    )
+                self._require_seed_configmap_pod_owner_reference(
+                    seed,
+                    pod_name=pod_name,
+                    runtime_incarnation=runtime_incarnation,
+                )
+        backing_kind = "pod"
+        backing_uid = runtime_incarnation
+        trusted_claim_uid: str | None = None
+        trusted_service_uid: str | None = None
+        if pvc_name:
+            claim = await asyncio.to_thread(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=self._namespace,
+            )
+            backing_kind = "pvc"
+            if expected_owner is not None:
+                trusted_claim_uid = (
+                    self._require_pinned_workspace_resource_identity(
+                        claim,
+                        resource="pvc",
+                        owner=expected_owner,
+                        expected_name=pvc_name,
+                        expected_runtime_generation=str(expected_runtime_generation),
+                        expected_attempt_id=str(expected_provision_attempt),
+                        retained_uid=expected_retained_pvc_uid,
+                    )
+                    if pinned_attempt
+                    else self._require_stateless_pvc_identity(
+                        claim,
+                        owner=expected_owner,
+                        pvc_name=pvc_name,
+                        expected_storage_class=expected_pvc_storage_class,
+                    )
+                )
+                if (
+                    expected_pvc_uid is not None
+                    and trusted_claim_uid != expected_pvc_uid
+                ):
+                    raise WorkspaceRuntimeAuthorityError("workspace PVC UID changed")
+                backing_uid = trusted_claim_uid
+            else:
+                backing_uid = str(getattr(claim.metadata, "uid", "") or "")
+            if expected_owner is not None:
+                service = await asyncio.to_thread(
+                    self._core_api.read_namespaced_service,
+                    name=expected_owner.pod_name,
+                    namespace=self._namespace,
+                )
+                trusted_service_uid = (
+                    self._require_pinned_workspace_resource_identity(
+                        service,
+                        resource="service",
+                        owner=expected_owner,
+                        expected_name=expected_owner.pod_name,
+                        expected_runtime_generation=str(expected_runtime_generation),
+                        expected_attempt_id=str(expected_provision_attempt),
+                        retained_uid=expected_retained_service_uid,
+                    )
+                    if pinned_attempt
+                    else self._require_stateless_service_identity(
+                        service,
+                        owner=expected_owner,
+                    )
+                )
+                if pinned_attempt and (
+                    expected_service_uid is None
+                    or trusted_service_uid != expected_service_uid
+                ):
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace Service UID changed"
+                    )
+        if not backing_uid:
+            raise RuntimeError("workspace pod has no Kubernetes UID")
+        output = await asyncio.to_thread(
+            k8s_stream,
+            self._core_api.connect_get_namespaced_pod_exec,
+            pod_name,
+            self._namespace,
+            command=[
+                "ssh-keygen",
+                "-lf",
+                "/var/lib/srw-system/ssh/ssh_host_ed25519_key.pub",
+                "-E",
+                "sha256",
+            ],
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+            _request_timeout=10,
+        )
+        fields = str(output).strip().split()
+        fingerprint = next(
+            (field for field in fields if field.startswith("SHA256:")), None
+        )
+        if not fingerprint:
+            raise RuntimeError("workspace host-key fingerprint was not reported")
+        if expected_owner is not None:
+            confirmed = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+            self._require_workspace_pod_connection_identity(
+                confirmed,
+                owner=expected_owner,
+                expected_runtime_incarnation=runtime_incarnation,
+                expected_creation_generation=expected_creation_generation,
+                expected_network_tier=expected_network_tier,
+                expected_pvc_name=pvc_name,
+                expected_seed_configmap=expected_seed_configmap,
+            )
+            if pinned_attempt and (
+                self._require_pinned_workspace_resource_identity(
+                    confirmed,
+                    resource="pod",
+                    owner=expected_owner,
+                    expected_name=pod_name,
+                    expected_runtime_generation=str(expected_runtime_generation),
+                    expected_attempt_id=str(expected_provision_attempt),
+                )
+                != runtime_incarnation
+            ):
+                raise WorkspaceRuntimeAuthorityError("workspace Pod UID changed")
+            if pvc_name:
+                confirmed_claim = await asyncio.to_thread(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+                confirmed_claim_uid = (
+                    self._require_pinned_workspace_resource_identity(
+                        confirmed_claim,
+                        resource="pvc",
+                        owner=expected_owner,
+                        expected_name=pvc_name,
+                        expected_runtime_generation=str(expected_runtime_generation),
+                        expected_attempt_id=str(expected_provision_attempt),
+                        retained_uid=expected_retained_pvc_uid,
+                    )
+                    if pinned_attempt
+                    else self._require_stateless_pvc_identity(
+                        confirmed_claim,
+                        owner=expected_owner,
+                        pvc_name=pvc_name,
+                        expected_storage_class=expected_pvc_storage_class,
+                    )
+                )
+                if confirmed_claim_uid != trusted_claim_uid:
+                    raise WorkspaceRuntimeAuthorityError("workspace PVC UID changed")
+                confirmed_service = await asyncio.to_thread(
+                    self._core_api.read_namespaced_service,
+                    name=expected_owner.pod_name,
+                    namespace=self._namespace,
+                )
+                confirmed_service_uid = (
+                    self._require_pinned_workspace_resource_identity(
+                        confirmed_service,
+                        resource="service",
+                        owner=expected_owner,
+                        expected_name=expected_owner.pod_name,
+                        expected_runtime_generation=str(expected_runtime_generation),
+                        expected_attempt_id=str(expected_provision_attempt),
+                        retained_uid=expected_retained_service_uid,
+                    )
+                    if pinned_attempt
+                    else self._require_stateless_service_identity(
+                        confirmed_service,
+                        owner=expected_owner,
+                    )
+                )
+                if confirmed_service_uid != trusted_service_uid:
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace Service UID changed"
+                    )
+            if seed_configmap is not None:
+                confirmed_seed = await asyncio.to_thread(
+                    self._core_api.read_namespaced_config_map,
+                    name=seed_configmap,
+                    namespace=self._namespace,
+                )
+                confirmed_seed_uid = (
+                    self._require_pinned_workspace_resource_identity(
+                        confirmed_seed,
+                        resource="seed_configmap",
+                        owner=expected_owner,
+                        expected_name=seed_configmap,
+                        expected_runtime_generation=str(expected_runtime_generation),
+                        expected_attempt_id=str(expected_provision_attempt),
+                    )
+                    if pinned_attempt
+                    else self._require_stateless_seed_configmap_identity(
+                        confirmed_seed,
+                        owner=expected_owner,
+                        generation=expected_creation_generation,
+                    )
+                )
+                if confirmed_seed_uid != trusted_seed_uid:
+                    raise WorkspaceRuntimeAuthorityError(
+                        "workspace seed ConfigMap UID changed"
+                    )
+                self._require_seed_configmap_pod_owner_reference(
+                    confirmed_seed,
+                    pod_name=pod_name,
+                    runtime_incarnation=runtime_incarnation,
+                )
+        return (
+            f"k8s-{backing_kind}:{self._namespace}:{backing_uid}",
+            fingerprint,
+            runtime_incarnation,
+        )
 
     async def _set_context(self, owner: WorkspaceOwner, updates: dict) -> None:
         """Atomically merge updates into the workspace context for a job or session."""

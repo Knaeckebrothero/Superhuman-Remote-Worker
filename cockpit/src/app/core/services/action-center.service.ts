@@ -5,6 +5,27 @@ import {ApiService} from './api.service';
 import {AppNotification, Job} from '../models/api.model';
 import {ActionItem, ActionItemStatus, MessageActionData, ReviewActionData,} from '../models/action.model';
 
+/**
+ * Full UUID — the shape of a persistent-session thread id. Job-message
+ * thread ids are short hex tokens and loop keys are "loop-" + 6 chars, so
+ * this cleanly separates session-keyed rows (officer pages) from job-keyed
+ * ones.
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * An officer page: keyed to a persistent session, no job behind it. REST rows
+ * persist job_id NULL; live SSE frames carry job_id === thread_id (the
+ * dispatch keys its queue row with the thread UUID).
+ */
+function isSessionPage(n: AppNotification): boolean {
+  return (
+    !!n.thread_id &&
+    UUID_RE.test(n.thread_id) &&
+    (!n.job_id || n.job_id === n.thread_id)
+  );
+}
+
 /** Sort: pending before resolved, then urgency desc, then timestamp desc. */
 function actionItemComparator(a: ActionItem, b: ActionItem): number {
   // Pending always above resolved
@@ -111,8 +132,13 @@ export class ActionCenterService {
     const threadMap = new Map<string, AppNotification>();
 
     for (const n of notifications) {
-      if (!n.thread_id || !n.job_id) continue;
-      const key = `${n.job_id}:${n.thread_id}`;
+      if (!n.thread_id) continue;
+      // Session pages have no job; every other row still requires one.
+      if (!n.job_id && !isSessionPage(n)) continue;
+      // Session pages key on the thread UUID alone so the REST row
+      // (job_id NULL), the live SSE frame (job_id === thread_id), and the
+      // email deep link (?job={thread}&thread={thread}) all converge.
+      const key = `${n.job_id || n.thread_id}:${n.thread_id}`;
       const existing = threadMap.get(key);
       if (!existing || new Date(n.created_at) > new Date(existing.created_at)) {
         threadMap.set(key, n);
@@ -120,6 +146,7 @@ export class ActionCenterService {
     }
 
     return Array.from(threadMap.values()).map((n) => {
+      const sessionPage = isSessionPage(n);
       const isUnread = !n.read_at;
       // Determine blocking status from notification subject/status
       const isBlocking = n.status === 'waiting_for_reply';
@@ -131,14 +158,19 @@ export class ActionCenterService {
       else urgency = 20;
 
       return {
-        id: `msg:${n.job_id}:${n.thread_id}`,
+        id: `msg:${n.job_id || n.thread_id}:${n.thread_id}`,
         type: 'message' as const,
         status,
         urgency,
         timestamp: n.created_at,
         title: n.subject || 'Message',
-        subtitle: [n.config_name || 'agent', n.job_description].filter(Boolean).join(' \u00B7 '),
-        jobId: n.job_id,
+        subtitle: sessionPage
+          ? [n.config_name, `session ${n.thread_id!.slice(0, 8)}`].filter(Boolean).join(' \u00B7 ')
+          : [n.config_name || 'agent', n.job_description].filter(Boolean).join(' \u00B7 '),
+        // No resolvable job behind a session page: a null jobId keeps the
+        // detail pane from firing the thread lookup that 404s (today's
+        // dead-end bug) and disables the job-scoped reply path.
+        jobId: sessionPage ? null : n.job_id,
         message: {
           threadId: n.thread_id!,
           subject: n.subject,
@@ -147,6 +179,7 @@ export class ActionCenterService {
           configName: n.config_name,
           jobDescription: n.job_description,
           unread: isUnread,
+          sessionThreadId: sessionPage ? n.thread_id : null,
         } as MessageActionData,
       };
     });
@@ -222,18 +255,22 @@ export class ActionCenterService {
     private mapSession(e: SessionEvent): ActionItem {
         const isPermission = e.type === 'session.permission_request';
         const isVmUpgrade = e.type === 'session.vm_upgrade';
+        const isWorkspaceUpgrade = e.type === 'session.workspace_upgrade';
+        const isUpgrade = isVmUpgrade || isWorkspaceUpgrade;
 
         return {
             id: `sess:${e.event_id}`,
             type: 'session',
             status: 'pending',
-            urgency: isPermission ? 90 : isVmUpgrade ? 70 : 30,
+            urgency: isPermission ? 90 : isUpgrade ? 70 : 30,
             timestamp: e.created_at,
             title: isPermission
                 ? `Approve: ${e.tool}`
                 : isVmUpgrade
                     ? 'VM Upgrade Needed'
-                    : 'Waiting for Input',
+                    : isWorkspaceUpgrade
+                        ? 'Workspace Upgrade Needed'
+                        : 'Waiting for Input',
             subtitle: [e.title, e.config_name].filter(Boolean).join(' \u00B7 '),
             jobId: null,
             session: {threadId: e.thread_id, event: e},

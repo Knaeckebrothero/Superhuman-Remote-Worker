@@ -1,0 +1,77 @@
+// Stalled-send affordances on a queued chat bubble.
+//
+// Lives here rather than in persistent-chat.component.scss purely for the
+// anyComponentStyle budget: that component is a kitchen sink already sitting
+// ~0.5 kB under its cap, and the agreed rule is to keep new styling out of it
+// until it is split (knowledge-base/knowledge/issues/persistent_chat_component_style_budget.md).
+//
+// Scoped under the full `.message.message-user.queued.stalled` class chain, which
+// is deliberate and load-bearing, not redundancy. Two of these rules OVERRIDE
+// `.message-user.queued` rules in persistent-chat.component.scss, and Angular's
+// emulated encapsulation appends an `[_ngcontent-…]` attribute to every
+// component selector — so the component's `.message-user.queued[_ngcontent]`
+// (0,3,0) outranks a plain global `.message-user.stalled` (0,2,0) and the
+// override silently loses. Verified on k3d: the bubble stayed at opacity 0.65
+// and the avatar kept --text-secondary. Stacking the classes here outranks it
+// without putting a single byte into that component's style budget.
+.message.message-user.queued.stalled {
+  // (0,4,0) beats the component's `.message-user.queued[_ngcontent]` (0,3,0).
+  // Queued bubbles are muted to read as "in flight"; a stalled one needs
+  // attention instead, so undo the muting.
+  opacity: 1;
+
+  // The redundant-looking `.avatar` step is required. The component's
+  // `.message-user.queued[_ngcontent] .avatar-icon[_ngcontent]` is (0,5,0) —
+  // two classes plus two encapsulation attributes plus the icon class — so the
+  // obvious `& .avatar-icon` only TIES it, and a tie goes to the component
+  // sheet because Angular injects it after this one. The extra class makes it
+  // (0,6,0). Verified on k3d: without it the icon renders --text-secondary.
+  .avatar .avatar-icon {
+    color: var(--danger);
+  }
+
+  .queued-note {
+    color: var(--danger);
+  }
+
+  .queued-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+    font-size: 0.8rem;
+  }
+
+  .queued-action {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-secondary);
+    text-decoration: underline;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--text-primary);
+    }
+  }
+}
+
+/* Upload stage block inside a queued user bubble. Lives here, not in the
+   component sheet, to keep new bytes out of that sheet's anyComponentStyle
+   budget (knowledge-base/knowledge/issues/persistent_chat_component_style_budget.md).
+ *
+ * NOTHING HERE MAY SET `display` ON `.upload-stage`. This selector is (0,5,0)
+ * and outranks the component's own `.upload-stage[_ngcontent]` (0,2,0), so a
+ * `display: flex` here silently overrode it and laid the block out as a ROW:
+ * the label and the progress bar became siblings on one line, and the bar —
+ * which has no width of its own — rendered at width 0. Measured in Chrome
+ * before the fix: barBelowLine=false, bar width 0, i.e. the bar shipped
+ * invisible. `.upload-stage` must stay a block so `.upload-bar` can span it.
+ * (The three declarations that did this were a stale copy of
+ * `.upload-stage-line`'s, from before Slice 2 added the bar underneath it.)
+ *
+ * The properties left below are inherited-only and layout-neutral. */
+.message.message-user.queued .message-body .upload-stage {
+  margin-top: 6px;
+  font-size: 0.85em;
+  color: var(--text-secondary);
+}

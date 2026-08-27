@@ -1,0 +1,20 @@
+{{- if .Values.canvas.livePreview.viewer.enabled }}
+# Internal target. Fronted either by the optional chart Ingress
+# (viewer.ingress.enabled), a Cloudflare tunnel entry, or an operator-owned
+# wildcard edge — see knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-canvas-gateway
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8086
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway") | nindent 4 }}
+{{- end }}

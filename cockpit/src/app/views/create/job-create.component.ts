@@ -1,13 +1,16 @@
 import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
-import {ActivatedRoute} from '@angular/router';
+import {ActivatedRoute, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
+import type {SessionToolGroupsResponse} from '../../core/services/api.service';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {JobArtifactService} from '../../core/services/job-artifact.service';
 import {UserService} from '../../core/services/user.service';
-import {Datasource, Expert, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
+import {ErrorMessageService} from '../../core/services/error-message.service';
+import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
 import {FilePreview, UploadStatus} from '../../core/models/file.model';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
-import {PRIORITY_LEVELS} from '../agent-settings/agent-settings.types';
+import {PRIORITY_LEVELS, resolveEffectiveModels} from '../agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
@@ -41,6 +44,9 @@ import {AppTooltipDirective} from '../../ui/tooltip';
     <div class="job-create-container">
       <div class="header-bar">
         <span class="title">{{ 'jobs.create.title' | transloco }}</span>
+        <app-button variant="secondary" size="sm" class="back-btn" (clicked)="cancel()">
+          {{ 'jobs.create.backToJobs' | transloco }}
+        </app-button>
       </div>
 
       <div class="form-container">
@@ -67,7 +73,11 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         <form (submit)="$event.preventDefault(); onSubmit()">
           <!-- Project Selector -->
           @if (projects().length > 0) {
-            <app-form-field [label]="'jobs.create.projectLabel' | transloco" [hint]="'jobs.create.projectHint' | transloco">
+            <app-form-field
+              [label]="'jobs.create.projectLabel' | transloco"
+              [hint]="'jobs.create.projectHint' | transloco"
+              [error]="selectedProjectIsArchived() ? ('jobs.create.projectArchivedWarning' | transloco) : ''"
+            >
               <app-select
                 [value]="selectedProjectId() ?? ''"
                 (changed)="onProjectIdChange($event)"
@@ -76,7 +86,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
                 <option value="">{{ 'jobs.create.projectNone' | transloco }}</option>
                 @for (proj of projects(); track proj.id) {
                   <option [value]="proj.id">
-                    {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}
+                    {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}@if (proj.status === 'archived') { {{ 'jobs.create.projectArchived' | transloco }}}
                   </option>
                 }
               </app-select>
@@ -91,7 +101,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               [required]="true"
               [rows]="6"
               [placeholder]="'jobs.create.descriptionPlaceholder' | transloco"
-              [disabled]="isSubmitting() || artifacts.streaming()"
+              [disabled]="isSubmitting()"
             />
           </app-form-field>
 
@@ -102,7 +112,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               (valueChange)="kickoffMessage = $event"
               [rows]="3"
               [placeholder]="'jobs.create.kickoffPlaceholder' | transloco"
-              [disabled]="isSubmitting() || artifacts.streaming()"
+              [disabled]="isSubmitting()"
             />
           </app-form-field>
 
@@ -146,6 +156,9 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             <span class="field-hint">
               @if (selectedExpert()) {
                 {{ 'jobs.create.expertSelectedPrefix' | transloco }} {{ selectedExpert()!.display_name }}
+                @if (selectedExpertSource()) {
+                  · {{ ('settings.expertDefaults.source.' + selectedExpertSource()) | transloco }}
+                }
               } @else {
                 {{ 'jobs.create.expertHintUnselected' | transloco }}
               }
@@ -168,7 +181,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
                 <div class="dropzone-content">
                   <app-icon size="inherit" class="dropzone-icon">upload_file</app-icon>
                   <span class="dropzone-text">{{ 'jobs.create.dropHint' | transloco }}</span>
-                  <span class="dropzone-hint">{{ 'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getMaxFiles(), maxSizeMb: fileService.getMaxFileSizeMB() } }}</span>
+                  <span class="dropzone-hint">{{ 'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getJobUploadMaxFiles(), maxSizeMb: fileService.getJobUploadMaxFileSizeMB() } }}</span>
                 </div>
               } @else {
                 <div class="file-list">
@@ -269,14 +282,21 @@ import {AppTooltipDirective} from '../../ui/tooltip';
           <app-agent-settings
             mode="job"
             [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
-            [disabled]="isSubmitting() || artifacts.streaming()"
+            [resolvedToolset]="toolPreview()"
+            [readsResolvedToolset]="true"
+            [gatedCapabilities]="capabilities.grants() ?? null"
+            [disabled]="isSubmitting()"
             [showProjectMemory]="projectHasSharedMemory()"
-            [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
+            [enumerateOnly]="expertDetail()?.enumerate_only ?? frameworkEnumerateOnly()"
             [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
+            [effectiveModels]="resolvedEffectiveModels()"
             [datasources]="availableDatasources()"
             [loadingDatasources]="isLoadingDatasources()"
+            [datasourceLoadError]="datasourceLoadError()"
+            [datasourceContextKey]="datasourceContextKey()"
+            [datasourceDefaultsEnabled]="capabilities.datasourceScopeAutoAttachAvailable()"
             [loadingExpert]="isLoadingExpertDetail()"
-            [streaming]="artifacts.streaming()"
+            (retryDatasources)="loadDatasources()"
             (instructionsChange)="onInstructionsChange($event)"
           />
 
@@ -294,7 +314,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               type="submit"
               variant="primary"
               [loading]="isSubmitting() || isUploading()"
-              [disabled]="!formData.description || artifacts.streaming()"
+              [disabled]="!formData.description || isLoadingDatasources() || datasourceLoadError()"
             >
               @if (isSubmitting()) {
                 {{ 'jobs.create.creating' | transloco }}
@@ -329,9 +349,13 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         display: flex;
         align-items: center;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
+      }
+
+      .back-btn {
+        margin-left: auto;
       }
 
       .title {
@@ -399,7 +423,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         border: none;
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 11px;
         cursor: pointer;
         transition: all 0.15s ease;
@@ -465,7 +489,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .slider-label {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         min-width: 14px;
         text-align: center;
       }
@@ -647,14 +671,14 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       .tool-toggle-desc {
         display: block;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .field-hint {
         display: block;
         margin-top: 4px;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .field-error {
@@ -677,7 +701,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         align-items: center;
         gap: 8px;
         padding: 16px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 13px;
       }
 
@@ -750,7 +774,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .expert-desc {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         line-height: 1.4;
         display: -webkit-box;
         -webkit-line-clamp: 2;
@@ -815,7 +839,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .dropzone-icon {
         font-size: 48px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .dropzone-text {
@@ -825,7 +849,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .dropzone-hint {
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* File List */
@@ -862,7 +886,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .file-icon {
         font-size: 28px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         width: 36px;
         text-align: center;
       }
@@ -885,7 +909,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .file-size {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .file-error {
@@ -920,7 +944,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       }
 
       .status-icon.pending {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       app-button.add-more-btn {
@@ -940,7 +964,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         border: 1px dashed var(--border-color, var(--surface-1));
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
         cursor: pointer;
         transition: all 0.15s ease;
@@ -971,7 +995,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         align-items: center;
         gap: 8px;
         padding: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
       }
 
@@ -1024,7 +1048,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       .ds-desc {
         display: block;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -1084,8 +1108,11 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 })
 export class JobCreateComponent implements OnInit {
   private readonly api = inject(ApiService);
+  readonly capabilities = inject(CapabilitiesService);
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
   private readonly userService = inject(UserService);
+  private readonly errors = inject(ErrorMessageService);
   private readonly modelService = inject(ModelService);
   readonly fileService = inject(FileHandlingService);
   readonly artifacts = inject(JobArtifactService);
@@ -1094,7 +1121,9 @@ export class JobCreateComponent implements OnInit {
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
 
   constructor() {
-    // Sync builder AI → settings component
+    // Mirror artifact form-state (expert prefill / user edits) into the
+    // settings component. The description effect below also writes back
+    // formData.description, so it is load-bearing for the manual form.
     effect(() => {
       const instructions = this.artifacts.instructions();
       if (instructions !== null) {
@@ -1130,6 +1159,10 @@ export class JobCreateComponent implements OnInit {
 
   readonly experts = signal<Expert[]>([]);
   readonly selectedExpert = signal<Expert | null>(null);
+  private readonly effectiveDefaultExpertId = signal<string | null>(null);
+  readonly selectedExpertSource = signal<'project' | 'user' | 'application' | 'explicit' | null>(null);
+  private expertSelectionTouched = false;
+  private defaultRequestSerial = 0;
   readonly isLoadingExperts = signal(false);
   readonly expertDetail = signal<ExpertDetail | null>(null);
   readonly isLoadingExpertDetail = signal(false);
@@ -1153,6 +1186,11 @@ export class JobCreateComponent implements OnInit {
 
   onProjectIdChange(value: string | null): void {
     this.selectedProjectId.set(value && value !== '' ? value : null);
+    // Refresh eligible datasources for the newly selected project.
+    this.loadDatasources();
+    this.loadEffectiveDefault();
+    // The project is a grant scope, so it can change what the answer says.
+    this.loadToolPreview();
   }
 
   onCloudStorageChange(value: string | null): void {
@@ -1165,6 +1203,14 @@ export class JobCreateComponent implements OnInit {
   readonly selectedProjectId = signal<string | null>(null);
 
   readonly cloudStorageOverride = signal<'inherit' | 'readonly' | 'readwrite'>('inherit');
+  /** A project reachable only through a `?project=` deep link can be archived;
+   *  the form says so instead of pretending the job will be accepted. */
+  readonly selectedProjectIsArchived = computed(() => {
+    const pid = this.selectedProjectId();
+    if (!pid) return false;
+    return this.projects().find((p) => p.id === pid)?.status === 'archived';
+  });
+
   readonly selectedProjectHasCloudStorage = computed(() => {
     const pid = this.selectedProjectId();
     if (!pid) return false;
@@ -1172,11 +1218,28 @@ export class JobCreateComponent implements OnInit {
     return !!proj?.cloud_storage_url;
   });
 
-  readonly availableDatasources = signal<Datasource[]>([]);
+  readonly availableDatasources = signal<EligibleDatasource[]>([]);
   readonly isLoadingDatasources = signal(false);
+  readonly datasourceLoadError = signal(false);
+  readonly datasourceContextKey = computed(() =>
+    this.selectedProjectId() ? `project:${this.selectedProjectId()}` : 'standalone',
+  );
+  private datasourceRequestSerial = 0;
 
   readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly frameworkSettingsMatrix = signal<Record<string, Record<string, unknown>>>({});
+  /** Write vocabulary for categories that refuse `true` — `shell` is the only
+   *  one today. Registry-derived and identical on every expert detail, so the
+   *  worker_base fetch is a fine source when no expert is selected. Without it
+   *  the Shell tick emits `true` and 400s on a rule the form cannot satisfy. */
+  readonly frameworkEnumerateOnly = signal<Record<string, string[]> | null>(null);
+  // Server-resolved effective models for worker_base — the fallback floor used
+  // underneath the selected expert, so the model picker's "Default" option
+  // shows the resolved chat pin instead of the config-literal placeholder.
+  readonly frameworkEffectiveModels = signal<EffectiveModels | null>(null);
+  readonly resolvedEffectiveModels = computed(() =>
+    resolveEffectiveModels(this.expertDetail()?.effective_models, this.frameworkEffectiveModels()),
+  );
   readonly projectHasSharedMemory = computed(() => {
     const pid = this.selectedProjectId();
     if (!pid) return false;
@@ -1198,35 +1261,117 @@ export class JobCreateComponent implements OnInit {
     this.modelService.load();
     this.loadExperts();
     this.loadDatasources();
-    this.api.getExpertDetail('defaults').subscribe((d) => {
+    // accountDefaults: resolve against the same layers the dispatcher will —
+    // the account model floor sits above worker_base and below the expert.
+    this.api.getExpertDetail('worker_base', {accountDefaults: true}).subscribe((d) => {
       if (d?.config) this.frameworkDefaults.set(d.config);
       if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
+      if (d?.effective_models) this.frameworkEffectiveModels.set(d.effective_models);
+      if (d?.enumerate_only) this.frameworkEnumerateOnly.set(d.enumerate_only);
     });
+    // The bare-worker_base prediction, so the pane is honest before the user
+    // picks anything. The expert and project hooks refine it from there.
+    this.loadToolPreview();
   }
 
   private loadExperts(): void {
     this.isLoadingExperts.set(true);
-    this.api.getExperts().subscribe({
-      next: (experts) => { this.experts.set(experts); this.isLoadingExperts.set(false); },
+    this.api.getExperts('worker').subscribe({
+      next: (experts) => {
+        this.experts.set(experts);
+        this.applyEffectiveDefault();
+        this.isLoadingExperts.set(false);
+      },
       error: () => { this.isLoadingExperts.set(false); },
+    });
+    this.loadEffectiveDefault();
+  }
+
+  private loadEffectiveDefault(): void {
+    if (this.expertSelectionTouched) return;
+    const serial = ++this.defaultRequestSerial;
+    this.api.getExpertDefaults(this.selectedProjectId()).subscribe((response: ExpertDefaultsResponse | null) => {
+      if (serial !== this.defaultRequestSerial || this.expertSelectionTouched) return;
+      this.effectiveDefaultExpertId.set(response?.defaults?.worker?.effective?.id ?? null);
+      this.selectedExpertSource.set(response?.defaults?.worker?.source ?? null);
+      this.applyEffectiveDefault();
     });
   }
 
-  toggleExpert(expert: Expert): void {
-    if (this.selectedExpert()?.id === expert.id) {
-      this.selectedExpert.set(null);
-      this.expertDetail.set(null);
-      this.artifacts.instructions.set(null);
-      this.agentSettings?.resetAll();
-    } else {
+  private applyEffectiveDefault(): void {
+    if (this.expertSelectionTouched) return;
+    const id = this.effectiveDefaultExpertId();
+    const expert = id ? this.experts().find(item => item.id === id) : undefined;
+    if (expert && this.selectedExpert()?.id !== expert.id) {
       this.selectedExpert.set(expert);
       this.fetchExpertDetail(expert.id);
+      this.loadToolPreview();
     }
+  }
+
+  toggleExpert(expert: Expert): void {
+    this.expertSelectionTouched = true;
+    this.selectedExpertSource.set('explicit');
+    if (this.selectedExpert()?.id === expert.id) return;
+    this.selectedExpert.set(expert);
+    this.fetchExpertDetail(expert.id);
+    this.loadToolPreview();
+  }
+
+  /** The server's answer for "what would a job created like this bind?".
+   *
+   *  Null until the first answer lands, and null again on failure — the tools
+   *  group renders its static list in that case, labelled, rather than an empty
+   *  pane. `readsResolvedToolset` is what tells it a read was attempted.
+   */
+  readonly toolPreview = signal<SessionToolGroupsResponse | null>(null);
+  private toolPreviewSerial = 0;
+
+  /** Ask the server what this job's toolset would be.
+   *
+   *  Sends `expert_type: 'worker'`: without it the endpoint answers for a
+   *  SESSION (session_base, session code floors), which is a different toolset —
+   *  60 tools vs 64 on the shipped bases — and predicting the wrong one on the
+   *  job form is the defect this whole series exists to remove, at a new seam.
+   *
+   *  Routed exactly as `createJob` routes the expert, for the same reason the
+   *  session form does it: a preview that resolved a different expert layer from
+   *  the create it previews would be worse than no preview.
+   *
+   *  Serial-guarded so a slow answer for an expert the user has already switched
+   *  away from cannot paint over the current one.
+   */
+  private loadToolPreview(): void {
+    const serial = ++this.toolPreviewSerial;
+    const expert = this.selectedExpert();
+    const isDbExpert =
+      !!expert &&
+      !['default', 'defaults', 'worker_base'].includes(expert.id) &&
+      (expert.storage_kind === 'db' ||
+        ['user', 'global', 'managed'].includes(expert.source ?? ''));
+    const isBundled =
+      !!expert && !isDbExpert && !['default', 'defaults', 'worker_base'].includes(expert.id);
+
+    this.api
+      .previewToolGroups({
+        expert_type: 'worker',
+        config_name: isBundled ? expert!.id : null,
+        expert_id: isDbExpert ? expert!.id : null,
+        project_id: this.selectedProjectId() ?? null,
+      })
+      .subscribe((preview) => {
+        if (serial !== this.toolPreviewSerial) return;
+        this.toolPreview.set(preview);
+        const categories = preview?.categories;
+        if (categories && !this.agentSettings?.hasToolEdits()) {
+          this.agentSettings?.prefillFromResolvedToolset(categories);
+        }
+      });
   }
 
   private fetchExpertDetail(expertId: string): void {
     this.isLoadingExpertDetail.set(true);
-    this.api.getExpertDetail(expertId).subscribe({
+    this.api.getExpertDetail(expertId, {accountDefaults: true}).subscribe({
       next: (detail) => {
         this.expertDetail.set(detail);
         if (detail?.instructions) {
@@ -1243,36 +1388,99 @@ export class JobCreateComponent implements OnInit {
   }
 
   onDescriptionEdit(value: string): void {
-    if (!this.artifacts.streaming()) {
-      this.artifacts.description.set(value || null);
-    }
+    this.artifacts.description.set(value || null);
   }
 
   onInstructionsChange(value: string | null): void {
-    if (!this.artifacts.streaming()) {
-      this.artifacts.instructions.set(value);
-    }
+    this.artifacts.instructions.set(value);
   }
 
-  private loadDatasources(): void {
+  loadDatasources(): void {
+    const serial = ++this.datasourceRequestSerial;
     this.isLoadingDatasources.set(true);
-    this.api.getDatasources('global').subscribe({
-      next: (datasources) => { this.availableDatasources.set(datasources); this.isLoadingDatasources.set(false); },
-      error: () => { this.isLoadingDatasources.set(false); },
+    this.datasourceLoadError.set(false);
+    // The server applies execution authorization and scope for this exact
+    // project, then marks owner-specific defaults. Re-fetch on context change.
+    const pid = this.selectedProjectId();
+    this.api.getEligibleDatasources(pid ? [pid] : []).subscribe({
+      next: (datasources) => {
+        if (serial !== this.datasourceRequestSerial) return;
+        this.availableDatasources.set(datasources);
+        this.isLoadingDatasources.set(false);
+      },
+      error: () => {
+        if (serial !== this.datasourceRequestSerial) return;
+        // Keep the last authorized page visible for context and retry. The
+        // picker disables edits while errored and submission remains blocked.
+        this.datasourceLoadError.set(true);
+        this.isLoadingDatasources.set(false);
+      },
     });
   }
 
+  /** Only active projects are offered: an archived one cannot take new work,
+   *  so listing it is offering a guaranteed 409. The one exception is a project
+   *  named explicitly by `?project=` — see `resolveDeepLinkedProject`. */
   private loadProjects(userId: string): void {
-    this.api.getProjects(userId).subscribe((projects) => {
-      this.projects.set(projects);
-      const qp = this.route.snapshot.queryParamMap.get('project');
-      if (qp && projects.some((p) => p.id === qp)) {
-        this.selectedProjectId.set(qp);
-      } else {
-        const defaultProject = projects.find((p) => p.is_default);
-        this.selectedProjectId.set(defaultProject?.id ?? projects[0]?.id ?? null);
-      }
+    this.api.getProjects(userId, ['active']).subscribe({
+      next: (projects) => {
+        this.projects.set(projects);
+        const qp = this.route.snapshot.queryParamMap.get('project');
+        if (qp && projects.some((p) => p.id === qp)) {
+          this.selectedProjectId.set(qp);
+          this.afterProjectSelection();
+          return;
+        }
+        if (qp) {
+          this.resolveDeepLinkedProject(qp, projects);
+          return;
+        }
+        this.selectDefaultProject(projects);
+        this.afterProjectSelection();
+      },
+      error: () => {
+        // The picker is optional context, and the description field is where
+        // the work actually is — keep the form usable rather than blank.
+        this.projects.set([]);
+        this.selectedProjectId.set(null);
+        this.afterProjectSelection();
+      },
     });
+  }
+
+  /**
+   * A `?project=` the active list does not contain. Resolve it before falling
+   * back to the default: if it is merely archived, keep it selected and FLAG
+   * it, because quietly retargeting the job at the personal project is how a
+   * job ends up somewhere nobody asked for. (The create itself is refused
+   * server-side; the form shows that refusal verbatim.)
+   */
+  private resolveDeepLinkedProject(projectId: string, active: Project[]): void {
+    this.api.getProject(projectId).subscribe((project) => {
+      if (project && project.status === 'archived') {
+        this.projects.set([...active, project]);
+        this.selectedProjectId.set(project.id);
+      } else {
+        // Deleted, or no longer visible to this user — nothing to keep.
+        this.selectDefaultProject(active);
+      }
+      this.afterProjectSelection();
+    });
+  }
+
+  /** Never lands on an archived project by accident: one is only ever in this
+   *  list because the user named it explicitly. */
+  private selectDefaultProject(projects: Project[]): void {
+    const selectable = projects.filter((p) => p.status !== 'archived');
+    const defaultProject = selectable.find((p) => p.is_default);
+    this.selectedProjectId.set(defaultProject?.id ?? selectable[0]?.id ?? null);
+  }
+
+  /** Now that a project is selected, refresh eligible datasources so
+   *  project-linked sources are included and pre-selected. */
+  private afterProjectSelection(): void {
+    this.loadDatasources();
+    this.loadEffectiveDefault();
   }
 
   // ===== File Upload Methods =====
@@ -1312,14 +1520,32 @@ export class JobCreateComponent implements OnInit {
 
   private async addFiles(files: File[]): Promise<void> {
     const currentCount = this.filePreviews().length;
-    const maxFiles = this.fileService.getMaxFiles();
+    // Job creation uploads go to POST /api/uploads (local orchestrator
+    // storage), a different endpoint from the chat composer's thread
+    // uploads — it genuinely allows a much bigger batch server-side
+    // (orchestrator/uploads.py:53-54), so this uses FileHandlingService's
+    // job-upload caps rather than its (smaller) composer defaults.
+    const maxFiles = this.fileService.getJobUploadMaxFiles();
+    const maxFileSizeMB = this.fileService.getJobUploadMaxFileSizeMB();
     if (currentCount + files.length > maxFiles) {
       this.errorMessage.set(`Maximum ${maxFiles} files allowed`);
       files = files.slice(0, maxFiles - currentCount);
     }
     if (files.length === 0) return;
-    const newPreviews = await this.fileService.createFilePreviews(files);
-    this.filePreviews.update((current) => [...current, ...newPreviews]);
+    const {previews, rejected} = await this.fileService.createFilePreviews(files, {maxFileSizeMB, maxFiles});
+    this.filePreviews.update((current) => [...current, ...previews]);
+    if (rejected.length > 0) {
+      // Oversize files no longer vanish silently (previously a console.warn
+      // only). A 'count' rejection here would mean the pre-check above and
+      // this call disagree on the same maxFiles value, which shouldn't
+      // happen — but report it honestly rather than swallow it.
+      const tooLarge = rejected.filter((r) => r.reason === 'size');
+      this.errorMessage.set(
+        tooLarge.length > 0
+          ? `${tooLarge.map((r) => r.name).join(', ')} exceed${tooLarge.length === 1 ? 's' : ''} the ${maxFileSizeMB} MB limit`
+          : `Maximum ${maxFiles} files allowed`,
+      );
+    }
     this.uploadId = null;
   }
 
@@ -1332,7 +1558,10 @@ export class JobCreateComponent implements OnInit {
   // ===== Form Submission =====
 
   async onSubmit(): Promise<void> {
-    if (!this.formData.description || this.isSubmitting() || this.isUploading()) return;
+    if (
+      !this.formData.description || this.isSubmitting() || this.isUploading() ||
+      this.isLoadingDatasources() || this.datasourceLoadError()
+    ) return;
     this.clearMessages();
 
     const files = this.filePreviews();
@@ -1344,7 +1573,16 @@ export class JobCreateComponent implements OnInit {
     const request: JobCreateRequest = { description: this.formData.description };
 
     const expert = this.selectedExpert();
-    if (expert && expert.id !== 'defaults') request.config_name = expert.id;
+    if (expert && !['default', 'defaults', 'worker_base'].includes(expert.id)) {
+      // DB-backed experts (source user/global) go via expert_id — the
+      // orchestrator resolves them into the job config. Bundled experts keep
+      // the config_name path. Fixes the config_name=<uuid> conflation.
+      if (expert.storage_kind === 'db' || ['user', 'global', 'managed'].includes(expert.source ?? '')) {
+        request.expert_id = expert.id;
+      } else {
+        request.config_name = expert.id;
+      }
+    }
     if (this.uploadId) request.upload_id = this.uploadId;
 
     // Collect overrides from the settings component
@@ -1358,10 +1596,8 @@ export class JobCreateComponent implements OnInit {
     if (this.kickoffMessage.trim()) request.kickoff_message = this.kickoffMessage.trim();
 
     const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];
-    if (dsIds.length > 0) request.datasource_ids = dsIds;
-
-    const builderSessionId = this.artifacts.sessionId();
-    if (builderSessionId) request.builder_session_id = builderSessionId;
+    // Empty is an explicit opt-out; omission means "apply server defaults".
+    request.datasource_ids = dsIds;
 
     const projectId = this.selectedProjectId();
     if (projectId) request.project_id = projectId;
@@ -1384,16 +1620,16 @@ export class JobCreateComponent implements OnInit {
     this.api.createJob(request).subscribe({
       next: (job) => {
         this.isSubmitting.set(false);
-        if (job) {
-          this.successMessage.set(`Job created successfully! ID: ${job.id.slice(0, 8)}...`);
-          this.resetForm();
-        } else {
-          this.errorMessage.set('Failed to create job. Please try again.');
-        }
+        this.successMessage.set(`Job created successfully! ID: ${job.id.slice(0, 8)}...`);
+        this.resetForm();
       },
+      // The form stays mounted with every selection intact, and shows what the
+      // server actually objected to — `err.message` would be Angular's
+      // "Http failure response for /api/jobs: 400 Bad Request", which tells the
+      // user nothing about which setting to change.
       error: (err) => {
         this.isSubmitting.set(false);
-        this.errorMessage.set(`Error: ${err.message || 'Unknown error'}`);
+        this.errorMessage.set(this.errors.translate(err, 'errors.jobs.createFailed'));
       },
     });
   }
@@ -1439,16 +1675,23 @@ export class JobCreateComponent implements OnInit {
     this.filePreviews.set([]);
     this.uploadId = null;
     this.selectedExpert.set(null);
+    this.selectedExpertSource.set(null);
+    this.expertSelectionTouched = false;
     this.expertDetail.set(null);
     this.selectedPriority.set(5);
     this.cloudStorageOverride.set('inherit');
     this.agentSettings?.resetAll();
-    const defaultProject = this.projects().find((p) => p.is_default);
-    this.selectedProjectId.set(defaultProject?.id ?? this.projects()[0]?.id ?? null);
+    this.selectDefaultProject(this.projects());
+    this.afterProjectSelection();
     this.artifacts.reset();
   }
 
   clearSuccess(): void { this.successMessage.set(null); }
   clearError(): void { this.errorMessage.set(null); }
   private clearMessages(): void { this.successMessage.set(null); this.errorMessage.set(null); }
+
+  /** Leave the create form and return to the job list. */
+  cancel(): void {
+    this.router.navigate(['/jobs']);
+  }
 }

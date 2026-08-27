@@ -1,6 +1,6 @@
 # Cockpit Styles
 
-This is the engineering side of the design system. For brand intent, palette rationale, and "when to use which theme", see [`design/themes/`](../../../design/themes/README.md) at the repo root.
+This is the engineering side of the design system. For brand intent, palette rationale, and "when to use which theme", see [`knowledge-base/knowledge/design/cockpit/themes/`](../../../knowledge-base/knowledge/design/cockpit/themes/README.md) at the repo root.
 
 ## Layout
 
@@ -87,7 +87,7 @@ First-run preference is `'system'` — the app respects the OS preference. A pre
    ```
    And add `'mytheme'` to `VALID_PREFERENCES`.
 5. **Add it to the picker** — `OPTIONS` in `src/app/ui/theme-toggle/theme-toggle.component.ts`. Pick a `group` (`'light'` or `'dark'`) so it lands in the right `<optgroup>`.
-6. **Document the design intent** in `design/themes/README.md` — palette story, when to use it, what it's *for*.
+6. **Document the design intent** in `knowledge-base/knowledge/design/cockpit/themes/README.md` — palette story, when to use it, what it's *for*.
 7. **Test the picker test** — `theme.service.spec.ts` should already cover the new theme via the generic body-class swap test, but add a smoke test if your theme has special semantics.
 
 If your theme departs from the Roman shape language (rounded corners, different display font, etc.), you'll also need to either:
@@ -219,7 +219,7 @@ A primitive that exposes `--btn-radius` (as in the button example above) can be 
 
 The Inset Stamp recipe lives in `_shape-recipes.scss` as `@mixin stamp($variant)`. The token contract: Roman themes set the `--stamp-*` family; non-Roman themes leave them unset and the recipe falls back to `transparent`, collapsing to a flat button. Tinted button variants (warning, info, success, danger) get `stamp('soft')` to avoid the muddy inner shadow on translucent fills.
 
-Legacy component-class selectors (`.btn`, `.session-message .message-bubble`, `.approval-card`) in `_shape-overrides.scss` predate the recipe model and target classes that have largely been renamed during the BEM migration. They're being removed as primitives migrate to recipes (`docs/features/design_system_completion.md` Phase 3). New shape rules belong in a recipe mixin, not as a body-class-scoped selector.
+Legacy component-class selectors (`.btn`, `.session-message .message-bubble`, `.approval-card`) in `_shape-overrides.scss` predate the recipe model and target classes that have largely been renamed during the BEM migration. They're being removed as primitives migrate to recipes (`knowledge-base/knowledge/features/design_system_completion.md` Phase 3). New shape rules belong in a recipe mixin, not as a body-class-scoped selector.
 
 ## Verification
 
@@ -259,7 +259,7 @@ A few standard-scss rules are disabled — see `.stylelintrc.json` comments-in-s
 
 ## Cross-references
 
-- Brand intent + palette rationale: [`design/themes/README.md`](../../../design/themes/README.md)
+- Brand intent + palette rationale: [`knowledge-base/knowledge/design/cockpit/themes/README.md`](../../../knowledge-base/knowledge/design/cockpit/themes/README.md)
 - Theme service: `src/app/core/services/theme.service.ts`
 - Theme picker: `src/app/ui/theme-toggle/theme-toggle.component.ts`
 - Brand mark: `src/app/ui/legion-mark/legion-mark.component.ts`

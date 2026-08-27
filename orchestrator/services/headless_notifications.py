@@ -1,7 +1,7 @@
 """Email magic-link generation + outbound notification dispatch for
 headless persistent sessions.
 
-Phase 4 of docs/features/headless_persistent_sessions.md. When the agent's
+Phase 4 of knowledge-base/knowledge/features/headless_persistent_sessions.md. When the agent's
 permission_check inserts a row into thread_permission_requests and no
 client has been attached for >30s, the permission-pending watcher
 (orchestrator/main.py) calls send_permission_pending_email() here. We:
@@ -51,6 +51,9 @@ import secrets
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+from services.brand import TRAVERTINE as _C
+from services.email_layout import Action, escape_text, render_email
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +229,62 @@ async def record_notification(
         )
 
 
+async def claim_sent_notification(
+    db: Any,
+    *,
+    thread_id: str,
+    request_id: Optional[str],
+    kind: str,
+    email_to: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> Optional[int]:
+    """Atomically claim the single 'sent' slot for (request_id, kind) BEFORE
+    sending (HA / M1 — dual-leader dedup).
+
+    Inserts a thread_notifications row with delivery_status='sent' guarded by
+    the partial unique index uq_tn_sent_request_kind (migration 0038). Returns
+    the new row id iff THIS call won the slot; None means a concurrent sweeper
+    in the transient dual-leader window already claimed it (is sending), so the
+    caller MUST NOT send again. Unlike record_notification this is NOT
+    best-effort — a DB error propagates so we never silently double-send.
+    """
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO thread_notifications "
+            "(thread_id, request_id, kind, delivery_status, email_to, metadata) "
+            "VALUES ($1, $2, $3, 'sent', $4, $5::jsonb) "
+            "ON CONFLICT (request_id, kind) WHERE delivery_status = 'sent' "
+            "DO NOTHING "
+            "RETURNING id",
+            thread_id,
+            request_id,
+            kind,
+            email_to,
+            json.dumps(metadata or {}),
+        )
+    return row["id"] if row else None
+
+
+async def downgrade_sent_claim(db: Any, claim_id: int) -> None:
+    """Downgrade a claimed 'sent' row to 'failed' when the send didn't go
+    through. Frees the unique slot and keeps the audit honest. 'failed' is
+    terminal in the sweeper query, so this won't re-dispatch — matching the
+    behaviour before claim-before-send. Best-effort."""
+    try:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE thread_notifications SET delivery_status = 'failed' "
+                "WHERE id = $1",
+                claim_id,
+            )
+    except Exception as e:
+        logger.warning(
+            "thread_notifications downgrade to 'failed' failed (id=%s): %s",
+            claim_id,
+            e,
+        )
+
+
 def _build_magic_link_url(cockpit_url: str, raw_token: str) -> str:
     """Compose the user-visible URL we embed in the email. The cockpit
     serves /magic/approve/{token} via the orchestrator proxy in
@@ -256,41 +315,29 @@ def _build_permission_email_bodies(
         f"This link expires in 30 minutes and can be used once.\n"
     )
 
-    # Escape HTML special chars in the args preview.
-    safe_args = (
-        tool_args_preview.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-    safe_tool = tool_name.replace("&", "&amp;").replace("<", "&lt;")
+    safe_args = escape_text(tool_args_preview)
+    safe_tool = escape_text(tool_name)
 
-    html_body = f"""\
-<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #cdd6f4; background: #1e1e2e;">
-  <div style="border: 1px solid #313244; border-radius: 12px; overflow: hidden;">
-    <div style="background: #181825; padding: 16px 20px; border-bottom: 1px solid #313244;">
-      <h2 style="margin: 0 0 4px 0; color: #cba6f7; font-size: 16px;">Permission requested</h2>
-      <p style="margin: 0; color: #a6adc8; font-size: 13px;">
-        Waiting ~{request_age_minutes} minute(s)
-      </p>
-    </div>
-    <div style="padding: 20px; font-size: 14px; line-height: 1.6; color: #cdd6f4;">
-      <p style="margin: 0 0 12px 0;">
-        The agent wants to call <code style="background: #181825; padding: 2px 6px; border-radius: 4px;">{safe_tool}</code>:
-      </p>
-      <pre style="background: #181825; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: #a6e3a1;">{safe_args}</pre>
-    </div>
-    <div style="background: #181825; padding: 16px 20px; border-top: 1px solid #313244; text-align: center;">
-      <a href="{approve_url}" style="display: inline-block; background: #a6e3a1; color: #1e1e2e; padding: 10px 24px; margin: 4px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px;">Approve</a>
-      <a href="{deny_url}" style="display: inline-block; background: #f38ba8; color: #1e1e2e; padding: 10px 24px; margin: 4px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px;">Deny</a>
-      <p style="margin: 16px 0 0 0; color: #6c7086; font-size: 12px;">
-        Or <a href="{cockpit_link}" style="color: #cba6f7;">open the cockpit</a> for full context.
-      </p>
-      <p style="margin: 8px 0 0 0; color: #6c7086; font-size: 11px;">
-        Links expire in 30 minutes and can be used once.
-      </p>
-    </div>
-  </div>
-</div>"""
+    body_html = (
+        f"<p style='margin:0 0 12px 0;'>The agent wants to call "
+        f'<code style="background:{_C["surface-0"]};padding:2px 6px;'
+        f'font-family:monospace;">{safe_tool}</code>:</p>'
+        f'<pre style="background:{_C["surface-0"]};padding:12px;'
+        f"margin:0;overflow-x:auto;font-size:12px;line-height:18px;"
+        f'font-family:monospace;color:{_C["text-primary"]};">{safe_args}</pre>'
+    )
+
+    html_body = render_email(
+        title="Permission requested",
+        subtitle=f"Waiting {request_age_minutes} min for your decision.",
+        body_html=body_html,
+        actions=[
+            Action(label="Approve", url=approve_url, variant="approve"),
+            Action(label="Deny", url=deny_url, variant="deny"),
+        ],
+        footer_note="Open the cockpit for full context.",
+    )
+
     return text_body, html_body
 
 
@@ -450,7 +497,23 @@ async def send_permission_pending_email(
 
     subject = f"[SRW] Approval needed: {permission_row['tool_name']}"
 
-    # 5. Dispatch via EmailService internals (private _send is fine —
+    # 5. Claim the single 'sent' slot for this (request, kind) BEFORE sending,
+    # so a concurrent sweeper in the transient dual-leader window (leader
+    # election has no fencing) cannot also send. Losing the claim means another
+    # sweeper already sent (or is sending) → skip silently. In steady state
+    # leadership is single, so this only fires during a partition / failover.
+    claim_id = await claim_sent_notification(
+        db,
+        thread_id=thread_id,
+        request_id=approval_id,
+        kind="permission_pending",
+        email_to=recipient_email,
+        metadata={"tool": permission_row["tool_name"]},
+    )
+    if claim_id is None:
+        return {"status": "skipped_dedup"}
+
+    # 6. Dispatch via EmailService internals (private _send is fine —
     # same package). We avoid send_agent_message because that template
     # is job-oriented; this notification is thread-only.
     sent_ok = False
@@ -469,14 +532,10 @@ async def send_permission_pending_email(
             e,
         )
 
+    if not sent_ok:
+        # Send failed after we claimed the slot — downgrade the audit row to
+        # 'failed' (terminal in the sweeper query, same as before this change).
+        await downgrade_sent_claim(db, claim_id)
+
     status = "sent" if sent_ok else "failed"
-    await record_notification(
-        db,
-        thread_id=thread_id,
-        request_id=approval_id,
-        kind="permission_pending",
-        delivery_status=status,
-        email_to=recipient_email,
-        metadata={"tool": permission_row["tool_name"]},
-    )
     return {"status": status, "email_to": recipient_email}

@@ -151,8 +151,8 @@ class TestGetVerificationConfig:
     def test_is_verification_enabled(self):
         assert is_verification_enabled(make_job(verification_enabled=True)) is True
         assert is_verification_enabled(make_job(verification_enabled=False)) is False
-        # When resolved_config is NULL, falls back to disk — defaults.yaml has enabled=true
-        assert is_verification_enabled({"id": "x", "resolved_config": None}) is True
+        # The conservative worker base does not start a critic round implicitly.
+        assert is_verification_enabled({"id": "x", "resolved_config": None}) is False
 
     def test_is_verification_disabled_by_override(self):
         """Config override disables verification even without resolved_config."""
@@ -332,6 +332,22 @@ class TestDetermineJobStatus:
         status, err = determine_job_status(job, result)
         assert status == "pending_review"
 
+    def test_workspace_upgrade_required_paused(self):
+        """A worker in-process sandbox upgrade that FAILED surfaces the freeze;
+        the orchestrator pauses for re-attempt (workspace_tier_upgrade.md §4.3
+        W1). On the happy path this freeze never reaches completion — the agent
+        swaps in place and the job continues."""
+        job = make_job(
+            freeze_data={
+                "freeze_type": "workspace_upgrade_required",
+                "target_tier": "sandbox",
+            }
+        )
+        result = {"should_stop": True, "goal_achieved": False}
+        status, err = determine_job_status(job, result)
+        assert status == "paused"
+        assert err is None
+
     def test_no_freeze_data_not_goal_achieved(self):
         """Stopped without goal or freeze data — pending_review."""
         job = make_job(verification_enabled=True)
@@ -446,10 +462,10 @@ class TestGetScholarConfig:
 class TestResolveScholarConfigFromDisk:
     """Test the lightweight YAML reader for creation-time config checks."""
 
-    def test_defaults_has_scholar_enabled(self):
-        """defaults.yaml should have scholar enabled."""
+    def test_worker_base_has_scholar_disabled(self):
+        """The framework base must not start a research subjob implicitly."""
         sc = resolve_scholar_config_from_disk("default")
-        assert sc.get("enabled") is True
+        assert sc.get("enabled") is False
 
     def test_config_override_disables(self):
         sc = resolve_scholar_config_from_disk(
@@ -467,7 +483,7 @@ class TestResolveScholarConfigFromDisk:
 
     def test_nonexistent_config_falls_back_to_defaults(self):
         sc = resolve_scholar_config_from_disk("nonexistent_config_xyz")
-        assert sc.get("enabled") is True  # From defaults.yaml
+        assert sc.get("enabled") is False  # From worker_base.yaml
 
     def test_scholar_config_reads_scholar_expert(self):
         """The scholar expert config disables scholar spawning to prevent
@@ -522,3 +538,40 @@ class TestFormatScholarInstructions:
                 config_name="x",
             )
             assert result is None
+
+
+class TestVerificationInstructionsDelivery:
+    """Task 7: the rendered instructions must actually reach the critic.
+
+    Before this fix, ``format_verification_instructions`` was called in
+    ``orchestrator/main.py`` and its result was only null-checked, never
+    passed to ``create_job`` (which has no ``instructions`` parameter) — so
+    every critic since the orchestrator migration ran on a generic
+    description instead of the rendered brief. See
+    knowledge-base/knowledge/superpowers/plans/2026-07-27-verification-fail-closed.md Task 7.
+    """
+
+    def test_prior_findings_rendered_into_template(self):
+        from orchestrator.services.completion import format_verification_instructions
+
+        text = format_verification_instructions(
+            job_id="t1",
+            description="d",
+            freeze_data={},
+            config_name="worker_base",
+            prior_findings="- **F1** [high, opened round 1]: missing source",
+        )
+        assert text is not None
+        assert "F1" in text
+        assert "missing source" in text
+
+    def test_missing_prior_findings_does_not_abort(self):
+        """A KeyError here returns None, which aborts critic spawn entirely."""
+        from orchestrator.services.completion import format_verification_instructions
+
+        assert (
+            format_verification_instructions(
+                job_id="t1", description="d", freeze_data={}, config_name="worker_base"
+            )
+            is not None
+        )

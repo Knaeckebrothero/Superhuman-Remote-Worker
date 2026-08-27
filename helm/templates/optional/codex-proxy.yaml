@@ -13,6 +13,9 @@ data:
   config.yaml: |
     port: 8317
     auth-dir: /data/auth
+    request-retry: {{ .Values.codexProxy.requestRetry | int }}
+    request-log: {{ .Values.codexProxy.requestLog }}
+    debug: {{ .Values.codexProxy.debug }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

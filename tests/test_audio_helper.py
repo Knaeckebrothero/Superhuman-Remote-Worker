@@ -9,7 +9,7 @@ Validates:
 - Context carry-over between chunks
 - Transcript line splitting for paged output
 - ffprobe duration detection and ffmpeg splitting
-- Archiving to MongoDB via LLMArchiver
+- Archiving to the Postgres audit store via LLMArchiver
 - Sync wrapper bridging async to sync
 """
 
@@ -382,7 +382,7 @@ class TestTranscribeSync:
 
 
 class TestArchiving:
-    """Test MongoDB archiving of transcription calls."""
+    """Test audit-store archiving of transcription calls."""
 
     @pytest.mark.asyncio
     async def test_archive_called_on_success(
@@ -451,7 +451,7 @@ class TestArchiving:
         mock_client.audio.transcriptions.create = AsyncMock(return_value="Still works")
 
         mock_archiver = MagicMock()
-        mock_archiver.archive.side_effect = Exception("MongoDB down")
+        mock_archiver.archive.side_effect = Exception("audit store down")
 
         with patch("src.core.archiver.get_archiver", return_value=mock_archiver):
             result = await audio_helper.transcribe(tmp_audio, job_id="job-789")

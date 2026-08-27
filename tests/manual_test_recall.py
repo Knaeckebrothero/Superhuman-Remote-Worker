@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FAKE_MEMORIES = [
     {
         "content": "The config system uses YAML files with $extends inheritance. "
-        "Child configs deep-merge with parent (defaults.yaml). "
+        "Child configs deep-merge with parent (worker_base.yaml). "
         "Arrays replace entirely, dicts merge recursively, null clears a key.",
         "summary": "Config uses YAML inheritance with deep merge",
         "keywords": ["config", "yaml", "extends", "inheritance", "deep_merge"],

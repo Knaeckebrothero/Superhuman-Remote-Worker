@@ -16,19 +16,69 @@ Superhuman Remote Worker is a multi-tier AI agent orchestration system.
   i18n, REST/WebSocket/SSE data flows, and Vitest tests.
 - `helm/`, `deployment/`, `docker/`, `vm/`: Kubernetes, GitOps, container, and
   workspace/VM infrastructure.
-- `docs/`: design notes, feature plans, issue analyses, and operational runbooks.
+- `knowledge-base/`: the **design vault** — design notes, feature plans, issue
+  analyses, and operational runbooks. A separate private repository cloned into
+  this checkout (see Design vault below); notes live under
+  `knowledge-base/knowledge/`.
+- `knowledge-history/`: the archive half of the vault — shipped and abandoned
+  work. Also a separate private repository, read-only in practice.
 - `Advanced-LLM-Chat/`, `CitationEngine/`, and `HomeLab/` are nested/external
   projects in this checkout. Treat them as separate scopes unless the task
   explicitly targets them.
+
+## Design vault
+
+The design vault is **not** in this repository. It lives in two private repos that are
+cloned into this checkout as plain nested repositories (like `HomeLab/` — not submodules),
+and both are gitignored here:
+
+| clone | repository | contents |
+|---|---|---|
+| `knowledge-base/` | `superhuman-remote-worker/knowledge-base` | live vault, notes under `knowledge/` |
+| `knowledge-history/` | `superhuman-remote-worker/knowledge-history` | archive, folders at the repo root |
+
+```bash
+git clone git@github.com:superhuman-remote-worker/knowledge-base.git
+git clone git@github.com:superhuman-remote-worker/knowledge-history.git
+```
+
+Without those clones the paths referenced throughout this repository will not resolve.
+
+Both clones are gitignored here, so a stray `git add -A` cannot publish a private repo
+into the public one. Because that would also hide them from a bare `rg <term>`, a
+committed `.ignore` re-includes them for ripgrep only — search reaches the vault, git
+still does not.
+
+A note becomes visible to SRW when it is **pushed**, not when it is saved: the
+orchestrator indexes the GitHub repository, never your working copy. Nothing warns you
+about the gap, and both sides look healthy while it exists.
+
+The same two repositories are attached to the SRW project on the cluster, so agents read
+and write the *same* vault through the knowledge-base tools. Notes an agent writes land
+flat at `knowledge/<slug>.md`; treat that root as an inbox and file them into
+subdirectories by hand.
+
+Two rules that matter when adding notes:
+
+- **A note's slug is its filename stem, globally.** Two files with the same basename
+  anywhere in the live vault collide, and one of them is then silently never indexed. If a
+  name must repeat (a `README.md`, say), give the note an explicit `id:` in its frontmatter
+  — that overrides the stem.
+- **`policy/` holds the two manifests CI validates against the code**
+  (`policy/endpoint_inventory.txt`, `policy/ci_self_hosted_runners.md`). CI cannot read the
+  private vault, so anything a gate checks lives beside the code, never in a note.
+- **The design trail from before 2026-08-17 is in this repository's git history**, under
+  the old `docs/` path. `git log -- docs/…` and `git show <sha>:docs/…` work; the folder
+  was removed going forward.
 
 ## Working Agreements
 
 - Prefer narrowly scoped edits that follow the existing architecture. This repo
   is already broad; avoid opportunistic refactors.
-- Read the relevant docs under `docs/features/`, `docs/issues/`, or
-  `docs/done/` before changing behavior that has an existing design trail.
-- For larger features, create or update a plan/design note under `docs/features/`
-  or `docs/issues/` before implementation.
+- Read the relevant docs under `knowledge-base/knowledge/features/`, `knowledge-base/knowledge/issues/`, or
+  `knowledge-history/done/` before changing behavior that has an existing design trail.
+- For larger features, create or update a plan/design note under `knowledge-base/knowledge/features/`
+  or `knowledge-base/knowledge/issues/` before implementation.
 - Do not print, commit, or summarize secret values from `.env`, local overlays,
   kube secrets, or private deployment files. Use `.env.example` and
   `deployment/values-local.example.yaml` as public references.
@@ -72,6 +122,7 @@ npm run build
 Python verification:
 
 ```bash
+./scripts/pytest-fast.sh
 pytest tests/ -x -q --tb=short
 pytest tests/test_<area>.py -x -q --tb=short
 ruff check src/ orchestrator/ tests/
@@ -131,7 +182,9 @@ k3d cluster stop srw
 - Use `AsyncMock` for awaitable collaborators.
 - Keep `config.extra` as a real dict in tests; using `MagicMock()` there can
   break YAML/config handling.
-- tmux-dependent tests may auto-skip when tmux is unavailable.
+- `tests/test_run_command.py` uses a mocked shell backend and never requires tmux. RemoteBackend
+  sentinel/restore behavior is transport-mocked in `tests/test_workspace_backends.py`; use a local
+  k3d workspace SSH/tmux exercise for a real-pane behavioral gate.
 - Cockpit tests use Vitest with jsdom and `cockpit/src/test-setup.ts`.
 - Use `vi.fn()` for Cockpit mocks and `of()` for RxJS observables.
 - Angular signal mocks need callable values with `.set()` / `.update()` when the
@@ -144,7 +197,7 @@ k3d cluster stop srw
 - Cockpit is Angular 21 with standalone components and signal-based state. Do not
   introduce NgRx or a new state framework without explicit direction.
 - Keep UI changes aligned with the existing Cockpit design system. Useful
-  references include `docs/design_framework.md`, `docs/cockpit_ds.md`, and
+  references include `knowledge-base/knowledge/design_framework.md`, `knowledge-base/knowledge/cockpit_ds.md`, and
   `cockpit/src/styles/README.md`.
 - Prefer existing shared services/components over one-off implementations.
 - For user-visible workflows, verify in the running app when practical, not only
@@ -155,6 +208,8 @@ k3d cluster stop srw
 - `.github/workflows/main.yml` is the full blocking pipeline for `main`.
 - `.github/workflows/develop.yml` is change-based and auto-formats Python on
   pushes to `develop`; still run local checks before pushing.
+- Python test jobs use `scripts/pytest-fast.sh` with bounded, file-level xdist
+  scheduling. Keep local and CI invocation aligned; do not switch CI to `-n auto`.
 - CI uses Python 3.12, Node 22, npm for Cockpit, and Ruff 0.14.10.
 - The Playwright version is pinned in `.playwright-version` and must match the
   `playwright==...` pin in `requirements.txt`.
