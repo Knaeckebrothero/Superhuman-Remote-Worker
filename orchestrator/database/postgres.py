@@ -9661,14 +9661,22 @@ class PostgresDB:
                 captured_claim = {} if captured_claim is None else captured_claim
                 if not isinstance(captured_claim, dict):
                     return False
-                claim_rows = await conn.fetch(
-                    "SELECT claim_id,thread_id,created_runtime_generation,"
-                    "create_attempt,provisioner,pvc_name,status,pvc_uid "
-                    "FROM thread_agent_workspace_claims "
-                    "WHERE thread_id=$1::uuid AND status<>'reclaimed' FOR SHARE",
-                    thread_uuid,
-                )
                 if captured_claim:
+                    try:
+                        captured_claim_uuid = UUID(
+                            str(captured_claim.get("claim_id") or "")
+                        )
+                    except (TypeError, ValueError):
+                        return False
+                    claim_rows = await conn.fetch(
+                        "SELECT claim_id,thread_id,created_runtime_generation,"
+                        "create_attempt,provisioner,pvc_name,status,pvc_uid "
+                        "FROM thread_agent_workspace_claims "
+                        "WHERE thread_id=$1::uuid "
+                        "AND (status<>'reclaimed' OR claim_id=$2::uuid) FOR SHARE",
+                        thread_uuid,
+                        captured_claim_uuid,
+                    )
                     if len(claim_rows) != 1:
                         return False
                     claim_row = claim_rows[0]
@@ -9684,13 +9692,21 @@ class PostgresDB:
                         == str(captured_claim.get("provisioner") or "")
                         and str(claim_row["pvc_name"])
                         == str(captured_claim.get("pvc_name") or "")
-                        and str(claim_row["status"]) == "fenced"
+                        # A later obligation may replay after post-horizon GC
+                        # exact-deleted this same captured fence. Its immutable
+                        # row remains the authority in terminal ``reclaimed``.
+                        and str(claim_row["status"]) in {"fenced", "reclaimed"}
                         and bool(str(claim_row["pvc_uid"] or ""))
                         and external_receipt.get("agent_workspace_cleanup_protocol")
                         == "k8s_pvc_name_tombstone_v1"
                     ):
                         return False
-                elif claim_rows:
+                elif await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM "
+                    "thread_agent_workspace_claims WHERE "
+                    "thread_id=$1::uuid AND status<>'reclaimed')",
+                    thread_uuid,
+                ):
                     return False
 
                 captured_workspace_intent = context.get("workspace_provision_intent")
