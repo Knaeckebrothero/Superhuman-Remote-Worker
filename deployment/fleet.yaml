@@ -12,7 +12,6 @@ helm:
   version: "0.0.0-dev.sha-83e5c1c"
   valuesFiles:
     - values-experimental.yaml
-    - values-runtime-authority-cutover.yaml
   # secretName: ghcr-helm-auth
   takeOwnership: true
 ignorePaths:
