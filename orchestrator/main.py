@@ -11472,7 +11472,15 @@ async def _cleanup_pinned_thread_retirement(
                 raise RuntimeError(
                     "workspace PVC appeared outside captured retirement authority"
                 )
-        elif workspace_identity.pvc_uid != backing_resource_uid:
+        elif (
+            workspace_identity.pvc_uid is not None
+            and workspace_identity.pvc_uid != backing_resource_uid
+        ):
+            # A present same-name PVC must still be the exact captured UID.
+            # Absence is an idempotent replay after an earlier exact release
+            # deleted the volume but a later retirement obligation remained
+            # retryable; _release_captured_workspace rechecks Pod absence and
+            # never adopts a deterministic-name successor.
             raise RuntimeError("workspace PVC identity changed before retirement")
         released = await container_provisioner.release_workspace(
             WorkspaceOwner.session(thread_id),
