@@ -1239,6 +1239,110 @@ def _json_runtime_status_is_absent(value: dict[str, Any]) -> bool:
     return isinstance(value["status"], str) and value["status"] in {"", "deleted"}
 
 
+async def _settled_pinned_workspace_predecessor_generation(
+    conn,
+    *,
+    thread_id: UUID,
+    current_generation: UUID,
+    workspace: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    namespace: str,
+    pod_name: str,
+    pvc_name: str | None,
+) -> str | None:
+    """Prove one retained-PVC workspace shell belongs to a retired generation.
+
+    Soft pinned retirement deletes the exact Pod and Service but deliberately
+    keeps the PVC binding for Resume. Its terminal context retains the former
+    stable endpoint strings while clearing the Pod UID. A successor create may
+    discard those strings only when the published provision intent and the
+    append-only soft-retirement outcome agree on that exact predecessor.
+    """
+
+    if (
+        pvc_name is None
+        or workspace.get("status") != "deleted"
+        or workspace.get("provisioner") != "k8s"
+        or workspace.get("namespace") != namespace
+        or workspace.get("pod_name") != pod_name
+        or workspace.get("host") != f"{pod_name}.{namespace}.svc.cluster.local"
+        or type(workspace.get("port")) is not int
+        or workspace.get("port") != 30022
+        or workspace.get("_runtime_incarnation") is not None
+        or workspace.get("_docker_workspace_lease_id") is not None
+        or workspace.get("pod_ip") is not None
+        or workspace.get("ide_host") is not None
+        or workspace.get("ide_port") is not None
+        or binding.get("kind") != "remote"
+        or re.fullmatch(
+            r"SHA256:[A-Za-z0-9+/]{43}",
+            str(binding.get("ssh_host_key_fingerprint") or ""),
+        )
+        is None
+    ):
+        return None
+    try:
+        binding_generation = _canonical_uuid_text(
+            binding.get("generation"), label="retained workspace binding generation"
+        )
+        if (
+            _canonical_uuid_text(
+                workspace.get("_canvas_workspace_generation"),
+                label="retained workspace endpoint generation",
+            )
+            != binding_generation
+        ):
+            return None
+        backing_id = str(binding.get("backing_id") or "")
+        expected_prefix = f"k8s-pvc:{namespace}:"
+        if not backing_id.startswith(expected_prefix):
+            return None
+        pvc_uid = _canonical_uuid_text(
+            backing_id.removeprefix(expected_prefix),
+            label="retained workspace PVC UID",
+        )
+    except RuntimeError:
+        return None
+
+    row = await conn.fetchrow(
+        """
+        SELECT intent.runtime_generation::text AS runtime_generation
+          FROM thread_workspace_provision_intents AS intent
+          JOIN thread_runtime_retirement_outcomes AS outcome
+            ON outcome.thread_id = intent.thread_id
+           AND outcome.runtime_generation = intent.runtime_generation
+         WHERE intent.thread_id = $1::uuid
+           AND intent.namespace = $2
+           AND intent.pod_name = $3
+           AND intent.pvc_name = $4
+           AND intent.pvc_uid = $5
+           AND intent.status = 'published'
+           AND intent.runtime_generation <> $6::uuid
+           AND outcome.disposition = 'ended'
+           AND outcome.permanent = false
+           AND outcome.outcome = 'settled'
+         ORDER BY intent.resolved_at DESC NULLS LAST, intent.created_at DESC
+         LIMIT 1
+         FOR SHARE OF intent, outcome
+        """,
+        thread_id,
+        namespace,
+        pod_name,
+        pvc_name,
+        pvc_uid,
+        current_generation,
+    )
+    if row is None:
+        return None
+    try:
+        return _canonical_uuid_text(
+            row["runtime_generation"],
+            label="retired workspace provision generation",
+        )
+    except RuntimeError:
+        return None
+
+
 def _pinned_retirement_local_quiescence_matches(
     context: Any,
     receipt: Any,
@@ -11241,7 +11345,20 @@ class PostgresDB:
                         "_canvas_workspace_generation",
                     )
                 ):
-                    return None
+                    predecessor_generation = (
+                        await _settled_pinned_workspace_predecessor_generation(
+                            conn,
+                            thread_id=parsed_thread,
+                            current_generation=parsed_generation,
+                            workspace=workspace,
+                            binding=current_binding or {},
+                            namespace=parsed_namespace,
+                            pod_name=parsed_pod_name,
+                            pvc_name=parsed_pvc_name,
+                        )
+                    )
+                    if predecessor_generation is None:
+                        return None
                 if not _json_runtime_status_is_absent(current_vm) or any(
                     _json_field_is_nonnull(current_vm, field)
                     for field in (

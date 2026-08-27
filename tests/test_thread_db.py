@@ -58,6 +58,104 @@ def _mock_conn():
 
 
 @pytest.mark.asyncio
+async def test_pinned_workspace_resume_accepts_exact_soft_retired_pvc_shell():
+    thread_id = UUID("aaaaaaaa-1111-4222-8333-444444444444")
+    current_generation = UUID("11111111-1111-4111-8111-111111111111")
+    retired_generation = UUID("22222222-2222-4222-8222-222222222222")
+    attempt = UUID("33333333-3333-4333-8333-333333333333")
+    pvc_uid = UUID("44444444-4444-4444-8444-444444444444")
+    endpoint_generation = UUID("55555555-5555-4555-8555-555555555555")
+    namespace = "srw-test"
+    pod_name = f"ws-thread-{str(thread_id)[:12]}"
+    pvc_name = f"pvc-{pod_name}"
+    service_name = pod_name
+    workspace = {
+        "status": "deleted",
+        "provisioner": "k8s",
+        "namespace": namespace,
+        "pod_name": pod_name,
+        "host": f"{pod_name}.{namespace}.svc.cluster.local",
+        "port": 30022,
+        "pod_ip": None,
+        "ide_host": None,
+        "ide_port": None,
+        "_runtime_incarnation": None,
+        "_canvas_workspace_generation": str(endpoint_generation),
+    }
+    binding = {
+        "kind": "remote",
+        "backing_id": f"k8s-pvc:{namespace}:{pvc_uid}",
+        "generation": str(endpoint_generation),
+        "ssh_host_key_fingerprint": "SHA256:" + ("A" * 43),
+    }
+    thread = {
+        "status": "created",
+        "execution_lane": "pinned",
+        "runtime_generation": current_generation,
+        "runtime_retirement_token": None,
+        "agent_id": None,
+        "runtime_attach_token": None,
+        "metadata": {
+            "workspace_container": workspace,
+            "_workspace_binding": binding,
+        },
+    }
+    intent = {
+        "attempt_id": attempt,
+        "runtime_generation": current_generation,
+        "pod_name": pod_name,
+        "pvc_name": pvc_name,
+        "seed_configmap_name": None,
+        "service_name": service_name,
+    }
+    conn = _mock_conn()
+    conn.fetch = AsyncMock(return_value=[])
+    conn.fetchrow = AsyncMock(
+        side_effect=[
+            thread,
+            None,
+            {"runtime_generation": str(retired_generation)},
+            intent,
+        ]
+    )
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    db = _make_db_with_conn(conn)
+
+    result = await db.reserve_pinned_thread_workspace_provision_intent(
+        str(thread_id),
+        expected_runtime_generation=str(current_generation),
+        expected_agent_id=None,
+        expected_attach_token=None,
+        expected_workspace_context=workspace,
+        expected_binding_context=binding,
+        attempt_id=str(attempt),
+        namespace=namespace,
+        pod_name=pod_name,
+        pvc_name=pvc_name,
+        seed_configmap_name=None,
+        service_name=service_name,
+        retained_service_uid=None,
+        network_tier="internet-only",
+        manifest_fingerprint="a" * 64,
+    )
+
+    assert result == intent
+    pending_metadata = json.loads(conn.execute.await_args.args[4])
+    pending = pending_metadata["workspace_container"]
+    assert pending["status"] == "pending"
+    assert pending["_workspace_provision_generation"] == str(current_generation)
+    assert pending["_runtime_incarnation"] is None
+    assert pending["pod_name"] is None
+    proof_call = conn.fetchrow.await_args_list[2]
+    proof_sql = " ".join(proof_call.args[0].split())
+    assert "JOIN thread_runtime_retirement_outcomes AS outcome" in proof_sql
+    assert "intent.runtime_generation <> $6::uuid" in proof_sql
+    assert "outcome.permanent = false" in proof_sql
+    assert "outcome.outcome = 'settled'" in proof_sql
+    assert proof_call.args[6] == current_generation
+
+
+@pytest.mark.asyncio
 async def test_complete_pinned_workspace_intent_decodes_jsonb_previous_binding_text():
     """Real asyncpg returns this JSONB column as text in the deployed pool."""
 
