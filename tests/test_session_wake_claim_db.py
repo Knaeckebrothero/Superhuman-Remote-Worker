@@ -53,9 +53,10 @@ def pg_dsn():
 async def db(pg_dsn):
     """Minimal real-FK session/wake schema carrying the production SQL shape.
 
-    Mirrors migrations 0070/0071 rather than replaying the full migration chain
-    — including the partial index and ``ON DELETE SET NULL`` FK, so both claim
-    planning and hard-delete settlement use real PostgreSQL lock/FK semantics.
+    Mirrors migrations 0070/0071 rather than replaying the full migration chain,
+    plus the minimal current lifecycle projection read by hard delete. This
+    keeps claim planning and delete settlement on real PostgreSQL lock/FK
+    semantics without duplicating unrelated application tables.
     """
     d = PostgresDB(connection_string=pg_dsn)
     await d.connect()
@@ -70,6 +71,12 @@ async def db(pg_dsn):
         await conn.execute("DROP TABLE IF EXISTS thread_turn_commits CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_rewinds CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_messages CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS agents CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS cloud_ro_mounts CASCADE")
+        await conn.execute(
+            "DROP TABLE IF EXISTS thread_agent_pod_provision_intents CASCADE"
+        )
+        await conn.execute("DROP TABLE IF EXISTS thread_agent_workspace_claims CASCADE")
         await conn.execute("DROP TABLE IF EXISTS threads CASCADE")
         await conn.execute(
             """
@@ -77,9 +84,29 @@ async def db(pg_dsn):
                 id uuid PRIMARY KEY,
                 execution_lane text NOT NULL DEFAULT 'pinned',
                 status text NOT NULL DEFAULT 'ended',
-                metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+                metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+                agent_id uuid,
+                control_admission_agent_id uuid,
+                runtime_attach_token uuid,
+                runtime_generation uuid NOT NULL DEFAULT gen_random_uuid(),
+                runtime_retirement_token uuid,
+                runtime_retirement_permanent boolean,
+                runtime_retirement_authorized_at timestamptz,
+                runtime_retirement_context jsonb,
+                runtime_retirement_local_quiescence jsonb,
+                runtime_retirement_external_cleanup jsonb,
+                runtime_authority_exposed boolean NOT NULL DEFAULT false
             )
             """
+        )
+        await conn.execute("CREATE TABLE agents (id uuid PRIMARY KEY, thread_id uuid)")
+        await conn.execute("CREATE TABLE cloud_ro_mounts (thread_id uuid, status text)")
+        await conn.execute(
+            "CREATE TABLE thread_agent_pod_provision_intents "
+            "(thread_id uuid, status text)"
+        )
+        await conn.execute(
+            "CREATE TABLE thread_agent_workspace_claims (thread_id uuid, status text)"
         )
         await conn.execute(
             """

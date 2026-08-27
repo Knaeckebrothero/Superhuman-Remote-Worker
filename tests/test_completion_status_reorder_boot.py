@@ -22,6 +22,7 @@ import main  # noqa: E402
 async def test_reorder_without_completion_commands_fails_before_db_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", False)
     monkeypatch.setattr(main, "COMPLETION_STATUS_REORDER_ENABLED", True)
     connect = AsyncMock()
@@ -40,6 +41,7 @@ async def test_reorder_without_completion_commands_fails_before_db_connect(
 async def test_reorder_with_completion_commands_reaches_db_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(main, "COMPLETION_STATUS_REORDER_ENABLED", True)
 

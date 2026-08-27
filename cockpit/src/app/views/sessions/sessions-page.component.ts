@@ -175,7 +175,8 @@ interface Project {
             <div class="session-card"
                  data-testid="session-card"
                  [attr.data-thread-id]="thread.id"
-                 [class.ended]="thread.status === 'ended'">
+                 [class.ended]="thread.status === 'ended'"
+                 [class.ending]="thread.status === 'ending'">
               <div class="session-heading" (click)="openSession(thread)">
                 <span class="session-status-dot" [class]="thread.status"></span>
                 <span class="session-title">
@@ -210,6 +211,7 @@ interface Project {
                 <app-icon-button
                   [ariaLabel]="'sessions.tooltip.resume' | transloco"
                   [tooltip]="'sessions.tooltip.resume' | transloco"
+                  [disabled]="thread.status === 'ending'"
                   (clicked)="resumeSession(thread)"
                 >
                   <app-icon size="sm">play_arrow</app-icon>
@@ -218,6 +220,7 @@ interface Project {
                   variant="danger"
                   [ariaLabel]="'sessions.tooltip.delete' | transloco"
                   [tooltip]="'sessions.tooltip.delete' | transloco"
+                  [disabled]="thread.status === 'ending'"
                   (clicked)="deleteSession(thread)"
                 >
                   <app-icon size="sm">delete</app-icon>
@@ -435,6 +438,7 @@ interface Project {
     }
 
     .session-status-dot.active, .session-status-dot.created { background: var(--success); }
+    .session-status-dot.ending { background: var(--warning, #f59e0b); }
     .session-status-dot.ended { background: var(--surface-2); }
 
     .session-title {
@@ -590,6 +594,10 @@ export class SessionsPageComponent implements OnInit {
         const filter = this.statusFilter();
         const all = this.threads();
         if (!filter) return all;
+        // "Active" is the non-terminal bucket shown by activeCount: created,
+        // awaiting, suspended and the non-resumable ending handoff all remain
+        // visible until the authoritative ended transition lands.
+        if (filter === 'active') return all.filter(t => t.status !== 'ended');
         return all.filter(t => t.status === filter);
     };
 
@@ -608,7 +616,13 @@ export class SessionsPageComponent implements OnInit {
             const data = await firstValueFrom(
                 this.http.get<{ threads: Thread[] }>(`${environment.apiUrl}/persistent/threads`)
             );
-            this.threads.set(data.threads || []);
+            this.threads.set(
+                (data.threads || []).map(thread =>
+                    thread.runtime_retirement_pending === true
+                        ? { ...thread, status: 'ending' as const }
+                        : thread,
+                ),
+            );
         } catch (e) {
             // Silent — sessions not available
         }
@@ -796,7 +810,10 @@ export class SessionsPageComponent implements OnInit {
         } catch (e: any) {
             // Mid-turn guard (session_silent_failure_audit.md #11): a
             // cleanup sweep used to tear down live sessions silently.
-            if (e?.status === 409) {
+            if (
+                e?.status === 409 &&
+                e?.error?.detail?.code === 'turn_in_flight'
+            ) {
                 // Live/mid-turn session — escalate to a force-delete confirm.
                 this.confirmForceOpen.set(true);
                 return;

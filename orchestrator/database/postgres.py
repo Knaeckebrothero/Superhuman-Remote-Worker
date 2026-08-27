@@ -51,6 +51,7 @@ from security.crypto import (
 from utils.db_url import build_postgres_url
 from src.shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from src.shared.job_steering import context_delivery_key, queued_reply_key
+from src.shared.pinned_session_identity import PinnedSessionBinding
 from src.shared.deliverable_contract import (
     parse_required_deliverables,
     pr_repositories,
@@ -65,8 +66,30 @@ from src.shared.workspace_contract import (
     vm_mode_from_env,
     workspace_contract_projection,
 )
+from services.cloud.backend_instance_authority import (
+    MAIN_CLOUD_BACKEND_INSTANCE_VERSION,
+    MainCloudBackendInstanceAuthority,
+)
+from services.cloud.protected_effect_contract import (
+    NextcloudEffectFenceIntent,
+    NextcloudEffectHorizon,
+)
+from services.cloud.protected_reader_authority import (
+    ProtectedNextcloudReaderGrantPlan,
+)
+from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
 
 logger = logging.getLogger(__name__)
+
+# A same-name Kubernetes fence must outlive every non-watch API request that
+# could still commit the original create.  The deployment's documented
+# apiserver request horizon is five minutes; keep an equal safety margin and
+# reject configurations that would reopen the key earlier.
+PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS = int(
+    os.getenv("PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS", "600")
+)
+if PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS < 600:
+    raise RuntimeError("PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS must be at least 600")
 
 _WORKSPACE_REQUEST_UNSET = object()
 
@@ -550,6 +573,27 @@ def _stateless_runtime_creation_context(
     return metadata, workspace, runtime, marker
 
 
+def _advisory_identity_bytes(value: object) -> bytes:
+    """Canonical identity bytes for UUID-backed advisory-lock resources."""
+
+    try:
+        return UUID(str(value)).bytes
+    except (TypeError, ValueError):
+        # Non-UUID ids are isolated-test/legacy fixtures only. Keep a stable
+        # fallback while ensuring harmless case/whitespace spelling changes do
+        # not split one logical lock.
+        return str(value).strip().lower().encode()
+
+
+def _thread_lifecycle_lock_key(thread_id: str) -> int:
+    """Stable canonical lock key for one thread lifecycle authority."""
+
+    digest = hashlib.blake2b(
+        b"thread_lifecycle:" + _advisory_identity_bytes(thread_id), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
 def _thread_datasource_lock_key(thread_id: str) -> int:
     """Stable, domain-separated advisory-lock key for connector delivery.
 
@@ -558,7 +602,8 @@ def _thread_datasource_lock_key(thread_id: str) -> int:
     also makes it safe to attach while provisioning already owns that lock.
     """
     digest = hashlib.blake2b(
-        b"datasource_selection:" + thread_id.encode(), digest_size=8
+        b"datasource_selection:" + _advisory_identity_bytes(thread_id),
+        digest_size=8,
     ).digest()
     return int.from_bytes(digest, byteorder="big", signed=True)
 
@@ -574,15 +619,8 @@ def _stateless_cancel_cleanup_lock_key(job_id: UUID) -> int:
 
 def _stateless_session_workspace_ensure_lock_key(thread_id: str) -> int:
     """Domain-separated session advisory key for physical workspace recovery."""
-    try:
-        identity = UUID(str(thread_id)).bytes
-    except (TypeError, ValueError):
-        # Non-UUID ids exist only in isolated tests/legacy fixtures. Preserve a
-        # stable fallback while canonicalizing every production thread UUID so
-        # upper/lower/text spellings cannot split one lifecycle lock.
-        identity = str(thread_id).strip().lower().encode()
     digest = hashlib.blake2b(
-        b"stateless_session_workspace_ensure:" + identity,
+        b"stateless_session_workspace_ensure:" + _advisory_identity_bytes(thread_id),
         digest_size=8,
     ).digest()
     return int.from_bytes(digest, byteorder="big", signed=True)
@@ -1187,6 +1225,490 @@ PG_TYPE_MAP = {
 }
 
 
+def _json_field_is_nonnull(value: dict[str, Any], key: str) -> bool:
+    """Match PostgreSQL JSONB ``->> key IS NOT NULL`` exactly."""
+
+    return key in value and value[key] is not None
+
+
+def _json_runtime_status_is_absent(value: dict[str, Any]) -> bool:
+    """Only a missing/null, empty-string, or exact deleted status is absent."""
+
+    if "status" not in value or value["status"] is None:
+        return True
+    return isinstance(value["status"], str) and value["status"] in {"", "deleted"}
+
+
+def _pinned_retirement_local_quiescence_matches(
+    context: Any,
+    receipt: Any,
+    *,
+    runtime_generation: str | UUID,
+    retirement_token: str | UUID,
+    final_status: str,
+    permanent: bool = False,
+) -> bool:
+    """Validate the physical-zero receipt captured by one pinned retirement.
+
+    The UPDATE trigger enforces this shape for soft settlement. Permanent
+    deletion has a separate database trigger because DELETE never invokes the
+    UPDATE trigger; keeping the same predicate here makes the application
+    helper fail before it performs auxiliary deletes during rolling upgrades.
+    """
+
+    if not isinstance(context, dict):
+        return False
+    workspace = context.get("workspace_container")
+    binding = context.get("workspace_binding")
+    vm = context.get("vm")
+    agent = context.get("agent")
+    agent_pod = context.get("agent_pod")
+    provision_intent = context.get("agent_pod_provision_intent")
+    workspace_provision_intent = context.get("workspace_provision_intent")
+    workspace_claim = context.get("agent_workspace_claim")
+    protected_ro = context.get("protected_ro")
+    workspace = {} if workspace is None else workspace
+    binding = {} if binding is None else binding
+    vm = {} if vm is None else vm
+    agent = {} if agent is None else agent
+    agent_pod = {} if agent_pod is None else agent_pod
+    provision_intent = {} if provision_intent is None else provision_intent
+    workspace_provision_intent = (
+        {} if workspace_provision_intent is None else workspace_provision_intent
+    )
+    workspace_claim = {} if workspace_claim is None else workspace_claim
+    protected_ro = {} if protected_ro is None else protected_ro
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            workspace,
+            binding,
+            vm,
+            agent,
+            agent_pod,
+            provision_intent,
+            workspace_provision_intent,
+            workspace_claim,
+            protected_ro,
+        )
+    ):
+        return False
+    if (
+        agent
+        and (not agent.get("hostname") or not agent.get("pod_uid"))
+        or agent_pod
+        and (not agent_pod.get("pod_name") or not agent_pod.get("pod_uid"))
+        or provision_intent
+        and (
+            not provision_intent.get("attempt_id")
+            or not provision_intent.get("pod_name")
+            or provision_intent.get("provisioner") not in {"agent", "persistent"}
+            or provision_intent.get("status") != "planned"
+        )
+        or workspace_claim
+        and (
+            not workspace_claim.get("claim_id")
+            or not workspace_claim.get("pvc_name")
+            or workspace_claim.get("provisioner") not in {"agent", "persistent"}
+            or workspace_claim.get("status") not in {"planned", "ready"}
+            or (workspace_claim.get("status") == "ready")
+            != bool(str(workspace_claim.get("pvc_uid") or ""))
+        )
+    ):
+        return False
+    runtime_exposed = bool(
+        context.get("runtime_authority_exposed") is True
+        or context.get("agent_id")
+        or context.get("runtime_attach_token")
+        or agent
+        or agent_pod
+        or provision_intent
+    )
+    if not runtime_exposed:
+        return True
+    if not isinstance(receipt, dict):
+        return False
+
+    backend = str(context.get("workspace_backend") or "")
+    sandbox_generation = binding.get("generation")
+    sandbox_runtime = (
+        workspace.get(_DOCKER_WORKSPACE_LEASE_KEY)
+        if workspace.get("provisioner") == "docker"
+        else workspace.get("_runtime_incarnation")
+    )
+    sandbox_physical_evidence = bool(
+        binding
+        or _json_field_is_nonnull(workspace, "_runtime_incarnation")
+        or not _json_runtime_status_is_absent(workspace)
+        or any(
+            _json_field_is_nonnull(workspace, field)
+            for field in (
+                "pod_ip",
+                "pod_name",
+                "host",
+                "port",
+                "ide_host",
+                "ide_port",
+                "_canvas_workspace_generation",
+            )
+        )
+    )
+    pre_provision_intent_zero = bool(
+        provision_intent
+        and not agent
+        and not agent_pod
+        and context.get("agent_id") is None
+        and context.get("runtime_attach_token") is None
+    )
+    workspace_create_pending = bool(workspace_provision_intent)
+    if pre_provision_intent_zero or workspace_create_pending:
+        expected_protocol = "agent_runtime_zero_v1"
+    elif backend == "sandbox":
+        if (
+            permanent
+            and sandbox_physical_evidence
+            and str(receipt.get("quiescence_actor") or "") == "orchestrator"
+            and str(receipt.get("quiescence_protocol") or "")
+            == "sandbox_actuator_zero_v1"
+        ):
+            expected_protocol = "sandbox_actuator_zero_v1"
+        elif sandbox_generation and sandbox_runtime:
+            expected_protocol = "workspace_process_zero_v1"
+        elif not sandbox_generation and not sandbox_runtime:
+            expected_protocol = "agent_runtime_zero_v1"
+        else:
+            return False
+    elif backend in {"virtual", "none"}:
+        expected_protocol = "agent_runtime_zero_v1"
+    elif backend in {"vm", "remote"}:
+        expected_protocol = "workspace_actuator_zero_v1"
+    else:
+        expected_protocol = None
+    expected_workspace_generation = (
+        None
+        if pre_provision_intent_zero or workspace_create_pending
+        else vm.get("provision_generation")
+        if backend in {"vm", "remote"}
+        else sandbox_generation
+        if backend == "sandbox"
+        else None
+    )
+    expected_workspace_runtime = (
+        None
+        if pre_provision_intent_zero or workspace_create_pending
+        else vm.get("vm_uid")
+        if backend in {"vm", "remote"}
+        else sandbox_runtime
+        if backend == "sandbox"
+        else None
+    )
+    if (
+        not pre_provision_intent_zero
+        and backend in {"vm", "remote"}
+        and (not expected_workspace_generation or not expected_workspace_runtime)
+    ):
+        return False
+    pre_registration_pod_zero = bool(
+        agent_pod
+        and not agent
+        and context.get("agent_id") is None
+        and context.get("runtime_attach_token") is None
+    )
+    return bool(
+        int(receipt.get("version") or 0) == 1
+        and str(receipt.get("runtime_generation") or "") == str(runtime_generation)
+        and str(receipt.get("retirement_token") or "") == str(retirement_token)
+        and str(receipt.get("agent_id") or "") == str(context.get("agent_id") or "")
+        and str(receipt.get("runtime_attach_token") or "")
+        == str(context.get("runtime_attach_token") or "")
+        and str(receipt.get("settle_status") or "") == final_status
+        and str(receipt.get("quiescence_protocol") or "") == expected_protocol
+        and str(receipt.get("quiescence_actor") or "") in {"agent", "orchestrator"}
+        and str(receipt.get("workspace_generation") or "")
+        == str(expected_workspace_generation or "")
+        and str(receipt.get("workspace_runtime_incarnation") or "")
+        == str(expected_workspace_runtime or "")
+        and (
+            not pre_registration_pod_zero
+            or (
+                str(receipt.get("quiescence_actor") or "") == "orchestrator"
+                and str(receipt.get("quiescence_protocol") or "")
+                == "agent_runtime_zero_v1"
+                and str(receipt.get("agent_pod_name") or "")
+                == str(agent_pod.get("pod_name") or "")
+                and str(receipt.get("agent_pod_uid") or "")
+                == str(agent_pod.get("pod_uid") or "")
+            )
+        )
+        and (
+            not pre_provision_intent_zero
+            or (
+                str(receipt.get("quiescence_actor") or "") == "orchestrator"
+                and str(receipt.get("quiescence_protocol") or "")
+                == "agent_runtime_zero_v1"
+                and str(receipt.get("agent_pod_provision_attempt") or "")
+                == str(provision_intent.get("attempt_id") or "")
+                and str(receipt.get("agent_pod_name") or "")
+                == str(provision_intent.get("pod_name") or "")
+                and bool(str(receipt.get("agent_pod_uid") or ""))
+                and receipt.get("agent_pod_fence_protocol") == "k8s_name_tombstone_v1"
+            )
+        )
+    )
+
+
+def _pinned_retirement_external_cleanup_expected(
+    context: Any,
+    *,
+    runtime_generation: str | UUID,
+    retirement_token: str | UUID,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Build the exact append-once external-cleanup receipt for one T/G.
+
+    Resource absence in mutable thread metadata is not proof that an exact
+    actuator ran: a stale/unaware writer can clear JSON without deleting a Pod,
+    PVC, VM/rootdisk, Docker lease, or protected reader.  The physical-clear
+    CAS publishes this receipt in the same row-locked UPDATE that removes the
+    captured identities.  Both the application delete helper and the database
+    DELETE trigger validate it independently.
+    """
+
+    if not isinstance(context, dict):
+        return False, None
+    raw_workspace = context.get("workspace_container")
+    raw_binding = context.get("workspace_binding")
+    raw_agent_claim = context.get("agent_workspace_claim")
+    raw_workspace_intent = context.get("workspace_provision_intent")
+    raw_vm = context.get("vm")
+    raw_ro = context.get("protected_ro")
+    workspace = {} if raw_workspace is None else raw_workspace
+    binding = {} if raw_binding is None else raw_binding
+    agent_claim = {} if raw_agent_claim is None else raw_agent_claim
+    workspace_intent = {} if raw_workspace_intent is None else raw_workspace_intent
+    vm = {} if raw_vm is None else raw_vm
+    protected_ro = {} if raw_ro is None else raw_ro
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            workspace,
+            binding,
+            agent_claim,
+            workspace_intent,
+            vm,
+            protected_ro,
+        )
+    ):
+        return False, None
+    if agent_claim:
+        required_claim_fields = (
+            "claim_id",
+            "thread_id",
+            "created_runtime_generation",
+            "create_attempt",
+            "provisioner",
+            "pvc_name",
+            "status",
+        )
+        if not all(
+            str(agent_claim.get(field) or "") for field in required_claim_fields
+        ):
+            return False, None
+        try:
+            UUID(str(agent_claim["claim_id"]))
+            UUID(str(agent_claim["thread_id"]))
+            UUID(str(agent_claim["created_runtime_generation"]))
+            UUID(str(agent_claim["create_attempt"]))
+        except (TypeError, ValueError):
+            return False, None
+        if (
+            agent_claim.get("provisioner") not in {"agent", "persistent"}
+            or agent_claim.get("status") not in {"planned", "ready"}
+            or (agent_claim.get("status") == "ready")
+            != bool(str(agent_claim.get("pvc_uid") or ""))
+        ):
+            return False, None
+
+    if workspace_intent:
+        required_intent_fields = (
+            "attempt_id",
+            "thread_id",
+            "runtime_generation",
+            "namespace",
+            "pod_name",
+            "network_tier",
+            "manifest_fingerprint",
+            "status",
+        )
+        if not all(
+            str(workspace_intent.get(field) or "") for field in required_intent_fields
+        ):
+            return False, None
+        try:
+            UUID(str(workspace_intent["attempt_id"]))
+            UUID(str(workspace_intent["thread_id"]))
+            UUID(str(workspace_intent["runtime_generation"]))
+            created_agent = workspace_intent.get("created_agent_id")
+            created_attach = workspace_intent.get("created_attach_token")
+            if created_agent is not None:
+                UUID(str(created_agent))
+            if created_attach is not None:
+                UUID(str(created_attach))
+        except (TypeError, ValueError):
+            return False, None
+        if (
+            str(workspace_intent.get("thread_id"))
+            != str(context.get("thread_id") or "")
+            or str(workspace_intent.get("runtime_generation"))
+            != str(runtime_generation)
+            or (workspace_intent.get("created_agent_id") is None)
+            != (workspace_intent.get("created_attach_token") is None)
+            or workspace_intent.get("status") not in {"planned", "fenced", "retired"}
+            or not isinstance(workspace_intent.get("previous_binding"), dict)
+            or dict(workspace_intent.get("previous_binding") or {}) != binding
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(workspace_intent.get("manifest_fingerprint") or ""),
+            )
+            is None
+            or not str(workspace_intent.get("pod_name") or "")
+            or (
+                (workspace_intent.get("pvc_name") is None)
+                != (workspace_intent.get("service_name") is None)
+            )
+        ):
+            return False, None
+
+    workspace_physical_evidence = bool(
+        not _json_runtime_status_is_absent(workspace)
+        or any(
+            _json_field_is_nonnull(workspace, field)
+            for field in (
+                "_runtime_incarnation",
+                _DOCKER_WORKSPACE_LEASE_KEY,
+                "pod_ip",
+                "pod_name",
+                "host",
+                "port",
+                "ide_host",
+                "ide_port",
+                "_canvas_workspace_generation",
+            )
+        )
+    )
+    sandbox_evidence = bool(binding or workspace_physical_evidence)
+    vm_evidence = bool(
+        not _json_runtime_status_is_absent(vm)
+        or any(
+            _json_field_is_nonnull(vm, field)
+            for field in (
+                "provision_generation",
+                "identity_provision_generation",
+                "vm_uid",
+                "_runtime_incarnation",
+                "rootdisk_pvc_uid",
+                "ssh_host",
+                "ssh_port",
+                "_canvas_workspace_generation",
+            )
+        )
+    )
+    backend = str(context.get("workspace_backend") or "")
+    if workspace_intent:
+        # The attempt owns all names it may have submitted, including a
+        # retained K8s backing during restore.  Its same-name fence/retired
+        # work item is the external proof; the pending metadata marker is not
+        # itself a published process endpoint and must not be forced through
+        # the ordinary K8s Pod/binding tuple.
+        if vm_evidence:
+            return False, None
+        workspace_protocol = "workspace_provision_fence_v1"
+    elif backend == "sandbox":
+        if vm_evidence or (binding and binding.get("kind") == "virtual"):
+            return False, None
+        workspace_protocol = (
+            "sandbox_actuator_zero_v1" if sandbox_evidence else "external_none_v1"
+        )
+    elif backend in {"vm", "remote"}:
+        if sandbox_evidence:
+            return False, None
+        workspace_protocol = (
+            "workspace_actuator_zero_v1" if vm_evidence else "external_none_v1"
+        )
+    elif backend == "virtual":
+        if vm_evidence or workspace_physical_evidence:
+            return False, None
+        if binding and (
+            binding.get("kind") != "virtual"
+            or not re.fullmatch(
+                r"rclone:[0-9a-f]{64}", str(binding.get("backing_id") or "")
+            )
+        ):
+            return False, None
+        workspace_protocol = (
+            "virtual_backing_zero_v1" if binding else "external_none_v1"
+        )
+    elif backend == "none":
+        if sandbox_evidence or vm_evidence:
+            return False, None
+        workspace_protocol = "external_none_v1"
+    else:
+        return False, None
+
+    ro_live = str(protected_ro.get("status") or "") in {
+        "engaging",
+        "active",
+        "revoking",
+    }
+    if ro_live and not all(
+        str(protected_ro.get(field) or "")
+        for field in (
+            "id",
+            "runtime_generation",
+            "engage_attempt",
+            "grant_handle",
+        )
+    ):
+        return False, None
+    receipt = {
+        "version": 1,
+        "runtime_generation": str(runtime_generation),
+        "retirement_token": str(retirement_token),
+        "cleanup_actor": "orchestrator",
+        "workspace_cleanup_protocol": workspace_protocol,
+        "agent_workspace_cleanup_protocol": (
+            "k8s_pvc_name_tombstone_v1" if agent_claim else None
+        ),
+        "protected_reader_cleanup_protocol": (
+            "protected_reader_zero_v1" if ro_live else None
+        ),
+        "captured_resources": {
+            "workspace_backend": backend,
+            "workspace_container": raw_workspace,
+            "workspace_binding": raw_binding,
+            "agent_workspace_claim": raw_agent_claim,
+            "workspace_provision_intent": raw_workspace_intent,
+            "vm": raw_vm,
+            "protected_ro": raw_ro,
+        },
+    }
+    return True, receipt
+
+
+def _pinned_retirement_external_cleanup_matches(
+    context: Any,
+    receipt: Any,
+    *,
+    runtime_generation: str | UUID,
+    retirement_token: str | UUID,
+) -> bool:
+    valid, expected = _pinned_retirement_external_cleanup_expected(
+        context,
+        runtime_generation=runtime_generation,
+        retirement_token=retirement_token,
+    )
+    return bool(valid and isinstance(receipt, dict) and receipt == expected)
+
+
 # =============================================================================
 # Contacts registry (knowledge-history/done/contacts_registry.md)
 # =============================================================================
@@ -1330,6 +1852,22 @@ class PostgresDB:
         self._pool: Optional[asyncpg.Pool] = None
         self._queries: Dict[str, str] = {}  # Cache for loaded queries
         self._migrations_dir: Path = migrations_dir or MIGRATIONS_APP_DIR
+        # Long lifecycle owners need a dedicated PostgreSQL session because
+        # their external K8s/SSH/S3 work performs nested application-pool
+        # queries. Bound those sessions per replica; lock losers poll with a
+        # short-lived connection and never accumulate blocking DB backends.
+        dedicated_slots = max(
+            1,
+            int(os.getenv("POSTGRES_DEDICATED_ADVISORY_LOCK_SLOTS", "4")),
+        )
+        # Domains are deliberately separate. Lifecycle ownership nests the
+        # datasource-delivery boundary during pool attach; one shared
+        # non-reentrant semaphore lets N outer owners consume all N permits
+        # and deadlock on their inner locks.
+        self._dedicated_advisory_lock_slot_groups = {
+            domain: asyncio.Semaphore(dedicated_slots)
+            for domain in ("lifecycle", "datasource", "workspace")
+        }
 
         logger.info("PostgresDB initialized (not connected yet)")
 
@@ -2942,46 +3480,13 @@ class PostgresDB:
         blocking form so it cannot race a recreate already in progress.
         """
         key = _stateless_session_workspace_ensure_lock_key(str(thread_id))
-        if asyncpg is None:
-            raise RuntimeError("asyncpg is required for stateless workspace recovery")
-        conn = await asyncpg.connect(
-            self._connection_string,
-            timeout=5,
-            # A blocking lifecycle lock deliberately outlives the ordinary
-            # statement timeout. The socket tenure (and advisory unlock in
-            # ``finally``) is the cancellation boundary instead.
-            command_timeout=(None if wait else getattr(self, "_command_timeout", 60)),
-        )
-        acquired = False
-        try:
-            if wait:
-                acquire = conn.execute("SELECT pg_advisory_lock($1)", key)
-                if wait_timeout_s is None:
-                    await acquire
-                else:
-                    await asyncio.wait_for(acquire, timeout=float(wait_timeout_s))
-                acquired = True
-            else:
-                acquired = bool(
-                    await conn.fetchval("SELECT pg_try_advisory_lock($1)", key)
-                )
+        async with self._dedicated_session_advisory_lock(
+            key,
+            domain="workspace",
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+        ) as acquired:
             yield acquired
-        finally:
-            try:
-                if acquired:
-                    unlocked = await conn.fetchval("SELECT pg_advisory_unlock($1)", key)
-                    if not unlocked:
-                        logger.error(
-                            "Stateless session workspace advisory unlock failed "
-                            "for thread %s",
-                            thread_id,
-                        )
-            finally:
-                try:
-                    await conn.close(timeout=5)
-                except BaseException:
-                    conn.terminate()
-                    raise
 
     async def stateless_cancel_cleanup_pending(self, job_id: str) -> bool | None:
         """Return marker state for a cleanup-lock owner.
@@ -4382,6 +4887,759 @@ class PostgresDB:
 
     # ---- protected cloud mode: per-mount RO reader grants (design §8.1.4) ----
 
+    async def get_protected_effect_database_time(self) -> datetime:
+        """Return PostgreSQL wall time for capability/dispatch bracketing."""
+
+        async with self.acquire() as conn:
+            value = await conn.fetchval("SELECT clock_timestamp()")
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise RuntimeError("PostgreSQL returned a malformed protected-effect time")
+        return value.astimezone(timezone.utc)
+
+    async def install_ro_mount_engage_intent(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        selected_mount_id: str,
+        expected_runtime_generation: str,
+        plan: ProtectedNextcloudReaderGrantPlan,
+        credentials: str,
+        webdav_url: str,
+        auth_kind: str = "basic",
+    ) -> dict[str, Any] | None:
+        """Persist one exact, non-deliverable grant before its first effect.
+
+        A different unresolved attempt is never overwritten. A confirmed
+        revoked attempt may be replaced; live staging is preserved only when
+        its immutable logical source is byte-for-byte identical.
+        """
+
+        if (
+            not isinstance(plan, ProtectedNextcloudReaderGrantPlan)
+            or not isinstance(credentials, str)
+            or not credentials
+            or not isinstance(webdav_url, str)
+            or not webdav_url
+            or auth_kind != "basic"
+        ):
+            return None
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_user = UUID(str(user_id))
+            parsed_mount = UUID(str(selected_mount_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_attempt = UUID(plan.engage_attempt)
+            parsed_instance = UUID(plan.backend_instance_id)
+        except (TypeError, ValueError):
+            return None
+        encrypted_credentials = _encrypt_optional(credentials)
+        if encrypted_credentials is None:
+            return None
+        source_json = json.dumps(
+            plan.source.binding,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    """
+                    SELECT id
+                      FROM threads
+                     WHERE id=$1::uuid
+                       AND user_id=$2::uuid
+                       AND execution_lane='pinned'
+                       AND runtime_generation=$3::uuid
+                       AND runtime_retirement_token IS NULL
+                       AND status IN ('created','active','awaiting_user','suspended')
+                     FOR UPDATE
+                    """,
+                    parsed_thread,
+                    parsed_user,
+                    parsed_generation,
+                )
+                if thread is None:
+                    return None
+                mount_row = await conn.fetchrow(
+                    """
+                    SELECT id, thread_id, mount_kind, target_path, source_kind,
+                           source_ref, backend_id, backend_instance_id,
+                           cloud_handle, webdav_url, target_user_sub, created_at
+                      FROM thread_mounts
+                     WHERE id=$1::uuid AND thread_id=$2::uuid
+                     FOR SHARE
+                    """,
+                    parsed_mount,
+                    parsed_thread,
+                )
+                selected_source = ProtectedMountSourceIdentity.from_mount_row(
+                    dict(mount_row) if mount_row is not None else None
+                )
+                if selected_source != plan.source:
+                    return None
+                backend_exists = await conn.fetchval(
+                    """
+                    SELECT true
+                      FROM main_cloud_backend_instances
+                     WHERE id=$1::uuid AND backend_id='nextcloud'
+                     FOR SHARE
+                    """,
+                    parsed_instance,
+                )
+                if backend_exists is not True:
+                    return None
+
+                existing_row = await conn.fetchrow(
+                    "SELECT * FROM cloud_ro_mounts WHERE thread_id=$1::uuid FOR UPDATE",
+                    parsed_thread,
+                )
+                if existing_row is not None:
+                    existing = self._ro_mount_row(existing_row)
+                    same_attempt = (
+                        str(existing.get("runtime_generation") or "")
+                        == str(parsed_generation)
+                        and str(existing.get("engage_attempt") or "")
+                        == str(parsed_attempt)
+                        and str(existing.get("backend_instance_id") or "")
+                        == str(parsed_instance)
+                        and existing.get("backend") == "nextcloud"
+                        and existing.get("reader_id") == plan.reader_id
+                        and existing.get("grant_group_id") == plan.group_id
+                        and existing.get("grant_handle") == plan.grant_handle
+                        and existing.get("grant_handle_sha256")
+                        == plan.grant_handle_sha256
+                        and existing.get("source_binding") == plan.source.binding
+                        and existing.get("source_binding_sha256") == plan.source.sha256
+                        and existing.get("credentials") == credentials
+                        and existing.get("webdav_url") == webdav_url
+                        and existing.get("auth_kind") == auth_kind
+                    )
+                    if same_attempt:
+                        if existing.get("status") not in {"engaging", "active"}:
+                            return None
+                        return {
+                            "id": str(existing["id"]),
+                            "status": existing["status"],
+                            "idempotent": True,
+                        }
+                    if existing.get("status") != "revoked":
+                        return None
+                    unresolved_effect = await conn.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                              FROM cloud_ro_effect_intents
+                             WHERE engage_attempt=$1::uuid
+                               AND (
+                                   status <> 'closed'
+                                   OR safe_after > clock_timestamp()
+                               )
+                        )
+                        """,
+                        existing.get("engage_attempt"),
+                    )
+                    if unresolved_effect:
+                        return None
+                    staging_live = existing.get("staged_summary") is not None
+                    same_source = (
+                        existing.get("source_binding") == plan.source.binding
+                        and existing.get("source_binding_sha256") == plan.source.sha256
+                    )
+                    if staging_live and not same_source:
+                        return None
+                    result = await conn.execute(
+                        """
+                        UPDATE cloud_ro_mounts
+                           SET user_id=$2::uuid,
+                               backend='nextcloud',
+                               backend_instance_id=$3::uuid,
+                               reader_id=$4,
+                               grant_group_id=$5,
+                               grant_handle=$6,
+                               grant_handle_sha256=$7,
+                               credentials=$8,
+                               webdav_url=$9,
+                               auth_kind='basic',
+                               status='engaging',
+                               runtime_generation=$10::uuid,
+                               engage_attempt=$11::uuid,
+                               source_binding=$12::jsonb,
+                               source_binding_sha256=$13,
+                               selected_mount_id=$14::uuid,
+                               etag_baseline=CASE WHEN $15 THEN etag_baseline ELSE NULL END,
+                               staged_epoch=CASE WHEN $15 THEN staged_epoch ELSE 0 END,
+                               staged_at=CASE WHEN $15 THEN staged_at ELSE NULL END,
+                               staged_summary=CASE WHEN $15 THEN staged_summary ELSE NULL END,
+                               created_at=now(), revoked_at=NULL,
+                               revocation_started_at=NULL,
+                               remote_absence_verified_at=NULL,
+                               failure_code=NULL
+                         WHERE id=$1::uuid AND status='revoked'
+                        """,
+                        existing["id"],
+                        parsed_user,
+                        parsed_instance,
+                        plan.reader_id,
+                        plan.group_id,
+                        plan.grant_handle,
+                        plan.grant_handle_sha256,
+                        encrypted_credentials,
+                        webdav_url,
+                        parsed_generation,
+                        parsed_attempt,
+                        source_json,
+                        plan.source.sha256,
+                        parsed_mount,
+                        staging_live,
+                    )
+                    if result != "UPDATE 1":
+                        return None
+                    return {
+                        "id": str(existing["id"]),
+                        "status": "engaging",
+                        "idempotent": False,
+                    }
+
+                row_id = await conn.fetchval(
+                    """
+                    INSERT INTO cloud_ro_mounts (
+                        thread_id, user_id, backend, backend_instance_id,
+                        reader_id, grant_group_id, grant_handle,
+                        grant_handle_sha256, credentials, webdav_url, auth_kind,
+                        status, runtime_generation, engage_attempt,
+                        source_binding, source_binding_sha256, selected_mount_id
+                    ) VALUES (
+                        $1::uuid,$2::uuid,'nextcloud',$3::uuid,$4,$5,$6,$7,$8,$9,
+                        'basic','engaging',$10::uuid,$11::uuid,$12::jsonb,$13,
+                        $14::uuid
+                    )
+                    RETURNING id::text
+                    """,
+                    parsed_thread,
+                    parsed_user,
+                    parsed_instance,
+                    plan.reader_id,
+                    plan.group_id,
+                    plan.grant_handle,
+                    plan.grant_handle_sha256,
+                    encrypted_credentials,
+                    webdav_url,
+                    parsed_generation,
+                    parsed_attempt,
+                    source_json,
+                    plan.source.sha256,
+                    parsed_mount,
+                )
+                return (
+                    {"id": row_id, "status": "engaging", "idempotent": False}
+                    if row_id is not None
+                    else None
+                )
+
+    async def install_cloud_ro_effect_intent(
+        self,
+        *,
+        thread_id: str,
+        expected_runtime_generation: str,
+        expected_engage_attempt: str,
+        intent: NextcloudEffectFenceIntent,
+    ) -> str | None:
+        """Commit one signed pre-effect intent under exact T/G/A authority."""
+
+        if not isinstance(intent, NextcloudEffectFenceIntent):
+            return None
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_attempt = UUID(str(expected_engage_attempt))
+            parsed_instance = UUID(intent.request.backend_instance_id)
+        except (TypeError, ValueError):
+            return None
+        if intent.request.engage_attempt != str(parsed_attempt):
+            return None
+        fence_json = json.dumps(
+            intent.binding,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                authority = await conn.fetchval(
+                    """
+                    SELECT ro.id
+                      FROM cloud_ro_mounts AS ro
+                      JOIN threads AS thread ON thread.id=ro.thread_id
+                     WHERE ro.thread_id=$1::uuid
+                       AND ro.runtime_generation=$2::uuid
+                       AND ro.engage_attempt=$3::uuid
+                       AND ro.backend='nextcloud'
+                       AND ro.backend_instance_id=$4::uuid
+                       AND ro.status='engaging'
+                       AND thread.execution_lane='pinned'
+                       AND thread.runtime_generation=$2::uuid
+                       AND thread.runtime_retirement_token IS NULL
+                       AND thread.status IN
+                           ('created','active','awaiting_user','suspended')
+                     FOR UPDATE OF ro, thread
+                    """,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_attempt,
+                    parsed_instance,
+                )
+                if authority is None:
+                    return None
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO cloud_ro_effect_intents (
+                        thread_id, runtime_generation, engage_attempt,
+                        backend_instance_id, backend_id, config_sha256,
+                        request_authority_sha256, fence_intent
+                    ) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'nextcloud',$5,$6,$7::jsonb)
+                    ON CONFLICT (engage_attempt, request_authority_sha256)
+                    DO NOTHING
+                    RETURNING id::text, fence_intent
+                    """,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_attempt,
+                    parsed_instance,
+                    intent.request.config_sha256,
+                    intent.request.authority_sha256,
+                    fence_json,
+                )
+                if row is not None:
+                    return str(row["id"])
+                existing = await conn.fetchrow(
+                    """
+                    SELECT id::text, thread_id, runtime_generation,
+                           backend_instance_id, backend_id, config_sha256,
+                           fence_intent
+                      FROM cloud_ro_effect_intents
+                     WHERE engage_attempt=$1::uuid
+                       AND request_authority_sha256=$2
+                     FOR SHARE
+                    """,
+                    parsed_attempt,
+                    intent.request.authority_sha256,
+                )
+                if existing is None:
+                    return None
+                persisted_fence = existing["fence_intent"]
+                if isinstance(persisted_fence, str):
+                    try:
+                        persisted_fence = json.loads(persisted_fence)
+                    except (TypeError, ValueError):
+                        return None
+                if not (
+                    existing["thread_id"] == parsed_thread
+                    and existing["runtime_generation"] == parsed_generation
+                    and existing["backend_instance_id"] == parsed_instance
+                    and existing["backend_id"] == "nextcloud"
+                    and existing["config_sha256"] == intent.request.config_sha256
+                    and persisted_fence == intent.binding
+                ):
+                    return None
+                return str(existing["id"])
+
+    async def close_cloud_ro_effect_intent(
+        self,
+        effect_intent_id: str,
+        *,
+        expected_thread_id: str,
+        expected_runtime_generation: str,
+        expected_engage_attempt: str,
+        horizon: NextcloudEffectHorizon,
+    ) -> bool:
+        """Append the exact signed/recomputed dispatch horizon once."""
+
+        if not isinstance(horizon, NextcloudEffectHorizon):
+            return False
+        try:
+            parsed_id = UUID(str(effect_intent_id))
+            parsed_thread = UUID(str(expected_thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_attempt = UUID(str(expected_engage_attempt))
+        except (TypeError, ValueError):
+            return False
+        if horizon.engage_attempt != str(parsed_attempt):
+            return False
+        horizon_json = json.dumps(
+            horizon.binding,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE cloud_ro_effect_intents
+                   SET status='closed', horizon=$6::jsonb,
+                       dispatch_closed_at=$7, safe_after=$8, closed_at=now()
+                 WHERE id=$1::uuid
+                   AND thread_id=$2::uuid
+                   AND runtime_generation=$3::uuid
+                   AND engage_attempt=$4::uuid
+                   AND request_authority_sha256=$5
+                   AND config_sha256=$9
+                   AND fence_intent=$10::jsonb
+                   AND status='planned'
+                """,
+                parsed_id,
+                parsed_thread,
+                parsed_generation,
+                parsed_attempt,
+                horizon.request_authority_sha256,
+                horizon_json,
+                horizon.dispatch_closed_at,
+                horizon.safe_after,
+                horizon.config_sha256,
+                json.dumps(
+                    horizon.intent.binding,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        return result == "UPDATE 1"
+
+    async def list_unclosed_cloud_ro_effect_intents(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(int(limit), 500))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, thread_id, runtime_generation, engage_attempt,
+                       backend_instance_id, backend_id, config_sha256,
+                       request_authority_sha256, fence_intent, created_at
+                  FROM cloud_ro_effect_intents
+                 WHERE status='planned'
+                 ORDER BY created_at, id
+                 LIMIT $1
+                """,
+                bounded_limit,
+            )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            if isinstance(item.get("fence_intent"), str):
+                try:
+                    item["fence_intent"] = json.loads(item["fence_intent"])
+                except (TypeError, ValueError):
+                    item["fence_intent"] = None
+            result.append(item)
+        return result
+
+    async def get_cloud_ro_effect_horizon_state(
+        self,
+        engage_attempt: str,
+    ) -> dict[str, Any] | None:
+        try:
+            parsed_attempt = UUID(str(engage_attempt))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT count(*)::integer AS effect_count,
+                       count(*) FILTER (WHERE status='planned')::integer
+                           AS planned_count,
+                       max(safe_after) FILTER (WHERE status='closed') AS safe_after,
+                       clock_timestamp() AS db_now
+                  FROM cloud_ro_effect_intents
+                 WHERE engage_attempt=$1::uuid
+                """,
+                parsed_attempt,
+            )
+        if row is None:
+            return None
+        safe_after = row["safe_after"]
+        db_now = row["db_now"]
+        planned_count = int(row["planned_count"] or 0)
+        return {
+            "effect_count": int(row["effect_count"] or 0),
+            "planned_count": planned_count,
+            "safe_after": safe_after,
+            "db_now": db_now,
+            "fence_elapsed": planned_count == 0
+            and (safe_after is None or safe_after <= db_now),
+        }
+
+    @staticmethod
+    def _ro_mount_matches_protected_plan(
+        row: Mapping[str, Any] | None,
+        plan: ProtectedNextcloudReaderGrantPlan,
+    ) -> bool:
+        if not isinstance(row, Mapping) or not isinstance(
+            plan, ProtectedNextcloudReaderGrantPlan
+        ):
+            return False
+        source = ProtectedMountSourceIdentity.from_binding(
+            row.get("source_binding"),
+            expected_sha256=str(row.get("source_binding_sha256") or ""),
+        )
+        return bool(
+            source == plan.source
+            and row.get("backend") == "nextcloud"
+            and str(row.get("backend_instance_id") or "") == plan.backend_instance_id
+            and str(row.get("engage_attempt") or "") == plan.engage_attempt
+            and row.get("reader_id") == plan.reader_id
+            and row.get("grant_group_id") == plan.group_id
+            and row.get("grant_handle") == plan.grant_handle
+            and row.get("grant_handle_sha256") == plan.grant_handle_sha256
+        )
+
+    async def activate_ro_mount_attempt_with_baseline(
+        self,
+        row_id: str,
+        baseline: dict[str, str],
+        *,
+        thread_id: str,
+        user_id: str,
+        selected_mount_id: str,
+        expected_runtime_generation: str,
+        plan: ProtectedNextcloudReaderGrantPlan,
+    ) -> bool:
+        """Publish only the exact still-selected T/G/A/source grant row."""
+
+        if not isinstance(baseline, dict) or not all(
+            isinstance(path, str) and isinstance(etag, str)
+            for path, etag in baseline.items()
+        ):
+            return False
+        try:
+            parsed_row = UUID(str(row_id))
+            parsed_thread = UUID(str(thread_id))
+            parsed_user = UUID(str(user_id))
+            parsed_mount = UUID(str(selected_mount_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(plan, ProtectedNextcloudReaderGrantPlan):
+            return False
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchval(
+                    """
+                    SELECT id
+                      FROM threads
+                     WHERE id=$1::uuid
+                       AND user_id=$2::uuid
+                       AND execution_lane='pinned'
+                       AND runtime_generation=$3::uuid
+                       AND runtime_retirement_token IS NULL
+                       AND status IN ('created','active','awaiting_user','suspended')
+                     FOR UPDATE
+                    """,
+                    parsed_thread,
+                    parsed_user,
+                    parsed_generation,
+                )
+                if thread is None:
+                    return False
+                mount_row = await conn.fetchrow(
+                    """
+                    SELECT id, thread_id, mount_kind, target_path, source_kind,
+                           source_ref, backend_id, backend_instance_id,
+                           cloud_handle, webdav_url, target_user_sub, created_at
+                      FROM thread_mounts
+                     WHERE id=$1::uuid AND thread_id=$2::uuid
+                     FOR SHARE
+                    """,
+                    parsed_mount,
+                    parsed_thread,
+                )
+                selected_source = ProtectedMountSourceIdentity.from_mount_row(
+                    dict(mount_row) if mount_row is not None else None
+                )
+                if selected_source != plan.source:
+                    return False
+                raw = await conn.fetchrow(
+                    "SELECT * FROM cloud_ro_mounts WHERE id=$1::uuid FOR UPDATE",
+                    parsed_row,
+                )
+                if raw is None:
+                    return False
+                row = self._ro_mount_row(raw)
+                if not (
+                    row.get("status") == "engaging"
+                    and str(row.get("thread_id") or "") == str(parsed_thread)
+                    and str(row.get("user_id") or "") == str(parsed_user)
+                    and str(row.get("runtime_generation") or "")
+                    == str(parsed_generation)
+                    and str(row.get("selected_mount_id") or "") == str(parsed_mount)
+                    and self._ro_mount_matches_protected_plan(row, plan)
+                ):
+                    return False
+                result = await conn.execute(
+                    """
+                    UPDATE cloud_ro_mounts
+                       SET etag_baseline=$2::jsonb,
+                           status='active', revoked_at=NULL,
+                           failure_code=NULL
+                     WHERE id=$1::uuid AND status='engaging'
+                    """,
+                    parsed_row,
+                    json.dumps(baseline, sort_keys=True, separators=(",", ":")),
+                )
+                return result == "UPDATE 1"
+
+    async def begin_ro_mount_revocation_if_matches(
+        self,
+        row_id: str,
+        *,
+        expected_thread_id: str,
+        expected_runtime_generation: str,
+        plan: ProtectedNextcloudReaderGrantPlan,
+    ) -> bool:
+        """Fence A against publication/remint before its first remote delete."""
+
+        try:
+            parsed_row = UUID(str(row_id))
+            parsed_thread = UUID(str(expected_thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                raw = await conn.fetchrow(
+                    "SELECT * FROM cloud_ro_mounts WHERE id=$1::uuid FOR UPDATE",
+                    parsed_row,
+                )
+                if raw is None:
+                    return False
+                row = self._ro_mount_row(raw)
+                if not (
+                    row.get("status") in {"engaging", "active", "revoking"}
+                    and str(row.get("thread_id") or "") == str(parsed_thread)
+                    and str(row.get("runtime_generation") or "")
+                    == str(parsed_generation)
+                    and self._ro_mount_matches_protected_plan(row, plan)
+                ):
+                    return False
+                if row.get("status") == "revoking":
+                    return True
+                result = await conn.execute(
+                    """
+                    UPDATE cloud_ro_mounts
+                       SET status='revoking',
+                           revocation_started_at=COALESCE(revocation_started_at, now()),
+                           failure_code=NULL
+                     WHERE id=$1::uuid AND status IN ('engaging','active')
+                    """,
+                    parsed_row,
+                )
+                return result == "UPDATE 1"
+
+    async def finish_ro_mount_revocation_if_matches(
+        self,
+        row_id: str,
+        *,
+        expected_thread_id: str,
+        expected_runtime_generation: str,
+        plan: ProtectedNextcloudReaderGrantPlan,
+    ) -> bool:
+        """Publish revoked only after every A dispatch horizon has elapsed.
+
+        The caller performs strict post-horizon group+reader deletion first.
+        PostgreSQL supplies the time check and records the remote-absence proof
+        in the same exact-attempt transition; a lost/late A callback cannot
+        settle a replacement B occupying the one-row projection.
+        """
+
+        try:
+            parsed_row = UUID(str(row_id))
+            parsed_thread = UUID(str(expected_thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_attempt = UUID(plan.engage_attempt)
+        except (TypeError, ValueError, AttributeError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                raw = await conn.fetchrow(
+                    "SELECT * FROM cloud_ro_mounts WHERE id=$1::uuid FOR UPDATE",
+                    parsed_row,
+                )
+                if raw is None:
+                    return False
+                row = self._ro_mount_row(raw)
+                if not (
+                    row.get("status") == "revoking"
+                    and str(row.get("thread_id") or "") == str(parsed_thread)
+                    and str(row.get("runtime_generation") or "")
+                    == str(parsed_generation)
+                    and self._ro_mount_matches_protected_plan(row, plan)
+                ):
+                    return False
+                horizon = await conn.fetchrow(
+                    """
+                    SELECT count(*) FILTER (WHERE status='planned')::integer
+                               AS planned_count,
+                           max(safe_after) FILTER (WHERE status='closed')
+                               AS safe_after,
+                           clock_timestamp() AS db_now
+                      FROM cloud_ro_effect_intents
+                     WHERE engage_attempt=$1::uuid
+                    """,
+                    parsed_attempt,
+                )
+                if horizon is None or int(horizon["planned_count"] or 0) != 0:
+                    return False
+                safe_after = horizon["safe_after"]
+                if safe_after is not None and safe_after > horizon["db_now"]:
+                    return False
+                result = await conn.execute(
+                    """
+                    UPDATE cloud_ro_mounts
+                       SET status='revoked', revoked_at=now(),
+                           remote_absence_verified_at=clock_timestamp(),
+                           credentials=NULL, failure_code=NULL
+                     WHERE id=$1::uuid AND status='revoking'
+                    """,
+                    parsed_row,
+                )
+                return result == "UPDATE 1"
+
+    async def list_unsettled_ro_mount_authorities(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return exact non-secret engage/revoke work for the leader sweep."""
+
+        bounded_limit = max(1, min(int(limit), 500))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, thread_id, user_id, backend, backend_instance_id,
+                       reader_id, grant_group_id, grant_handle,
+                       grant_handle_sha256, status, runtime_generation,
+                       engage_attempt, source_binding, source_binding_sha256,
+                       selected_mount_id, staged_epoch, staged_summary,
+                       etag_baseline, created_at, revocation_started_at
+                  FROM cloud_ro_mounts
+                 WHERE status IN ('engaging','active','revoking')
+                 ORDER BY created_at, id
+                 LIMIT $1
+                """,
+                bounded_limit,
+            )
+        result: list[dict[str, Any]] = []
+        for raw in rows:
+            row = dict(raw)
+            for field in ("source_binding", "staged_summary", "etag_baseline"):
+                if isinstance(row.get(field), str):
+                    try:
+                        row[field] = json.loads(row[field])
+                    except (TypeError, ValueError):
+                        row[field] = None
+            result.append(row)
+        return result
+
     async def create_ro_mount(
         self,
         *,
@@ -4393,23 +5651,44 @@ class PostgresDB:
         credentials: str | None,
         webdav_url: str,
         auth_kind: str,
-    ) -> str:
-        """Upsert the per-mount RO grant row (one live grant per thread).
+        expected_runtime_generation: str,
+        engage_attempt: str,
+    ) -> str | None:
+        """Upsert an unpublished RO grant row (one row per thread).
 
         Encrypts ``credentials`` at rest. A re-provision on the same thread
-        replaces the prior grant row in place (ON CONFLICT).
+        replaces the prior grant row in place (ON CONFLICT). ``engaging`` is
+        intentionally not deliverable; a separate exact CAS publishes
+        ``active`` together with its complete baseline.
         """
         async with self.acquire() as conn:
             return await conn.fetchval(
                 """
                 INSERT INTO cloud_ro_mounts
                     (thread_id, user_id, backend, reader_id, grant_handle,
-                     credentials, webdav_url, auth_kind, status)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active')
+                     credentials, webdav_url, auth_kind, status,
+                     runtime_generation, engage_attempt)
+                SELECT $1,$2,$3,$4,$5,$6,$7,$8,'engaging',$9::uuid,$10::uuid
+                  FROM threads
+                 WHERE id = $1
+                   AND execution_lane = 'pinned'
+                   AND runtime_generation = $9::uuid
+                   AND runtime_retirement_token IS NULL
+                   AND status IN ('created','active','awaiting_user','suspended')
                 ON CONFLICT (thread_id) DO UPDATE SET
                     user_id=$2, backend=$3, reader_id=$4, grant_handle=$5,
                     credentials=$6, webdav_url=$7, auth_kind=$8,
-                    status='active', created_at=now(), revoked_at=NULL
+                    status='engaging', created_at=now(), revoked_at=NULL,
+                    runtime_generation=$9::uuid, engage_attempt=$10::uuid
+                WHERE EXISTS (
+                    SELECT 1 FROM threads
+                     WHERE id = $1
+                       AND execution_lane = 'pinned'
+                       AND runtime_generation = $9::uuid
+                       AND runtime_retirement_token IS NULL
+                       AND status IN
+                           ('created','active','awaiting_user','suspended')
+                )
                 RETURNING id::text
                 """,
                 thread_id,
@@ -4420,7 +5699,37 @@ class PostgresDB:
                 _encrypt_optional(credentials),
                 webdav_url,
                 auth_kind,
+                expected_runtime_generation,
+                engage_attempt,
             )
+
+    async def activate_ro_mount_with_baseline(
+        self,
+        row_id: str,
+        baseline: dict[str, str],
+        *,
+        expected_runtime_generation: str,
+        expected_engage_attempt: str,
+        expected_grant_handle: str,
+    ) -> bool:
+        """Atomically publish an exact engage attempt and its baseline."""
+
+        if not isinstance(baseline, dict):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE cloud_ro_mounts SET etag_baseline=$2::jsonb, "
+                "status='active', revoked_at=NULL "
+                "WHERE id=$1::uuid AND status='engaging' "
+                "AND runtime_generation=$3::uuid AND engage_attempt=$4::uuid "
+                "AND grant_handle=$5",
+                row_id,
+                json.dumps(baseline),
+                expected_runtime_generation,
+                expected_engage_attempt,
+                expected_grant_handle,
+            )
+        return result == "UPDATE 1"
 
     async def get_ro_mount_by_thread(self, thread_id: str) -> dict | None:
         async with self.acquire() as conn:
@@ -4432,7 +5741,8 @@ class PostgresDB:
     async def list_active_ro_mounts(self) -> list[dict]:
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM cloud_ro_mounts WHERE status='active'"
+                "SELECT * FROM cloud_ro_mounts "
+                "WHERE status IN ('engaging','active','revoking')"
             )
         return [self._ro_mount_row(r) for r in rows]
 
@@ -4447,13 +5757,43 @@ class PostgresDB:
         async with self.acquire() as conn:
             result = await conn.execute(
                 "UPDATE cloud_ro_mounts SET status='revoked', revoked_at=now() "
-                "WHERE id=$1 AND status='active'",
+                "WHERE id=$1 AND status IN ('engaging','active','revoking')",
                 row_id,
             )
         return result == "UPDATE 1"
 
+    async def mark_ro_mount_revoked_if_matches(
+        self,
+        row_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_engage_attempt: str,
+        expected_grant_handle: str,
+    ) -> bool:
+        """Revoke only the exact protected-reader incarnation."""
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE cloud_ro_mounts SET status='revoked', revoked_at=now() "
+                "WHERE id=$1::uuid AND status IN ('engaging','active','revoking') "
+                "AND runtime_generation=$2::uuid AND engage_attempt=$3::uuid "
+                "AND grant_handle=$4",
+                row_id,
+                expected_runtime_generation,
+                expected_engage_attempt,
+                expected_grant_handle,
+            )
+        return result == "UPDATE 1"
+
     async def update_ro_mount_baseline(
-        self, row_id: str, baseline: dict[str, str], *, require_active: bool = True
+        self,
+        row_id: str,
+        baseline: dict[str, str],
+        *,
+        require_active: bool = True,
+        expected_engage_attempt: str | None = None,
+        expected_source_binding_sha256: str | None = None,
+        expected_staged_epoch: int | None = None,
     ) -> bool:
         """Persist the etag baseline (engage-time capture / post-apply re-capture).
 
@@ -4467,11 +5807,39 @@ class PostgresDB:
         late apply/reject on an ended thread doesn't wedge behind a status
         clause that reads have no such gate for.
         """
+        exact_source = (
+            expected_engage_attempt is not None
+            or expected_source_binding_sha256 is not None
+            or expected_staged_epoch is not None
+        )
+        if exact_source:
+            try:
+                expected_engage_attempt = str(UUID(str(expected_engage_attempt)))
+                expected_staged_epoch = int(expected_staged_epoch)
+            except (TypeError, ValueError):
+                return False
+            if not re.fullmatch(
+                r"[0-9a-f]{64}", str(expected_source_binding_sha256 or "")
+            ):
+                return False
         query = "UPDATE cloud_ro_mounts SET etag_baseline = $2::jsonb WHERE id = $1"
         if require_active:
             query += " AND status = 'active'"
+        values: list[Any] = [row_id, json.dumps(baseline)]
+        if exact_source:
+            query += (
+                " AND engage_attempt=$3::uuid AND source_binding_sha256=$4 "
+                "AND staged_epoch=$5"
+            )
+            values.extend(
+                [
+                    expected_engage_attempt,
+                    expected_source_binding_sha256,
+                    expected_staged_epoch,
+                ]
+            )
         async with self.acquire() as conn:
-            result = await conn.execute(query, row_id, json.dumps(baseline))
+            result = await conn.execute(query, *values)
         return result == "UPDATE 1"
 
     async def update_ro_mount_staging(
@@ -4481,12 +5849,27 @@ class PostgresDB:
         staged_epoch: int,
         staged_summary: dict | None,
         require_active: bool = True,
+        expected_engage_attempt: str | None = None,
+        expected_source_binding_sha256: str | None = None,
     ) -> bool:
         """Advance the staging epoch. staged_summary=None clears the staged state.
 
         See ``update_ro_mount_baseline`` for the ``require_active`` contract —
         same rationale, same default.
         """
+        exact_source = (
+            expected_engage_attempt is not None
+            or expected_source_binding_sha256 is not None
+        )
+        if exact_source:
+            try:
+                expected_engage_attempt = str(UUID(str(expected_engage_attempt)))
+            except (TypeError, ValueError):
+                return False
+            if not re.fullmatch(
+                r"[0-9a-f]{64}", str(expected_source_binding_sha256 or "")
+            ):
+                return False
         query = (
             "UPDATE cloud_ro_mounts SET staged_epoch = $2, "
             "staged_summary = $3::jsonb, "
@@ -4495,14 +5878,618 @@ class PostgresDB:
         )
         if require_active:
             query += " AND status = 'active'"
+        values: list[Any] = [
+            row_id,
+            staged_epoch,
+            json.dumps(staged_summary) if staged_summary is not None else None,
+        ]
+        if exact_source:
+            query += " AND engage_attempt=$4::uuid AND source_binding_sha256=$5"
+            values.extend([expected_engage_attempt, expected_source_binding_sha256])
         async with self.acquire() as conn:
-            result = await conn.execute(
-                query,
-                row_id,
-                staged_epoch,
-                json.dumps(staged_summary) if staged_summary is not None else None,
-            )
+            result = await conn.execute(query, *values)
         return result == "UPDATE 1"
+
+    async def publish_ro_mount_staging_exact(
+        self,
+        row_id: str,
+        *,
+        thread_id: str,
+        expected_runtime_generation: str,
+        expected_retirement_token: str | None,
+        expected_agent_id: str | None,
+        expected_attach_token: str | None,
+        expected_workspace: dict[str, Any],
+        expected_workspace_binding: dict[str, Any],
+        expected_engage_attempt: str,
+        expected_source_binding_sha256: str,
+        expected_staged_epoch: int,
+        staged_epoch: int,
+        staged_summary: dict | None,
+        retirement_stage_kind: str = "uploaded",
+    ) -> dict[str, Any] | None:
+        """Publish one staged generation under the complete source authority.
+
+        S3 writes happen before this transaction and use immutable keys.  This
+        is the sole visibility point: the exact thread generation/retirement
+        mode, physical workspace tuple, reader attempt and prior epoch must all
+        still match.  A stale producer may leave unreachable immutable blobs,
+        but can never make them the reviewable generation.
+        """
+
+        try:
+            parsed_row = UUID(str(row_id))
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = (
+                UUID(str(expected_retirement_token))
+                if expected_retirement_token is not None
+                else None
+            )
+            parsed_agent = (
+                UUID(str(expected_agent_id)) if expected_agent_id is not None else None
+            )
+            parsed_attach = (
+                UUID(str(expected_attach_token))
+                if expected_attach_token is not None
+                else None
+            )
+            parsed_attempt = UUID(str(expected_engage_attempt))
+        except (TypeError, ValueError):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{64}", str(expected_source_binding_sha256 or "")):
+            return None
+        if retirement_stage_kind not in {"uploaded", "empty", "unchanged"}:
+            return None
+        if retirement_stage_kind == "unchanged":
+            if staged_epoch != expected_staged_epoch:
+                return None
+        elif staged_epoch != expected_staged_epoch + 1:
+            return None
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    """
+                    SELECT status, user_id, agent_id, runtime_attach_token,
+                           runtime_retirement_token, metadata
+                      FROM threads
+                     WHERE id=$1::uuid
+                       AND execution_lane='pinned'
+                       AND runtime_generation=$2::uuid
+                       AND runtime_retirement_token IS NOT DISTINCT FROM $3::uuid
+                       AND agent_id IS NOT DISTINCT FROM $4::uuid
+                       AND runtime_attach_token IS NOT DISTINCT FROM $5::uuid
+                       AND ($3::uuid IS NULL OR runtime_retirement_authorized_at IS NOT NULL)
+                       AND ($4::uuid IS NOT NULL OR runtime_authority_exposed=false)
+                       AND status IN ('created','active','awaiting_user','suspended')
+                     FOR UPDATE
+                    """,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                    parsed_agent,
+                    parsed_attach,
+                )
+                if thread is None:
+                    return None
+                metadata = thread.get("metadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return None
+                if not isinstance(metadata, dict):
+                    return None
+                if (metadata.get("workspace_container") or {}) != expected_workspace:
+                    return None
+                if (
+                    metadata.get("_workspace_binding") or {}
+                ) != expected_workspace_binding:
+                    return None
+
+                if retirement_stage_kind == "unchanged":
+                    unchanged = await conn.fetchval(
+                        """
+                        SELECT id
+                          FROM cloud_ro_mounts
+                         WHERE id=$1::uuid
+                           AND thread_id=$2::uuid
+                           AND runtime_generation=$3::uuid
+                           AND engage_attempt=$4::uuid
+                           AND source_binding_sha256=$7
+                           AND staged_epoch=$5
+                           AND staged_summary IS NOT DISTINCT FROM $6::jsonb
+                           AND status='active'
+                         FOR UPDATE
+                        """,
+                        parsed_row,
+                        parsed_thread,
+                        parsed_generation,
+                        parsed_attempt,
+                        expected_staged_epoch,
+                        (
+                            json.dumps(staged_summary)
+                            if staged_summary is not None
+                            else None
+                        ),
+                        expected_source_binding_sha256,
+                    )
+                    if unchanged is None:
+                        return None
+                else:
+                    result = await conn.execute(
+                        """
+                        UPDATE cloud_ro_mounts
+                           SET staged_epoch=$6,
+                               staged_summary=$7::jsonb,
+                               staged_at=CASE WHEN $7::text IS NULL THEN NULL ELSE now() END
+                         WHERE id=$1::uuid
+                           AND thread_id=$2::uuid
+                           AND runtime_generation=$3::uuid
+                           AND engage_attempt=$4::uuid
+                           AND source_binding_sha256=$8
+                           AND staged_epoch=$5
+                           AND status='active'
+                        """,
+                        parsed_row,
+                        parsed_thread,
+                        parsed_generation,
+                        parsed_attempt,
+                        expected_staged_epoch,
+                        staged_epoch,
+                        (
+                            json.dumps(staged_summary)
+                            if staged_summary is not None
+                            else None
+                        ),
+                        expected_source_binding_sha256,
+                    )
+                    if result != "UPDATE 1":
+                        return None
+                stage_receipt: dict[str, Any] | None = None
+                if parsed_retirement is not None:
+                    binding_generation = str(
+                        expected_workspace_binding.get("generation") or ""
+                    )
+                    runtime_incarnation = str(
+                        expected_workspace.get("_runtime_incarnation") or ""
+                    )
+                    try:
+                        binding_generation = str(UUID(binding_generation))
+                        runtime_incarnation = str(UUID(runtime_incarnation))
+                    except (TypeError, ValueError):
+                        raise RuntimeError(
+                            "retirement staging lacks exact workspace identity"
+                        )
+                    stage_receipt = {
+                        "version": 1,
+                        "kind": retirement_stage_kind,
+                        "runtime_generation": str(parsed_generation),
+                        "retirement_token": str(parsed_retirement),
+                        "mount_id": str(parsed_row),
+                        "engage_attempt": str(parsed_attempt),
+                        "source_binding_sha256": expected_source_binding_sha256,
+                        "workspace_generation": binding_generation,
+                        "workspace_runtime_incarnation": runtime_incarnation,
+                        "expected_staged_epoch": int(expected_staged_epoch),
+                        "staged_epoch": int(staged_epoch),
+                        "staged_summary": staged_summary,
+                    }
+                    receipt_write = await conn.execute(
+                        """
+                        UPDATE threads
+                           SET runtime_retirement_stage_receipt=$4::jsonb
+                         WHERE id=$1::uuid
+                           AND runtime_generation=$2::uuid
+                           AND runtime_retirement_token=$3::uuid
+                           AND runtime_retirement_authorized_at IS NOT NULL
+                           AND runtime_retirement_permanent=false
+                           AND runtime_retirement_stage_receipt IS NULL
+                        """,
+                        parsed_thread,
+                        parsed_generation,
+                        parsed_retirement,
+                        json.dumps(
+                            stage_receipt,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+                    if receipt_write != "UPDATE 1":
+                        # Returning from this transaction rolls the RO update
+                        # back too; no review can become visible without its
+                        # retry authority.
+                        raise RuntimeError(
+                            "retirement stage receipt publication lost authority"
+                        )
+                return {
+                    "thread_status": str(thread["status"]),
+                    "user_id": str(thread["user_id"]),
+                    "runtime_retirement_pending": parsed_retirement is not None,
+                    "retirement_stage_receipt": stage_receipt,
+                }
+
+    async def publish_never_engaged_retirement_stage_receipt(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+    ) -> dict[str, Any] | None:
+        """Receipt a protected runtime whose RO credential was never delivered.
+
+        An ``active`` reader row alone means its backend probe completed; it
+        does not mean any runtime received the credential.  The narrow
+        no-actor/no-workspace shape may therefore exact-revoke that captured
+        grant first and publish this zero-stage receipt.  Any staged overlay,
+        replacement reader, or physical/actor evidence remains fail-closed.
+        """
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_token = UUID(str(expected_retirement_token))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT agent_id, control_admission_agent_id,
+                           runtime_attach_token, metadata,
+                           runtime_authority_exposed,
+                           runtime_retirement_context,
+                           runtime_retirement_stage_receipt,
+                           runtime_retirement_local_quiescence
+                      FROM threads
+                     WHERE id=$1::uuid
+                       AND execution_lane='pinned'
+                       AND runtime_generation=$2::uuid
+                       AND runtime_retirement_token=$3::uuid
+                       AND runtime_retirement_authorized_at IS NOT NULL
+                       AND runtime_retirement_permanent=false
+                     FOR UPDATE
+                    """,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_token,
+                )
+                if row is None:
+                    return None
+                existing = row["runtime_retirement_stage_receipt"]
+                if existing is not None:
+                    return dict(existing) if isinstance(existing, Mapping) else None
+                context = row["runtime_retirement_context"] or {}
+                metadata = row["metadata"] or {}
+                local_quiescence = row["runtime_retirement_local_quiescence"]
+                if isinstance(context, str):
+                    try:
+                        context = json.loads(context)
+                    except (TypeError, ValueError):
+                        return None
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return None
+                if isinstance(local_quiescence, str):
+                    try:
+                        local_quiescence = json.loads(local_quiescence)
+                    except (TypeError, ValueError):
+                        return None
+                if not isinstance(context, dict) or not isinstance(metadata, dict):
+                    return None
+                captured_workspace = context.get("workspace_container")
+                captured_binding = context.get("workspace_binding")
+                captured_vm = context.get("vm")
+                current_workspace = metadata.get("workspace_container")
+                current_binding = metadata.get("_workspace_binding")
+                current_vm = metadata.get("vm")
+                captured_workspace = (
+                    {} if captured_workspace is None else captured_workspace
+                )
+                captured_binding = {} if captured_binding is None else captured_binding
+                captured_vm = {} if captured_vm is None else captured_vm
+                current_workspace = (
+                    {} if current_workspace is None else current_workspace
+                )
+                current_binding = {} if current_binding is None else current_binding
+                current_vm = {} if current_vm is None else current_vm
+                if not all(
+                    isinstance(value, dict)
+                    for value in (
+                        captured_workspace,
+                        captured_binding,
+                        captured_vm,
+                        current_workspace,
+                        current_binding,
+                        current_vm,
+                    )
+                ):
+                    return None
+
+                def _empty_actor(value: Any) -> bool:
+                    return value is None or isinstance(value, dict) and not value
+
+                def _status_absent(value: dict[str, Any]) -> bool:
+                    if "status" not in value or value["status"] is None:
+                        return True
+                    return isinstance(value["status"], str) and value["status"] in {
+                        "",
+                        "deleted",
+                    }
+
+                def _fields_absent(
+                    value: dict[str, Any], fields: tuple[str, ...]
+                ) -> bool:
+                    return all(
+                        field not in value or value[field] is None for field in fields
+                    )
+
+                workspace_absent = bool(
+                    _status_absent(captured_workspace)
+                    and _fields_absent(
+                        captured_workspace,
+                        (
+                            "_runtime_incarnation",
+                            "_docker_workspace_lease_id",
+                            "pod_ip",
+                            "pod_name",
+                            "host",
+                            "port",
+                            "ide_host",
+                            "ide_port",
+                            "_canvas_workspace_generation",
+                        ),
+                    )
+                )
+                vm_absent = bool(
+                    _status_absent(captured_vm)
+                    and _fields_absent(
+                        captured_vm,
+                        (
+                            "provision_generation",
+                            "identity_provision_generation",
+                            "vm_uid",
+                            "_runtime_incarnation",
+                            "rootdisk_pvc_uid",
+                            "ssh_host",
+                            "ssh_port",
+                            "_canvas_workspace_generation",
+                        ),
+                    )
+                )
+                captured_agent_pod = context.get("agent_pod")
+                captured_provision_intent = context.get("agent_pod_provision_intent")
+                pre_registration_process_zero = bool(
+                    context.get("runtime_authority_exposed") is True
+                    and row["runtime_authority_exposed"] is True
+                    and context.get("agent_id") is None
+                    and context.get("runtime_attach_token") is None
+                    and _empty_actor(context.get("agent"))
+                    and isinstance(captured_agent_pod, dict)
+                    and captured_agent_pod
+                    and _empty_actor(metadata.get("agent_pod"))
+                    and _pinned_retirement_local_quiescence_matches(
+                        context,
+                        local_quiescence,
+                        runtime_generation=parsed_generation,
+                        retirement_token=parsed_token,
+                        final_status=str(context.get("settle_status") or ""),
+                    )
+                )
+                retired_provision_intent = False
+                if (
+                    isinstance(captured_provision_intent, dict)
+                    and captured_provision_intent
+                ):
+                    try:
+                        captured_attempt = UUID(
+                            str(captured_provision_intent.get("attempt_id") or "")
+                        )
+                    except (TypeError, ValueError):
+                        return None
+                    retired_provision_intent = bool(
+                        await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM "
+                            "thread_agent_pod_provision_intents WHERE "
+                            "attempt_id=$1::uuid AND thread_id=$2::uuid AND "
+                            "runtime_generation=$3::uuid AND status='fenced' "
+                            "AND pod_name=$4)",
+                            captured_attempt,
+                            parsed_thread,
+                            parsed_generation,
+                            str(captured_provision_intent.get("pod_name") or ""),
+                        )
+                    )
+                pre_provision_process_zero = bool(
+                    context.get("runtime_authority_exposed") is True
+                    and row["runtime_authority_exposed"] is True
+                    and context.get("agent_id") is None
+                    and context.get("runtime_attach_token") is None
+                    and _empty_actor(context.get("agent"))
+                    and _empty_actor(context.get("agent_pod"))
+                    and isinstance(captured_provision_intent, dict)
+                    and captured_provision_intent
+                    and retired_provision_intent
+                    and _empty_actor(metadata.get("agent_pod"))
+                    and _pinned_retirement_local_quiescence_matches(
+                        context,
+                        local_quiescence,
+                        runtime_generation=parsed_generation,
+                        retirement_token=parsed_token,
+                        final_status=str(context.get("settle_status") or ""),
+                    )
+                )
+                process_authority_zero = bool(
+                    context.get("runtime_authority_exposed") is False
+                    and row["runtime_authority_exposed"] is False
+                    and _empty_actor(context.get("agent"))
+                    and _empty_actor(context.get("agent_pod"))
+                    or pre_registration_process_zero
+                    or pre_provision_process_zero
+                )
+                no_runtime_exposed = bool(
+                    context.get("protected_cloud") is True
+                    and process_authority_zero
+                    and context.get("agent_id") is None
+                    and context.get("control_admission_agent_id") is None
+                    and context.get("runtime_attach_token") is None
+                    and row["agent_id"] is None
+                    and row["control_admission_agent_id"] is None
+                    and row["runtime_attach_token"] is None
+                    and _empty_actor(metadata.get("agent_pod"))
+                    and captured_workspace == current_workspace
+                    and captured_binding == current_binding
+                    and captured_vm == current_vm
+                    and workspace_absent
+                    and captured_binding == {}
+                    and vm_absent
+                )
+                captured_ro = context.get("protected_ro")
+                if captured_ro is not None and not isinstance(captured_ro, dict):
+                    return None
+                current_ro_row = await conn.fetchrow(
+                    "SELECT id, thread_id, user_id, backend, backend_instance_id, "
+                    "reader_id, grant_group_id, grant_handle, grant_handle_sha256, "
+                    "source_binding, source_binding_sha256, selected_mount_id, "
+                    "status, staged_epoch, staged_summary, etag_baseline, "
+                    "runtime_generation, engage_attempt FROM cloud_ro_mounts "
+                    "WHERE thread_id=$1::uuid FOR SHARE",
+                    parsed_thread,
+                )
+                current_ro = (
+                    dict(current_ro_row) if current_ro_row is not None else None
+                )
+                if current_ro is not None:
+                    try:
+                        for field in (
+                            "etag_baseline",
+                            "staged_summary",
+                            "source_binding",
+                        ):
+                            if isinstance(current_ro.get(field), str):
+                                current_ro[field] = json.loads(current_ro[field])
+                    except (TypeError, ValueError):
+                        return None
+                no_reader_exposed = captured_ro is None and current_ro is None
+                captured_plan: ProtectedNextcloudReaderGrantPlan | None = None
+                if isinstance(captured_ro, dict):
+                    try:
+                        captured_stage_epoch = int(captured_ro["staged_epoch"])
+                        UUID(str(captured_ro["id"]))
+                        UUID(str(captured_ro["runtime_generation"]))
+                        UUID(str(captured_ro["engage_attempt"]))
+                    except (KeyError, TypeError, ValueError):
+                        return None
+                    captured_plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(
+                        captured_ro
+                    )
+                    if captured_plan is None:
+                        return None
+                    captured_attempt = str(captured_ro.get("engage_attempt") or "")
+                    captured_mount = str(captured_ro.get("id") or "")
+                    captured_generation = str(
+                        captured_ro.get("runtime_generation") or ""
+                    )
+                    captured_status = str(captured_ro.get("status") or "")
+                    captured_baseline = captured_ro.get("etag_baseline")
+                    never_delivered_capture = bool(
+                        captured_mount
+                        and captured_attempt
+                        and captured_generation == str(parsed_generation)
+                        and captured_ro.get("backend") == "nextcloud"
+                        and str(captured_ro.get("thread_id") or "")
+                        == str(parsed_thread)
+                        and str(captured_ro.get("user_id") or "")
+                        == str(context.get("user_id") or "")
+                        and captured_status
+                        in {"engaging", "active", "revoking", "revoked"}
+                        and (
+                            isinstance(captured_baseline, dict)
+                            if captured_status == "active"
+                            else captured_baseline is None
+                            or isinstance(captured_baseline, dict)
+                        )
+                        and captured_stage_epoch == 0
+                        and captured_ro.get("staged_summary") is None
+                    )
+                    if current_ro is None:
+                        no_reader_exposed = never_delivered_capture
+                    else:
+                        try:
+                            current_stage_epoch = int(current_ro["staged_epoch"])
+                        except (KeyError, TypeError, ValueError):
+                            return None
+                        current_plan = (
+                            ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(
+                                current_ro
+                            )
+                        )
+                        no_reader_exposed = bool(
+                            never_delivered_capture
+                            and str(current_ro.get("id") or "") == captured_mount
+                            and current_plan == captured_plan
+                            and str(current_ro.get("user_id") or "")
+                            == str(captured_ro.get("user_id") or "")
+                            and str(current_ro.get("runtime_generation") or "")
+                            == captured_generation
+                            and str(current_ro.get("engage_attempt") or "")
+                            == captured_attempt
+                            and str(current_ro.get("status") or "") == "revoked"
+                            and current_ro.get("etag_baseline") == captured_baseline
+                            and current_stage_epoch == 0
+                            and current_ro.get("staged_summary") is None
+                        )
+                if not no_runtime_exposed or not no_reader_exposed:
+                    return None
+                receipt = {
+                    "version": 1,
+                    "kind": "never_engaged",
+                    "runtime_generation": str(parsed_generation),
+                    "retirement_token": str(parsed_token),
+                    "mount_id": (
+                        str(captured_ro.get("id"))
+                        if isinstance(captured_ro, dict)
+                        and captured_ro.get("id") is not None
+                        else None
+                    ),
+                    "engage_attempt": (
+                        str(captured_ro.get("engage_attempt"))
+                        if isinstance(captured_ro, dict)
+                        and captured_ro.get("engage_attempt") is not None
+                        else None
+                    ),
+                    "source_binding_sha256": (
+                        captured_plan.source_sha256
+                        if captured_plan is not None
+                        else None
+                    ),
+                    "workspace_generation": None,
+                    "workspace_runtime_incarnation": None,
+                    "expected_staged_epoch": 0,
+                    "staged_epoch": 0,
+                    "staged_summary": None,
+                }
+                result = await conn.execute(
+                    """
+                    UPDATE threads
+                       SET runtime_retirement_stage_receipt=$4::jsonb
+                     WHERE id=$1::uuid
+                       AND runtime_generation=$2::uuid
+                       AND runtime_retirement_token=$3::uuid
+                       AND runtime_retirement_authorized_at IS NOT NULL
+                       AND runtime_authority_exposed=false
+                       AND runtime_retirement_permanent=false
+                       AND runtime_retirement_stage_receipt IS NULL
+                    """,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_token,
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                )
+                return receipt if result == "UPDATE 1" else None
 
     @staticmethod
     def _ro_mount_row(row) -> dict:
@@ -4510,7 +6497,7 @@ class PostgresDB:
         d["credentials"] = _decrypt_stored(
             d.get("credentials"), field="cloud_ro_mounts.credentials"
         )
-        for _jf in ("etag_baseline", "staged_summary"):
+        for _jf in ("etag_baseline", "staged_summary", "source_binding"):
             if isinstance(d.get(_jf), str):
                 d[_jf] = json.loads(d[_jf])
         return d
@@ -6349,6 +8336,7 @@ class PostgresDB:
         owner_kind: str,
         owner_id: str,
         candidates: List[Dict[str, Any]],
+        expected_runtime_generation: str | None = None,
     ) -> Dict[str, Any] | None:
         """Atomically lease one static Docker workspace across jobs and threads.
 
@@ -6371,6 +8359,12 @@ class PostgresDB:
             return None
         if owner_kind not in {"job", "thread"}:
             raise ValueError("Docker workspace owner kind must be job or thread")
+        expected_generation_uuid: UUID | None = None
+        if owner_kind == "thread" and expected_runtime_generation is not None:
+            try:
+                expected_generation_uuid = UUID(str(expected_runtime_generation))
+            except (TypeError, ValueError):
+                return None
 
         normalized: list[dict[str, Any]] = []
         by_endpoint: dict[tuple[str, int], dict[str, Any]] = {}
@@ -6450,24 +8444,56 @@ class PostgresDB:
         if not normalized:
             return None
 
-        select_owner = (
-            "SELECT context->'workspace_container' AS workspace "
-            "FROM jobs WHERE id = $1 FOR UPDATE"
-            if owner_kind == "job"
-            else "SELECT metadata->'workspace_container' AS workspace "
-            "FROM threads WHERE id = $1 FOR UPDATE"
-        )
-        update_owner = (
-            "UPDATE jobs "
-            "SET context = jsonb_set(COALESCE(context, '{}'::jsonb), "
-            "'{workspace_container}', $2::jsonb), "
-            "updated_at = CURRENT_TIMESTAMP WHERE id = $1"
-            if owner_kind == "job"
-            else "UPDATE threads "
-            "SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), "
-            "'{workspace_container}', $2::jsonb), "
-            "last_activity = CURRENT_TIMESTAMP WHERE id = $1"
-        )
+        if owner_kind == "job":
+            select_owner = (
+                "SELECT context->'workspace_container' AS workspace "
+                "FROM jobs WHERE id = $1 FOR UPDATE"
+            )
+            owner_select_args: tuple[Any, ...] = (owner_uuid,)
+        elif expected_generation_uuid is not None:
+            select_owner = (
+                "SELECT metadata->'workspace_container' AS workspace "
+                "FROM threads WHERE id = $1 "
+                "AND runtime_generation = $2::uuid "
+                "AND runtime_retirement_token IS NULL "
+                "AND status IN ('created','active','awaiting_user','suspended') "
+                "FOR UPDATE"
+            )
+            owner_select_args = (owner_uuid, expected_generation_uuid)
+        else:
+            select_owner = (
+                "SELECT metadata->'workspace_container' AS workspace "
+                "FROM threads WHERE id = $1 FOR UPDATE"
+            )
+            owner_select_args = (owner_uuid,)
+        if owner_kind == "job":
+            update_owner = (
+                "UPDATE jobs "
+                "SET context = jsonb_set(COALESCE(context, '{}'::jsonb), "
+                "'{workspace_container}', $2::jsonb), "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = $1"
+            )
+        elif expected_generation_uuid is not None:
+            update_owner = (
+                "UPDATE threads "
+                "SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), "
+                "'{workspace_container}', $2::jsonb), "
+                "last_activity = CURRENT_TIMESTAMP WHERE id = $1 "
+                "AND runtime_generation = $3::uuid "
+                "AND runtime_retirement_token IS NULL"
+            )
+        else:
+            update_owner = (
+                "UPDATE threads "
+                "SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), "
+                "'{workspace_container}', $2::jsonb), "
+                "last_activity = CURRENT_TIMESTAMP WHERE id = $1"
+            )
+
+        def owner_update_args(payload: str) -> tuple[Any, ...]:
+            if owner_kind == "thread" and expected_generation_uuid is not None:
+                return owner_uuid, payload, expected_generation_uuid
+            return owner_uuid, payload
 
         def parse_workspace(raw: Any) -> dict[str, Any]:
             if isinstance(raw, str):
@@ -6524,7 +8550,7 @@ class PostgresDB:
                     "SELECT pg_advisory_xact_lock(hashtext($1))",
                     "srw-docker-workspace-pool",
                 )
-                owner_row = await conn.fetchrow(select_owner, owner_uuid)
+                owner_row = await conn.fetchrow(select_owner, *owner_select_args)
                 if owner_row is None:
                     return None
                 current = parse_workspace(owner_row["workspace"])
@@ -6644,7 +8670,8 @@ class PostgresDB:
                         if owner_kind == "thread":
                             quarantined[_DOCKER_WORKSPACE_GENERATION_KEY] = None
                         result = await conn.execute(
-                            update_owner, owner_uuid, json.dumps(quarantined)
+                            update_owner,
+                            *owner_update_args(json.dumps(quarantined)),
                         )
                         if result != "UPDATE 1":
                             raise RuntimeError(
@@ -6710,7 +8737,8 @@ class PostgresDB:
                         ),
                     )
                     result = await conn.execute(
-                        update_owner, owner_uuid, json.dumps(authoritative)
+                        update_owner,
+                        *owner_update_args(json.dumps(authoritative)),
                     )
                     if result != "UPDATE 1":
                         raise RuntimeError(
@@ -6800,7 +8828,8 @@ class PostgresDB:
                                         None
                                     )
                             result = await conn.execute(
-                                update_owner, owner_uuid, json.dumps(authoritative)
+                                update_owner,
+                                *owner_update_args(json.dumps(authoritative)),
                             )
                             if result != "UPDATE 1":
                                 raise RuntimeError(
@@ -6912,7 +8941,8 @@ class PostgresDB:
                     # Canvas remains unavailable even for attested inventory.
                     lease[_DOCKER_WORKSPACE_GENERATION_KEY] = None
                 owner_result = await conn.execute(
-                    update_owner, owner_uuid, json.dumps(lease)
+                    update_owner,
+                    *owner_update_args(json.dumps(lease)),
                 )
                 if owner_result != "UPDATE 1":
                     # Raising (rather than returning None) rolls the inventory
@@ -7074,8 +9104,11 @@ class PostgresDB:
 
                 allowed_targets = {
                     "ready": {"ready", "releasing", "quarantined"},
-                    "releasing": {"released", "quarantined"},
-                    "released": set(),
+                    # Recovery uses this exact no-op to re-attest that a mirror
+                    # claiming ``releasing`` still has the same durable owner,
+                    # lease and endpoint before remote process cleanup.
+                    "releasing": {"releasing", "released", "quarantined"},
+                    "released": {"released"},
                     "quarantined": {"quarantined"},
                 }
                 inventory_status = str(inventory["status"])
@@ -7162,10 +9195,16 @@ class PostgresDB:
 
                 current_trust = str(inventory.get("trust_mode") or "unattested")
                 target_trust = str(requested_trust or current_trust)
-                if status == "released" and requested_trust is None:
+                if (
+                    status == "released"
+                    and inventory_status != "released"
+                    and requested_trust is None
+                ):
                     # Releasing an endpoint is a trust-boundary operation. A
                     # controller must explicitly preserve attested provenance;
-                    # dev cleanup must explicitly downgrade to trusted_dev.
+                    # dev cleanup must explicitly downgrade to trusted_dev. An
+                    # exact released -> released no-op is only an inventory
+                    # re-attestation and does not cross that boundary.
                     raise ValueError(
                         "Docker workspace release requires an explicit trust mode"
                     )
@@ -7294,6 +9333,1113 @@ class PostgresDB:
             )
 
         return result == "UPDATE 1"
+
+    async def clear_pinned_attach_abort_workspace_endpoint(
+        self,
+        thread_id: str,
+        *,
+        retired_runtime_generation: str,
+        retired_attach_token: str,
+        retired_agent_id: str,
+        successor_generation: str,
+        workspace_generation: str,
+        workspace_runtime_incarnation: str,
+    ) -> bool:
+        """Clear only the workspace endpoint retired by an exact attach abort.
+
+        ``workspace_process_zero_v1`` intentionally kills every workspace UID
+        process, including code-server.  The successor must therefore recreate
+        the captured Kubernetes Pod before it can attach.  Pod deletion is an
+        external effect; this CAS is its durable DB half and is replayable from
+        the append-only abort outcome after a lost response or process crash.
+
+        The backing binding is deliberately retained (a PVC survives the Pod),
+        while the old Pod UID and all delivery coordinates are made non-ready.
+        A delayed G1 outcome can never clear a G3 endpoint because the exact G2
+        generation, unbound/open shape, backing generation, old Pod UID, and
+        outcome tuple are joined in one UPDATE.
+        """
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            retired_generation_uuid = UUID(str(retired_runtime_generation))
+            retired_attach_uuid = UUID(str(retired_attach_token))
+            retired_agent_uuid = UUID(str(retired_agent_id))
+            successor_uuid = UUID(str(successor_generation))
+            workspace_generation_uuid = UUID(str(workspace_generation))
+            workspace_runtime_uuid = UUID(str(workspace_runtime_incarnation))
+        except (TypeError, ValueError):
+            return False
+
+        endpoint_clear = json.dumps(
+            {
+                "status": "deleted",
+                "pod_ip": None,
+                "host": None,
+                "port": None,
+                "_canvas_workspace_generation": None,
+                "_runtime_incarnation": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE threads AS t
+                   SET metadata = jsonb_set(
+                           COALESCE(t.metadata, '{}'::jsonb),
+                           '{workspace_container}',
+                           COALESCE(t.metadata->'workspace_container', '{}'::jsonb)
+                               || $8::jsonb
+                       ),
+                       last_activity = CURRENT_TIMESTAMP
+                 WHERE t.id = $1::uuid
+                   AND t.execution_lane = 'pinned'
+                   AND t.status = 'created'
+                   AND t.runtime_generation = $5::uuid
+                   AND t.runtime_retirement_token IS NULL
+                   AND t.agent_id IS NULL
+                   AND t.runtime_attach_token IS NULL
+                   AND t.metadata->'workspace_container'->>'provisioner' = 'k8s'
+                   AND t.metadata->'workspace_container'->>'_runtime_incarnation'
+                       = $7::text
+                   AND t.metadata->'_workspace_binding'->>'generation' = $6::text
+                   AND EXISTS (
+                       SELECT 1
+                         FROM thread_runtime_attach_abort_outcomes AS outcome
+                        WHERE outcome.thread_id = t.id
+                          AND outcome.runtime_generation = $2::uuid
+                          AND outcome.runtime_attach_token = $3::uuid
+                          AND outcome.agent_id = $4::uuid
+                          AND outcome.successor_generation = t.runtime_generation
+                          AND outcome.quiescence_protocol =
+                              'workspace_process_zero_v1'
+                          AND outcome.workspace_generation = $6::uuid
+                          AND outcome.workspace_runtime_incarnation = $7::uuid
+                   )
+                """,
+                thread_uuid,
+                retired_generation_uuid,
+                retired_attach_uuid,
+                retired_agent_uuid,
+                successor_uuid,
+                str(workspace_generation_uuid),
+                str(workspace_runtime_uuid),
+                endpoint_clear,
+            )
+        return result == "UPDATE 1"
+
+    async def clear_pinned_attach_abort_docker_workspace_endpoint(
+        self,
+        thread_id: str,
+        *,
+        retired_runtime_generation: str,
+        retired_attach_token: str,
+        retired_agent_id: str,
+        successor_generation: str,
+        workspace_generation: str,
+        docker_lease_id: str,
+    ) -> bool:
+        """Clear an exact terminal Docker lease after delivered attach abort.
+
+        Docker's allocation lease UUID is its runtime-incarnation authority.
+        The static container has no Kubernetes Pod UID, so the durable successor
+        owner must first move that exact inventory lease to ``released`` or
+        nonallocatable ``quarantined`` and only then clear the G2 mirror/backing.
+        """
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            retired_generation_uuid = UUID(str(retired_runtime_generation))
+            retired_attach_uuid = UUID(str(retired_attach_token))
+            retired_agent_uuid = UUID(str(retired_agent_id))
+            successor_uuid = UUID(str(successor_generation))
+            workspace_generation_uuid = UUID(str(workspace_generation))
+            lease_uuid = UUID(str(docker_lease_id))
+        except (TypeError, ValueError):
+            return False
+
+        endpoint_clear = json.dumps(
+            {
+                "status": "deleted",
+                "pod_ip": None,
+                "pod_name": None,
+                "host": None,
+                "port": None,
+                "ide_host": None,
+                "ide_port": None,
+                "_canvas_workspace_generation": None,
+                "_runtime_incarnation": None,
+                _DOCKER_WORKSPACE_LEASE_KEY: None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                terminal = await conn.fetchrow(
+                    "SELECT host, port, status FROM docker_workspace_leases "
+                    "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                    "AND lease_id=$2::uuid AND status IN ('released','quarantined') "
+                    "FOR SHARE",
+                    thread_uuid,
+                    lease_uuid,
+                )
+                if terminal is None:
+                    return False
+                result = await conn.execute(
+                    """
+                    UPDATE threads AS t
+                       SET metadata = jsonb_set(
+                               COALESCE(t.metadata, '{}'::jsonb)
+                                   - '_workspace_binding',
+                               '{workspace_container}',
+                               COALESCE(t.metadata->'workspace_container', '{}'::jsonb)
+                                   || $8::jsonb
+                           ),
+                           last_activity = CURRENT_TIMESTAMP
+                     WHERE t.id = $1::uuid
+                       AND t.execution_lane = 'pinned'
+                       AND t.status = 'created'
+                       AND t.runtime_generation = $5::uuid
+                       AND t.runtime_retirement_token IS NULL
+                       AND t.agent_id IS NULL
+                       AND t.runtime_attach_token IS NULL
+                       AND t.metadata->'workspace_container'->>'provisioner' = 'docker'
+                       AND t.metadata->'workspace_container'
+                               ->>'_docker_workspace_lease_id' = $7::text
+                       AND t.metadata->'workspace_container'->>'status' = $9::text
+                       AND t.metadata->'workspace_container'->>'host' = $10::text
+                       AND (t.metadata->'workspace_container'->>'port')::integer = $11
+                       AND t.metadata->'_workspace_binding'->>'generation' = $6::text
+                       AND EXISTS (
+                           SELECT 1
+                             FROM thread_runtime_attach_abort_outcomes AS outcome
+                            WHERE outcome.thread_id = t.id
+                              AND outcome.runtime_generation = $2::uuid
+                              AND outcome.runtime_attach_token = $3::uuid
+                              AND outcome.agent_id = $4::uuid
+                              AND outcome.successor_generation = t.runtime_generation
+                              AND outcome.quiescence_protocol =
+                                  'workspace_process_zero_v1'
+                              AND outcome.workspace_generation = $6::uuid
+                              AND outcome.workspace_runtime_incarnation = $7::uuid
+                       )
+                    """,
+                    thread_uuid,
+                    retired_generation_uuid,
+                    retired_attach_uuid,
+                    retired_agent_uuid,
+                    successor_uuid,
+                    str(workspace_generation_uuid),
+                    str(lease_uuid),
+                    endpoint_clear,
+                    str(terminal["status"]),
+                    str(terminal["host"]),
+                    int(terminal["port"]),
+                )
+                return result == "UPDATE 1"
+
+    async def clear_pinned_retirement_physical_runtime_endpoint(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        retirement_token: str,
+        completed_quiescence_protocol: str | None = None,
+        completed_external_cleanup_protocol: str | None = None,
+        expected_stopped_agent_pod_name: str | None = None,
+        expected_stopped_agent_pod_uid: str | None = None,
+    ) -> bool:
+        """Persist exact external workspace/VM absence for permanent DELETE.
+
+        Kubernetes/VM deletion is an external effect. After the captured
+        actuator succeeds, this row-locked CAS clears only the physical tuple
+        and permanent backing recorded by the immutable retirement context.
+        The DELETE trigger can then distinguish completed cleanup from a caller
+        merely claiming that an external Pod, VM/rootdisk, or PVC disappeared.
+        """
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            generation_uuid = UUID(str(runtime_generation))
+            token_uuid = UUID(str(retirement_token))
+        except (TypeError, ValueError):
+            return False
+        completed_protocol = str(completed_quiescence_protocol or "")
+        if completed_protocol not in {
+            "",
+            "agent_runtime_zero_v1",
+            "sandbox_actuator_zero_v1",
+            "workspace_actuator_zero_v1",
+        }:
+            return False
+        external_protocol = str(completed_external_cleanup_protocol or "")
+        if external_protocol not in {
+            "",
+            "sandbox_actuator_zero_v1",
+            "workspace_actuator_zero_v1",
+            "virtual_backing_zero_v1",
+            "workspace_provision_fence_v1",
+        }:
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT metadata, runtime_retirement_context,
+                           runtime_retirement_local_quiescence,
+                           runtime_retirement_external_cleanup,
+                           runtime_authority_exposed, agent_id,
+                           control_admission_agent_id, runtime_attach_token,
+                           status::text AS status,
+                           NOT EXISTS (
+                               SELECT 1 FROM cloud_ro_mounts ro
+                                WHERE ro.thread_id=threads.id
+                                  AND ro.status IN ('engaging','active','revoking')
+                           ) AS protected_ro_absent
+                      FROM threads
+                     WHERE id=$1::uuid
+                       AND execution_lane='pinned'
+                       AND runtime_generation=$2::uuid
+                       AND runtime_retirement_token=$3::uuid
+                       AND runtime_retirement_permanent=true
+                       AND runtime_retirement_authorized_at IS NOT NULL
+                     FOR UPDATE
+                    """,
+                    thread_uuid,
+                    generation_uuid,
+                    token_uuid,
+                )
+                if row is None:
+                    return False
+                metadata = row["metadata"]
+                context = row["runtime_retirement_context"]
+                metadata = {} if metadata is None else metadata
+                context = {} if context is None else context
+                for value_name, value in (("metadata", metadata), ("context", context)):
+                    if isinstance(value, str):
+                        try:
+                            parsed = json.loads(value)
+                        except (TypeError, ValueError):
+                            return False
+                        if value_name == "metadata":
+                            metadata = parsed
+                        else:
+                            context = parsed
+                if (
+                    not isinstance(metadata, dict)
+                    or not isinstance(context, dict)
+                    or str(context.get("generation") or "") != str(generation_uuid)
+                    or str(context.get("settle_status") or "") != "ended"
+                    or str(context.get("agent_id") or "") != str(row["agent_id"] or "")
+                    or str(context.get("runtime_attach_token") or "")
+                    != str(row["runtime_attach_token"] or "")
+                    or row["protected_ro_absent"] is not True
+                ):
+                    return False
+                external_receipt_valid, external_receipt = (
+                    _pinned_retirement_external_cleanup_expected(
+                        context,
+                        runtime_generation=generation_uuid,
+                        retirement_token=token_uuid,
+                    )
+                )
+                if not external_receipt_valid or external_receipt is None:
+                    return False
+                expected_workspace_cleanup = str(
+                    external_receipt.get("workspace_cleanup_protocol") or ""
+                )
+                if expected_workspace_cleanup == "external_none_v1":
+                    if external_protocol:
+                        return False
+                elif external_protocol != expected_workspace_cleanup:
+                    return False
+
+                captured_claim = context.get("agent_workspace_claim")
+                captured_claim = {} if captured_claim is None else captured_claim
+                if not isinstance(captured_claim, dict):
+                    return False
+                claim_rows = await conn.fetch(
+                    "SELECT claim_id,thread_id,created_runtime_generation,"
+                    "create_attempt,provisioner,pvc_name,status,pvc_uid "
+                    "FROM thread_agent_workspace_claims "
+                    "WHERE thread_id=$1::uuid AND status<>'reclaimed' FOR SHARE",
+                    thread_uuid,
+                )
+                if captured_claim:
+                    if len(claim_rows) != 1:
+                        return False
+                    claim_row = claim_rows[0]
+                    if not (
+                        str(claim_row["claim_id"])
+                        == str(captured_claim.get("claim_id") or "")
+                        and str(claim_row["thread_id"]) == str(thread_uuid)
+                        and str(claim_row["created_runtime_generation"])
+                        == str(captured_claim.get("created_runtime_generation") or "")
+                        and str(claim_row["create_attempt"])
+                        == str(captured_claim.get("create_attempt") or "")
+                        and str(claim_row["provisioner"])
+                        == str(captured_claim.get("provisioner") or "")
+                        and str(claim_row["pvc_name"])
+                        == str(captured_claim.get("pvc_name") or "")
+                        and str(claim_row["status"]) == "fenced"
+                        and bool(str(claim_row["pvc_uid"] or ""))
+                        and external_receipt.get("agent_workspace_cleanup_protocol")
+                        == "k8s_pvc_name_tombstone_v1"
+                    ):
+                        return False
+                elif claim_rows:
+                    return False
+
+                captured_workspace_intent = context.get("workspace_provision_intent")
+                captured_workspace_intent = (
+                    {}
+                    if captured_workspace_intent is None
+                    else captured_workspace_intent
+                )
+                if not isinstance(captured_workspace_intent, dict):
+                    return False
+                if captured_workspace_intent:
+                    try:
+                        workspace_attempt = UUID(
+                            str(captured_workspace_intent.get("attempt_id") or "")
+                        )
+                    except (TypeError, ValueError):
+                        return False
+                    intent_row = await conn.fetchrow(
+                        "SELECT * FROM thread_workspace_provision_intents "
+                        "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid "
+                        "FOR SHARE",
+                        workspace_attempt,
+                        thread_uuid,
+                    )
+                    if intent_row is None or str(intent_row["status"]) not in {
+                        "fenced",
+                        "retired",
+                    }:
+                        return False
+                    immutable_intent_fields = (
+                        "thread_id",
+                        "runtime_generation",
+                        "created_agent_id",
+                        "created_attach_token",
+                        "namespace",
+                        "pod_name",
+                        "pvc_name",
+                        "seed_configmap_name",
+                        "service_name",
+                        "network_tier",
+                        "manifest_fingerprint",
+                        "retained_binding_generation",
+                        "retained_pvc_uid",
+                        "retained_service_uid",
+                        "pod_uid",
+                        "pvc_uid",
+                        "seed_configmap_uid",
+                        "service_uid",
+                    )
+                    if any(
+                        str(intent_row[field] or "")
+                        != str(captured_workspace_intent.get(field) or "")
+                        for field in immutable_intent_fields
+                    ):
+                        return False
+                    intent_previous_binding = intent_row["previous_binding"]
+                    if isinstance(intent_previous_binding, str):
+                        try:
+                            intent_previous_binding = json.loads(
+                                intent_previous_binding
+                            )
+                        except (TypeError, ValueError):
+                            return False
+                    if not isinstance(intent_previous_binding, dict) or dict(
+                        intent_previous_binding
+                    ) != dict(captured_workspace_intent.get("previous_binding") or {}):
+                        return False
+                    # Before the request horizon expires, every potential name
+                    # must remain occupied by this attempt's inert fence.  A
+                    # terminal retired row is accepted only after the GC has
+                    # exact-deleted/re-probed those recorded fences; the trusted
+                    # caller still exact-cleans any retained backing before this
+                    # CAS.
+                    if str(intent_row["status"]) == "fenced" and any(
+                        intent_row[fence_field] is None
+                        for name_field, fence_field in (
+                            ("pod_name", "fence_pod_uid"),
+                            ("pvc_name", "fence_pvc_uid"),
+                            ("seed_configmap_name", "fence_configmap_uid"),
+                            ("service_name", "fence_service_uid"),
+                        )
+                        if intent_row[name_field] is not None
+                    ):
+                        return False
+                elif await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM "
+                    "thread_workspace_provision_intents WHERE "
+                    "thread_id=$1::uuid AND status IN "
+                    "('planned','revoking','fenced'))",
+                    thread_uuid,
+                ):
+                    return False
+
+                def _object_or_present(value: Any) -> Any:
+                    return {} if value is None else value
+
+                current_workspace = _object_or_present(
+                    metadata.get("workspace_container")
+                )
+                current_binding = _object_or_present(metadata.get("_workspace_binding"))
+                current_vm = _object_or_present(metadata.get("vm"))
+                current_agent_pod = _object_or_present(metadata.get("agent_pod"))
+                captured_workspace = _object_or_present(
+                    context.get("workspace_container")
+                )
+                captured_binding = _object_or_present(context.get("workspace_binding"))
+                captured_vm = _object_or_present(context.get("vm"))
+                captured_agent = _object_or_present(context.get("agent"))
+                captured_agent_pod = _object_or_present(context.get("agent_pod"))
+                if not all(
+                    isinstance(value, dict)
+                    for value in (
+                        current_workspace,
+                        current_binding,
+                        current_vm,
+                        captured_workspace,
+                        captured_binding,
+                        captured_vm,
+                        current_agent_pod,
+                        captured_agent,
+                        captured_agent_pod,
+                    )
+                ):
+                    return False
+                if (
+                    captured_agent
+                    and (
+                        not captured_agent.get("hostname")
+                        or not captured_agent.get("pod_uid")
+                    )
+                    or captured_agent_pod
+                    and (
+                        not captured_agent_pod.get("pod_name")
+                        or not captured_agent_pod.get("pod_uid")
+                    )
+                ):
+                    return False
+                captured_actor_pods: set[tuple[str, str]] = set()
+                for actor, name_key in (
+                    (captured_agent, "hostname"),
+                    (captured_agent_pod, "pod_name"),
+                ):
+                    if not actor:
+                        continue
+                    captured_actor_pods.add(
+                        (str(actor[name_key]), str(actor["pod_uid"]))
+                    )
+                if len(captured_actor_pods) > 1:
+                    return False
+                if current_agent_pod and (
+                    not current_agent_pod.get("pod_name")
+                    or not current_agent_pod.get("pod_uid")
+                ):
+                    return False
+                current_pod = (
+                    str(current_agent_pod.get("pod_name") or ""),
+                    str(current_agent_pod.get("pod_uid") or ""),
+                )
+                if current_agent_pod and current_pod not in captured_actor_pods:
+                    return False
+
+                captured_workspace_runtime = str(
+                    captured_workspace.get("_runtime_incarnation") or ""
+                )
+                captured_workspace_generation = str(
+                    captured_binding.get("generation") or ""
+                )
+                if _json_field_is_nonnull(current_binding, "generation") and (
+                    not _json_field_is_nonnull(captured_binding, "generation")
+                    or current_binding.get("generation")
+                    != captured_binding.get("generation")
+                ):
+                    return False
+                if _json_field_is_nonnull(
+                    current_workspace, "_runtime_incarnation"
+                ) and (
+                    not _json_field_is_nonnull(
+                        captured_workspace, "_runtime_incarnation"
+                    )
+                    or current_workspace.get("_runtime_incarnation")
+                    != captured_workspace.get("_runtime_incarnation")
+                ):
+                    return False
+                for field in (
+                    "pod_ip",
+                    "pod_name",
+                    "host",
+                    "port",
+                    "ide_host",
+                    "ide_port",
+                    "_canvas_workspace_generation",
+                ):
+                    if _json_field_is_nonnull(current_workspace, field) and (
+                        not _json_field_is_nonnull(captured_workspace, field)
+                        or current_workspace.get(field) != captured_workspace.get(field)
+                    ):
+                        return False
+                if current_binding and current_binding != captured_binding:
+                    return False
+
+                for field in (
+                    "provision_generation",
+                    "identity_provision_generation",
+                    "vm_uid",
+                    "_runtime_incarnation",
+                    "rootdisk_pvc_uid",
+                    "ssh_host",
+                    "ssh_port",
+                    "_canvas_workspace_generation",
+                ):
+                    if _json_field_is_nonnull(current_vm, field) and (
+                        not _json_field_is_nonnull(captured_vm, field)
+                        or current_vm.get(field) != captured_vm.get(field)
+                    ):
+                        return False
+
+                backend = str(context.get("workspace_backend") or "")
+                captured_virtual_binding = bool(
+                    backend == "virtual"
+                    and captured_binding
+                    and captured_binding.get("kind") == "virtual"
+                )
+                captured_sandbox_evidence = bool(
+                    backend == "sandbox"
+                    and not captured_workspace_intent
+                    and (
+                        _json_field_is_nonnull(
+                            captured_workspace, "_runtime_incarnation"
+                        )
+                        or captured_binding
+                        or not _json_runtime_status_is_absent(captured_workspace)
+                        or any(
+                            _json_field_is_nonnull(captured_workspace, field)
+                            for field in (
+                                "pod_ip",
+                                "pod_name",
+                                "host",
+                                "port",
+                                "ide_host",
+                                "ide_port",
+                                "_canvas_workspace_generation",
+                            )
+                        )
+                    )
+                )
+                captured_vm_evidence = any(
+                    _json_field_is_nonnull(captured_vm, field)
+                    for field in (
+                        "provision_generation",
+                        "identity_provision_generation",
+                        "vm_uid",
+                        "_runtime_incarnation",
+                        "rootdisk_pvc_uid",
+                        "ssh_host",
+                        "ssh_port",
+                        "_canvas_workspace_generation",
+                    )
+                ) or not _json_runtime_status_is_absent(captured_vm)
+                incompatible_physical_shape = bool(
+                    (captured_workspace_intent and captured_vm_evidence)
+                    or (backend in {"vm", "remote"} and captured_sandbox_evidence)
+                    or (backend == "sandbox" and captured_vm_evidence)
+                    or (
+                        backend == "virtual"
+                        and not captured_workspace_intent
+                        and (
+                            captured_vm_evidence
+                            or bool(captured_binding) != captured_virtual_binding
+                            or any(
+                                _json_field_is_nonnull(captured_workspace, field)
+                                for field in (
+                                    "_runtime_incarnation",
+                                    "pod_ip",
+                                    "pod_name",
+                                    "host",
+                                    "port",
+                                    "ide_host",
+                                    "ide_port",
+                                    "_canvas_workspace_generation",
+                                )
+                            )
+                            or not _json_runtime_status_is_absent(captured_workspace)
+                        )
+                    )
+                    or (
+                        backend == "none"
+                        and not captured_workspace_intent
+                        and (
+                            bool(captured_binding)
+                            or captured_vm_evidence
+                            or any(
+                                _json_field_is_nonnull(captured_workspace, field)
+                                for field in (
+                                    "_runtime_incarnation",
+                                    "pod_ip",
+                                    "pod_name",
+                                    "host",
+                                    "port",
+                                    "ide_host",
+                                    "ide_port",
+                                    "_canvas_workspace_generation",
+                                )
+                            )
+                            or not _json_runtime_status_is_absent(captured_workspace)
+                        )
+                    )
+                    or backend not in {"sandbox", "virtual", "none", "vm", "remote"}
+                )
+                if incompatible_physical_shape:
+                    return False
+
+                required_external_protocol = (
+                    "workspace_provision_fence_v1"
+                    if captured_workspace_intent
+                    else "sandbox_actuator_zero_v1"
+                    if captured_sandbox_evidence
+                    else "workspace_actuator_zero_v1"
+                    if captured_vm_evidence
+                    else "virtual_backing_zero_v1"
+                    if captured_virtual_binding
+                    else ""
+                )
+                if required_external_protocol and (
+                    external_protocol != required_external_protocol
+                ):
+                    return False
+
+                captured_docker_lease = str(
+                    captured_workspace.get(_DOCKER_WORKSPACE_LEASE_KEY) or ""
+                )
+                docker_terminal_status: str | None = None
+                if backend == "sandbox" and (
+                    captured_workspace.get("provisioner") == "docker"
+                    or captured_docker_lease
+                ):
+                    # A Docker workspace has no Kubernetes Pod incarnation. Its
+                    # durable external authority is the inventory lease.  The
+                    # actuator leaves an exact terminal inventory row behind:
+                    # ``released`` after trusted-dev reset, or ``quarantined``
+                    # when controller-attested recreation is required.  Never
+                    # accept a caller-supplied protocol without proving that
+                    # exact lease reached one of those terminal dispositions.
+                    try:
+                        docker_lease_uuid = UUID(captured_docker_lease)
+                        UUID(str(captured_binding.get("generation") or ""))
+                    except (TypeError, ValueError):
+                        return False
+                    backing_id = str(captured_binding.get("backing_id") or "")
+                    if (
+                        captured_workspace.get("provisioner") != "docker"
+                        or captured_binding.get("kind") != "remote"
+                        or not backing_id.startswith("docker:")
+                        or not backing_id.endswith(f":{docker_lease_uuid}")
+                        or str(current_workspace.get(_DOCKER_WORKSPACE_LEASE_KEY) or "")
+                        != str(docker_lease_uuid)
+                    ):
+                        return False
+                    inventory = await conn.fetchrow(
+                        "SELECT host, port, status, owner_kind, owner_id "
+                        "FROM docker_workspace_leases "
+                        "WHERE lease_id=$1::uuid FOR SHARE",
+                        docker_lease_uuid,
+                    )
+                    if (
+                        inventory is None
+                        or str(inventory["status"] or "")
+                        not in {"released", "quarantined"}
+                        or str(inventory["owner_kind"] or "") != "thread"
+                        or str(inventory["owner_id"] or "") != str(thread_uuid)
+                        or str(inventory["host"] or "")
+                        != str(current_workspace.get("host") or "")
+                    ):
+                        return False
+                    try:
+                        if int(inventory["port"]) != int(current_workspace.get("port")):
+                            return False
+                    except (TypeError, ValueError):
+                        return False
+                    docker_terminal_status = str(inventory["status"])
+
+                captured_workspace_status = captured_workspace.get("status")
+                current_workspace_status = current_workspace.get("status")
+                accepted_workspace_status_change = False
+                if external_protocol == "sandbox_actuator_zero_v1":
+                    if docker_terminal_status is not None:
+                        accepted_workspace_status_change = (
+                            current_workspace_status == docker_terminal_status
+                        )
+                    else:
+                        accepted_workspace_status_change = bool(
+                            current_workspace_status is None
+                            or isinstance(current_workspace_status, str)
+                            and current_workspace_status in {"", "deleting", "deleted"}
+                        )
+                elif external_protocol == "workspace_provision_fence_v1":
+                    accepted_workspace_status_change = bool(
+                        current_workspace_status is None
+                        or isinstance(current_workspace_status, str)
+                        and current_workspace_status in {"", "pending", "deleted"}
+                    )
+                if current_workspace_status != captured_workspace_status and not (
+                    accepted_workspace_status_change
+                ):
+                    return False
+                captured_vm_status = captured_vm.get("status")
+                current_vm_status = current_vm.get("status")
+                if current_vm_status != captured_vm_status and not (
+                    external_protocol == "workspace_actuator_zero_v1"
+                    and (
+                        current_vm_status is None
+                        or isinstance(current_vm_status, str)
+                        and current_vm_status in {"", "deleting", "deleted"}
+                    )
+                ):
+                    return False
+
+                cleared_workspace = dict(current_workspace)
+                cleared_workspace.update(
+                    {
+                        "status": "deleted",
+                        "pod_ip": None,
+                        "pod_name": None,
+                        "host": None,
+                        "port": None,
+                        "ide_host": None,
+                        "ide_port": None,
+                        "_canvas_workspace_generation": None,
+                        "_runtime_incarnation": None,
+                        _DOCKER_WORKSPACE_LEASE_KEY: None,
+                    }
+                )
+                cleared_vm = dict(current_vm)
+                cleared_vm.update(
+                    {
+                        "status": "deleted",
+                        "provision_generation": None,
+                        "identity_provision_generation": None,
+                        "vm_uid": None,
+                        "_runtime_incarnation": None,
+                        "rootdisk_pvc_uid": None,
+                        "ssh_host": None,
+                        "ssh_port": None,
+                        "_canvas_workspace_generation": None,
+                    }
+                )
+                updated_metadata = dict(metadata)
+                updated_metadata["workspace_container"] = cleared_workspace
+                updated_metadata["vm"] = cleared_vm
+                # A permanent retirement has already reclaimed the captured
+                # PVC/backing.  Leaving this private binding behind would let a
+                # DELETE orphan storage and makes markerless legacy absence
+                # indistinguishable from an uncleared retained workspace.
+                updated_metadata.pop("_workspace_binding", None)
+                local_quiescence = row["runtime_retirement_local_quiescence"]
+                if isinstance(local_quiescence, str):
+                    try:
+                        local_quiescence = json.loads(local_quiescence)
+                    except (TypeError, ValueError):
+                        return False
+                runtime_exposed = bool(
+                    row["runtime_authority_exposed"] is True
+                    or context.get("runtime_authority_exposed") is True
+                    or context.get("agent_id")
+                    or context.get("agent")
+                    or context.get("agent_pod")
+                )
+                prior_soft_settlement = bool(
+                    str(row["status"] or "") == "ended"
+                    and row["agent_id"] is None
+                    and row["control_admission_agent_id"] is None
+                    and row["runtime_attach_token"] is None
+                    and not captured_agent
+                    and not captured_agent_pod
+                    and not current_agent_pod
+                    and await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM "
+                        "thread_runtime_retirement_outcomes "
+                        "WHERE thread_id=$1::uuid "
+                        "AND runtime_generation=$2::uuid "
+                        "AND disposition='ended' AND permanent=false "
+                        "AND outcome='settled')",
+                        thread_uuid,
+                        generation_uuid,
+                    )
+                )
+                exact_local_quiescence = bool(
+                    runtime_exposed
+                    and _pinned_retirement_local_quiescence_matches(
+                        context,
+                        local_quiescence,
+                        runtime_generation=generation_uuid,
+                        retirement_token=token_uuid,
+                        final_status="ended",
+                        permanent=True,
+                    )
+                )
+                synthesized_local_quiescence = False
+                if (
+                    runtime_exposed
+                    and local_quiescence is None
+                    and not prior_soft_settlement
+                ):
+                    # The external-actuator fallback is only for an ownerless
+                    # generation (including mixed-version ended tombstones).
+                    # A still-bound process must append its own exact receipt,
+                    # or be retired through the dedicated captured-actor
+                    # recovery path before this durable cleanup edge.
+                    if (
+                        str(row["status"] or "") != "ended"
+                        or str(context.get("entry_status") or "") != "ended"
+                        or row["agent_id"] is not None
+                        or row["runtime_attach_token"] is not None
+                        or context.get("agent_id")
+                        or context.get("runtime_attach_token")
+                    ):
+                        return False
+                    stopped_actor = (
+                        str(expected_stopped_agent_pod_name or ""),
+                        str(expected_stopped_agent_pod_uid or ""),
+                    )
+                    if captured_actor_pods != (
+                        {stopped_actor} if any(stopped_actor) else set()
+                    ):
+                        return False
+                    if backend == "sandbox":
+                        if captured_sandbox_evidence:
+                            if completed_protocol != "sandbox_actuator_zero_v1":
+                                return False
+                            quiescence_protocol = "sandbox_actuator_zero_v1"
+                        elif captured_actor_pods and (
+                            completed_protocol == "agent_runtime_zero_v1"
+                        ):
+                            quiescence_protocol = "agent_runtime_zero_v1"
+                        else:
+                            return False
+                    elif backend in {"virtual", "none"}:
+                        if not captured_actor_pods or (
+                            completed_protocol != "agent_runtime_zero_v1"
+                        ):
+                            return False
+                        quiescence_protocol = "agent_runtime_zero_v1"
+                    elif backend in {"vm", "remote"}:
+                        if not (
+                            captured_vm.get("provision_generation")
+                            and captured_vm.get("vm_uid")
+                        ):
+                            return False
+                        if completed_protocol != "workspace_actuator_zero_v1":
+                            return False
+                        quiescence_protocol = "workspace_actuator_zero_v1"
+                        captured_workspace_generation = str(
+                            captured_vm.get("provision_generation")
+                        )
+                        captured_workspace_runtime = str(captured_vm.get("vm_uid"))
+                    else:
+                        return False
+                    local_quiescence = {
+                        "version": 1,
+                        "runtime_generation": str(generation_uuid),
+                        "retirement_token": str(token_uuid),
+                        "agent_id": context.get("agent_id"),
+                        "runtime_attach_token": context.get("runtime_attach_token"),
+                        "settle_status": "ended",
+                        "quiescence_protocol": quiescence_protocol,
+                        "quiescence_actor": "orchestrator",
+                        "workspace_generation": (captured_workspace_generation or None),
+                        "workspace_runtime_incarnation": (
+                            captured_workspace_runtime or None
+                        ),
+                    }
+                    synthesized_local_quiescence = True
+                elif (
+                    runtime_exposed
+                    and not prior_soft_settlement
+                    and not exact_local_quiescence
+                ):
+                    return False
+                if current_agent_pod:
+                    if not (
+                        prior_soft_settlement
+                        or exact_local_quiescence
+                        or synthesized_local_quiescence
+                    ):
+                        return False
+                    updated_metadata.pop("agent_pod", None)
+                result = await conn.execute(
+                    """
+                    UPDATE threads
+                       SET metadata=$4::jsonb,
+                           runtime_retirement_local_quiescence=$6::jsonb,
+                           runtime_retirement_external_cleanup=$7::jsonb,
+                           last_activity=CURRENT_TIMESTAMP
+                     WHERE id=$1::uuid
+                       AND runtime_generation=$2::uuid
+                       AND runtime_retirement_token=$3::uuid
+                       AND runtime_retirement_permanent=true
+                       AND runtime_retirement_authorized_at IS NOT NULL
+                       AND metadata IS NOT DISTINCT FROM $5::jsonb
+                    """,
+                    thread_uuid,
+                    generation_uuid,
+                    token_uuid,
+                    json.dumps(updated_metadata, sort_keys=True, separators=(",", ":")),
+                    json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                    (
+                        json.dumps(
+                            local_quiescence,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if local_quiescence is not None
+                        else None
+                    ),
+                    json.dumps(
+                        external_receipt,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                return result == "UPDATE 1"
+
+    async def pinned_retirement_external_cleanup_complete(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        retirement_token: str,
+    ) -> bool:
+        """Read back one exact durable external-cleanup publication.
+
+        This is the response-loss/restart path for the external actuator CAS.
+        It never infers completion from missing metadata alone: the append-once
+        receipt must match the immutable captured resource tuple, and every
+        mutable resource authority must still be absent.
+        """
+
+        try:
+            thread_uuid = UUID(str(thread_id))
+            generation_uuid = UUID(str(runtime_generation))
+            token_uuid = UUID(str(retirement_token))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT metadata, runtime_retirement_context,
+                       runtime_retirement_external_cleanup,
+                       NOT EXISTS (
+                           SELECT 1 FROM cloud_ro_mounts ro
+                            WHERE ro.thread_id=threads.id
+                              AND ro.status IN ('engaging','active','revoking')
+                       ) AS protected_ro_absent,
+                       NOT EXISTS (
+                           SELECT 1 FROM docker_workspace_leases lease
+                            WHERE lease.owner_kind='thread'
+                              AND lease.owner_id=threads.id
+                              AND lease.status IN ('ready','releasing')
+                       ) AS docker_lease_absent
+                  FROM threads
+                 WHERE id=$1::uuid
+                   AND execution_lane='pinned'
+                   AND runtime_generation=$2::uuid
+                   AND runtime_retirement_token=$3::uuid
+                   AND runtime_retirement_permanent=true
+                   AND runtime_retirement_authorized_at IS NOT NULL
+                """,
+                thread_uuid,
+                generation_uuid,
+                token_uuid,
+            )
+        if row is None:
+            return False
+        metadata = row["metadata"]
+        context = row["runtime_retirement_context"]
+        receipt = row["runtime_retirement_external_cleanup"]
+        for name, value in (
+            ("metadata", metadata),
+            ("context", context),
+            ("receipt", receipt),
+        ):
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except (TypeError, ValueError):
+                    return False
+                if name == "metadata":
+                    metadata = parsed
+                elif name == "context":
+                    context = parsed
+                else:
+                    receipt = parsed
+        if not isinstance(metadata, dict):
+            return False
+        workspace = metadata.get("workspace_container")
+        binding = metadata.get("_workspace_binding")
+        vm = metadata.get("vm")
+        agent_pod = metadata.get("agent_pod")
+        workspace = {} if workspace is None else workspace
+        binding = {} if binding is None else binding
+        vm = {} if vm is None else vm
+        agent_pod = {} if agent_pod is None else agent_pod
+        if not all(
+            isinstance(value, dict) for value in (workspace, binding, vm, agent_pod)
+        ):
+            return False
+        mutable_absence = bool(
+            not agent_pod
+            and _json_runtime_status_is_absent(workspace)
+            and not binding
+            and not any(
+                _json_field_is_nonnull(workspace, field)
+                for field in (
+                    "_runtime_incarnation",
+                    _DOCKER_WORKSPACE_LEASE_KEY,
+                    "pod_ip",
+                    "pod_name",
+                    "host",
+                    "port",
+                    "ide_host",
+                    "ide_port",
+                    "_canvas_workspace_generation",
+                )
+            )
+            and _json_runtime_status_is_absent(vm)
+            and not any(
+                _json_field_is_nonnull(vm, field)
+                for field in (
+                    "provision_generation",
+                    "identity_provision_generation",
+                    "vm_uid",
+                    "_runtime_incarnation",
+                    "rootdisk_pvc_uid",
+                    "ssh_host",
+                    "ssh_port",
+                    "_canvas_workspace_generation",
+                )
+            )
+        )
+        return bool(
+            mutable_absence
+            and row["protected_ro_absent"] is True
+            and row["docker_lease_absent"] is True
+            and _pinned_retirement_external_cleanup_matches(
+                context,
+                receipt,
+                runtime_generation=generation_uuid,
+                retirement_token=token_uuid,
+            )
+        )
 
     async def stateless_thread_workspace_creation_requires_authority(
         self, thread_id: str
@@ -7880,6 +11026,1115 @@ class PostgresDB:
                 )
                 return {"workspace_generation": generation, "changed": True}
 
+    async def reserve_pinned_thread_workspace_provision_intent(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_agent_id: str | None,
+        expected_attach_token: str | None,
+        expected_workspace_context: Mapping[str, Any] | None,
+        expected_binding_context: Mapping[str, Any] | None,
+        attempt_id: str,
+        namespace: str,
+        pod_name: str,
+        pvc_name: str | None,
+        seed_configmap_name: str | None,
+        service_name: str | None,
+        retained_service_uid: str | None,
+        network_tier: str,
+        manifest_fingerprint: str,
+    ) -> Dict[str, Any] | None:
+        """Durably name every pinned Kubernetes create before its first effect.
+
+        The row lock is the lifecycle admission edge.  A route read made before
+        End, Resume, actor rebind, or another workspace publication cannot
+        install an intent afterwards.  Retries adopt the sole exact planned
+        attempt and therefore never issue a second set of names.
+        """
+
+        def _dns_name(value: object, *, optional: bool = False) -> str | None:
+            if optional and value is None:
+                return None
+            candidate = str(value or "").strip()
+            if (
+                not candidate
+                or len(candidate) > 253
+                or re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?", candidate) is None
+            ):
+                raise ValueError("invalid Kubernetes resource name")
+            return candidate
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_attempt = UUID(str(attempt_id))
+            parsed_agent = (
+                UUID(str(expected_agent_id)) if expected_agent_id is not None else None
+            )
+            parsed_attach = (
+                UUID(str(expected_attach_token))
+                if expected_attach_token is not None
+                else None
+            )
+            parsed_namespace = _dns_name(namespace)
+            parsed_pod_name = _dns_name(pod_name)
+            parsed_pvc_name = _dns_name(pvc_name, optional=True)
+            parsed_seed_name = _dns_name(seed_configmap_name, optional=True)
+            parsed_service_name = _dns_name(service_name, optional=True)
+        except (TypeError, ValueError):
+            return None
+        if (
+            (parsed_agent is None) != (parsed_attach is None)
+            or (parsed_pvc_name is None) != (parsed_service_name is None)
+            or (retained_service_uid is not None and parsed_service_name is None)
+            or not isinstance(network_tier, str)
+            or not network_tier.strip()
+            or len(network_tier.strip()) > 32
+            or not isinstance(manifest_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest_fingerprint) is None
+            or expected_workspace_context is not None
+            and not isinstance(expected_workspace_context, Mapping)
+            or expected_binding_context is not None
+            and not isinstance(expected_binding_context, Mapping)
+        ):
+            return None
+        expected_workspace = (
+            dict(expected_workspace_context)
+            if expected_workspace_context is not None
+            else None
+        )
+        expected_binding = (
+            dict(expected_binding_context)
+            if expected_binding_context is not None
+            else None
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT status,execution_lane,runtime_generation,"
+                    "runtime_retirement_token,agent_id,runtime_attach_token,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    parsed_thread,
+                )
+                if row is None:
+                    return None
+                metadata = row["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return None
+                if not isinstance(metadata, dict):
+                    return None
+                raw_workspace = metadata.get("workspace_container")
+                raw_binding = metadata.get("_workspace_binding")
+                raw_vm = metadata.get("vm")
+                if not all(
+                    value is None or isinstance(value, dict)
+                    for value in (raw_workspace, raw_binding, raw_vm)
+                ):
+                    return None
+                current_workspace = (
+                    dict(raw_workspace) if raw_workspace is not None else None
+                )
+                current_binding = dict(raw_binding) if raw_binding is not None else None
+                current_vm = dict(raw_vm) if raw_vm is not None else {}
+                if not (
+                    str(row["execution_lane"] or "") == "pinned"
+                    and str(row["status"] or "")
+                    in {"created", "active", "awaiting_user", "suspended"}
+                    and row["runtime_generation"] == parsed_generation
+                    and row["runtime_retirement_token"] is None
+                    and row["agent_id"] == parsed_agent
+                    and row["runtime_attach_token"] == parsed_attach
+                ):
+                    return None
+                inverse = await conn.fetch(
+                    "SELECT id FROM agents WHERE thread_id=$1::uuid FOR SHARE",
+                    parsed_thread,
+                )
+                if parsed_agent is None:
+                    if inverse:
+                        return None
+                elif len(inverse) != 1 or inverse[0]["id"] != parsed_agent:
+                    return None
+
+                existing = await conn.fetchrow(
+                    "SELECT * FROM thread_workspace_provision_intents "
+                    "WHERE thread_id=$1::uuid "
+                    "AND status IN ('planned','revoking','fenced') FOR UPDATE",
+                    parsed_thread,
+                )
+                if existing is not None:
+                    marker = current_workspace or {}
+                    if not (
+                        str(existing["status"]) == "planned"
+                        and str(existing["runtime_generation"])
+                        == str(parsed_generation)
+                        and existing["created_agent_id"] == parsed_agent
+                        and existing["created_attach_token"] == parsed_attach
+                        and str(existing["namespace"]) == parsed_namespace
+                        and str(existing["pod_name"]) == parsed_pod_name
+                        and existing["pvc_name"] == parsed_pvc_name
+                        and existing["seed_configmap_name"] == parsed_seed_name
+                        and existing["service_name"] == parsed_service_name
+                        and str(existing["retained_service_uid"] or "")
+                        == str(retained_service_uid or "").strip()
+                        and str(existing["network_tier"]) == network_tier.strip()
+                        and str(existing["manifest_fingerprint"])
+                        == manifest_fingerprint
+                        and isinstance(marker, dict)
+                        and str(marker.get("_workspace_provision_attempt") or "")
+                        == str(existing["attempt_id"])
+                        and str(marker.get("_workspace_provision_generation") or "")
+                        == str(parsed_generation)
+                    ):
+                        return None
+                    return dict(existing)
+
+                if (
+                    current_workspace != expected_workspace
+                    or current_binding != expected_binding
+                ):
+                    return None
+                workspace = current_workspace or {}
+                allowed_status = workspace.get("status")
+                if not (
+                    allowed_status is None
+                    or isinstance(allowed_status, str)
+                    and allowed_status in {"", "deleted", "failed", "suspended"}
+                ):
+                    return None
+                if any(
+                    _json_field_is_nonnull(workspace, field)
+                    for field in (
+                        "_runtime_incarnation",
+                        "_docker_workspace_lease_id",
+                        "pod_ip",
+                        "pod_name",
+                        "host",
+                        "port",
+                        "ide_host",
+                        "ide_port",
+                        "_canvas_workspace_generation",
+                    )
+                ):
+                    return None
+                if not _json_runtime_status_is_absent(current_vm) or any(
+                    _json_field_is_nonnull(current_vm, field)
+                    for field in (
+                        "provision_generation",
+                        "identity_provision_generation",
+                        "vm_uid",
+                        "_runtime_incarnation",
+                        "rootdisk_pvc_uid",
+                        "ssh_host",
+                        "ssh_port",
+                        "_canvas_workspace_generation",
+                    )
+                ):
+                    return None
+
+                previous_binding = current_binding or {}
+                retained_generation: UUID | None = None
+                retained_pvc_uid: str | None = None
+                if previous_binding:
+                    kind = previous_binding.get("kind")
+                    backing_id = str(previous_binding.get("backing_id") or "")
+                    if kind == "virtual":
+                        if re.fullmatch(r"rclone:[0-9a-f]{64}", backing_id) is None:
+                            return None
+                        try:
+                            UUID(str(previous_binding.get("generation") or ""))
+                        except (TypeError, ValueError):
+                            return None
+                    elif kind == "remote" and backing_id.startswith(
+                        f"k8s-pvc:{parsed_namespace}:"
+                    ):
+                        if parsed_pvc_name is None:
+                            return None
+                        try:
+                            retained_generation = UUID(
+                                str(previous_binding.get("generation") or "")
+                            )
+                            retained_pvc_uid = str(UUID(backing_id.rsplit(":", 1)[-1]))
+                        except (TypeError, ValueError):
+                            return None
+                    elif kind == "remote" and backing_id.startswith(
+                        f"k8s-pod:{parsed_namespace}:"
+                    ):
+                        try:
+                            UUID(str(previous_binding.get("generation") or ""))
+                            UUID(backing_id.rsplit(":", 1)[-1])
+                        except (TypeError, ValueError):
+                            return None
+                    else:
+                        return None
+
+                intent = await conn.fetchrow(
+                    "INSERT INTO thread_workspace_provision_intents ("
+                    "attempt_id,thread_id,runtime_generation,created_agent_id,"
+                    "created_attach_token,namespace,pod_name,pvc_name,"
+                    "seed_configmap_name,service_name,network_tier,"
+                    "manifest_fingerprint,"
+                    "previous_binding,retained_binding_generation,retained_pvc_uid,"
+                    "retained_service_uid) "
+                    "VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,"
+                    "$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::uuid,$15,$16) "
+                    "RETURNING *",
+                    parsed_attempt,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_agent,
+                    parsed_attach,
+                    parsed_namespace,
+                    parsed_pod_name,
+                    parsed_pvc_name,
+                    parsed_seed_name,
+                    parsed_service_name,
+                    network_tier.strip(),
+                    manifest_fingerprint,
+                    json.dumps(previous_binding, sort_keys=True, separators=(",", ":")),
+                    retained_generation,
+                    retained_pvc_uid,
+                    str(retained_service_uid or "").strip() or None,
+                )
+                pending = dict(workspace)
+                pending.update(
+                    {
+                        "status": "pending",
+                        "provisioner": "k8s",
+                        "_workspace_provision_attempt": str(parsed_attempt),
+                        "_workspace_provision_generation": str(parsed_generation),
+                        "_runtime_incarnation": None,
+                        "_canvas_workspace_generation": None,
+                        "pod_ip": None,
+                        "pod_name": None,
+                        "host": None,
+                        "port": None,
+                        "ide_host": None,
+                        "ide_port": None,
+                    }
+                )
+                updated_metadata = dict(metadata)
+                updated_metadata["workspace_container"] = pending
+                result = await conn.execute(
+                    "UPDATE threads SET metadata=$4::jsonb,last_activity=now() "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL "
+                    "AND metadata IS NOT DISTINCT FROM $3::jsonb",
+                    parsed_thread,
+                    parsed_generation,
+                    json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                    json.dumps(updated_metadata, sort_keys=True, separators=(",", ":")),
+                )
+                if result != "UPDATE 1":
+                    raise RuntimeError("workspace provision intent publication lost")
+                return dict(intent)
+
+    async def publish_pinned_thread_workspace_provision_resource(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        attempt_id: str,
+        resource: str,
+        resource_uid: str,
+    ) -> bool:
+        """Record one exact original Kubernetes UID under a planned intent."""
+
+        columns = {
+            "pod": ("pod_uid", "pod_name"),
+            "pvc": ("pvc_uid", "pvc_name"),
+            "seed_configmap": ("seed_configmap_uid", "seed_configmap_name"),
+            "service": ("service_uid", "service_name"),
+        }
+        selected = columns.get(resource)
+        uid = str(resource_uid or "").strip()
+        if selected is None or not uid:
+            return False
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_attempt = UUID(str(attempt_id))
+        except (TypeError, ValueError):
+            return False
+        uid_column, name_column = selected
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT execution_lane,status,runtime_generation,"
+                    "runtime_retirement_token,agent_id,runtime_attach_token,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    parsed_thread,
+                )
+                intent = await conn.fetchrow(
+                    "SELECT * FROM thread_workspace_provision_intents "
+                    "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_attempt,
+                    parsed_thread,
+                )
+                if intent is None or thread is None:
+                    return False
+                metadata = thread["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return False
+                workspace = (
+                    metadata.get("workspace_container")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if not (
+                    str(intent["status"]) == "planned"
+                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                    and intent[name_column] is not None
+                    and str(thread["execution_lane"] or "") == "pinned"
+                    and str(thread["status"] or "")
+                    in {"created", "active", "awaiting_user", "suspended"}
+                    and thread["runtime_generation"] == parsed_generation
+                    and thread["runtime_retirement_token"] is None
+                    and thread["agent_id"] == intent["created_agent_id"]
+                    and thread["runtime_attach_token"] == intent["created_attach_token"]
+                    and isinstance(workspace, dict)
+                    and str(workspace.get("_workspace_provision_attempt") or "")
+                    == str(parsed_attempt)
+                    and str(workspace.get("_workspace_provision_generation") or "")
+                    == str(parsed_generation)
+                ):
+                    return False
+                current_uid = intent[uid_column]
+                if current_uid is not None:
+                    return str(current_uid) == uid
+                if resource == "pvc" and intent["retained_pvc_uid"] is not None:
+                    if str(intent["retained_pvc_uid"]) != uid:
+                        return False
+                result = await conn.execute(
+                    f"UPDATE thread_workspace_provision_intents SET {uid_column}=$2 "
+                    "WHERE attempt_id=$1::uuid AND status='planned' "
+                    f"AND {uid_column} IS NULL",
+                    parsed_attempt,
+                    uid,
+                )
+                return result == "UPDATE 1"
+
+    async def complete_pinned_thread_workspace_provision_intent(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        attempt_id: str,
+        expected_pod_uid: str,
+        expected_pvc_uid: str | None,
+        expected_seed_configmap_uid: str | None,
+        expected_service_uid: str | None,
+        pod_ip: str,
+        ssh_host_key_fingerprint: str,
+        port: int = 30022,
+    ) -> Dict[str, Any] | None:
+        """Publish Ready + backing from one fully observed workspace attempt."""
+
+        if (
+            not isinstance(pod_ip, str)
+            or not pod_ip.strip()
+            or not isinstance(ssh_host_key_fingerprint, str)
+            or re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", ssh_host_key_fingerprint)
+            is None
+            or isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            return None
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_attempt = UUID(str(attempt_id))
+            parsed_pod_uid = UUID(str(expected_pod_uid))
+            parsed_pvc_uid = (
+                UUID(str(expected_pvc_uid)) if expected_pvc_uid is not None else None
+            )
+            parsed_seed_uid = (
+                UUID(str(expected_seed_configmap_uid))
+                if expected_seed_configmap_uid is not None
+                else None
+            )
+            parsed_service_uid = (
+                UUID(str(expected_service_uid))
+                if expected_service_uid is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT execution_lane,status,runtime_generation,"
+                    "runtime_retirement_token,agent_id,runtime_attach_token,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    parsed_thread,
+                )
+                intent = await conn.fetchrow(
+                    "SELECT * FROM thread_workspace_provision_intents "
+                    "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_attempt,
+                    parsed_thread,
+                )
+                if intent is None or thread is None:
+                    return None
+                metadata = thread["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return None
+                if not isinstance(metadata, dict):
+                    return None
+                workspace = metadata.get("workspace_container")
+                current_binding = metadata.get("_workspace_binding")
+                current_binding = {} if current_binding is None else current_binding
+                if not (
+                    str(intent["status"]) == "planned"
+                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                    and str(intent["pod_uid"] or "") == str(parsed_pod_uid)
+                    and (
+                        intent["pvc_uid"] is None
+                        if parsed_pvc_uid is None
+                        else str(intent["pvc_uid"] or "") == str(parsed_pvc_uid)
+                    )
+                    and (intent["pvc_name"] is None) == (parsed_pvc_uid is None)
+                    and (
+                        intent["seed_configmap_uid"] is None
+                        if parsed_seed_uid is None
+                        else str(intent["seed_configmap_uid"] or "")
+                        == str(parsed_seed_uid)
+                    )
+                    and (intent["seed_configmap_name"] is None)
+                    == (parsed_seed_uid is None)
+                    and (
+                        intent["service_uid"] is None
+                        if parsed_service_uid is None
+                        else str(intent["service_uid"] or "") == str(parsed_service_uid)
+                    )
+                    and (intent["service_name"] is None) == (parsed_service_uid is None)
+                    and str(thread["execution_lane"] or "") == "pinned"
+                    and str(thread["status"] or "")
+                    in {"created", "active", "awaiting_user", "suspended"}
+                    and thread["runtime_generation"] == parsed_generation
+                    and thread["runtime_retirement_token"] is None
+                    and thread["agent_id"] == intent["created_agent_id"]
+                    and thread["runtime_attach_token"] == intent["created_attach_token"]
+                    and isinstance(workspace, dict)
+                    and str(workspace.get("_workspace_provision_attempt") or "")
+                    == str(parsed_attempt)
+                    and str(workspace.get("_workspace_provision_generation") or "")
+                    == str(parsed_generation)
+                    and isinstance(current_binding, dict)
+                    and current_binding == dict(intent["previous_binding"] or {})
+                ):
+                    return None
+                pod_uid = str(intent["pod_uid"])
+                pvc_uid = str(intent["pvc_uid"] or "") or None
+                backing_id = (
+                    f"k8s-pvc:{intent['namespace']}:{pvc_uid}"
+                    if pvc_uid is not None
+                    else f"k8s-pod:{intent['namespace']}:{pod_uid}"
+                )
+                previous = dict(intent["previous_binding"] or {})
+                if (
+                    intent["retained_binding_generation"] is not None
+                    and str(intent["retained_pvc_uid"] or "") == str(pvc_uid or "")
+                    and str(previous.get("backing_id") or "") == backing_id
+                    and previous.get("kind") == "remote"
+                ):
+                    binding_generation = str(intent["retained_binding_generation"])
+                else:
+                    binding_generation = str(uuid4())
+                binding = {
+                    "generation": binding_generation,
+                    "kind": "remote",
+                    "backing_id": backing_id,
+                    "ssh_host_key_fingerprint": ssh_host_key_fingerprint,
+                }
+                ready = dict(workspace)
+                ready.pop("_workspace_provision_attempt", None)
+                ready.pop("_workspace_provision_generation", None)
+                ready.update(
+                    {
+                        "status": "ready",
+                        "provisioner": "k8s",
+                        "pod_name": str(intent["pod_name"]),
+                        "namespace": str(intent["namespace"]),
+                        "pod_ip": pod_ip.strip(),
+                        "port": port,
+                        "host": (
+                            f"{intent['service_name']}.{intent['namespace']}.svc.cluster.local"
+                            if intent["service_name"] is not None
+                            else None
+                        ),
+                        "_runtime_incarnation": pod_uid,
+                        "_canvas_workspace_generation": binding_generation,
+                    }
+                )
+                updated_metadata = dict(metadata)
+                updated_metadata["workspace_container"] = ready
+                updated_metadata["_workspace_binding"] = binding
+                updated = await conn.execute(
+                    "UPDATE threads SET metadata=$4::jsonb,last_activity=now() "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL "
+                    "AND metadata IS NOT DISTINCT FROM $3::jsonb",
+                    parsed_thread,
+                    parsed_generation,
+                    json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                    json.dumps(updated_metadata, sort_keys=True, separators=(",", ":")),
+                )
+                if updated != "UPDATE 1":
+                    raise RuntimeError("workspace Ready publication lost")
+                resolved = await conn.execute(
+                    "UPDATE thread_workspace_provision_intents "
+                    "SET status='published',resolved_at=now() "
+                    "WHERE attempt_id=$1::uuid AND status='planned'",
+                    parsed_attempt,
+                )
+                if resolved != "UPDATE 1":
+                    raise RuntimeError("workspace intent resolution lost")
+                return {
+                    "runtime_incarnation": pod_uid,
+                    "workspace_generation": binding_generation,
+                    "backing_id": backing_id,
+                    "host": ready.get("host"),
+                }
+
+    async def revoke_pinned_thread_workspace_provision_intent(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_attempt_id: str,
+    ) -> Dict[str, Any] | None:
+        """Close a planned multi-object create before acquiring name fences."""
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = UUID(str(expected_retirement_token))
+            parsed_attempt = UUID(str(expected_attempt_id))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT runtime_retirement_context FROM threads "
+                    "WHERE id=$1::uuid AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                )
+                intent = await conn.fetchrow(
+                    "SELECT * FROM thread_workspace_provision_intents "
+                    "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_attempt,
+                    parsed_thread,
+                )
+                if row is None or intent is None:
+                    return None
+                context = row["runtime_retirement_context"]
+                if isinstance(context, str):
+                    try:
+                        context = json.loads(context)
+                    except (TypeError, ValueError):
+                        return None
+                captured = (
+                    context.get("workspace_provision_intent")
+                    if isinstance(context, dict)
+                    else None
+                )
+                if not (
+                    isinstance(captured, dict)
+                    and str(captured.get("attempt_id") or "") == str(parsed_attempt)
+                    and str(captured.get("runtime_generation") or "")
+                    == str(parsed_generation)
+                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                ):
+                    return None
+                if str(intent["status"]) in {"revoking", "fenced", "retired"}:
+                    return dict(intent)
+                if str(intent["status"]) != "planned":
+                    return None
+                changed = await conn.execute(
+                    "UPDATE thread_workspace_provision_intents "
+                    "SET status='revoking' "
+                    "WHERE attempt_id=$1::uuid AND status='planned'",
+                    parsed_attempt,
+                )
+                if changed != "UPDATE 1":
+                    raise RuntimeError("workspace intent revocation lost")
+                refreshed = dict(intent)
+                refreshed["status"] = "revoking"
+                return refreshed
+
+    async def fence_pinned_thread_workspace_provision_intent(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_attempt_id: str,
+        fence_pod_uid: str,
+        fence_pvc_uid: str | None,
+        fence_configmap_uid: str | None,
+        fence_service_uid: str | None,
+        permanent: bool,
+    ) -> bool:
+        """Persist same-name fences under the exact retirement snapshot.
+
+        Soft retirement clears only the pending endpoint marker and preserves
+        the captured prior backing. Permanent retirement leaves the thread
+        metadata untouched here: the separate physical-clear CAS publishes
+        the append-once external receipt in the same UPDATE that removes that
+        evidence. A permanent follow-up may monotonically add PVC/Service
+        fences omitted by an earlier soft retirement.
+        """
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = UUID(str(expected_retirement_token))
+            parsed_attempt = UUID(str(expected_attempt_id))
+        except (TypeError, ValueError):
+            return False
+        fences = {
+            "fence_pod_uid": str(fence_pod_uid or "").strip() or None,
+            "fence_pvc_uid": str(fence_pvc_uid or "").strip() or None,
+            "fence_configmap_uid": (str(fence_configmap_uid or "").strip() or None),
+            "fence_service_uid": str(fence_service_uid or "").strip() or None,
+        }
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT metadata,runtime_retirement_context,"
+                    "runtime_retirement_permanent FROM threads "
+                    "WHERE id=$1::uuid AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                )
+                intent = await conn.fetchrow(
+                    "SELECT * FROM thread_workspace_provision_intents "
+                    "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_attempt,
+                    parsed_thread,
+                )
+                if row is None or intent is None:
+                    return False
+                metadata = row["metadata"]
+                context = row["runtime_retirement_context"]
+                try:
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+                    if isinstance(context, str):
+                        context = json.loads(context)
+                except (TypeError, ValueError):
+                    return False
+                captured = (
+                    context.get("workspace_provision_intent")
+                    if isinstance(context, dict)
+                    else None
+                )
+                workspace = (
+                    metadata.get("workspace_container")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                previous_binding = intent["previous_binding"]
+                if isinstance(previous_binding, str):
+                    try:
+                        previous_binding = json.loads(previous_binding)
+                    except (TypeError, ValueError):
+                        return False
+                intent_status = str(intent["status"])
+                if not (
+                    isinstance(metadata, dict)
+                    and isinstance(captured, dict)
+                    and str(captured.get("attempt_id") or "") == str(parsed_attempt)
+                    and str(captured.get("runtime_generation") or "")
+                    == str(parsed_generation)
+                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                    and isinstance(previous_binding, dict)
+                    and dict(captured.get("previous_binding") or {})
+                    == dict(previous_binding)
+                    and all(
+                        str(intent[field] or "") == str(captured.get(field) or "")
+                        for field in (
+                            "thread_id",
+                            "created_agent_id",
+                            "created_attach_token",
+                            "namespace",
+                            "pod_name",
+                            "pvc_name",
+                            "seed_configmap_name",
+                            "service_name",
+                            "network_tier",
+                            "manifest_fingerprint",
+                            "retained_binding_generation",
+                            "retained_pvc_uid",
+                            "retained_service_uid",
+                            "pod_uid",
+                            "pvc_uid",
+                            "seed_configmap_uid",
+                            "service_uid",
+                        )
+                    )
+                    and intent_status in {"revoking", "fenced", "retired"}
+                    and isinstance(workspace, dict)
+                    and bool(row["runtime_retirement_permanent"]) == bool(permanent)
+                    and fences["fence_pod_uid"]
+                    and (
+                        intent["pvc_name"] is None
+                        or (not permanent and intent["retained_pvc_uid"] is not None)
+                        or intent_status == "retired"
+                        or fences["fence_pvc_uid"]
+                    )
+                    and (
+                        intent["seed_configmap_name"] is None
+                        or fences["fence_configmap_uid"]
+                    )
+                    and (
+                        intent["service_name"] is None
+                        or (
+                            not permanent and intent["retained_service_uid"] is not None
+                        )
+                        or intent_status == "retired"
+                        or fences["fence_service_uid"]
+                    )
+                ):
+                    return False
+
+                if intent_status == "retired":
+                    pass
+                else:
+                    # Existing fence identities are immutable. A permanent
+                    # follow-up may fill only the retained-resource holes from
+                    # a prior soft fence and restarts the request horizon.
+                    if any(
+                        intent[key] is not None and intent[key] != value
+                        for key, value in fences.items()
+                    ):
+                        return False
+                    if intent_status == "fenced":
+                        if all(intent[key] == value for key, value in fences.items()):
+                            pass
+                        elif not permanent:
+                            return False
+                        else:
+                            upgraded = await conn.execute(
+                                "UPDATE thread_workspace_provision_intents SET "
+                                "fence_pod_uid=COALESCE(fence_pod_uid,$2),"
+                                "fence_pvc_uid=COALESCE(fence_pvc_uid,$3),"
+                                "fence_configmap_uid="
+                                "COALESCE(fence_configmap_uid,$4),"
+                                "fence_service_uid=COALESCE(fence_service_uid,$5),"
+                                "fenced_at=now(),gc_after=now()+"
+                                "($6::double precision * interval '1 second') "
+                                "WHERE attempt_id=$1::uuid AND status='fenced'",
+                                parsed_attempt,
+                                fences["fence_pod_uid"],
+                                fences["fence_pvc_uid"],
+                                fences["fence_configmap_uid"],
+                                fences["fence_service_uid"],
+                                float(PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS),
+                            )
+                            if upgraded != "UPDATE 1":
+                                raise RuntimeError(
+                                    "workspace intent fence upgrade lost"
+                                )
+                    else:
+                        fenced = await conn.execute(
+                            "UPDATE thread_workspace_provision_intents SET "
+                            "status='fenced',fence_pod_uid=$2,fence_pvc_uid=$3,"
+                            "fence_configmap_uid=$4,fence_service_uid=$5,"
+                            "fenced_at=now(),gc_after=now()+"
+                            "($6::double precision * interval '1 second') "
+                            "WHERE attempt_id=$1::uuid AND status='revoking'",
+                            parsed_attempt,
+                            fences["fence_pod_uid"],
+                            fences["fence_pvc_uid"],
+                            fences["fence_configmap_uid"],
+                            fences["fence_service_uid"],
+                            float(PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS),
+                        )
+                        if fenced != "UPDATE 1":
+                            raise RuntimeError(
+                                "workspace intent fence publication lost"
+                            )
+
+                if not permanent:
+                    binding_unchanged = dict(
+                        metadata.get("_workspace_binding") or {}
+                    ) == dict(previous_binding)
+                    marker_matches = bool(
+                        str(workspace.get("_workspace_provision_attempt") or "")
+                        == str(parsed_attempt)
+                        and str(workspace.get("_workspace_provision_generation") or "")
+                        == str(parsed_generation)
+                    )
+                    if not binding_unchanged:
+                        return False
+                    if not marker_matches:
+                        return bool(
+                            intent_status in {"fenced", "retired"}
+                            and workspace.get("status") == "deleted"
+                            and "_workspace_provision_attempt" not in workspace
+                            and "_workspace_provision_generation" not in workspace
+                        )
+                    cleared = dict(workspace)
+                    cleared.pop("_workspace_provision_attempt", None)
+                    cleared.pop("_workspace_provision_generation", None)
+                    cleared.update(
+                        {
+                            "status": "deleted",
+                            "pod_ip": None,
+                            "pod_name": None,
+                            "host": None,
+                            "port": None,
+                            "ide_host": None,
+                            "ide_port": None,
+                            "_runtime_incarnation": None,
+                            "_canvas_workspace_generation": None,
+                        }
+                    )
+                    updated_metadata = dict(metadata)
+                    updated_metadata["workspace_container"] = cleared
+                    updated = await conn.execute(
+                        "UPDATE threads SET metadata=$4::jsonb,last_activity=now() "
+                        "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                        "AND runtime_retirement_token=$3::uuid "
+                        "AND metadata IS NOT DISTINCT FROM $5::jsonb",
+                        parsed_thread,
+                        parsed_generation,
+                        parsed_retirement,
+                        json.dumps(
+                            updated_metadata,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                    )
+                    if updated != "UPDATE 1":
+                        raise RuntimeError("workspace pending marker cleanup lost")
+                return True
+
+    async def list_pinned_thread_workspace_provision_fences_for_gc(
+        self, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Return exact workspace fence work whose request horizon elapsed."""
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM thread_workspace_provision_intents "
+                "WHERE status='fenced' AND gc_after <= now() "
+                "ORDER BY gc_after,created_at LIMIT $1",
+                max(1, min(int(limit), 1000)),
+            )
+        return [dict(row) for row in rows]
+
+    async def retire_pinned_thread_workspace_provision_fence(
+        self,
+        attempt_id: str,
+        *,
+        expected_fence_pod_uid: str,
+        expected_fence_pvc_uid: str | None,
+        expected_fence_configmap_uid: str | None,
+        expected_fence_service_uid: str | None,
+    ) -> bool:
+        """Mark a post-horizon fence retired after exact UID deletion."""
+
+        try:
+            parsed_attempt = UUID(str(attempt_id))
+        except (TypeError, ValueError):
+            return False
+        expected = tuple(
+            str(value or "").strip() or None
+            for value in (
+                expected_fence_pod_uid,
+                expected_fence_pvc_uid,
+                expected_fence_configmap_uid,
+                expected_fence_service_uid,
+            )
+        )
+        if expected[0] is None:
+            return False
+        async with self.acquire() as conn:
+            return (
+                await conn.execute(
+                    "UPDATE thread_workspace_provision_intents "
+                    "SET status='retired',resolved_at=now() "
+                    "WHERE attempt_id=$1::uuid AND status='fenced' "
+                    "AND gc_after <= now() "
+                    "AND fence_pod_uid IS NOT DISTINCT FROM $2 "
+                    "AND fence_pvc_uid IS NOT DISTINCT FROM $3 "
+                    "AND fence_configmap_uid IS NOT DISTINCT FROM $4 "
+                    "AND fence_service_uid IS NOT DISTINCT FROM $5",
+                    parsed_attempt,
+                    *expected,
+                )
+                == "UPDATE 1"
+            )
+
+    async def begin_pinned_thread_vm_provisioning(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_agent_id: str | None,
+        expected_attach_token: str | None,
+        expected_vm_context: Mapping[str, Any] | None,
+        provision_context: Mapping[str, Any],
+    ) -> bool:
+        """Install one VM provision generation before any controller effect.
+
+        The caller's earlier route/read snapshot is advisory.  This method is
+        the effect admission boundary: it locks the thread, proves the exact
+        open pinned ``(T, G, agent, attach)`` authority and the VM subdocument
+        the caller observed, then publishes the new provision generation and
+        ``provisioning`` status in the same update.  A stale upgrade therefore
+        cannot dispatch after End, Resume, rebind, or another VM attempt.
+
+        ``None`` means the ``vm`` member was absent/JSON-null.  Present scalar
+        or array values fail closed instead of being truthiness-coerced to an
+        empty object.
+        """
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_runtime_generation = UUID(str(expected_runtime_generation))
+            parsed_agent = (
+                UUID(str(expected_agent_id)) if expected_agent_id is not None else None
+            )
+            parsed_attach = (
+                UUID(str(expected_attach_token))
+                if expected_attach_token is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            return False
+        if (parsed_agent is None) != (parsed_attach is None):
+            return False
+        if expected_vm_context is not None and not isinstance(
+            expected_vm_context, Mapping
+        ):
+            return False
+        if not isinstance(provision_context, Mapping):
+            return False
+        proposed = dict(provision_context)
+        try:
+            provision_generation = _canonical_uuid_text(
+                proposed.get("provision_generation"),
+                label="thread VM provision generation",
+            )
+        except RuntimeError:
+            return False
+        if (
+            proposed.get("status") != "provisioning"
+            or proposed.get("identity_authenticated") is not False
+            or proposed.get("identity_provision_generation") is not None
+            or proposed.get("vm_uid") is not None
+            or proposed.get("_runtime_incarnation") is not None
+            or proposed.get("rootdisk_pvc_uid") is not None
+            or proposed.get("ssh_host") is not None
+            or proposed.get("ssh_port") is not None
+            or proposed.get("_canvas_workspace_generation") is not None
+        ):
+            return False
+        proposed["provision_generation"] = provision_generation
+        expected_vm = (
+            dict(expected_vm_context) if expected_vm_context is not None else None
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT status,execution_lane,runtime_generation,"
+                    "runtime_retirement_token,agent_id,runtime_attach_token,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    parsed_thread,
+                )
+                if row is None:
+                    return False
+                metadata = row["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(metadata, dict):
+                    return False
+                raw_current_vm = metadata.get("vm")
+                if raw_current_vm is not None and not isinstance(raw_current_vm, dict):
+                    return False
+                current_vm = (
+                    dict(raw_current_vm) if raw_current_vm is not None else None
+                )
+                if current_vm != expected_vm:
+                    return False
+                current_vm_status = str((current_vm or {}).get("status") or "")
+                if current_vm_status in {
+                    "provisioning",
+                    "created",
+                    "starting",
+                    "ssh_pending",
+                    "ready",
+                    "waiting_golden",
+                    "waiting_capacity",
+                    "waiting_headscale",
+                }:
+                    return False
+                if not (
+                    str(row["execution_lane"] or "") == "pinned"
+                    and str(row["status"] or "")
+                    in {"created", "active", "awaiting_user", "suspended"}
+                    and row["runtime_generation"] == parsed_runtime_generation
+                    and row["runtime_retirement_token"] is None
+                    and row["agent_id"] == parsed_agent
+                    and row["runtime_attach_token"] == parsed_attach
+                ):
+                    return False
+                inverse_agents = await conn.fetch(
+                    "SELECT id FROM agents WHERE thread_id=$1::uuid FOR SHARE",
+                    parsed_thread,
+                )
+                if parsed_agent is None:
+                    if inverse_agents:
+                        return False
+                elif (
+                    len(inverse_agents) != 1 or inverse_agents[0]["id"] != parsed_agent
+                ):
+                    return False
+
+                next_vm = {**(current_vm or {}), **proposed}
+                metadata["vm"] = next_vm
+                result = await conn.execute(
+                    "UPDATE threads SET metadata=$2::jsonb,"
+                    "last_activity=CURRENT_TIMESTAMP "
+                    "WHERE id=$1::uuid AND runtime_generation=$3::uuid "
+                    "AND runtime_retirement_token IS NULL",
+                    parsed_thread,
+                    json.dumps(metadata),
+                    parsed_runtime_generation,
+                )
+                return result == "UPDATE 1"
+
     async def merge_thread_vm_context(
         self, thread_id: str, vm_updates: Dict[str, Any]
     ) -> bool:
@@ -8191,30 +12446,32 @@ class PostgresDB:
             "datasource_selection": safe_provenance,
         }
 
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                # Serialize every replacement, including A -> [], with the
-                # credential-delivery boundary.  Once this transaction
-                # commits, an in-flight attach can no longer deliver the old
-                # selection; either the attach completed first or it will
-                # re-read this newly committed snapshot.
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock($1)",
-                    _thread_datasource_lock_key(thread_id),
-                )
-                await _lock_and_compare_policy_snapshot(
-                    conn, datasource_uuids, policy_snapshot
-                )
-                result = await conn.execute(
-                    """
-                    UPDATE threads
-                    SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb,
-                        last_activity = CURRENT_TIMESTAMP
-                    WHERE id = $2
-                    """,
-                    json.dumps(metadata_patch),
-                    thread_uuid,
-                )
+        # Own the shared datasource key *before* taking an application-pool
+        # slot. Delivery holds the same dedicated-session lock while it builds
+        # and sends the credential payload and performs nested DB reads. With
+        # a size-one pool the old ordering (pool -> blocking xact lock) could
+        # starve the delivery owner of its own next pool acquisition.
+        async with self.thread_datasource_lock(thread_id):
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    # Serialize every replacement, including A -> [], with the
+                    # credential-delivery boundary. Once this transaction
+                    # commits, an in-flight attach can no longer deliver the
+                    # old selection; either attach completed first or it will
+                    # re-read this newly committed snapshot.
+                    await _lock_and_compare_policy_snapshot(
+                        conn, datasource_uuids, policy_snapshot
+                    )
+                    result = await conn.execute(
+                        """
+                        UPDATE threads
+                        SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb,
+                            last_activity = CURRENT_TIMESTAMP
+                        WHERE id = $2
+                        """,
+                        json.dumps(metadata_patch),
+                        thread_uuid,
+                    )
 
         return result == "UPDATE 1"
 
@@ -8778,6 +13035,9 @@ class PostgresDB:
         current_job_id: str | None = None,
         metrics: Dict[str, Any] | None = None,
         aux_degraded: bool | None = None,
+        session_runtime_generation: UUID | str | None = None,
+        session_runtime_attach_token: UUID | str | None = None,
+        require_pinned_identity: bool = False,
     ) -> Dict[str, Any] | None:
         """Update agent heartbeat and status.
 
@@ -8794,6 +13054,13 @@ class PostgresDB:
                 (metrics.aux.degraded). True/False updates agents.aux_degraded;
                 None leaves the persisted flag untouched (e.g. older agent
                 builds or a not-yet-wired aux LLM). See aux Phase 2.
+            session_runtime_generation: Exact pinned runtime generation echoed
+                by a thread-bound agent.
+            session_runtime_attach_token: Exact per-process attach authority
+                echoed by a thread-bound agent. New dedicated and pool
+                runtimes both bind with a non-NULL token.
+            require_pinned_identity: Staged rollout gate for ordinary pinned
+                sessions. Protected rows always require exact identity.
 
         Returns:
             Dict with previous status (for transition detection) or None if not found
@@ -8804,17 +13071,99 @@ class PostgresDB:
             return None
 
         job_uuid = UUID(current_job_id) if current_job_id else None
+        try:
+            presented_generation = (
+                UUID(str(session_runtime_generation))
+                if session_runtime_generation is not None
+                else None
+            )
+            presented_attach_token = (
+                UUID(str(session_runtime_attach_token))
+                if session_runtime_attach_token is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            # Keep malformed identity indistinguishable from stale identity.
+            # The route turns this into a conflict without touching liveness.
+            return {"authority_refused": True}
 
         async with self.acquire() as conn:
             # Fetch previous status (transition detection) + intents
             # (orchestrator-set drain/upgrade hints that the agent reads
             # from the heartbeat response and reacts to).
             prev = await conn.fetchrow(
-                "SELECT status, intents, metadata, thread_id FROM agents WHERE id = $1",
+                "SELECT agent.status, agent.intents, agent.metadata, "
+                "       agent.thread_id, thread.execution_lane, "
+                "       thread.runtime_generation AS thread_runtime_generation, "
+                "       thread.runtime_attach_token AS thread_runtime_attach_token, "
+                "       thread.runtime_retirement_token, "
+                "       thread.status AS thread_status, "
+                "       thread.metadata AS thread_metadata "
+                "FROM agents AS agent "
+                "LEFT JOIN threads AS thread ON thread.id = agent.thread_id "
+                "WHERE agent.id = $1",
                 uuid_val,
             )
             if not prev:
                 return None
+
+            bound_thread_id = prev.get("thread_id")
+            lane = str(prev.get("execution_lane") or "")
+            thread_metadata_raw = prev.get("thread_metadata") or {}
+            if isinstance(thread_metadata_raw, str):
+                try:
+                    thread_metadata = json.loads(thread_metadata_raw)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    thread_metadata = {"protected_cloud": "malformed"}
+            elif isinstance(thread_metadata_raw, dict):
+                thread_metadata = thread_metadata_raw
+            else:
+                thread_metadata = {"protected_cloud": "malformed"}
+            protected_identity = (
+                bound_thread_id is not None
+                and lane == "pinned"
+                and (
+                    "protected_cloud" in thread_metadata
+                    and thread_metadata.get("protected_cloud") is not False
+                )
+            )
+            exact_identity_required = bool(
+                bound_thread_id is not None
+                and lane == "pinned"
+                and (protected_identity or require_pinned_identity)
+            )
+            expected_generation = prev.get("thread_runtime_generation")
+            expected_attach_token = prev.get("thread_runtime_attach_token")
+            identity_mismatch = bool(
+                bound_thread_id is not None
+                and lane == "pinned"
+                and (
+                    prev.get("runtime_retirement_token") is not None
+                    or str(prev.get("thread_status") or "")
+                    not in {"created", "active", "awaiting_user"}
+                    or (
+                        presented_generation is not None
+                        and presented_generation != expected_generation
+                    )
+                    or (
+                        presented_attach_token is not None
+                        and presented_attach_token != expected_attach_token
+                    )
+                    or (exact_identity_required and presented_generation is None)
+                    or (
+                        exact_identity_required
+                        and (
+                            expected_attach_token is None
+                            or presented_attach_token is None
+                        )
+                    )
+                )
+            )
+            if identity_mismatch:
+                return {
+                    "authority_refused": True,
+                    "thread_id": str(bound_thread_id),
+                }
 
             prev_status = prev["status"]
             prev_metadata_raw = prev["metadata"] if "metadata" in prev else None
@@ -8872,10 +13221,17 @@ class PostgresDB:
                 params.append(value)
                 return f"${len(params)}"
 
+            incoming_status = _p(status)
             status_expr = (
                 "CASE WHEN status = 'draining' THEN 'draining' "
                 "WHEN status = 'offline' THEN 'offline' "
-                f"ELSE {_p(status)} END"
+                # A warm attach reserves agents.status='session' before the
+                # agent's background setup exists.  Mixed-version pool agents
+                # may still heartbeat ready in that window; preserve the
+                # reservation until exact release clears thread_id.
+                "WHEN status = 'session' AND thread_id IS NOT NULL "
+                f"AND {incoming_status} = 'ready' THEN 'session' "
+                f"ELSE {incoming_status} END"
             )
             set_clauses = [
                 f"status = {status_expr}",
@@ -8899,13 +13255,48 @@ class PostgresDB:
             if aux_degraded is not None:
                 set_clauses.append(f"aux_degraded = {_p(aux_degraded)}")
 
+            agent_param = _p(uuid_val)
             query = (
-                f"UPDATE agents SET {', '.join(set_clauses)} WHERE id = {_p(uuid_val)}"
+                f"UPDATE agents SET {', '.join(set_clauses)} WHERE id = {agent_param}"
             )
+            if bound_thread_id is None:
+                # A warm-pool heartbeat admitted while idle must not cross a
+                # concurrent reservation and mutate the newly bound runtime.
+                query += " AND thread_id IS NULL"
+            elif lane == "pinned" and presented_generation is not None:
+                # This UPDATE is the final credential boundary. Even if End,
+                # release, or same-agent G1->G2 reuse lands after the snapshot,
+                # the stale beat cannot touch agent status/timestamp/metrics.
+                bound_param = _p(bound_thread_id)
+                generation_param = _p(presented_generation)
+                attach_param = _p(presented_attach_token)
+                query += (
+                    f" AND thread_id = {bound_param} "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM threads AS thread "
+                    f"WHERE thread.id = {bound_param} "
+                    f"AND thread.agent_id = {agent_param} "
+                    "AND thread.execution_lane = 'pinned' "
+                    "AND thread.status IN ('created', 'active', 'awaiting_user') "
+                    "AND thread.runtime_retirement_token IS NULL "
+                    f"AND thread.runtime_generation = {generation_param} "
+                    "AND thread.runtime_attach_token "
+                    f"IS NOT DISTINCT FROM {attach_param}::uuid)"
+                )
+            elif bound_thread_id is not None:
+                # Compatibility mode still pins the binding observed by this
+                # request. Strict/protected rows never take this branch.
+                query += f" AND thread_id = {_p(bound_thread_id)}"
             result = await conn.execute(query, *params)
 
             if result != "UPDATE 1":
-                return None
+                # The agent row existed at admission. A conditional miss is
+                # therefore an ownership race, not a 404: mapping it to 404
+                # would tell the stale pod to re-register itself into G2.
+                return {
+                    "authority_refused": True,
+                    "thread_id": str(bound_thread_id) if bound_thread_id else None,
+                }
 
             # Job execution lease renewal (knowledge-base/knowledge/features/job_execution_lease.md):
             # a heartbeat that carries a job renews that job's lease — liveness
@@ -8938,17 +13329,28 @@ class PostgresDB:
                 effective_status = "draining"
             elif prev_status == "offline":
                 effective_status = "offline"
+            elif (
+                prev_status == "session"
+                and prev.get("thread_id") is not None
+                and status == "ready"
+            ):
+                effective_status = "session"
             else:
                 effective_status = status
             # The agent's bound thread rides the same row read at zero
             # marginal DB cost; the handler needs it to slide a thread-bound
             # runtime-actor grant on liveness. None for stateless workers.
-            bound_thread_id = prev["thread_id"] if "thread_id" in prev else None
             return {
                 "previous_status": prev_status,
                 "effective_status": effective_status,
                 "intents": intents,
                 "thread_id": str(bound_thread_id) if bound_thread_id else None,
+                "session_runtime_generation": (
+                    str(expected_generation) if expected_generation else None
+                ),
+                "session_runtime_attach_token": (
+                    str(expected_attach_token) if expected_attach_token else None
+                ),
             }
 
     async def list_agents(
@@ -9025,7 +13427,7 @@ class PostgresDB:
         return dict(row) if row else None
 
     async def delete_agent(self, agent_id: str) -> bool:
-        """Delete (deregister) an agent.
+        """Delete an unbound agent; bound runtime authority fails closed.
 
         Args:
             agent_id: Agent UUID as string
@@ -9040,6 +13442,17 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             async with conn.transaction():
+                # A bound agent row carries the only controller-attested Pod
+                # name/UID for its exact attach. ON DELETE SET NULL is not a
+                # quiescence proof and, after 0185, would also leave a token
+                # without its reciprocal actor. Retirement/recycle must first
+                # stop that exact process and clear the pair in its owned edge.
+                referenced = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM threads WHERE agent_id = $1)",
+                    uuid_val,
+                )
+                if referenced:
+                    return False
                 # ``threads.agent_id`` has ON DELETE SET NULL, but the exact
                 # control capability intentionally has no FK. Close it before
                 # deleting the credential row so no stale owner token remains.
@@ -13384,6 +17797,9 @@ class PostgresDB:
         reason: str,
         force: bool = False,
         allow_orphan_retirement: bool = False,
+        retirement_token: str | None = None,
+        retirement_generation: str | None = None,
+        retirement_settle_status: str | None = None,
         fault_injector: Any = None,
     ) -> Dict[str, Any]:
         """One atomic, idempotent commissioned -> vacant post handoff.
@@ -13397,13 +17813,14 @@ class PostgresDB:
 
         A direct End may set ``allow_orphan_retirement``. If the target is not
         the linked incarnation, this transaction locks the current thread and
-        target in order, then disables/ends only the target. It deliberately
+        target in order, then disables only the target. It deliberately
         performs no harvest, history, wake, route, or post mutation.
 
         For the linked incarnation the transaction then harvests authoritative
         thread state, folds/deletes wakes, writes durable user-fallback intent,
-        appends one incarnation, unlinks the post and disables/ends the thread.
-        External cleanup and route delivery are post-commit responsibilities.
+        appends one incarnation, unlinks the post and disables the thread.
+        The shared pinned retirement funnel alone publishes ``status=ended``
+        after exact external cleanup; route delivery remains post-commit.
 
         ``fault_injector`` is an isolated-test hook invoked after each named DB
         substep. Production callers leave it unset; real-Postgres tests use it
@@ -13417,6 +17834,31 @@ class PostgresDB:
                 "invalid_identity", "Officer Post identity is invalid."
             ) from exc
 
+        retirement_requested = any(
+            value is not None
+            for value in (
+                retirement_token,
+                retirement_generation,
+                retirement_settle_status,
+            )
+        )
+        retirement_token_uuid: UUID | None = None
+        retirement_generation_uuid: UUID | None = None
+        if retirement_requested:
+            if retirement_settle_status not in {"ended", "suspended"}:
+                raise OfficerPostLifecycleConflict(
+                    "invalid_retirement_authority",
+                    "Officer retirement disposition is invalid.",
+                )
+            try:
+                retirement_token_uuid = UUID(str(retirement_token))
+                retirement_generation_uuid = UUID(str(retirement_generation))
+            except (ValueError, TypeError) as exc:
+                raise OfficerPostLifecycleConflict(
+                    "invalid_retirement_authority",
+                    "Officer retirement authority is invalid.",
+                ) from exc
+
         async def _fault(step: str) -> None:
             if fault_injector is None:
                 return
@@ -13427,6 +17869,29 @@ class PostgresDB:
         result: Dict[str, Any]
         async with self.acquire() as conn:
             async with conn.transaction():
+
+                async def _authorize_retirement() -> None:
+                    if not retirement_requested:
+                        return
+                    authorized = await conn.fetchval(
+                        "UPDATE threads SET runtime_retirement_authorized_at="
+                        "COALESCE(runtime_retirement_authorized_at, now()) "
+                        "WHERE id=$1::uuid AND execution_lane='pinned' "
+                        "AND runtime_generation=$2::uuid "
+                        "AND runtime_retirement_token=$3::uuid "
+                        "AND runtime_retirement_context->>'settle_status'=$4 "
+                        "RETURNING id",
+                        thread_uuid,
+                        retirement_generation_uuid,
+                        retirement_token_uuid,
+                        retirement_settle_status,
+                    )
+                    if authorized is None:
+                        raise OfficerPostLifecycleConflict(
+                            "retirement_authority_changed",
+                            "Officer retirement authority changed; retry.",
+                        )
+
                 post_row = await conn.fetchrow(
                     "SELECT * FROM project_officers WHERE project_id = $1 FOR UPDATE",
                     project_uuid,
@@ -13478,6 +17943,11 @@ class PostgresDB:
                             "project_mismatch",
                             "Officer orphan/thread project mismatch.",
                         )
+                    # This update disables the old incarnation. Authorize the
+                    # exact retirement in the same transaction first so a
+                    # crash can never leave a mutated, hidden preflight that a
+                    # stale-preflight reaper would later reopen.
+                    await _authorize_retirement()
                     if orphan_row is not None:
                         orphan_metadata = orphan_row["metadata"]
                         if isinstance(orphan_metadata, str):
@@ -13503,9 +17973,6 @@ class PostgresDB:
                                SET metadata = jsonb_set(
                                        COALESCE(metadata, '{}'::jsonb),
                                        '{config_override}', $2::jsonb),
-                                   status = 'ended',
-                                   ended_at = COALESCE(ended_at, now()),
-                                   control_admission_agent_id = NULL,
                                    last_activity = now()
                              WHERE id = $1
                             """,
@@ -13528,6 +17995,15 @@ class PostgresDB:
                         "incarnation": None,
                     }
                 if linked is None:
+                    # A retry after the post transaction committed still has
+                    # an idempotent authorization obligation. Lock/authorize
+                    # the target before reporting the already-vacant post.
+                    if retirement_requested:
+                        await conn.fetchrow(
+                            "SELECT id FROM threads WHERE id=$1::uuid FOR UPDATE",
+                            thread_uuid,
+                        )
+                        await _authorize_retirement()
                     return {
                         "transitioned": False,
                         "orphan_retired": False,
@@ -13617,6 +18093,13 @@ class PostgresDB:
                         "in_flight_jobs": in_flight_jobs,
                         "incarnation": None,
                     }
+
+                # Linearization edge: the in-flight refusal above is still an
+                # observational no-op. Every decommission mutation below is
+                # owned by an append-only retirement authorization in this
+                # same transaction, so crash recovery must converge rather
+                # than reopen the runtime.
+                await _authorize_retirement()
 
                 metadata: Dict[str, Any] = {}
                 if thread_row is not None:
@@ -13845,9 +18328,6 @@ class PostgresDB:
                            SET metadata = jsonb_set(
                                    COALESCE(metadata, '{}'::jsonb),
                                    '{config_override}', $2::jsonb),
-                               status = 'ended',
-                               ended_at = COALESCE(ended_at, now()),
-                               control_admission_agent_id = NULL,
                                last_activity = now()
                          WHERE id = $1
                         """,
@@ -17215,36 +21695,155 @@ class PostgresDB:
                     )
         return str(row["id"])
 
-    @asynccontextmanager
-    async def thread_advisory_lock(self, thread_id: str):
-        """Postgres advisory lock keyed by ``thread_id``.
-
-        Pattern matches the schema-migration lock at
-        ``orchestrator/database/migrate.py:157``. The lock key is a stable
-        hash of the thread_id (Postgres advisory locks take a bigint key).
-        Used by ``POST /api/sessions/{thread_id}/prepare`` to serialize
-        concurrent prepare calls — see
-        ``knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md``.
-        """
-        h = hashlib.blake2b(thread_id.encode(), digest_size=8).digest()
-        key = int.from_bytes(h, byteorder="big", signed=True)
-
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("SELECT pg_advisory_xact_lock($1)", key)
-                yield
-                # Lock auto-released at transaction end.
+    def _dedicated_advisory_slots(self, domain: str) -> asyncio.Semaphore:
+        # A few focused tests instantiate PostgresDB via ``__new__``. Lazily
+        # supply the production default so those tests exercise the real lock
+        # contract without constructing a connection pool.
+        groups = getattr(self, "_dedicated_advisory_lock_slot_groups", None)
+        if groups is None:
+            groups = {}
+            self._dedicated_advisory_lock_slot_groups = groups
+        slots = groups.get(domain)
+        if slots is None:
+            slots = asyncio.Semaphore(4)
+            groups[domain] = slots
+        return slots
 
     @asynccontextmanager
-    async def thread_datasource_lock(self, thread_id: str):
-        """Serialize connector selection writes with credential delivery."""
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock($1)",
-                    _thread_datasource_lock_key(thread_id),
+    async def _dedicated_session_advisory_lock(
+        self,
+        key: int,
+        *,
+        domain: str,
+        wait: bool,
+        wait_timeout_s: float | None,
+        poll_interval_s: float = 0.05,
+    ):
+        """Hold one advisory lock without a pooled or blocked-waiter session."""
+
+        if asyncpg is None:
+            raise RuntimeError("asyncpg is required for lifecycle locking")
+        loop = asyncio.get_running_loop()
+        deadline = (
+            None
+            if wait_timeout_s is None
+            else loop.time() + max(0.0, float(wait_timeout_s))
+        )
+        slots = self._dedicated_advisory_slots(domain)
+        slot_acquired = False
+        conn = None
+        acquired = False
+        try:
+            if not wait and getattr(slots, "_value", 0) <= 0:
+                yield False
+                return
+            acquire_slot = slots.acquire()
+            if wait and deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError("advisory lock wait timed out")
+                await asyncio.wait_for(acquire_slot, timeout=remaining)
+            elif wait:
+                await acquire_slot
+            else:
+                # The value check above makes this nonblocking in practice;
+                # no await boundary can decrement the semaphore in between.
+                await acquire_slot
+            slot_acquired = True
+
+            while True:
+                conn = await asyncpg.connect(
+                    self._connection_string,
+                    timeout=5,
+                    command_timeout=getattr(self, "_command_timeout", 60),
                 )
-                yield
+                acquired = bool(
+                    await conn.fetchval("SELECT pg_try_advisory_lock($1)", key)
+                )
+                if acquired:
+                    break
+                try:
+                    await conn.close(timeout=5)
+                except BaseException:
+                    conn.terminate()
+                    raise
+                conn = None
+                if not wait:
+                    yield False
+                    return
+                if deadline is not None:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise TimeoutError("advisory lock wait timed out")
+                    await asyncio.sleep(min(poll_interval_s, remaining))
+                else:
+                    await asyncio.sleep(poll_interval_s)
+
+            yield True
+        finally:
+            try:
+                if acquired and conn is not None:
+                    unlocked = await conn.fetchval("SELECT pg_advisory_unlock($1)", key)
+                    if not unlocked:
+                        logger.error("Dedicated advisory unlock failed for key %s", key)
+            finally:
+                if conn is not None:
+                    try:
+                        await conn.close(timeout=5)
+                    except BaseException:
+                        conn.terminate()
+                        raise
+                if slot_acquired:
+                    slots.release()
+
+    @asynccontextmanager
+    async def thread_advisory_lock(
+        self,
+        thread_id: str,
+        *,
+        wait: bool = True,
+        wait_timeout_s: float | None = 300.0,
+    ):
+        """Cross-replica lifecycle mutex keyed by ``thread_id``.
+
+        The owner retains one bounded dedicated session. Waiters use
+        ``pg_try_advisory_lock`` polling and close each losing session before
+        backoff, so neither the application pool nor PostgreSQL's backend
+        budget is consumed by a duplicate-request storm.
+        """
+        key = _thread_lifecycle_lock_key(thread_id)
+
+        async with self._dedicated_session_advisory_lock(
+            key,
+            domain="lifecycle",
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+        ) as acquired:
+            yield acquired
+
+    @asynccontextmanager
+    async def try_thread_advisory_lock(self, thread_id: str):
+        """Try one thread lifecycle mutex without retaining a waiting connection."""
+
+        async with self.thread_advisory_lock(thread_id, wait=False) as acquired:
+            yield acquired
+
+    @asynccontextmanager
+    async def thread_datasource_lock(
+        self, thread_id: str, *, wait_timeout_s: float | None = 60.0
+    ):
+        """Serialize connector writes with delivery without occupying the pool."""
+
+        key = _thread_datasource_lock_key(thread_id)
+        async with self._dedicated_session_advisory_lock(
+            key,
+            domain="datasource",
+            wait=True,
+            wait_timeout_s=wait_timeout_s,
+        ) as acquired:
+            if not acquired:  # defensive; wait=True raises on timeout
+                raise TimeoutError("datasource lock wait timed out")
+            yield
 
     async def get_thread(self, thread_id: str) -> Dict[str, Any] | None:
         """Get thread by ID.
@@ -17320,7 +21919,7 @@ class PostgresDB:
                 WHERE status = 'active'
                   AND metadata->'workspace_container' IS NOT NULL
                   AND COALESCE(metadata->'workspace_container'->>'status', '') NOT IN
-                      ('ready', 'creating', 'restoring', 'created', 'pending', 'suspending')
+                      ('ready', 'creating', 'restoring', 'created', 'suspending')
                 """,
             )
         return [dict(r) for r in rows]
@@ -17337,6 +21936,3077 @@ class PostgresDB:
                 WHERE id = $1
                 """,
                 thread_id,
+            )
+
+    async def reserve_pinned_agent_pod_provision_intent(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        attempt_id: str,
+        pod_name: str,
+        provisioner: str,
+        pvc_name: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Persist one exact Kubernetes Pod create intent before its effect.
+
+        A retry adopts the existing planned intent for the same thread life;
+        it never invents another random Pod name.  The exposure latch is set
+        in the same transaction so retirement cannot mistake a response-lost
+        create for a never-exposed life.
+        """
+
+        if provisioner not in {"agent", "persistent"}:
+            return None
+        name = str(pod_name or "").strip()
+        if (
+            not name
+            or len(name) > 253
+            or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?", name)
+        ):
+            return None
+        claim_name = str(pvc_name or "").strip() or None
+        if claim_name is not None and (
+            len(claim_name) > 253
+            or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?", claim_name)
+        ):
+            return None
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_attempt = UUID(str(attempt_id))
+        except (TypeError, ValueError):
+            return None
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT status, execution_lane, runtime_generation, "
+                    "runtime_retirement_token, agent_id, "
+                    "control_admission_agent_id, runtime_attach_token, metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    parsed_thread,
+                )
+                if row is None:
+                    return None
+                metadata = row["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return None
+                if not isinstance(metadata, dict):
+                    return None
+                if not (
+                    str(row["execution_lane"] or "") == "pinned"
+                    and str(row["runtime_generation"] or "") == str(parsed_generation)
+                    and row["runtime_retirement_token"] is None
+                    and str(row["status"] or "")
+                    in {"created", "active", "awaiting_user", "suspended"}
+                    and row["agent_id"] is None
+                    and row["control_admission_agent_id"] is None
+                    and row["runtime_attach_token"] is None
+                ):
+                    return None
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM agents WHERE thread_id=$1::uuid)",
+                    parsed_thread,
+                ):
+                    return None
+
+                existing = await conn.fetchrow(
+                    "SELECT attempt_id, thread_id, runtime_generation, "
+                    "provisioner, workspace_claim_id, pod_name, status, pod_uid "
+                    "FROM thread_agent_pod_provision_intents "
+                    "WHERE thread_id=$1::uuid "
+                    "AND status IN ('planned','revoking','fenced') FOR UPDATE",
+                    parsed_thread,
+                )
+                if existing is not None:
+                    if not (
+                        str(existing["status"]) == "planned"
+                        and str(existing["runtime_generation"])
+                        == str(parsed_generation)
+                        and str(existing["provisioner"]) == provisioner
+                        and metadata.get("agent_pod") in (None, {})
+                    ):
+                        return None
+                    existing_claim = None
+                    if existing["workspace_claim_id"] is not None:
+                        existing_claim = await conn.fetchrow(
+                            "SELECT * FROM thread_agent_workspace_claims "
+                            "WHERE claim_id=$1::uuid FOR UPDATE",
+                            existing["workspace_claim_id"],
+                        )
+                    if bool(claim_name) != bool(existing_claim):
+                        return None
+                    if existing_claim is not None and (
+                        str(existing_claim["thread_id"]) != str(parsed_thread)
+                        or str(existing_claim["provisioner"]) != provisioner
+                        or str(existing_claim["pvc_name"]) != claim_name
+                        or str(existing_claim["status"]) not in {"planned", "ready"}
+                    ):
+                        return None
+                    result = dict(existing)
+                    result["workspace_claim"] = (
+                        dict(existing_claim) if existing_claim is not None else None
+                    )
+                    return result
+
+                # An idempotent provision call can race the first successful
+                # publication or simply retry after losing its 200.  Adopt the
+                # sole exact same-G published attempt instead of reserving a
+                # new random name that would misclassify the live incumbent as
+                # foreign and leave a second planned intent behind.
+                published_attempts = await conn.fetch(
+                    "SELECT attempt_id,thread_id,runtime_generation,"
+                    "provisioner,workspace_claim_id,pod_name,status,pod_uid "
+                    "FROM thread_agent_pod_provision_intents "
+                    "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND status='published' ORDER BY resolved_at DESC LIMIT 2 "
+                    "FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                )
+                if published_attempts:
+                    if len(published_attempts) != 1:
+                        return None
+                    published = published_attempts[0]
+                    marker = metadata.get("agent_pod")
+                    if not (
+                        isinstance(marker, dict)
+                        and str(published["provisioner"]) == provisioner
+                        and str(published["pod_name"] or "")
+                        == str(marker.get("pod_name") or "")
+                        and str(published["pod_uid"] or "")
+                        == str(marker.get("pod_uid") or "")
+                        and str(published["attempt_id"])
+                        == str(marker.get("provision_attempt") or "")
+                        and str(published["runtime_generation"])
+                        == str(marker.get("runtime_generation") or "")
+                    ):
+                        return None
+                    published_claim = None
+                    if published["workspace_claim_id"] is not None:
+                        published_claim = await conn.fetchrow(
+                            "SELECT * FROM thread_agent_workspace_claims "
+                            "WHERE claim_id=$1::uuid FOR UPDATE",
+                            published["workspace_claim_id"],
+                        )
+                    if bool(claim_name) != bool(published_claim):
+                        return None
+                    if published_claim is not None and not (
+                        str(published_claim["thread_id"]) == str(parsed_thread)
+                        and str(published_claim["provisioner"]) == provisioner
+                        and str(published_claim["pvc_name"]) == claim_name
+                        and str(published_claim["status"]) == "ready"
+                        and bool(str(published_claim["pvc_uid"] or ""))
+                    ):
+                        return None
+                    result = dict(published)
+                    result["workspace_claim"] = (
+                        dict(published_claim) if published_claim is not None else None
+                    )
+                    return result
+
+                if metadata.get("agent_pod") not in (None, {}):
+                    return None
+
+                workspace_claim = None
+                workspace_claim_id = None
+                if claim_name is not None:
+                    workspace_claim = await conn.fetchrow(
+                        "SELECT * FROM thread_agent_workspace_claims "
+                        "WHERE thread_id=$1::uuid FOR UPDATE",
+                        parsed_thread,
+                    )
+                    if workspace_claim is None:
+                        workspace_claim_id = uuid4()
+                        workspace_claim = await conn.fetchrow(
+                            "INSERT INTO thread_agent_workspace_claims ("
+                            "claim_id,thread_id,created_runtime_generation,"
+                            "create_attempt,provisioner,pvc_name) "
+                            "VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5,$6) "
+                            "RETURNING *",
+                            workspace_claim_id,
+                            parsed_thread,
+                            parsed_generation,
+                            parsed_attempt,
+                            provisioner,
+                            claim_name,
+                        )
+                    else:
+                        workspace_claim_id = workspace_claim["claim_id"]
+                        if not (
+                            str(workspace_claim["provisioner"]) == provisioner
+                            and str(workspace_claim["pvc_name"]) == claim_name
+                            and str(workspace_claim["status"]) in {"planned", "ready"}
+                        ):
+                            return None
+                await conn.execute(
+                    "INSERT INTO thread_agent_pod_provision_intents ("
+                    "attempt_id,thread_id,runtime_generation,provisioner,"
+                    "workspace_claim_id,pod_name) "
+                    "VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5::uuid,$6)",
+                    parsed_attempt,
+                    parsed_thread,
+                    parsed_generation,
+                    provisioner,
+                    workspace_claim_id,
+                    name,
+                )
+                latched = await conn.execute(
+                    "UPDATE threads SET runtime_authority_exposed=true "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL",
+                    parsed_thread,
+                    parsed_generation,
+                )
+                if latched != "UPDATE 1":
+                    raise RuntimeError("agent Pod provision intent latch lost")
+                return {
+                    "attempt_id": parsed_attempt,
+                    "thread_id": parsed_thread,
+                    "runtime_generation": parsed_generation,
+                    "provisioner": provisioner,
+                    "workspace_claim_id": workspace_claim_id,
+                    "workspace_claim": (
+                        dict(workspace_claim) if workspace_claim is not None else None
+                    ),
+                    "pod_name": name,
+                    "status": "planned",
+                    "pod_uid": None,
+                }
+
+    async def publish_pinned_agent_workspace_claim(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        claim_id: str,
+        pvc_name: str,
+        pvc_uid: str,
+        expected_retirement_token: str | None = None,
+    ) -> bool:
+        """Promote one exact pre-effect PVC claim to retained authority."""
+
+        name = str(pvc_name or "").strip()
+        uid = str(pvc_uid or "").strip()
+        if not name or not uid:
+            return False
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_claim = UUID(str(claim_id))
+            parsed_retirement = (
+                UUID(str(expected_retirement_token))
+                if expected_retirement_token is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT status,execution_lane,runtime_generation,"
+                    "runtime_retirement_token,runtime_retirement_permanent,"
+                    "runtime_retirement_authorized_at,runtime_retirement_context "
+                    "FROM threads "
+                    "WHERE id=$1::uuid FOR UPDATE",
+                    parsed_thread,
+                )
+                claim = await conn.fetchrow(
+                    "SELECT * FROM thread_agent_workspace_claims "
+                    "WHERE claim_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_claim,
+                    parsed_thread,
+                )
+                if thread is None or claim is None:
+                    return False
+                if str(claim["status"]) == "ready":
+                    return bool(
+                        str(claim["pvc_name"]) == name
+                        and str(claim["pvc_uid"] or "") == uid
+                    )
+                context = thread["runtime_retirement_context"]
+                if isinstance(context, str):
+                    try:
+                        context = json.loads(context)
+                    except (TypeError, ValueError):
+                        return False
+                captured_claim = (
+                    context.get("agent_workspace_claim")
+                    if isinstance(context, dict)
+                    else None
+                )
+                open_publication = bool(
+                    parsed_retirement is None
+                    and thread["runtime_retirement_token"] is None
+                    and str(thread["status"] or "")
+                    in {"created", "active", "awaiting_user", "suspended"}
+                )
+                retirement_publication = bool(
+                    parsed_retirement is not None
+                    and thread["runtime_retirement_token"] == parsed_retirement
+                    and thread["runtime_retirement_permanent"] is False
+                    and thread["runtime_retirement_authorized_at"] is not None
+                    and isinstance(captured_claim, dict)
+                    and str(captured_claim.get("claim_id") or "") == str(parsed_claim)
+                    and str(captured_claim.get("pvc_name") or "") == name
+                    and str(captured_claim.get("status") or "") == "planned"
+                )
+                if not (
+                    str(claim["status"]) == "planned"
+                    and str(claim["pvc_name"]) == name
+                    and str(thread["execution_lane"] or "") == "pinned"
+                    and str(thread["runtime_generation"] or "")
+                    == str(parsed_generation)
+                    and (open_publication or retirement_publication)
+                ):
+                    return False
+                return (
+                    await conn.execute(
+                        "UPDATE thread_agent_workspace_claims "
+                        "SET status='ready',pvc_uid=$2,resolved_at=now() "
+                        "WHERE claim_id=$1::uuid AND status='planned'",
+                        parsed_claim,
+                        uid,
+                    )
+                    == "UPDATE 1"
+                )
+
+    async def revoke_pinned_agent_workspace_claim(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_claim_id: str,
+        expected_pvc_name: str,
+    ) -> bool:
+        """Close a permanent claim before acquiring its same-name PVC fence."""
+
+        name = str(expected_pvc_name or "").strip()
+        if not name:
+            return False
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = UUID(str(expected_retirement_token))
+            parsed_claim = UUID(str(expected_claim_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT runtime_retirement_context FROM threads "
+                    "WHERE id=$1::uuid AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_permanent=true "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                )
+                claim = await conn.fetchrow(
+                    "SELECT * FROM thread_agent_workspace_claims "
+                    "WHERE claim_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_claim,
+                    parsed_thread,
+                )
+                if row is None or claim is None:
+                    return False
+                context = row["runtime_retirement_context"]
+                if isinstance(context, str):
+                    try:
+                        context = json.loads(context)
+                    except (TypeError, ValueError):
+                        return False
+                captured = (
+                    context.get("agent_workspace_claim")
+                    if isinstance(context, dict)
+                    else None
+                )
+                if not (
+                    isinstance(captured, dict)
+                    and str(captured.get("claim_id") or "") == str(parsed_claim)
+                    and str(captured.get("thread_id") or "") == str(parsed_thread)
+                    and str(captured.get("pvc_name") or "") == name
+                    and str(claim["pvc_name"]) == name
+                    and str(claim["created_runtime_generation"])
+                    == str(captured.get("created_runtime_generation") or "")
+                    and str(claim["create_attempt"])
+                    == str(captured.get("create_attempt") or "")
+                    and str(claim["provisioner"])
+                    == str(captured.get("provisioner") or "")
+                ):
+                    return False
+                status = str(claim["status"] or "")
+                if status in {"revoking", "fenced"}:
+                    return True
+                if status not in {"planned", "ready"}:
+                    return False
+                return (
+                    await conn.execute(
+                        "UPDATE thread_agent_workspace_claims "
+                        "SET status='revoking',resolved_at=NULL "
+                        "WHERE claim_id=$1::uuid AND status=$2",
+                        parsed_claim,
+                        status,
+                    )
+                    == "UPDATE 1"
+                )
+
+    async def fence_pinned_agent_workspace_claim(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_claim_id: str,
+        expected_pvc_name: str,
+        fence_pvc_uid: str,
+    ) -> bool:
+        """Persist the UID that won one permanent PVC-name fence."""
+
+        name = str(expected_pvc_name or "").strip()
+        uid = str(fence_pvc_uid or "").strip()
+        if not name or not uid:
+            return False
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = UUID(str(expected_retirement_token))
+            parsed_claim = UUID(str(expected_claim_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT runtime_retirement_context FROM threads "
+                    "WHERE id=$1::uuid AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_permanent=true "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                )
+                claim = await conn.fetchrow(
+                    "SELECT * FROM thread_agent_workspace_claims "
+                    "WHERE claim_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_claim,
+                    parsed_thread,
+                )
+                if row is None or claim is None:
+                    return False
+                context = row["runtime_retirement_context"]
+                if isinstance(context, str):
+                    try:
+                        context = json.loads(context)
+                    except (TypeError, ValueError):
+                        return False
+                captured = (
+                    context.get("agent_workspace_claim")
+                    if isinstance(context, dict)
+                    else None
+                )
+                if not (
+                    isinstance(captured, dict)
+                    and str(captured.get("claim_id") or "") == str(parsed_claim)
+                    and str(captured.get("pvc_name") or "") == name
+                    and str(claim["pvc_name"]) == name
+                ):
+                    return False
+                if str(claim["status"]) == "fenced":
+                    return str(claim["pvc_uid"] or "") == uid
+                if str(claim["status"]) != "revoking":
+                    return False
+                return (
+                    await conn.execute(
+                        "UPDATE thread_agent_workspace_claims "
+                        "SET status='fenced',pvc_uid=$2,fenced_at=now(),"
+                        "gc_after=now()+($3::double precision * interval '1 second') "
+                        "WHERE claim_id=$1::uuid AND status='revoking'",
+                        parsed_claim,
+                        uid,
+                        float(PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS),
+                    )
+                    == "UPDATE 1"
+                )
+
+    async def list_due_pinned_k8s_create_fences(
+        self, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """List restart-safe Pod/PVC tombstones whose request horizon elapsed."""
+
+        bounded = max(1, min(int(limit), 500))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT 'pod'::text AS resource_kind,
+                       attempt_id AS authority_id, thread_id,
+                       runtime_generation, attempt_id AS create_attempt,
+                       provisioner, pod_name AS resource_name,
+                       pod_uid AS resource_uid
+                  FROM thread_agent_pod_provision_intents
+                 WHERE status='fenced' AND gc_after <= now()
+                UNION ALL
+                SELECT 'pvc'::text AS resource_kind,
+                       claim_id AS authority_id, thread_id,
+                       created_runtime_generation AS runtime_generation,
+                       create_attempt, provisioner, pvc_name AS resource_name,
+                       pvc_uid AS resource_uid
+                  FROM thread_agent_workspace_claims
+                 WHERE status='fenced' AND gc_after <= now()
+                 ORDER BY resource_kind, authority_id
+                 LIMIT $1
+                """,
+                bounded,
+            )
+        return [dict(row) for row in rows]
+
+    async def list_pinned_agent_create_intents_for_reconcile(
+        self, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """List open pre-effect attempts a restarted leader may promote.
+
+        This is deliberately read-only authority discovery.  The leader never
+        creates a credential-bearing Pod or PVC; it only observes an exact
+        attempt-labelled object whose original create already committed and
+        asks the row-locked publication methods to adopt its immutable UID.
+        """
+
+        bounded = max(1, min(int(limit), 500))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT intent.attempt_id, intent.thread_id,
+                       intent.runtime_generation, intent.provisioner,
+                       intent.pod_name, intent.workspace_claim_id,
+                       claim.claim_id, claim.created_runtime_generation,
+                       claim.create_attempt AS claim_create_attempt,
+                       claim.provisioner AS claim_provisioner,
+                       claim.pvc_name, claim.status AS claim_status,
+                       claim.pvc_uid
+                  FROM thread_agent_pod_provision_intents intent
+                  JOIN threads t
+                    ON t.id = intent.thread_id
+                   AND t.execution_lane = 'pinned'
+                   AND t.runtime_generation = intent.runtime_generation
+                   AND t.runtime_retirement_token IS NULL
+                   AND t.status IN ('created','active','awaiting_user','suspended')
+                   AND t.agent_id IS NULL
+                   AND t.control_admission_agent_id IS NULL
+                   AND t.runtime_attach_token IS NULL
+                  LEFT JOIN thread_agent_workspace_claims claim
+                    ON claim.claim_id = intent.workspace_claim_id
+                 WHERE intent.status = 'planned'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agents a
+                        WHERE a.thread_id = intent.thread_id
+                           OR a.hostname = intent.pod_name
+                   )
+                 ORDER BY intent.created_at, intent.attempt_id
+                 LIMIT $1
+                """,
+                bounded,
+            )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = {
+                "attempt_id": row["attempt_id"],
+                "thread_id": row["thread_id"],
+                "runtime_generation": row["runtime_generation"],
+                "provisioner": row["provisioner"],
+                "pod_name": row["pod_name"],
+                "workspace_claim": None,
+            }
+            if row["workspace_claim_id"] is not None:
+                item["workspace_claim"] = {
+                    "claim_id": row["claim_id"],
+                    "thread_id": row["thread_id"],
+                    "created_runtime_generation": row["created_runtime_generation"],
+                    "create_attempt": row["claim_create_attempt"],
+                    "provisioner": row["claim_provisioner"],
+                    "pvc_name": row["pvc_name"],
+                    "status": row["claim_status"],
+                    "pvc_uid": row["pvc_uid"],
+                }
+            result.append(item)
+        return result
+
+    async def complete_pinned_k8s_create_fence_gc(
+        self,
+        *,
+        resource_kind: str,
+        authority_id: str,
+        expected_resource_uid: str,
+    ) -> bool:
+        """Mark one exact post-horizon tombstone gone after UID-fenced delete."""
+
+        uid = str(expected_resource_uid or "").strip()
+        if resource_kind not in {"pod", "pvc"} or not uid:
+            return False
+        try:
+            parsed_authority = UUID(str(authority_id))
+        except (TypeError, ValueError):
+            return False
+        table = (
+            "thread_agent_pod_provision_intents"
+            if resource_kind == "pod"
+            else "thread_agent_workspace_claims"
+        )
+        id_column = "attempt_id" if resource_kind == "pod" else "claim_id"
+        uid_column = "pod_uid" if resource_kind == "pod" else "pvc_uid"
+        target = "retired" if resource_kind == "pod" else "reclaimed"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT status,{uid_column} AS resource_uid FROM {table} "
+                    f"WHERE {id_column}=$1::uuid FOR UPDATE",
+                    parsed_authority,
+                )
+                if row is None:
+                    return False
+                if str(row["status"]) == target:
+                    return str(row["resource_uid"] or "") == uid
+                if not (
+                    str(row["status"]) == "fenced"
+                    and str(row["resource_uid"] or "") == uid
+                ):
+                    return False
+                return (
+                    await conn.execute(
+                        f"UPDATE {table} SET status=$2,resolved_at=now() "
+                        f"WHERE {id_column}=$1::uuid AND status='fenced' "
+                        "AND gc_after <= now()",
+                        parsed_authority,
+                        target,
+                    )
+                    == "UPDATE 1"
+                )
+
+    async def publish_pinned_agent_pod_provision_intent(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        attempt_id: str,
+        pod_name: str,
+        pod_uid: str,
+        namespace: str | None = None,
+    ) -> bool:
+        """Promote one planned attempt to a complete live Pod tuple."""
+
+        name = str(pod_name or "").strip()
+        uid = str(pod_uid or "").strip()
+        if not name or not uid:
+            return False
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_attempt = UUID(str(attempt_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT status, execution_lane, runtime_generation, "
+                    "runtime_retirement_token, agent_id, runtime_attach_token, "
+                    "metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    parsed_thread,
+                )
+                intent = await conn.fetchrow(
+                    "SELECT * FROM thread_agent_pod_provision_intents "
+                    "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid "
+                    "FOR UPDATE",
+                    parsed_attempt,
+                    parsed_thread,
+                )
+                if thread is None or intent is None:
+                    return False
+                metadata = thread["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(metadata, dict):
+                    return False
+                expected_marker = {
+                    "pod_name": name,
+                    "pod_uid": uid,
+                    "runtime_generation": str(parsed_generation),
+                    "provision_attempt": str(parsed_attempt),
+                }
+                if namespace:
+                    expected_marker["namespace"] = str(namespace)
+                current_marker = metadata.get("agent_pod")
+                if str(intent["status"]) == "published":
+                    return bool(
+                        str(intent["runtime_generation"]) == str(parsed_generation)
+                        and str(intent["pod_name"]) == name
+                        and str(intent["pod_uid"] or "") == uid
+                        and isinstance(current_marker, dict)
+                        and str(current_marker.get("pod_name") or "") == name
+                        and str(current_marker.get("pod_uid") or "") == uid
+                        and str(current_marker.get("provision_attempt") or "")
+                        == str(parsed_attempt)
+                    )
+                if not (
+                    str(intent["status"]) == "planned"
+                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                    and str(intent["pod_name"]) == name
+                    and str(thread["execution_lane"] or "") == "pinned"
+                    and str(thread["runtime_generation"] or "")
+                    == str(parsed_generation)
+                    and thread["runtime_retirement_token"] is None
+                    and str(thread["status"] or "")
+                    in {"created", "active", "awaiting_user", "suspended"}
+                    and thread["agent_id"] is None
+                    and thread["runtime_attach_token"] is None
+                    and current_marker in (None, {})
+                ):
+                    return False
+                updated_metadata = dict(metadata)
+                updated_metadata["agent_pod"] = expected_marker
+                published = await conn.execute(
+                    "UPDATE threads SET metadata=$3::jsonb, "
+                    "runtime_authority_exposed=true, last_activity=now() "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM agents "
+                    "WHERE thread_id=$1::uuid OR hostname=$4 OR pod_uid=$5)",
+                    parsed_thread,
+                    parsed_generation,
+                    json.dumps(updated_metadata, sort_keys=True, separators=(",", ":")),
+                    name,
+                    uid,
+                )
+                if published != "UPDATE 1":
+                    return False
+                resolved = await conn.execute(
+                    "UPDATE thread_agent_pod_provision_intents "
+                    "SET status='published',pod_uid=$2,resolved_at=now() "
+                    "WHERE attempt_id=$1::uuid AND status='planned'",
+                    parsed_attempt,
+                    uid,
+                )
+                if resolved != "UPDATE 1":
+                    raise RuntimeError("agent Pod provision publication lost")
+                return True
+
+    async def revoke_pinned_agent_pod_provision_intent(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_attempt_id: str,
+        expected_pod_name: str,
+    ) -> bool:
+        """Close one ambiguous create before its same-name causal fence.
+
+        Once ``revoking`` is durable, provisioner retries may no longer issue
+        the credential-bearing manifest.  Retirement can then acquire the
+        same Kubernetes name with a secret-free fence Pod; whichever create
+        wins makes every delayed create for the other manifest conflict.
+        """
+
+        name = str(expected_pod_name or "").strip()
+        if not name:
+            return False
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = UUID(str(expected_retirement_token))
+            parsed_attempt = UUID(str(expected_attempt_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT agent_id,control_admission_agent_id,"
+                    "runtime_attach_token,metadata,runtime_retirement_context "
+                    "FROM threads WHERE id=$1::uuid AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                )
+                intent = await conn.fetchrow(
+                    "SELECT * FROM thread_agent_pod_provision_intents "
+                    "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_attempt,
+                    parsed_thread,
+                )
+                if row is None or intent is None:
+                    return False
+                context = row["runtime_retirement_context"]
+                metadata = row["metadata"]
+                try:
+                    if isinstance(context, str):
+                        context = json.loads(context)
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+                except (TypeError, ValueError):
+                    return False
+                captured = (
+                    context.get("agent_pod_provision_intent")
+                    if isinstance(context, dict)
+                    else None
+                )
+                if not (
+                    isinstance(context, dict)
+                    and isinstance(metadata, dict)
+                    and isinstance(captured, dict)
+                    and str(captured.get("attempt_id") or "") == str(parsed_attempt)
+                    and str(captured.get("runtime_generation") or "")
+                    == str(parsed_generation)
+                    and str(captured.get("pod_name") or "") == name
+                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                    and str(intent["pod_name"]) == name
+                    and context.get("agent_id") is None
+                    and context.get("runtime_attach_token") is None
+                    and context.get("agent") in (None, {})
+                    and context.get("agent_pod") in (None, {})
+                    and row["agent_id"] is None
+                    and row["control_admission_agent_id"] is None
+                    and row["runtime_attach_token"] is None
+                    and metadata.get("agent_pod") in (None, {})
+                ):
+                    return False
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM agents "
+                    "WHERE thread_id=$1::uuid OR hostname=$2)",
+                    parsed_thread,
+                    name,
+                ):
+                    return False
+                status = str(intent["status"])
+                if status in {"revoking", "fenced"}:
+                    return True
+                if status != "planned":
+                    return False
+                return (
+                    await conn.execute(
+                        "UPDATE thread_agent_pod_provision_intents "
+                        "SET status='revoking' "
+                        "WHERE attempt_id=$1::uuid AND status='planned'",
+                        parsed_attempt,
+                    )
+                    == "UPDATE 1"
+                )
+
+    async def fence_pinned_agent_pod_provision_intent(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_attempt_id: str,
+        expected_pod_name: str,
+        fence_pod_uid: str,
+    ) -> bool:
+        """Persist the UID that won the same-name Kubernetes create fence."""
+
+        name = str(expected_pod_name or "").strip()
+        uid = str(fence_pod_uid or "").strip()
+        if not name or not uid:
+            return False
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = UUID(str(expected_retirement_token))
+            parsed_attempt = UUID(str(expected_attempt_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT runtime_retirement_context FROM threads "
+                    "WHERE id=$1::uuid AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                )
+                intent = await conn.fetchrow(
+                    "SELECT * FROM thread_agent_pod_provision_intents "
+                    "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_attempt,
+                    parsed_thread,
+                )
+                if row is None or intent is None:
+                    return False
+                context = row["runtime_retirement_context"]
+                if isinstance(context, str):
+                    try:
+                        context = json.loads(context)
+                    except (TypeError, ValueError):
+                        return False
+                captured = (
+                    context.get("agent_pod_provision_intent")
+                    if isinstance(context, dict)
+                    else None
+                )
+                if not (
+                    isinstance(captured, dict)
+                    and str(captured.get("attempt_id") or "") == str(parsed_attempt)
+                    and str(captured.get("pod_name") or "") == name
+                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                    and str(intent["pod_name"]) == name
+                ):
+                    return False
+                if str(intent["status"]) == "fenced":
+                    return str(intent["pod_uid"] or "") == uid
+                if str(intent["status"]) != "revoking":
+                    return False
+                return (
+                    await conn.execute(
+                        "UPDATE thread_agent_pod_provision_intents "
+                        "SET status='fenced',pod_uid=$2,fenced_at=now(),"
+                        "gc_after=now()+($3::double precision * interval '1 second') "
+                        "WHERE attempt_id=$1::uuid AND status='revoking'",
+                        parsed_attempt,
+                        uid,
+                        float(PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS),
+                    )
+                    == "UPDATE 1"
+                )
+
+    async def acknowledge_pinned_agent_pod_provision_intent_zero(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_attempt_id: str,
+        expected_pod_name: str,
+        observed_pod_uid: str | None,
+    ) -> dict[str, Any] | None:
+        """Retire a response-lost create after exact attempt absence proof."""
+
+        name = str(expected_pod_name or "").strip()
+        observed_uid = str(observed_pod_uid or "").strip() or None
+        if not name:
+            return None
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = UUID(str(expected_retirement_token))
+            parsed_attempt = UUID(str(expected_attempt_id))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT status,agent_id,control_admission_agent_id,"
+                    "runtime_attach_token,metadata,runtime_retirement_context,"
+                    "runtime_retirement_local_quiescence FROM threads "
+                    "WHERE id=$1::uuid AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                )
+                intent = await conn.fetchrow(
+                    "SELECT * FROM thread_agent_pod_provision_intents "
+                    "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid FOR UPDATE",
+                    parsed_attempt,
+                    parsed_thread,
+                )
+                if row is None or intent is None:
+                    return None
+                context = row["runtime_retirement_context"]
+                metadata = row["metadata"]
+                existing = row["runtime_retirement_local_quiescence"]
+                try:
+                    if isinstance(context, str):
+                        context = json.loads(context)
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+                    if isinstance(existing, str):
+                        existing = json.loads(existing)
+                except (TypeError, ValueError):
+                    return None
+                if not isinstance(context, dict) or not isinstance(metadata, dict):
+                    return None
+                captured = context.get("agent_pod_provision_intent")
+                if not (
+                    isinstance(captured, dict)
+                    and str(captured.get("attempt_id") or "") == str(parsed_attempt)
+                    and str(captured.get("runtime_generation") or "")
+                    == str(parsed_generation)
+                    and str(captured.get("pod_name") or "") == name
+                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                    and str(intent["pod_name"]) == name
+                    and context.get("agent_id") is None
+                    and context.get("runtime_attach_token") is None
+                    and context.get("agent") in (None, {})
+                    and context.get("agent_pod") in (None, {})
+                    and row["agent_id"] is None
+                    and row["control_admission_agent_id"] is None
+                    and row["runtime_attach_token"] is None
+                    and metadata.get("agent_pod") in (None, {})
+                ):
+                    return None
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM agents "
+                    "WHERE thread_id=$1::uuid OR hostname=$2 "
+                    "OR ($3::text IS NOT NULL AND pod_uid=$3))",
+                    parsed_thread,
+                    name,
+                    observed_uid,
+                ):
+                    return None
+                receipt = {
+                    "version": 1,
+                    "runtime_generation": str(parsed_generation),
+                    "retirement_token": str(parsed_retirement),
+                    "agent_id": None,
+                    "runtime_attach_token": None,
+                    "settle_status": str(context.get("settle_status") or ""),
+                    "quiescence_protocol": "agent_runtime_zero_v1",
+                    "quiescence_actor": "orchestrator",
+                    "workspace_generation": None,
+                    "workspace_runtime_incarnation": None,
+                    "agent_pod_provision_attempt": str(parsed_attempt),
+                    "agent_pod_name": name,
+                    "agent_pod_uid": observed_uid,
+                    "agent_pod_fence_protocol": "k8s_name_tombstone_v1",
+                }
+                if str(intent["status"]) == "fenced" and existing is not None:
+                    return existing if existing == receipt else None
+                if (
+                    str(intent["status"]) != "fenced"
+                    or str(intent["pod_uid"] or "") != str(observed_uid or "")
+                    or existing is not None
+                ):
+                    return None
+                updated = await conn.execute(
+                    "UPDATE threads SET runtime_retirement_local_quiescence=$4::jsonb "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL "
+                    "AND runtime_retirement_local_quiescence IS NULL",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                )
+                if updated != "UPDATE 1":
+                    raise RuntimeError("agent Pod provision zero publication lost")
+                return receipt
+
+    async def begin_pinned_thread_retirement(
+        self,
+        thread_id: str,
+        *,
+        permanent: bool,
+        settle_status: str = "ended",
+        expected_runtime_generation: str | None = None,
+        expected_agent_id: str | None = None,
+        expected_attach_token: object | str | None = _WORKSPACE_REQUEST_UNSET,
+        expected_retirement_token: object | str | None = _WORKSPACE_REQUEST_UNSET,
+        initiator: str = "owner",
+        require_agent_offline: bool = False,
+        authorize_immediately: bool = False,
+    ) -> Dict[str, Any]:
+        """Atomically close one pinned runtime and capture cleanup authority.
+
+        The row deliberately remains in its live status while remote cleanup
+        runs.  ``runtime_retirement_token`` is the admission closure; every
+        prepare/bind/status/credential writer predicates on it.  A retry with
+        the same permanence receives the immutable original context rather
+        than observing (and accidentally targeting) a replacement resource.
+        """
+
+        if settle_status not in {"ended", "suspended"}:
+            raise ValueError("settle_status must be ended or suspended")
+        if permanent and settle_status != "ended":
+            raise ValueError("permanent retirement must settle ended")
+        if initiator not in {"owner", "agent", "system"}:
+            raise ValueError("invalid pinned retirement initiator")
+        if authorize_immediately and initiator != "agent":
+            raise ValueError("only the exact agent may authorize retirement at Begin")
+
+        try:
+            parsed_thread_id = UUID(str(thread_id))
+        except (TypeError, ValueError):
+            return {"state": "missing"}
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT *
+                      FROM threads
+                     WHERE id = $1::uuid
+                     FOR UPDATE
+                    """,
+                    parsed_thread_id,
+                )
+                if row is None:
+                    return {"state": "missing"}
+                thread = dict(row)
+                if str(thread.get("execution_lane") or "") != "pinned":
+                    return {"state": "incompatible"}
+                generation = str(thread.get("runtime_generation") or "")
+                try:
+                    generation = str(UUID(generation))
+                except (TypeError, ValueError):
+                    return {"state": "malformed"}
+                if expected_runtime_generation is not None and generation != str(
+                    expected_runtime_generation
+                ):
+                    return {"state": "conflict", "reason": "generation_changed"}
+                if expected_agent_id is not None and str(
+                    thread.get("agent_id") or ""
+                ) != str(expected_agent_id):
+                    return {"state": "conflict", "reason": "agent_changed"}
+                if expected_attach_token is not _WORKSPACE_REQUEST_UNSET and str(
+                    thread.get("runtime_attach_token") or ""
+                ) != str(expected_attach_token or ""):
+                    return {
+                        "state": "conflict",
+                        "reason": "attach_attempt_changed",
+                    }
+
+                existing_token = thread.get("runtime_retirement_token")
+                if existing_token is not None:
+                    if (
+                        expected_retirement_token is not _WORKSPACE_REQUEST_UNSET
+                        and str(existing_token) != str(expected_retirement_token or "")
+                    ):
+                        return {
+                            "state": "conflict",
+                            "reason": "retirement_attempt_changed",
+                            "generation": generation,
+                        }
+                    existing_context = thread.get("runtime_retirement_context") or {}
+                    if isinstance(existing_context, str):
+                        try:
+                            existing_context = json.loads(existing_context)
+                        except (TypeError, ValueError):
+                            return {"state": "malformed"}
+                    if not isinstance(existing_context, dict):
+                        return {"state": "malformed"}
+                    if (
+                        thread.get("runtime_retirement_authorized_at") is None
+                        and expected_retirement_token is _WORKSPACE_REQUEST_UNSET
+                        and str(existing_context.get("initiator") or "owner")
+                        != initiator
+                    ):
+                        return {
+                            "state": "conflict",
+                            "reason": "retirement_initiator_changed",
+                            "generation": generation,
+                        }
+                    if bool(thread.get("runtime_retirement_permanent")) != bool(
+                        permanent
+                    ):
+                        return {
+                            "state": "conflict",
+                            "reason": "retirement_mode_changed",
+                            "token": str(existing_token),
+                            "generation": generation,
+                        }
+                    if str(existing_context.get("settle_status") or "") != str(
+                        settle_status
+                    ):
+                        return {
+                            "state": "conflict",
+                            "reason": "retirement_disposition_changed",
+                            "token": str(existing_token),
+                            "generation": generation,
+                        }
+                    if require_agent_offline and thread.get("agent_id") is not None:
+                        current_agent_status = await conn.fetchval(
+                            "SELECT status::text FROM agents "
+                            "WHERE id=$1::uuid AND thread_id=$2::uuid FOR SHARE",
+                            thread["agent_id"],
+                            parsed_thread_id,
+                        )
+                        # A missing exact agent row is terminal absence.  Any
+                        # present non-offline process still owns its local
+                        # quiescence and must be allowed to make the final
+                        # settlement call itself.
+                        if (
+                            current_agent_status is not None
+                            and str(current_agent_status) != "offline"
+                        ):
+                            return {
+                                "state": "conflict",
+                                "reason": "agent_recovered",
+                            }
+                    authorized_at = thread.get("runtime_retirement_authorized_at")
+                    if authorize_immediately and authorized_at is None:
+                        authorized_at = await conn.fetchval(
+                            "UPDATE threads SET "
+                            "runtime_retirement_authorized_at=now() "
+                            "WHERE id=$1::uuid "
+                            "AND execution_lane='pinned' "
+                            "AND runtime_generation=$2::uuid "
+                            "AND runtime_retirement_token=$3::uuid "
+                            "AND runtime_retirement_authorized_at IS NULL "
+                            "AND runtime_retirement_context->>'initiator'='agent' "
+                            "AND runtime_retirement_context->>'settle_status'=$4 "
+                            "RETURNING runtime_retirement_authorized_at",
+                            parsed_thread_id,
+                            UUID(generation),
+                            existing_token,
+                            settle_status,
+                        )
+                        if authorized_at is None:
+                            return {
+                                "state": "conflict",
+                                "reason": "authorization_changed",
+                                "generation": generation,
+                            }
+                    return {
+                        "state": "pending",
+                        "token": str(existing_token),
+                        "generation": generation,
+                        "permanent": bool(permanent),
+                        "started_at": thread["runtime_retirement_started_at"],
+                        "authorized_at": authorized_at,
+                        "context": existing_context,
+                        "reused": True,
+                    }
+
+                # A final/quiescence retry carrying T1 may never mint T2 if
+                # T1 was aborted or settled.  Only the begin-only operation
+                # omits this expectation and is allowed to install a marker.
+                if expected_retirement_token is not _WORKSPACE_REQUEST_UNSET:
+                    return {
+                        "state": "conflict",
+                        "reason": "retirement_attempt_missing",
+                        "generation": generation,
+                    }
+
+                status = str(thread.get("status") or "")
+                if status == "ended" and not permanent and settle_status == "ended":
+                    return {"state": "settled", "generation": generation}
+                if status == "ended" and not permanent:
+                    return {
+                        "state": "conflict",
+                        "reason": "retirement_disposition_changed",
+                    }
+                if status not in {
+                    "created",
+                    "active",
+                    "awaiting_user",
+                    "suspended",
+                    "ended",
+                }:
+                    return {"state": "incompatible", "status": status}
+                # The runtime closes and drains its durable control inbox
+                # before asking to retire.  Owner/offline End cannot safely
+                # strand an already-admitted request under a token that its
+                # old consumer is then forbidden to use.  The locked thread
+                # row serializes this proof with public control admission.
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
+                    "WHERE thread_id=$1::uuid AND outcome IS NULL "
+                    "AND runtime_generation=$2::uuid)",
+                    parsed_thread_id,
+                    UUID(generation),
+                ):
+                    return {
+                        "state": "conflict",
+                        "reason": "pending_control_requests",
+                    }
+
+                metadata = thread.get("metadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return {"state": "malformed"}
+                if not isinstance(metadata, dict):
+                    return {"state": "malformed"}
+                from services.session_runtime_admission import (
+                    protected_cloud_marker_state,
+                )
+
+                protected_marker = protected_cloud_marker_state(metadata)
+                if protected_marker == "malformed" and not permanent:
+                    # A malformed present marker is never downgraded to an
+                    # ordinary soft End: doing so would bypass the mandatory
+                    # final protected-overlay receipt. Permanent deletion may
+                    # intentionally discard the whole thread/review surface.
+                    return {
+                        "state": "malformed",
+                        "reason": "protected_cloud_malformed",
+                    }
+                config_override = metadata.get("config_override") or {}
+                if not isinstance(config_override, dict):
+                    return {"state": "malformed"}
+                workspace_config = config_override.get("workspace") or {}
+                if not isinstance(workspace_config, dict):
+                    return {"state": "malformed"}
+
+                agent: dict[str, Any] | None = None
+                inverse_agent_rows = await conn.fetch(
+                    "SELECT id FROM agents WHERE thread_id=$1::uuid FOR SHARE",
+                    parsed_thread_id,
+                )
+                inverse_agent_ids = {
+                    str(inverse["id"]) for inverse in inverse_agent_rows
+                }
+                if thread.get("agent_id") is not None:
+                    agent_row = await conn.fetchrow(
+                        """
+                        SELECT id, hostname, pod_uid, pod_ip, pod_port,
+                               thread_id, status::text AS status
+                          FROM agents
+                         WHERE id = $1::uuid
+                         FOR SHARE
+                        """,
+                        thread["agent_id"],
+                    )
+                    if agent_row is not None:
+                        agent = {
+                            key: (
+                                str(agent_row[key])
+                                if key in {"id", "thread_id"}
+                                and agent_row[key] is not None
+                                else agent_row[key]
+                            )
+                            for key in agent_row.keys()
+                        }
+                expected_inverse_ids = (
+                    {str(thread["agent_id"])}
+                    if thread.get("agent_id") is not None
+                    else set()
+                )
+                if (
+                    inverse_agent_ids != expected_inverse_ids
+                    or thread.get("agent_id") is not None
+                    and (
+                        agent is None
+                        or str(agent.get("thread_id") or "") != str(parsed_thread_id)
+                    )
+                ):
+                    return {
+                        "state": "malformed",
+                        "reason": "agent_binding_nonreciprocal",
+                    }
+                if (
+                    require_agent_offline
+                    and agent is not None
+                    and str(agent.get("status") or "") != "offline"
+                ):
+                    return {"state": "conflict", "reason": "agent_recovered"}
+
+                workspace_claim_row = await conn.fetchrow(
+                    "SELECT claim_id,thread_id,created_runtime_generation,"
+                    "create_attempt,provisioner,pvc_name,status,pvc_uid,"
+                    "fenced_at,gc_after FROM thread_agent_workspace_claims "
+                    "WHERE thread_id=$1::uuid AND status<>'reclaimed' FOR SHARE",
+                    parsed_thread_id,
+                )
+                workspace_claim = None
+                if workspace_claim_row is not None:
+                    if str(workspace_claim_row["status"]) not in {"planned", "ready"}:
+                        return {
+                            "state": "malformed",
+                            "reason": "agent_workspace_claim_transition_incomplete",
+                        }
+                    workspace_claim = {
+                        key: (
+                            str(workspace_claim_row[key])
+                            if workspace_claim_row[key] is not None
+                            else None
+                        )
+                        for key in workspace_claim_row.keys()
+                    }
+
+                provision_intent_row = await conn.fetchrow(
+                    "SELECT attempt_id,thread_id,runtime_generation,provisioner,"
+                    "pod_name,status,pod_uid FROM "
+                    "thread_agent_pod_provision_intents "
+                    "WHERE thread_id=$1::uuid "
+                    "AND status IN ('planned','revoking') FOR SHARE",
+                    parsed_thread_id,
+                )
+                provision_intent = None
+                if provision_intent_row is not None:
+                    if str(provision_intent_row["runtime_generation"]) != generation:
+                        return {
+                            "state": "malformed",
+                            "reason": "agent_pod_provision_generation_mismatch",
+                        }
+                    provision_intent = {
+                        "attempt_id": str(provision_intent_row["attempt_id"]),
+                        "thread_id": str(provision_intent_row["thread_id"]),
+                        "runtime_generation": str(
+                            provision_intent_row["runtime_generation"]
+                        ),
+                        "provisioner": str(provision_intent_row["provisioner"]),
+                        "pod_name": str(provision_intent_row["pod_name"]),
+                        "status": str(provision_intent_row["status"]),
+                        "pod_uid": provision_intent_row["pod_uid"],
+                    }
+
+                ro_row = await conn.fetchrow(
+                    """
+                    SELECT id, thread_id, user_id, backend, backend_instance_id,
+                           reader_id, grant_group_id, grant_handle,
+                           grant_handle_sha256, status, selected_mount_id,
+                           source_binding, source_binding_sha256,
+                           staged_epoch, staged_summary, etag_baseline,
+                           runtime_generation, engage_attempt
+                      FROM cloud_ro_mounts
+                     WHERE thread_id = $1::uuid
+                     FOR SHARE
+                    """,
+                    parsed_thread_id,
+                )
+                protected_ro = None
+                if ro_row is not None:
+                    ro_staged_summary = ro_row["staged_summary"]
+                    ro_etag_baseline = ro_row["etag_baseline"]
+                    ro_source_binding = ro_row["source_binding"]
+                    try:
+                        if isinstance(ro_staged_summary, str):
+                            ro_staged_summary = json.loads(ro_staged_summary)
+                        if isinstance(ro_etag_baseline, str):
+                            ro_etag_baseline = json.loads(ro_etag_baseline)
+                        if isinstance(ro_source_binding, str):
+                            ro_source_binding = json.loads(ro_source_binding)
+                    except (TypeError, ValueError):
+                        return {
+                            "state": "malformed",
+                            "reason": "protected_reader_identity_malformed",
+                        }
+                    protected_ro = {
+                        "id": str(ro_row["id"]),
+                        "thread_id": str(ro_row["thread_id"]),
+                        "user_id": str(ro_row["user_id"]),
+                        "backend": ro_row["backend"],
+                        "backend_instance_id": (
+                            str(ro_row["backend_instance_id"])
+                            if ro_row["backend_instance_id"] is not None
+                            else None
+                        ),
+                        "reader_id": ro_row["reader_id"],
+                        "grant_group_id": ro_row["grant_group_id"],
+                        "grant_handle": ro_row["grant_handle"],
+                        "grant_handle_sha256": ro_row["grant_handle_sha256"],
+                        "status": ro_row["status"],
+                        "selected_mount_id": (
+                            str(ro_row["selected_mount_id"])
+                            if ro_row["selected_mount_id"] is not None
+                            else None
+                        ),
+                        "source_binding": ro_source_binding,
+                        "source_binding_sha256": ro_row["source_binding_sha256"],
+                        "staged_epoch": int(ro_row["staged_epoch"]),
+                        "staged_summary": ro_staged_summary,
+                        "etag_baseline": ro_etag_baseline,
+                        "runtime_generation": str(ro_row["runtime_generation"])
+                        if ro_row["runtime_generation"] is not None
+                        else None,
+                        "engage_attempt": str(ro_row["engage_attempt"])
+                        if ro_row["engage_attempt"] is not None
+                        else None,
+                    }
+
+                agent_pod_context = metadata.get("agent_pod")
+                workspace_context = metadata.get("workspace_container")
+                workspace_binding_context = metadata.get("_workspace_binding")
+                vm_context = metadata.get("vm")
+                if not all(
+                    value is None or isinstance(value, dict)
+                    for value in (
+                        agent_pod_context,
+                        workspace_context,
+                        workspace_binding_context,
+                        vm_context,
+                    )
+                ):
+                    return {
+                        "state": "malformed",
+                        "reason": "physical_runtime_identity_malformed",
+                    }
+                agent_pod_context = agent_pod_context or {}
+                workspace_context = workspace_context or {}
+                workspace_binding_context = workspace_binding_context or {}
+                vm_context = vm_context or {}
+
+                # A pinned Kubernetes create is a distinct external-effect
+                # authority from a published workspace endpoint.  Capture its
+                # pre-effect names/attempt under the already-held thread lock;
+                # never infer or re-probe those names after Begin.  A soft End
+                # may leave the exact row fenced (and later retired by the
+                # horizon GC) while preserving its prior backing for Resume,
+                # so a same-G permanent follow-up may capture that terminal
+                # intent even though the pending marker has been cleared.
+                marker_attempt_raw = workspace_context.get(
+                    "_workspace_provision_attempt"
+                )
+                marker_generation_raw = workspace_context.get(
+                    "_workspace_provision_generation"
+                )
+                marker_attempt: UUID | None = None
+                if marker_attempt_raw is not None:
+                    try:
+                        marker_attempt = UUID(str(marker_attempt_raw))
+                    except (TypeError, ValueError):
+                        return {
+                            "state": "malformed",
+                            "reason": "workspace_provision_intent_malformed",
+                        }
+                    if (
+                        str(marker_generation_raw or "") != generation
+                        or workspace_context.get("status") != "pending"
+                        or workspace_context.get("provisioner") != "k8s"
+                        or any(
+                            _json_field_is_nonnull(workspace_context, field)
+                            for field in (
+                                "_runtime_incarnation",
+                                "_docker_workspace_lease_id",
+                                "pod_ip",
+                                "pod_name",
+                                "host",
+                                "port",
+                                "ide_host",
+                                "ide_port",
+                                "_canvas_workspace_generation",
+                            )
+                        )
+                    ):
+                        return {
+                            "state": "malformed",
+                            "reason": "workspace_provision_intent_malformed",
+                        }
+                elif marker_generation_raw is not None:
+                    return {
+                        "state": "malformed",
+                        "reason": "workspace_provision_intent_malformed",
+                    }
+
+                unresolved_workspace_intents = await conn.fetch(
+                    "SELECT * FROM thread_workspace_provision_intents "
+                    "WHERE thread_id=$1::uuid "
+                    "AND status IN ('planned','revoking','fenced') "
+                    "ORDER BY created_at DESC FOR SHARE",
+                    parsed_thread_id,
+                )
+                if len(unresolved_workspace_intents) > 1:
+                    return {
+                        "state": "malformed",
+                        "reason": "workspace_provision_intent_multiplicity",
+                    }
+                workspace_intent_row = (
+                    unresolved_workspace_intents[0]
+                    if unresolved_workspace_intents
+                    else None
+                )
+                if marker_attempt is not None:
+                    if (
+                        workspace_intent_row is None
+                        or workspace_intent_row["attempt_id"] != marker_attempt
+                        or str(workspace_intent_row["status"]) != "planned"
+                    ):
+                        return {
+                            "state": "malformed",
+                            "reason": "workspace_provision_intent_mismatch",
+                        }
+                elif workspace_intent_row is not None:
+                    if not (
+                        permanent
+                        and status == "ended"
+                        and str(workspace_intent_row["status"]) == "fenced"
+                    ):
+                        return {
+                            "state": "malformed",
+                            "reason": "workspace_provision_intent_unmarked",
+                        }
+                elif permanent and status == "ended":
+                    workspace_intent_row = await conn.fetchrow(
+                        "SELECT * FROM thread_workspace_provision_intents "
+                        "WHERE thread_id=$1::uuid "
+                        "AND runtime_generation=$2::uuid AND status='retired' "
+                        "ORDER BY created_at DESC LIMIT 1 FOR SHARE",
+                        parsed_thread_id,
+                        UUID(generation),
+                    )
+
+                workspace_provision_intent: dict[str, Any] | None = None
+                if workspace_intent_row is not None:
+                    previous_binding = workspace_intent_row["previous_binding"]
+                    if isinstance(previous_binding, str):
+                        try:
+                            previous_binding = json.loads(previous_binding)
+                        except (TypeError, ValueError):
+                            previous_binding = None
+                    try:
+                        UUID(str(workspace_intent_row["attempt_id"]))
+                        intent_generation = str(
+                            UUID(str(workspace_intent_row["runtime_generation"]))
+                        )
+                        created_agent_text = (
+                            str(UUID(str(workspace_intent_row["created_agent_id"])))
+                            if workspace_intent_row["created_agent_id"] is not None
+                            else None
+                        )
+                        created_attach_text = (
+                            str(UUID(str(workspace_intent_row["created_attach_token"])))
+                            if workspace_intent_row["created_attach_token"] is not None
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        return {
+                            "state": "malformed",
+                            "reason": "workspace_provision_intent_malformed",
+                        }
+                    if not (
+                        intent_generation == generation
+                        and isinstance(previous_binding, dict)
+                        and dict(previous_binding) == workspace_binding_context
+                        and (
+                            str(workspace_intent_row["status"]) != "planned"
+                            or (
+                                created_agent_text
+                                == (
+                                    str(thread["agent_id"])
+                                    if thread.get("agent_id") is not None
+                                    else None
+                                )
+                                and created_attach_text
+                                == (
+                                    str(thread["runtime_attach_token"])
+                                    if thread.get("runtime_attach_token") is not None
+                                    else None
+                                )
+                            )
+                        )
+                    ):
+                        return {
+                            "state": "malformed",
+                            "reason": "workspace_provision_intent_mismatch",
+                        }
+                    workspace_provision_intent = {
+                        key: (
+                            str(workspace_intent_row[key])
+                            if workspace_intent_row[key] is not None
+                            and key
+                            in {
+                                "attempt_id",
+                                "thread_id",
+                                "runtime_generation",
+                                "created_agent_id",
+                                "created_attach_token",
+                                "retained_binding_generation",
+                            }
+                            else workspace_intent_row[key]
+                        )
+                        for key in (
+                            "attempt_id",
+                            "thread_id",
+                            "runtime_generation",
+                            "created_agent_id",
+                            "created_attach_token",
+                            "namespace",
+                            "pod_name",
+                            "pvc_name",
+                            "seed_configmap_name",
+                            "service_name",
+                            "network_tier",
+                            "manifest_fingerprint",
+                            "previous_binding",
+                            "retained_binding_generation",
+                            "retained_pvc_uid",
+                            "retained_service_uid",
+                            "status",
+                            "pod_uid",
+                            "pvc_uid",
+                            "seed_configmap_uid",
+                            "service_uid",
+                            "fence_pod_uid",
+                            "fence_pvc_uid",
+                            "fence_configmap_uid",
+                            "fence_service_uid",
+                        )
+                    }
+                    workspace_provision_intent["previous_binding"] = dict(
+                        previous_binding
+                    )
+                if (
+                    agent
+                    and agent_pod_context
+                    and (
+                        str(agent.get("hostname") or "")
+                        != str(agent_pod_context.get("pod_name") or "")
+                        or str(agent.get("pod_uid") or "")
+                        != str(agent_pod_context.get("pod_uid") or "")
+                    )
+                ):
+                    return {
+                        "state": "malformed",
+                        "reason": "agent_pod_identity_mismatch",
+                    }
+
+                def _has_external_fields(
+                    value: dict[str, Any], fields: tuple[str, ...]
+                ) -> bool:
+                    return any(_json_field_is_nonnull(value, field) for field in fields)
+
+                workspace_intent_pending = bool(
+                    workspace_provision_intent
+                    and workspace_provision_intent.get("status") == "planned"
+                )
+                workspace_evidence = bool(
+                    not workspace_intent_pending
+                    and not _json_runtime_status_is_absent(workspace_context)
+                    or _has_external_fields(
+                        workspace_context,
+                        (
+                            "_runtime_incarnation",
+                            "pod_ip",
+                            "pod_name",
+                            "host",
+                            "port",
+                            "ide_host",
+                            "ide_port",
+                            "_canvas_workspace_generation",
+                            "_docker_workspace_lease_id",
+                        ),
+                    )
+                )
+                virtual_binding = bool(
+                    workspace_binding_context
+                    and workspace_binding_context.get("kind") == "virtual"
+                )
+                sandbox_evidence = bool(
+                    workspace_evidence
+                    or (workspace_binding_context and not virtual_binding)
+                )
+                vm_evidence = bool(
+                    not _json_runtime_status_is_absent(vm_context)
+                    or _has_external_fields(
+                        vm_context,
+                        (
+                            "provision_generation",
+                            "identity_provision_generation",
+                            "vm_uid",
+                            "_runtime_incarnation",
+                            "rootdisk_pvc_uid",
+                            "ssh_host",
+                            "ssh_port",
+                            "_canvas_workspace_generation",
+                        ),
+                    )
+                )
+                if workspace_provision_intent is not None and vm_evidence:
+                    return {
+                        "state": "malformed",
+                        "reason": "mixed_workspace_provision_vm_authority",
+                    }
+                if vm_evidence and sandbox_evidence:
+                    return {
+                        "state": "malformed",
+                        "reason": "mixed_physical_runtime_authority",
+                    }
+                declared_backend = str(workspace_config.get("backend") or "sandbox")
+                effective_backend = (
+                    "vm"
+                    if vm_evidence
+                    else "sandbox"
+                    if sandbox_evidence
+                    else "virtual"
+                    if virtual_binding
+                    else declared_backend
+                )
+                if effective_backend not in {
+                    "sandbox",
+                    "virtual",
+                    "none",
+                    "vm",
+                    "remote",
+                }:
+                    return {
+                        "state": "malformed",
+                        "reason": "workspace_backend_malformed",
+                    }
+                try:
+                    if vm_evidence:
+                        _canonical_uuid_text(
+                            vm_context.get("provision_generation"),
+                            label="VM provision generation",
+                        )
+                        _canonical_uuid_text(vm_context.get("vm_uid"), label="VM UID")
+                        _canonical_uuid_text(
+                            vm_context.get("rootdisk_pvc_uid"),
+                            label="VM rootdisk UID",
+                        )
+                    elif sandbox_evidence and workspace_provision_intent is None:
+                        if workspace_context.get("provisioner") == "docker":
+                            lease_id = _canonical_uuid_text(
+                                workspace_context.get("_docker_workspace_lease_id"),
+                                label="Docker workspace lease",
+                            )
+                            _canonical_uuid_text(
+                                workspace_binding_context.get("generation"),
+                                label="workspace binding generation",
+                            )
+                            backing_id = str(
+                                workspace_binding_context.get("backing_id") or ""
+                            )
+                            if (
+                                workspace_binding_context.get("kind") != "remote"
+                                or not backing_id.startswith("docker:")
+                                or not backing_id.endswith(f":{lease_id}")
+                            ):
+                                raise RuntimeError(
+                                    "Docker workspace authority is malformed"
+                                )
+                            docker_inventory = await conn.fetchrow(
+                                "SELECT host, port, status FROM "
+                                "docker_workspace_leases WHERE "
+                                "owner_kind='thread' AND owner_id=$1::uuid "
+                                "AND lease_id=$2::uuid FOR SHARE",
+                                parsed_thread_id,
+                                UUID(lease_id),
+                            )
+                            docker_status = str(
+                                (docker_inventory or {}).get("status") or ""
+                            )
+                            terminal_prior_soft = bool(
+                                permanent
+                                and str(thread.get("status") or "") == "ended"
+                                and docker_status in {"released", "quarantined"}
+                                and await conn.fetchval(
+                                    "SELECT EXISTS (SELECT 1 FROM "
+                                    "thread_runtime_retirement_outcomes WHERE "
+                                    "thread_id=$1::uuid AND "
+                                    "runtime_generation=$2::uuid AND "
+                                    "disposition='ended' AND permanent=false "
+                                    "AND outcome='settled')",
+                                    parsed_thread_id,
+                                    UUID(generation),
+                                )
+                            )
+                            try:
+                                docker_endpoint_matches = bool(
+                                    docker_inventory is not None
+                                    and str(docker_inventory["host"] or "")
+                                    == str(workspace_context.get("host") or "")
+                                    and int(docker_inventory["port"])
+                                    == int(workspace_context.get("port"))
+                                )
+                            except (TypeError, ValueError):
+                                docker_endpoint_matches = False
+                            if not docker_endpoint_matches or not (
+                                docker_status in {"ready", "releasing"}
+                                or terminal_prior_soft
+                            ):
+                                raise RuntimeError(
+                                    "Docker workspace authority is malformed"
+                                )
+                        else:
+                            runtime_uid = _canonical_uuid_text(
+                                workspace_context.get("_runtime_incarnation"),
+                                label="workspace runtime incarnation",
+                            )
+                            generation_id = _canonical_uuid_text(
+                                workspace_binding_context.get("generation"),
+                                label="workspace binding generation",
+                            )
+                            backing_id = str(
+                                workspace_binding_context.get("backing_id") or ""
+                            )
+                            try:
+                                backing_uid = str(UUID(backing_id.rsplit(":", 1)[-1]))
+                            except (TypeError, ValueError):
+                                raise RuntimeError(
+                                    "workspace backing authority is malformed"
+                                ) from None
+                            if (
+                                workspace_binding_context.get("kind") != "remote"
+                                or not (
+                                    backing_id.startswith("k8s-pvc:")
+                                    or backing_id.startswith("k8s-pod:")
+                                )
+                                or (
+                                    backing_id.startswith("k8s-pod:")
+                                    and backing_uid != runtime_uid
+                                )
+                                or (
+                                    workspace_context.get(
+                                        "_canvas_workspace_generation"
+                                    )
+                                    not in (None, generation_id)
+                                )
+                            ):
+                                raise RuntimeError(
+                                    "Kubernetes workspace authority is malformed"
+                                )
+                    elif virtual_binding:
+                        generation_id = _canonical_uuid_text(
+                            workspace_binding_context.get("generation"),
+                            label="virtual binding generation",
+                        )
+                        if (
+                            not re.fullmatch(
+                                r"rclone:[0-9a-f]{64}",
+                                str(workspace_binding_context.get("backing_id") or ""),
+                            )
+                            or not generation_id
+                        ):
+                            raise RuntimeError(
+                                "virtual workspace authority is malformed"
+                            )
+                except RuntimeError:
+                    return {
+                        "state": "malformed",
+                        "reason": "physical_runtime_identity_malformed",
+                    }
+                runtime_authority_exposed = bool(
+                    thread.get("runtime_authority_exposed")
+                    or thread.get("agent_id")
+                    or thread.get("runtime_attach_token")
+                    or agent
+                    or agent_pod_context
+                    or provision_intent
+                )
+
+                context = {
+                    "version": 1,
+                    "thread_id": str(parsed_thread_id),
+                    "generation": generation,
+                    "entry_status": status,
+                    "settle_status": settle_status,
+                    "initiator": initiator,
+                    "user_id": str(thread["user_id"])
+                    if thread.get("user_id") is not None
+                    else None,
+                    "agent_id": str(thread["agent_id"])
+                    if thread.get("agent_id") is not None
+                    else None,
+                    "control_admission_agent_id": str(
+                        thread["control_admission_agent_id"]
+                    )
+                    if thread.get("control_admission_agent_id") is not None
+                    else None,
+                    # The exact agent closes its durable control inbox before
+                    # sending Begin. If the orchestrator crashes while that
+                    # marker is still hidden/unauthorized, abort must restore
+                    # the same reciprocal runtime rather than reopening the
+                    # thread with control admission stranded NULL. Owner/system
+                    # preflights never receive this authority.
+                    "control_admission_reopen_agent_id": (
+                        str(thread["agent_id"])
+                        if initiator == "agent"
+                        and not authorize_immediately
+                        and thread.get("control_admission_agent_id") is None
+                        and thread.get("agent_id") is not None
+                        and thread.get("runtime_attach_token") is not None
+                        and agent is not None
+                        and str(agent.get("id") or "")
+                        == str(thread.get("agent_id") or "")
+                        and str(agent.get("thread_id") or "") == str(parsed_thread_id)
+                        else None
+                    ),
+                    "runtime_attach_token": str(thread["runtime_attach_token"])
+                    if thread.get("runtime_attach_token") is not None
+                    else None,
+                    "runtime_authority_exposed": runtime_authority_exposed,
+                    "agent": agent,
+                    "agent_pod": metadata.get("agent_pod"),
+                    "agent_pod_provision_intent": provision_intent,
+                    "agent_workspace_claim": workspace_claim,
+                    "workspace_provision_intent": workspace_provision_intent,
+                    "workspace_container": metadata.get("workspace_container"),
+                    "workspace_binding": metadata.get("_workspace_binding"),
+                    "vm": metadata.get("vm"),
+                    "workspace_backend": effective_backend,
+                    "protected_cloud": protected_marker == "on",
+                    "protected_cloud_state": protected_marker,
+                    "route": {
+                        "name": f"session-{parsed_thread_id}",
+                        "owner_pod_uid": (agent or {}).get("pod_uid"),
+                    },
+                    "protected_ro": protected_ro,
+                }
+                token = uuid4()
+                admitted = await conn.fetchrow(
+                    """
+                    UPDATE threads
+                       SET runtime_retirement_token = $2::uuid,
+                           runtime_retirement_permanent = $3::boolean,
+                           runtime_retirement_started_at = now(),
+                           runtime_retirement_authorized_at = CASE
+                               WHEN $6::boolean THEN now()
+                               ELSE NULL
+                           END,
+                           runtime_retirement_context = $4::jsonb,
+                           runtime_retirement_stage_receipt = NULL,
+                           runtime_retirement_local_quiescence = NULL,
+                           runtime_retirement_external_cleanup = NULL,
+                           runtime_authority_exposed = $7::boolean
+                     WHERE id = $1::uuid
+                       AND execution_lane = 'pinned'
+                       AND runtime_generation = $5::uuid
+                       AND runtime_retirement_token IS NULL
+                       AND (
+                            status IN ('created','active','awaiting_user','suspended')
+                            OR ($3::boolean AND status='ended')
+                       )
+                    RETURNING runtime_retirement_started_at,
+                              runtime_retirement_authorized_at
+                    """,
+                    parsed_thread_id,
+                    token,
+                    bool(permanent),
+                    json.dumps(context, sort_keys=True, separators=(",", ":")),
+                    UUID(generation),
+                    authorize_immediately,
+                    runtime_authority_exposed,
+                )
+                if admitted is None:
+                    return {"state": "conflict", "reason": "authority_changed"}
+                return {
+                    "state": "pending",
+                    "token": str(token),
+                    "generation": generation,
+                    "permanent": bool(permanent),
+                    "started_at": admitted["runtime_retirement_started_at"],
+                    "authorized_at": admitted["runtime_retirement_authorized_at"],
+                    "context": context,
+                    "reused": False,
+                }
+
+    async def abort_pinned_thread_retirement(
+        self, thread_id: str, *, token: str, generation: str
+    ) -> bool:
+        """Clear one exact, still-hidden retirement preflight.
+
+        Permanence becomes irrevocable only at the append-only authorization
+        edge.  Before that edge an owner request has not instructed the actor
+        to quiesce and no retirement actuator may have run, so both soft and
+        permanent preflights can be rolled back observationally.  The
+        authorization/receipt predicates make a delayed abort harmless.
+        """
+
+        try:
+            parsed_thread_id = UUID(str(thread_id))
+            parsed_token = UUID(str(token))
+            parsed_generation = UUID(str(generation))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchval(
+                """
+                UPDATE threads
+                   SET runtime_retirement_token = NULL,
+                       runtime_retirement_permanent = NULL,
+                       runtime_retirement_started_at = NULL,
+                       runtime_retirement_authorized_at = NULL,
+                       runtime_retirement_context = NULL,
+                       runtime_retirement_stage_receipt = NULL,
+                       runtime_retirement_local_quiescence = NULL,
+                       runtime_retirement_external_cleanup = NULL,
+                       control_admission_agent_id = CASE
+                           WHEN control_admission_agent_id IS NULL
+                            AND runtime_retirement_context->>'initiator' = 'agent'
+                            AND runtime_retirement_context
+                                ->>'control_admission_reopen_agent_id'
+                                = agent_id::text
+                            AND runtime_retirement_context->>'generation'
+                                = runtime_generation::text
+                            AND runtime_retirement_context
+                                ->>'runtime_attach_token'
+                                = runtime_attach_token::text
+                            AND EXISTS (
+                                SELECT 1 FROM agents a
+                                 WHERE a.id = threads.agent_id
+                                   AND a.thread_id = threads.id
+                                   AND a.status = 'session'
+                            )
+                           THEN agent_id
+                           ELSE control_admission_agent_id
+                       END
+                 WHERE id = $1::uuid
+                   AND execution_lane = 'pinned'
+                   AND runtime_generation = $2::uuid
+                   AND runtime_retirement_token = $3::uuid
+                   AND runtime_retirement_authorized_at IS NULL
+                   AND runtime_retirement_stage_receipt IS NULL
+                   AND runtime_retirement_local_quiescence IS NULL
+                   AND runtime_retirement_external_cleanup IS NULL
+                   AND status IN ('created','active','awaiting_user','suspended')
+                RETURNING id
+                """,
+                parsed_thread_id,
+                parsed_generation,
+                parsed_token,
+            )
+        return row is not None
+
+    async def authorize_pinned_thread_retirement(
+        self,
+        thread_id: str,
+        *,
+        token: str,
+        generation: str,
+        settle_status: str,
+    ) -> bool:
+        """Append the durable post-preflight authorization once."""
+
+        if settle_status not in {"ended", "suspended"}:
+            return False
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_token = UUID(str(token))
+            parsed_generation = UUID(str(generation))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchval(
+                "UPDATE threads SET runtime_retirement_authorized_at="
+                "COALESCE(runtime_retirement_authorized_at, now()) "
+                "WHERE id=$1::uuid AND execution_lane='pinned' "
+                "AND runtime_generation=$2::uuid "
+                "AND runtime_retirement_token=$3::uuid "
+                "AND runtime_retirement_context->>'settle_status'=$4 "
+                "RETURNING id",
+                parsed_thread,
+                parsed_generation,
+                parsed_token,
+                settle_status,
+            )
+        return row is not None
+
+    async def acknowledge_pinned_thread_local_quiescence(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_agent_id: str,
+        expected_attach_token: str,
+        expected_settle_status: str,
+        expected_quiescence_protocol: str,
+        expected_workspace_generation: str | None,
+        expected_workspace_runtime_incarnation: str | None,
+        quiescence_actor: str = "agent",
+    ) -> dict[str, Any] | None:
+        """Append the exact agent's local-cleanup receipt once.
+
+        This is the live actor's proof that retirement may snapshot/stage or
+        permanently destroy an exposed workspace. Agent/offline status is not quiescence: Begin
+        itself rejects heartbeats and can make a still-running process look
+        offline.  The physical workspace tuple prevents a stale process from
+        acknowledging cleanup for a replacement backing in the same session
+        generation.
+        """
+
+        if (
+            expected_settle_status not in {"ended", "suspended"}
+            or expected_quiescence_protocol
+            not in {
+                "workspace_process_zero_v1",
+                "agent_runtime_zero_v1",
+                "workspace_actuator_zero_v1",
+            }
+            or quiescence_actor not in {"agent", "orchestrator"}
+        ):
+            return None
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = UUID(str(expected_retirement_token))
+            parsed_agent = UUID(str(expected_agent_id))
+            parsed_attach = UUID(str(expected_attach_token))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT runtime_retirement_token, "
+                    "runtime_retirement_context, "
+                    "runtime_retirement_local_quiescence "
+                    "FROM threads WHERE id=$1::uuid "
+                    "AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND agent_id=$3::uuid "
+                    "AND runtime_attach_token=$4::uuid "
+                    "AND runtime_retirement_token=$5::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_agent,
+                    parsed_attach,
+                    parsed_retirement,
+                )
+                if row is None:
+                    return None
+                context = row["runtime_retirement_context"]
+                context = {} if context is None else context
+                existing = row["runtime_retirement_local_quiescence"]
+                if isinstance(context, str):
+                    try:
+                        context = json.loads(context)
+                    except (TypeError, ValueError):
+                        return None
+                if isinstance(existing, str):
+                    try:
+                        existing = json.loads(existing)
+                    except (TypeError, ValueError):
+                        return None
+                if not isinstance(context, dict):
+                    return None
+                workspace = context.get("workspace_container")
+                binding = context.get("workspace_binding")
+                vm = context.get("vm")
+                agent = context.get("agent")
+                agent_pod = context.get("agent_pod")
+                workspace_provision_intent = context.get("workspace_provision_intent")
+                protected_ro = context.get("protected_ro")
+                workspace = {} if workspace is None else workspace
+                binding = {} if binding is None else binding
+                vm = {} if vm is None else vm
+                agent = {} if agent is None else agent
+                agent_pod = {} if agent_pod is None else agent_pod
+                workspace_provision_intent = (
+                    {}
+                    if workspace_provision_intent is None
+                    else workspace_provision_intent
+                )
+                protected_ro = {} if protected_ro is None else protected_ro
+                if not all(
+                    isinstance(value, dict)
+                    for value in (
+                        workspace,
+                        binding,
+                        vm,
+                        agent,
+                        agent_pod,
+                        workspace_provision_intent,
+                        protected_ro,
+                    )
+                ):
+                    return None
+                if (
+                    agent
+                    and (not agent.get("hostname") or not agent.get("pod_uid"))
+                    or agent_pod
+                    and (not agent_pod.get("pod_name") or not agent_pod.get("pod_uid"))
+                ):
+                    return None
+                workspace_backend = str(context.get("workspace_backend") or "")
+                sandbox_generation = str(binding.get("generation") or "")
+                sandbox_runtime = str(
+                    (
+                        workspace.get(_DOCKER_WORKSPACE_LEASE_KEY)
+                        if workspace.get("provisioner") == "docker"
+                        else workspace.get("_runtime_incarnation")
+                    )
+                    or ""
+                )
+                if workspace_provision_intent:
+                    expected_protocol = "agent_runtime_zero_v1"
+                elif workspace_backend == "sandbox":
+                    if bool(sandbox_generation) != bool(sandbox_runtime):
+                        return None
+                    expected_protocol = (
+                        "workspace_process_zero_v1"
+                        if sandbox_generation
+                        else "agent_runtime_zero_v1"
+                    )
+                else:
+                    expected_protocol = {
+                        "virtual": "agent_runtime_zero_v1",
+                        "none": "agent_runtime_zero_v1",
+                        "vm": "workspace_actuator_zero_v1",
+                        "remote": "workspace_actuator_zero_v1",
+                    }.get(workspace_backend)
+                if expected_protocol != expected_quiescence_protocol:
+                    return None
+                if workspace_provision_intent:
+                    captured_workspace_generation = ""
+                    captured_workspace_runtime = ""
+                elif workspace_backend == "sandbox":
+                    captured_workspace_generation = sandbox_generation
+                    captured_workspace_runtime = sandbox_runtime
+                elif workspace_backend in {"vm", "remote"}:
+                    captured_workspace_generation = str(
+                        vm.get("provision_generation") or ""
+                    )
+                    captured_workspace_runtime = str(vm.get("vm_uid") or "")
+                    if (
+                        not captured_workspace_generation
+                        or not captured_workspace_runtime
+                    ):
+                        return None
+                else:
+                    captured_workspace_generation = ""
+                    captured_workspace_runtime = ""
+                if (
+                    str(context.get("generation") or "") != str(parsed_generation)
+                    or str(context.get("agent_id") or "") != str(parsed_agent)
+                    or str(context.get("runtime_attach_token") or "")
+                    != str(parsed_attach)
+                    or str(context.get("settle_status") or "") != expected_settle_status
+                    or captured_workspace_generation
+                    != str(expected_workspace_generation or "")
+                    or captured_workspace_runtime
+                    != str(expected_workspace_runtime_incarnation or "")
+                ):
+                    return None
+                receipt = {
+                    "version": 1,
+                    "runtime_generation": str(parsed_generation),
+                    "retirement_token": str(parsed_retirement),
+                    "agent_id": str(parsed_agent),
+                    "runtime_attach_token": str(parsed_attach),
+                    "settle_status": expected_settle_status,
+                    "quiescence_protocol": expected_quiescence_protocol,
+                    "quiescence_actor": quiescence_actor,
+                    "workspace_generation": (captured_workspace_generation or None),
+                    "workspace_runtime_incarnation": (
+                        captured_workspace_runtime or None
+                    ),
+                }
+                if existing is not None:
+                    # Agent and orchestrator recovery may race after the exact
+                    # agent Pod is stopped. Their physical proof is identical;
+                    # the actor label is audit context, not a competing owner.
+                    comparable = dict(receipt)
+                    comparable.pop("quiescence_actor", None)
+                    existing_comparable = (
+                        dict(existing) if isinstance(existing, dict) else {}
+                    )
+                    existing_actor = existing_comparable.pop("quiescence_actor", None)
+                    return (
+                        existing
+                        if existing_actor in {"agent", "orchestrator"}
+                        and existing_comparable == comparable
+                        else None
+                    )
+                updated = await conn.execute(
+                    "UPDATE threads SET "
+                    "runtime_retirement_local_quiescence=$6::jsonb "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND agent_id=$3::uuid AND runtime_attach_token=$4::uuid "
+                    "AND runtime_retirement_token=$5::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL "
+                    "AND runtime_retirement_local_quiescence IS NULL",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_agent,
+                    parsed_attach,
+                    parsed_retirement,
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                )
+                return receipt if updated == "UPDATE 1" else None
+
+    async def acknowledge_pinned_thread_pre_registration_pod_zero(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_pod_name: str,
+        expected_pod_uid: str,
+    ) -> dict[str, Any] | None:
+        """Receipt an exact pre-registration Pod stop and clear its marker.
+
+        This is not a substitute for a live session ACK.  It is admitted only
+        for a created pinned life whose immutable Begin context captured one
+        complete ``agent_pod`` tuple but no agent, attach token, control owner,
+        or inverse/matching agent row.  The caller UID-deletes and waits for
+        that Pod before this CAS; registration remains closed by T throughout.
+        """
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_retirement = UUID(str(expected_retirement_token))
+        except (TypeError, ValueError):
+            return None
+        pod_name = str(expected_pod_name or "")
+        pod_uid = str(expected_pod_uid or "")
+        if not pod_name or not pod_uid:
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT status, agent_id, control_admission_agent_id, "
+                    "runtime_attach_token, metadata, "
+                    "runtime_retirement_context, "
+                    "runtime_retirement_local_quiescence FROM threads "
+                    "WHERE id=$1::uuid AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                )
+                if row is None:
+                    return None
+                context = row["runtime_retirement_context"]
+                metadata = row["metadata"]
+                existing = row["runtime_retirement_local_quiescence"]
+                try:
+                    if isinstance(context, str):
+                        context = json.loads(context)
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+                    if isinstance(existing, str):
+                        existing = json.loads(existing)
+                except (TypeError, ValueError):
+                    return None
+                if not isinstance(context, dict) or not isinstance(metadata, dict):
+                    return None
+                captured_agent = context.get("agent")
+                captured_pod = context.get("agent_pod")
+                if not (
+                    str(row["status"] or "") == "created"
+                    and str(context.get("entry_status") or "") == "created"
+                    and context.get("runtime_authority_exposed") is True
+                    and context.get("agent_id") is None
+                    and context.get("control_admission_agent_id") is None
+                    and context.get("runtime_attach_token") is None
+                    and (
+                        captured_agent is None
+                        or isinstance(captured_agent, dict)
+                        and not captured_agent
+                    )
+                    and isinstance(captured_pod, dict)
+                    and str(captured_pod.get("pod_name") or "") == pod_name
+                    and str(captured_pod.get("pod_uid") or "") == pod_uid
+                    and row["agent_id"] is None
+                    and row["control_admission_agent_id"] is None
+                    and row["runtime_attach_token"] is None
+                ):
+                    return None
+                matching_agent = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM agents "
+                    "WHERE thread_id=$1::uuid OR hostname=$2 OR pod_uid=$3)",
+                    parsed_thread,
+                    pod_name,
+                    pod_uid,
+                )
+                if matching_agent:
+                    return None
+                receipt = {
+                    "version": 1,
+                    "runtime_generation": str(parsed_generation),
+                    "retirement_token": str(parsed_retirement),
+                    "agent_id": None,
+                    "runtime_attach_token": None,
+                    "settle_status": str(context.get("settle_status") or ""),
+                    "quiescence_protocol": "agent_runtime_zero_v1",
+                    "quiescence_actor": "orchestrator",
+                    "workspace_generation": None,
+                    "workspace_runtime_incarnation": None,
+                    "agent_pod_name": pod_name,
+                    "agent_pod_uid": pod_uid,
+                }
+                current_pod = metadata.get("agent_pod")
+                if existing is not None:
+                    return (
+                        existing
+                        if existing == receipt and current_pod in (None, {})
+                        else None
+                    )
+                if current_pod != captured_pod:
+                    return None
+                updated = await conn.execute(
+                    "UPDATE threads SET "
+                    "runtime_retirement_local_quiescence=$4::jsonb, "
+                    "metadata=metadata-'agent_pod' "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL "
+                    "AND runtime_retirement_local_quiescence IS NULL "
+                    "AND agent_id IS NULL AND control_admission_agent_id IS NULL "
+                    "AND runtime_attach_token IS NULL "
+                    "AND metadata->'agent_pod'=$5::jsonb "
+                    "AND NOT EXISTS (SELECT 1 FROM agents "
+                    "WHERE thread_id=$1::uuid OR hostname=$6 OR pod_uid=$7)",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                    json.dumps(captured_pod, sort_keys=True, separators=(",", ":")),
+                    pod_name,
+                    pod_uid,
+                )
+                return receipt if updated == "UPDATE 1" else None
+
+    async def settle_pinned_thread_retirement(
+        self,
+        thread_id: str,
+        *,
+        token: str,
+        generation: str,
+        final_status: str = "ended",
+        staged_event: dict[str, Any] | None = None,
+    ) -> bool:
+        """Publish soft End/suspend after exact cleanup and rotate as needed."""
+
+        if final_status not in {"ended", "suspended"}:
+            raise ValueError("final_status must be ended or suspended")
+
+        try:
+            parsed_thread_id = UUID(str(thread_id))
+            parsed_token = UUID(str(token))
+            parsed_generation = UUID(str(generation))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                retirement = await conn.fetchrow(
+                    "SELECT runtime_retirement_context, "
+                    "runtime_retirement_stage_receipt, "
+                    "runtime_retirement_local_quiescence FROM threads "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_authorized_at IS NOT NULL "
+                    "AND runtime_retirement_permanent=false FOR UPDATE",
+                    parsed_thread_id,
+                    parsed_generation,
+                    parsed_token,
+                )
+                if retirement is None:
+                    return False
+                context = retirement["runtime_retirement_context"]
+                context = {} if context is None else context
+                receipt = retirement["runtime_retirement_stage_receipt"]
+                local_quiescence = retirement["runtime_retirement_local_quiescence"]
+                if isinstance(context, str):
+                    try:
+                        context = json.loads(context)
+                    except (TypeError, ValueError):
+                        return False
+                if isinstance(receipt, str):
+                    try:
+                        receipt = json.loads(receipt)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(context, dict):
+                    return False
+                if str(context.get("settle_status") or "") != final_status:
+                    return False
+                if isinstance(local_quiescence, str):
+                    try:
+                        local_quiescence = json.loads(local_quiescence)
+                    except (TypeError, ValueError):
+                        return False
+                workspace = context.get("workspace_container")
+                binding = context.get("workspace_binding")
+                protected_ro = context.get("protected_ro")
+                vm = context.get("vm")
+                agent = context.get("agent")
+                agent_pod = context.get("agent_pod")
+                provision_intent = context.get("agent_pod_provision_intent")
+                workspace_provision_intent = context.get("workspace_provision_intent")
+                workspace_claim = context.get("agent_workspace_claim")
+                workspace = {} if workspace is None else workspace
+                binding = {} if binding is None else binding
+                protected_ro = {} if protected_ro is None else protected_ro
+                vm = {} if vm is None else vm
+                agent = {} if agent is None else agent
+                agent_pod = {} if agent_pod is None else agent_pod
+                provision_intent = {} if provision_intent is None else provision_intent
+                workspace_provision_intent = (
+                    {}
+                    if workspace_provision_intent is None
+                    else workspace_provision_intent
+                )
+                workspace_claim = {} if workspace_claim is None else workspace_claim
+                if not all(
+                    isinstance(value, dict)
+                    for value in (
+                        workspace,
+                        binding,
+                        protected_ro,
+                        vm,
+                        agent,
+                        agent_pod,
+                        provision_intent,
+                        workspace_provision_intent,
+                        workspace_claim,
+                    )
+                ):
+                    return False
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM "
+                    "thread_agent_pod_provision_intents "
+                    "WHERE thread_id=$1::uuid "
+                    "AND status IN ('planned','revoking'))",
+                    parsed_thread_id,
+                ):
+                    return False
+                current_claims = await conn.fetch(
+                    "SELECT claim_id,created_runtime_generation,create_attempt,"
+                    "provisioner,pvc_name,status,pvc_uid "
+                    "FROM thread_agent_workspace_claims "
+                    "WHERE thread_id=$1::uuid AND status<>'reclaimed' FOR SHARE",
+                    parsed_thread_id,
+                )
+                if workspace_claim:
+                    if len(current_claims) != 1:
+                        return False
+                    current_claim = current_claims[0]
+                    if not (
+                        str(current_claim["claim_id"])
+                        == str(workspace_claim.get("claim_id") or "")
+                        and str(current_claim["created_runtime_generation"])
+                        == str(workspace_claim.get("created_runtime_generation") or "")
+                        and str(current_claim["create_attempt"])
+                        == str(workspace_claim.get("create_attempt") or "")
+                        and str(current_claim["provisioner"])
+                        == str(workspace_claim.get("provisioner") or "")
+                        and str(current_claim["pvc_name"])
+                        == str(workspace_claim.get("pvc_name") or "")
+                        and str(current_claim["status"]) == "ready"
+                        and bool(str(current_claim["pvc_uid"] or ""))
+                    ):
+                        return False
+                elif current_claims:
+                    return False
+                if workspace_provision_intent:
+                    try:
+                        workspace_attempt = UUID(
+                            str(workspace_provision_intent.get("attempt_id") or "")
+                        )
+                    except (TypeError, ValueError):
+                        return False
+                    current_workspace_intent = await conn.fetchrow(
+                        "SELECT * FROM thread_workspace_provision_intents "
+                        "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid "
+                        "FOR SHARE",
+                        workspace_attempt,
+                        parsed_thread_id,
+                    )
+                    if current_workspace_intent is None or str(
+                        current_workspace_intent["status"]
+                    ) not in {"fenced", "retired"}:
+                        return False
+                    current_previous_binding = current_workspace_intent[
+                        "previous_binding"
+                    ]
+                    if isinstance(current_previous_binding, str):
+                        try:
+                            current_previous_binding = json.loads(
+                                current_previous_binding
+                            )
+                        except (TypeError, ValueError):
+                            return False
+                    captured_previous_binding = workspace_provision_intent.get(
+                        "previous_binding"
+                    )
+                    if not (
+                        isinstance(current_previous_binding, dict)
+                        and isinstance(captured_previous_binding, dict)
+                        and current_previous_binding == captured_previous_binding
+                    ):
+                        return False
+                    if any(
+                        str(current_workspace_intent[field] or "")
+                        != str(workspace_provision_intent.get(field) or "")
+                        for field in (
+                            "thread_id",
+                            "runtime_generation",
+                            "created_agent_id",
+                            "created_attach_token",
+                            "namespace",
+                            "pod_name",
+                            "pvc_name",
+                            "seed_configmap_name",
+                            "service_name",
+                            "network_tier",
+                            "manifest_fingerprint",
+                            "retained_binding_generation",
+                            "retained_pvc_uid",
+                            "retained_service_uid",
+                            "pod_uid",
+                            "pvc_uid",
+                            "seed_configmap_uid",
+                            "service_uid",
+                        )
+                    ):
+                        return False
+                elif await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM "
+                    "thread_workspace_provision_intents WHERE "
+                    "thread_id=$1::uuid AND status IN "
+                    "('planned','revoking','fenced'))",
+                    parsed_thread_id,
+                ):
+                    return False
+                if not _pinned_retirement_local_quiescence_matches(
+                    context,
+                    local_quiescence,
+                    runtime_generation=parsed_generation,
+                    retirement_token=parsed_token,
+                    final_status=final_status,
+                ):
+                    return False
+                if bool((context or {}).get("protected_cloud")):
+                    if not isinstance(receipt, dict) or not isinstance(
+                        staged_event, dict
+                    ):
+                        return False
+                    protected_plan = (
+                        ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(
+                            protected_ro
+                        )
+                        if protected_ro
+                        else None
+                    )
+                    if protected_ro and protected_plan is None:
+                        return False
+                    expected_mount_id = (
+                        str(protected_ro.get("id") or "") if protected_ro else None
+                    )
+                    expected_attempt = (
+                        str(protected_ro.get("engage_attempt") or "")
+                        if protected_ro
+                        else None
+                    )
+                    expected_source_sha256 = (
+                        protected_plan.source_sha256
+                        if protected_plan is not None
+                        else None
+                    )
+                    if not (
+                        int(receipt.get("version") or 0) == 1
+                        and str(receipt.get("runtime_generation") or "")
+                        == str(parsed_generation)
+                        and str(receipt.get("retirement_token") or "")
+                        == str(parsed_token)
+                        and int(receipt.get("staged_epoch", -1))
+                        == int(staged_event.get("staged_epoch", -2))
+                        and str(receipt.get("mount_id") or "")
+                        == str(staged_event.get("mount_id") or "")
+                        and (
+                            receipt.get("mount_id") is None
+                            if expected_mount_id is None
+                            else str(receipt.get("mount_id") or "") == expected_mount_id
+                        )
+                        and (
+                            receipt.get("engage_attempt") is None
+                            if expected_attempt is None
+                            else str(receipt.get("engage_attempt") or "")
+                            == expected_attempt
+                        )
+                        and (
+                            receipt.get("source_binding_sha256") is None
+                            if expected_source_sha256 is None
+                            else str(receipt.get("source_binding_sha256") or "")
+                            == expected_source_sha256
+                        )
+                        and str(staged_event.get("session_runtime_generation") or "")
+                        == str(parsed_generation)
+                        and str(staged_event.get("thread_id") or "")
+                        == str(parsed_thread_id)
+                    ):
+                        return False
+                    summary = receipt.get("staged_summary")
+                    if isinstance(summary, dict) and not (
+                        protected_plan is not None
+                        and summary.get("source_binding")
+                        == protected_plan.source.binding
+                        and str(summary.get("source_binding_sha256") or "")
+                        == protected_plan.source_sha256
+                    ):
+                        return False
+                    expected_counts = (
+                        (summary.get("counts") or {})
+                        if isinstance(summary, dict)
+                        else {"added": 0, "modified": 0, "deleted": 0}
+                    )
+                    if staged_event.get("counts") != expected_counts or int(
+                        staged_event.get("file_count") or 0
+                    ) != sum(int(value or 0) for value in expected_counts.values()):
+                        return False
+                agent_id = (
+                    context.get("agent_id") if isinstance(context, dict) else None
+                )
+                outcome_inserted = await conn.execute(
+                    """
+                    INSERT INTO thread_runtime_retirement_outcomes (
+                        thread_id, runtime_generation, retirement_token,
+                        agent_id, runtime_attach_token, disposition,
+                        permanent, outcome
+                    ) VALUES (
+                        $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+                        $6::varchar, false, 'settled'
+                    )
+                    ON CONFLICT (thread_id, runtime_generation,
+                                 retirement_token) DO NOTHING
+                    """,
+                    parsed_thread_id,
+                    parsed_generation,
+                    parsed_token,
+                    context.get("agent_id"),
+                    context.get("runtime_attach_token"),
+                    final_status,
+                )
+                if outcome_inserted != "INSERT 0 1":
+                    raise RuntimeError(
+                        "pinned retirement outcome conflicts with exact authority"
+                    )
+                if agent_id:
+                    await conn.execute(
+                        "UPDATE agents SET thread_id=NULL, status='offline' "
+                        "WHERE id=$1::uuid AND thread_id=$2::uuid",
+                        agent_id,
+                        parsed_thread_id,
+                    )
+                row = await conn.fetchval(
+                    """
+                UPDATE threads
+                   SET status = $4::varchar,
+                       ended_at = CASE WHEN $4::varchar = 'ended'
+                                       THEN CURRENT_TIMESTAMP ELSE NULL END,
+                       runtime_generation = CASE WHEN $4::varchar = 'suspended'
+                           THEN uuid_generate_v4() ELSE runtime_generation END,
+                       agent_id = NULL,
+                       control_admission_agent_id = NULL,
+                       runtime_attach_token = NULL,
+                       awaiting_user_since = NULL,
+                       runtime_retirement_token = NULL,
+                       runtime_retirement_permanent = NULL,
+                       runtime_retirement_started_at = NULL,
+                       runtime_retirement_authorized_at = NULL,
+                       runtime_retirement_context = NULL,
+                       runtime_retirement_stage_receipt = NULL,
+                       runtime_retirement_local_quiescence = NULL,
+                       runtime_retirement_external_cleanup = NULL,
+                       metadata = COALESCE(metadata, '{}'::jsonb) - 'agent_pod'
+                 WHERE id = $1::uuid
+                   AND execution_lane = 'pinned'
+                   AND runtime_generation = $2::uuid
+                   AND runtime_retirement_token = $3::uuid
+                   AND runtime_retirement_authorized_at IS NOT NULL
+                   AND runtime_retirement_permanent = false
+                   AND status IN ('created','active','awaiting_user','suspended')
+                RETURNING id
+                """,
+                    parsed_thread_id,
+                    parsed_generation,
+                    parsed_token,
+                    final_status,
+                )
+                if row is None:
+                    raise RuntimeError(
+                        "pinned retirement settlement lost exact authority"
+                    )
+                if row is not None:
+                    from src.shared.event_journal import append_system_frame
+
+                    # The final cloud wake precedes the terminal lifecycle
+                    # edge in one transaction.  Replayers therefore learn the
+                    # terminal review state before the session becomes ended
+                    # or suspended, while either append failure rolls the
+                    # lifecycle CAS back as a unit.
+                    if staged_event is not None:
+                        if str(
+                            staged_event.get("session_runtime_generation") or ""
+                        ) != str(parsed_generation):
+                            raise RuntimeError(
+                                "staged event generation does not match retirement"
+                            )
+                        await append_system_frame(
+                            conn,
+                            thread_id=str(parsed_thread_id),
+                            kind="cloud.diff_staged",
+                            payload=dict(staged_event),
+                        )
+                    lifecycle_payload: dict[str, Any] = {
+                        "thread_id": str(parsed_thread_id),
+                        "session_runtime_generation": str(parsed_generation),
+                    }
+                    lifecycle_kind = "session.ended"
+                    if final_status == "suspended":
+                        lifecycle_kind = "session.suspended"
+                        lifecycle_payload["message"] = (
+                            "Session suspended. Send a message to resume where "
+                            "you left off."
+                        )
+                    await append_system_frame(
+                        conn,
+                        thread_id=str(parsed_thread_id),
+                        kind=lifecycle_kind,
+                        payload=lifecycle_payload,
+                    )
+        return row is not None
+
+    async def get_pinned_thread_retirement_outcome(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        retirement_token: str,
+        agent_id: str,
+        runtime_attach_token: str,
+        disposition: str,
+        permanent: bool,
+    ) -> dict[str, Any] | None:
+        """Read one exact terminal receipt without exposing successor state."""
+
+        if disposition not in {"ended", "suspended"}:
+            return None
+        try:
+            identifiers = tuple(
+                UUID(str(value))
+                for value in (
+                    thread_id,
+                    runtime_generation,
+                    retirement_token,
+                    agent_id,
+                    runtime_attach_token,
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT disposition, permanent, outcome, settled_at
+                  FROM thread_runtime_retirement_outcomes
+                 WHERE thread_id=$1::uuid
+                   AND runtime_generation=$2::uuid
+                   AND retirement_token=$3::uuid
+                   AND agent_id=$4::uuid
+                   AND runtime_attach_token=$5::uuid
+                   AND disposition=$6::varchar
+                   AND permanent=$7::boolean
+                """,
+                *identifiers,
+                disposition,
+                bool(permanent),
+            )
+        if row is None:
+            return None
+        return {
+            "status": "settled_or_superseded",
+            "retirement_disposition": str(row["disposition"]),
+            "retirement_permanent": bool(row["permanent"]),
+            "outcome": str(row["outcome"]),
+            "settled_at": row["settled_at"],
+        }
+
+    async def pinned_thread_has_prior_soft_settlement(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        retirement_token: str,
+    ) -> bool:
+        """Prove an ended G was already quiesced by an exact soft settlement.
+
+        Soft End retains the generation/exposure bit but clears the live owner
+        and current receipt. A later permanent delete may reuse the append-only
+        settlement outcome only while the same G remains ended, ownerless, and
+        protected by its newly authorized permanent token. Resume rotates G,
+        so an old outcome cannot authorize deletion of the successor.
+        """
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(runtime_generation))
+            parsed_token = UUID(str(retirement_token))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM threads thread
+                          JOIN thread_runtime_retirement_outcomes outcome
+                            ON outcome.thread_id = thread.id
+                           AND outcome.runtime_generation =
+                               thread.runtime_generation
+                         WHERE thread.id = $1::uuid
+                           AND thread.execution_lane = 'pinned'
+                           AND thread.runtime_generation = $2::uuid
+                           AND thread.runtime_retirement_token = $3::uuid
+                           AND thread.runtime_retirement_permanent = true
+                           AND thread.runtime_retirement_authorized_at IS NOT NULL
+                           AND thread.status = 'ended'
+                           AND thread.agent_id IS NULL
+                           AND thread.control_admission_agent_id IS NULL
+                           AND thread.runtime_attach_token IS NULL
+                           AND (
+                               NOT (COALESCE(thread.metadata, '{}'::jsonb)
+                                    ? 'agent_pod')
+                               OR thread.metadata->'agent_pod' IS NULL
+                               OR thread.metadata->'agent_pod' = 'null'::jsonb
+                               OR thread.metadata->'agent_pod' = '{}'::jsonb
+                           )
+                           AND (
+                               NOT (
+                                   thread.runtime_retirement_context ? 'agent'
+                               )
+                               OR thread.runtime_retirement_context->'agent'
+                                  IN ('null'::jsonb, '{}'::jsonb)
+                           )
+                           AND (
+                               NOT (
+                                   thread.runtime_retirement_context ? 'agent_pod'
+                               )
+                               OR thread.runtime_retirement_context->'agent_pod'
+                                  IN ('null'::jsonb, '{}'::jsonb)
+                           )
+                           AND outcome.disposition = 'ended'
+                           AND outcome.permanent = false
+                           AND outcome.outcome = 'settled'
+                    )
+                    """,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_token,
+                )
+            )
+
+    async def pinned_runtime_generation_is_open(
+        self, thread_id: str, generation: str
+    ) -> bool:
+        """Cheap final-side-effect fence for a captured pinned generation."""
+
+        try:
+            parsed_thread_id = UUID(str(thread_id))
+            parsed_generation = UUID(str(generation))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM threads
+                         WHERE id = $1::uuid
+                           AND execution_lane = 'pinned'
+                           AND runtime_generation = $2::uuid
+                           AND runtime_retirement_token IS NULL
+                           AND status IN ('created','active','awaiting_user','suspended')
+                    )
+                    """,
+                    parsed_thread_id,
+                    parsed_generation,
+                )
             )
 
     async def get_stateless_thread_lifecycle_authority(
@@ -18497,11 +26167,16 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 thread = await conn.fetchrow(
-                    "SELECT status::text AS status, execution_lane, metadata "
+                    "SELECT status::text AS status, execution_lane, metadata, "
+                    "runtime_generation, runtime_retirement_token "
                     "FROM threads WHERE id = $1::uuid FOR UPDATE",
                     thread_id,
                 )
-                if thread is None or str(thread["status"] or "") != "ended":
+                if (
+                    thread is None
+                    or str(thread["status"] or "") != "ended"
+                    or thread["runtime_retirement_token"] is not None
+                ):
                     return False
                 stateless = str(thread["execution_lane"] or "") == "stateless"
                 if stateless:
@@ -18622,6 +26297,7 @@ class PostgresDB:
                             metadata      = $2::jsonb
                         WHERE id = $1::uuid
                           AND status = 'ended'
+                          AND runtime_retirement_token IS NULL
                           AND NOT (COALESCE(metadata, '{}'::jsonb)
                                    ? '_stateless_workspace_retirement_pending')
                           AND NOT (COALESCE(metadata, '{}'::jsonb)
@@ -18647,6 +26323,7 @@ class PostgresDB:
                             ended_at      = NULL,
                             last_activity = CURRENT_TIMESTAMP
                         WHERE id = $1::uuid AND status = 'ended'
+                          AND runtime_retirement_token IS NULL
                         RETURNING id
                         """,
                         thread_id,
@@ -18683,7 +26360,13 @@ class PostgresDB:
                 json.dumps(ack),
             )
 
-    async def delete_thread(self, thread_id: str) -> None:
+    async def delete_thread(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_retirement_token: str | None = None,
+        expected_runtime_generation: str | None = None,
+    ) -> None:
         """Permanently delete a thread and its messages."""
         try:
             thread_uuid = UUID(str(thread_id))
@@ -18695,25 +26378,261 @@ class PostgresDB:
                     "SELECT pg_advisory_xact_lock(hashtext($1))",
                     "srw-docker-workspace-pool",
                 )
-                await conn.execute(
-                    """
-                    UPDATE docker_workspace_leases
-                    SET status = 'quarantined',
-                        quarantine_reason = 'owner_deleted_before_recreation',
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE owner_kind = 'thread' AND owner_id = $1
-                      AND status IN ('ready', 'releasing')
-                    """,
-                    thread_uuid,
-                )
                 thread = await conn.fetchrow(
-                    "SELECT execution_lane, status::text AS status, metadata "
+                    "SELECT execution_lane, status::text AS status, metadata, "
+                    "agent_id, control_admission_agent_id, runtime_attach_token, "
+                    "runtime_generation, runtime_retirement_token, "
+                    "runtime_retirement_permanent, "
+                    "runtime_retirement_authorized_at, "
+                    "runtime_retirement_context, "
+                    "runtime_retirement_local_quiescence, "
+                    "runtime_retirement_external_cleanup, "
+                    "runtime_authority_exposed, "
+                    "EXISTS (SELECT 1 FROM docker_workspace_leases lease "
+                    "WHERE lease.owner_kind='thread' "
+                    "AND lease.owner_id=threads.id "
+                    "AND lease.status IN ('ready','releasing')) "
+                    "AS live_docker_workspace_lease, "
+                    "EXISTS (SELECT 1 FROM cloud_ro_mounts ro "
+                    "WHERE ro.thread_id=threads.id "
+                    "AND ro.status IN ('engaging','active','revoking')) "
+                    "AS live_protected_ro "
+                    ", EXISTS (SELECT 1 FROM "
+                    "thread_agent_pod_provision_intents intent "
+                    "WHERE intent.thread_id=threads.id "
+                    "AND intent.status IN ('planned','revoking')) "
+                    "AS unresolved_agent_pod_provision_intent "
+                    ", EXISTS (SELECT 1 FROM "
+                    "thread_agent_workspace_claims claim "
+                    "WHERE claim.thread_id=threads.id "
+                    "AND claim.status IN ('planned','ready','revoking')) "
+                    "AS unresolved_agent_workspace_claim "
                     "FROM threads WHERE id = $1::uuid FOR UPDATE",
                     thread_uuid,
                 )
                 if thread is None:
                     return
                 stateless = str(thread["execution_lane"] or "") == "stateless"
+                thread_metadata = thread["metadata"]
+                thread_metadata = {} if thread_metadata is None else thread_metadata
+                if isinstance(thread_metadata, str):
+                    try:
+                        thread_metadata = json.loads(thread_metadata)
+                    except (TypeError, ValueError):
+                        thread_metadata = None
+                workspace_metadata = (
+                    thread_metadata.get("workspace_container")
+                    if isinstance(thread_metadata, dict)
+                    else None
+                )
+                workspace_binding = (
+                    thread_metadata.get("_workspace_binding")
+                    if isinstance(thread_metadata, dict)
+                    else None
+                )
+                vm_metadata = (
+                    thread_metadata.get("vm")
+                    if isinstance(thread_metadata, dict)
+                    else None
+                )
+                agent_pod_metadata = (
+                    thread_metadata.get("agent_pod")
+                    if isinstance(thread_metadata, dict)
+                    else None
+                )
+                workspace_metadata = (
+                    {} if workspace_metadata is None else workspace_metadata
+                )
+                workspace_binding = (
+                    {} if workspace_binding is None else workspace_binding
+                )
+                vm_metadata = {} if vm_metadata is None else vm_metadata
+                agent_pod_metadata = (
+                    {} if agent_pod_metadata is None else agent_pod_metadata
+                )
+                physical_runtime_absent = bool(
+                    isinstance(thread_metadata, dict)
+                    and isinstance(workspace_metadata, dict)
+                    and isinstance(workspace_binding, dict)
+                    and isinstance(vm_metadata, dict)
+                    and isinstance(agent_pod_metadata, dict)
+                    and not agent_pod_metadata
+                    and _json_runtime_status_is_absent(workspace_metadata)
+                    and not _json_field_is_nonnull(
+                        workspace_metadata, "_runtime_incarnation"
+                    )
+                    and not _json_field_is_nonnull(
+                        workspace_metadata, _DOCKER_WORKSPACE_LEASE_KEY
+                    )
+                    and not workspace_binding
+                    and not any(
+                        _json_field_is_nonnull(workspace_metadata, field)
+                        for field in (
+                            "pod_ip",
+                            "pod_name",
+                            "host",
+                            "port",
+                            "ide_host",
+                            "ide_port",
+                            "_canvas_workspace_generation",
+                        )
+                    )
+                    and _json_runtime_status_is_absent(vm_metadata)
+                    and not any(
+                        _json_field_is_nonnull(vm_metadata, field)
+                        for field in (
+                            "provision_generation",
+                            "identity_provision_generation",
+                            "vm_uid",
+                            "_runtime_incarnation",
+                            "rootdisk_pvc_uid",
+                            "ssh_host",
+                            "ssh_port",
+                            "_canvas_workspace_generation",
+                        )
+                    )
+                )
+                retirement_context: dict[str, Any] | None = None
+                if expected_runtime_retirement_token is not None:
+                    if (
+                        stateless
+                        or str(thread["runtime_retirement_token"] or "")
+                        != str(expected_runtime_retirement_token)
+                        or str(thread["runtime_generation"] or "")
+                        != str(expected_runtime_generation or "")
+                        or thread["runtime_retirement_permanent"] is not True
+                        or thread["runtime_retirement_authorized_at"] is None
+                    ):
+                        raise RuntimeError(
+                            "permanent pinned delete lost retirement authority"
+                        )
+                    retirement_context = thread["runtime_retirement_context"]
+                    retirement_context = (
+                        {} if retirement_context is None else retirement_context
+                    )
+                    local_quiescence = thread["runtime_retirement_local_quiescence"]
+                    external_cleanup = thread["runtime_retirement_external_cleanup"]
+                    for name, value in (
+                        ("context", retirement_context),
+                        ("local quiescence", local_quiescence),
+                        ("external cleanup", external_cleanup),
+                    ):
+                        if isinstance(value, str):
+                            try:
+                                parsed = json.loads(value)
+                            except (TypeError, ValueError) as exc:
+                                raise RuntimeError(
+                                    f"permanent pinned delete {name} is malformed"
+                                ) from exc
+                            if name == "context":
+                                retirement_context = parsed
+                            elif name == "local quiescence":
+                                local_quiescence = parsed
+                            else:
+                                external_cleanup = parsed
+                    if (
+                        not isinstance(retirement_context, dict)
+                        or retirement_context.get("settle_status") != "ended"
+                        or str(retirement_context.get("generation") or "")
+                        != str(thread["runtime_generation"] or "")
+                        or str(retirement_context.get("agent_id") or "")
+                        != str(thread["agent_id"] or "")
+                        or str(retirement_context.get("runtime_attach_token") or "")
+                        != str(thread["runtime_attach_token"] or "")
+                    ):
+                        raise RuntimeError(
+                            "permanent pinned delete context is malformed"
+                        )
+                    prior_soft_settlement = bool(
+                        str(thread["status"] or "") == "ended"
+                        and thread["agent_id"] is None
+                        and thread["control_admission_agent_id"] is None
+                        and thread["runtime_attach_token"] is None
+                        and retirement_context.get("agent") in (None, {})
+                        and retirement_context.get("agent_pod") in (None, {})
+                        and retirement_context.get("agent_pod_provision_intent")
+                        in (None, {})
+                        and not agent_pod_metadata
+                        and await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM "
+                            "thread_runtime_retirement_outcomes "
+                            "WHERE thread_id=$1::uuid "
+                            "AND runtime_generation=$2::uuid "
+                            "AND disposition='ended' AND permanent=false "
+                            "AND outcome='settled')",
+                            thread_uuid,
+                            thread["runtime_generation"],
+                        )
+                    )
+                    runtime_exposed = bool(
+                        thread["runtime_authority_exposed"] is True
+                        or thread["agent_id"] is not None
+                        or thread["runtime_attach_token"] is not None
+                        or retirement_context.get("runtime_authority_exposed") is True
+                        or retirement_context.get("agent_id")
+                        or retirement_context.get("runtime_attach_token")
+                        or retirement_context.get("agent") not in (None, {})
+                        or retirement_context.get("agent_pod") not in (None, {})
+                        or retirement_context.get("agent_pod_provision_intent")
+                        not in (None, {})
+                    )
+                    exact_local_quiescence = (
+                        _pinned_retirement_local_quiescence_matches(
+                            retirement_context,
+                            local_quiescence,
+                            runtime_generation=thread["runtime_generation"],
+                            retirement_token=thread["runtime_retirement_token"],
+                            final_status="ended",
+                            permanent=True,
+                        )
+                        if runtime_exposed
+                        else False
+                    )
+                    process_zero_proven = bool(
+                        not runtime_exposed
+                        or prior_soft_settlement
+                        or exact_local_quiescence
+                    )
+                    external_cleanup_proven = bool(
+                        physical_runtime_absent
+                        and not thread["live_protected_ro"]
+                        and not thread["live_docker_workspace_lease"]
+                        and not thread["unresolved_agent_pod_provision_intent"]
+                        and not thread["unresolved_agent_workspace_claim"]
+                        and _pinned_retirement_external_cleanup_matches(
+                            retirement_context,
+                            external_cleanup,
+                            runtime_generation=thread["runtime_generation"],
+                            retirement_token=thread["runtime_retirement_token"],
+                        )
+                    )
+                    if not process_zero_proven or not external_cleanup_proven:
+                        raise RuntimeError(
+                            "permanent pinned delete lacks physical quiescence"
+                        )
+                elif not stateless:
+                    # Preserve only the historical cleanup of an already-ended,
+                    # never-exposed ownerless row. Every live, exposed, owned,
+                    # or marker-bearing pinned delete must use the authorized
+                    # exact retirement path above; the database DELETE trigger
+                    # independently enforces the same belt for direct writers.
+                    safe_legacy_terminal = bool(
+                        str(thread["status"] or "") == "ended"
+                        and thread["runtime_authority_exposed"] is not True
+                        and thread["agent_id"] is None
+                        and thread["control_admission_agent_id"] is None
+                        and thread["runtime_attach_token"] is None
+                        and thread["runtime_retirement_token"] is None
+                        and physical_runtime_absent
+                        and not thread["live_protected_ro"]
+                        and not thread["live_docker_workspace_lease"]
+                        and not thread["unresolved_agent_pod_provision_intent"]
+                        and not thread["unresolved_agent_workspace_claim"]
+                    )
+                    if not safe_legacy_terminal:
+                        raise RuntimeError(
+                            "pinned delete lacks authorized retirement authority"
+                        )
                 terminal_token = 0
                 if stateless:
                     from src.shared.session_retirement import (
@@ -18791,6 +26710,39 @@ class PostgresDB:
                         raise RuntimeError(
                             "permanent stateless delete queue authority changed"
                         )
+                    # Stateless deletion has its own terminal queue/workspace
+                    # authority. Preserve the historical fail-safe which makes
+                    # a still-owned static endpoint nonallocatable, but never do
+                    # this before validating pinned retirement: quarantine is
+                    # allocation fencing, not pinned process-zero.
+                    await conn.execute(
+                        """
+                        UPDATE docker_workspace_leases
+                           SET status = 'quarantined',
+                               quarantine_reason = 'owner_deleted_before_recreation',
+                               updated_at = CURRENT_TIMESTAMP
+                         WHERE owner_kind = 'thread' AND owner_id = $1
+                           AND status IN ('ready', 'releasing')
+                        """,
+                        thread_uuid,
+                    )
+
+                inverse_agents = await conn.fetch(
+                    "SELECT id FROM agents WHERE thread_id=$1::uuid FOR UPDATE",
+                    thread_uuid,
+                )
+                inverse_agent_ids = {str(row["id"]) for row in inverse_agents}
+                expected_inverse_agent = str(thread["agent_id"] or "")
+                if inverse_agent_ids != (
+                    {expected_inverse_agent} if expected_inverse_agent else set()
+                ):
+                    raise RuntimeError(
+                        "permanent thread delete has nonreciprocal agent authority"
+                    )
+                if stateless and expected_inverse_agent:
+                    raise RuntimeError(
+                        "permanent stateless delete retains agent authority"
+                    )
                 unfinished_memory = await conn.fetch(
                     """
                     SELECT producer_id
@@ -18858,10 +26810,60 @@ class PostgresDB:
                         raise RuntimeError("unexpected terminal queue delete result")
                     if deleted_queue == "DELETE 0" and terminal_token != 0:
                         raise RuntimeError("terminal queue delete lost its row")
-                await conn.execute(
-                    "DELETE FROM threads WHERE id = $1",
-                    thread_uuid,
-                )
+                if expected_runtime_retirement_token is None:
+                    await conn.execute(
+                        "DELETE FROM threads WHERE id = $1",
+                        thread_uuid,
+                    )
+                else:
+                    assert retirement_context is not None
+                    if expected_inverse_agent:
+                        detached = await conn.execute(
+                            "UPDATE agents SET thread_id=NULL "
+                            "WHERE id=$1::uuid AND thread_id=$2::uuid",
+                            UUID(expected_inverse_agent),
+                            thread_uuid,
+                        )
+                        if detached != "UPDATE 1":
+                            raise RuntimeError(
+                                "permanent pinned delete lost reciprocal agent authority"
+                            )
+                    outcome_inserted = await conn.execute(
+                        """
+                        INSERT INTO thread_runtime_retirement_outcomes (
+                            thread_id, runtime_generation, retirement_token,
+                            agent_id, runtime_attach_token, disposition,
+                            permanent, outcome
+                        ) VALUES (
+                            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+                            'ended', true, 'deleted'
+                        )
+                        ON CONFLICT (thread_id, runtime_generation,
+                                     retirement_token) DO NOTHING
+                        """,
+                        thread_uuid,
+                        expected_runtime_generation,
+                        expected_runtime_retirement_token,
+                        retirement_context.get("agent_id"),
+                        retirement_context.get("runtime_attach_token"),
+                    )
+                    if outcome_inserted != "INSERT 0 1":
+                        raise RuntimeError(
+                            "permanent retirement outcome conflicts with exact authority"
+                        )
+                    deleted = await conn.execute(
+                        "DELETE FROM threads WHERE id = $1 "
+                        "AND runtime_generation = $2::uuid "
+                        "AND runtime_retirement_token = $3::uuid "
+                        "AND runtime_retirement_permanent = true",
+                        thread_uuid,
+                        expected_runtime_generation,
+                        expected_runtime_retirement_token,
+                    )
+                    if deleted != "DELETE 1":
+                        raise RuntimeError(
+                            "permanent pinned delete lost retirement authority"
+                        )
 
     async def update_thread_status(self, thread_id: str, status: str) -> None:
         """Update thread status.
@@ -18908,9 +26910,11 @@ class PostgresDB:
         thread_id: str,
         *,
         backend_id: str,
+        backend_instance_id: str,
         session_handle: str,
         share_handle: str | None = None,
-    ) -> None:
+        expected_runtime_generation: str | None = None,
+    ) -> bool:
         """Store main-cloud session folder info on a thread.
 
         Writes to both the new ``main_cloud_*`` columns and the legacy
@@ -18927,23 +26931,33 @@ class PostgresDB:
             except ValueError:
                 legacy_share_id = None
         async with self.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 """
                 UPDATE threads
                 SET main_cloud_backend        = $2,
-                    main_cloud_session_handle = $3,
-                    main_cloud_share_handle   = $4,
-                    nc_session_folder         = $5,
-                    nc_share_id               = $6
+                    main_cloud_backend_instance_id = $3::uuid,
+                    main_cloud_session_handle = $4,
+                    main_cloud_share_handle   = $5,
+                    nc_session_folder         = $6,
+                    nc_share_id               = $7
                 WHERE id = $1
+                  AND ($8::uuid IS NULL OR (
+                      execution_lane='pinned'
+                      AND runtime_generation=$8::uuid
+                      AND runtime_retirement_token IS NULL
+                      AND status IN ('created','active','awaiting_user','suspended')
+                  ))
                 """,
                 UUID(thread_id),
                 backend_id,
+                UUID(backend_instance_id),
                 session_handle,
                 share_handle,
                 legacy_nc_folder,
                 legacy_share_id,
+                expected_runtime_generation,
             )
+        return result == "UPDATE 1"
 
     # --------------------------------------------------------------- thread_mounts
     # Canonical store for which cloud surfaces are attached to a thread.
@@ -18962,6 +26976,7 @@ class PostgresDB:
         source_kind: str,
         source_ref: str | None = None,
         backend_id: str | None = None,
+        backend_instance_id: str | None = None,
         cloud_handle: str | None = None,
         webdav_url: str | None = None,
         target_user_sub: str | None = None,
@@ -18973,10 +26988,10 @@ class PostgresDB:
                 INSERT INTO thread_mounts (
                     thread_id, mount_kind, target_path,
                     source_kind, source_ref,
-                    backend_id, cloud_handle, webdav_url,
+                    backend_id, backend_instance_id, cloud_handle, webdav_url,
                     target_user_sub
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING id
                 """,
                 UUID(thread_id),
@@ -18985,6 +27000,7 @@ class PostgresDB:
                 source_kind,
                 UUID(source_ref) if source_ref else None,
                 backend_id,
+                UUID(backend_instance_id) if backend_instance_id else None,
                 cloud_handle,
                 webdav_url,
                 target_user_sub,
@@ -18998,7 +27014,7 @@ class PostgresDB:
                 """
                 SELECT id, thread_id, mount_kind, target_path,
                        source_kind, source_ref,
-                       backend_id, cloud_handle, webdav_url,
+                       backend_id, backend_instance_id, cloud_handle, webdav_url,
                        target_user_sub, created_at
                 FROM thread_mounts
                 WHERE thread_id = $1
@@ -19032,7 +27048,7 @@ class PostgresDB:
                 """
                 SELECT id, thread_id, mount_kind, target_path,
                        source_kind, source_ref,
-                       backend_id, cloud_handle, webdav_url,
+                       backend_id, backend_instance_id, cloud_handle, webdav_url,
                        target_user_sub, created_at
                 FROM thread_mounts
                 WHERE thread_id = ANY($1::uuid[])
@@ -19080,10 +27096,10 @@ class PostgresDB:
                         INSERT INTO thread_mounts (
                             thread_id, mount_kind, target_path,
                             source_kind, source_ref,
-                            backend_id, cloud_handle, webdav_url,
+                            backend_id, backend_instance_id, cloud_handle, webdav_url,
                             target_user_sub
                         )
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                         RETURNING id
                         """,
                         UUID(thread_id),
@@ -19092,6 +27108,11 @@ class PostgresDB:
                         entry["source_kind"],
                         UUID(src_ref) if src_ref else None,
                         entry.get("backend_id"),
+                        (
+                            UUID(str(entry["backend_instance_id"]))
+                            if entry.get("backend_instance_id")
+                            else None
+                        ),
                         entry.get("cloud_handle"),
                         entry.get("webdav_url"),
                         entry.get("target_user_sub"),
@@ -19099,8 +27120,8 @@ class PostgresDB:
                     new_ids.append(str(row["id"]))
         return new_ids
 
-    async def mark_orphaned_threads_ended(self) -> list[str]:
-        """Mark threads as ended when their bound agent is offline.
+    async def mark_orphaned_threads_ended(self) -> list[Dict[str, Any]]:
+        """Select live pinned runtimes whose exact agent is offline.
 
         Only flags threads that have an ``agent_id`` pointing at an offline
         agent. ``agent_id IS NULL`` is intentionally excluded — it covers
@@ -19109,37 +27130,34 @@ class PostgresDB:
         proxy own. Catching those here would race the dispatcher and flip
         brand-new threads to 'ended' within a second of creation.
 
-        Returns:
-            List of thread IDs that were marked ended. The caller is
-            responsible for tearing down the associated workspace + agent
-            pods; this method only owns the DB state transition.
+        Despite its legacy name this method is now read-only. The caller feeds
+        each exact generation/agent/attach tuple into the durable pinned
+        retirement funnel. Writing ``ended`` here used to reopen Resume before
+        name-based cleanup had finished, the original End->Resume ABA.
         """
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                UPDATE threads
-                SET status        = 'ended',
-                    ended_at      = CURRENT_TIMESTAMP,
-                    last_activity = CURRENT_TIMESTAMP,
-                    control_admission_agent_id = NULL
-                WHERE status IN ('created', 'active')
-                  AND execution_lane <> 'stateless'
-                  AND agent_id IS NOT NULL
-                  AND agent_id IN (SELECT id
-                                   FROM agents
-                                   WHERE status = 'offline')
+                SELECT thread.id, thread.status, thread.runtime_generation,
+                       thread.agent_id, thread.runtime_attach_token
+                  FROM threads AS thread
+                  JOIN agents AS agent ON agent.id = thread.agent_id
+                 WHERE thread.status IN ('created', 'active')
+                  AND thread.execution_lane = 'pinned'
+                  AND thread.runtime_retirement_token IS NULL
+                  AND agent.status = 'offline'
                   -- Officer threads are exempt: the officer watchdog owns
                   -- their lifecycle and RESPAWNS the pod instead of ending
                   -- the thread (centurion.md §4).
-                  AND COALESCE(metadata->'config_override'->'officer'
+                  AND COALESCE(thread.metadata->'config_override'->'officer'
                                ->>'enabled','false') <> 'true'
-                RETURNING id
+                 ORDER BY thread.id
                 """
             )
-        return [str(row["id"]) for row in rows]
+        return [dict(row) for row in rows]
 
-    async def mark_orphaned_threads_suspended(self) -> list[str]:
-        """Suspend PAUSED threads whose bound agent went offline.
+    async def mark_orphaned_threads_suspended(self) -> list[Dict[str, Any]]:
+        """Select paused pinned runtimes whose exact agent is offline.
 
         Companion to ``mark_orphaned_threads_ended`` for the ``awaiting_user``
         / ``suspended`` states that method intentionally skips. A thread only
@@ -19152,34 +27170,188 @@ class PostgresDB:
         gate) and suspended-restore (which keys off
         ``metadata.workspace_container.status``, not thread status).
 
-        Set-based CAS: idempotent across ticks (once ``agent_id`` is NULL the
-        row no longer matches) and race-free against a concurrent ``/prepare``
-        (which only ever re-binds to a live, non-offline agent). No advisory
-        lock needed — same contract as the drain-suspend CAS in ``main.py``.
-
-        Returns:
-            List of thread IDs suspended. The caller is responsible for freeing
-            the associated workspace + agent pod; this method only owns the DB
-            state transition.
+        The retirement funnel settles these crash-orphaned runtimes back to
+        ``suspended`` only after exact cleanup and atomically rotates their
+        runtime generation. Automatic wake can therefore resume G2 without
+        exposing it to any delayed G1 continuation.
         """
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                UPDATE threads
-                SET status        = 'suspended',
-                    agent_id      = NULL,
-                    last_activity = CURRENT_TIMESTAMP,
-                    control_admission_agent_id = NULL
-                WHERE status IN ('awaiting_user', 'suspended')
-                  AND execution_lane <> 'stateless'
-                  AND agent_id IS NOT NULL
-                  AND agent_id IN (SELECT id
-                                   FROM agents
-                                   WHERE status = 'offline')
-                RETURNING id
+                SELECT thread.id, thread.status, thread.runtime_generation,
+                       thread.agent_id, thread.runtime_attach_token
+                  FROM threads AS thread
+                  JOIN agents AS agent ON agent.id = thread.agent_id
+                 WHERE thread.status IN ('awaiting_user', 'suspended')
+                   AND thread.execution_lane = 'pinned'
+                   AND thread.runtime_retirement_token IS NULL
+                   AND agent.status = 'offline'
+                 ORDER BY thread.id
                 """
             )
-        return [str(row["id"]) for row in rows]
+        return [dict(row) for row in rows]
+
+    async def list_retryable_pinned_retirements(
+        self, *, grace_seconds: int = 900, limit: int = 25
+    ) -> list[Dict[str, Any]]:
+        """Return durable retirements whose local runtime can no longer finish.
+
+        Beginning retirement is intentionally not a best-effort flag: it is
+        the durable admission closure for one exact generation.  If the
+        orchestrator or agent dies after Begin, the marker must eventually be
+        actuated rather than wedging Resume forever.  We only nominate rows
+        after a generous grace and when the captured agent is absent/offline;
+        a live process retains ownership of its local quiescence and final
+        settlement call.
+        """
+
+        bounded_grace = max(0, int(grace_seconds))
+        bounded_limit = max(1, min(int(limit), 100))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT t.id, t.status, t.runtime_generation, t.agent_id,
+                       t.runtime_attach_token, t.runtime_retirement_token,
+                       t.runtime_retirement_permanent,
+                       t.runtime_retirement_started_at,
+                       t.runtime_retirement_authorized_at,
+                       t.runtime_retirement_context,
+                       a.status::text AS agent_status
+                  FROM threads AS t
+             LEFT JOIN agents AS a ON a.id = t.agent_id
+                 WHERE t.execution_lane = 'pinned'
+                   AND t.runtime_retirement_token IS NOT NULL
+                   AND t.runtime_retirement_authorized_at IS NOT NULL
+                   AND t.runtime_retirement_started_at
+                       <= now() - make_interval(secs => $1::double precision)
+                   AND (t.agent_id IS NULL OR a.id IS NULL OR a.status = 'offline')
+                 ORDER BY t.runtime_retirement_started_at ASC, t.id ASC
+                 LIMIT $2
+                """,
+                float(bounded_grace),
+                bounded_limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def list_retryable_thread_attach_abort_successors(
+        self, *, limit: int = 25
+    ) -> list[Dict[str, Any]]:
+        """Return exact G2 work left by a committed failed-attach abort.
+
+        The append-only outcome is deliberately independent of the request
+        process.  Joining it to the exact successor generation makes this a
+        restart-safe headless provisioning worklist: an old G1 outcome cannot
+        adopt G3, and a bound/retiring/terminal G2 is no longer eligible.
+        ``provision_or_assign`` owns its normal exact-generation/Kubernetes
+        deduplication once a candidate is handed off.
+        """
+
+        bounded_limit = max(1, min(int(limit), 100))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT o.thread_id,
+                       o.runtime_generation AS retired_runtime_generation,
+                       o.runtime_attach_token AS retired_attach_token,
+                       o.agent_id AS retired_agent_id,
+                       o.successor_generation,
+                       o.quiescence_protocol,
+                       o.workspace_generation,
+                       o.workspace_runtime_incarnation,
+                       o.released_at
+                  FROM thread_runtime_attach_abort_outcomes AS o
+                  JOIN threads AS t
+                    ON t.id = o.thread_id
+                   AND t.runtime_generation = o.successor_generation
+                 WHERE t.execution_lane = 'pinned'
+                   AND t.status = 'created'
+                   AND t.runtime_retirement_token IS NULL
+                   AND t.agent_id IS NULL
+                 ORDER BY o.released_at ASC, o.thread_id ASC
+                 LIMIT $1
+                """,
+                bounded_limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def abort_stale_pinned_retirement_preflights(
+        self, *, grace_seconds: int = 300, limit: int = 25
+    ) -> list[Dict[str, Any]]:
+        """Clear abandoned hidden Begin markers without touching authorized work.
+
+        Begin intentionally commits before remote/policy preflight so it can
+        close input admission. A process may die at any following await. No
+        actor or actuator is allowed to observe an unauthorized marker as an
+        End instruction, and every stand-down mutation is now serialized with
+        authorization, so an old marker with no authorization or receipt is
+        safe to clear. ``FOR UPDATE SKIP LOCKED`` makes an authorize-vs-expire
+        race choose exactly one edge.
+        """
+
+        bounded_grace = max(1, int(grace_seconds))
+        bounded_limit = max(1, min(int(limit), 100))
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH stale AS (
+                    SELECT id, runtime_generation, runtime_retirement_token
+                      FROM threads
+                     WHERE execution_lane = 'pinned'
+                       AND runtime_retirement_token IS NOT NULL
+                       AND runtime_retirement_authorized_at IS NULL
+                       AND runtime_retirement_stage_receipt IS NULL
+                       AND runtime_retirement_local_quiescence IS NULL
+                       AND runtime_retirement_external_cleanup IS NULL
+                       AND runtime_retirement_started_at
+                           <= now() - make_interval(secs => $1::double precision)
+                     ORDER BY runtime_retirement_started_at, id
+                     FOR UPDATE SKIP LOCKED
+                     LIMIT $2
+                )
+                UPDATE threads AS t
+                   SET runtime_retirement_token = NULL,
+                       runtime_retirement_permanent = NULL,
+                       runtime_retirement_started_at = NULL,
+                       runtime_retirement_authorized_at = NULL,
+                       runtime_retirement_context = NULL,
+                       runtime_retirement_stage_receipt = NULL,
+                       runtime_retirement_local_quiescence = NULL,
+                       runtime_retirement_external_cleanup = NULL,
+                       control_admission_agent_id = CASE
+                           WHEN t.control_admission_agent_id IS NULL
+                            AND t.runtime_retirement_context->>'initiator' = 'agent'
+                            AND t.runtime_retirement_context
+                                ->>'control_admission_reopen_agent_id'
+                                = t.agent_id::text
+                            AND t.runtime_retirement_context->>'generation'
+                                = t.runtime_generation::text
+                            AND t.runtime_retirement_context
+                                ->>'runtime_attach_token'
+                                = t.runtime_attach_token::text
+                            AND EXISTS (
+                                SELECT 1 FROM agents a
+                                 WHERE a.id = t.agent_id
+                                   AND a.thread_id = t.id
+                                   AND a.status = 'session'
+                            )
+                           THEN t.agent_id
+                           ELSE t.control_admission_agent_id
+                       END
+                  FROM stale
+                 WHERE t.id = stale.id
+                   AND t.runtime_generation = stale.runtime_generation
+                   AND t.runtime_retirement_token = stale.runtime_retirement_token
+                   AND t.runtime_retirement_authorized_at IS NULL
+                   AND t.runtime_retirement_stage_receipt IS NULL
+                   AND t.runtime_retirement_local_quiescence IS NULL
+                   AND t.runtime_retirement_external_cleanup IS NULL
+                RETURNING t.id, stale.runtime_generation,
+                          stale.runtime_retirement_token
+                """,
+                float(bounded_grace),
+                bounded_limit,
+            )
+        return [dict(row) for row in rows]
 
     async def mark_stuck_working_agents_ready(self) -> int:
         """Reset agents whose self-reported status is internally inconsistent.
@@ -19382,9 +27554,14 @@ class PostgresDB:
             async with conn.transaction():
                 candidates = await conn.fetch(
                     """
-                    SELECT id FROM agents
-                    WHERE status = 'offline'
-                      AND last_heartbeat < NOW() - ($1 || ' hours')::INTERVAL
+                    SELECT agent.id FROM agents AS agent
+                    WHERE agent.status = 'offline'
+                      AND agent.last_heartbeat
+                          < NOW() - ($1 || ' hours')::INTERVAL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM threads AS thread
+                          WHERE thread.agent_id = agent.id
+                      )
                     """,
                     str(retention_hours),
                 )
@@ -19410,6 +27587,10 @@ class PostgresDB:
                     WHERE id = ANY($1::uuid[])
                       AND status = 'offline'
                       AND last_heartbeat < NOW() - ($2 || ' hours')::INTERVAL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM threads AS thread
+                          WHERE thread.agent_id = agents.id
+                      )
                     """,
                     candidate_ids,
                     str(retention_hours),
@@ -19418,15 +27599,241 @@ class PostgresDB:
             return int(result.split()[1])
         return 0
 
-    async def update_thread_agent(self, thread_id: str, agent_id: str) -> None:
-        """Bind an agent to a thread."""
+    async def update_thread_agent(
+        self,
+        thread_id: str,
+        agent_id: str | None,
+        *,
+        expected_runtime_generation: str | None = None,
+    ) -> bool:
+        """Legacy bind helper; generic detachment is intentionally refused.
+
+        Clearing a pinned actor is a process-authority transition, not a
+        pointer repair. Callers must use retirement, exact attach-abort, or the
+        durable recycler after it has proved the captured Pod absent.
+        """
+        if agent_id is None:
+            return False
         async with self.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 "UPDATE threads SET agent_id = $2, "
-                "control_admission_agent_id = NULL WHERE id = $1",
+                "control_admission_agent_id = NULL WHERE id = $1 "
+                "AND status IN ('created','active','awaiting_user','suspended') "
+                "AND runtime_retirement_token IS NULL "
+                "AND ($3::uuid IS NULL OR runtime_generation = $3::uuid)",
                 thread_id,
                 agent_id,
+                expected_runtime_generation,
             )
+        return result == "UPDATE 1"
+
+    async def pinned_thread_agent_is_reciprocal(
+        self,
+        thread_id: str,
+        agent_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_attach_token: str | None,
+        expected_ro_mount_id: str | None = None,
+        expected_ro_engage_attempt: str | None = None,
+        expected_ro_grant_handle: str | None = None,
+        expected_ro_reader_id: str | None = None,
+        expected_ro_webdav_url: str | None = None,
+    ) -> bool:
+        """Return whether one pinned runtime owns both binding pointers.
+
+        This is a credential-delivery predicate, not a repair operation.  A
+        stale runtime must not learn a successor generation's repository,
+        workspace, or protected-cloud credentials merely because it still
+        holds the cluster-wide internal key.
+        """
+
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM threads AS t
+                        JOIN agents AS a
+                          ON a.id = t.agent_id
+                         AND a.thread_id = t.id
+                        WHERE t.id = $1::uuid
+                          AND t.agent_id = $2::uuid
+                          AND t.execution_lane = 'pinned'
+                          AND t.runtime_generation = $3::uuid
+                          AND t.runtime_attach_token IS NOT DISTINCT FROM $4::uuid
+                          AND t.runtime_retirement_token IS NULL
+                          AND t.status IN
+                              ('created','active','awaiting_user','suspended')
+                          AND (
+                              $5::uuid IS NULL
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM cloud_ro_mounts AS ro
+                                  WHERE ro.thread_id = t.id
+                                    AND ro.id = $5::uuid
+                                    AND ro.status = 'active'
+                                    AND ro.user_id = t.user_id
+                                    AND ro.backend = 'nextcloud'
+                                    AND ro.auth_kind = 'basic'
+                                    AND ro.credentials IS NOT NULL
+                                    AND ro.credentials <> ''
+                                    AND jsonb_typeof(ro.etag_baseline) = 'object'
+                                    AND ro.runtime_generation = $3::uuid
+                                    AND ro.engage_attempt = $6::uuid
+                                    AND ro.grant_handle = $7
+                                    AND ro.reader_id = $8
+                                    AND ro.webdav_url = $9
+                              )
+                          )
+                    )
+                    """,
+                    thread_id,
+                    agent_id,
+                    expected_runtime_generation,
+                    expected_attach_token,
+                    expected_ro_mount_id,
+                    expected_ro_engage_attempt,
+                    expected_ro_grant_handle,
+                    expected_ro_reader_id,
+                    expected_ro_webdav_url,
+                )
+            )
+
+    async def get_pinned_session_binding(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+    ) -> PinnedSessionBinding | None:
+        """Read one exact reciprocal pinned runtime and physical endpoint.
+
+        This is the selection primitive for readiness probes, route creation,
+        and live input.  Every authority and endpoint coordinate comes from
+        one PostgreSQL snapshot; callers compare ``target_key`` after each
+        await and re-gate the returned agent status for their operation.
+
+        A dedicated Pod marker is supplemental physical authority.  When it
+        exists it must name this exact agent, generation, and durable
+        provision attempt.  Pool bindings legitimately have no marker.
+        """
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT t.id AS thread_id,
+                       t.runtime_generation,
+                       t.agent_id,
+                       t.runtime_attach_token,
+                       a.hostname AS agent_hostname,
+                       a.pod_uid,
+                       a.pod_ip,
+                       a.pod_port,
+                       a.status AS agent_status
+                  FROM threads AS t
+                  JOIN agents AS a
+                    ON a.id = t.agent_id
+                   AND a.thread_id = t.id
+                 WHERE t.id = $1::uuid
+                   AND t.execution_lane = 'pinned'
+                   AND t.runtime_generation = $2::uuid
+                   AND t.runtime_attach_token IS NOT NULL
+                   AND t.runtime_retirement_token IS NULL
+                   AND t.status IN
+                       ('created','active','awaiting_user','suspended')
+                   AND jsonb_typeof(t.metadata) = 'object'
+                   AND NULLIF(BTRIM(a.hostname), '') IS NOT NULL
+                   AND NULLIF(BTRIM(a.pod_uid), '') IS NOT NULL
+                   AND NULLIF(BTRIM(a.pod_ip), '') IS NOT NULL
+                   AND (a.pod_port IS NULL OR a.pod_port BETWEEN 1 AND 65535)
+                   AND (
+                       NOT (t.metadata ? 'agent_pod')
+                       OR t.metadata->'agent_pod' IS NULL
+                       OR t.metadata->'agent_pod' IN
+                          ('null'::jsonb, '{}'::jsonb)
+                       OR (
+                           jsonb_typeof(t.metadata->'agent_pod') = 'object'
+                           AND t.metadata->'agent_pod'->>'pod_name'
+                               = a.hostname
+                           AND t.metadata->'agent_pod'->>'pod_uid'
+                               = a.pod_uid
+                           AND t.metadata->'agent_pod'->>'runtime_generation'
+                               = t.runtime_generation::text
+                           AND EXISTS (
+                               SELECT 1
+                                 FROM thread_agent_pod_provision_intents AS intent
+                                WHERE intent.attempt_id::text =
+                                      t.metadata->'agent_pod'
+                                          ->>'provision_attempt'
+                                  AND intent.thread_id = t.id
+                                  AND intent.runtime_generation =
+                                      t.runtime_generation
+                                  AND intent.status = 'published'
+                                  AND intent.pod_name = a.hostname
+                                  AND intent.pod_uid = a.pod_uid
+                           )
+                       )
+                   )
+                """,
+                parsed_thread,
+                parsed_generation,
+            )
+        if row is None:
+            return None
+        try:
+            return PinnedSessionBinding.from_mapping(row)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    async def clear_stale_thread_agent_if_matches(
+        self,
+        thread_id: str,
+        expected_agent_id: str,
+        *,
+        expected_runtime_generation: str,
+    ) -> bool:
+        """Refuse pointer-only repair of an offline pinned binding.
+
+        Offline/missing is a liveness hint, never proof that its Pod, detached
+        writers, or workspace processes are absent. The caller may use this
+        exact observation to enqueue retirement/recycle recovery, but it may
+        not reopen admission by clearing the pair in the same generation.
+        """
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT status, agent_id, runtime_generation, "
+                    "runtime_retirement_token, runtime_attach_token, "
+                    "execution_lane FROM threads "
+                    "WHERE id = $1 FOR UPDATE",
+                    thread_id,
+                )
+                if (
+                    thread is None
+                    or str(thread.get("agent_id") or "") != expected_agent_id
+                    or str(thread.get("runtime_generation") or "")
+                    != expected_runtime_generation
+                    or thread.get("runtime_retirement_token") is not None
+                    or str(thread.get("status") or "")
+                    not in ("created", "active", "awaiting_user", "suspended")
+                ):
+                    return False
+
+                agent = await conn.fetchrow(
+                    "SELECT status, thread_id FROM agents WHERE id = $1 FOR UPDATE",
+                    expected_agent_id,
+                )
+                if agent is not None and str(agent.get("status") or "") != "offline":
+                    return False
+                return False
 
     # --- Thread message persistence ---
 
@@ -25355,7 +33762,9 @@ class PostgresDB:
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
                               nextcloud_folder_id, cloud_storage_read_only,
-                              main_cloud_backend, main_cloud_folder_handle,
+                              main_cloud_backend,
+                              main_cloud_backend_instance_id,
+                              main_cloud_folder_handle,
                               created_at, updated_at
                     """,
                     f"{display_name}'s Workspace",
@@ -25724,7 +34133,9 @@ class PostgresDB:
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
                               nextcloud_folder_id, cloud_storage_read_only,
-                              main_cloud_backend, main_cloud_folder_handle,
+                              main_cloud_backend,
+                              main_cloud_backend_instance_id,
+                              main_cloud_folder_handle,
                               created_at, updated_at
                     """,
                     name,
@@ -25768,7 +34179,8 @@ class PostgresDB:
                 SELECT id, name, description, goal, status, is_default,
                        default_config_name, default_config_override,
                        nextcloud_folder_id, cloud_storage_read_only,
-                       main_cloud_backend, main_cloud_folder_handle,
+                       main_cloud_backend, main_cloud_backend_instance_id,
+                       main_cloud_folder_handle,
                        network_tier,
                        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = projects.id) AS job_count,
                        created_at, updated_at
@@ -25864,7 +34276,8 @@ class PostgresDB:
                 SELECT p.id, p.name, p.description, p.goal, p.status,
                        p.is_default, p.default_config_name,
                        p.nextcloud_folder_id, p.cloud_storage_read_only,
-                       p.main_cloud_backend, p.main_cloud_folder_handle,
+                       p.main_cloud_backend, p.main_cloud_backend_instance_id,
+                       p.main_cloud_folder_handle,
                        p.created_at, p.updated_at,
                        pm.role AS user_role,
                        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id) AS job_count,
@@ -25959,6 +34372,7 @@ class PostgresDB:
             "nextcloud_folder_id",
             "cloud_storage_read_only",
             "main_cloud_backend",
+            "main_cloud_backend_instance_id",
             "main_cloud_folder_handle",
             # Admin-only at the API layer (orchestrator/main.py update_project);
             # listed here so the DB UPDATE path accepts it once authorized.
@@ -25976,6 +34390,8 @@ class PostgresDB:
             updates.append(f"{key} = ${param_count}")
             if key == "default_config_override":
                 values.append(json.dumps(value) if isinstance(value, dict) else value)
+            elif key == "main_cloud_backend_instance_id":
+                values.append(UUID(str(value)))
             else:
                 values.append(value)
 
@@ -27408,7 +35824,9 @@ class PostgresDB:
                 RETURNING id, name, description, goal, status, is_default,
                           default_config_name, default_config_override,
                           nextcloud_folder_id, cloud_storage_read_only,
-                          main_cloud_backend, main_cloud_folder_handle,
+                          main_cloud_backend,
+                          main_cloud_backend_instance_id,
+                          main_cloud_folder_handle,
                           created_at, updated_at
                 """,
                 f"{display_name}'s Workspace",
@@ -29318,6 +37736,383 @@ class PostgresDB:
                     )
         except Exception:
             logger.exception("Failed to seed admin grants for %s", user_id)
+
+    # =========================================================================
+    # Durable main-cloud backend installation authority. Provider ids are not
+    # routing coordinates: every historical effect resolves the exact retained
+    # backend_instance_id, while the singleton pointer is used only for fresh
+    # effects.
+
+    @staticmethod
+    def _main_cloud_backend_instance_authority(
+        row: Mapping[str, Any] | None,
+    ) -> MainCloudBackendInstanceAuthority | None:
+        if row is None:
+            return None
+        try:
+            values = dict(row)
+        except (TypeError, ValueError):
+            return None
+        routing = values.get("routing")
+        secret_refs = values.get("secret_refs")
+        for value_name, value in (("routing", routing), ("secret_refs", secret_refs)):
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except (TypeError, ValueError):
+                    return None
+                if value_name == "routing":
+                    routing = parsed
+                else:
+                    secret_refs = parsed
+        return MainCloudBackendInstanceAuthority.from_binding(
+            {
+                "version": MAIN_CLOUD_BACKEND_INSTANCE_VERSION,
+                "backend_instance_id": str(values.get("id") or ""),
+                "backend_id": values.get("backend_id"),
+                "routing": routing,
+                "routing_sha256": values.get("routing_sha256"),
+                "installation_proof_sha256": values.get("installation_proof_sha256"),
+                "secret_refs": secret_refs,
+                "secret_revision": values.get("secret_revision"),
+            }
+        )
+
+    async def register_main_cloud_backend_instance(
+        self,
+        authority: MainCloudBackendInstanceAuthority,
+    ) -> MainCloudBackendInstanceAuthority | None:
+        """Append or exact-adopt one immutable installation snapshot.
+
+        Concurrent replicas that observed the same routing/proof converge on
+        the first UUID. A same-identity row with different secret references
+        is not silently rotated; that requires the explicit revision CAS.
+        """
+
+        if not isinstance(authority, MainCloudBackendInstanceAuthority):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO main_cloud_backend_instances (
+                        id, backend_id, routing, routing_sha256,
+                        installation_proof_sha256, secret_refs, secret_revision
+                    ) VALUES ($1::uuid,$2,$3::jsonb,$4,$5,$6::jsonb,$7)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    UUID(authority.backend_instance_id),
+                    authority.backend_id,
+                    json.dumps(
+                        authority.routing, sort_keys=True, separators=(",", ":")
+                    ),
+                    authority.routing_sha256,
+                    authority.installation_proof_sha256,
+                    json.dumps(
+                        authority.secret_refs,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    authority.secret_revision,
+                )
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, backend_id, routing, routing_sha256,
+                           installation_proof_sha256, secret_refs, secret_revision
+                      FROM main_cloud_backend_instances
+                     WHERE backend_id=$1
+                       AND routing_sha256=$2
+                       AND installation_proof_sha256=$3
+                     FOR SHARE
+                    """,
+                    authority.backend_id,
+                    authority.routing_sha256,
+                    authority.installation_proof_sha256,
+                )
+                adopted = self._main_cloud_backend_instance_authority(row)
+                if (
+                    adopted is None
+                    or adopted.backend_id != authority.backend_id
+                    or adopted.routing != authority.routing
+                    or adopted.secret_refs != authority.secret_refs
+                    or adopted.secret_revision != authority.secret_revision
+                ):
+                    return None
+                return adopted
+
+    async def install_initial_main_cloud_backend_instance(
+        self,
+        authority: MainCloudBackendInstanceAuthority,
+        *,
+        activated_by: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Register an instance and claim the singleton only when absent.
+
+        Fresh replicas converge on one UUID. Once an active pointer exists, a
+        startup env/routing drift never rewrites it; the method returns ``None``
+        unless the observed immutable identity is already the active one.
+        """
+
+        if not isinstance(authority, MainCloudBackendInstanceAuthority):
+            return None
+        actor = str(activated_by) if activated_by is not None else None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO main_cloud_backend_instances (
+                        id, backend_id, routing, routing_sha256,
+                        installation_proof_sha256, secret_refs, secret_revision
+                    ) VALUES ($1::uuid,$2,$3::jsonb,$4,$5,$6::jsonb,$7)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    UUID(authority.backend_instance_id),
+                    authority.backend_id,
+                    json.dumps(
+                        authority.routing, sort_keys=True, separators=(",", ":")
+                    ),
+                    authority.routing_sha256,
+                    authority.installation_proof_sha256,
+                    json.dumps(
+                        authority.secret_refs,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    authority.secret_revision,
+                )
+                adopted_row = await conn.fetchrow(
+                    """
+                    SELECT id, backend_id, routing, routing_sha256,
+                           installation_proof_sha256, secret_refs, secret_revision
+                      FROM main_cloud_backend_instances
+                     WHERE backend_id=$1
+                       AND routing_sha256=$2
+                       AND installation_proof_sha256=$3
+                     FOR SHARE
+                    """,
+                    authority.backend_id,
+                    authority.routing_sha256,
+                    authority.installation_proof_sha256,
+                )
+                adopted = self._main_cloud_backend_instance_authority(adopted_row)
+                if (
+                    adopted is None
+                    or adopted.routing != authority.routing
+                    or adopted.secret_refs != authority.secret_refs
+                    or adopted.secret_revision != authority.secret_revision
+                ):
+                    return None
+                await conn.execute(
+                    """
+                    INSERT INTO main_cloud_active_backend (
+                        singleton, backend_instance_id, backend_id,
+                        activation_revision, activated_by
+                    ) VALUES (true,$1::uuid,$2,1,$3)
+                    ON CONFLICT (singleton) DO NOTHING
+                    """,
+                    UUID(adopted.backend_instance_id),
+                    adopted.backend_id,
+                    actor,
+                )
+                active = await conn.fetchrow(
+                    """
+                    SELECT active.activation_revision, active.activated_at,
+                           instance.id, instance.backend_id, instance.routing,
+                           instance.routing_sha256,
+                           instance.installation_proof_sha256,
+                           instance.secret_refs, instance.secret_revision
+                      FROM main_cloud_active_backend AS active
+                      JOIN main_cloud_backend_instances AS instance
+                        ON instance.id=active.backend_instance_id
+                       AND instance.backend_id=active.backend_id
+                     WHERE active.singleton=true
+                     FOR SHARE OF active, instance
+                    """
+                )
+                active_authority = self._main_cloud_backend_instance_authority(active)
+                if (
+                    active_authority is None
+                    or active_authority.backend_instance_id
+                    != adopted.backend_instance_id
+                ):
+                    return None
+                return {
+                    "authority": active_authority,
+                    "activation_revision": int(active["activation_revision"]),
+                    "activated_at": active["activated_at"],
+                }
+
+    async def get_main_cloud_backend_instance(
+        self,
+        backend_instance_id: str,
+        *,
+        expected_backend_id: str | None = None,
+    ) -> MainCloudBackendInstanceAuthority | None:
+        try:
+            parsed_id = UUID(str(backend_instance_id))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, backend_id, routing, routing_sha256,
+                       installation_proof_sha256, secret_refs, secret_revision
+                  FROM main_cloud_backend_instances
+                 WHERE id=$1::uuid
+                   AND ($2::text IS NULL OR backend_id=$2)
+                """,
+                parsed_id,
+                expected_backend_id,
+            )
+        return self._main_cloud_backend_instance_authority(row)
+
+    async def list_main_cloud_backend_instances(
+        self,
+    ) -> list[MainCloudBackendInstanceAuthority]:
+        """Return retained snapshots for startup cache reconstruction."""
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, backend_id, routing, routing_sha256,
+                       installation_proof_sha256, secret_refs, secret_revision
+                  FROM main_cloud_backend_instances
+                 ORDER BY created_at, id
+                """
+            )
+        authorities: list[MainCloudBackendInstanceAuthority] = []
+        for row in rows:
+            authority = self._main_cloud_backend_instance_authority(row)
+            if authority is None:
+                raise RuntimeError("stored main-cloud backend authority is malformed")
+            authorities.append(authority)
+        return authorities
+
+    async def get_active_main_cloud_backend_instance(
+        self,
+    ) -> dict[str, Any] | None:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT active.activation_revision, active.activated_at,
+                       instance.id, instance.backend_id, instance.routing,
+                       instance.routing_sha256,
+                       instance.installation_proof_sha256,
+                       instance.secret_refs, instance.secret_revision
+                  FROM main_cloud_active_backend AS active
+                  JOIN main_cloud_backend_instances AS instance
+                    ON instance.id=active.backend_instance_id
+                   AND instance.backend_id=active.backend_id
+                 WHERE active.singleton=true
+                """
+            )
+        authority = self._main_cloud_backend_instance_authority(row)
+        if authority is None or row is None:
+            return None
+        return {
+            "authority": authority,
+            "activation_revision": int(row["activation_revision"]),
+            "activated_at": row["activated_at"],
+        }
+
+    async def activate_main_cloud_backend_instance(
+        self,
+        backend_instance_id: str,
+        *,
+        expected_activation_revision: int,
+        activated_by: str | None = None,
+    ) -> dict[str, Any] | None:
+        """CAS the fresh-effect pointer to an already registered instance."""
+
+        try:
+            parsed_id = UUID(str(backend_instance_id))
+        except (TypeError, ValueError):
+            return None
+        if (
+            type(expected_activation_revision) is not int
+            or expected_activation_revision <= 0
+        ):
+            return None
+        actor = str(activated_by) if activated_by is not None else None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                instance = await conn.fetchrow(
+                    """
+                    SELECT id, backend_id, routing, routing_sha256,
+                           installation_proof_sha256, secret_refs, secret_revision
+                      FROM main_cloud_backend_instances
+                     WHERE id=$1::uuid
+                     FOR SHARE
+                    """,
+                    parsed_id,
+                )
+                authority = self._main_cloud_backend_instance_authority(instance)
+                if authority is None:
+                    return None
+                result = await conn.execute(
+                    """
+                    UPDATE main_cloud_active_backend
+                       SET backend_instance_id=$1::uuid,
+                           backend_id=$2,
+                           activation_revision=activation_revision+1,
+                           activated_by=$3
+                     WHERE singleton=true
+                       AND activation_revision=$4
+                       AND backend_instance_id IS DISTINCT FROM $1::uuid
+                    """,
+                    parsed_id,
+                    authority.backend_id,
+                    actor,
+                    expected_activation_revision,
+                )
+                if result != "UPDATE 1":
+                    return None
+                return {
+                    "authority": authority,
+                    "activation_revision": expected_activation_revision + 1,
+                }
+
+    async def rotate_main_cloud_backend_secret_refs(
+        self,
+        authority: MainCloudBackendInstanceAuthority,
+        *,
+        expected_secret_revision: int,
+    ) -> MainCloudBackendInstanceAuthority | None:
+        """Rotate references only after the caller re-probed the same proof."""
+
+        if (
+            not isinstance(authority, MainCloudBackendInstanceAuthority)
+            or type(expected_secret_revision) is not int
+            or authority.secret_revision != expected_secret_revision + 1
+        ):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE main_cloud_backend_instances
+                   SET secret_refs=$2::jsonb,
+                       secret_revision=$3
+                 WHERE id=$1::uuid
+                   AND backend_id=$4
+                   AND routing_sha256=$5
+                   AND installation_proof_sha256=$6
+                   AND secret_revision=$7
+                RETURNING id, backend_id, routing, routing_sha256,
+                          installation_proof_sha256, secret_refs, secret_revision
+                """,
+                UUID(authority.backend_instance_id),
+                json.dumps(
+                    authority.secret_refs,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                authority.secret_revision,
+                authority.backend_id,
+                authority.routing_sha256,
+                authority.installation_proof_sha256,
+                expected_secret_revision,
+            )
+        return self._main_cloud_backend_instance_authority(row)
 
     # =========================================================================
     # Key/value store for deploy-time configuration that operators can edit

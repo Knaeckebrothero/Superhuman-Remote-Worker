@@ -115,6 +115,7 @@ function createService() {
 
     const mockNotifications: any = {
         lifecycleEvent: signal<{thread_id: string; state: string; reason?: string} | null>(null),
+        cloudDiffStagedEvent: signal(null),
     };
 
     TestBed.resetTestingModule();
@@ -299,14 +300,52 @@ describe('PersistentChatService — Phase 3 outbox', () => {
 
     // --- 4. flush outcomes: 409 / 503 / 404 -------------------------------
 
-    it('409 removes the item but keeps the bubble', async () => {
+    it('keeps a distinct sibling-tab message queued on generic 409', async () => {
         const ctx = await readySession();
         ctx.mockHttp.post.mockReturnValue(throwError(() => ({status: 409})));
-        await ctx.service.sendMessage('dup');
+        // Tab A's already-running "alpha" is not proof that this tab's
+        // distinct "beta" was accepted: /input has no client idempotency key.
+        await ctx.service.sendMessage('beta');
         await flushTick();
 
-        expect(ctx.service.outbox().length).toBe(0);
-        expect(ctx.service.turns().some((t) => isUserTurn(t) && t.content === 'dup')).toBe(true);
+        expect(ctx.service.outbox().map((item) => item.displayContent)).toEqual(['beta']);
+        expect(ctx.service.outbox()[0].attempts).toBe(1);
+        expect(ctx.service.outboxStalled()).toBe(true);
+        expect(ctx.service.pendingTurnCount()).toBe(0);
+        expect(ctx.service.error()).not.toBeNull();
+        expect(ctx.service.turns().some((t) => isUserTurn(t) && t.content === 'beta')).toBe(true);
+    });
+
+    it.each([
+        ['session_ending', 'ending'],
+        ['session_ended', 'ended'],
+    ] as const)('keeps the unsent item and applies typed %s lifecycle state', async (code, status) => {
+        const ctx = await readySession();
+        const es = ctx.sseInstances[0];
+        ctx.mockHttp.post.mockReturnValue(
+            throwError(() => ({
+                status: 409,
+                error: {
+                    detail: {
+                        code,
+                        message: 'Session is retiring',
+                        retirement_disposition: 'ended',
+                    },
+                },
+            })),
+        );
+
+        await ctx.service.sendMessage('beta must remain visible');
+        await flushTick();
+
+        expect(ctx.service.threadStatus()).toBe(status);
+        expect(ctx.service.sessionReady()).toBe(false);
+        expect(ctx.service.outbox().map((item) => item.displayContent)).toEqual([
+            'beta must remain visible',
+        ]);
+        expect(ctx.service.outboxStalled()).toBe(true);
+        expect(ctx.service.pendingTurnCount()).toBe(0);
+        expect(es.close).not.toHaveBeenCalled();
     });
 
     it('503 keeps item + bubble + banner, no timer retry; next send retriggers', async () => {

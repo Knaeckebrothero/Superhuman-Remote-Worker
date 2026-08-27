@@ -7,6 +7,7 @@ swap_backend(), get_workspace_content(), cleanup().
 """
 
 import asyncio
+import threading
 import time
 import uuid
 from types import SimpleNamespace
@@ -74,6 +75,281 @@ def _make_session(**overrides):
         config=overrides.get("config", _make_config()),
         **{k: v for k, v in overrides.items() if k not in ("thread_id", "config")},
     )
+
+
+@pytest.mark.parametrize(
+    ("lower_states", "lower_active", "overlay", "mount_id", "expected"),
+    [
+        (
+            [
+                SimpleNamespace(
+                    mount_id="lower-1",
+                    mount_kind="protected_lower",
+                    target_path="/cloud/lower",
+                )
+            ],
+            True,
+            SimpleNamespace(active=True, lower="/cloud/lower", merged="/cloud/merged"),
+            "lower-1",
+            True,
+        ),
+        (
+            [],
+            True,
+            SimpleNamespace(active=True, lower="/cloud/lower", merged="/cloud/merged"),
+            "lower-1",
+            False,
+        ),
+        (
+            [
+                SimpleNamespace(
+                    mount_id="lower-1",
+                    mount_kind="protected_lower",
+                    target_path="/cloud/lower",
+                )
+            ],
+            False,
+            SimpleNamespace(active=True, lower="/cloud/lower", merged="/cloud/merged"),
+            "lower-1",
+            False,
+        ),
+        (
+            [
+                SimpleNamespace(
+                    mount_id="lower-1",
+                    mount_kind="protected_lower",
+                    target_path="/cloud/lower",
+                )
+            ],
+            True,
+            SimpleNamespace(active=False, lower="/cloud/lower", merged="/cloud/merged"),
+            "lower-1",
+            False,
+        ),
+        (
+            [
+                SimpleNamespace(
+                    mount_id="wrong",
+                    mount_kind="protected_lower",
+                    target_path="/cloud/lower",
+                )
+            ],
+            True,
+            SimpleNamespace(active=True, lower="/cloud/lower", merged="/cloud/merged"),
+            "lower-1",
+            False,
+        ),
+        (
+            [
+                SimpleNamespace(
+                    mount_id="lower-1",
+                    mount_kind="session_folder",
+                    target_path="/cloud/lower",
+                )
+            ],
+            True,
+            SimpleNamespace(active=True, lower="/cloud/lower", merged="/cloud/merged"),
+            "lower-1",
+            False,
+        ),
+        (
+            [
+                SimpleNamespace(
+                    mount_id="lower-1",
+                    mount_kind="protected_lower",
+                    target_path="/cloud/merged",
+                )
+            ],
+            True,
+            SimpleNamespace(active=True, lower="/cloud/lower", merged="/cloud/merged"),
+            "lower-1",
+            False,
+        ),
+        (
+            [
+                SimpleNamespace(
+                    mount_id="lower-1",
+                    mount_kind="protected_lower",
+                    target_path="/cloud/lower",
+                ),
+                SimpleNamespace(
+                    mount_id="lower-2",
+                    mount_kind="protected_lower",
+                    target_path="/cloud/lower",
+                ),
+            ],
+            True,
+            SimpleNamespace(active=True, lower="/cloud/lower", merged="/cloud/merged"),
+            "lower-1",
+            False,
+        ),
+        (
+            [
+                SimpleNamespace(
+                    mount_id="lower-1",
+                    mount_kind="protected_lower",
+                    target_path="/cloud/lower",
+                )
+            ],
+            True,
+            SimpleNamespace(active=True, lower="/wrong", merged="/cloud/merged"),
+            "lower-1",
+            False,
+        ),
+        (
+            [
+                SimpleNamespace(
+                    mount_id="lower-1",
+                    mount_kind="protected_lower",
+                    target_path="/cloud/lower",
+                )
+            ],
+            True,
+            SimpleNamespace(active=True, lower="/cloud/lower", merged="/wrong"),
+            "lower-1",
+            False,
+        ),
+    ],
+)
+def test_protected_cloud_ready_requires_exact_lower_overlay_join(
+    lower_states, lower_active, overlay, mount_id, expected
+):
+    session = object.__new__(PersistentSession)
+    session.protected_cloud_required = True
+    session.cloud_mount_manager = SimpleNamespace(
+        active=lower_active,
+        mounts=lower_states,
+    )
+    session.overlay_mount_manager = overlay
+    session._protected_mount_id = mount_id
+    session._protected_cloud_health_ready = expected or bool(
+        lower_active and overlay is not None
+    )
+
+    assert session.protected_cloud_ready() is expected
+
+
+def test_nonprotected_session_does_not_require_cloud_controllers():
+    session = object.__new__(PersistentSession)
+    session.protected_cloud_required = False
+
+    assert session.protected_cloud_ready() is True
+
+
+def test_protected_cloud_ready_requires_a_current_health_proof():
+    session = _make_session(protected_cloud_required=True)
+    session._protected_mount_id = "lower-1"
+    session.cloud_mount_manager = SimpleNamespace(
+        active=True,
+        mounts=[
+            SimpleNamespace(
+                mount_id="lower-1",
+                mount_kind="protected_lower",
+                target_path="/cloud/lower",
+            )
+        ],
+    )
+    session.overlay_mount_manager = SimpleNamespace(
+        active=True,
+        lower="/cloud/lower",
+        merged="/cloud/merged",
+    )
+    session._protected_cloud_health_ready = False
+
+    assert session.protected_cloud_ready() is False
+    session._protected_cloud_health_ready = True
+    assert session.protected_cloud_ready() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heal_fails", [False, True])
+async def test_overlay_monitor_revokes_health_while_healing_and_requires_post_proof(
+    monkeypatch, heal_fails
+):
+    import src.api.persistent_session as module
+
+    monkeypatch.setattr(module, "_CLOUD_OVERLAY_MONITOR_INTERVAL_SECONDS", 0)
+    session = _make_session(protected_cloud_required=True)
+    session._protected_mount_id = "lower-1"
+    session._protected_cloud_health_ready = True
+    lower = SimpleNamespace(
+        active=True,
+        mounts=[
+            SimpleNamespace(
+                mount_id="lower-1",
+                mount_kind="protected_lower",
+                target_path="/cloud/lower",
+            )
+        ],
+        restart_mount=MagicMock(),
+    )
+    heal_started = threading.Event()
+    heal_release = threading.Event()
+    heal_finished = threading.Event()
+    post_heal_probe = threading.Event()
+    probes = 0
+
+    def health_check():
+        nonlocal probes
+        probes += 1
+        if probes > 1:
+            post_heal_probe.set()
+        return probes > 1 and not heal_fails
+
+    def heal(remount_lower):
+        heal_started.set()
+        try:
+            assert heal_release.wait(timeout=2)
+            if heal_fails:
+                raise RuntimeError("heal failed")
+            remount_lower()
+        finally:
+            heal_finished.set()
+
+    overlay = SimpleNamespace(
+        active=True,
+        lower="/cloud/lower",
+        merged="/cloud/merged",
+        health_check=health_check,
+        heal=heal,
+    )
+    session.cloud_mount_manager = lower
+    session.overlay_mount_manager = overlay
+
+    monitor = asyncio.create_task(session._cloud_overlay_monitor_loop())
+    try:
+        # Worker-pool startup can legitimately take longer than a fixed
+        # number of event-loop yields under the full test suite. Wait on the
+        # actual cross-thread barrier so this still proves the heal began.
+        assert await asyncio.wait_for(
+            asyncio.to_thread(heal_started.wait, 2),
+            timeout=3,
+        )
+        # The resident controller is still active, but admission is already
+        # closed for the full repair window.
+        assert overlay.active is True
+        assert session.protected_cloud_ready() is False
+
+        heal_release.set()
+        assert await asyncio.wait_for(
+            asyncio.to_thread(heal_finished.wait, 2),
+            timeout=3,
+        )
+        if not heal_fails:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(post_heal_probe.wait, 2),
+                timeout=3,
+            )
+            for _ in range(100):
+                if session._protected_cloud_health_ready:
+                    break
+                await asyncio.sleep(0)
+        assert session.protected_cloud_ready() is (not heal_fails)
+        if not heal_fails:
+            lower.restart_mount.assert_called_once_with("lower-1")
+    finally:
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
 
 
 class TestDeployBoundSkillWithoutDeploymentDir:
@@ -878,6 +1154,93 @@ class TestSetupWorkspace:
         )
 
     @pytest.mark.asyncio
+    async def test_protected_pinned_workspace_uses_exact_remote_identity_pin(self):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        session.protected_cloud_required = True
+        mock_remote = MagicMock()
+        remote_constructor = MagicMock(return_value=mock_remote)
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
+        }
+
+        with (
+            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=remote_constructor
+                    )
+                },
+            ),
+        ):
+            MockWM.return_value.path = "/tmp/test"
+            MockWM.return_value.initialize = MagicMock()
+            await session._setup_workspace(workspace_override=workspace_override)
+
+        kwargs = remote_constructor.call_args.kwargs
+        assert (
+            kwargs["workspace_generation"] == workspace_override["workspace_generation"]
+        )
+        assert (
+            kwargs["runtime_incarnation"]
+            == workspace_override["workspace_runtime_incarnation"]
+        )
+        assert kwargs["expected_host_key_fingerprint"] == "SHA256:trusted"
+        mock_remote.set_shell_owner_token.assert_not_called()
+        mock_remote.claim_shell_owner.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_protected_host_key_mismatch_fails_without_retry_or_tool_setup(self):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        session.protected_cloud_required = True
+        mock_remote = MagicMock()
+        mock_remote.connect.side_effect = WorkspaceHostIdentityMismatch(
+            "host key fingerprint mismatch"
+        )
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
+        }
+        sleep = AsyncMock()
+
+        with (
+            patch("src.api.persistent_session.asyncio.sleep", sleep),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=MagicMock(return_value=mock_remote)
+                    )
+                },
+            ),
+            pytest.raises(
+                WorkspaceUnavailableError,
+                match="SSH identity attestation failed",
+            ),
+        ):
+            await session._setup_workspace(workspace_override=workspace_override)
+
+        sleep.assert_not_awaited()
+        assert session.workspace_manager is None
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "workspace_override",
         [
@@ -914,6 +1277,41 @@ class TestSetupWorkspace:
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             **workspace_override,
         }
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="backing, runtime incarnation, and SSH host identity",
+        ):
+            await session._setup_workspace(workspace_override=workspace_override)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "missing_field",
+        [
+            "workspace_generation",
+            "workspace_runtime_incarnation",
+            "workspace_ssh_host_key_fingerprint",
+        ],
+    )
+    async def test_exact_ordinary_pinned_sandbox_requires_physical_identity(
+        self, missing_field
+    ):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(
+            config=cfg,
+            pinned_runtime_identity_required=True,
+        )
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+            "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
+        }
+        workspace_override.pop(missing_field)
 
         with pytest.raises(
             WorkspaceUnavailableError,
@@ -1363,6 +1761,7 @@ class TestSetupCloudMountOverlayFailure:
         fake_overlay_manager.mount = MagicMock(
             side_effect=RuntimeError("fuse-overlayfs: mount failed")
         )
+        fake_overlay_manager.unmount = MagicMock(return_value=None)
 
         with (
             patch(
@@ -1382,6 +1781,7 @@ class TestSetupCloudMountOverlayFailure:
         # No half-protected session: the RO lower is torn down AND cleared,
         # not left mounted with no capture overlay on top.
         fake_rclone_manager.aclose.assert_awaited_once()
+        fake_overlay_manager.unmount.assert_called_once_with()
         assert session.cloud_mount_manager is None
 
     @pytest.mark.asyncio
@@ -1474,6 +1874,8 @@ class TestSetupCloudMountOverlayFailure:
         fake_overlay_manager.mount = MagicMock(
             side_effect=RuntimeError("overlay identity mismatch")
         )
+        fake_overlay_manager.rollback_failed_mount = MagicMock(return_value=False)
+        fake_overlay_manager.unmount = MagicMock()
 
         with (
             patch(
@@ -1490,6 +1892,8 @@ class TestSetupCloudMountOverlayFailure:
 
         fake_rclone_manager.detach_for_handoff.assert_awaited_once_with()
         fake_rclone_manager.aclose.assert_not_awaited()
+        fake_overlay_manager.rollback_failed_mount.assert_called_once_with()
+        fake_overlay_manager.unmount.assert_not_called()
         assert session.cloud_mount_manager is None
         assert session.overlay_mount_manager is None
 
@@ -3645,6 +4049,132 @@ class TestCleanup:
 
         assert session.shell_manager.cleanup.call_count == 2
         backend.retire.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["overlay", "rclone", "shell", "backend"])
+    async def test_protected_terminal_cleanup_requires_every_remote_ack(self, failure):
+        session = _make_session(
+            protected_cloud_required=True,
+            pinned_runtime_identity_required=True,
+            workspace_backend_tier="sandbox",
+        )
+        backend = MagicMock()
+        backend.terminal_local_quiescence_protocol = "workspace_process_zero_v1"
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+        overlay = MagicMock()
+        cloud = MagicMock()
+        cloud.aclose = AsyncMock()
+        session.overlay_mount_manager = overlay
+        session.cloud_mount_manager = cloud
+
+        if failure == "overlay":
+            overlay.unmount.side_effect = RuntimeError("overlay still busy")
+        elif failure == "rclone":
+            cloud.aclose.side_effect = RuntimeError("rclone still mounted")
+        elif failure == "shell":
+            session.shell_manager.cleanup.side_effect = RuntimeError("shell ack lost")
+        else:
+            backend.retire.side_effect = RuntimeError("backend retire lost")
+
+        with pytest.raises(WorkspaceUnavailableError):
+            await session.cleanup()
+
+        overlay.unmount.assert_called_once_with(strict=True)
+        if failure != "overlay":
+            cloud.aclose.assert_awaited_once_with(strict=True)
+        else:
+            cloud.aclose.assert_not_awaited()
+        session.shell_manager.cleanup.assert_called_once_with(strict=True)
+
+    @pytest.mark.asyncio
+    async def test_protected_cleanup_waits_for_busy_upperdir_to_quiesce(self):
+        session = _make_session(
+            protected_cloud_required=True,
+            pinned_runtime_identity_required=True,
+            workspace_backend_tier="sandbox",
+        )
+        backend = MagicMock()
+        backend.terminal_local_quiescence_protocol = "workspace_process_zero_v1"
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+        cloud = MagicMock()
+        cloud.aclose = AsyncMock()
+        session.cloud_mount_manager = cloud
+
+        entered = threading.Event()
+        release = threading.Event()
+        overlay = MagicMock()
+
+        def block_upperdir(*, strict=False):
+            assert strict is True
+            entered.set()
+            assert release.wait(timeout=2)
+
+        overlay.unmount.side_effect = block_upperdir
+        session.overlay_mount_manager = overlay
+
+        cleanup = asyncio.create_task(session.cleanup())
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not cleanup.done()
+        cloud.aclose.assert_not_awaited()
+        release.set()
+        await cleanup
+
+        cloud.aclose.assert_awaited_once_with(strict=True)
+        session.shell_manager.cleanup.assert_called_once_with(strict=True)
+        assert session.local_quiescence_protocol == "workspace_process_zero_v1"
+
+    @pytest.mark.asyncio
+    async def test_exact_lite_cleanup_mints_agent_runtime_zero_only_after_retire(self):
+        session = _make_session(
+            pinned_runtime_identity_required=True,
+            workspace_backend_tier="none",
+        )
+        backend = MagicMock()
+        session.workspace_manager = MagicMock(backend=backend)
+
+        await session.cleanup()
+
+        backend.retire.assert_called_once_with()
+        assert session.local_quiescence_protocol == "agent_runtime_zero_v1"
+
+    @pytest.mark.asyncio
+    async def test_exact_ordinary_sandbox_cleanup_mints_workspace_process_zero(self):
+        session = _make_session(
+            pinned_runtime_identity_required=True,
+            workspace_backend_tier="sandbox",
+        )
+        backend = MagicMock()
+        backend.terminal_local_quiescence_protocol = "workspace_process_zero_v1"
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+
+        await session.cleanup()
+
+        session.shell_manager.cleanup.assert_called_once_with(strict=True)
+        backend.retire.assert_called_once_with()
+        assert session.local_quiescence_protocol == "workspace_process_zero_v1"
+
+    @pytest.mark.asyncio
+    async def test_exact_vm_cleanup_never_forges_workspace_actuator_proof(self):
+        session = _make_session(
+            pinned_runtime_identity_required=True,
+            workspace_backend_tier="vm",
+        )
+        backend = MagicMock()
+        backend.terminal_local_quiescence_protocol = None
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="shell retirement remains unacknowledged",
+        ):
+            await session.cleanup()
+
+        session.shell_manager.cleanup.assert_called_once_with(strict=True)
+        assert session.local_quiescence_protocol == ""
 
     @pytest.mark.asyncio
     async def test_cleanup_retires_remote_backend(self):

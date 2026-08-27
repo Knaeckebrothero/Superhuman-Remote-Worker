@@ -104,6 +104,7 @@ from pydantic import (  # noqa: E402
     Field,
     PrivateAttr,
     SecretStr,
+    StrictBool,
     field_validator,
     model_validator,
 )
@@ -229,6 +230,7 @@ from src.shared.session_retirement import (  # noqa: E402
     STATELESS_STOP_KEYS,
     stateless_stop_markers,
 )
+from src.shared.pinned_session_identity import PinnedSessionBinding  # noqa: E402
 from services.stateless_workspace_gate import (  # noqa: E402
     declared_thread_workspace_backend,
     stateless_session_workspace_check,
@@ -373,11 +375,21 @@ from services.virtual_workspace import (  # noqa: E402
     virtual_workspace_rclone_spec as _build_virtual_workspace_rclone_spec,
 )
 from services.workspace_binding import (  # noqa: E402
+    CANVAS_WORKSPACE_GENERATION_KEY,
     ensure_virtual_thread_workspace_binding,
     remote_canvas_presentation_available,
     virtual_thread_backing_id,
 )
 from services.workspace import workspace_service  # noqa: E402
+from services.session_runtime_admission import (  # noqa: E402
+    ThreadRuntimeAuthority,
+    pinned_binding_invalid_detail,
+    protected_cloud_marker_state,
+    same_thread_runtime_authority,
+    thread_runtime_authority,
+    thread_runtime_is_preparable,
+    thread_runtime_refusal_detail,
+)
 from services.job_todos import (  # noqa: E402
     build_archive_listing,
     parse_archived_todos,
@@ -419,7 +431,24 @@ from services.cloud.reload import (  # noqa: E402
     fire_reload,
     run_listen_loop,
 )
-from services.cloud.ro_engage import engage_ro_mount, RoEngageRefused  # noqa: E402
+from services.cloud.instance_registry import (  # noqa: E402
+    activate_main_cloud_config,
+    initialize_main_cloud_instance_authority,
+    preload_retained_main_cloud_instances,
+    reload_active_main_cloud_instance,
+)
+from services.cloud.protected_reader_authority import (  # noqa: E402
+    ProtectedNextcloudReaderGrantPlan,
+)
+from services.cloud.ro_engage import (  # noqa: E402
+    RoEngageCleanupPending,
+    RoEngageRefused,
+    engage_ro_mount,
+    revoke_ro_mount_attempt,
+)
+from services.cloud_staging.source_identity import (  # noqa: E402
+    ProtectedMountSourceIdentity,
+)
 from services.llm_endpoint_probe import probe_endpoint_models  # noqa: E402
 from services.email_datasource import (  # noqa: E402
     email_dispatch_config,
@@ -1669,6 +1698,17 @@ COMPLETION_FINALIZER_INLINE_DELAY_SECONDS = max(
     float(os.environ.get("COMPLETION_FINALIZER_INLINE_DELAY_SECONDS", "0")),
 )
 
+# Durable pinned retirement is retried only after the exact local agent is
+# absent/offline and this grace has elapsed.  This is deliberately longer than
+# ordinary local teardown: a live runtime owns memory/git/event-writer drain
+# after Begin and before its final settlement request.
+_PINNED_RETIREMENT_RETRY_GRACE_SECONDS = max(
+    0, int(os.environ.get("PINNED_RETIREMENT_RETRY_GRACE_SECONDS", "900"))
+)
+_PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS = max(
+    1, int(os.environ.get("PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS", "300"))
+)
+
 # S36 explicitly overrides the workspace Pod's ordinary 120-second grace with
 # a 10-second UID-preconditioned delete. Keep the exact-absence proof below the
 # pinned agent's 60-second report timeout while leaving room for API latency.
@@ -1687,6 +1727,158 @@ _kb_datasource_tasks: set[asyncio.Task] = set()
 # Per-datasource view of the same tasks lets deletion cancel and await only the
 # source being removed. The global set remains the shutdown ownership set.
 _kb_datasource_tasks_by_id: dict[str, set[asyncio.Task]] = {}
+
+
+async def _retire_orphaned_pinned_runtime(candidate: Mapping[str, Any]) -> bool:
+    """Retire one offline incarnation through the normal pinned End funnel.
+
+    The candidate is a read-only hint. ``begin_pinned_thread_retirement``
+    rechecks the exact generation, agent, attach attempt and offline state in
+    its row transaction before closing admission. A recovered/rebound agent is
+    therefore preserved even when it changes immediately after the sweep.
+    """
+
+    thread_id = str(candidate.get("id") or "")
+    generation = str(candidate.get("runtime_generation") or "")
+    agent_id = str(candidate.get("agent_id") or "")
+    attach_token = (
+        str(candidate.get("runtime_attach_token"))
+        if candidate.get("runtime_attach_token") is not None
+        else None
+    )
+    if not thread_id or not generation or not agent_id:
+        return False
+    settle_status: Literal["ended", "suspended"] = (
+        "suspended"
+        if str(candidate.get("status") or "") in {"awaiting_user", "suspended"}
+        else "ended"
+    )
+    thread = await postgres_db.get_thread(thread_id)
+    if not isinstance(thread, Mapping):
+        return False
+    try:
+        await _end_thread_flow(
+            thread_id,
+            dict(thread),
+            permanent=False,
+            force=True,
+            expected_runtime_generation=generation,
+            expected_agent_id=agent_id,
+            expected_attach_token=attach_token,
+            require_expected_agent_offline=True,
+            settle_status=settle_status,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            logger.info(
+                "Offline-runtime retirement lost authority for thread %s; "
+                "preserving the current runtime",
+                thread_id,
+            )
+            return False
+        raise
+    return True
+
+
+async def _retry_pending_pinned_retirement(candidate: Mapping[str, Any]) -> bool:
+    """Retry one exact durable retirement after its local actor disappeared."""
+
+    context = candidate.get("runtime_retirement_context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(context, Mapping):
+        return False
+    thread_id = str(candidate.get("id") or "")
+    generation = str(candidate.get("runtime_generation") or "")
+    token = str(candidate.get("runtime_retirement_token") or "")
+    settle_status = str(context.get("settle_status") or "")
+    if (
+        not thread_id
+        or not generation
+        or not token
+        or settle_status
+        not in {
+            "ended",
+            "suspended",
+        }
+    ):
+        return False
+    if str(context.get("generation") or "") != generation:
+        return False
+    permanent = bool(candidate.get("runtime_retirement_permanent"))
+    if permanent and settle_status != "ended":
+        return False
+    expected_agent_id = (
+        str(context.get("agent_id")) if context.get("agent_id") is not None else None
+    )
+    expected_attach_token = (
+        str(context.get("runtime_attach_token"))
+        if context.get("runtime_attach_token") is not None
+        else None
+    )
+    thread = await postgres_db.get_thread(thread_id)
+    if not isinstance(thread, Mapping):
+        return False
+    runtime_exposed = _retirement_context_runtime_exposed(
+        {
+            "generation": generation,
+            "token": token,
+            "permanent": permanent,
+            "context": context,
+        }
+    )
+    if runtime_exposed and not _retirement_has_exact_local_quiescence(
+        {
+            "generation": generation,
+            "token": token,
+            "permanent": permanent,
+            "context": context,
+        },
+        thread,
+    ):
+        recovered = await _recover_captured_sandbox_process_zero(
+            {
+                "generation": generation,
+                "token": token,
+                "permanent": permanent,
+                "context": context,
+            }
+        )
+        if not recovered:
+            return False
+        thread = await postgres_db.get_thread(thread_id)
+        if thread is None:
+            return True
+        if str(thread.get("runtime_retirement_token") or "") != token:
+            return str(thread.get("status") or "") in {"ended", "suspended"}
+    try:
+        result = await _end_thread_flow(
+            thread_id,
+            dict(thread),
+            permanent=permanent,
+            force=True,
+            expected_runtime_generation=generation,
+            expected_agent_id=expected_agent_id,
+            expected_attach_token=expected_attach_token,
+            # Exact physical process zero above supersedes the lossy `offline`
+            # status hint.  A token itself rejects heartbeats, so offline can
+            # never be used as a quiescence proof.
+            require_expected_agent_offline=False,
+            settle_status=settle_status,
+            local_runtime_quiesced=runtime_exposed,
+        )
+    except HTTPException as exc:
+        # Exact authority loss is a successful refusal; a retryable cleanup
+        # failure remains represented by the durable marker for a later pass.
+        if exc.status_code in {409, 503}:
+            return False
+        raise
+    return str(result.get("status") or "") in {
+        "deleted" if permanent else settle_status
+    }
 
 
 async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
@@ -1846,40 +2038,111 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                     deleted,
                 )
 
-            # 3. Propagate: threads bound to offline agents → 'ended'
-            ended_ids = await _step(
+            # 2c. A failed warm attach rotates G1 -> unbound G2 and records an
+            # append-only outcome. The request-local scheduler is only the
+            # latency fast path; this durable scan is the restart/transient-
+            # failure owner for headless sessions. Every task remains keyed to
+            # the exact retired tuple and may provision only the named G2.
+            attach_abort_successors = await _step(
+                "attach_abort_successors",
+                postgres_db.list_retryable_thread_attach_abort_successors(limit=25),
+            )
+            for successor in attach_abort_successors or []:
+                if not isinstance(successor, Mapping):
+                    continue
+                _schedule_attach_abort_successor(
+                    str(successor.get("thread_id") or ""),
+                    retired_runtime_generation=str(
+                        successor.get("retired_runtime_generation") or ""
+                    ),
+                    retired_attach_token=str(
+                        successor.get("retired_attach_token") or ""
+                    ),
+                    retired_agent_id=str(successor.get("retired_agent_id") or ""),
+                )
+
+            # 3. Propagate: exact pinned runtimes bound to offline agents go
+            # through begin -> exact cleanup -> settle. The old set-based
+            # status write made Resume visible before cleanup and let stale
+            # name deletes destroy its successor.
+            ended_candidates = await _step(
                 "orphaned_threads_ended", postgres_db.mark_orphaned_threads_ended()
             )
-            if ended_ids:
-                logger.info(f"Marked {len(ended_ids)} thread(s) as ended (orphaned)")
-                # The DB transition leaves workspace + agent pods alive — release
-                # them here so we don't depend on the idle sweeper as the only
-                # backstop (it's disabled whenever S3 snapshots are unavailable).
-                # reclaim_volume=False: this fires when an agent pod merely goes
-                # offline, and the 'ended' it wrote above is a RESUMABLE state
-                # (resume_thread accepts it) — an agent crash must never take
-                # the user's PVC-backed workspace with it.
-                for thread_id in ended_ids:
-                    await _step(
-                        "release_thread_resources",
-                        _release_thread_resources(thread_id, reclaim_volume=False),
+            if ended_candidates:
+                retired = 0
+                for candidate in ended_candidates:
+                    if isinstance(candidate, Mapping) and await _step(
+                        "retire_orphaned_pinned_runtime",
+                        _retire_orphaned_pinned_runtime(candidate),
+                    ):
+                        retired += 1
+                if retired:
+                    logger.info(
+                        "Retired %d offline pinned runtime(s) through exact End",
+                        retired,
                     )
 
-            # 3b. Propagate: PAUSED threads (awaiting_user / suspended) bound to
-            # offline agents → 'suspended' with agent_id cleared, so the next
-            # open re-provisions instead of 409-looping. These are the paused
-            # states mark_orphaned_threads_ended intentionally skips; suspend
-            # (not release) keeps them resumable.
-            suspended_ids = await _step(
+            # 3b. Paused offline runtimes use the same safe funnel. They settle
+            # as resumable ended sessions rather than exposing an automatic
+            # suspended wake before exact cleanup has completed.
+            suspended_candidates = await _step(
                 "orphaned_threads_suspended",
                 postgres_db.mark_orphaned_threads_suspended(),
             )
-            if suspended_ids:
-                logger.info(f"Suspended {len(suspended_ids)} orphaned paused thread(s)")
-                for thread_id in suspended_ids:
-                    await _step(
-                        "suspend_thread_resources",
-                        _suspend_thread_resources(thread_id),
+            if suspended_candidates:
+                retired = 0
+                for candidate in suspended_candidates:
+                    if isinstance(candidate, Mapping) and await _step(
+                        "retire_orphaned_paused_runtime",
+                        _retire_orphaned_pinned_runtime(candidate),
+                    ):
+                        retired += 1
+                if retired:
+                    logger.info(
+                        "Retired %d paused offline pinned runtime(s) through exact End",
+                        retired,
+                    )
+
+            # 3c. A hidden Begin is a short-lived admission preflight, not an
+            # End instruction. If its owner dies before the append-only
+            # authorization edge, exact expiry reopens the same runtime. The
+            # row lock makes authorize-vs-expire choose exactly one outcome.
+            expired_preflights = await _step(
+                "stale_pinned_retirement_preflights",
+                postgres_db.abort_stale_pinned_retirement_preflights(
+                    grace_seconds=_PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS,
+                    limit=25,
+                ),
+            )
+            if expired_preflights:
+                logger.warning(
+                    "Reopened %d abandoned pinned retirement preflight(s)",
+                    len(expired_preflights),
+                )
+
+            # 3d. Authorized Begin is durable.  If an orchestrator/agent dies after it
+            # closes admission, Resume must remain blocked until another
+            # replica finishes the immutable captured disposition.  Only
+            # sufficiently old markers whose exact actor is absent/offline
+            # are nominated; the shared advisory lock serializes replicas.
+            pending_retirements = await _step(
+                "pending_pinned_retirements",
+                postgres_db.list_retryable_pinned_retirements(
+                    grace_seconds=_PINNED_RETIREMENT_RETRY_GRACE_SECONDS,
+                    limit=25,
+                ),
+            )
+            if pending_retirements:
+                retired = 0
+                for candidate in pending_retirements:
+                    if isinstance(candidate, Mapping) and await _step(
+                        "retry_pending_pinned_retirement",
+                        _retry_pending_pinned_retirement(candidate),
+                    ):
+                        retired += 1
+                if retired:
+                    logger.info(
+                        "Completed %d durable pinned retirement retry(s)", retired
                     )
 
             # 4. Legacy compatibility: pre-lease pinned jobs assigned to
@@ -2485,6 +2748,275 @@ async def snapshot_gc_sweeper(shutdown_event: asyncio.Event) -> None:
     logger.info("Snapshot GC sweeper stopped")
 
 
+async def pinned_agent_create_intent_reconciler(
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Promote exact response-lost Pod/PVC creates after process restart.
+
+    This leader never originates a credential-bearing Kubernetes effect.  It
+    only observes the immutable labels/UID of an already-committed object and
+    lets the row-locked publication CAS adopt it while T/G remains open.
+    Retirement owns the complementary revoke/fence path.
+    """
+
+    interval_s = max(
+        5,
+        int(os.getenv("PINNED_AGENT_CREATE_RECONCILE_INTERVAL_SECONDS", "15")),
+    )
+    logger.info("Pinned agent create-intent reconciler started")
+    while not shutdown_event.is_set():
+        try:
+            rows = await postgres_db.list_pinned_agent_create_intents_for_reconcile(
+                limit=50
+            )
+            for row in rows:
+                try:
+                    provisioner = str(row.get("provisioner") or "")
+                    provider = (
+                        persistent_provisioner
+                        if provisioner == "persistent"
+                        else agent_provisioner
+                        if provisioner == "agent"
+                        else None
+                    )
+                    if provider is None or not provider.is_available:
+                        continue
+                    thread_id = str(row.get("thread_id") or "")
+                    generation = str(row.get("runtime_generation") or "")
+                    attempt_id = str(row.get("attempt_id") or "")
+                    pod_name = str(row.get("pod_name") or "")
+                    if not all((thread_id, generation, attempt_id, pod_name)):
+                        continue
+
+                    claim = row.get("workspace_claim")
+                    if claim is not None:
+                        if not isinstance(claim, Mapping):
+                            continue
+                        claim_id = str(claim.get("claim_id") or "")
+                        claim_generation = str(
+                            claim.get("created_runtime_generation") or ""
+                        )
+                        claim_attempt = str(claim.get("create_attempt") or "")
+                        claim_name = str(claim.get("pvc_name") or "")
+                        claim_status = str(claim.get("status") or "")
+                        claim_uid = str(claim.get("pvc_uid") or "")
+                        if not all(
+                            (
+                                claim_id,
+                                claim_generation,
+                                claim_attempt,
+                                claim_name,
+                            )
+                        ) or claim_status not in {"planned", "ready"}:
+                            continue
+                        observed_claim = await provider.agent_workspace_claim_authority(
+                            claim_name,
+                            expected_thread_id=thread_id,
+                            expected_runtime_generation=claim_generation,
+                            expected_claim_id=claim_id,
+                            expected_create_attempt=claim_attempt,
+                            expected_pvc_uid=claim_uid or None,
+                        )
+                        observed_claim_uid = str(
+                            (observed_claim or {}).get("pvc_uid") or ""
+                        )
+                        if not (
+                            str((observed_claim or {}).get("state") or "")
+                            == "exact_present"
+                            and observed_claim_uid
+                            and (not claim_uid or observed_claim_uid == claim_uid)
+                        ):
+                            continue
+                        if (
+                            claim_status == "planned"
+                            and not await postgres_db.publish_pinned_agent_workspace_claim(
+                                thread_id,
+                                expected_runtime_generation=generation,
+                                claim_id=claim_id,
+                                pvc_name=claim_name,
+                                pvc_uid=observed_claim_uid,
+                            )
+                        ):
+                            continue
+
+                    observed_pod = await provider.agent_pod_provision_intent_authority(
+                        pod_name,
+                        expected_thread_id=thread_id,
+                        expected_runtime_generation=generation,
+                        expected_attempt_id=attempt_id,
+                    )
+                    pod_uid = str((observed_pod or {}).get("pod_uid") or "")
+                    if not (
+                        str((observed_pod or {}).get("state") or "") == "exact_present"
+                        and pod_uid
+                    ):
+                        continue
+                    await postgres_db.publish_pinned_agent_pod_provision_intent(
+                        thread_id,
+                        expected_runtime_generation=generation,
+                        attempt_id=attempt_id,
+                        pod_name=pod_name,
+                        pod_uid=pod_uid,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Pinned agent create-intent reconciliation failed for %s",
+                        row.get("attempt_id"),
+                    )
+        except Exception:
+            logger.exception("Pinned agent create-intent reconciliation pass failed")
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_s)
+        except TimeoutError:
+            pass
+    logger.info("Pinned agent create-intent reconciler stopped")
+
+
+async def pinned_k8s_create_fence_gc_sweeper(
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Exact-delete post-horizon Pod/PVC name fences and retire their rows.
+
+    Fence rows deliberately survive thread deletion and process restart. A
+    due timestamp is necessary but not sufficient: the sweeper reattests the
+    immutable labels and recorded UID, issues a UID-preconditioned delete, and
+    marks the work item terminal only after the Kubernetes name is absent.
+    """
+
+    interval_s = max(
+        5,
+        int(os.getenv("PINNED_K8S_CREATE_FENCE_GC_INTERVAL_SECONDS", "30")),
+    )
+    logger.info("Pinned Kubernetes create-fence GC started (interval=%ds)", interval_s)
+    while not shutdown_event.is_set():
+        try:
+            rows = await postgres_db.list_due_pinned_k8s_create_fences(limit=50)
+            for row in rows:
+                provisioner = str(row.get("provisioner") or "")
+                provider = (
+                    persistent_provisioner
+                    if provisioner == "persistent"
+                    else agent_provisioner
+                    if provisioner == "agent"
+                    else None
+                )
+                if provider is None or not provider.is_available:
+                    continue
+                resource_kind = str(row.get("resource_kind") or "")
+                resource_name = str(row.get("resource_name") or "")
+                resource_uid = str(row.get("resource_uid") or "")
+                thread_id = str(row.get("thread_id") or "")
+                generation = str(row.get("runtime_generation") or "")
+                create_attempt = str(row.get("create_attempt") or "")
+                authority_id = str(row.get("authority_id") or "")
+                if not all(
+                    (
+                        resource_name,
+                        resource_uid,
+                        thread_id,
+                        generation,
+                        create_attempt,
+                        authority_id,
+                    )
+                ):
+                    continue
+                if resource_kind == "pod":
+                    observed = await provider.agent_pod_provision_intent_authority(
+                        resource_name,
+                        expected_thread_id=thread_id,
+                        expected_runtime_generation=generation,
+                        expected_attempt_id=create_attempt,
+                    )
+                    state = str((observed or {}).get("state") or "")
+                    observed_uid = str((observed or {}).get("pod_uid") or "")
+                    if state == "exact_fence" and observed_uid == resource_uid:
+                        deleted = (
+                            await persistent_provisioner.delete_agent_pod_exact(
+                                thread_id, expected_pod_uid=resource_uid
+                            )
+                            if provisioner == "persistent"
+                            else await agent_provisioner.delete_agent_pod_exact(
+                                resource_name, expected_pod_uid=resource_uid
+                            )
+                        )
+                        if not deleted:
+                            continue
+                        observed = await provider.agent_pod_provision_intent_authority(
+                            resource_name,
+                            expected_thread_id=thread_id,
+                            expected_runtime_generation=generation,
+                            expected_attempt_id=create_attempt,
+                        )
+                        state = str((observed or {}).get("state") or "")
+                    if state != "exact_absent":
+                        continue
+                elif resource_kind == "pvc":
+                    observed = await provider.agent_workspace_claim_authority(
+                        resource_name,
+                        expected_thread_id=thread_id,
+                        expected_runtime_generation=generation,
+                        expected_claim_id=authority_id,
+                        expected_create_attempt=create_attempt,
+                        expected_pvc_uid=resource_uid,
+                    )
+                    state = str((observed or {}).get("state") or "")
+                    observed_uid = str((observed or {}).get("pvc_uid") or "")
+                    if state == "exact_fence" and observed_uid == resource_uid:
+                        if not await provider.delete_agent_workspace_claim_exact(
+                            resource_name, expected_pvc_uid=resource_uid
+                        ):
+                            continue
+                        observed = await provider.agent_workspace_claim_authority(
+                            resource_name,
+                            expected_thread_id=thread_id,
+                            expected_runtime_generation=generation,
+                            expected_claim_id=authority_id,
+                            expected_create_attempt=create_attempt,
+                            expected_pvc_uid=resource_uid,
+                        )
+                        state = str((observed or {}).get("state") or "")
+                    if state != "exact_absent":
+                        continue
+                else:
+                    continue
+                await postgres_db.complete_pinned_k8s_create_fence_gc(
+                    resource_kind=resource_kind,
+                    authority_id=authority_id,
+                    expected_resource_uid=resource_uid,
+                )
+            if container_provisioner.is_available:
+                workspace_rows = await postgres_db.list_pinned_thread_workspace_provision_fences_for_gc(
+                    limit=50
+                )
+                for workspace_row in workspace_rows:
+                    if not await container_provisioner.delete_pinned_workspace_provision_fences_exact(
+                        workspace_row
+                    ):
+                        continue
+                    await postgres_db.retire_pinned_thread_workspace_provision_fence(
+                        str(workspace_row.get("attempt_id") or ""),
+                        expected_fence_pod_uid=str(
+                            workspace_row.get("fence_pod_uid") or ""
+                        ),
+                        expected_fence_pvc_uid=(
+                            str(workspace_row.get("fence_pvc_uid") or "") or None
+                        ),
+                        expected_fence_configmap_uid=(
+                            str(workspace_row.get("fence_configmap_uid") or "") or None
+                        ),
+                        expected_fence_service_uid=(
+                            str(workspace_row.get("fence_service_uid") or "") or None
+                        ),
+                    )
+        except Exception:
+            logger.exception("Pinned Kubernetes create-fence GC pass failed")
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_s)
+        except TimeoutError:
+            pass
+    logger.info("Pinned Kubernetes create-fence GC stopped")
+
+
 async def quiet_hours_digest_loop(shutdown_event: asyncio.Event) -> None:
     """Background task that flushes queued notifications when quiet hours end.
 
@@ -2788,6 +3320,16 @@ def _is_protected_cloud_mode_enabled() -> bool:
     ``agent.protectedCloudModeEnabled`` flag
     (knowledge-base/knowledge/design/cloud_access_unification.md §8 Phase 1)."""
     return os.getenv("PROTECTED_CLOUD_MODE_ENABLED", "").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def _require_pinned_status_identity() -> bool:
+    """Require exact pinned lifecycle identity unless explicitly disabled."""
+
+    return os.getenv("REQUIRE_PINNED_STATUS_IDENTITY", "true").lower().strip() in (
         "true",
         "1",
         "yes",
@@ -3513,6 +4055,52 @@ async def _agent_toolset_from_status(agent: dict[str, Any]) -> "_Measurement":
     )
 
 
+async def _require_supported_protected_session_class(
+    thread: dict[str, Any], metadata: dict[str, Any]
+) -> None:
+    """Fail closed when a protected row selects an unsupported runtime class.
+
+    This check intentionally runs before Resume's ended->created CAS as well
+    as before provisioning.  Older rows can predate create-time class
+    materialization, so only the fully resolved expert/account/request stack
+    is authoritative.
+    """
+
+    if protected_cloud_marker_state(metadata) != "on":
+        return
+    class_status: dict[str, Any] = {}
+    try:
+        effective_config = await _resolve_session_config(
+            thread,
+            metadata,
+            status=class_status,
+            resolve_base_when_experts_disabled=True,
+        )
+        if effective_config is None or _protected_cloud_officer_active(
+            effective_config
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "protected_cloud_unsupported_session_class",
+                    "message": (
+                        "Protected cloud sessions are not supported for the "
+                        "background Officer runtime."
+                    ),
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "protected_cloud_session_class_unverified",
+                "message": "Protected cloud session class could not be verified.",
+            },
+        ) from exc
+
+
 async def _session_grant_violations(thread: dict[str, Any]) -> list[str]:
     """Pre-flight the capability grants for a session's resolved config.
 
@@ -3533,7 +4121,31 @@ async def _session_grant_violations(thread: dict[str, Any]) -> list[str]:
         try:
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
-            metadata = {}
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "session_metadata_malformed",
+                    "message": "This session's stored state is invalid.",
+                },
+            )
+    protected_marker = protected_cloud_marker_state(metadata)
+    if protected_marker == "malformed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "protected_cloud_malformed",
+                "message": "Protected cloud session state is invalid.",
+            },
+        )
+    if protected_marker == "on" and _thread_workspace_backend(thread) != "sandbox":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "protected_cloud_unsupported_workspace",
+                "message": "Protected cloud sessions require the Container tier.",
+            },
+        )
+    await _require_supported_protected_session_class(thread, metadata)
     try:
         await _resolve_session_config(thread, metadata)
         return []
@@ -5324,48 +5936,73 @@ def _thread_uses_pinned_execution(thread: Any) -> bool:
     return bool(thread and thread.get("execution_lane") == LANE_PINNED)
 
 
+def _thread_accepts_runtime(thread: Any) -> bool:
+    """Lifecycle half of runtime admission (lane is checked separately)."""
+
+    return thread_runtime_is_preparable(thread)
+
+
 async def _bind_registered_persistent_agent(
     thread_id: str,
     agent_id: str,
     expected_agent_id: str | None,
-) -> bool:
+    expected_runtime_generation: str,
+) -> str | None:
     """Lane-qualified final half of persistent-agent registration.
 
-    ``register_agent`` has already written ``agents.thread_id``.  The thread
-    advisory lock serializes sanctioned transitions, while this conditional
-    update also fails closed if an out-of-band lane edit lands between the
-    precheck and the final bind.  A refused bind clears only this exact
-    agent/thread association; it never deletes a possibly pre-existing
-    hostname-upsert row.
+    A new dedicated agent is first inserted unbound. The thread side is written
+    first here, then ``agents.thread_id`` is paired in the same transaction;
+    deferred reciprocal constraints validate the final state. The advisory
+    lock serializes sanctioned transitions, while the conditional update also
+    fails closed if an out-of-band lane edit lands between precheck and bind.
     """
+    attach_token = str(uuid4())
     async with postgres_db.acquire() as conn:
-        if expected_agent_id is None:
-            bound = await conn.execute(
-                "UPDATE threads SET agent_id = $2, "
-                "control_admission_agent_id = NULL "
-                "WHERE id = $1 AND execution_lane = $3 AND agent_id IS NULL",
-                thread_id,
+        async with conn.transaction():
+            if expected_agent_id is None:
+                bound = await conn.execute(
+                    "UPDATE threads SET agent_id = $2, "
+                    "runtime_attach_token = $5::uuid, "
+                    "control_admission_agent_id = NULL "
+                    "WHERE id = $1 AND execution_lane = $3 AND agent_id IS NULL "
+                    "AND status IN ('created','active','awaiting_user','suspended') "
+                    "AND runtime_generation = $4::uuid "
+                    "AND runtime_retirement_token IS NULL",
+                    thread_id,
+                    agent_id,
+                    "pinned",
+                    expected_runtime_generation,
+                    attach_token,
+                )
+            else:
+                bound = await conn.execute(
+                    "UPDATE threads SET agent_id = $2, "
+                    "runtime_attach_token = $6::uuid, "
+                    "control_admission_agent_id = NULL "
+                    "WHERE id = $1 AND execution_lane = $3 AND agent_id = $4 "
+                    "AND status IN ('created','active','awaiting_user','suspended') "
+                    "AND runtime_generation = $5::uuid "
+                    "AND runtime_retirement_token IS NULL",
+                    thread_id,
+                    agent_id,
+                    "pinned",
+                    expected_agent_id,
+                    expected_runtime_generation,
+                    attach_token,
+                )
+            if bound != "UPDATE 1":
+                return None
+            reciprocal = await conn.execute(
+                "UPDATE agents SET thread_id=$2::uuid "
+                "WHERE id=$1::uuid "
+                "AND (thread_id IS NULL OR thread_id=$2::uuid) "
+                "AND current_job_id IS NULL",
                 agent_id,
-                "pinned",
-            )
-        else:
-            bound = await conn.execute(
-                "UPDATE threads SET agent_id = $2, "
-                "control_admission_agent_id = NULL "
-                "WHERE id = $1 AND execution_lane = $3 AND agent_id = $4",
                 thread_id,
-                agent_id,
-                "pinned",
-                expected_agent_id,
             )
-        if bound == "UPDATE 1":
-            return True
-        await conn.execute(
-            "UPDATE agents SET thread_id = NULL WHERE id = $1 AND thread_id = $2",
-            agent_id,
-            thread_id,
-        )
-        return False
+            if reciprocal != "UPDATE 1":
+                raise RuntimeError("agent is no longer available for exact binding")
+            return attach_token
 
 
 async def _find_idle_persistent_agent() -> Optional[dict]:
@@ -5421,6 +6058,7 @@ async def _send_session_attach(
     project_ids: Optional[list] = None,
     datasources: Optional[list] = None,
     config_name: Optional[str] = None,
+    expected_runtime_generation: str | None = None,
 ) -> bool:
     """Serialize connector selection with the complete attach delivery."""
     async with postgres_db.thread_datasource_lock(thread_id):
@@ -5431,10 +6069,13 @@ async def _send_session_attach(
             project_ids=project_ids,
             datasources=datasources,
             config_name=config_name,
+            expected_runtime_generation=expected_runtime_generation,
         )
 
 
-async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool:
+async def _reserve_session_attach_binding(
+    agent_id: str, thread_id: str, *, expected_runtime_generation: str
+) -> str | None:
     """Atomically reserve both sides of a pinned warm-pool binding.
 
     Reservation happens before HTTP delivery.  That ordering makes the
@@ -5443,6 +6084,7 @@ async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool
     the lane is still pinned.  We never need to tear down an already-started
     session merely because a post-delivery lane CAS lost.
     """
+    attach_token = str(uuid4())
     try:
         async with postgres_db.acquire() as conn:
             async with conn.transaction():
@@ -5451,12 +6093,18 @@ async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool
                 # deadlock when a control is admitted during a warm bind.
                 thread_bound = await conn.execute(
                     "UPDATE threads SET agent_id = $2, "
+                    "runtime_attach_token = $4::uuid, "
                     "control_admission_agent_id = NULL "
                     "WHERE id = $1 AND execution_lane = $3 "
-                    "AND agent_id IS NULL",
+                    "AND agent_id IS NULL "
+                    "AND status IN ('created','active','awaiting_user','suspended') "
+                    "AND runtime_generation = $5::uuid "
+                    "AND runtime_retirement_token IS NULL",
                     thread_id,
                     agent_id,
                     "pinned",
+                    attach_token,
+                    expected_runtime_generation,
                 )
                 if thread_bound != "UPDATE 1":
                     raise RuntimeError(
@@ -5472,7 +6120,7 @@ async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool
                 )
                 if agent_bound != "UPDATE 1":
                     raise RuntimeError("agent is no longer idle")
-        return True
+        return attach_token
     except Exception as exc:
         logger.info(
             "Session attach reservation refused for agent %s / thread %s: %s",
@@ -5480,27 +6128,681 @@ async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool
             thread_id,
             exc,
         )
+        return None
+
+
+SessionAttachReleaseOutcome = Literal["released", "already_detached", "unsafe"]
+_attach_abort_successor_tasks: dict[
+    tuple[str, str, str, str], "asyncio.Task[None]"
+] = {}
+
+
+def _current_attach_abort_successor(
+    thread: Mapping[str, Any] | None,
+    *,
+    thread_id: str,
+    successor_generation: str,
+) -> bool:
+    """Return whether an abort outcome still owns its exact open G2."""
+
+    authority = thread_runtime_authority(thread)
+    return bool(
+        authority is not None
+        and authority.thread_id == thread_id
+        and authority.generation == successor_generation
+        and _thread_uses_pinned_execution(thread)
+        and str(thread.get("status") or "") == "created"
+        and thread.get("runtime_retirement_token") is None
+        and thread.get("agent_id") is None
+        and thread.get("runtime_attach_token") is None
+    )
+
+
+async def _prepare_attach_abort_successor_workspace(
+    candidate: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Recreate the workspace killed by an exact delivered-attach abort.
+
+    ``workspace_process_zero_v1`` is intentionally stronger than tmux cleanup:
+    it kills every workspace-user process, including the entrypoint's
+    code-server.  Reusing that Ready Pod would make G2 appear healthy while its
+    IDE is dead.  The append-only G1 outcome therefore owns exact UID deletion
+    (PVC retained), a G2/endpoint CAS, fresh U2 creation, and an IDE health
+    proof.  Other abort protocols did not kill workspace residents and skip
+    this actuator.
+    """
+
+    protocol = str(candidate.get("quiescence_protocol") or "")
+    if protocol in {
+        "pre_delivery_no_payload_v1",
+        "agent_attach_not_started_v1",
+        "agent_runtime_zero_v1",
+    }:
+        return current
+    if protocol != "workspace_process_zero_v1":
+        return None
+
+    try:
+        thread_id = str(UUID(str(candidate.get("thread_id") or "")))
+        retired_generation = str(
+            UUID(str(candidate.get("retired_runtime_generation") or ""))
+        )
+        retired_attach_token = str(
+            UUID(str(candidate.get("retired_attach_token") or ""))
+        )
+        retired_agent_id = str(UUID(str(candidate.get("retired_agent_id") or "")))
+        successor_generation = str(
+            UUID(str(candidate.get("successor_generation") or ""))
+        )
+        workspace_generation = str(
+            UUID(str(candidate.get("workspace_generation") or ""))
+        )
+        retired_workspace_runtime = str(
+            UUID(str(candidate.get("workspace_runtime_incarnation") or ""))
+        )
+    except (TypeError, ValueError):
+        return None
+
+    if not _current_attach_abort_successor(
+        current,
+        thread_id=thread_id,
+        successor_generation=successor_generation,
+    ):
+        return None
+    metadata = thread_metadata_object(current)
+    workspace = metadata.get("workspace_container") or {}
+    binding = metadata.get("_workspace_binding") or {}
+    if not isinstance(workspace, Mapping) or not isinstance(binding, Mapping):
+        return None
+    if str(workspace.get("provisioner") or "") == "docker":
+        if str(binding.get("generation") or "") != workspace_generation:
+            return None
+        current_lease = str(workspace.get("_docker_workspace_lease_id") or "")
+        if current_lease == retired_workspace_runtime:
+            if not await docker_provisioner.release_thread_workspace(
+                thread_id,
+                expected_lease_id=retired_workspace_runtime,
+                force_quarantine=True,
+            ):
+                return None
+            if not await postgres_db.clear_pinned_attach_abort_docker_workspace_endpoint(
+                thread_id,
+                retired_runtime_generation=retired_generation,
+                retired_attach_token=retired_attach_token,
+                retired_agent_id=retired_agent_id,
+                successor_generation=successor_generation,
+                workspace_generation=workspace_generation,
+                docker_lease_id=retired_workspace_runtime,
+            ):
+                return None
+            current = await postgres_db.get_thread(thread_id)
+            if not _current_attach_abort_successor(
+                current,
+                thread_id=thread_id,
+                successor_generation=successor_generation,
+            ):
+                return None
+            return current
+        # A retry may observe the exact G2 after provision_or_assign already
+        # installed a distinct lease. Never release or rewrite that successor.
+        if current_lease and current_lease != retired_workspace_runtime:
+            return current if str(workspace.get("status") or "") == "ready" else None
+        # The exact terminal-lease CAS already cleared the old mirror; the
+        # caller may now provision a fresh Docker lease for G2.
+        if not current_lease and str(workspace.get("status") or "") == "deleted":
+            return current
+        return None
+    if (
+        str(workspace.get("provisioner") or "") != "k8s"
+        or str(binding.get("generation") or "") != workspace_generation
+    ):
+        # Static Docker workspaces have no exact restart actuator.  Their
+        # all-UID-zero receipt remains durable, but the successor fails closed
+        # instead of advertising a dead code-server lease as Ready.
+        return None
+
+    current_runtime = str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+    if current_runtime == retired_workspace_runtime:
+        owner = WorkspaceOwner.session(thread_id)
+        pod_authority = await container_provisioner.workspace_pod_authority(
+            owner,
+            expected_runtime_incarnation=retired_workspace_runtime,
+        )
+        if pod_authority in {"exact_live", "exact_terminal"}:
+            deleted = await container_provisioner.delete_workspace(
+                owner,
+                expected_runtime_incarnation=retired_workspace_runtime,
+                captured_teardown_uid=retired_workspace_runtime,
+                wait_for_exact_absence=True,
+                defer_context_clear=True,
+            )
+            if not deleted:
+                return None
+        elif pod_authority != "exact_absent":
+            # A same-name replacement or ambiguous control-plane result is not
+            # deletion authority over either endpoint.
+            return None
+
+        cleared = await postgres_db.clear_pinned_attach_abort_workspace_endpoint(
+            thread_id,
+            retired_runtime_generation=retired_generation,
+            retired_attach_token=retired_attach_token,
+            retired_agent_id=retired_agent_id,
+            successor_generation=successor_generation,
+            workspace_generation=workspace_generation,
+            workspace_runtime_incarnation=retired_workspace_runtime,
+        )
+        if not cleared:
+            return None
+        current = await postgres_db.get_thread(thread_id)
+        if not _current_attach_abort_successor(
+            current,
+            thread_id=thread_id,
+            successor_generation=successor_generation,
+        ):
+            return None
+        metadata = thread_metadata_object(current)
+        workspace = metadata.get("workspace_container") or {}
+        binding = metadata.get("_workspace_binding") or {}
+        if (
+            not isinstance(workspace, Mapping)
+            or not isinstance(binding, Mapping)
+            or str(binding.get("generation") or "") != workspace_generation
+        ):
+            return None
+        current_runtime = str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+
+    if not current_runtime:
+        ensured = await ensure_session_workspace(
+            thread_id,
+            db=postgres_db,
+            provisioner=container_provisioner,
+            suspension=workspace_suspension_service,
+            expected_runtime_generation=successor_generation,
+            _pinned_runtime_lock_held=True,
+        )
+        if ensured is None or ensured.outcome == EnsureOutcome.FAILED:
+            return None
+        current = await postgres_db.get_thread(thread_id)
+        if not _current_attach_abort_successor(
+            current,
+            thread_id=thread_id,
+            successor_generation=successor_generation,
+        ):
+            return None
+        metadata = thread_metadata_object(current)
+        workspace = metadata.get("workspace_container") or {}
+        binding = metadata.get("_workspace_binding") or {}
+        if not isinstance(workspace, Mapping) or not isinstance(binding, Mapping):
+            return None
+        current_runtime = str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+
+    # A crash after creation but before provisioning re-enters here with U2
+    # already Ready.  Accept only a different, fully attested K8s incarnation
+    # on the same durable backing; U1 can never be re-advertised.
+    try:
+        current_runtime = str(UUID(current_runtime))
+    except (TypeError, ValueError):
+        return None
+    if (
+        current_runtime == retired_workspace_runtime
+        or str(workspace.get("status") or "") != "ready"
+        or str(workspace.get("provisioner") or "") != "k8s"
+        or str(binding.get("generation") or "") != workspace_generation
+        or str(workspace.get(CANVAS_WORKSPACE_GENERATION_KEY) or "")
+        != workspace_generation
+        or not remote_canvas_presentation_available(metadata, dict(workspace))
+    ):
+        return None
+    if not await container_provisioner.wait_for_workspace_code_server(
+        WorkspaceOwner.session(thread_id),
+        expected_runtime_incarnation=current_runtime,
+    ):
+        return None
+
+    final = await postgres_db.get_thread(thread_id)
+    if not _current_attach_abort_successor(
+        final,
+        thread_id=thread_id,
+        successor_generation=successor_generation,
+    ):
+        return None
+    final_metadata = thread_metadata_object(final)
+    final_workspace = final_metadata.get("workspace_container") or {}
+    final_binding = final_metadata.get("_workspace_binding") or {}
+    if (
+        not isinstance(final_workspace, Mapping)
+        or not isinstance(final_binding, Mapping)
+        or str(final_workspace.get("status") or "") != "ready"
+        or str(final_workspace.get("provisioner") or "") != "k8s"
+        or str(final_workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+        != current_runtime
+        or str(final_workspace.get(CANVAS_WORKSPACE_GENERATION_KEY) or "")
+        != workspace_generation
+        or str(final_binding.get("generation") or "") != workspace_generation
+        or not remote_canvas_presentation_available(
+            final_metadata, dict(final_workspace)
+        )
+    ):
+        return None
+    return final
+
+
+async def _reconcile_attach_abort_successor(
+    candidate: Mapping[str, Any],
+) -> bool:
+    """Provision only the exact unbound G2 named by a durable abort outcome.
+
+    The append-only outcome is the restart-safe work item.  A request-local
+    task gives the common path low latency, while the stale-agent sweep calls
+    this same routine until G2 is bound/provisioning or ceases to be current.
+    No code is permitted to recapture an arbitrary current generation after a
+    failed G1 attach.
+    """
+
+    try:
+        thread_id = str(UUID(str(candidate.get("thread_id") or "")))
+        retired_generation = str(
+            UUID(
+                str(
+                    candidate.get("retired_runtime_generation")
+                    or candidate.get("runtime_generation")
+                    or ""
+                )
+            )
+        )
+        successor_generation = str(
+            UUID(str(candidate.get("successor_generation") or ""))
+        )
+    except (TypeError, ValueError):
+        return False
+    if successor_generation == retired_generation:
         return False
 
+    async with postgres_db.try_thread_advisory_lock(thread_id) as lock_owner:
+        if not lock_owner:
+            return False
+        current = await postgres_db.get_thread(thread_id)
+        if not _current_attach_abort_successor(
+            current,
+            thread_id=thread_id,
+            successor_generation=successor_generation,
+        ):
+            return False
+        current = await _prepare_attach_abort_successor_workspace(candidate, current)
+        if current is None:
+            return False
+        authority = thread_runtime_authority(current)
+        if authority is None:
+            return False
+        metadata = thread_metadata_object(current)
+        config_override = metadata.get("config_override") or {}
+        if not isinstance(config_override, dict):
+            return False
+        datasource_ids = metadata.get("datasource_ids")
+        if not isinstance(datasource_ids, list):
+            datasource_ids = None
+        current_user_id = str(current.get("user_id") or "system")
+        current_config_name = canonical_config_name(
+            str(current.get("config_name") or "session_base")
+        )
 
-async def _release_session_attach_binding(agent_id: str, thread_id: str) -> None:
-    """Release only the exact pre-delivery reservation after assembly refuses."""
+    # Never nest provision_or_assign's lifecycle lock beneath this owner. Its
+    # exact G2 authority check is the post-release CAS: if End/Resume/G3 wins
+    # here, the delayed G2 provision task becomes a no-op.
+    project_ids = await _thread_project_ids(thread_id)
+    latest = await postgres_db.get_thread(thread_id)
+    if not same_thread_runtime_authority(
+        latest, authority
+    ) or not _current_attach_abort_successor(
+        latest,
+        thread_id=thread_id,
+        successor_generation=successor_generation,
+    ):
+        return False
+    from services.provision_or_assign import provision_or_assign
 
-    async with postgres_db.acquire() as conn:
-        async with conn.transaction():
-            # Preserve the established threads -> agents lock/update order.
-            await conn.execute(
-                "UPDATE threads SET agent_id = NULL WHERE id = $1 AND agent_id = $2",
+    await provision_or_assign(
+        current_user_id,
+        thread_id,
+        current_config_name,
+        config_override,
+        project_ids,
+        datasource_ids,
+        runtime_generation=successor_generation,
+    )
+    return True
+
+
+def _schedule_attach_abort_successor(
+    thread_id: str,
+    *,
+    retired_runtime_generation: str,
+    retired_attach_token: str,
+    retired_agent_id: str,
+) -> "asyncio.Task[None]":
+    """Strongly own provisioning of the exact successor G after attach abort.
+
+    The G1 create/prepare task must stop after the generation rotation, but a
+    browser poll does not resubmit prepare and headless callers may never
+    reconnect.  The append-only abort outcome names G2; this owner reads that
+    exact edge, then provisions only while G2 is still created/open/unbound.
+    Duplicate lost-response retries share one task and every stale G1/G3
+    continuation is a no-op.
+    """
+
+    task_key = (
+        thread_id,
+        retired_runtime_generation,
+        retired_attach_token,
+        retired_agent_id,
+    )
+    existing = _attach_abort_successor_tasks.get(task_key)
+    if existing is not None and not existing.done():
+        return existing
+
+    async def _run() -> None:
+        try:
+            async with postgres_db.acquire() as conn:
+                outcome = await conn.fetchrow(
+                    "SELECT thread_id, runtime_generation AS "
+                    "retired_runtime_generation, runtime_attach_token AS "
+                    "retired_attach_token, agent_id AS retired_agent_id, "
+                    "successor_generation, quiescence_protocol, "
+                    "workspace_generation, workspace_runtime_incarnation FROM "
+                    "thread_runtime_attach_abort_outcomes "
+                    "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_attach_token=$3::uuid AND agent_id=$4::uuid",
+                    thread_id,
+                    retired_runtime_generation,
+                    retired_attach_token,
+                    retired_agent_id,
+                )
+            if outcome is None:
+                return
+            await _reconcile_attach_abort_successor(dict(outcome))
+        except Exception:
+            logger.exception(
+                "Failed to reconcile successor runtime after exact attach "
+                "abort (thread=%s retired_generation=%s)",
                 thread_id,
-                agent_id,
+                retired_runtime_generation,
             )
-            await conn.execute(
-                "UPDATE agents SET thread_id = NULL, status = 'ready' "
-                "WHERE id = $1 AND thread_id = $2 "
-                "AND current_job_id IS NULL AND status = 'session'",
-                agent_id,
-                thread_id,
-            )
+
+    task = asyncio.create_task(
+        _run(),
+        name=f"attach-abort-successor-{thread_id[:8]}-{retired_runtime_generation[:8]}",
+    )
+    _attach_abort_successor_tasks[task_key] = task
+
+    def _done(finished: "asyncio.Task[None]") -> None:
+        if _attach_abort_successor_tasks.get(task_key) is finished:
+            _attach_abort_successor_tasks.pop(task_key, None)
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def _release_session_attach_binding(
+    agent_id: str,
+    thread_id: str,
+    *,
+    expected_runtime_generation: str,
+    expected_attach_token: str,
+    pre_delivery: bool = False,
+    expected_agent_pod_uid: str | None = None,
+    local_runtime_quiesced: bool = False,
+    local_quiescence_protocol: str | None = None,
+    workspace_generation: str | None = None,
+    workspace_runtime_incarnation: str | None = None,
+) -> SessionAttachReleaseOutcome:
+    """Abort one exact failed attach before it can admit paid/user work.
+
+    Clearing pointers inside G1 is an ABA: the same pool process/thread pair
+    can recur and a delayed failure can then clear G2. Successful abort rotates
+    the thread generation and resets the monotonic exposure bit in one
+    proof-bearing transaction. ``pre_delivery`` is server-only and means the
+    HTTP payload never crossed; the agent route must instead present strict
+    process-zero proof bound to the captured physical workspace.
+    """
+
+    class _AttachAbortCASLost(RuntimeError):
+        pass
+
+    try:
+        async with postgres_db.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT agent_id, status, metadata, runtime_generation, "
+                    "runtime_attach_token, runtime_retirement_token, "
+                    "runtime_authority_exposed FROM threads "
+                    "WHERE id = $1 FOR UPDATE",
+                    thread_id,
+                )
+                agent = await conn.fetchrow(
+                    "SELECT thread_id, current_job_id, status, hostname, pod_uid "
+                    "FROM agents "
+                    "WHERE id = $1 FOR UPDATE",
+                    agent_id,
+                )
+                prior = await conn.fetchrow(
+                    "SELECT successor_generation FROM "
+                    "thread_runtime_attach_abort_outcomes "
+                    "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_attach_token=$3::uuid AND agent_id=$4::uuid",
+                    thread_id,
+                    expected_runtime_generation,
+                    expected_attach_token,
+                    agent_id,
+                )
+                if prior is not None:
+                    return "already_detached"
+                # Everything below intentionally remains inside the same
+                # transaction as the two FOR UPDATE reads.  The generation
+                # rotation, reciprocal agent release, and durable outcome are
+                # one indivisible authority transition; a failure at any
+                # point rolls all three back.
+                thread_matches = bool(
+                    thread is not None
+                    and str(thread.get("agent_id") or "") == agent_id
+                    and str(thread.get("runtime_generation") or "")
+                    == expected_runtime_generation
+                    and str(thread.get("runtime_attach_token") or "")
+                    == expected_attach_token
+                    and thread.get("runtime_retirement_token") is None
+                )
+                agent_matches = bool(
+                    agent is not None and str(agent.get("thread_id") or "") == thread_id
+                )
+                if not thread_matches or not agent_matches:
+                    return "unsafe"
+                if (
+                    str(thread.get("status") or "") != "created"
+                    or thread.get("runtime_authority_exposed") is not True
+                    or agent.get("current_job_id") is not None
+                    or str(agent.get("status") or "") != "session"
+                ):
+                    return "unsafe"
+                current_pod_uid = str(agent.get("pod_uid") or "")
+                if not current_pod_uid or (
+                    not pre_delivery
+                    and current_pod_uid != str(expected_agent_pod_uid or "")
+                ):
+                    return "unsafe"
+
+                metadata = thread.get("metadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return "unsafe"
+                if not isinstance(metadata, dict):
+                    return "unsafe"
+                updated_metadata = dict(metadata)
+                agent_pod_marker = metadata.get("agent_pod")
+                if agent_pod_marker not in (None, {}):
+                    if not (
+                        isinstance(agent_pod_marker, dict)
+                        and str(agent_pod_marker.get("pod_name") or "")
+                        == str(agent.get("hostname") or "")
+                        and str(agent_pod_marker.get("pod_uid") or "")
+                        == current_pod_uid
+                    ):
+                        return "unsafe"
+                    # The exact G1 Pod is released back to its agent-side
+                    # lifecycle; it is not G2 thread authority. Clear only
+                    # the marker proven reciprocal to the captured agent in
+                    # this same rotation transaction—never UID-delete it.
+                    updated_metadata.pop("agent_pod", None)
+                config = metadata.get("config_override") or {}
+                workspace_cfg = (
+                    config.get("workspace") if isinstance(config, dict) else {}
+                )
+                backend = (
+                    str(
+                        (workspace_cfg or {}).get("backend")
+                        if isinstance(workspace_cfg, dict)
+                        else ""
+                    )
+                    or "sandbox"
+                )
+                ws = metadata.get("workspace_container") or {}
+                binding = metadata.get("_workspace_binding") or {}
+                if not isinstance(ws, dict) or not isinstance(binding, dict):
+                    return "unsafe"
+                captured_workspace_generation = str(binding.get("generation") or "")
+                captured_workspace_runtime = str(
+                    (
+                        ws.get("_docker_workspace_lease_id")
+                        if ws.get("provisioner") == "docker"
+                        else ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+                    )
+                    or ""
+                )
+                if bool(captured_workspace_generation) != bool(
+                    captured_workspace_runtime
+                ):
+                    return "unsafe"
+                if pre_delivery:
+                    release_kind = "server_pre_delivery"
+                    proof_protocol = "pre_delivery_no_payload_v1"
+                else:
+                    if not local_runtime_quiesced:
+                        return "unsafe"
+                    release_kind = "process_zero"
+                    if local_quiescence_protocol == "agent_attach_not_started_v1":
+                        # The dual agent may reject the delivered claim before
+                        # its monotonic setup-started latch flips (for example,
+                        # runtime-actor bind refusal).  No session/backend/task
+                        # exists to run workspace cleanup yet. The agent route
+                        # owns that one-way local latch; the DB additionally
+                        # proves this G admitted no input/control authority.
+                        proof_protocol = "agent_attach_not_started_v1"
+                    elif backend == "sandbox" and captured_workspace_generation:
+                        proof_protocol = "workspace_process_zero_v1"
+                    elif backend in {"sandbox", "virtual", "none"} and not (
+                        captured_workspace_generation or captured_workspace_runtime
+                    ):
+                        proof_protocol = "agent_runtime_zero_v1"
+                    else:
+                        # VM/remote cleanup requires the orchestrator's exact
+                        # actuator stop/snapshot proof, never an agent assertion.
+                        return "unsafe"
+                    if local_quiescence_protocol != proof_protocol:
+                        return "unsafe"
+                    if str(workspace_generation or "") != captured_workspace_generation:
+                        return "unsafe"
+                    if (
+                        str(workspace_runtime_incarnation or "")
+                        != captured_workspace_runtime
+                    ):
+                        return "unsafe"
+
+                admitted_input = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
+                    "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
+                    "AND owner_runtime_generation=$3::uuid "
+                    "AND state IN ('admitted','settled'))",
+                    thread_id,
+                    agent_id,
+                    expected_runtime_generation,
+                )
+                admitted_control = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
+                    "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid)",
+                    thread_id,
+                    expected_runtime_generation,
+                )
+                if admitted_input or admitted_control:
+                    return "unsafe"
+
+                successor_generation = str(uuid4())
+                receipt = {
+                    "version": 1,
+                    "runtime_generation": expected_runtime_generation,
+                    "successor_generation": successor_generation,
+                    "agent_id": agent_id,
+                    "runtime_attach_token": expected_attach_token,
+                    "agent_pod_uid": current_pod_uid,
+                    "release_kind": release_kind,
+                    "quiescence_protocol": proof_protocol,
+                    "workspace_generation": captured_workspace_generation or None,
+                    "workspace_runtime_incarnation": (
+                        captured_workspace_runtime or None
+                    ),
+                }
+                thread_updated = await conn.execute(
+                    "UPDATE threads SET agent_id=NULL, runtime_attach_token=NULL, "
+                    "control_admission_agent_id=NULL, "
+                    "runtime_generation=$5::uuid, runtime_authority_exposed=false, "
+                    "runtime_attach_abort_receipt=$6::jsonb, metadata=$7::jsonb "
+                    "WHERE id=$1::uuid AND agent_id=$2::uuid "
+                    "AND status='created' AND runtime_generation=$3::uuid "
+                    "AND runtime_attach_token=$4::uuid "
+                    "AND runtime_retirement_token IS NULL",
+                    thread_id,
+                    agent_id,
+                    expected_runtime_generation,
+                    expected_attach_token,
+                    successor_generation,
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                    json.dumps(updated_metadata, sort_keys=True, separators=(",", ":")),
+                )
+                agent_updated = await conn.execute(
+                    "UPDATE agents SET thread_id=NULL, status='ready' "
+                    "WHERE id=$1::uuid AND thread_id=$2::uuid "
+                    "AND pod_uid=$3 AND current_job_id IS NULL AND status='session'",
+                    agent_id,
+                    thread_id,
+                    current_pod_uid,
+                )
+                if thread_updated != "UPDATE 1" or agent_updated != "UPDATE 1":
+                    raise _AttachAbortCASLost
+                outcome_inserted = await conn.execute(
+                    "INSERT INTO thread_runtime_attach_abort_outcomes ("
+                    "thread_id, runtime_generation, runtime_attach_token, "
+                    "agent_id, agent_pod_uid, successor_generation, release_kind, "
+                    "quiescence_protocol, workspace_generation, "
+                    "workspace_runtime_incarnation) VALUES ("
+                    "$1::uuid,$2::uuid,$3::uuid,$4::uuid,$5,$6::uuid,$7,$8,"
+                    "$9::uuid,$10::uuid) ON CONFLICT DO NOTHING",
+                    thread_id,
+                    expected_runtime_generation,
+                    expected_attach_token,
+                    agent_id,
+                    current_pod_uid,
+                    successor_generation,
+                    release_kind,
+                    proof_protocol,
+                    captured_workspace_generation or None,
+                    captured_workspace_runtime or None,
+                )
+                if outcome_inserted != "INSERT 0 1":
+                    raise _AttachAbortCASLost
+        return "released"
+    except _AttachAbortCASLost:
+        return "unsafe"
 
 
 async def _assemble_session_attach_payload(
@@ -5556,13 +6858,37 @@ async def _assemble_session_attach_payload(
     if not _thread:
         logger.warning("Session attach: thread %s vanished; refusing", thread_id)
         return None
+    if not _thread_accepts_runtime(_thread):
+        logger.info(
+            "Session attach: thread %s lifecycle %r is not preparable; refusing",
+            thread_id,
+            _thread.get("status"),
+        )
+        return None
 
     _meta = _thread.get("metadata") or {}
     if isinstance(_meta, str):
         try:
             _meta = json.loads(_meta)
         except (json.JSONDecodeError, TypeError):
-            _meta = {}
+            logger.warning(
+                "Session attach: malformed metadata for thread %s; refusing",
+                thread_id,
+            )
+            return None
+    protected_marker = protected_cloud_marker_state(_meta)
+    if protected_marker == "malformed":
+        logger.warning(
+            "Session attach: malformed protected marker for thread %s; refusing",
+            thread_id,
+        )
+        return None
+    if protected_marker == "on" and not await _await_protected_cloud_runtime_ready(
+        thread_id,
+        timeout_s=0,
+        allow_schedule=False,
+    ):
+        return None
 
     # Datasource selections are mutable authorization grants, not frozen
     # capabilities. The caller may have resolved a payload before this function
@@ -5667,8 +6993,104 @@ async def _assemble_session_attach_payload(
         )
         return None
 
+    # Complete every protected reader/selection await before the final
+    # lifecycle read.  Callers hold ``thread_datasource_lock`` across this
+    # helper, so the selected thread_mount row cannot change between this
+    # exact snapshot and the synchronous post-read checks below.
+    prepared_protected_selection: tuple[str, ...] | None = None
+    if protected_marker == "on":
+        prepared_runtime_authority = thread_runtime_authority(_thread)
+        if prepared_runtime_authority is None:
+            return None
+        ro_row, mount_rows = await asyncio.gather(
+            postgres_db.get_ro_mount_by_thread(thread_id),
+            postgres_db.list_thread_mounts(thread_id),
+        )
+        from services.cloud_staging import select_protected_mount
+
+        prepared_protected_selection = _protected_mount_selection_identity(
+            select_protected_mount(mount_rows)
+        )
+        if (
+            prepared_protected_selection is None
+            or not _ro_mount_matches_protected_selection(
+                ro_row,
+                mount_rows,
+                thread_id=thread_id,
+                user_id=str(_thread.get("user_id") or ""),
+                runtime_generation=prepared_runtime_authority.generation,
+            )
+        ):
+            return None
+        if _build_protected_cloud_mount(ro_row, thread_id=thread_id) is None:
+            return None
+
+    # Config/datasource/repository assembly crosses several awaits. End may
+    # commit during any of them, so the response-side credential boundary owns
+    # one authoritative final lifecycle read. Nothing after this read may
+    # await before the payload is returned.
+    final_thread = await postgres_db.get_thread(thread_id)
+    if not _thread_accepts_runtime(final_thread):
+        logger.info(
+            "Session attach: lifecycle changed before payload delivery "
+            "(thread=%s status=%r)",
+            thread_id,
+            (final_thread or {}).get("status"),
+        )
+        return None
+    final_meta = thread_metadata_object(final_thread)
+    final_marker = protected_cloud_marker_state(final_meta)
+    if final_marker == "malformed":
+        return None
+    if final_marker != protected_marker:
+        return None
+    if final_marker == "on" and prepared_protected_selection is None:
+        return None
+    final_runtime_authority = thread_runtime_authority(final_thread)
+    if final_runtime_authority is None and (
+        final_marker != "off" or _require_pinned_status_identity()
+    ):
+        return None
+    final_workspace = final_meta.get("workspace_container") or {}
+    final_binding = final_meta.get("_workspace_binding") or {}
+    if not isinstance(final_workspace, dict) or not isinstance(final_binding, dict):
+        return None
+    final_workspace_generation = final_binding.get("generation")
+    final_workspace_runtime = (
+        final_workspace.get("_docker_workspace_lease_id")
+        if final_workspace.get("provisioner") == "docker"
+        else final_workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+    )
+    if bool(final_workspace_generation) != bool(final_workspace_runtime):
+        return None
+    try:
+        final_workspace_generation = (
+            str(UUID(str(final_workspace_generation)))
+            if final_workspace_generation
+            else None
+        )
+        final_workspace_runtime = (
+            str(UUID(str(final_workspace_runtime))) if final_workspace_runtime else None
+        )
+    except (TypeError, ValueError):
+        return None
+
     return {
         "thread_id": thread_id,
+        # Exact post-0185 contract. The maintenance gate drains old writers;
+        # every admitted pinned lifecycle write must carry this identity.
+        "pinned_status_identity_contract": 1,
+        "pinned_runtime_generation_contract": 1,
+        "session_runtime_generation": (
+            final_runtime_authority.generation
+            if final_runtime_authority is not None
+            else None
+        ),
+        # Non-secret physical identity used by the dual agent's monotonic
+        # pre-setup claim. If actor binding fails before workspace setup, it
+        # can echo this exact tuple while proving that setup never began.
+        "workspace_generation": final_workspace_generation,
+        "workspace_runtime_incarnation": final_workspace_runtime,
         "config_override": None if resolved_config else config_override,
         "resolved_config": resolved_config,
         "project_ids": project_ids,
@@ -5685,6 +7107,7 @@ async def _send_session_attach_locked(
     project_ids: Optional[list] = None,
     datasources: Optional[list] = None,
     config_name: Optional[str] = None,
+    expected_runtime_generation: str | None = None,
 ) -> bool:
     """Send a session attach request to an idle persistent agent.
 
@@ -5705,13 +7128,33 @@ async def _send_session_attach_locked(
     """
     del project_ids, datasources  # recomputed inside the assembly (see docstring)
     thread = await postgres_db.get_thread(thread_id)
-    if not _thread_uses_pinned_execution(thread):
+    runtime_authority = thread_runtime_authority(thread)
+    if not _thread_uses_pinned_execution(thread) or runtime_authority is None:
         logger.warning(
             "Session attach: refusing pinned delivery for thread %s on "
             "execution lane %r",
             thread_id,
             thread.get("execution_lane") if thread else None,
         )
+        return False
+    if (
+        expected_runtime_generation is not None
+        and runtime_authority.generation != expected_runtime_generation
+    ):
+        return False
+    # A protected reader is an admission prerequisite, not work an already
+    # reserved warm agent should wait on.  Keep this authoritative gate inside
+    # the sender so Docker/create and future callers cannot omit it.
+    if not await _await_protected_cloud_runtime_ready(
+        thread_id,
+        timeout_s=0,
+        allow_schedule=False,
+    ):
+        return False
+    thread = await postgres_db.get_thread(thread_id)
+    if not _thread_uses_pinned_execution(thread) or not same_thread_runtime_authority(
+        thread, runtime_authority
+    ):
         return False
     try:
         await prepare_thread_repository_authority(postgres_db, gitea_client, thread)
@@ -5722,8 +7165,32 @@ async def _send_session_attach_locked(
             exc.code,
         )
         return False
+    thread = await postgres_db.get_thread(thread_id)
+    if not _thread_uses_pinned_execution(thread) or not same_thread_runtime_authority(
+        thread, runtime_authority
+    ):
+        return False
+    # Repository authority preparation is another await boundary.  A revoked
+    # reader/current mount selection must fail before either side of the warm
+    # reservation is written.
+    if not await _await_protected_cloud_runtime_ready(
+        thread_id,
+        timeout_s=0,
+        allow_schedule=False,
+    ):
+        return False
+    thread = await postgres_db.get_thread(thread_id)
+    if not _thread_uses_pinned_execution(thread) or not same_thread_runtime_authority(
+        thread, runtime_authority
+    ):
+        return False
     agent_id = str(agent["id"])
-    if not await _reserve_session_attach_binding(agent_id, thread_id):
+    attach_token = await _reserve_session_attach_binding(
+        agent_id,
+        thread_id,
+        expected_runtime_generation=runtime_authority.generation,
+    )
+    if attach_token is None:
         return False
     payload = await _assemble_session_attach_payload(
         thread_id,
@@ -5733,7 +7200,13 @@ async def _send_session_attach_locked(
     )
     if payload is None:
         try:
-            await _release_session_attach_binding(agent_id, thread_id)
+            release = await _release_session_attach_binding(
+                agent_id,
+                thread_id,
+                expected_runtime_generation=runtime_authority.generation,
+                expected_attach_token=attach_token,
+                pre_delivery=True,
+            )
         except Exception:
             # A failed release is ambiguous ownership, just like a failed HTTP
             # attach. Retain/fence it for the reconciler; never provision a
@@ -5745,7 +7218,59 @@ async def _send_session_attach_locked(
                 thread_id,
             )
             return True
-        return False
+        if release in {"released", "already_detached"}:
+            _schedule_attach_abort_successor(
+                thread_id,
+                retired_runtime_generation=runtime_authority.generation,
+                retired_attach_token=attach_token,
+                retired_agent_id=agent_id,
+            )
+        return release not in {"released", "already_detached"}
+
+    payload_generation = str(payload.get("session_runtime_generation") or "")
+    if payload_generation != runtime_authority.generation:
+        release = await _release_session_attach_binding(
+            agent_id,
+            thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+            expected_attach_token=attach_token,
+            pre_delivery=True,
+        )
+        if release in {"released", "already_detached"}:
+            _schedule_attach_abort_successor(
+                thread_id,
+                retired_runtime_generation=runtime_authority.generation,
+                retired_attach_token=attach_token,
+                retired_agent_id=agent_id,
+            )
+        return release not in {"released", "already_detached"}
+    payload["session_runtime_attach_token"] = attach_token
+
+    current = await postgres_db.get_thread(thread_id)
+    if (
+        not _thread_uses_pinned_execution(current)
+        or not same_thread_runtime_authority(current, runtime_authority)
+        or str(current.get("agent_id") or "") != agent_id
+        or str(current.get("runtime_attach_token") or "") != attach_token
+    ):
+        release = await _release_session_attach_binding(
+            agent_id,
+            thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+            expected_attach_token=attach_token,
+            pre_delivery=True,
+        )
+        if release in {"released", "already_detached"}:
+            _schedule_attach_abort_successor(
+                thread_id,
+                retired_runtime_generation=runtime_authority.generation,
+                retired_attach_token=attach_token,
+                retired_agent_id=agent_id,
+            )
+        # An unsafe/unconfirmed release still owns enough authority that a
+        # fallback runtime would create a double owner.  Report the delivery
+        # as ambiguous and leave the reconciler/process latch to fence it.
+        return release not in {"released", "already_detached"}
 
     agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
     try:
@@ -5855,6 +7380,35 @@ def _materialized_session_class_override(
         "enabled": officer.get("enabled") is True,
         "conference": officer.get("conference") is True,
     }
+
+
+def _protected_cloud_officer_active(effective_config: Any) -> bool:
+    """Whether an effective/resolved config selects the officer ceiling.
+
+    Create-time merged fragments carry ``officer`` at the root; delivered
+    resolved blobs carry it under ``agent``.  Accept both exact shapes without
+    truthiness coercion so expert/account defaults are checked just like an
+    explicit request override.  Conference-only sessions keep the ordinary
+    interactive tool plane (``officer.enabled`` is false) and are therefore
+    not rejected by this officer-specific boundary.
+    """
+
+    if not isinstance(effective_config, dict):
+        raise ValueError("session class configuration is malformed")
+    candidate = effective_config
+    if "agent" in effective_config:
+        candidate = effective_config.get("agent")
+        if not isinstance(candidate, dict):
+            raise ValueError("session class configuration is malformed")
+    officer = candidate.get("officer")
+    if officer is None:
+        return False
+    if not isinstance(officer, dict):
+        raise ValueError("session class configuration is malformed")
+    enabled = officer.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("session class configuration is malformed")
+    return enabled is True
 
 
 def _require_stateless_workspace(thread: dict[str, Any]) -> str:
@@ -8307,6 +9861,1679 @@ async def _release_thread_resources(
         logger.exception("Persistent pod cleanup failed for thread %s", thread_id)
 
 
+async def _pinned_retirement_is_current(retirement: Mapping[str, Any]) -> bool:
+    """Recheck one durable pinned cleanup token without reopening admission."""
+
+    current = await postgres_db.get_thread(
+        str(retirement.get("context", {}).get("thread_id") or "")
+    )
+    return bool(
+        current
+        and str(current.get("runtime_generation") or "")
+        == str(retirement.get("generation") or "")
+        and str(current.get("runtime_retirement_token") or "")
+        == str(retirement.get("token") or "")
+        and bool(current.get("runtime_retirement_permanent"))
+        == bool(retirement.get("permanent"))
+    )
+
+
+def _retirement_context_runtime_exposed(
+    retirement: Mapping[str, Any],
+) -> bool:
+    """Whether this generation ever delivered a process authority.
+
+    New Begin rows carry the database-monotonic exposure bit.  The identity
+    fallback is deliberately conservative for an already-pending marker
+    written during a rolling upgrade.
+    """
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    if not isinstance(context, Mapping):
+        return True
+    return bool(
+        context.get("runtime_authority_exposed") is True
+        or context.get("agent_id")
+        or context.get("runtime_attach_token")
+        or context.get("agent") not in (None, {})
+        or context.get("agent_pod") not in (None, {})
+        or context.get("agent_pod_provision_intent") not in (None, {})
+    )
+
+
+def _retirement_json_field_is_nonnull(value: Mapping[str, Any], key: str) -> bool:
+    return key in value and value[key] is not None
+
+
+def _retirement_json_status_is_absent(value: Mapping[str, Any]) -> bool:
+    if "status" not in value or value["status"] is None:
+        return True
+    return isinstance(value["status"], str) and value["status"] in {"", "deleted"}
+
+
+def _never_delivered_protected_reader_shape(
+    retirement: Mapping[str, Any],
+    thread: Mapping[str, Any],
+    row: Mapping[str, Any] | None,
+    *,
+    require_current_revoked: bool,
+) -> bool:
+    """Prove a protected grant existed but no runtime could receive it.
+
+    ``cloud_ro_mounts.status='active'`` records backend probe completion, not
+    credential delivery.  A retirement that captured no actor, workspace,
+    binding, VM, or staged overlay may revoke that exact reader first and then
+    publish a zero-stage receipt.  This predicate is shared by the pre-stage
+    actuator and receipt replay so a later/replacement row cannot be relabelled
+    as the captured source.
+    """
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    if not isinstance(context, Mapping):
+        return False
+    raw_metadata = thread.get("metadata")
+    raw_metadata = {} if raw_metadata is None else raw_metadata
+    if isinstance(raw_metadata, str):
+        try:
+            raw_metadata = json.loads(raw_metadata)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(raw_metadata, Mapping):
+        return False
+
+    def _object_or_empty(value: Any) -> Mapping[str, Any] | None:
+        if value is None:
+            return {}
+        return value if isinstance(value, Mapping) else None
+
+    captured_workspace = _object_or_empty(context.get("workspace_container"))
+    captured_binding = _object_or_empty(context.get("workspace_binding"))
+    captured_vm = _object_or_empty(context.get("vm"))
+    current_workspace = _object_or_empty(raw_metadata.get("workspace_container"))
+    current_binding = _object_or_empty(raw_metadata.get("_workspace_binding"))
+    current_vm = _object_or_empty(raw_metadata.get("vm"))
+    if any(
+        value is None
+        for value in (
+            captured_workspace,
+            captured_binding,
+            captured_vm,
+            current_workspace,
+            current_binding,
+            current_vm,
+        )
+    ):
+        return False
+    assert captured_workspace is not None
+    assert captured_binding is not None
+    assert captured_vm is not None
+    assert current_workspace is not None
+    assert current_binding is not None
+    assert current_vm is not None
+
+    def _empty_actor(value: Any) -> bool:
+        return value is None or isinstance(value, Mapping) and not value
+
+    workspace_fields = (
+        WORKSPACE_RUNTIME_INCARNATION_KEY,
+        "_docker_workspace_lease_id",
+        "pod_ip",
+        "pod_name",
+        "host",
+        "port",
+        "ide_host",
+        "ide_port",
+        "_canvas_workspace_generation",
+    )
+    vm_fields = (
+        "provision_generation",
+        "identity_provision_generation",
+        "vm_uid",
+        "_runtime_incarnation",
+        "rootdisk_pvc_uid",
+        "ssh_host",
+        "ssh_port",
+        "_canvas_workspace_generation",
+    )
+    captured_agent_pod = context.get("agent_pod")
+    captured_provision_intent = context.get("agent_pod_provision_intent")
+    pre_registration_process_zero = bool(
+        context.get("runtime_authority_exposed") is True
+        and thread.get("runtime_authority_exposed") is True
+        and context.get("agent_id") is None
+        and context.get("runtime_attach_token") is None
+        and _empty_actor(context.get("agent"))
+        and isinstance(captured_agent_pod, Mapping)
+        and captured_agent_pod
+        and _empty_actor(raw_metadata.get("agent_pod"))
+        and _retirement_has_exact_local_quiescence(retirement, thread)
+    )
+    pre_provision_process_zero = bool(
+        context.get("runtime_authority_exposed") is True
+        and thread.get("runtime_authority_exposed") is True
+        and context.get("agent_id") is None
+        and context.get("runtime_attach_token") is None
+        and _empty_actor(context.get("agent"))
+        and _empty_actor(context.get("agent_pod"))
+        and isinstance(captured_provision_intent, Mapping)
+        and captured_provision_intent
+        and _empty_actor(raw_metadata.get("agent_pod"))
+        and _retirement_has_exact_local_quiescence(retirement, thread)
+    )
+    process_authority_zero = bool(
+        context.get("runtime_authority_exposed") is False
+        and thread.get("runtime_authority_exposed") is False
+        and _empty_actor(context.get("agent"))
+        and _empty_actor(context.get("agent_pod"))
+        or pre_registration_process_zero
+        or pre_provision_process_zero
+    )
+    no_runtime = bool(
+        str(thread.get("runtime_generation") or "")
+        == str(retirement.get("generation") or "")
+        and str(thread.get("runtime_retirement_token") or "")
+        == str(retirement.get("token") or "")
+        and context.get("protected_cloud") is True
+        and raw_metadata.get("protected_cloud") is True
+        and process_authority_zero
+        and context.get("agent_id") is None
+        and context.get("control_admission_agent_id") is None
+        and context.get("runtime_attach_token") is None
+        and _empty_actor(raw_metadata.get("agent_pod"))
+        and thread.get("agent_id") is None
+        and thread.get("control_admission_agent_id") is None
+        and thread.get("runtime_attach_token") is None
+        and captured_workspace == current_workspace
+        and captured_binding == current_binding == {}
+        and captured_vm == current_vm
+        and _retirement_json_status_is_absent(captured_workspace)
+        and not any(
+            _retirement_json_field_is_nonnull(captured_workspace, field)
+            for field in workspace_fields
+        )
+        and _retirement_json_status_is_absent(captured_vm)
+        and not any(
+            _retirement_json_field_is_nonnull(captured_vm, field) for field in vm_fields
+        )
+    )
+    if not no_runtime:
+        return False
+
+    captured_ro = context.get("protected_ro")
+    if captured_ro is None:
+        return row is None
+    if not isinstance(captured_ro, Mapping):
+        return False
+    try:
+        UUID(str(captured_ro["id"]))
+        UUID(str(captured_ro["runtime_generation"]))
+        staged_epoch = int(captured_ro["staged_epoch"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    captured_plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(captured_ro)
+    if captured_plan is None:
+        return False
+    captured_status = str(captured_ro.get("status") or "")
+    captured_baseline = captured_ro.get("etag_baseline")
+    if not (
+        str(captured_ro.get("runtime_generation") or "")
+        == str(retirement.get("generation") or "")
+        and captured_ro.get("backend") == "nextcloud"
+        and str(captured_ro.get("user_id") or "") == str(context.get("user_id") or "")
+        and str(captured_ro.get("thread_id") or "")
+        == str(context.get("thread_id") or "")
+        and captured_status in {"engaging", "active", "revoking", "revoked"}
+        and (
+            isinstance(captured_baseline, Mapping)
+            if captured_status == "active"
+            else captured_baseline is None or isinstance(captured_baseline, Mapping)
+        )
+        and staged_epoch == 0
+        and captured_ro.get("staged_summary") is None
+    ):
+        return False
+    if row is None:
+        return True
+    try:
+        current_epoch = int(row["staged_epoch"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    current_plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(row)
+    expected_current_statuses = (
+        {"revoked"}
+        if require_current_revoked
+        else {
+            captured_status,
+            "revoking",
+            "revoked",
+        }
+    )
+    return bool(
+        str(row.get("id") or "") == str(captured_ro.get("id") or "")
+        and current_plan == captured_plan
+        and str(row.get("user_id") or "") == str(captured_ro.get("user_id") or "")
+        and str(row.get("runtime_generation") or "")
+        == str(captured_ro.get("runtime_generation") or "")
+        and str(row.get("engage_attempt") or "")
+        == str(captured_ro.get("engage_attempt") or "")
+        and str(row.get("status") or "") in expected_current_statuses
+        and row.get("etag_baseline") == captured_baseline
+        and current_epoch == 0
+        and row.get("staged_summary") is None
+    )
+
+
+async def _revoke_never_delivered_protected_reader(
+    retirement: Mapping[str, Any],
+    thread: Mapping[str, Any],
+    row: Mapping[str, Any] | None,
+) -> bool:
+    """Exact-revoke the pre-agent reader before mandatory soft staging."""
+
+    context = retirement.get("context") or {}
+    captured_ro = context.get("protected_ro") if isinstance(context, Mapping) else None
+    if not isinstance(captured_ro, Mapping) or not (
+        _never_delivered_protected_reader_shape(
+            retirement,
+            thread,
+            row,
+            require_current_revoked=False,
+        )
+    ):
+        return False
+    plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(captured_ro)
+    if plan is None:
+        return False
+    backend = await _resolve_protected_reader_backend(plan)
+    current_status = str((row or {}).get("status") or "")
+    revoked = current_status == "revoked"
+    if not revoked:
+        revoked = await revoke_ro_mount_attempt(
+            backend=backend,
+            postgres_db=postgres_db,
+            row_id=str(captured_ro.get("id") or ""),
+            thread_id=str(context.get("thread_id") or ""),
+            runtime_generation=str(captured_ro.get("runtime_generation") or ""),
+            plan=plan,
+        )
+    current = await postgres_db.get_ro_mount_by_thread(
+        str(context.get("thread_id") or "")
+    )
+    if (
+        not revoked
+        and current is not None
+        and str(current.get("status") or "") != "revoked"
+    ):
+        return False
+    fresh_thread = await postgres_db.get_thread(str(context.get("thread_id") or ""))
+    return bool(
+        fresh_thread
+        and _never_delivered_protected_reader_shape(
+            retirement,
+            fresh_thread,
+            current,
+            require_current_revoked=True,
+        )
+    )
+
+
+def _retirement_has_exact_local_quiescence(
+    retirement: Mapping[str, Any], thread: Mapping[str, Any]
+) -> bool:
+    """Validate the append-only local cleanup receipt for this exact life."""
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    receipt = thread.get("runtime_retirement_local_quiescence")
+    if isinstance(receipt, str):
+        try:
+            receipt = json.loads(receipt)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(context, Mapping) or not isinstance(receipt, Mapping):
+        return False
+    workspace = context.get("workspace_container")
+    binding = context.get("workspace_binding")
+    vm = context.get("vm")
+    agent = context.get("agent")
+    agent_pod = context.get("agent_pod")
+    provision_intent = context.get("agent_pod_provision_intent")
+    workspace_provision_intent = context.get("workspace_provision_intent")
+    workspace_claim = context.get("agent_workspace_claim")
+    protected_ro = context.get("protected_ro")
+    workspace = {} if workspace is None else workspace
+    binding = {} if binding is None else binding
+    vm = {} if vm is None else vm
+    agent = {} if agent is None else agent
+    agent_pod = {} if agent_pod is None else agent_pod
+    provision_intent = {} if provision_intent is None else provision_intent
+    workspace_provision_intent = (
+        {} if workspace_provision_intent is None else workspace_provision_intent
+    )
+    workspace_claim = {} if workspace_claim is None else workspace_claim
+    protected_ro = {} if protected_ro is None else protected_ro
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            workspace,
+            binding,
+            vm,
+            agent,
+            agent_pod,
+            provision_intent,
+            workspace_provision_intent,
+            workspace_claim,
+            protected_ro,
+        )
+    ):
+        return False
+    if (
+        agent
+        and (not agent.get("hostname") or not agent.get("pod_uid"))
+        or agent_pod
+        and (not agent_pod.get("pod_name") or not agent_pod.get("pod_uid"))
+        or provision_intent
+        and (
+            not provision_intent.get("attempt_id")
+            or not provision_intent.get("pod_name")
+            or provision_intent.get("provisioner") not in {"agent", "persistent"}
+            or provision_intent.get("status") != "planned"
+        )
+        or workspace_claim
+        and (
+            not workspace_claim.get("claim_id")
+            or not workspace_claim.get("pvc_name")
+            or workspace_claim.get("provisioner") not in {"agent", "persistent"}
+            or workspace_claim.get("status") not in {"planned", "ready"}
+            or (workspace_claim.get("status") == "ready")
+            != bool(str(workspace_claim.get("pvc_uid") or ""))
+        )
+    ):
+        return False
+    backend = str(context.get("workspace_backend") or "")
+    sandbox_generation = binding.get("generation")
+    sandbox_runtime = (
+        workspace.get("_docker_workspace_lease_id")
+        if workspace.get("provisioner") == "docker"
+        else workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+    )
+    sandbox_physical_evidence = bool(
+        binding
+        or _retirement_json_field_is_nonnull(
+            workspace, WORKSPACE_RUNTIME_INCARNATION_KEY
+        )
+        or not _retirement_json_status_is_absent(workspace)
+        or any(
+            _retirement_json_field_is_nonnull(workspace, field)
+            for field in (
+                "pod_ip",
+                "pod_name",
+                "host",
+                "port",
+                "ide_host",
+                "ide_port",
+                "_canvas_workspace_generation",
+            )
+        )
+    )
+    pre_provision_intent_zero = bool(
+        provision_intent
+        and not agent
+        and not agent_pod
+        and context.get("agent_id") is None
+        and context.get("runtime_attach_token") is None
+    )
+    workspace_create_pending = bool(workspace_provision_intent)
+    if pre_provision_intent_zero or workspace_create_pending:
+        expected_protocol = "agent_runtime_zero_v1"
+    elif backend == "sandbox":
+        if (
+            bool(retirement.get("permanent"))
+            and sandbox_physical_evidence
+            and str(receipt.get("quiescence_actor") or "") == "orchestrator"
+            and str(receipt.get("quiescence_protocol") or "")
+            == "sandbox_actuator_zero_v1"
+        ):
+            expected_protocol = "sandbox_actuator_zero_v1"
+        elif sandbox_generation and sandbox_runtime:
+            expected_protocol = "workspace_process_zero_v1"
+        elif not sandbox_generation and not sandbox_runtime:
+            expected_protocol = "agent_runtime_zero_v1"
+        else:
+            return False
+    elif backend in {"virtual", "none"}:
+        expected_protocol = "agent_runtime_zero_v1"
+    elif backend in {"vm", "remote"}:
+        expected_protocol = "workspace_actuator_zero_v1"
+    else:
+        expected_protocol = None
+    expected_workspace_generation = (
+        None
+        if pre_provision_intent_zero or workspace_create_pending
+        else sandbox_generation
+        if backend == "sandbox"
+        else vm.get("provision_generation")
+        if backend in {"vm", "remote"}
+        else None
+    )
+    expected_workspace_runtime = (
+        None
+        if pre_provision_intent_zero or workspace_create_pending
+        else sandbox_runtime
+        if backend == "sandbox"
+        else vm.get("vm_uid")
+        if backend in {"vm", "remote"}
+        else None
+    )
+    pre_registration_pod_zero = bool(
+        agent_pod
+        and not agent
+        and context.get("agent_id") is None
+        and context.get("runtime_attach_token") is None
+    )
+    return bool(
+        int(receipt.get("version") or 0) == 1
+        and str(receipt.get("runtime_generation") or "")
+        == str(retirement.get("generation") or "")
+        and str(receipt.get("retirement_token") or "")
+        == str(retirement.get("token") or "")
+        and str(receipt.get("agent_id") or "") == str(context.get("agent_id") or "")
+        and str(receipt.get("runtime_attach_token") or "")
+        == str(context.get("runtime_attach_token") or "")
+        and str(receipt.get("settle_status") or "")
+        == str(context.get("settle_status") or "")
+        and expected_protocol is not None
+        and str(receipt.get("quiescence_protocol") or "") == expected_protocol
+        and str(receipt.get("quiescence_actor") or "") in {"agent", "orchestrator"}
+        and str(receipt.get("workspace_generation") or "")
+        == str(expected_workspace_generation or "")
+        and str(receipt.get("workspace_runtime_incarnation") or "")
+        == str(expected_workspace_runtime or "")
+        and (
+            not pre_registration_pod_zero
+            or (
+                str(receipt.get("quiescence_actor") or "") == "orchestrator"
+                and str(receipt.get("quiescence_protocol") or "")
+                == "agent_runtime_zero_v1"
+                and str(receipt.get("agent_pod_name") or "")
+                == str(agent_pod.get("pod_name") or "")
+                and str(receipt.get("agent_pod_uid") or "")
+                == str(agent_pod.get("pod_uid") or "")
+            )
+        )
+        and (
+            not pre_provision_intent_zero
+            or (
+                str(receipt.get("quiescence_actor") or "") == "orchestrator"
+                and str(receipt.get("quiescence_protocol") or "")
+                == "agent_runtime_zero_v1"
+                and str(receipt.get("agent_pod_provision_attempt") or "")
+                == str(provision_intent.get("attempt_id") or "")
+                and str(receipt.get("agent_pod_name") or "")
+                == str(provision_intent.get("pod_name") or "")
+                and bool(str(receipt.get("agent_pod_uid") or ""))
+                and receipt.get("agent_pod_fence_protocol") == "k8s_name_tombstone_v1"
+            )
+        )
+    )
+
+
+async def _wait_for_captured_agent_pod_retired(
+    pod_name: str, pod_uid: str, *, timeout_s: float = 60.0
+) -> bool:
+    """Wait until one exact Pod process is absent/terminal, never by name."""
+
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while True:
+        authority = await agent_provisioner.agent_pod_authority(
+            pod_name, expected_pod_uid=pod_uid
+        )
+        if authority in {"exact_absent", "exact_terminal", "replacement"}:
+            return True
+        if authority != "exact_live" and asyncio.get_running_loop().time() >= deadline:
+            return False
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.25)
+
+
+def _captured_retirement_agent_pods(
+    retirement: Mapping[str, Any],
+) -> set[tuple[str, str]]:
+    """Return immutable agent Pod name/UID pairs from one Begin context."""
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    if not isinstance(context, Mapping):
+        return set()
+    captured: set[tuple[str, str]] = set()
+    agent = context.get("agent") or {}
+    if isinstance(agent, Mapping) and agent:
+        captured.add(
+            (str(agent.get("hostname") or ""), str(agent.get("pod_uid") or ""))
+        )
+    agent_pod = context.get("agent_pod") or {}
+    if isinstance(agent_pod, Mapping) and agent_pod:
+        captured.add(
+            (
+                str(agent_pod.get("pod_name") or ""),
+                str(agent_pod.get("pod_uid") or ""),
+            )
+        )
+    return captured
+
+
+async def _stop_captured_retirement_agent(
+    retirement: Mapping[str, Any],
+) -> None:
+    """Delete/wait only the exact captured actor process, never by name."""
+
+    for pod_name, pod_uid in _captured_retirement_agent_pods(retirement):
+        if not pod_name and not pod_uid:
+            continue
+        if not pod_name or not pod_uid or not agent_provisioner.is_available:
+            raise RuntimeError("captured agent Pod identity is incomplete")
+        if not await agent_provisioner.delete_agent_pod_exact(
+            pod_name, expected_pod_uid=pod_uid
+        ):
+            raise RuntimeError("exact agent Pod deletion is retryable")
+        if not await _wait_for_captured_agent_pod_retired(pod_name, pod_uid):
+            raise RuntimeError("exact agent Pod termination is retryable")
+
+
+def _pre_registration_agent_pod_zero_candidate(
+    retirement: Mapping[str, Any], thread: Mapping[str, Any]
+) -> tuple[str, str] | None:
+    """Return the sole captured Pod for a created life never registered.
+
+    The retirement token closes the persistent registration/bind boundary.
+    This shape has no session identity capable of acknowledging cleanup, so an
+    exact Pod UID stop is the only truthful process-zero actuator.  A bound,
+    active, incomplete, replaced, or already-cleared marker is never adopted.
+    """
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    if not isinstance(context, Mapping):
+        return None
+    raw_metadata = thread.get("metadata")
+    raw_metadata = {} if raw_metadata is None else raw_metadata
+    if isinstance(raw_metadata, str):
+        try:
+            raw_metadata = json.loads(raw_metadata)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw_metadata, Mapping):
+        return None
+    captured_agent = context.get("agent")
+    captured_pod = context.get("agent_pod")
+    current_pod = raw_metadata.get("agent_pod")
+    if not (
+        str(thread.get("runtime_generation") or "")
+        == str(retirement.get("generation") or "")
+        and str(thread.get("runtime_retirement_token") or "")
+        == str(retirement.get("token") or "")
+        and str(thread.get("status") or "") == "created"
+        and str(context.get("entry_status") or "") == "created"
+        and context.get("runtime_authority_exposed") is True
+        and context.get("agent_id") is None
+        and context.get("control_admission_agent_id") is None
+        and context.get("runtime_attach_token") is None
+        and (
+            captured_agent is None
+            or isinstance(captured_agent, Mapping)
+            and not captured_agent
+        )
+        and isinstance(captured_pod, Mapping)
+        and captured_pod
+        and current_pod == captured_pod
+        and thread.get("agent_id") is None
+        and thread.get("control_admission_agent_id") is None
+        and thread.get("runtime_attach_token") is None
+    ):
+        return None
+    pod_name = str(captured_pod.get("pod_name") or "")
+    pod_uid = str(captured_pod.get("pod_uid") or "")
+    return (pod_name, pod_uid) if pod_name and pod_uid else None
+
+
+async def _recover_pre_registration_agent_pod_zero(
+    retirement: Mapping[str, Any], thread: Mapping[str, Any]
+) -> bool:
+    """Exact-stop and receipt one pre-registration claimant Pod."""
+
+    pod = _pre_registration_agent_pod_zero_candidate(retirement, thread)
+    if pod is None:
+        return False
+    context = retirement.get("context") or {}
+    thread_id = str(context.get("thread_id") or "")
+    # Sanctioned registration takes the same advisory lifecycle lock as End;
+    # this pre-effect check therefore cannot race its unbound-agent insert.
+    # The post-effect receipt CAS repeats it against direct/legacy writers.
+    matching_agent = await postgres_db.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM agents "
+        "WHERE thread_id=$1::uuid OR hostname=$2 OR pod_uid=$3)",
+        thread_id,
+        pod[0],
+        pod[1],
+    )
+    if matching_agent:
+        return False
+    try:
+        await _stop_captured_retirement_agent(retirement)
+    except Exception:
+        logger.exception(
+            "Pre-registration agent Pod stop remains retryable for thread %s",
+            thread_id,
+        )
+        return False
+    receipt = await postgres_db.acknowledge_pinned_thread_pre_registration_pod_zero(
+        thread_id,
+        expected_runtime_generation=str(retirement.get("generation") or ""),
+        expected_retirement_token=str(retirement.get("token") or ""),
+        expected_pod_name=pod[0],
+        expected_pod_uid=pod[1],
+    )
+    return receipt is not None
+
+
+def _agent_pod_provision_intent_zero_candidate(
+    retirement: Mapping[str, Any], thread: Mapping[str, Any]
+) -> dict[str, str] | None:
+    """Return one captured pre-effect Pod attempt with no session owner."""
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    if not isinstance(context, Mapping):
+        return None
+    intent = context.get("agent_pod_provision_intent")
+    if not isinstance(intent, Mapping) or not intent:
+        return None
+    metadata = thread.get("metadata")
+    metadata = {} if metadata is None else metadata
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(metadata, Mapping):
+        return None
+    attempt_id = str(intent.get("attempt_id") or "")
+    pod_name = str(intent.get("pod_name") or "")
+    provisioner = str(intent.get("provisioner") or "")
+    try:
+        UUID(attempt_id)
+    except (TypeError, ValueError):
+        return None
+    if not (
+        provisioner in {"agent", "persistent"}
+        and pod_name
+        and str(intent.get("status") or "") == "planned"
+        and str(intent.get("thread_id") or "") == str(context.get("thread_id") or "")
+        and str(intent.get("runtime_generation") or "")
+        == str(retirement.get("generation") or "")
+        and str(thread.get("runtime_generation") or "")
+        == str(retirement.get("generation") or "")
+        and str(thread.get("runtime_retirement_token") or "")
+        == str(retirement.get("token") or "")
+        and context.get("runtime_authority_exposed") is True
+        and context.get("agent_id") is None
+        and context.get("control_admission_agent_id") is None
+        and context.get("runtime_attach_token") is None
+        and context.get("agent") in (None, {})
+        and context.get("agent_pod") in (None, {})
+        and thread.get("agent_id") is None
+        and thread.get("control_admission_agent_id") is None
+        and thread.get("runtime_attach_token") is None
+        and metadata.get("agent_pod") in (None, {})
+    ):
+        return None
+    return {
+        "attempt_id": attempt_id,
+        "pod_name": pod_name,
+        "provisioner": provisioner,
+    }
+
+
+async def _recover_agent_pod_provision_intent_zero(
+    retirement: Mapping[str, Any], thread: Mapping[str, Any]
+) -> bool:
+    """Resolve an accepted-or-absent create attempt before settlement."""
+
+    intent = _agent_pod_provision_intent_zero_candidate(retirement, thread)
+    if intent is None:
+        return False
+    context = retirement.get("context") or {}
+    thread_id = str(context.get("thread_id") or "")
+    provider = (
+        persistent_provisioner
+        if intent["provisioner"] == "persistent"
+        else agent_provisioner
+    )
+    if not provider.is_available:
+        return False
+    if await postgres_db.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM agents WHERE thread_id=$1::uuid OR hostname=$2)",
+        thread_id,
+        intent["pod_name"],
+    ):
+        return False
+    generation = str(retirement.get("generation") or "")
+    token = str(retirement.get("token") or "")
+    if not await postgres_db.revoke_pinned_agent_pod_provision_intent(
+        thread_id,
+        expected_runtime_generation=generation,
+        expected_retirement_token=token,
+        expected_attempt_id=intent["attempt_id"],
+        expected_pod_name=intent["pod_name"],
+    ):
+        return False
+
+    intent_row = await postgres_db.fetchrow(
+        "SELECT status,pod_uid FROM thread_agent_pod_provision_intents "
+        "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid",
+        intent["attempt_id"],
+        thread_id,
+    )
+    if intent_row is None:
+        return False
+    intent_status = str(intent_row["status"] or "")
+    fence_uid = str(intent_row["pod_uid"] or "")
+    if intent_status == "fenced":
+        observed = await provider.agent_pod_provision_intent_authority(
+            intent["pod_name"],
+            expected_thread_id=thread_id,
+            expected_runtime_generation=generation,
+            expected_attempt_id=intent["attempt_id"],
+        )
+        if not (
+            isinstance(observed, Mapping)
+            and str(observed.get("state") or "") == "exact_fence"
+            and str(observed.get("pod_uid") or "") == fence_uid
+        ):
+            return False
+    elif intent_status == "revoking":
+        # A same-name CREATE is the causal barrier. A GET 404 alone could run
+        # before the original credential-bearing request commits. If an
+        # original manifest already owns the name, delete that exact UID and
+        # retry until the *secret-free* fence itself wins. The retained fence
+        # stays live through settlement/deletion so no delayed create CAS can
+        # observe the key absent.
+        deadline = asyncio.get_running_loop().time() + 60.0
+        while True:
+            fenced = await provider.fence_agent_pod_provision_intent(
+                intent["pod_name"],
+                expected_thread_id=thread_id,
+                expected_runtime_generation=generation,
+                expected_attempt_id=intent["attempt_id"],
+            )
+            if not isinstance(fenced, Mapping):
+                return False
+            fence_state = str(fenced.get("state") or "")
+            candidate_uid = str(fenced.get("pod_uid") or "")
+            if fence_state == "exact_fence":
+                fence_uid = candidate_uid
+                break
+            if fence_state != "exact_original" or not candidate_uid:
+                return False
+            deleted = (
+                await persistent_provisioner.delete_agent_pod_exact(
+                    thread_id, expected_pod_uid=candidate_uid
+                )
+                if intent["provisioner"] == "persistent"
+                else await agent_provisioner.delete_agent_pod_exact(
+                    intent["pod_name"], expected_pod_uid=candidate_uid
+                )
+            )
+            if not deleted:
+                return False
+            while True:
+                authority = await provider.agent_pod_authority(
+                    intent["pod_name"], expected_pod_uid=candidate_uid
+                )
+                if authority == "exact_absent":
+                    break
+                if authority == "replacement":
+                    # The next loop classifies whether another delayed exact
+                    # create or a foreign successor won the name.
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    return False
+                await asyncio.sleep(0.2)
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+        if (
+            not fence_uid
+            or not await postgres_db.fence_pinned_agent_pod_provision_intent(
+                thread_id,
+                expected_runtime_generation=generation,
+                expected_retirement_token=token,
+                expected_attempt_id=intent["attempt_id"],
+                expected_pod_name=intent["pod_name"],
+                fence_pod_uid=fence_uid,
+            )
+        ):
+            return False
+        intent_status = "fenced"
+    if intent_status != "fenced" or not fence_uid:
+        return False
+
+    receipt = await postgres_db.acknowledge_pinned_agent_pod_provision_intent_zero(
+        thread_id,
+        expected_runtime_generation=generation,
+        expected_retirement_token=token,
+        expected_attempt_id=intent["attempt_id"],
+        expected_pod_name=intent["pod_name"],
+        observed_pod_uid=fence_uid,
+    )
+    return receipt is not None
+
+
+def _captured_agent_workspace_claim(
+    retirement: Mapping[str, Any],
+) -> dict[str, str] | None:
+    """Validate the immutable PVC claim frozen by retirement Begin."""
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    if not isinstance(context, Mapping):
+        return None
+    raw = context.get("agent_workspace_claim")
+    if raw in (None, {}):
+        return None
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("captured agent workspace claim is malformed")
+    values = {
+        "claim_id": str(raw.get("claim_id") or ""),
+        "thread_id": str(raw.get("thread_id") or ""),
+        "created_runtime_generation": str(raw.get("created_runtime_generation") or ""),
+        "create_attempt": str(raw.get("create_attempt") or ""),
+        "provisioner": str(raw.get("provisioner") or ""),
+        "pvc_name": str(raw.get("pvc_name") or ""),
+        "status": str(raw.get("status") or ""),
+        "pvc_uid": str(raw.get("pvc_uid") or ""),
+    }
+    try:
+        UUID(values["claim_id"])
+        UUID(values["thread_id"])
+        UUID(values["created_runtime_generation"])
+        UUID(values["create_attempt"])
+    except (TypeError, ValueError):
+        raise RuntimeError("captured agent workspace claim UUID is malformed") from None
+    if not (
+        values["thread_id"] == str(context.get("thread_id") or "")
+        and values["provisioner"] in {"agent", "persistent"}
+        and values["pvc_name"]
+        and values["status"] in {"planned", "ready"}
+        and (values["status"] == "ready") == bool(values["pvc_uid"])
+    ):
+        raise RuntimeError("captured agent workspace claim authority is incomplete")
+    return values
+
+
+async def _reconcile_agent_workspace_claim_for_retirement(
+    retirement: Mapping[str, Any],
+) -> None:
+    """Retain a soft PVC or causally fence a permanently retired PVC name."""
+
+    claim = _captured_agent_workspace_claim(retirement)
+    if claim is None:
+        return
+    provider = (
+        persistent_provisioner
+        if claim["provisioner"] == "persistent"
+        else agent_provisioner
+    )
+    if not provider.is_available:
+        raise RuntimeError("captured agent workspace provisioner is unavailable")
+    context = retirement.get("context") or {}
+    thread_id = str(context.get("thread_id") or "")
+    generation = str(retirement.get("generation") or "")
+    token = str(retirement.get("token") or "")
+    if not bool(retirement.get("permanent")):
+        retained_uid = await provider.ensure_agent_workspace_claim(
+            claim["pvc_name"],
+            expected_thread_id=thread_id,
+            expected_runtime_generation=claim["created_runtime_generation"],
+            expected_claim_id=claim["claim_id"],
+            expected_create_attempt=claim["create_attempt"],
+            expected_pvc_uid=claim["pvc_uid"] or None,
+        )
+        if (
+            not retained_uid
+            or not await postgres_db.publish_pinned_agent_workspace_claim(
+                thread_id,
+                expected_runtime_generation=generation,
+                expected_retirement_token=token,
+                claim_id=claim["claim_id"],
+                pvc_name=claim["pvc_name"],
+                pvc_uid=retained_uid,
+            )
+        ):
+            raise RuntimeError("exact agent workspace retention is retryable")
+        return
+
+    if not await postgres_db.revoke_pinned_agent_workspace_claim(
+        thread_id,
+        expected_runtime_generation=generation,
+        expected_retirement_token=token,
+        expected_claim_id=claim["claim_id"],
+        expected_pvc_name=claim["pvc_name"],
+    ):
+        raise RuntimeError("agent workspace claim revocation is retryable")
+    claim_row = await postgres_db.fetchrow(
+        "SELECT status,pvc_uid FROM thread_agent_workspace_claims "
+        "WHERE claim_id=$1::uuid AND thread_id=$2::uuid",
+        claim["claim_id"],
+        thread_id,
+    )
+    if claim_row is None:
+        raise RuntimeError("agent workspace claim disappeared")
+    claim_status = str(claim_row["status"] or "")
+    fence_uid = str(claim_row["pvc_uid"] or "")
+    if claim_status == "fenced":
+        observed = await provider.agent_workspace_claim_authority(
+            claim["pvc_name"],
+            expected_thread_id=thread_id,
+            expected_runtime_generation=claim["created_runtime_generation"],
+            expected_claim_id=claim["claim_id"],
+            expected_create_attempt=claim["create_attempt"],
+            expected_pvc_uid=fence_uid,
+        )
+        if not (
+            isinstance(observed, Mapping)
+            and str(observed.get("state") or "") == "exact_fence"
+            and str(observed.get("pvc_uid") or "") == fence_uid
+        ):
+            raise RuntimeError("agent workspace fence reattestation failed")
+        return
+    if claim_status != "revoking":
+        raise RuntimeError("agent workspace claim transition is malformed")
+
+    deadline = asyncio.get_running_loop().time() + 120.0
+    while True:
+        fenced = await provider.fence_agent_workspace_claim(
+            claim["pvc_name"],
+            expected_thread_id=thread_id,
+            expected_runtime_generation=claim["created_runtime_generation"],
+            expected_claim_id=claim["claim_id"],
+            expected_create_attempt=claim["create_attempt"],
+        )
+        if not isinstance(fenced, Mapping):
+            raise RuntimeError("agent workspace fence observation is malformed")
+        state = str(fenced.get("state") or "")
+        candidate_uid = str(fenced.get("pvc_uid") or "")
+        if state == "exact_fence" and candidate_uid:
+            fence_uid = candidate_uid
+            break
+        if state != "exact_original" or not candidate_uid:
+            raise RuntimeError("agent workspace name has foreign authority")
+        if not await provider.delete_agent_workspace_claim_exact(
+            claim["pvc_name"], expected_pvc_uid=candidate_uid
+        ):
+            raise RuntimeError("exact agent workspace deletion is retryable")
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError("agent workspace fence acquisition timed out")
+        await asyncio.sleep(0.25)
+    if not await postgres_db.fence_pinned_agent_workspace_claim(
+        thread_id,
+        expected_runtime_generation=generation,
+        expected_retirement_token=token,
+        expected_claim_id=claim["claim_id"],
+        expected_pvc_name=claim["pvc_name"],
+        fence_pvc_uid=fence_uid,
+    ):
+        raise RuntimeError("agent workspace fence publication is retryable")
+
+
+def _captured_workspace_provision_intent(
+    retirement: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Validate the immutable multi-resource K8s create attempt from Begin."""
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    if not isinstance(context, Mapping):
+        raise RuntimeError("captured retirement context is malformed")
+    raw = context.get("workspace_provision_intent")
+    if raw in (None, {}):
+        return None
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("captured workspace provision intent is malformed")
+    intent = dict(raw)
+    try:
+        attempt_id = str(UUID(str(intent.get("attempt_id") or "")))
+        thread_id = str(UUID(str(intent.get("thread_id") or "")))
+        generation = str(UUID(str(intent.get("runtime_generation") or "")))
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "captured workspace provision intent UUID is malformed"
+        ) from None
+    if not (
+        attempt_id == str(intent.get("attempt_id") or "")
+        and thread_id == str(context.get("thread_id") or "")
+        and generation == str(retirement.get("generation") or "")
+        and str(intent.get("namespace") or "")
+        and str(intent.get("pod_name") or "")
+        and str(intent.get("network_tier") or "")
+        and re.fullmatch(r"[0-9a-f]{64}", str(intent.get("manifest_fingerprint") or ""))
+        and intent.get("status") in {"planned", "fenced", "retired"}
+        and isinstance(intent.get("previous_binding"), Mapping)
+        and (intent.get("created_agent_id") is None)
+        == (intent.get("created_attach_token") is None)
+        and (intent.get("pvc_name") is None) == (intent.get("service_name") is None)
+    ):
+        raise RuntimeError("captured workspace provision intent is incomplete")
+    return intent
+
+
+async def _reconcile_workspace_provision_intent_for_retirement(
+    retirement: Mapping[str, Any],
+) -> bool:
+    """Causally fence every name submitted by one pinned workspace create."""
+
+    captured = _captured_workspace_provision_intent(retirement)
+    if captured is None:
+        return False
+    if not container_provisioner.is_available:
+        raise RuntimeError("captured workspace provisioner is unavailable")
+    context = retirement.get("context") or {}
+    thread_id = str(context.get("thread_id") or "")
+    generation = str(retirement.get("generation") or "")
+    token = str(retirement.get("token") or "")
+    permanent = bool(retirement.get("permanent"))
+    current = await postgres_db.revoke_pinned_thread_workspace_provision_intent(
+        thread_id,
+        expected_runtime_generation=generation,
+        expected_retirement_token=token,
+        expected_attempt_id=str(captured.get("attempt_id") or ""),
+    )
+    if not isinstance(current, Mapping):
+        raise RuntimeError("workspace provision intent revocation is retryable")
+    fences = await container_provisioner.fence_pinned_workspace_provision_intent(
+        current,
+        permanent=permanent,
+    )
+    if not isinstance(fences, Mapping):
+        raise RuntimeError("workspace provision name fencing is retryable")
+
+    previous_binding = captured.get("previous_binding") or {}
+    if permanent and isinstance(previous_binding, Mapping) and previous_binding:
+        if previous_binding.get("kind") == "virtual":
+            from services.thread_uploads import (
+                purge_attested_pinned_virtual_workspace,
+            )
+
+            current_thread = await postgres_db.get_thread(thread_id)
+            if (
+                current_thread is None
+                or not await purge_attested_pinned_virtual_workspace(
+                    current_thread,
+                    expected_runtime_generation=generation,
+                    expected_retirement_token=token,
+                )
+            ):
+                raise RuntimeError("exact prior virtual backing cleanup is retryable")
+
+    if not await postgres_db.fence_pinned_thread_workspace_provision_intent(
+        thread_id,
+        expected_runtime_generation=generation,
+        expected_retirement_token=token,
+        expected_attempt_id=str(captured.get("attempt_id") or ""),
+        fence_pod_uid=str(fences.get("fence_pod_uid") or ""),
+        fence_pvc_uid=str(fences.get("fence_pvc_uid") or "") or None,
+        fence_configmap_uid=(str(fences.get("fence_configmap_uid") or "") or None),
+        fence_service_uid=(str(fences.get("fence_service_uid") or "") or None),
+        permanent=permanent,
+    ):
+        raise RuntimeError("workspace provision fence publication is retryable")
+    return True
+
+
+async def _recover_captured_sandbox_process_zero(
+    retirement: Mapping[str, Any],
+) -> bool:
+    """Mint a crash-recovery zero proof for one exact sandbox incarnation.
+
+    The agent process is stopped and proven absent *before* the workspace is
+    contacted, so cached SSH credentials cannot reconnect behind the zero
+    proof.  The thread advisory lock is deliberately not held while waiting
+    for the agent Pod: a graceful SIGTERM path may be concurrently finishing
+    its own ACK/settlement through that lock.  Once the Pod is absent, the
+    immutable retirement token serializes the exact remote UID-zero command
+    with staging and settlement.
+    """
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    if not isinstance(context, Mapping):
+        return False
+    if not _retirement_context_runtime_exposed(retirement):
+        return True
+
+    thread_id = str(context.get("thread_id") or "")
+    current = await postgres_db.get_thread(thread_id)
+    if current and _agent_pod_provision_intent_zero_candidate(retirement, current):
+        async with postgres_db.try_thread_advisory_lock(thread_id) as lock_owner:
+            if not lock_owner:
+                return False
+            current = await postgres_db.get_thread(thread_id)
+            return bool(
+                current
+                and await _recover_agent_pod_provision_intent_zero(retirement, current)
+            )
+
+    if str(context.get("workspace_backend") or "sandbox") != "sandbox":
+        return False
+    captured_pods = _captured_retirement_agent_pods(retirement)
+    if not captured_pods or any(not name or not uid for name, uid in captured_pods):
+        return False
+    if current and _pre_registration_agent_pod_zero_candidate(retirement, current):
+        # Unlike a registered session, this Pod has no caller that could need
+        # the lifecycle lock to publish its own ACK. Serialize against its
+        # still-in-flight registration before exact UID deletion.
+        async with postgres_db.try_thread_advisory_lock(thread_id) as lock_owner:
+            if not lock_owner:
+                return False
+            current = await postgres_db.get_thread(thread_id)
+            return bool(
+                current
+                and await _recover_pre_registration_agent_pod_zero(retirement, current)
+            )
+
+    captured_workspace = context.get("workspace_container")
+    captured_binding = context.get("workspace_binding")
+    captured_workspace = {} if captured_workspace is None else captured_workspace
+    captured_binding = {} if captured_binding is None else captured_binding
+    if not isinstance(captured_workspace, Mapping) or not isinstance(
+        captured_binding, Mapping
+    ):
+        return False
+    captured_docker_lease = str(
+        captured_workspace.get("_docker_workspace_lease_id") or ""
+    )
+    if captured_workspace.get("provisioner") == "docker":
+        try:
+            UUID(captured_docker_lease)
+        except (TypeError, ValueError):
+            return False
+        # Allocation is fenced before the old agent disappears or the remote
+        # strict-zero command runs. A delayed allocator can therefore never
+        # hand this host/lease to another thread during crash recovery.
+        if not await docker_provisioner.fence_thread_workspace_lease(
+            str(context.get("thread_id") or ""),
+            expected_lease_id=captured_docker_lease,
+        ):
+            return False
+
+    # Never hold the DB lifecycle mutex while waiting for a Pod whose graceful
+    # shutdown may need that same mutex to append its own exact proof.
+    try:
+        await _stop_captured_retirement_agent(retirement)
+    except Exception:
+        logger.exception(
+            "Pinned retirement agent stop remains retryable for thread %s",
+            context.get("thread_id"),
+        )
+        return False
+
+    generation = str(retirement.get("generation") or "")
+    token = str(retirement.get("token") or "")
+    if not thread_id or not generation or not token:
+        return False
+
+    async with postgres_db.try_thread_advisory_lock(thread_id) as lock_owner:
+        if not lock_owner:
+            return False
+        current = await postgres_db.get_thread(thread_id)
+        if current is None:
+            return True
+        if str(current.get("runtime_retirement_token") or "") != token:
+            # A graceful exact-agent settlement may have won while the Pod
+            # stop was converging.  Never act on whichever runtime is current.
+            return str(current.get("runtime_generation") or "") != generation or str(
+                current.get("status") or ""
+            ) in {"ended", "suspended"}
+        if str(current.get("runtime_generation") or "") != generation:
+            return False
+        if _retirement_has_exact_local_quiescence(retirement, current):
+            return True
+
+        workspace = captured_workspace
+        binding = captured_binding
+        if not isinstance(workspace, Mapping) or not isinstance(binding, Mapping):
+            return False
+        workspace_generation = str(binding.get("generation") or "")
+        runtime_incarnation = str(
+            (
+                workspace.get("_docker_workspace_lease_id")
+                if workspace.get("provisioner") == "docker"
+                else workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+            )
+            or ""
+        )
+        fingerprint = str(binding.get("ssh_host_key_fingerprint") or "")
+        host = str(workspace.get("pod_ip") or workspace.get("host") or "")
+        raw_port = workspace.get("port", 30022)
+        try:
+            UUID(thread_id)
+            UUID(generation)
+            UUID(token)
+            UUID(str(context.get("agent_id") or ""))
+            UUID(str(context.get("runtime_attach_token") or ""))
+            UUID(workspace_generation)
+            UUID(runtime_incarnation)
+            port = int(raw_port)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not host
+            or not 1 <= port <= 65535
+            or not fingerprint.startswith("SHA256:")
+            or workspace.get("status") != "ready"
+            or binding.get("kind") != "remote"
+            or str(workspace.get("_canvas_workspace_generation") or "")
+            != workspace_generation
+        ):
+            return False
+
+        from services import resolve_ssh_key_path
+        from src.core.backends.remote import RemoteBackend
+
+        key_path = resolve_ssh_key_path()
+        if not key_path:
+            return False
+        backend = RemoteBackend(
+            host=host,
+            port=port,
+            username="agent-host",
+            key_path=key_path,
+            workspace_path="/home/agent-host/workspace",
+            job_id=thread_id,
+            workspace_generation=workspace_generation,
+            runtime_incarnation=runtime_incarnation,
+            expected_host_key_fingerprint=fingerprint,
+            workspace_owner_kind="session",
+            workspace_owner_id=thread_id,
+            workspace_tier="sandbox",
+            sudo_action="freeze",
+        )
+        try:
+            protocol = await asyncio.to_thread(
+                backend.protected_workspace_zero_cleanup_strict
+            )
+        except Exception:
+            logger.exception(
+                "Pinned retirement workspace zero remains retryable for thread %s",
+                thread_id,
+            )
+            return False
+        finally:
+            await asyncio.to_thread(backend.disconnect)
+        if protocol != "workspace_process_zero_v1":
+            return False
+        current = await postgres_db.get_thread(thread_id)
+        if not current or not await _pinned_retirement_is_current(retirement):
+            return False
+        receipt = await postgres_db.acknowledge_pinned_thread_local_quiescence(
+            thread_id,
+            expected_runtime_generation=generation,
+            expected_retirement_token=token,
+            expected_agent_id=str(context.get("agent_id") or ""),
+            expected_attach_token=str(context.get("runtime_attach_token") or ""),
+            expected_settle_status=str(context.get("settle_status") or ""),
+            expected_quiescence_protocol=protocol,
+            expected_workspace_generation=workspace_generation,
+            expected_workspace_runtime_incarnation=runtime_incarnation,
+            quiescence_actor="orchestrator",
+        )
+        return receipt is not None
+
+
+async def _cleanup_pinned_thread_retirement(
+    retirement: Mapping[str, Any],
+    *,
+    cleanup_agent_pod: bool = True,
+) -> None:
+    """Actuate only identities captured by ``begin_pinned_thread_retirement``.
+
+    Every ambiguous failure raises and deliberately leaves the durable token
+    pending. Resume and all runtime/credential admission stay closed until an
+    exact retry completes. Deterministic names are lookup keys only; every K8s
+    deletion carries a captured UID and soft End never deletes a PVC.
+    """
+
+    context = retirement.get("context")
+    context = {} if context is None else context
+    if not isinstance(context, Mapping):
+        raise RuntimeError("pinned retirement context is malformed")
+    thread_id = str(context.get("thread_id") or "")
+    generation = str(retirement.get("generation") or "")
+    if not thread_id or str(context.get("generation") or "") != generation:
+        raise RuntimeError("pinned retirement context authority is malformed")
+    permanent = bool(retirement.get("permanent"))
+
+    # Wait out/prohibit every protected-engage producer before touching its
+    # stable remote grant key. The scheduler uses this same cross-replica lock.
+    if not await _pinned_retirement_is_current(retirement):
+        raise RuntimeError("pinned retirement authority changed")
+    if permanent and await postgres_db.pinned_retirement_external_cleanup_complete(
+        thread_id,
+        runtime_generation=generation,
+        retirement_token=str(retirement.get("token") or ""),
+    ):
+        # The prior attempt crossed the append-once external-cleanup CAS only
+        # after route teardown, exact resource actuators, reader revocation and
+        # any required captured-agent stop.  A lost response/restart therefore
+        # replays from this receipt without probing deterministic resource names
+        # or adopting a successor endpoint.
+        return
+
+    agent = context.get("agent")
+    agent = {} if agent is None else agent
+    if not isinstance(agent, Mapping):
+        raise RuntimeError("captured agent identity is malformed")
+    agent_pod = context.get("agent_pod")
+    agent_pod = {} if agent_pod is None else agent_pod
+    if not isinstance(agent_pod, Mapping):
+        raise RuntimeError("captured agent Pod identity is malformed")
+
+    # Never address a captured Pod by IP here. Pod IPs are reusable, and an
+    # old cleanup cannot prove that the process currently listening there is
+    # the captured Pod/runtime. Agent-initiated End already performs its own
+    # graceful memory/git flush; owner/offline retirement deliberately relies
+    # on the exact UID deletion below instead of risking a successor detach.
+
+    # Remove only the route owned by this Pod UID + runtime generation.
+    route = context.get("route")
+    route = {} if route is None else route
+    if not isinstance(route, Mapping):
+        raise RuntimeError("captured route identity is malformed")
+    route_owner_uid = str((route or {}).get("owner_pod_uid") or "")
+    if not await session_router.teardown_route(
+        thread_id,
+        expected_runtime_generation=generation,
+        expected_owner_uid=route_owner_uid or None,
+    ):
+        raise RuntimeError("exact session route cleanup is retryable")
+
+    workspace_provision_intent_zero = (
+        await _reconcile_workspace_provision_intent_for_retirement(retirement)
+    )
+
+    # Workspace teardown is separately identity-fenced. PVC deletion occurs
+    # only for permanent End; soft End preserves the backing for Resume.
+    ws = context.get("workspace_container")
+    ws = {} if ws is None else ws
+    if not isinstance(ws, Mapping):
+        raise RuntimeError("captured workspace identity is malformed")
+    backend = str(context.get("workspace_backend") or "sandbox")
+    vm = context.get("vm")
+    vm = {} if vm is None else vm
+    if not isinstance(vm, Mapping):
+        raise RuntimeError("captured VM identity is malformed")
+    vm_identity_present = any(
+        _retirement_json_field_is_nonnull(vm, field)
+        for field in (
+            "provision_generation",
+            "identity_provision_generation",
+            "vm_uid",
+            "_runtime_incarnation",
+            "rootdisk_pvc_uid",
+            "ssh_host",
+            "ssh_port",
+            "_canvas_workspace_generation",
+        )
+    ) or not _retirement_json_status_is_absent(vm)
+    binding = context.get("workspace_binding")
+    binding = {} if binding is None else binding
+    if not isinstance(binding, Mapping):
+        raise RuntimeError("captured workspace binding is malformed")
+    virtual_binding_present = bool(binding and binding.get("kind") == "virtual")
+    sandbox_identity_present = bool(
+        _retirement_json_field_is_nonnull(ws, WORKSPACE_RUNTIME_INCARNATION_KEY)
+        or (binding and not virtual_binding_present)
+        or not _retirement_json_status_is_absent(ws)
+        or any(
+            _retirement_json_field_is_nonnull(ws, field)
+            for field in (
+                "pod_ip",
+                "pod_name",
+                "host",
+                "port",
+                "ide_host",
+                "ide_port",
+                "_canvas_workspace_generation",
+            )
+        )
+    )
+    if backend not in {"sandbox", "virtual", "none", "vm", "remote"}:
+        raise RuntimeError("captured workspace backend is unsupported")
+    if workspace_provision_intent_zero and vm_identity_present:
+        raise RuntimeError("workspace create intent also contains VM authority")
+    if (
+        not workspace_provision_intent_zero
+        and backend in {"vm", "remote"}
+        and sandbox_identity_present
+    ):
+        raise RuntimeError("captured VM retirement also contains sandbox authority")
+    if (
+        not workspace_provision_intent_zero
+        and backend == "sandbox"
+        and vm_identity_present
+    ):
+        raise RuntimeError("captured sandbox retirement also contains VM authority")
+    if (
+        not workspace_provision_intent_zero
+        and backend == "virtual"
+        and (
+            sandbox_identity_present
+            or vm_identity_present
+            or (binding and not virtual_binding_present)
+        )
+    ):
+        raise RuntimeError("captured virtual retirement contains physical authority")
+    if (
+        not workspace_provision_intent_zero
+        and backend == "none"
+        and (sandbox_identity_present or vm_identity_present or binding)
+    ):
+        raise RuntimeError("captured lite retirement contains physical authority")
+    completed_quiescence_protocol: str | None = None
+    completed_external_cleanup_protocol: str | None = None
+    if workspace_provision_intent_zero:
+        completed_external_cleanup_protocol = "workspace_provision_fence_v1"
+    elif backend in {"vm", "remote"} and vm_identity_present:
+        from services.vm_provisioner import VMTeardownIdentity
+
+        provision_generation = str(vm.get("provision_generation") or "")
+        vm_uid = str(vm.get("vm_uid") or "")
+        rootdisk_uid = str(vm.get("rootdisk_pvc_uid") or "")
+        if (
+            not vm_provisioner.is_available
+            or not provision_generation
+            or not vm_uid
+            or (permanent and not rootdisk_uid)
+        ):
+            raise RuntimeError("exact VM cleanup authority is incomplete")
+        vm_result = await vm_provisioner.delete_vm_captured(
+            thread_id,
+            VMTeardownIdentity(
+                provision_generation=provision_generation,
+                vm_uid=vm_uid,
+                rootdisk_pvc_uid=rootdisk_uid or None,
+            ),
+            purge_disk=permanent,
+            entity_type="thread",
+        )
+        if not vm_result.completed:
+            raise RuntimeError("exact VM cleanup is retryable")
+        completed_quiescence_protocol = "workspace_actuator_zero_v1"
+        completed_external_cleanup_protocol = "workspace_actuator_zero_v1"
+    elif backend in {"vm", "remote"}:
+        pass
+    elif backend == "sandbox" and ws.get("provisioner") == "docker":
+        lease_id = str(ws.get("_docker_workspace_lease_id") or "")
+        if not lease_id or not await docker_provisioner.release_thread_workspace(
+            thread_id,
+            expected_lease_id=lease_id,
+            force_quarantine=True,
+        ):
+            raise RuntimeError("exact Docker workspace cleanup is retryable")
+        # Quarantine/release fences allocation of this exact lease, but does
+        # not prove its remote same-UID processes stopped. Exposed Docker lives
+        # need a pre-existing host-key/lease-bound workspace_process_zero_v1
+        # receipt from the live agent (or the dedicated recovery actuator).
+        completed_external_cleanup_protocol = "sandbox_actuator_zero_v1"
+    elif backend == "sandbox" and sandbox_identity_present:
+        if not container_provisioner.is_available:
+            raise RuntimeError("Kubernetes workspace cleanup is unavailable")
+        workspace_identity = (
+            await container_provisioner.capture_workspace_teardown_identity(
+                WorkspaceOwner.session(thread_id)
+            )
+        )
+        captured_runtime = str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+        captured_generation = str(binding.get("generation") or "")
+        captured_backing = str(binding.get("backing_id") or "")
+        if (
+            not captured_runtime
+            or not captured_generation
+            or binding.get("kind") != "remote"
+            or not (
+                captured_backing.startswith("k8s-pvc:")
+                or captured_backing.startswith("k8s-pod:")
+            )
+        ):
+            raise RuntimeError("exact Kubernetes cleanup authority is incomplete")
+        try:
+            UUID(captured_runtime)
+            UUID(captured_generation)
+            backing_resource_uid = str(UUID(captured_backing.rsplit(":", 1)[-1]))
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "exact Kubernetes cleanup authority is malformed"
+            ) from None
+        if (
+            workspace_identity.pod_uid is not None
+            and workspace_identity.pod_uid != captured_runtime
+        ):
+            raise RuntimeError("workspace Pod identity changed before retirement")
+        if captured_backing.startswith("k8s-pod:"):
+            if backing_resource_uid != captured_runtime:
+                raise RuntimeError("workspace Pod backing authority is inconsistent")
+            if workspace_identity.pvc_uid is not None:
+                # ``k8s-pod`` is the immutable emptyDir shape. A PVC that
+                # appeared after Begin belongs to a replacement/provisioning
+                # attempt and must never be adopted by deterministic name.
+                raise RuntimeError(
+                    "workspace PVC appeared outside captured retirement authority"
+                )
+        elif workspace_identity.pvc_uid != backing_resource_uid:
+            raise RuntimeError("workspace PVC identity changed before retirement")
+        released = await container_provisioner.release_workspace(
+            WorkspaceOwner.session(thread_id),
+            reclaim_volume=permanent,
+            capture_snapshot=True,
+            strict=True,
+            teardown_identity=workspace_identity,
+        )
+        if not released:
+            raise RuntimeError("exact Kubernetes workspace cleanup is retryable")
+        completed_quiescence_protocol = "sandbox_actuator_zero_v1"
+        completed_external_cleanup_protocol = "sandbox_actuator_zero_v1"
+    elif backend == "virtual" and virtual_binding_present and permanent:
+        from services.thread_uploads import purge_attested_pinned_virtual_workspace
+
+        current = await postgres_db.get_thread(thread_id)
+        if current is None or not await purge_attested_pinned_virtual_workspace(
+            current,
+            expected_runtime_generation=generation,
+            expected_retirement_token=str(retirement.get("token") or ""),
+        ):
+            raise RuntimeError("exact virtual backing cleanup is retryable")
+        completed_external_cleanup_protocol = "virtual_backing_zero_v1"
+
+    # Reader cleanup uses the captured row+attempt; never re-read a row by
+    # thread and accidentally revoke a successor grant.
+    protected_ro = context.get("protected_ro")
+    protected_ro = {} if protected_ro is None else protected_ro
+    if not isinstance(protected_ro, Mapping):
+        raise RuntimeError("captured protected reader identity is malformed")
+    if protected_ro.get("status") in {
+        "engaging",
+        "active",
+        "revoking",
+    }:
+        row_id = str(protected_ro.get("id") or "")
+        ro_generation = str(protected_ro.get("runtime_generation") or "")
+        plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(protected_ro)
+        if not row_id or not ro_generation or plan is None:
+            raise RuntimeError("protected reader cleanup lacks exact identity")
+        backend_client = await _resolve_protected_reader_backend(plan)
+        if not await revoke_ro_mount_attempt(
+            backend=backend_client,
+            postgres_db=postgres_db,
+            row_id=row_id,
+            thread_id=thread_id,
+            runtime_generation=ro_generation,
+            plan=plan,
+        ):
+            current_ro = await postgres_db.get_ro_mount_by_thread(thread_id)
+            if not current_ro or str(current_ro.get("status") or "") in {
+                "engaging",
+                "active",
+                "revoking",
+            }:
+                raise RuntimeError("protected reader row cleanup is retryable")
+
+    # Agent Pods last: workspace snapshots/detach may still need the process.
+    # The exact self-settlement route is itself awaiting this HTTP response;
+    # synchronously deleting/waiting for that caller creates a lifecycle
+    # cycle.  Its append-only local-quiescence receipt proves writers are
+    # stopped, so settlement may answer first and the process exits itself.
+    stopped_agent_pod_name: str | None = None
+    stopped_agent_pod_uid: str | None = None
+    if cleanup_agent_pod:
+        captured_agent_pods = _captured_retirement_agent_pods(retirement)
+        if len(captured_agent_pods) > 1:
+            raise RuntimeError("captured retirement agent identities disagree")
+        await _stop_captured_retirement_agent(retirement)
+        if captured_agent_pods:
+            stopped_agent_pod_name, stopped_agent_pod_uid = next(
+                iter(captured_agent_pods)
+            )
+            if completed_quiescence_protocol is None:
+                completed_quiescence_protocol = "agent_runtime_zero_v1"
+
+    # A bootstrap Pod can have a distinct persistent PVC whose create was
+    # already sent before registration. Soft settlement retains/re-attests the
+    # exact UID. Permanent settlement deletes only exact claimants and leaves
+    # a same-name inert PVC tombstone until the API-request horizon expires.
+    # This runs after agent stop so a mounted claim is never torn down first.
+    await _reconcile_agent_workspace_claim_for_retirement(retirement)
+
+    if permanent and not (
+        await postgres_db.clear_pinned_retirement_physical_runtime_endpoint(
+            thread_id,
+            runtime_generation=generation,
+            retirement_token=str(retirement.get("token") or ""),
+            completed_quiescence_protocol=completed_quiescence_protocol,
+            completed_external_cleanup_protocol=(completed_external_cleanup_protocol),
+            expected_stopped_agent_pod_name=stopped_agent_pod_name,
+            expected_stopped_agent_pod_uid=stopped_agent_pod_uid,
+        )
+    ):
+        raise RuntimeError(
+            "permanent retirement physical endpoint cleanup CAS is retryable"
+        )
+
+    if not await _pinned_retirement_is_current(retirement):
+        raise RuntimeError("pinned retirement authority changed before settlement")
+
+
 # Threads with a suspend currently in flight. Two triggers can race on the
 # same thread within a second (e.g. the disconnect watchdog and the agent's
 # own status→ended PUT); without this guard the loser found the workspace
@@ -9893,6 +13120,13 @@ class AgentRegistration(BaseModel):
         "worker", description="Agent mode: 'worker' or 'persistent'"
     )
     thread_id: str | None = Field(None, description="Thread UUID for persistent agents")
+    session_runtime_generation: UUID | None = Field(
+        None,
+        description=(
+            "Exact pinned runtime generation injected into a dedicated pod. "
+            "Protected runtimes must present it at registration."
+        ),
+    )
     build_sha: str | None = Field(
         None, description="Build commit SHA baked into the agent image"
     )
@@ -9929,6 +13163,15 @@ class AgentRegistrationResponse(BaseModel):
 
     agent_id: str
     heartbeat_interval_seconds: int
+    pinned_runtime_generation_contract: int = 1
+    session_runtime_generation: str | None = None
+    session_runtime_attach_token: str | None = Field(
+        None,
+        description=(
+            "Per-process pinned-runtime authority minted by the final "
+            "registration bind and echoed on maintenance requests"
+        ),
+    )
     runtime_actor: dict[str, Any] | None = Field(
         None,
         description=(
@@ -9954,6 +13197,14 @@ class AgentHeartbeat(BaseModel):
     graph_progress: int | None = Field(
         None,
         description="Monotonic graph-progress marker from worker heartbeat path",
+    )
+    session_runtime_generation: UUID | None = Field(
+        None,
+        description="Exact generation of a bound pinned session runtime",
+    )
+    session_runtime_attach_token: UUID | None = Field(
+        None,
+        description="Exact warm-attach attempt for a bound pinned runtime",
     )
 
 
@@ -11821,24 +15072,40 @@ async def lifespan(app: FastAPI):
 
     # Initialize Keycloak group sync (graceful if unavailable)
     await keycloak_groups.ensure_initialized()
-    await main_cloud_router.ensure_initialized()
 
-    # Phase 4: if a persisted overlay exists, apply it now so the
-    # active backend matches the cockpit admin UI's view. Non-fatal —
-    # if the overlay is broken the env-var-only path from the initial
-    # ensure_initialized() above stays in place.
+    # Adopt the exact durable backend installation before any main-cloud
+    # effect. The legacy system_settings row is read only as one-time input
+    # when 0186 has no active instance yet; afterward the immutable instance
+    # snapshot + singleton CAS pointer are the sole routing authority.
     try:
         _persisted_overlay = await postgres_db.get_system_setting("main_cloud")
     except Exception as _e:
-        logger.warning("Main cloud overlay read failed at startup (non-fatal): %s", _e)
+        logger.warning("Legacy main cloud overlay read failed at startup: %s", _e)
         _persisted_overlay = None
-    if _persisted_overlay:
-        _overlay_ok = await main_cloud_router.reload_from_db(_persisted_overlay)
-        if not _overlay_ok:
-            logger.warning(
-                "Main cloud overlay present in system_settings.main_cloud but "
-                "rebuild failed — active backend stays on env-var config"
-            )
+    try:
+        await initialize_main_cloud_instance_authority(
+            postgres_db,
+            main_cloud_router,
+            legacy_overlay=_persisted_overlay,
+        )
+        await preload_retained_main_cloud_instances(postgres_db, main_cloud_router)
+        if _persisted_overlay is not None:
+            try:
+                await postgres_db.delete_system_setting("main_cloud")
+            except Exception:
+                logger.warning(
+                    "Failed to remove inert legacy main_cloud setting",
+                    exc_info=True,
+                )
+    except Exception as _e:
+        # Main cloud is optional for the rest of the orchestrator, but an
+        # unbound env adapter must never become a fallback routing authority.
+        # It remains uninitialized and every cloud effect fails closed.
+        logger.error(
+            "Main cloud installation authority is unavailable; cloud effects "
+            "remain disabled: %s",
+            _e,
+        )
 
     # Issue 5: warn loudly if the *active* backend's required secrets are not
     # present in the env — it is silently running on built-in DEV credentials
@@ -11850,15 +15117,7 @@ async def lifespan(app: FastAPI):
         from services.cloud.config import missing_secret_envs
 
         _active_id = main_cloud_router.active.backend_id
-        # Only trust the overlay's credentials_ref if the overlay actually drove
-        # the active backend; otherwise check the plain env path.
-        _active_overlay = (
-            _persisted_overlay
-            if _persisted_overlay
-            and (_persisted_overlay.get("value") or {}).get("backend_id") == _active_id
-            else None
-        )
-        _missing_secrets = missing_secret_envs(_active_id, _active_overlay)
+        _missing_secrets = missing_secret_envs(_active_id, _persisted_overlay)
         if _missing_secrets:
             logger.warning(
                 "Main cloud backend %r is active but required secret env var(s) "
@@ -12262,6 +15521,12 @@ async def lifespan(app: FastAPI):
         run_when_leader(code_server_settings_sweeper, _shutdown_event)
     )
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
+    pinned_create_intent_reconciler_task = asyncio.create_task(
+        run_when_leader(pinned_agent_create_intent_reconciler, _shutdown_event)
+    )
+    pinned_create_fence_gc_task = asyncio.create_task(
+        run_when_leader(pinned_k8s_create_fence_gc_sweeper, _shutdown_event)
+    )
     imap_task = asyncio.create_task(run_when_leader(imap_poll_loop, _shutdown_event))
     digest_task = asyncio.create_task(
         run_when_leader(quiet_hours_digest_loop, _shutdown_event)
@@ -12282,13 +15547,12 @@ async def lifespan(app: FastAPI):
     pool_reconciler_task = asyncio.create_task(
         run_when_leader(agent_pool_reconciler, _shutdown_event)
     )
-    # Protected cloud mode: leader-gated sweep of orphaned RO reader grants
-    # (design §8.1.4). Only when the feature is enabled for this deployment.
-    ro_reader_reconciler_task = None
-    if _is_protected_cloud_mode_enabled():
-        ro_reader_reconciler_task = asyncio.create_task(
-            run_when_leader(ro_reader_reconciler_loop, _shutdown_event)
-        )
+    # Cleanup authority is independent of fresh protected-mode admission. A
+    # feature/config disable must never strand an already durable reader or
+    # pre-dispatch effect intent.
+    ro_reader_reconciler_task = asyncio.create_task(
+        run_when_leader(ro_reader_reconciler_loop, _shutdown_event)
+    )
     automation_cron_task = asyncio.create_task(
         cron_dispatcher_loop(
             postgres_db, _shutdown_event, on_job_created=_trigger_dispatch
@@ -12524,6 +15788,8 @@ async def lifespan(app: FastAPI):
     await ws_sweeper_task
     await ide_settings_sweeper_task
     await gc_sweeper_task
+    await pinned_create_intent_reconciler_task
+    await pinned_create_fence_gc_task
     await imap_task
     await digest_task
     await delegation_timeout_task
@@ -13682,6 +16948,26 @@ def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     welcome frame" oddity). The contract is now: metadata always leaves as a
     parsed OBJECT (unparseable/absent → ``{}``).
     """
+    raw_retirement_context = thread.get("runtime_retirement_context") or {}
+    if isinstance(raw_retirement_context, str):
+        try:
+            raw_retirement_context = json.loads(raw_retirement_context)
+        except (json.JSONDecodeError, TypeError):
+            raw_retirement_context = {}
+    # The token is installed before abortable turn/Officer preflight.  Only
+    # the append-only authorized edge is a public `ending` state; exposing the
+    # hidden preflight would make Cockpit retire control even when a non-force
+    # End is about to abort as an observational no-op.
+    retirement_pending = bool(
+        thread.get("runtime_retirement_token") is not None
+        and thread.get("runtime_retirement_authorized_at") is not None
+    )
+    retirement_disposition: str | None = None
+    if retirement_pending and isinstance(raw_retirement_context, Mapping):
+        candidate = str(raw_retirement_context.get("settle_status") or "")
+        if candidate in {"ended", "suspended"}:
+            retirement_disposition = candidate
+
     thread = _redact_nested_workspace_state(thread, field="metadata")
     md = thread.get("metadata")
     if isinstance(md, str):
@@ -13697,6 +16983,26 @@ def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
         md["config_override"] = redact_config_override(md["config_override"])
     md.pop("_workspace_binding", None)
     thread["metadata"] = md
+    # These are internal capabilities or immutable physical cleanup evidence,
+    # not owner API fields.  Never let a broad SELECT * list/detail response
+    # leak them.  Cockpit gets only the durable, non-secret lifecycle shape.
+    for internal_key in (
+        "runtime_generation",
+        "runtime_attach_token",
+        "runtime_attach_abort_receipt",
+        "runtime_authority_exposed",
+        "runtime_retirement_token",
+        "runtime_retirement_permanent",
+        "runtime_retirement_started_at",
+        "runtime_retirement_authorized_at",
+        "runtime_retirement_context",
+        "runtime_retirement_stage_receipt",
+        "runtime_retirement_local_quiescence",
+        "runtime_retirement_external_cleanup",
+    ):
+        thread.pop(internal_key, None)
+    thread["runtime_retirement_pending"] = retirement_pending
+    thread["retirement_disposition"] = retirement_disposition
     return thread
 
 
@@ -30335,7 +33641,7 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
             detail="Project has no cloud backend; cannot apply diff.",
         )
     try:
-        backend = main_cloud_router.for_backend(backend_id)
+        backend = main_cloud_router.for_project(project)
     except Exception as e:
         raise HTTPException(
             status_code=503,
@@ -36289,6 +39595,8 @@ async def register_agent(
     await require_internal(request)
     try:
         runtime_actor_payload: dict[str, Any] | None = None
+        registered_runtime_generation: str | None = None
+        registered_runtime_attach_token: str | None = None
         dedicated_bootstrap: str | None = None
         register_kwargs = dict(
             config_name=registration.config_name,
@@ -36309,7 +39617,11 @@ async def register_agent(
             # refusal" can delete another binding through the FK cascade.
             async with postgres_db.thread_advisory_lock(registration.thread_id):
                 thread = await postgres_db.get_thread(registration.thread_id)
-                if not _thread_uses_pinned_execution(thread):
+                registration_authority = thread_runtime_authority(thread)
+                if (
+                    not _thread_uses_pinned_execution(thread)
+                    or registration_authority is None
+                ):
                     # Authoritative bind-boundary fence. A dedicated pod can
                     # start while the row is pinned but register only after an
                     # operator has moved the detached thread to the queue lane;
@@ -36341,6 +39653,73 @@ async def register_agent(
                         detail="Workspace repository authority is unavailable",
                     ) from exc
 
+                # Repository authority preparation crosses DB/Gitea awaits.
+                # End may land while the dedicated pod is booting; re-read
+                # before the hostname upsert can create or rebind an agent row.
+                thread = await postgres_db.get_thread(registration.thread_id)
+                if not _thread_uses_pinned_execution(
+                    thread
+                ) or not same_thread_runtime_authority(thread, registration_authority):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=thread_runtime_refusal_detail(thread),
+                    )
+                marker = protected_cloud_marker_state(thread_metadata_object(thread))
+                if marker == "malformed":
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "protected_cloud_malformed"},
+                    )
+                if (
+                    registration.session_runtime_generation is not None
+                    and str(registration.session_runtime_generation)
+                    != registration_authority.generation
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "pinned_runtime_generation_mismatch"},
+                    )
+                if (
+                    marker == "off"
+                    and _require_pinned_status_identity()
+                    and registration.session_runtime_generation is None
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "pinned_runtime_generation_required"},
+                    )
+                if marker == "on":
+                    if (
+                        registration.session_runtime_generation is None
+                        or str(registration.session_runtime_generation)
+                        != registration_authority.generation
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "pinned_runtime_generation_required",
+                                "message": (
+                                    "Protected runtime registration requires its "
+                                    "exact session generation."
+                                ),
+                            },
+                        )
+                    (
+                        protected_state,
+                        protected_code,
+                    ) = await _protected_cloud_delivery_state(
+                        thread, thread_metadata_object(thread)
+                    )
+                    if protected_state != "ready":
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "protected_cloud_not_ready",
+                                "state": protected_state,
+                                "reason": protected_code,
+                            },
+                        )
+
                 # Defense-in-depth against the double-provisioning race
                 # (knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md):
                 # refuse a different live owner before the hostname upsert can
@@ -36353,6 +39732,14 @@ async def register_agent(
                 expected_upsert_id: str | None = None
                 if existing_id:
                     existing = await postgres_db.get_agent(str(existing_id))
+                    thread = await postgres_db.get_thread(registration.thread_id)
+                    if not same_thread_runtime_authority(
+                        thread, registration_authority
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=thread_runtime_refusal_detail(thread),
+                        )
                     existing_status = (existing or {}).get("status")
                     if not existing:
                         logger.warning(
@@ -36424,6 +39811,50 @@ async def register_agent(
                         ) from exc
                     dedicated_bootstrap = bootstrap
 
+                thread = await postgres_db.get_thread(registration.thread_id)
+                if not _thread_uses_pinned_execution(
+                    thread
+                ) or not same_thread_runtime_authority(thread, registration_authority):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=thread_runtime_refusal_detail(thread),
+                    )
+
+                planned_provision = await postgres_db.fetchrow(
+                    "SELECT attempt_id,pod_name FROM "
+                    "thread_agent_pod_provision_intents "
+                    "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND status='planned'",
+                    registration.thread_id,
+                    registration_authority.generation,
+                )
+                if planned_provision is not None:
+                    if (
+                        not registration.hostname
+                        or not registration.pod_uid
+                        or str(planned_provision["pod_name"])
+                        != str(registration.hostname)
+                        or not await postgres_db.publish_pinned_agent_pod_provision_intent(
+                            registration.thread_id,
+                            expected_runtime_generation=(
+                                registration_authority.generation
+                            ),
+                            attempt_id=str(planned_provision["attempt_id"]),
+                            pod_name=str(registration.hostname),
+                            pod_uid=str(registration.pod_uid),
+                        )
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"code": "agent_pod_provision_intent_mismatch"},
+                        )
+
+                # The exact thread<->agent pair is published atomically below.
+                # Publishing ``agents.thread_id`` first creates an inverse-only
+                # process authority that direct DELETE/retirement cannot fence.
+                register_kwargs["thread_id"] = (
+                    registration.thread_id if expected_upsert_id is not None else None
+                )
                 result = await postgres_db.register_agent(
                     **register_kwargs,
                     expected_agent_id=expected_upsert_id,
@@ -36442,20 +39873,29 @@ async def register_agent(
                         status_code=409,
                         detail="persistent agent identity changed during registration",
                     )
-                if not await _bind_registered_persistent_agent(
-                    registration.thread_id,
-                    new_id,
-                    str(existing_id) if existing_id else None,
-                ):
+                registered_runtime_attach_token = (
+                    await _bind_registered_persistent_agent(
+                        registration.thread_id,
+                        new_id,
+                        str(existing_id) if existing_id else None,
+                        registration_authority.generation,
+                    )
+                )
+                if registered_runtime_attach_token is None:
                     logger.warning(
                         "register_agent: final pinned-lane bind lost for "
                         "thread %s (agent=%s)",
                         registration.thread_id,
                         new_id,
                     )
+                    current = await postgres_db.get_thread(registration.thread_id)
                     raise HTTPException(
                         status_code=409,
-                        detail="thread execution lane changed before agent binding",
+                        detail=(
+                            thread_runtime_refusal_detail(current)
+                            if not _thread_accepts_runtime(current)
+                            else "thread execution lane changed before agent binding"
+                        ),
                     )
                 if dedicated_bootstrap is not None:
                     try:
@@ -36478,11 +39918,37 @@ async def register_agent(
                             detail="Runtime actor binding is no longer current.",
                         ) from exc
                     runtime_actor_payload = runtime_actor.to_payload()
+                    current = await postgres_db.get_thread(registration.thread_id)
+                    if not same_thread_runtime_authority(
+                        current, registration_authority
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=thread_runtime_refusal_detail(current),
+                        )
+                final_registered_thread = await postgres_db.get_thread(
+                    registration.thread_id
+                )
+                if (
+                    not same_thread_runtime_authority(
+                        final_registered_thread, registration_authority
+                    )
+                    or str(final_registered_thread.get("agent_id") or "") != new_id
+                    or str(final_registered_thread.get("runtime_attach_token") or "")
+                    != registered_runtime_attach_token
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Pinned runtime changed before registration completed",
+                    )
+                registered_runtime_generation = registration_authority.generation
         else:
             result = await postgres_db.register_agent(**register_kwargs)
         return AgentRegistrationResponse(
             **result,
             runtime_actor=runtime_actor_payload,
+            session_runtime_generation=registered_runtime_generation,
+            session_runtime_attach_token=registered_runtime_attach_token,
         )
     except HTTPException:
         raise
@@ -36657,13 +40123,8 @@ async def agent_create_thread(
             and container_provisioner.in_cluster
             and _backend_from_override(config_override) not in LITE_BACKENDS
         ):
-            await postgres_db.merge_thread_workspace_context(
-                thread_id, {"status": "pending"}
-            )
             asyncio.create_task(
-                container_provisioner.create_workspace(
-                    WorkspaceOwner.session(thread_id)
-                )
+                container_provisioner.create_pinned_thread_workspace(thread_id)
             )
 
         return {"thread_id": thread_id, "status": "created"}
@@ -36822,7 +40283,11 @@ async def _build_default_project_mount_row(
     legacy session folder" so a transient resolution failure never leaves
     the thread with zero mounts.
     """
-    backend = main_cloud_router.for_project(project)
+    backend = (
+        main_cloud_router.for_project(project)
+        if project.get("main_cloud_backend")
+        else main_cloud_router.for_owner()
+    )
     if not backend.is_initialized:
         return None
     members = await postgres_db.get_project_members(project_id)
@@ -36858,6 +40323,7 @@ async def _build_default_project_mount_row(
         "source_kind": "user_home",
         "source_ref": project_id,
         "backend_id": backend.backend_id,
+        "backend_instance_id": backend.backend_instance_id,
         "cloud_handle": home.handle.to_db(),
         "webdav_url": home.webdav_url,
         "target_user_sub": target_user_sub,
@@ -36913,7 +40379,7 @@ async def _build_thread_mount_rows(
         webdav_url: str | None = None
         if backend_id and handle_str:
             try:
-                backend = main_cloud_router.for_backend(backend_id)
+                backend = main_cloud_router.for_project(project)
                 if backend.is_initialized:
                     handle = ProjectFolderHandle.from_db(
                         handle_str, backend=backend.backend_id
@@ -36939,6 +40405,7 @@ async def _build_thread_mount_rows(
                 "source_kind": "project_folder",
                 "source_ref": project_id,
                 "backend_id": backend_id,
+                "backend_instance_id": project.get("main_cloud_backend_instance_id"),
                 "cloud_handle": handle_str,
                 "webdav_url": webdav_url,
             }
@@ -37080,28 +40547,191 @@ async def agent_get_thread_workspace(
     allowing the agent to wait for the workspace to be ready.
     """
     await require_internal(request)
+    request_headers = getattr(request, "headers", {})
+    presented_agent_id = request_headers.get("X-Agent-ID")
+    presented_runtime_generation = request_headers.get("X-Session-Runtime-Generation")
+    presented_attach_token = request_headers.get("X-Session-Runtime-Attach-Token")
     # This response is a credential-delivery boundary for cold/dedicated
     # sessions.  Use the same lock as live selection replacement and do every
     # authoritative read + response build beneath it.  Once an A -> B/[] save
     # commits, no later cold response can deliver the old A payload.
     async with postgres_db.thread_datasource_lock(thread_id):
-        return await _agent_get_thread_workspace_locked(thread_id)
+        return await _agent_get_thread_workspace_locked(
+            thread_id,
+            presented_agent_id=presented_agent_id,
+            presented_runtime_generation=presented_runtime_generation,
+            presented_attach_token=presented_attach_token,
+        )
 
 
-async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
+async def _require_pinned_workspace_credential_owner(
+    thread: dict[str, Any],
+    presented_agent_id: str | None,
+    presented_runtime_generation: str | None,
+    presented_attach_token: str | None,
+    *,
+    expected_protected_ro_row: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Fence pinned workspace credentials to the reciprocal runtime owner."""
+
+    if str(thread.get("execution_lane") or "") != "pinned":
+        return None
+    raw_metadata = thread.get("metadata")
+    if isinstance(raw_metadata, str):
+        try:
+            identity_metadata = json.loads(raw_metadata)
+        except (json.JSONDecodeError, TypeError):
+            identity_metadata = None
+    elif raw_metadata is None:
+        identity_metadata = {}
+    else:
+        identity_metadata = raw_metadata
+    # Protected rows do not participate in the mixed-version grace period:
+    # their response carries the live lower-mount credential. Any malformed
+    # authority is protected-by-default and likewise requires an exact owner.
+    protected_identity_required = (
+        not isinstance(identity_metadata, dict)
+        or protected_cloud_marker_state(identity_metadata) != "off"
+    )
+    exact_identity_required = bool(
+        protected_identity_required or _require_pinned_status_identity()
+    )
+    if (
+        not presented_agent_id
+        or not presented_runtime_generation
+        or (exact_identity_required and not presented_attach_token)
+    ):
+        if exact_identity_required:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pinned_status_identity_required",
+                    "message": (
+                        "Pinned workspace credentials require agent, runtime "
+                        "generation, and process attach identity."
+                    ),
+                },
+            )
+        return None
+    try:
+        parsed_agent_id = str(UUID(str(presented_agent_id)))
+        parsed_runtime_generation = str(UUID(str(presented_runtime_generation)))
+        parsed_attach_token = (
+            str(UUID(str(presented_attach_token))) if presented_attach_token else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pinned_runtime_identity_mismatch",
+                "message": "Pinned workspace runtime ownership changed.",
+            },
+        ) from exc
+    expected_authority = thread_runtime_authority(thread)
+    expected_ro: dict[str, str | None] = {
+        "mount_id": None,
+        "engage_attempt": None,
+        "grant_handle": None,
+        "reader_id": None,
+        "webdav_url": None,
+    }
+    if expected_protected_ro_row is not None:
+        try:
+            expected_ro = {
+                "mount_id": str(UUID(str(expected_protected_ro_row["id"]))),
+                "engage_attempt": str(
+                    UUID(str(expected_protected_ro_row["engage_attempt"]))
+                ),
+                "grant_handle": str(expected_protected_ro_row["grant_handle"]),
+                "reader_id": str(expected_protected_ro_row["reader_id"]),
+                "webdav_url": str(expected_protected_ro_row["webdav_url"]),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pinned_runtime_identity_mismatch",
+                    "message": "Pinned workspace runtime ownership changed.",
+                },
+            ) from exc
+    if (
+        expected_authority is None
+        or expected_authority.generation != parsed_runtime_generation
+        or str(thread.get("agent_id") or "") != parsed_agent_id
+        or not await postgres_db.pinned_thread_agent_is_reciprocal(
+            str(thread.get("id") or ""),
+            parsed_agent_id,
+            expected_runtime_generation=parsed_runtime_generation,
+            expected_attach_token=parsed_attach_token,
+            expected_ro_mount_id=expected_ro["mount_id"],
+            expected_ro_engage_attempt=expected_ro["engage_attempt"],
+            expected_ro_grant_handle=expected_ro["grant_handle"],
+            expected_ro_reader_id=expected_ro["reader_id"],
+            expected_ro_webdav_url=expected_ro["webdav_url"],
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pinned_runtime_identity_mismatch",
+                "message": "Pinned workspace runtime ownership changed.",
+            },
+        )
+    return parsed_agent_id
+
+
+async def _agent_get_thread_workspace_locked(
+    thread_id: str,
+    *,
+    presented_agent_id: str | None = None,
+    presented_runtime_generation: str | None = None,
+    presented_attach_token: str | None = None,
+) -> dict[str, Any]:
     """Build a cold-session payload from state fetched under the DS lock."""
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    metadata = thread.get("metadata") or {}
+    if not _thread_accepts_runtime(thread):
+        raise HTTPException(
+            status_code=409,
+            detail=thread_runtime_refusal_detail(thread),
+        )
+    await _require_pinned_workspace_credential_owner(
+        thread,
+        presented_agent_id,
+        presented_runtime_generation,
+        presented_attach_token,
+    )
+    raw_metadata = thread.get("metadata")
+    metadata = raw_metadata if raw_metadata is not None else {}
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
-            metadata = {}
+            return _protected_workspace_wait_payload(
+                state="failed", error_code="malformed_protected_marker"
+            )
+    if not isinstance(metadata, dict):
+        return _protected_workspace_wait_payload(
+            state="failed", error_code="malformed_protected_marker"
+        )
+    entry_protected_marker = protected_cloud_marker_state(metadata)
+    if entry_protected_marker != "off":
+        protected_state = await _protected_cloud_delivery_state(thread, metadata)
+        if protected_state[0] != "ready":
+            return _protected_workspace_wait_payload(
+                state=protected_state[0], error_code=protected_state[1]
+            )
     ws = metadata.get("workspace_container") or {}
     vm = metadata.get("vm") or {}
     binding = metadata.get("_workspace_binding") or {}
+    # Keep the durable workspace snapshot separate from response-local
+    # readiness redaction below.  The final credential-boundary read must
+    # detect a real U1 -> U2 change, not mistake locally cleared coordinates
+    # (restoring/non-ready/stale probe) for a concurrent database write.
+    authority_ws = ws
+    authority_vm = vm
+    authority_binding = binding
     workspace_backend = _thread_workspace_backend(thread)
     if thread.get("execution_lane") == "stateless" and workspace_backend == "sandbox":
         workspace_status = str(ws.get("status") or "")
@@ -37189,6 +40819,9 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
                     ws = refreshed_ws
                     vm = metadata.get("vm") or {}
                     binding = refreshed_binding
+                    authority_ws = refreshed_ws
+                    authority_vm = vm
+                    authority_binding = refreshed_binding
                     workspace_backend = refreshed_backend
                     refreshed_status = str(ws.get("status") or "")
                     if refreshed_status in {
@@ -37307,9 +40940,17 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
             # exact ready endpoint generation before cloud sync may call those
             # workspace bytes the source of an acknowledged generation.
             try:
-                candidate_runtime_incarnation = str(
-                    UUID(str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
+                # Kubernetes publishes its Pod UID. Static Docker workspaces
+                # have no Pod incarnation; their durable allocation lease UUID
+                # is the exact runtime-incarnation authority. Both are paired
+                # with the backing generation and host-key pin before any SSH
+                # process-zero proof can be accepted.
+                runtime_identity = (
+                    ws.get("_docker_workspace_lease_id")
+                    if ws.get("provisioner") == "docker"
+                    else ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
                 )
+                candidate_runtime_incarnation = str(UUID(str(runtime_identity)))
             except (TypeError, ValueError):
                 candidate_runtime_incarnation = None
             if thread.get("execution_lane") == "stateless":
@@ -37327,10 +40968,33 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
                         "ssh_host_key_fingerprint"
                     ]
             else:
-                # Pinned sessions retain their historical generation/runtime
-                # response contract and their existing SSH trust policy.
                 workspace_generation = candidate_generation
                 workspace_runtime_incarnation = candidate_runtime_incarnation
+                # Protected pinned sessions carry cloud credentials and staged
+                # write authority. Bind their SSH use side to the same exact
+                # host key as stateless claimants; stable Service/Docker
+                # coordinates alone cannot distinguish a replacement runtime.
+                if (
+                    entry_protected_marker == "on"
+                    and candidate_runtime_incarnation is not None
+                    and remote_canvas_presentation_available(metadata, ws)
+                ):
+                    workspace_ssh_host_key_fingerprint = binding[
+                        "ssh_host_key_fingerprint"
+                    ]
+    if (
+        entry_protected_marker == "on"
+        and workspace_backend not in {"virtual", "none"}
+        and ws.get("status") == "ready"
+        and (
+            workspace_generation is None
+            or workspace_runtime_incarnation is None
+            or workspace_ssh_host_key_fingerprint is None
+        )
+    ):
+        return _protected_workspace_wait_payload(
+            state="failed", error_code="workspace_runtime_identity_unavailable"
+        )
     if (
         thread.get("execution_lane") == "stateless"
         and workspace_backend == "virtual"
@@ -37517,8 +41181,121 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
             status_code=503,
             detail="Workspace repository authority changed during attach",
         )
+    # Complete protected-reader and exact selected-mount validation before the
+    # final lifecycle read. The endpoint holds ``thread_datasource_lock`` for
+    # this whole function, so selection cannot change after this snapshot;
+    # marker/lifecycle can still change through independent terminal writers
+    # and are checked synchronously after the final read below.
+    prepared_protected_mount: dict[str, Any] | None = None
+    if entry_protected_marker == "on":
+        prepared_runtime_authority = thread_runtime_authority(thread)
+        if prepared_runtime_authority is None:
+            return _protected_workspace_wait_payload(state="engaging")
+        prepared_ro_row, prepared_mount_rows = await asyncio.gather(
+            postgres_db.get_ro_mount_by_thread(thread_id),
+            postgres_db.list_thread_mounts(thread_id),
+        )
+        if not _ro_mount_matches_protected_selection(
+            prepared_ro_row,
+            prepared_mount_rows,
+            thread_id=thread_id,
+            user_id=str(thread.get("user_id") or ""),
+            runtime_generation=prepared_runtime_authority.generation,
+        ):
+            return _protected_workspace_wait_payload(state="engaging")
+        prepared_protected_mount = (
+            _build_protected_cloud_mount(prepared_ro_row, thread_id=thread_id)
+            if prepared_ro_row
+            else None
+        )
+        if prepared_protected_mount is None:
+            return _protected_workspace_wait_payload(state="engaging")
+
+    # Everything above this point crosses policy, workspace, repository and
+    # cloud awaits. This is the actual credential-delivery boundary and the
+    # final await before returning coordinates.
+    final_thread = await postgres_db.get_thread(thread_id)
+    if not _thread_accepts_runtime(final_thread):
+        raise HTTPException(
+            status_code=409,
+            detail=thread_runtime_refusal_detail(final_thread),
+        )
+    # This is deliberately the last await before any credential-bearing
+    # response. A delayed old runtime A that crosses End -> Resume -> B sees
+    # the successor binding here and is refused without learning B's bytes.
+    await _require_pinned_workspace_credential_owner(
+        final_thread,
+        presented_agent_id,
+        presented_runtime_generation,
+        presented_attach_token,
+        expected_protected_ro_row=(
+            prepared_ro_row if entry_protected_marker == "on" else None
+        ),
+    )
+    final_raw_metadata = final_thread.get("metadata")
+    final_metadata = final_raw_metadata if final_raw_metadata is not None else {}
+    if isinstance(final_metadata, str):
+        try:
+            final_metadata = json.loads(final_metadata)
+        except (json.JSONDecodeError, TypeError):
+            return _protected_workspace_wait_payload(
+                state="failed", error_code="malformed_protected_marker"
+            )
+    if not isinstance(final_metadata, dict):
+        return _protected_workspace_wait_payload(
+            state="failed", error_code="malformed_protected_marker"
+        )
+    final_ws = final_metadata.get("workspace_container") or {}
+    final_vm = final_metadata.get("vm") or {}
+    final_binding = final_metadata.get("_workspace_binding") or {}
+    if (
+        final_ws != authority_ws
+        or final_vm != authority_vm
+        or final_binding != authority_binding
+    ):
+        # Workspace U1 -> U2 is independent of the thread generation. Never
+        # splice U1 coordinates/credentials into a response authorized by a
+        # final read of U2; the agent retries from one coherent snapshot.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "workspace_runtime_identity_changed"},
+        )
+    final_protected_marker = protected_cloud_marker_state(final_metadata)
+    if final_protected_marker == "malformed":
+        return _protected_workspace_wait_payload(
+            state="failed", error_code="malformed_protected_marker"
+        )
+    if final_protected_marker != entry_protected_marker:
+        # A settings/lifecycle writer crossed this expensive credential build.
+        # Return no coordinates from either snapshot; the next poll starts
+        # from one authoritative marker instead of splicing the two states.
+        return _protected_workspace_wait_payload(state="engaging")
+    if final_protected_marker == "on":
+        # All DB/cloud validation already completed under the selection lock;
+        # only the exact prepared mount may cross the response boundary.
+        if prepared_protected_mount is None:
+            return _protected_workspace_wait_payload(state="engaging")
+        cloud_mount_cfg = prepared_protected_mount
+        cloud_sync_cfg = None
+        cloud_sync_degraded = False
+    final_runtime_authority = thread_runtime_authority(final_thread)
+    if final_runtime_authority is None and (
+        final_protected_marker != "off" or _require_pinned_status_identity()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "pinned_runtime_generation_unavailable"},
+        )
+
     return {
         "status": ws.get("status", "none"),
+        "pinned_status_identity_contract": 1,
+        "pinned_runtime_generation_contract": 1,
+        "session_runtime_generation": (
+            final_runtime_authority.generation
+            if final_runtime_authority is not None
+            else None
+        ),
         # Internal claim/attach identity, never exposed by owner-facing thread
         # routes. Durable cloud generations bind their source bytes to this
         # orchestrator-owned workspace incarnation and recheck it before each
@@ -37565,7 +41342,9 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         "repositories": repositories_payload,
         # Nextcloud session folder (legacy; preserved one release for back-compat)
         "nc_session_folder": (
-            None if suppress_disposable_cloud else thread.get("nc_session_folder")
+            None
+            if suppress_disposable_cloud or final_protected_marker != "off"
+            else final_thread.get("nc_session_folder")
         ),
         # Structured cloud-sync config (backend + webdav URL + auth).
         # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
@@ -37578,7 +41357,9 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         # Protected Cloud Mode marker (F-C1): tells the agent to fail-close
         # the legacy nc_session_folder sync shim and any cloud_sync
         # consumption rather than falling back to a live WebDAV mount.
-        "protected_cloud": bool(metadata.get("protected_cloud")),
+        "protected_cloud": final_protected_marker != "off",
+        "protected_cloud_state": ("ready" if final_protected_marker == "on" else None),
+        "protected_cloud_error_code": None,
     }
 
 
@@ -37593,6 +41374,299 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
 _cloud_stage_tasks: dict[str, "asyncio.Task[None]"] = {}
 
 
+def _capture_cloud_stage_authority(
+    thread: dict[str, Any], row: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Freeze the complete runtime/workspace/reader source for one stage."""
+
+    if thread.get("execution_lane") != "pinned":
+        return None
+    generation = str(thread.get("runtime_generation") or "")
+    agent_id = str(thread.get("agent_id") or "")
+    attach_token = str(thread.get("runtime_attach_token") or "")
+    orchestrator_owned_retirement = bool(
+        thread.get("runtime_retirement_token") is not None
+        and thread.get("runtime_retirement_authorized_at") is not None
+        and thread.get("runtime_authority_exposed") is False
+        and not agent_id
+        and not attach_token
+    )
+    metadata = thread_metadata_object(thread)
+    ws = metadata.get("workspace_container") or {}
+    binding = metadata.get("_workspace_binding") or {}
+    if not isinstance(ws, dict) or not isinstance(binding, dict):
+        return None
+    workspace_generation = str(binding.get("generation") or "")
+    workspace_runtime = str(ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+    fingerprint = str(binding.get("ssh_host_key_fingerprint") or "")
+    source = ProtectedMountSourceIdentity.from_binding(
+        row.get("source_binding"),
+        expected_sha256=str(row.get("source_binding_sha256") or ""),
+    )
+    try:
+        UUID(generation)
+        UUID(workspace_generation)
+        UUID(workspace_runtime)
+        UUID(str(row.get("engage_attempt") or ""))
+        if not orchestrator_owned_retirement:
+            UUID(attach_token)
+    except (TypeError, ValueError):
+        return None
+    if not (
+        (agent_id or orchestrator_owned_retirement)
+        and ws.get("status") == "ready"
+        and binding.get("kind") == "remote"
+        and str(ws.get("_canvas_workspace_generation") or "") == workspace_generation
+        and fingerprint.startswith("SHA256:")
+        and source is not None
+        and str(row.get("status") or "") == "active"
+        and str(row.get("runtime_generation") or "") == generation
+    ):
+        return None
+    return {
+        "runtime_generation": generation,
+        "runtime_retirement_token": (
+            str(thread["runtime_retirement_token"])
+            if thread.get("runtime_retirement_token") is not None
+            else None
+        ),
+        "agent_id": agent_id or None,
+        "runtime_attach_token": attach_token or None,
+        "workspace": dict(ws),
+        "workspace_binding": dict(binding),
+        "workspace_generation": workspace_generation,
+        "workspace_runtime_incarnation": workspace_runtime,
+        "workspace_ssh_host_key_fingerprint": fingerprint,
+        "mount_row_id": str(row.get("id") or ""),
+        "engage_attempt": str(row.get("engage_attempt") or ""),
+        "source_binding_sha256": source.sha256,
+        "expected_staged_epoch": int(row.get("staged_epoch") or 0),
+    }
+
+
+def _retirement_stage_event_from_receipt(
+    retirement: Mapping[str, Any],
+    thread: Mapping[str, Any],
+    row: Mapping[str, Any] | None,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Validate an append-once terminal stage receipt for retry recovery.
+
+    ``True`` means the final probe was already published and cleanup may be
+    retried without touching the now-absent workspace/reader.  ``event`` is
+    ``None`` only for a proven empty publication.  Any malformed or
+    cross-generation shape returns ``False`` and must never be treated as a
+    successful stage.
+    """
+
+    receipt = thread.get("runtime_retirement_stage_receipt")
+    if receipt is None:
+        return False, None
+    if isinstance(receipt, str):
+        try:
+            receipt = json.loads(receipt)
+        except (TypeError, ValueError):
+            return False, None
+    context = retirement.get("context") or {}
+    protected = context.get("protected_ro") or {}
+    workspace = context.get("workspace_container") or {}
+    binding = context.get("workspace_binding") or {}
+    if isinstance(receipt, Mapping) and receipt.get("kind") == "never_engaged":
+        captured_ro = context.get("protected_ro")
+        current_ro_proves_unpublished = _never_delivered_protected_reader_shape(
+            retirement,
+            thread,
+            row,
+            require_current_revoked=True,
+        )
+        captured_ro_is_never_delivered = bool(
+            current_ro_proves_unpublished and isinstance(captured_ro, Mapping)
+        )
+        expected_mount_id = (
+            str(captured_ro.get("id")) if captured_ro_is_never_delivered else None
+        )
+        expected_attempt = (
+            str(captured_ro.get("engage_attempt"))
+            if captured_ro_is_never_delivered
+            else None
+        )
+        captured_plan = (
+            ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(captured_ro)
+            if captured_ro_is_never_delivered
+            else None
+        )
+        expected_source_sha256 = (
+            captured_plan.source_sha256 if captured_plan is not None else None
+        )
+        if not (
+            current_ro_proves_unpublished
+            and int(receipt.get("version") or 0) == 1
+            and str(receipt.get("runtime_generation") or "")
+            == str(retirement.get("generation") or "")
+            and str(receipt.get("retirement_token") or "")
+            == str(retirement.get("token") or "")
+            and (
+                receipt.get("mount_id") is None
+                if expected_mount_id is None
+                else str(receipt.get("mount_id") or "") == expected_mount_id
+            )
+            and (
+                receipt.get("engage_attempt") is None
+                if expected_attempt is None
+                else str(receipt.get("engage_attempt") or "") == expected_attempt
+            )
+            and (
+                receipt.get("source_binding_sha256") is None
+                if expected_source_sha256 is None
+                else str(receipt.get("source_binding_sha256") or "")
+                == expected_source_sha256
+            )
+            and receipt.get("workspace_generation") is None
+            and receipt.get("workspace_runtime_incarnation") is None
+            and int(receipt.get("expected_staged_epoch") or 0) == 0
+            and int(receipt.get("staged_epoch") or 0) == 0
+            and receipt.get("staged_summary") is None
+        ):
+            return False, None
+        return True, {
+            "thread_id": str(context.get("thread_id") or ""),
+            "session_runtime_generation": str(retirement.get("generation") or ""),
+            "staged_epoch": 0,
+            "file_count": 0,
+            "counts": {"added": 0, "modified": 0, "deleted": 0},
+            "mount_id": expected_mount_id,
+        }
+    if row is None:
+        return False, None
+    if not all(
+        isinstance(value, Mapping)
+        for value in (receipt, context, protected, workspace, binding, row)
+    ):
+        return False, None
+    assert isinstance(receipt, Mapping)
+    assert isinstance(row, Mapping)
+    generation = str(retirement.get("generation") or "")
+    token = str(retirement.get("token") or "")
+    mount_id = str(protected.get("id") or "")
+    engage_attempt = str(protected.get("engage_attempt") or "")
+    workspace_generation = str(binding.get("generation") or "")
+    workspace_runtime = str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+    expected_epoch = int(protected.get("staged_epoch") or 0)
+    staged_epoch = int(receipt.get("staged_epoch") or -1)
+    receipt_kind = str(receipt.get("kind") or "")
+    captured_plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(protected)
+    current_plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(row)
+    if captured_plan is None or current_plan != captured_plan:
+        return False, None
+    source_sha256 = captured_plan.source_sha256
+    if not (
+        int(receipt.get("version") or 0) == 1
+        and str(receipt.get("runtime_generation") or "") == generation
+        and str(receipt.get("retirement_token") or "") == token
+        and str(receipt.get("mount_id") or "") == mount_id
+        and str(receipt.get("engage_attempt") or "") == engage_attempt
+        and str(receipt.get("source_binding_sha256") or "") == source_sha256
+        and str(receipt.get("workspace_generation") or "") == workspace_generation
+        and str(receipt.get("workspace_runtime_incarnation") or "") == workspace_runtime
+        and int(receipt.get("expected_staged_epoch") or -1) == expected_epoch
+        and staged_epoch
+        == (expected_epoch if receipt_kind == "unchanged" else expected_epoch + 1)
+        and str(row.get("id") or "") == mount_id
+        and str(row.get("runtime_generation") or "") == generation
+        and str(row.get("engage_attempt") or "") == engage_attempt
+        and int(row.get("staged_epoch") or -1) == staged_epoch
+    ):
+        return False, None
+    current_summary = row.get("staged_summary")
+    if isinstance(current_summary, str):
+        try:
+            current_summary = json.loads(current_summary)
+        except (TypeError, ValueError):
+            return False, None
+    summary = receipt.get("staged_summary")
+    if current_summary != summary:
+        return False, None
+    kind = receipt_kind
+    if kind == "empty":
+        if summary is not None:
+            return False, None
+        return True, {
+            "thread_id": str(context.get("thread_id") or ""),
+            "session_runtime_generation": generation,
+            "staged_epoch": staged_epoch,
+            "file_count": 0,
+            "counts": {"added": 0, "modified": 0, "deleted": 0},
+            "mount_id": mount_id,
+        }
+    if not isinstance(summary, Mapping):
+        return False, None
+    if not (
+        summary.get("source_binding") == captured_plan.source.binding
+        and str(summary.get("source_binding_sha256") or "") == source_sha256
+    ):
+        return False, None
+    if kind == "unchanged":
+        captured_summary = protected.get("staged_summary")
+        if isinstance(captured_summary, str):
+            try:
+                captured_summary = json.loads(captured_summary)
+            except (TypeError, ValueError):
+                return False, None
+        if captured_summary != summary:
+            return False, None
+    elif kind == "uploaded":
+        tar_sha = str(summary.get("tar_sha256") or "")
+        prefix = (
+            f"cloud-staging/{context.get('thread_id')}/{generation}/"
+            f"{workspace_generation}/{staged_epoch}/{source_sha256}/{tar_sha}/"
+        )
+        if not (
+            len(tar_sha) == 64
+            and str(summary.get("tar_key") or "") == f"{prefix}upper.tar"
+            and str(summary.get("manifest_key") or "") == f"{prefix}manifest.json"
+        ):
+            return False, None
+    else:
+        return False, None
+    counts = summary.get("counts") or {}
+    if not isinstance(counts, Mapping):
+        return False, None
+    event = {
+        "thread_id": str(context.get("thread_id") or ""),
+        "session_runtime_generation": generation,
+        "staged_epoch": staged_epoch,
+        "file_count": sum(int(value or 0) for value in counts.values()),
+        "counts": dict(counts),
+        "mount_id": mount_id,
+    }
+    return True, event
+
+
+def _cloud_stage_task_key(thread_id: str, authority: Mapping[str, Any]) -> str:
+    return ":".join(
+        (
+            thread_id,
+            str(authority.get("runtime_generation") or ""),
+            str(authority.get("workspace_generation") or ""),
+            str(authority.get("expected_staged_epoch") or ""),
+        )
+    )
+
+
+def _broadcast_cloud_stage_result(result: Mapping[str, Any] | None) -> None:
+    if not result or not isinstance(result.get("event"), dict):
+        return
+    publication = result.get("publication") or {}
+    if publication.get("runtime_retirement_pending"):
+        # Retirement journals the same payload atomically at settlement after
+        # the old agent Pod is gone; do not advertise it early.
+        return
+    user_id = str(publication.get("user_id") or "")
+    if user_id:
+        from services.notification_feed import notification_feed
+
+        notification_feed.broadcast(user_id, "cloud.diff_staged", result["event"])
+
+
 @app.post("/api/agents/threads/{thread_id}/cloud-stage")
 async def agent_trigger_cloud_stage(request: Request, thread_id: str) -> dict[str, Any]:
     """Internal — agent turn-end ping. Fire-and-forget staging of the thread's
@@ -37603,18 +41677,39 @@ async def agent_trigger_cloud_stage(request: Request, thread_id: str) -> dict[st
         return {"skipped": "flag_off"}
     from services.cloud_staging.stage import stage_thread_cloud_diff
 
+    headers = getattr(request, "headers", {})
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    await _require_pinned_workspace_credential_owner(
+        thread,
+        headers.get("X-Agent-ID"),
+        headers.get("X-Session-Runtime-Generation"),
+        headers.get("X-Session-Runtime-Attach-Token"),
+    )
+    row = await postgres_db.get_ro_mount_by_thread(thread_id)
+    authority = _capture_cloud_stage_authority(thread, row or {})
+    if authority is None or authority.get("runtime_retirement_token") is not None:
+        raise HTTPException(
+            status_code=409, detail={"code": "cloud_stage_authority_unavailable"}
+        )
+    task_key = _cloud_stage_task_key(thread_id, authority)
+
     async def _run() -> None:
         try:
-            await stage_thread_cloud_diff(
-                thread_id=thread_id,
-                postgres_db=postgres_db,
-                snapshot_service=snapshot_service,
-            )
+            async with postgres_db.thread_advisory_lock(thread_id):
+                result = await stage_thread_cloud_diff(
+                    thread_id=thread_id,
+                    postgres_db=postgres_db,
+                    snapshot_service=snapshot_service,
+                    authority=authority,
+                )
+            _broadcast_cloud_stage_result(result)
         finally:
-            _cloud_stage_tasks.pop(thread_id, None)
+            _cloud_stage_tasks.pop(task_key, None)
 
-    if thread_id not in _cloud_stage_tasks:
-        _cloud_stage_tasks[thread_id] = asyncio.create_task(_run())
+    if task_key not in _cloud_stage_tasks:
+        _cloud_stage_tasks[task_key] = asyncio.create_task(_run())
     return {"scheduled": True}
 
 
@@ -37629,24 +41724,221 @@ async def agent_get_thread_lifecycle(
     decide whether to exit without dragging in the full thread payload.
     """
     await require_internal(request)
+    headers = getattr(request, "headers", {})
+    presented_agent_id = headers.get("X-Agent-ID")
+    presented_runtime_generation = headers.get("X-Session-Runtime-Generation")
+    presented_attach_token = headers.get("X-Session-Runtime-Attach-Token")
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+    if str(thread.get("execution_lane") or "") == "pinned":
+        if thread.get("runtime_retirement_token") is not None:
+            # Credential delivery remains closed while retiring, but the
+            # exact old process needs one narrow read-only channel to discover
+            # the immutable token/disposition and finish strict local cleanup.
+            try:
+                parsed_thread = UUID(str(thread_id))
+                parsed_agent = UUID(str(presented_agent_id))
+                parsed_generation = UUID(str(presented_runtime_generation))
+                parsed_attach = UUID(str(presented_attach_token))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "pinned_runtime_identity_required"},
+                ) from exc
+            async with postgres_db.acquire() as conn:
+                pending = await conn.fetchrow(
+                    "SELECT t.status, t.agent_id, t.runtime_generation, "
+                    "t.runtime_attach_token, t.runtime_retirement_token, "
+                    "t.runtime_retirement_permanent, "
+                    "t.runtime_retirement_authorized_at, "
+                    "t.runtime_retirement_context, t.ended_at "
+                    "FROM threads t WHERE t.id=$1::uuid "
+                    "AND t.execution_lane='pinned' "
+                    "AND t.runtime_generation=$2::uuid "
+                    "AND t.agent_id=$3::uuid "
+                    "AND t.runtime_attach_token=$4::uuid "
+                    "AND t.runtime_retirement_token IS NOT NULL "
+                    "AND EXISTS (SELECT 1 FROM agents a WHERE a.id=$3::uuid "
+                    "AND a.thread_id=t.id) FOR SHARE",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_agent,
+                    parsed_attach,
+                )
+            if pending is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "pinned_runtime_identity_mismatch"},
+                )
+            thread = dict(pending)
+        else:
+            await _require_pinned_workspace_credential_owner(
+                thread,
+                presented_agent_id,
+                presented_runtime_generation,
+                presented_attach_token,
+            )
+            # The reciprocal query above awaits. Re-read and make its exact owner
+            # query the final await so G1 cannot miss End and accept a resumed G2
+            # lifecycle snapshot as its own.
+            thread = await postgres_db.get_thread(thread_id)
+            if not thread:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            await _require_pinned_workspace_credential_owner(
+                thread,
+                presented_agent_id,
+                presented_runtime_generation,
+                presented_attach_token,
+            )
+    retirement_context = thread.get("runtime_retirement_context") or {}
+    if isinstance(retirement_context, str):
+        try:
+            retirement_context = json.loads(retirement_context)
+        except (TypeError, ValueError):
+            retirement_context = {}
+    retirement_pending = thread.get("runtime_retirement_token") is not None
+    retirement_authorized = bool(
+        retirement_pending
+        and thread.get("runtime_retirement_authorized_at") is not None
+    )
     return {
-        "status": thread.get("status"),
+        "status": "ending" if retirement_authorized else thread.get("status"),
         "agent_id": str(thread.get("agent_id")) if thread.get("agent_id") else None,
+        "session_runtime_generation": (
+            str(thread.get("runtime_generation"))
+            if thread.get("runtime_generation")
+            else None
+        ),
+        "session_runtime_attach_token": (
+            str(thread.get("runtime_attach_token"))
+            if thread.get("runtime_attach_token")
+            else None
+        ),
+        "runtime_retirement_pending": bool(retirement_pending),
+        "runtime_retirement_preflight": bool(
+            retirement_pending and not retirement_authorized
+        ),
+        "runtime_retirement_authorized": retirement_authorized,
+        "retirement_permanent": bool(
+            retirement_authorized and thread.get("runtime_retirement_permanent") is True
+        ),
+        "retirement_disposition": (
+            str(retirement_context.get("settle_status"))
+            if retirement_authorized and isinstance(retirement_context, Mapping)
+            else None
+        ),
+        "session_runtime_retirement_token": (
+            str(thread.get("runtime_retirement_token"))
+            if retirement_authorized
+            else None
+        ),
         "ended_at": thread.get("ended_at").isoformat()
         if thread.get("ended_at")
         else None,
     }
 
 
+@app.get("/api/agents/threads/{thread_id}/retirement-outcome")
+async def agent_get_thread_retirement_outcome(
+    request: Request, thread_id: str
+) -> dict[str, Any]:
+    """Read back one exact final retirement after a lost settlement response.
+
+    This internal endpoint never returns the current thread/agent/workspace.
+    The full old T/G/process/disposition tuple either names an append-only
+    terminal receipt, names the same still-pending attempt, or proves nothing.
+    A generic 404, generation change, or successor therefore cannot be
+    mistaken for the caller's successful settlement.
+    """
+
+    await require_internal(request)
+    headers = getattr(request, "headers", {})
+    agent_id = headers.get("X-Agent-ID")
+    generation = headers.get("X-Session-Runtime-Generation")
+    attach_token = headers.get("X-Session-Runtime-Attach-Token")
+    retirement_token = headers.get("X-Session-Runtime-Retirement-Token")
+    disposition = str(headers.get("X-Retirement-Disposition") or "")
+    permanent_raw = str(headers.get("X-Retirement-Permanent") or "").lower()
+    if permanent_raw not in {"true", "false"}:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "pinned_retirement_outcome_identity_required"},
+        )
+    outcome = await postgres_db.get_pinned_thread_retirement_outcome(
+        thread_id,
+        runtime_generation=str(generation or ""),
+        retirement_token=str(retirement_token or ""),
+        agent_id=str(agent_id or ""),
+        runtime_attach_token=str(attach_token or ""),
+        disposition=disposition,
+        permanent=permanent_raw == "true",
+    )
+    if outcome is not None:
+        return outcome
+
+    current = await postgres_db.get_thread(thread_id)
+    context = (current or {}).get("runtime_retirement_context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (TypeError, ValueError):
+            context = {}
+    if (
+        isinstance(current, Mapping)
+        and isinstance(context, Mapping)
+        and str(current.get("runtime_generation") or "") == str(generation or "")
+        and str(current.get("runtime_retirement_token") or "")
+        == str(retirement_token or "")
+        and str(current.get("agent_id") or "") == str(agent_id or "")
+        and str(current.get("runtime_attach_token") or "") == str(attach_token or "")
+        and str(context.get("settle_status") or "") == disposition
+        and bool(current.get("runtime_retirement_permanent"))
+        == (permanent_raw == "true")
+        and current.get("runtime_retirement_authorized_at") is not None
+    ):
+        return {
+            "status": "ending",
+            "retirement_disposition": disposition,
+            "retirement_permanent": permanent_raw == "true",
+        }
+    raise HTTPException(
+        status_code=409,
+        detail={"code": "pinned_retirement_outcome_unproven"},
+    )
+
+
 class AgentThreadStatusRequest(BaseModel):
     status: str
     # Optional exact owner credential for pinned teardown. Stateless callers
-    # and legacy status writes omit it; when supplied, the status transition is
-    # serialized with the reciprocal thread/agent binding.
+    # omit it; pinned status writes require it after the 0185 drained cutover so
+    # the transition is serialized with the reciprocal thread/agent binding.
     agent_id: UUID | None = None
+    session_runtime_generation: UUID | None = None
+    session_runtime_attach_token: UUID | None = None
+    session_runtime_retirement_token: UUID | None = None
+    # Immutable disposition installed by the begin-only `ending` edge.  A
+    # retry may reuse that retirement token only for this exact outcome.
+    retirement_disposition: Literal["ended", "suspended"] | None = None
+    # Immutable owner-delete intent. Agents may only echo ``true`` from an
+    # already-authorized lifecycle response; an agent-originated Begin is
+    # always a resumable soft retirement.
+    retirement_permanent: bool = False
+    # Append-only settlement proof.  The agent may set this only after its
+    # strict local teardown has drained shell jobs, overlays/mounts and the
+    # ordinary event writer.  Physical workspace IDs bind the proof to the
+    # exact backing captured by Begin.
+    local_runtime_quiesced: bool = False
+    local_quiescence_protocol: (
+        Literal[
+            "workspace_process_zero_v1",
+            "agent_runtime_zero_v1",
+            "workspace_actuator_zero_v1",
+        ]
+        | None
+    ) = None
+    workspace_generation: UUID | None = None
+    workspace_runtime_incarnation: UUID | None = None
 
 
 class OfficerWakeRequest(BaseModel):
@@ -37754,6 +42046,7 @@ async def _hold_officer_for_conference(
                     "with the session brief. If your backstop fires before "
                     "the brief: sleep.]",
                     delivery_id=str(uuid4()),
+                    db=postgres_db,
                 )
     except Exception:
         logger.exception("conference hold: stamping failed (non-fatal)")
@@ -38540,7 +42833,12 @@ async def _inject_officer_notice(officer_thread: dict[str, Any], text: str) -> b
         agent = await _sw._resolve_live_agent(postgres_db, officer_thread)
         if agent is None:
             return False
-        outcome = await _sw._inject_live(agent, text, delivery_id=str(uuid4()))
+        outcome = await _sw._inject_live(
+            agent,
+            text,
+            delivery_id=str(uuid4()),
+            db=postgres_db,
+        )
         return outcome == _sw.WakeDeliveryResult.EXECUTED
     except Exception:
         logger.debug("officer notice: inject failed (non-fatal)", exc_info=True)
@@ -38584,6 +42882,7 @@ async def _decommission_officer_post(
     reason: str,
     force: bool = False,
     allow_orphan_retirement: bool = False,
+    retirement: Mapping[str, Any] | None = None,
 ) -> Optional[dict[str, Any]]:
     """Run the authoritative commissioned -> vacant database transition.
 
@@ -38599,12 +42898,22 @@ async def _decommission_officer_post(
         return None
     project_id = str(project_id)
     thread_id = str(thread["id"])
+    retirement_kwargs: dict[str, Any] = {}
+    if retirement is not None:
+        retirement_kwargs = {
+            "retirement_token": str(retirement.get("token")),
+            "retirement_generation": str(retirement.get("generation")),
+            "retirement_settle_status": str(
+                (retirement.get("context") or {}).get("settle_status") or ""
+            ),
+        }
     summary = await postgres_db.decommission_project_officer(
         project_id,
         thread_id,
         reason=reason,
         force=force,
         allow_orphan_retirement=allow_orphan_retirement,
+        **retirement_kwargs,
     )
 
     routes = summary.get("routes") or []
@@ -39544,7 +43853,7 @@ async def agent_update_thread_status(
     request: Request,
     thread_id: str,
     body: AgentThreadStatusRequest,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Update thread status. **Internal** (P4b) — requires ``X-Internal-Key``.
     Ingress strips this path.
 
@@ -39562,11 +43871,103 @@ async def agent_update_thread_status(
     the thread back to active while the orchestrator is mid-suspend.
     """
     await require_internal(request)
-    valid_statuses = {"active", "ended", "awaiting_user"}
+    valid_statuses = {"active", "ending", "ended", "awaiting_user"}
     if body.status not in valid_statuses:
         raise HTTPException(
             status_code=400,
             detail=f"Status must be one of: {valid_statuses}",
+        )
+    lane_thread = await postgres_db.get_thread(thread_id)
+    if (
+        body.status == "ended"
+        and body.agent_id is not None
+        and body.session_runtime_generation is not None
+        and body.session_runtime_attach_token is not None
+        and body.session_runtime_retirement_token is not None
+        and body.retirement_disposition is not None
+    ):
+        # Exact final-status retries are also the lost-200 reconciliation
+        # channel. The append-only outcome survives suspended generation
+        # rotation, quick Resume and permanent row deletion, and is keyed by
+        # the complete old process/T tuple. A generic missing row or G change
+        # is deliberately not treated as success.
+        exact_outcome = await postgres_db.get_pinned_thread_retirement_outcome(
+            thread_id,
+            runtime_generation=str(body.session_runtime_generation),
+            retirement_token=str(body.session_runtime_retirement_token),
+            agent_id=str(body.agent_id),
+            runtime_attach_token=str(body.session_runtime_attach_token),
+            disposition=str(body.retirement_disposition),
+            permanent=bool(body.retirement_permanent),
+        )
+        if exact_outcome is not None:
+            return exact_outcome
+        if lane_thread is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "pinned_retirement_outcome_unproven"},
+            )
+    lane_metadata = thread_metadata_object(lane_thread)
+    pinned_identity_required = bool(
+        lane_thread is not None
+        and lane_thread.get("execution_lane") == "pinned"
+        and (
+            protected_cloud_marker_state(lane_metadata) != "off"
+            or _require_pinned_status_identity()
+        )
+    )
+    if (
+        lane_thread is not None
+        and lane_thread.get("execution_lane") == "pinned"
+        and (
+            body.agent_id is None
+            or body.session_runtime_generation is None
+            or body.session_runtime_attach_token is None
+            or (
+                body.status in {"ending", "ended"}
+                and body.retirement_disposition is None
+            )
+            or (
+                body.status == "ended" and body.session_runtime_retirement_token is None
+            )
+        )
+        and pinned_identity_required
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pinned_status_identity_required",
+                "message": (
+                    "Pinned session status updates require agent, runtime "
+                    "generation, and process attach identity."
+                ),
+            },
+        )
+    if body.status == "ending" and (
+        body.agent_id is None
+        or body.session_runtime_generation is None
+        or body.session_runtime_attach_token is None
+        or body.retirement_disposition is None
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "pinned_status_identity_required"},
+        )
+    if body.status == "ending" and body.retirement_permanent:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "agent_permanent_retirement_forbidden"},
+        )
+    if (
+        lane_thread is not None
+        and lane_thread.get("execution_lane") == "pinned"
+        and body.session_runtime_generation is not None
+        and str(lane_thread.get("runtime_generation") or "")
+        != str(body.session_runtime_generation)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "pinned_runtime_generation_mismatch"},
         )
     if (
         body.status == "ended"
@@ -39586,7 +43987,13 @@ async def agent_update_thread_status(
                 status_code=409,
                 detail="Persistent recycle owns this thread transition",
             )
-    lane_thread = await postgres_db.get_thread(thread_id)
+    if body.status in {"active", "awaiting_user"} and not _thread_accepts_runtime(
+        lane_thread
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=thread_runtime_refusal_detail(lane_thread),
+        )
     if (
         lane_thread is not None
         and lane_thread.get("execution_lane") == "stateless"
@@ -39600,17 +44007,13 @@ async def agent_update_thread_status(
             detail="Stateless status updates require exact lease authority",
         )
     if body.agent_id is not None:
-        if body.status != "ended":
-            raise HTTPException(
-                status_code=400,
-                detail="Exact pinned-owner fencing is supported only for ended",
-            )
         agent_id = body.agent_id
         async with postgres_db.acquire() as conn:
             async with conn.transaction():
                 thread_record = await conn.fetchrow(
                     "SELECT id, agent_id, execution_lane, status, metadata, "
-                    "project_id, title "
+                    "project_id, title, runtime_generation, "
+                    "runtime_attach_token, runtime_retirement_token "
                     "FROM threads WHERE id = $1::uuid FOR UPDATE",
                     thread_id,
                 )
@@ -39618,11 +44021,24 @@ async def agent_update_thread_status(
                     thread_record is None
                     or str(thread_record["execution_lane"] or "") != "pinned"
                     or thread_record["agent_id"] != agent_id
+                    or (
+                        body.session_runtime_generation is not None
+                        and str(thread_record["runtime_generation"])
+                        != str(body.session_runtime_generation)
+                    )
+                    or (
+                        thread_record["runtime_retirement_token"] is not None
+                        and body.status not in {"ending", "ended"}
+                    )
+                    or str(thread_record["runtime_attach_token"] or "")
+                    != str(body.session_runtime_attach_token or "")
                 ):
                     raise HTTPException(
                         status_code=409,
                         detail="Pinned session ownership changed before teardown",
                     )
+                if str(thread_record["status"] or "") == "ended":
+                    return {"status": "ended"}
                 reciprocal = await conn.fetchval(
                     "SELECT 1 FROM agents WHERE id = $1::uuid "
                     "AND thread_id = $2::uuid FOR SHARE",
@@ -39637,35 +44053,207 @@ async def agent_update_thread_status(
 
                 thread_row = dict(thread_record)
                 officer = _officer_meta_enabled(_thread_officer_meta(thread_row))
-                if officer:
+                if (
+                    body.status == "ended"
+                    and officer
+                    and body.retirement_disposition not in {None, "suspended"}
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "pinned_retirement_disposition_mismatch"},
+                    )
+                if body.status == "ending":
+                    updated = thread_record["id"]
+                    result_status = "begin_retirement"
+                elif (
+                    body.status == "ended"
+                    and body.retirement_disposition == "suspended"
+                ):
+                    # Graceful Officer shutdown is a runtime suspension, not
+                    # Post retirement. It still must close admission before
+                    # cleanup and rotate generation at settlement; a direct
+                    # suspended write reopened the watchdog while G1 cleanup
+                    # was deleting deterministic resource names.
+                    updated = thread_record["id"]
+                    result_status = "retiring_suspended"
+                elif body.status == "ended":
+                    # The dedicated pinned retirement funnel owns the first
+                    # lifecycle write. Directly setting ended here would
+                    # reopen the historical End->Resume cleanup ABA window.
+                    updated = thread_record["id"]
+                    result_status = "retiring"
+                elif body.status == "awaiting_user":
                     updated = await conn.fetchval(
                         "UPDATE threads "
-                        "SET status = 'suspended', agent_id = NULL, "
-                        "    control_admission_agent_id = NULL, "
-                        "    awaiting_user_since = NULL "
+                        "SET status = 'awaiting_user', "
+                        "    awaiting_user_since = CASE "
+                        "        WHEN status = 'awaiting_user' "
+                        "             THEN awaiting_user_since "
+                        "        ELSE now() "
+                        "    END, "
+                        "    extend_count = CASE "
+                        "        WHEN status = 'awaiting_user' THEN extend_count "
+                        "        ELSE 0 "
+                        "    END, "
+                        "    last_activity = CURRENT_TIMESTAMP "
                         "WHERE id = $1::uuid AND agent_id = $2::uuid "
-                        "RETURNING id",
+                        "AND status <> 'ended' "
+                        "AND ($3::uuid IS NULL OR runtime_generation=$3::uuid) "
+                        "AND runtime_attach_token IS NOT DISTINCT FROM $4::uuid "
+                        "AND runtime_retirement_token IS NULL RETURNING id",
                         thread_id,
                         agent_id,
+                        body.session_runtime_generation,
+                        body.session_runtime_attach_token,
                     )
-                    result_status = "suspended"
+                    result_status = "awaiting_user"
                 else:
                     updated = await conn.fetchval(
                         "UPDATE threads "
-                        "SET status = 'ended', ended_at = CURRENT_TIMESTAMP, "
-                        "    control_admission_agent_id = NULL "
+                        "SET status = 'active', "
+                        "    awaiting_user_since = NULL, "
+                        "    extend_count = 0, "
+                        "    last_activity = CURRENT_TIMESTAMP "
                         "WHERE id = $1::uuid AND agent_id = $2::uuid "
-                        "AND status <> 'suspended' RETURNING id",
+                        "AND status <> 'ended' "
+                        "AND ($3::uuid IS NULL OR runtime_generation=$3::uuid) "
+                        "AND runtime_attach_token IS NOT DISTINCT FROM $4::uuid "
+                        "AND runtime_retirement_token IS NULL RETURNING id",
                         thread_id,
                         agent_id,
+                        body.session_runtime_generation,
+                        body.session_runtime_attach_token,
                     )
-                    result_status = "ended"
+                    result_status = "active"
                 if updated is None:
                     raise HTTPException(
                         status_code=409,
                         detail="Pinned session ownership changed before teardown",
                     )
 
+        if result_status == "begin_retirement":
+            retirement = await postgres_db.begin_pinned_thread_retirement(
+                thread_id,
+                permanent=bool(body.retirement_permanent),
+                settle_status=str(body.retirement_disposition),
+                initiator="agent",
+                expected_runtime_generation=str(body.session_runtime_generation),
+                expected_agent_id=str(agent_id),
+                expected_attach_token=str(body.session_runtime_attach_token),
+                authorize_immediately=True,
+            )
+            if (
+                retirement.get("state") != "pending"
+                or retirement.get("authorized_at") is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "pinned_retirement_conflict",
+                        "reason": retirement.get("reason") or retirement.get("state"),
+                    },
+                )
+            return {
+                "status": "ending",
+                "retirement_disposition": str(body.retirement_disposition),
+                "retirement_permanent": bool(retirement.get("permanent")),
+                "session_runtime_retirement_token": str(retirement["token"]),
+            }
+        if result_status in {"retiring", "retiring_suspended"}:
+            if body.retirement_disposition is not None and (
+                (result_status == "retiring_suspended")
+                != (body.retirement_disposition == "suspended")
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "pinned_retirement_disposition_mismatch"},
+                )
+            settle_disposition = (
+                str(body.retirement_disposition)
+                if body.retirement_disposition is not None
+                else ("suspended" if result_status == "retiring_suspended" else "ended")
+            )
+            if not body.local_runtime_quiesced:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "pinned_local_quiescence_required"},
+                )
+            if body.session_runtime_retirement_token is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "pinned_retirement_token_required"},
+                )
+            # A direct final request may race or replace the begin-only call.
+            # Install/reuse the immutable marker first, then append the exact
+            # local proof under that token before any staging or cleanup.
+            retirement = await postgres_db.begin_pinned_thread_retirement(
+                thread_id,
+                permanent=bool(body.retirement_permanent),
+                settle_status=settle_disposition,
+                initiator="agent",
+                expected_runtime_generation=str(body.session_runtime_generation),
+                expected_agent_id=str(agent_id),
+                expected_attach_token=str(body.session_runtime_attach_token),
+                expected_retirement_token=str(body.session_runtime_retirement_token),
+            )
+            if retirement.get("state") != "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "pinned_retirement_conflict",
+                        "reason": retirement.get("reason") or retirement.get("state"),
+                    },
+                )
+            local_receipt = (
+                await postgres_db.acknowledge_pinned_thread_local_quiescence(
+                    thread_id,
+                    expected_runtime_generation=str(body.session_runtime_generation),
+                    expected_retirement_token=str(
+                        body.session_runtime_retirement_token
+                    ),
+                    expected_agent_id=str(agent_id),
+                    expected_attach_token=str(body.session_runtime_attach_token),
+                    expected_settle_status=settle_disposition,
+                    expected_quiescence_protocol=str(
+                        body.local_quiescence_protocol or ""
+                    ),
+                    expected_workspace_generation=(
+                        str(body.workspace_generation)
+                        if body.workspace_generation is not None
+                        else None
+                    ),
+                    expected_workspace_runtime_incarnation=(
+                        str(body.workspace_runtime_incarnation)
+                        if body.workspace_runtime_incarnation is not None
+                        else None
+                    ),
+                )
+            )
+            if local_receipt is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "pinned_local_quiescence_refused"},
+                )
+            retired = await _end_thread_flow(
+                thread_id,
+                thread_row,
+                permanent=bool(body.retirement_permanent),
+                force=True,
+                expected_runtime_generation=(
+                    str(body.session_runtime_generation)
+                    if body.session_runtime_generation is not None
+                    else None
+                ),
+                expected_agent_id=str(agent_id),
+                expected_attach_token=(
+                    str(body.session_runtime_attach_token)
+                    if body.session_runtime_attach_token is not None
+                    else None
+                ),
+                settle_status=settle_disposition,
+                local_runtime_quiesced=True,
+            )
+            return retired
         if result_status == "suspended":
             logger.info(
                 "Officer thread %s: exact-owner agent 'ended' mapped to "
@@ -39693,13 +44281,20 @@ async def agent_update_thread_status(
                 _thread_officer_meta(thread_row)
             ):
                 async with postgres_db.acquire() as conn:
-                    await conn.execute(
+                    updated = await conn.fetchval(
                         "UPDATE threads "
                         "SET status = 'suspended', agent_id = NULL, "
                         "    control_admission_agent_id = NULL, "
                         "    awaiting_user_since = NULL "
-                        "WHERE id = $1 AND status <> 'ended'",
+                        "WHERE id = $1 AND status <> 'ended' RETURNING id",
                         thread_id,
+                    )
+                if updated is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=thread_runtime_refusal_detail(
+                            await postgres_db.get_thread(thread_id)
+                        ),
                     )
                 logger.info(
                     "Officer thread %s: agent-side 'ended' mapped to "
@@ -39747,7 +44342,7 @@ async def agent_update_thread_status(
             # preserved across repeated writes within the same session;
             # only the active→awaiting_user transition resets it.
             async with postgres_db.acquire() as conn:
-                await conn.execute(
+                updated = await conn.fetchval(
                     "UPDATE threads "
                     "SET status = 'awaiting_user', "
                     "    awaiting_user_since = CASE "
@@ -39760,25 +44355,41 @@ async def agent_update_thread_status(
                     "        ELSE 0 "
                     "    END, "
                     "    last_activity = CURRENT_TIMESTAMP "
-                    "WHERE id = $1",
+                    "WHERE id = $1 AND status <> 'ended' RETURNING id",
                     thread_id,
+                )
+            if updated is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=thread_runtime_refusal_detail(
+                        await postgres_db.get_thread(thread_id)
+                    ),
                 )
         else:  # active
             # On revert from awaiting_user (or any other source), clear the
             # attention-sleep timer fields so the watchdog re-arms cleanly
             # on the next natural-pause transition.
             async with postgres_db.acquire() as conn:
-                await conn.execute(
+                updated = await conn.fetchval(
                     "UPDATE threads "
                     "SET status = $2, "
                     "    awaiting_user_since = NULL, "
                     "    extend_count = 0, "
                     "    last_activity = CURRENT_TIMESTAMP "
-                    "WHERE id = $1",
+                    "WHERE id = $1 AND status <> 'ended' RETURNING id",
                     thread_id,
                     body.status,
                 )
+            if updated is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=thread_runtime_refusal_detail(
+                        await postgres_db.get_thread(thread_id)
+                    ),
+                )
         return {"status": body.status}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -39803,7 +44414,30 @@ async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, An
     """
     await require_internal(request)
     requesting_agent_id = request.headers.get("X-Agent-ID", "").strip()
-    if _persistent_thread_recycler is not None:
+    requesting_generation = request.headers.get(
+        "X-Session-Runtime-Generation", ""
+    ).strip()
+    requesting_attach_token = request.headers.get(
+        "X-Session-Runtime-Attach-Token", ""
+    ).strip()
+    requesting_retirement_token = request.headers.get(
+        "X-Session-Runtime-Retirement-Token", ""
+    ).strip()
+    local_quiesced = (
+        request.headers.get("X-Session-Local-Quiesced", "").strip().lower() == "true"
+    )
+    local_quiescence_protocol = request.headers.get(
+        "X-Session-Local-Quiescence-Protocol", ""
+    ).strip()
+    workspace_generation = request.headers.get("X-Workspace-Generation", "").strip()
+    workspace_runtime_incarnation = request.headers.get(
+        "X-Workspace-Runtime-Incarnation", ""
+    ).strip()
+    identity_thread = await postgres_db.get_thread(thread_id)
+    if not identity_thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    pinned_thread = str(identity_thread.get("execution_lane") or "") == "pinned"
+    if not pinned_thread and _persistent_thread_recycler is not None:
         acknowledgement = await _persistent_thread_recycler.acknowledge_parked_boundary(
             thread_id=thread_id,
             agent_id=requesting_agent_id or None,
@@ -39841,35 +44475,71 @@ async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, An
         return {"suspended": True, "status": "suspended"}
     if status not in ("created", "active", "awaiting_user"):
         return {"suspended": False, "status": status}
-    if not workspace_suspension_service.is_enabled:
-        return {"suspended": False, "status": status, "reason": "disabled"}
-
-    ok = await workspace_suspension_service.suspend_thread_workspace(thread_id)
-    if not ok:
-        return {"suspended": False, "status": status, "reason": "snapshot_failed"}
-
-    # CAS like the attention-sleep sweeper: don't clobber a state that moved
-    # under us mid-snapshot. agent_id is cleared because the requesting agent
-    # pod is already being deleted by suspend_thread_workspace — a stale
-    # binding would wedge the next attach on a dead agent.
-    async with postgres_db.acquire() as conn:
-        updated = await conn.fetchval(
-            "UPDATE threads "
-            "SET status = 'suspended', agent_id = NULL, "
-            "    control_admission_agent_id = NULL "
-            "WHERE id = $1 AND status IN ('created', 'active', 'awaiting_user') "
-            "RETURNING id",
-            thread_id,
+    if not local_quiesced:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "pinned_local_quiescence_required"},
         )
-    if updated:
-        logger.info("Drain-suspend complete for thread %s", thread_id)
-    else:
-        logger.info(
-            "Drain-suspend for thread %s: workspace suspended but status "
-            "moved concurrently — restore path will handle wake",
-            thread_id,
+    try:
+        requesting_retirement_token = str(UUID(requesting_retirement_token))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "pinned_retirement_token_required"},
+        ) from exc
+    retirement = await postgres_db.begin_pinned_thread_retirement(
+        thread_id,
+        permanent=False,
+        settle_status="suspended",
+        expected_runtime_generation=requesting_generation,
+        expected_agent_id=requesting_agent_id,
+        expected_attach_token=requesting_attach_token,
+        expected_retirement_token=requesting_retirement_token,
+    )
+    if retirement.get("state") != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pinned_retirement_conflict",
+                "reason": retirement.get("reason") or retirement.get("state"),
+            },
         )
-    return {"suspended": True, "status": "suspended" if updated else status}
+    if (
+        await postgres_db.acknowledge_pinned_thread_local_quiescence(
+            thread_id,
+            expected_runtime_generation=requesting_generation,
+            expected_retirement_token=requesting_retirement_token,
+            expected_agent_id=requesting_agent_id,
+            expected_attach_token=requesting_attach_token,
+            expected_settle_status="suspended",
+            expected_quiescence_protocol=local_quiescence_protocol,
+            expected_workspace_generation=workspace_generation or None,
+            expected_workspace_runtime_incarnation=(
+                workspace_runtime_incarnation or None
+            ),
+        )
+    ) is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "pinned_local_quiescence_refused"},
+        )
+    # Suspend is a resumable retirement, not a status write followed by
+    # name-based cleanup. The shared funnel closes admission first, captures
+    # exact physical identities, snapshots/deletes only those identities, and
+    # rotates the generation as it settles ``suspended``. Resume/prepare and a
+    # delayed G1 suspend therefore cannot overlap G2.
+    retired = await _end_thread_flow(
+        thread_id,
+        thread,
+        permanent=False,
+        force=True,
+        expected_runtime_generation=requesting_generation or None,
+        expected_agent_id=requesting_agent_id or None,
+        expected_attach_token=requesting_attach_token or None,
+        settle_status="suspended",
+        local_runtime_quiesced=True,
+    )
+    return {"suspended": True, "status": retired.get("status", "suspended")}
 
 
 @app.post("/api/agents/threads/{thread_id}/release-agent")
@@ -39885,15 +44555,100 @@ async def agent_release_thread_agent(
     and the next WS reconnect re-targets the same broken agent.
     """
     await require_internal(request)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if not await postgres_db.resume_thread(thread_id):
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="agent_id is required") from exc
+    agent_id = body.get("agent_id") if isinstance(body, dict) else None
+    if not isinstance(agent_id, str) or not agent_id:
+        raise HTTPException(status_code=400, detail="agent_id is required")
+    runtime_generation = (
+        body.get("session_runtime_generation") if isinstance(body, dict) else None
+    )
+    attach_token = (
+        body.get("session_runtime_attach_token") if isinstance(body, dict) else None
+    )
+    agent_pod_uid = body.get("agent_pod_uid") if isinstance(body, dict) else None
+    local_runtime_quiesced = (
+        body.get("local_runtime_quiesced") if isinstance(body, dict) else None
+    )
+    local_quiescence_protocol = (
+        body.get("local_quiescence_protocol") if isinstance(body, dict) else None
+    )
+    workspace_generation = (
+        body.get("workspace_generation") if isinstance(body, dict) else None
+    )
+    workspace_runtime_incarnation = (
+        body.get("workspace_runtime_incarnation") if isinstance(body, dict) else None
+    )
+    try:
+        agent_id = str(UUID(agent_id))
+        runtime_generation = str(UUID(str(runtime_generation)))
+        attach_token = str(UUID(str(attach_token)))
+    except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=409,
-            detail="Thread workspace retirement is still in progress",
+            detail={
+                "code": "pinned_runtime_identity_required",
+                "message": "Attach release requires its exact runtime identity.",
+            },
+        ) from exc
+    if (
+        not isinstance(agent_pod_uid, str)
+        or not agent_pod_uid.strip()
+        or local_runtime_quiesced is not True
+        or local_quiescence_protocol
+        not in {
+            "workspace_process_zero_v1",
+            "agent_runtime_zero_v1",
+            "agent_attach_not_started_v1",
+        }
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pinned_attach_quiescence_required",
+                "message": (
+                    "Attach release requires exact process-zero proof and "
+                    "the registered agent Pod identity."
+                ),
+            },
         )
-    return {"status": "released"}
+    try:
+        workspace_generation = (
+            str(UUID(str(workspace_generation)))
+            if workspace_generation not in {None, ""}
+            else None
+        )
+        workspace_runtime_incarnation = (
+            str(UUID(str(workspace_runtime_incarnation)))
+            if workspace_runtime_incarnation not in {None, ""}
+            else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "pinned_workspace_identity_invalid"},
+        ) from exc
+    outcome = await _release_session_attach_binding(
+        agent_id,
+        thread_id,
+        expected_runtime_generation=runtime_generation,
+        expected_attach_token=attach_token,
+        expected_agent_pod_uid=agent_pod_uid.strip(),
+        local_runtime_quiesced=True,
+        local_quiescence_protocol=local_quiescence_protocol,
+        workspace_generation=workspace_generation,
+        workspace_runtime_incarnation=workspace_runtime_incarnation,
+    )
+    if outcome in {"released", "already_detached"}:
+        _schedule_attach_abort_successor(
+            thread_id,
+            retired_runtime_generation=runtime_generation,
+            retired_attach_token=attach_token,
+            retired_agent_id=agent_id,
+        )
+    return {"status": outcome}
 
 
 class AgentThreadConfigUpdateRequest(BaseModel):
@@ -39954,6 +44709,28 @@ async def _apply_thread_config_update(
     (``actor`` is the resolved caller for owner-facing requests, None for
     internal ones — the recorded path distinguishes the two).
     """
+    protected_marker = _protected_cloud_mutation_marker(thread_row)
+    if protected_marker == "on" and {
+        "workspace",
+        "officer",
+    }.intersection(config_override):
+        # A protected session is safe only while its effective runtime remains
+        # the supported Container/non-Officer class.  Generic live config
+        # mutation is not an atomic protected-runtime transition protocol, so
+        # reject both security-relevant blocks before grant resolution, audit,
+        # or persistence.  Even a seemingly harmless partial/no-op block is
+        # refused: defaults and expert inheritance make a fragment alone an
+        # insufficient proof of the resulting class.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "protected_cloud_runtime_class_fixed",
+                "message": (
+                    "Protected cloud sessions cannot change workspace tier or "
+                    "Officer mode."
+                ),
+            },
+        )
     if "officer" in config_override and thread_row and thread_row.get("project_id"):
         post = await postgres_db.get_project_officer(str(thread_row["project_id"]))
         if post and str(post.get("thread_id") or "") == str(thread_id):
@@ -40250,6 +45027,76 @@ async def _apply_thread_config_update(
     return config_override, selected_ds_ids
 
 
+def _protected_cloud_mutation_marker(
+    thread: dict[str, Any] | None,
+) -> Literal["off", "on"]:
+    """Strict protected marker for live runtime mutations.
+
+    Runtime upgrade/config endpoints are credential and provisioning
+    boundaries.  They must not use ``thread_metadata_object``'s legacy
+    best-effort coercion: corrupt JSON/list metadata could otherwise become an
+    ordinary row and bypass the protected fixed-runtime contract.
+    """
+
+    if thread is None:
+        return "off"
+    raw_metadata = thread.get("metadata")
+    if raw_metadata is None:
+        metadata: Any = {}
+    elif isinstance(raw_metadata, str):
+        try:
+            metadata = json.loads(raw_metadata)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "protected_cloud_malformed",
+                    "message": "Protected cloud session state is invalid.",
+                },
+            ) from exc
+    else:
+        metadata = raw_metadata
+    marker = protected_cloud_marker_state(metadata)
+    if marker == "malformed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "protected_cloud_malformed",
+                "message": "Protected cloud session state is invalid.",
+            },
+        )
+    return marker
+
+
+def _require_unprotected_workspace_upgrade(
+    thread: dict[str, Any],
+) -> dict[str, Any]:
+    """Refuse every protected/malformed live workspace upgrade pre-effect."""
+
+    marker = _protected_cloud_mutation_marker(thread)
+    if marker == "on":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "protected_cloud_workspace_fixed",
+                "message": (
+                    "Protected cloud sessions cannot upgrade or replace their "
+                    "Container workspace."
+                ),
+            },
+        )
+    raw_metadata = thread.get("metadata")
+    if raw_metadata is None:
+        return {}
+    if isinstance(raw_metadata, str):
+        parsed = json.loads(raw_metadata)
+        # The strict marker helper above has already proved this shape.
+        assert isinstance(parsed, dict)
+        return parsed
+    assert isinstance(raw_metadata, dict)
+    return raw_metadata
+
+
 @app.patch("/api/agents/threads/{thread_id}/config")
 async def agent_update_thread_config(
     request: Request,
@@ -40311,6 +45158,8 @@ async def agent_upgrade_thread_to_vm(
             detail="Workspace upgrades are not yet supported on the stateless lane",
         )
 
+    metadata = _require_unprotected_workspace_upgrade(thread)
+
     # Sec-1 — authorize BEFORE provisioning (fail-closed). This endpoint is the
     # target of both the sandbox→VM sudo path and the lite→vm delegation from
     # /upgrade-to-workspace; it previously ran ungated. The shared gate enforces
@@ -40324,27 +45173,62 @@ async def agent_upgrade_thread_to_vm(
             detail="VM provisioning not available (no NATS or K8s)",
         )
 
-    # Check if a VM is already provisioned or in progress
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    vm_ctx = metadata.get("vm") or {}
-    if vm_ctx.get("status") in ("provisioning", "created", "ready"):
-        return {
-            "status": vm_ctx["status"],
-            "thread_id": thread_id,
-            "message": "VM already provisioned or in progress",
-        }
+    # The capability read above is advisory.  Serialize with End/protected
+    # lifecycle work, then re-read and install the provision generation under
+    # the exact current T/G/actor tuple before dispatch.  If End won after the
+    # route read, the DB transition returns False and no VM request is sent.
+    async with postgres_db.thread_advisory_lock(thread_id):
+        thread = await postgres_db.get_thread(thread_id)
+        if not thread:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        metadata = _require_unprotected_workspace_upgrade(thread)
+        runtime_authority = thread_runtime_authority(thread)
+        if runtime_authority is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "pinned_runtime_identity_mismatch"},
+            )
+        raw_vm_ctx = metadata.get("vm")
+        if raw_vm_ctx is not None and not isinstance(raw_vm_ctx, Mapping):
+            raise HTTPException(status_code=409, detail="VM authority is malformed")
+        vm_ctx = dict(raw_vm_ctx) if raw_vm_ctx is not None else None
+        if (vm_ctx or {}).get("status") in (
+            "provisioning",
+            "created",
+            "starting",
+            "ssh_pending",
+            "ready",
+            "waiting_golden",
+            "waiting_capacity",
+            "waiting_headscale",
+        ):
+            return {
+                "status": vm_ctx["status"],
+                "thread_id": thread_id,
+                "message": "VM already provisioned or in progress",
+            }
 
-    ok = await vm_provisioner.create_thread_vm(
-        thread_id=thread_id,
-        agent_config=canonical_config_name(thread.get("config_name", "session_base")),
-    )
+        ok = await vm_provisioner.create_thread_vm(
+            thread_id=thread_id,
+            agent_config=canonical_config_name(
+                thread.get("config_name", "session_base")
+            ),
+            expected_runtime_generation=runtime_authority.generation,
+            expected_agent_id=(
+                str(thread["agent_id"]) if thread.get("agent_id") is not None else None
+            ),
+            expected_attach_token=(
+                str(thread["runtime_attach_token"])
+                if thread.get("runtime_attach_token") is not None
+                else None
+            ),
+            expected_vm_context=vm_ctx,
+        )
     if not ok:
-        raise HTTPException(status_code=500, detail="Failed to request VM provisioning")
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "vm_provision_authority_changed"},
+        )
 
     return {
         "status": "provisioning",
@@ -40447,6 +45331,8 @@ async def agent_upgrade_thread_to_workspace(
             detail="Workspace upgrades are not yet supported on the stateless lane",
         )
 
+    metadata = _require_unprotected_workspace_upgrade(thread)
+
     # Sec-1 — authorize the upgrade against the owner's capability grants BEFORE
     # provisioning (fail-closed). sandbox passes by default; a shell-restricted
     # owner (or a vm target without vm_workspace) is refused with 403.
@@ -40459,12 +45345,6 @@ async def agent_upgrade_thread_to_workspace(
         )
 
     # Idempotency: short-circuit if a container is already in flight or ready.
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
     wc = metadata.get("workspace_container") or {}
     if wc.get("status") in ("pending", "creating", "created", "ready"):
         return {
@@ -40474,15 +45354,10 @@ async def agent_upgrade_thread_to_workspace(
             "message": "Workspace container already provisioned or in progress",
         }
 
-    # Mark pending, then provision in the background: create_workspace blocks
-    # up to ~120s waiting for the pod IP and updates
-    # metadata.workspace_container to ready/failed itself. The agent polls
-    # /workspace (-> _poll_workspace_ready) for the ready connection block.
-    # Mirrors the eager-session provisioning path in agent_create_thread.
-    await postgres_db.merge_thread_workspace_context(thread_id, {"status": "pending"})
-    asyncio.create_task(
-        container_provisioner.create_workspace(WorkspaceOwner.session(thread_id))
-    )
+    # The background owner installs the exact T/G/actor provision intent under
+    # the lifecycle lock before its first Kubernetes effect.  Do not publish a
+    # generic pending marker here: a stale route read must lose cleanly to End.
+    asyncio.create_task(container_provisioner.create_pinned_thread_workspace(thread_id))
 
     return {
         "status": "provisioning",
@@ -40880,9 +45755,22 @@ async def agent_heartbeat(
             current_job_id=heartbeat.current_job_id,
             metrics=metrics if metrics else None,
             aux_degraded=aux_degraded,
+            session_runtime_generation=heartbeat.session_runtime_generation,
+            session_runtime_attach_token=heartbeat.session_runtime_attach_token,
+            require_pinned_identity=_require_pinned_status_identity(),
         )
         if result is None:
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+        if result.get("authority_refused"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pinned_runtime_identity_mismatch",
+                    "message": (
+                        "The heartbeat does not own the current pinned session runtime."
+                    ),
+                },
+            )
 
         # If agent transitioned to ready, trigger the dispatcher
         # (will be wired up in the dispatcher task). Use effective_status —
@@ -40911,7 +45799,15 @@ async def agent_heartbeat(
         _hb_thread_id = result.get("thread_id")
         if _hb_thread_id:
             try:
-                await slide_thread_grant_on_liveness(postgres_db, str(_hb_thread_id))
+                await slide_thread_grant_on_liveness(
+                    postgres_db,
+                    str(_hb_thread_id),
+                    agent_id=agent_id,
+                    session_runtime_generation=result.get("session_runtime_generation"),
+                    session_runtime_attach_token=result.get(
+                        "session_runtime_attach_token"
+                    ),
+                )
             except Exception as exc:
                 logger.warning(
                     f"Runtime actor liveness slide failed for thread "
@@ -41156,7 +46052,7 @@ class ThreadCreateRequest(BaseModel):
             "honored as session tool group toggles."
         ),
     )
-    protected_cloud: bool = Field(
+    protected_cloud: StrictBool = Field(
         False,
         description=(
             "Protected cloud mode: mount the project cloud folder read-only with "
@@ -41756,15 +46652,37 @@ async def create_thread(
         effective_backend = _backend_from_override(effective_create_config)
         if effective_backend:
             config_override.setdefault("workspace", {})["backend"] = effective_backend
+        if request_body.protected_cloud and effective_backend != "sandbox":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_unsupported_workspace",
+                    "message": (
+                        "Protected cloud sessions require the Container workspace tier."
+                    ),
+                },
+            )
 
         # Officer/conference selects pinned-only lifecycle machinery. Freeze
         # the fully resolved booleans into the highest-priority request layer
         # just like the physical workspace tier above. Later expert/account
         # edits can still update ordinary config, but cannot silently move an
         # existing stateless thread onto a different wake plane.
-        config_override.setdefault("officer", {}).update(
-            _materialized_session_class_override(effective_create_config)
+        materialized_session_class = _materialized_session_class_override(
+            effective_create_config
         )
+        config_override.setdefault("officer", {}).update(materialized_session_class)
+        if request_body.protected_cloud and materialized_session_class["enabled"]:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_unsupported_session_class",
+                    "message": (
+                        "Protected cloud sessions are not supported for the "
+                        "background Officer runtime."
+                    ),
+                },
+            )
 
         # Conference embodiment (centurion.md §2/S9): validate the MATERIALIZED
         # effective class, not only the user's explicit fragment. An expert or
@@ -42002,6 +46920,14 @@ async def create_thread(
         if metadata_at_create:
             create_kwargs["initial_metadata"] = metadata_patch
         thread_id = await postgres_db.create_thread(**create_kwargs)
+        created_runtime_authority = thread_runtime_authority(
+            await postgres_db.get_thread(str(thread_id))
+        )
+        if created_runtime_authority is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Thread runtime changed during create admission",
+            )
 
         if metadata_patch and not metadata_at_create:
             async with postgres_db.acquire() as conn:
@@ -42036,13 +46962,23 @@ async def create_thread(
             )
             if _registered is None:
                 try:
-                    await postgres_db.decommission_project_officer(
-                        primary_project_id,
-                        str(thread_id),
-                        reason="commission_race_lost",
-                        force=True,
-                        allow_orphan_retirement=True,
-                    )
+                    race_loser = await postgres_db.get_thread(str(thread_id))
+                    if race_loser is not None:
+                        await _end_thread_flow(
+                            str(thread_id),
+                            race_loser,
+                            permanent=False,
+                            force=True,
+                            officer_retire_reason="commission_race_lost",
+                        )
+                    else:
+                        await postgres_db.decommission_project_officer(
+                            primary_project_id,
+                            str(thread_id),
+                            reason="commission_race_lost",
+                            force=True,
+                            allow_orphan_retirement=True,
+                        )
                 except Exception:
                     logger.warning(
                         "officer registration race: stand-down of thread %s failed",
@@ -42097,18 +47033,31 @@ async def create_thread(
         if request_body.protected_cloud:
             if _is_protected_cloud_mode_enabled():
                 seeded_rows = await postgres_db.list_thread_mounts(thread_id)
+                engage_thread = await postgres_db.get_thread(thread_id)
+                engage_authority = thread_runtime_authority(engage_thread)
+                if engage_authority is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Thread runtime changed before protected engage",
+                    )
                 _schedule_protected_engage(
                     thread_id,
                     user_id=str(user["id"]),
                     mount_rows=seeded_rows,
+                    runtime_generation=engage_authority.generation,
                 )
             else:
                 # F-M2: explain the degradation up front instead of leaving a
                 # protected-marked, mount-less thread silent about why.
-                await _record_protected_error(
-                    thread_id,
-                    "protected cloud mode is disabled on this deployment",
-                )
+                engage_thread = await postgres_db.get_thread(thread_id)
+                engage_authority = thread_runtime_authority(engage_thread)
+                if engage_authority is not None:
+                    await _record_protected_error(
+                        thread_id,
+                        "protected cloud mode is disabled on this deployment",
+                        code="feature_disabled",
+                        expected_runtime_generation=engage_authority.generation,
+                    )
 
         # Provision workspace container + agent pod FIRST (non-blocking).
         # Start image pull / pod creation immediately so it runs in parallel
@@ -42131,9 +47080,6 @@ async def create_thread(
             # fire-and-forget (mirrors the container task) with the requested
             # sizing; the agent pod provisioned below SSHes into the VM once it
             # reports ready. (knowledge-base/knowledge/features/session_create_on_vm.md)
-            await postgres_db.merge_thread_vm_context(
-                thread_id, {"status": "provisioning"}
-            )
             _vm_ws = (config_override.get("workspace") or {}).get("vm") or {}
             try:
                 _vm_cpu = int(_vm_ws.get("cpu_cores") or 8)
@@ -42146,26 +47092,51 @@ async def create_thread(
                 tid: str, cpu: int, mem: str, cfg: str
             ) -> None:
                 try:
-                    ok = await vm_provisioner.create_thread_vm(
-                        thread_id=tid,
-                        agent_config=cfg,
-                        cpu_cores=cpu,
-                        memory=mem,
-                    )
+                    async with postgres_db.thread_advisory_lock(tid):
+                        current = await postgres_db.get_thread(tid)
+                        current_authority = thread_runtime_authority(current)
+                        current_metadata = thread_metadata_object(current or {})
+                        raw_vm = current_metadata.get("vm")
+                        if raw_vm is not None and not isinstance(raw_vm, Mapping):
+                            ok = False
+                        elif current_authority is None:
+                            ok = False
+                        else:
+                            ok = await vm_provisioner.create_thread_vm(
+                                thread_id=tid,
+                                agent_config=cfg,
+                                cpu_cores=cpu,
+                                memory=mem,
+                                expected_runtime_generation=(
+                                    current_authority.generation
+                                ),
+                                expected_agent_id=(
+                                    str(current["agent_id"])
+                                    if current and current.get("agent_id") is not None
+                                    else None
+                                ),
+                                expected_attach_token=(
+                                    str(current["runtime_attach_token"])
+                                    if current
+                                    and current.get("runtime_attach_token") is not None
+                                    else None
+                                ),
+                                expected_vm_context=(
+                                    dict(raw_vm) if raw_vm is not None else None
+                                ),
+                            )
                 except Exception:
                     logger.exception("Thread %s: VM provisioning request raised", tid)
                     ok = False
                 if not ok:
-                    # No NATS/HTTP/k8s route accepted the request — record the
-                    # failure so the attach poll stops waiting and the cockpit
-                    # surfaces it (metadata.vm.status='failed' → _poll_workspace_ready
-                    # bail → session-ready timeout with the VM error).
-                    logger.error(
-                        "Thread %s: VM provisioning request was not accepted; "
-                        "marking vm failed.",
+                    # The provisioner generation-fences failures only after a
+                    # successful intent install.  A stale/retired caller must
+                    # not mutate the current thread merely to surface an old
+                    # request failure.
+                    logger.warning(
+                        "Thread %s: VM provisioning authority was not admitted",
                         tid,
                     )
-                    await postgres_db.merge_thread_vm_context(tid, {"status": "failed"})
 
             asyncio.create_task(
                 _provision_thread_vm(thread_id, _vm_cpu, _vm_mem, _vm_agent_config)
@@ -42178,15 +47149,9 @@ async def create_thread(
                 # End and recreate/publish a pod after retirement completed.
                 _schedule_stateless_workspace_ensure(thread_id)
             else:
-                await postgres_db.merge_thread_workspace_context(
-                    thread_id, {"status": "pending", "provisioner": "k8s"}
-                )
 
-                # Pinned keeps its historical direct provisioning path.
                 async def _provision_thread_workspace(tid: str) -> None:
-                    ok = await container_provisioner.create_workspace(
-                        WorkspaceOwner.session(tid)
-                    )
+                    ok = await container_provisioner.create_pinned_thread_workspace(tid)
                     if not ok:
                         logger.error(
                             "Thread %s: workspace container provisioning failed. "
@@ -42360,6 +47325,7 @@ async def create_thread(
                 await postgres_db.update_thread_main_cloud(
                     thread_id,
                     backend_id=backend.backend_id,
+                    backend_instance_id=str(backend.backend_instance_id),
                     session_handle=session_handle.to_db(),
                     share_handle=share_handle.to_db() if share_handle else None,
                 )
@@ -42399,6 +47365,7 @@ async def create_thread(
                     config_override,
                     effective_project_ids,
                     selected_thread_datasource_ids,
+                    runtime_generation=created_runtime_authority.generation,
                 )
             )
         elif docker_provisioner.is_available:
@@ -42516,8 +47483,10 @@ def _resolve_cloud_session_url(
         "nc_session_folder"
     )
     if handle_str:
-        backend_id = thread.get("main_cloud_backend") or None
-        backend = main_cloud_router.for_backend(backend_id)
+        try:
+            backend = main_cloud_router.for_thread(thread)
+        except Exception:
+            return None
         if not backend.is_initialized:
             return None
         try:
@@ -42534,7 +47503,13 @@ def _resolve_cloud_session_url(
         row_handle_str = m.get("cloud_handle")
         if not row_backend_id or not row_handle_str:
             continue
-        backend = main_cloud_router.for_backend(row_backend_id)
+        try:
+            backend = main_cloud_router.for_backend_instance(
+                str(m.get("backend_instance_id") or ""),
+                expected_backend_id=str(row_backend_id),
+            )
+        except Exception:
+            continue
         if not backend.is_initialized:
             continue
         try:
@@ -42638,9 +47613,11 @@ def _build_agent_cloud_sync(
         "nc_session_folder"
     )
     if handle_str:
-        backend_id = thread.get("main_cloud_backend") or None
-        backend = main_cloud_router.for_backend(backend_id)
-        if backend.is_initialized:
+        try:
+            backend = main_cloud_router.for_thread(thread)
+        except Exception:
+            backend = None
+        if backend is not None and backend.is_initialized:
             try:
                 handle = SessionFolderHandle.from_db(
                     handle_str, backend=backend.backend_id
@@ -42662,7 +47639,13 @@ def _build_agent_cloud_sync(
             # will surface "no mount available" via the raise-and-block
             # policy at the next turn boundary if anything depended on it.
             continue
-        backend = main_cloud_router.for_backend(row_backend_id)
+        try:
+            backend = main_cloud_router.for_backend_instance(
+                str(row.get("backend_instance_id") or ""),
+                expected_backend_id=str(row_backend_id),
+            )
+        except Exception:
+            continue
         if not backend.is_initialized:
             continue
         cfg = _backend_cloud_cfg(
@@ -42733,7 +47716,13 @@ async def _build_rclone_mount_from_row(
     handle_str = row.get("cloud_handle")
     if not backend_id or not handle_str:
         return None
-    backend = main_cloud_router.for_backend(backend_id)
+    try:
+        backend = main_cloud_router.for_backend_instance(
+            str(row.get("backend_instance_id") or ""),
+            expected_backend_id=str(backend_id),
+        )
+    except Exception:
+        return None
     if not backend.is_initialized or not isinstance(backend, SupportsRcloneMount):
         return None
     try:
@@ -42792,8 +47781,10 @@ async def _build_rclone_session_mount(
     )
     if not handle_str:
         return None
-    backend_id = thread.get("main_cloud_backend") or None
-    backend = main_cloud_router.for_backend(backend_id)
+    try:
+        backend = main_cloud_router.for_thread(thread)
+    except Exception:
+        return None
     if not backend.is_initialized or not isinstance(backend, SupportsRcloneMount):
         return None
     try:
@@ -42830,7 +47821,315 @@ async def _build_rclone_session_mount(
 # can be GC'd mid-flight" hazard, and lets a concurrent reader
 # (``_build_agent_cloud_mount``'s protected branch, or a future resume)
 # await the SAME task instead of racing it with its own poll loop.
-_protected_engage_tasks: dict[str, "asyncio.Task[None]"] = {}
+_protected_engage_tasks: dict[tuple[str, str], "asyncio.Task[None]"] = {}
+
+
+_PROTECTED_CLOUD_ERROR_CODES = frozenset(
+    {
+        "feature_disabled",
+        "malformed_protected_marker",
+        "unsupported_workspace_tier",
+        "no_protected_mount",
+        "engage_refused",
+        "engage_failed",
+    }
+)
+
+
+def _protected_mount_selection_identity(
+    row: Mapping[str, Any] | None,
+) -> tuple[str, ...] | None:
+    """Return the exact durable identity of one selected thread mount."""
+
+    if not isinstance(row, Mapping):
+        return None
+    values = (
+        row.get("id"),
+        row.get("mount_kind"),
+        row.get("backend_id"),
+        row.get("source_ref"),
+        row.get("cloud_handle"),
+    )
+    if any(value is None for value in values):
+        return None
+    return tuple(str(value) for value in values)
+
+
+def _ro_mount_matches_protected_selection(
+    ro_row: Mapping[str, Any] | None,
+    mount_rows: list[dict[str, Any]] | None,
+    *,
+    thread_id: str,
+    user_id: str,
+    runtime_generation: str,
+) -> bool:
+    """Bind a deliverable grant to its exact selected source and attempt."""
+
+    if not isinstance(ro_row, Mapping) or ro_row.get("status") != "active":
+        return False
+    try:
+        UUID(str(ro_row.get("id")))
+        UUID(str(ro_row.get("selected_mount_id")))
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(ro_row.get("etag_baseline"), dict):
+        return False
+    if str(ro_row.get("backend") or "") != "nextcloud":
+        return False
+    if str(ro_row.get("auth_kind") or "") != "basic":
+        return False
+    if not isinstance(ro_row.get("credentials"), str) or not ro_row["credentials"]:
+        return False
+    if not isinstance(ro_row.get("reader_id"), str) or not ro_row["reader_id"]:
+        return False
+    if not isinstance(ro_row.get("webdav_url"), str) or not ro_row["webdav_url"]:
+        return False
+    if str(ro_row.get("user_id") or "") != user_id:
+        return False
+    if str(ro_row.get("thread_id") or "") != thread_id:
+        return False
+    if str(ro_row.get("runtime_generation") or "") != runtime_generation:
+        return False
+    from services.cloud_staging import select_protected_mount
+
+    selected = select_protected_mount(mount_rows or [])
+    selected_source = ProtectedMountSourceIdentity.from_mount_row(selected)
+    if selected_source is None:
+        return False
+    if str(ro_row.get("selected_mount_id") or "") != str(selected.get("id") or ""):
+        return False
+    plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(ro_row)
+    if plan is None or plan.source != selected_source:
+        return False
+    try:
+        parsed_url = urlparse(ro_row["webdav_url"])
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            return False
+        delivered_segments = [
+            urllib.parse.unquote(segment)
+            for segment in parsed_url.path.rstrip("/").split("/")
+            if segment
+        ]
+    except (TypeError, ValueError):
+        return False
+    return delivered_segments[-2:] == [plan.reader_id, plan.mountpoint]
+
+
+async def _resolve_protected_reader_backend(
+    plan: ProtectedNextcloudReaderGrantPlan,
+):
+    """Resolve the immutable installation captured by a protected attempt."""
+
+    try:
+        return main_cloud_router.for_backend_instance(
+            plan.backend_instance_id,
+            expected_backend_id="nextcloud",
+        )
+    except Exception:
+        authority = await postgres_db.get_main_cloud_backend_instance(
+            plan.backend_instance_id,
+            expected_backend_id="nextcloud",
+        )
+        if authority is None:
+            raise RuntimeError("protected reader backend installation is unavailable")
+        return await main_cloud_router.resolve_backend_instance(authority)
+
+
+def _protected_workspace_wait_payload(
+    *, state: str, error_code: str | None = None
+) -> dict[str, Any]:
+    """Return a deliberately credential-free protected attach response.
+
+    A dedicated/warm agent may poll this endpoint while the reader probe is in
+    flight.  ``creating`` keeps the existing workspace poll alive, while a
+    terminal ``failed`` state lets a new agent stop without ever learning the
+    workspace, repository, VM, or cloud coordinates.
+    """
+
+    failed = state == "failed"
+    return {
+        "status": "failed" if failed else "creating",
+        "protected_cloud": True,
+        "protected_cloud_state": "failed" if failed else "engaging",
+        "protected_cloud_error_code": error_code if failed else None,
+        "pod_ip": None,
+        "pod_name": None,
+        "pod_port": None,
+        "namespace": None,
+        "vm_status": None,
+        "vm_ssh_host": None,
+        "vm_ssh_port": None,
+        "vm_name": None,
+        "ssh_key_path": None,
+        "workspace_generation": None,
+        "workspace_runtime_incarnation": None,
+        "workspace_ssh_host_key_fingerprint": None,
+        "git_remote_url": None,
+        "managed_repository_credentials": None,
+        "repositories": None,
+        "config_override": None,
+        "resolved_config": None,
+        "project_ids": [],
+        "datasources": None,
+        "nc_session_folder": None,
+        "cloud_sync": None,
+        "cloud_mount": None,
+        "cloud_sync_degraded": False,
+        "canvas_presentation_available": False,
+        "canvas_live_apps_available": False,
+        "canvas_shared_browser_available": False,
+    }
+
+
+async def _protected_cloud_delivery_state(
+    thread: dict[str, Any], metadata: dict[str, Any]
+) -> tuple[str, str | None]:
+    """Classify whether protected workspace credentials may be delivered."""
+
+    marker_state = protected_cloud_marker_state(metadata)
+    if marker_state == "off":
+        return "ready", None
+    if marker_state == "malformed":
+        return "failed", "malformed_protected_marker"
+    if _thread_workspace_backend(thread) != "sandbox":
+        return "failed", "unsupported_workspace_tier"
+    if not _is_protected_cloud_mode_enabled():
+        return "failed", "feature_disabled"
+    stored_code = metadata.get("protected_cloud_error_code")
+    if stored_code in _PROTECTED_CLOUD_ERROR_CODES:
+        return "failed", str(stored_code)
+    # Rows created by older orchestrators carry only the operator-facing raw
+    # error.  Treat that as terminal too, but never return its contents over
+    # the credential endpoint.
+    if metadata.get("protected_cloud_error"):
+        return "failed", "engage_failed"
+    thread_id = str(thread["id"])
+    runtime_authority = thread_runtime_authority(thread)
+    if runtime_authority is None:
+        return "engaging", None
+    row, mount_rows = await asyncio.gather(
+        postgres_db.get_ro_mount_by_thread(thread_id),
+        postgres_db.list_thread_mounts(thread_id),
+    )
+    if not _ro_mount_matches_protected_selection(
+        row,
+        mount_rows,
+        thread_id=thread_id,
+        user_id=str(thread.get("user_id") or ""),
+        runtime_generation=runtime_authority.generation,
+    ):
+        return "engaging", None
+    mount = _build_protected_cloud_mount(row, thread_id=thread_id) if row else None
+    if mount is None:
+        return "engaging", None
+    return "ready", None
+
+
+async def _await_protected_cloud_runtime_ready(
+    thread_id: str,
+    *,
+    timeout_s: float | None = None,
+    allow_schedule: bool = True,
+) -> bool:
+    """Wait for the protected reader grant before any runtime reservation.
+
+    Ordinary sessions are a constant-time no-op.  Protected sessions poll the
+    durable row as well as the local task registry so the gate works across
+    orchestrator replicas.  Lifecycle is re-read on every pass; End cancels
+    admission even when the Nextcloud call currently awaited by the engage
+    task cannot itself be cancelled immediately.
+    """
+
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("PROTECTED_CLOUD_ENGAGE_TIMEOUT_S", "300"))
+    from services.cloud_staging import select_protected_mount
+
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_s)
+    scheduled_here = False
+    entry_thread = await postgres_db.get_thread(thread_id)
+    runtime_authority = thread_runtime_authority(entry_thread)
+    if runtime_authority is None:
+        return False
+    task_key = (thread_id, runtime_authority.generation)
+    while True:
+        thread = await postgres_db.get_thread(thread_id)
+        if not same_thread_runtime_authority(thread, runtime_authority):
+            return False
+        metadata = thread_metadata_object(thread)
+        marker_state = protected_cloud_marker_state(metadata)
+        if marker_state == "off":
+            return True
+        if marker_state == "malformed":
+            return False
+        state, _error_code = await _protected_cloud_delivery_state(thread, metadata)
+        if state == "ready":
+            # The delivery probe awaits the reader row and selected mounts.
+            # End/marker mutation is independent of those reads, so prove the
+            # lifecycle one last time before this admission helper reports
+            # success to any present or future caller.
+            current = await postgres_db.get_thread(thread_id)
+            if not same_thread_runtime_authority(current, runtime_authority):
+                return False
+            current_metadata = thread_metadata_object(current)
+            return protected_cloud_marker_state(current_metadata) == "on"
+        if state == "failed":
+            return False
+
+        # A resume handled by an older replica, or a direct /prepare after an
+        # orchestrator restart, may have no local task reference.  Start the
+        # same idempotent engage flow once on this replica rather than allowing
+        # a mount-less runtime or polling forever with no producer.
+        if (
+            allow_schedule
+            and not scheduled_here
+            and _protected_engage_tasks.get(task_key) is None
+        ):
+            user_id = thread.get("user_id")
+            if user_id:
+                mount_rows = await postgres_db.list_thread_mounts(thread_id)
+                current = await postgres_db.get_thread(thread_id)
+                if not same_thread_runtime_authority(current, runtime_authority):
+                    return False
+                current_metadata = thread_metadata_object(current)
+                if protected_cloud_marker_state(current_metadata) != "on":
+                    return False
+                current_mount_rows = await postgres_db.list_thread_mounts(thread_id)
+                if _protected_mount_selection_identity(
+                    select_protected_mount(mount_rows)
+                ) != _protected_mount_selection_identity(
+                    select_protected_mount(current_mount_rows)
+                ):
+                    # Selection changed across the scheduling awaits.  Loop
+                    # from a new authoritative snapshot; never engage stale A.
+                    await asyncio.sleep(0)
+                    continue
+                _schedule_protected_engage(
+                    thread_id,
+                    user_id=str(user_id),
+                    mount_rows=current_mount_rows,
+                    metadata=current_metadata,
+                    runtime_generation=runtime_authority.generation,
+                )
+                scheduled_here = True
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        task = _protected_engage_tasks.get(task_key)
+        if task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=min(0.25, remaining)
+                )
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                # The engage owner records a sanitized terminal code.  Loop
+                # once more so that durable state, not task exception shape,
+                # decides admission.
+                pass
+        else:
+            await asyncio.sleep(min(0.25, remaining))
 
 
 def _schedule_protected_engage(
@@ -42839,6 +48138,7 @@ def _schedule_protected_engage(
     user_id: str,
     mount_rows: list[dict[str, Any]] | None,
     metadata: dict[str, Any] | None = None,
+    runtime_generation: str,
 ) -> "asyncio.Task[None]":
     """Fire-and-forget schedule of ``_engage_protected_cloud_for_thread``,
     registering the task in ``_protected_engage_tasks`` so callers racing the
@@ -42847,22 +48147,28 @@ def _schedule_protected_engage(
     and ``resume_thread`` so both engage paths behave identically."""
 
     async def _run() -> None:
-        await _engage_protected_cloud_for_thread(
-            thread_id,
-            user_id=user_id,
-            mount_rows=mount_rows,
-            metadata=metadata or {},
-        )
+        # Cross-replica serialization. End acquires the same lock after it
+        # closes admission, so no old engage can outlive retirement settlement
+        # and later revoke a resumed generation's stable remote grant key.
+        async with postgres_db.thread_advisory_lock(thread_id):
+            await _engage_protected_cloud_for_thread(
+                thread_id,
+                user_id=user_id,
+                mount_rows=mount_rows,
+                metadata=metadata or {},
+                runtime_generation=runtime_generation,
+            )
 
     task = asyncio.create_task(_run())
-    _protected_engage_tasks[thread_id] = task
+    task_key = (thread_id, runtime_generation)
+    _protected_engage_tasks[task_key] = task
 
     def _done(finished: "asyncio.Task[None]") -> None:
         # Only clear the slot if it's still ours — a newer registration for
         # the same thread_id (e.g. a resume re-engage firing right after a
         # create engage) must not be clobbered by this stale callback.
-        if _protected_engage_tasks.get(thread_id) is finished:
-            _protected_engage_tasks.pop(thread_id, None)
+        if _protected_engage_tasks.get(task_key) is finished:
+            _protected_engage_tasks.pop(task_key, None)
 
     task.add_done_callback(_done)
     return task
@@ -42874,68 +48180,244 @@ async def _engage_protected_cloud_for_thread(
     user_id: str,
     mount_rows: list[dict[str, Any]] | None,
     metadata: dict[str, Any],
+    runtime_generation: str,
 ) -> None:
     """Engage protected cloud mode ONCE at thread create (design §3.3/§11.4).
 
-    Picks the first Nextcloud-backed project mount, provisions the per-user
-    reader + per-mount RO grant, and runs the fail-closed probe via
+    Picks the first Nextcloud-backed project mount, provisions an attempt-scoped
+    reader + group, and runs the fail-closed probe via
     ``engage_ro_mount`` — persisting a ``cloud_ro_mounts`` row on success. On
     refusal, records ``metadata.protected_cloud_error`` so the session boots
     with NO cloud mount (never a live one) and the agent can say why."""
+    thread = await postgres_db.get_thread(thread_id)
+    runtime_authority = thread_runtime_authority(thread)
+    if runtime_authority is None or runtime_authority.generation != runtime_generation:
+        return
     if not _is_protected_cloud_mode_enabled():
+        await _record_protected_error(
+            thread_id,
+            "protected cloud mode is disabled on this deployment",
+            code="feature_disabled",
+            expected_runtime_generation=runtime_generation,
+        )
         return
     from services.cloud_staging import select_protected_mount
 
     row = select_protected_mount(mount_rows)
     if row is None:
         await _record_protected_error(
-            thread_id, "no Nextcloud project mount to protect"
+            thread_id,
+            "no Nextcloud project mount to protect",
+            code="no_protected_mount",
+            expected_runtime_generation=runtime_generation,
         )
         return
-    backend = main_cloud_router.for_backend("nextcloud")
+    expected_selection = _protected_mount_selection_identity(row)
+    expected_source = ProtectedMountSourceIdentity.from_mount_row(row)
     try:
-        handle = ProjectFolderHandle.from_db(row["cloud_handle"], backend="nextcloud")
+        selected_mount_id = str(UUID(str(row.get("id"))))
+    except (TypeError, ValueError):
+        selected_mount_id = ""
+    if expected_source is None or not selected_mount_id:
+        await _record_protected_error(
+            thread_id,
+            "protected mount authority is malformed",
+            code="engage_refused",
+            expected_runtime_generation=runtime_generation,
+        )
+        return
+    current_mount_rows = await postgres_db.list_thread_mounts(thread_id)
+    current_selected = select_protected_mount(current_mount_rows)
+    if (
+        expected_selection is None
+        or expected_selection != _protected_mount_selection_identity(current_selected)
+        or expected_source
+        != ProtectedMountSourceIdentity.from_mount_row(current_selected)
+    ):
+        logger.info(
+            "Thread %s: protected mount selection changed before engage; refusing stale grant",
+            thread_id,
+        )
+        return
+    try:
 
-        def _reader_client(credentials: str | None, reader_id: str):
-            # httpx client authenticated AS THE READER (basic auth), for the
-            # probe. reader_id is grant.reader_id (Slice C) — never
-            # re-derived here, since ensure_ro_reader/mint_ro_grant are the
-            # sole source of truth for the reader's actual username.
+        async def _still_admitted() -> bool:
+            current = await postgres_db.get_thread(thread_id)
+            if not same_thread_runtime_authority(current, runtime_authority):
+                return False
+            current_metadata = thread_metadata_object(current)
+            if protected_cloud_marker_state(current_metadata) != "on":
+                return False
+            latest_mounts = await postgres_db.list_thread_mounts(thread_id)
+            latest_selected = select_protected_mount(latest_mounts)
+            return expected_selection == _protected_mount_selection_identity(
+                latest_selected
+            ) and expected_source == ProtectedMountSourceIdentity.from_mount_row(
+                latest_selected
+            )
+
+        existing = await postgres_db.get_ro_mount_by_thread(thread_id)
+        if _ro_mount_matches_protected_selection(
+            existing,
+            current_mount_rows,
+            thread_id=thread_id,
+            user_id=user_id,
+            runtime_generation=runtime_generation,
+        ):
+            # A second replica can enter after the first atomically published
+            # this exact active attempt. It is already the completed operation.
+            return
+        plan: ProtectedNextcloudReaderGrantPlan | None = None
+        credentials: str | None = None
+        backend = None
+        if existing and existing.get("status") in {"engaging", "active", "revoking"}:
+            existing_plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(
+                existing
+            )
+            if existing_plan is None:
+                raise RoEngageRefused(
+                    "existing protected reader authority is malformed"
+                )
+            existing_backend = await _resolve_protected_reader_backend(existing_plan)
+            can_continue = (
+                existing.get("status") == "engaging"
+                and str(existing.get("thread_id") or "") == thread_id
+                and str(existing.get("user_id") or "") == user_id
+                and str(existing.get("runtime_generation") or "") == runtime_generation
+                and str(existing.get("selected_mount_id") or "") == selected_mount_id
+                and existing_plan.source == expected_source
+                and isinstance(existing.get("credentials"), str)
+                and bool(existing.get("credentials"))
+            )
+            if can_continue:
+                plan = existing_plan
+                credentials = str(existing["credentials"])
+                backend = existing_backend
+            else:
+                try:
+                    settled = await revoke_ro_mount_attempt(
+                        backend=existing_backend,
+                        postgres_db=postgres_db,
+                        row_id=str(existing["id"]),
+                        thread_id=str(existing["thread_id"]),
+                        runtime_generation=str(existing["runtime_generation"]),
+                        plan=existing_plan,
+                    )
+                except BaseException as exc:
+                    raise RoEngageCleanupPending(
+                        "prior protected reader cleanup is still pending"
+                    ) from exc
+                if not settled:
+                    raise RoEngageCleanupPending(
+                        "prior protected reader effect horizon has not elapsed"
+                    )
+                if not await _still_admitted():
+                    return
+
+        if plan is None:
+            plan = ProtectedNextcloudReaderGrantPlan(
+                engage_attempt=str(uuid4()),
+                backend_instance_id=expected_source.backend_instance_id,
+                source=expected_source,
+            )
+            credentials = secrets.token_urlsafe(32)
+            backend = await _resolve_protected_reader_backend(plan)
+        if backend is None or credentials is None:
+            raise RoEngageRefused("protected reader attempt could not be prepared")
+
+        def _reader_client(reader_credentials: str | None, reader_id: str):
             return httpx.AsyncClient(
-                base_url=backend._base_url,  # NC origin
-                auth=(reader_id, credentials or ""),
+                base_url=backend._base_url,
+                auth=(reader_id, reader_credentials or ""),
                 timeout=30.0,
             )
 
         await engage_ro_mount(
             backend=backend,
-            handle=handle,
-            user_key=user_id,
+            plan=plan,
+            credentials=credentials,
+            selected_mount_id=selected_mount_id,
             thread_id=thread_id,
             user_id=user_id,
             postgres_db=postgres_db,
             http_client_factory=_reader_client,
+            admission_check=_still_admitted,
+            expected_runtime_generation=runtime_generation,
         )
+        if not await _still_admitted():
+            # End can commit in the tiny interval after engage's final check.
+            # Revoke the durable/remote grant before this task returns; runtime
+            # admission independently remains closed even if cleanup itself is
+            # temporarily unavailable.
+            mounted = await postgres_db.get_ro_mount_by_thread(thread_id)
+            mounted_plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(mounted)
+            if mounted_plan == plan and mounted is not None:
+                await revoke_ro_mount_attempt(
+                    backend=backend,
+                    postgres_db=postgres_db,
+                    row_id=str(mounted["id"]),
+                    thread_id=thread_id,
+                    runtime_generation=runtime_generation,
+                    plan=plan,
+                )
+            return
         # Success: clear any stale error from a prior refused/flag-off attempt
         # so the attach-time poll fallback isn't suppressed on other replicas.
         async with postgres_db.acquire() as conn:
             await conn.execute(
-                "UPDATE threads SET metadata = COALESCE(metadata,'{}') - 'protected_cloud_error' WHERE id=$1",
+                "UPDATE threads SET metadata = COALESCE(metadata,'{}') "
+                "- 'protected_cloud_error' - 'protected_cloud_error_code' "
+                "WHERE id=$1 AND status IN "
+                "('created','active','awaiting_user','suspended') "
+                "AND execution_lane='pinned' "
+                "AND runtime_generation=$2::uuid "
+                "AND runtime_retirement_token IS NULL",
                 thread_id,
+                runtime_generation,
             )
+    except RoEngageCleanupPending as e:
+        logger.info("Thread %s: protected cleanup pending: %s", thread_id, e)
     except RoEngageRefused as e:
-        await _record_protected_error(thread_id, f"protected mode refused: {e}")
+        await _record_protected_error(
+            thread_id,
+            f"protected mode refused: {e}",
+            code="engage_refused",
+            expected_runtime_generation=runtime_generation,
+        )
     except Exception as e:  # provisioning error — fail closed, no mount
         logger.warning("Thread %s: protected engage failed: %s", thread_id, e)
-        await _record_protected_error(thread_id, f"protected engage error: {e}")
+        await _record_protected_error(
+            thread_id,
+            f"protected engage error: {e}",
+            code="engage_failed",
+            expected_runtime_generation=runtime_generation,
+        )
 
 
-async def _record_protected_error(thread_id: str, message: str) -> None:
+async def _record_protected_error(
+    thread_id: str,
+    message: str,
+    *,
+    code: str = "engage_failed",
+    expected_runtime_generation: str | None = None,
+) -> None:
+    if code not in _PROTECTED_CLOUD_ERROR_CODES:
+        raise ValueError(f"Unknown protected cloud error code: {code}")
     async with postgres_db.acquire() as conn:
         await conn.execute(
-            "UPDATE threads SET metadata = COALESCE(metadata,'{}') || $2::jsonb WHERE id=$1",
+            "UPDATE threads SET metadata = COALESCE(metadata,'{}') || $2::jsonb "
+            "WHERE id=$1 AND status IN "
+            "('created','active','awaiting_user','suspended') "
+            "AND runtime_retirement_token IS NULL "
+            "AND ($3::uuid IS NULL OR runtime_generation=$3::uuid)",
             thread_id,
-            json.dumps({"protected_cloud_error": message}),
+            json.dumps(
+                {
+                    "protected_cloud_error": message,
+                    "protected_cloud_error_code": code,
+                }
+            ),
+            expected_runtime_generation,
         )
 
 
@@ -43027,7 +48509,14 @@ async def _build_agent_cloud_mount(
     # served while the flag is OFF would fall through to the LIVE builders with
     # agent-service credentials (B8 review finding; violates the fail-closed
     # invariant). Flag off => protected threads get NO cloud, not live cloud.
-    if metadata.get("protected_cloud"):
+    protected_marker = protected_cloud_marker_state(metadata)
+    if protected_marker != "off":
+        if protected_marker == "malformed":
+            logger.warning(
+                "Thread %s: malformed protected_cloud marker; refusing cloud mount.",
+                thread.get("id"),
+            )
+            return None
         if not _is_protected_cloud_mode_enabled():
             logger.warning(
                 "Thread %s: protected_cloud marker present but "
@@ -43043,6 +48532,15 @@ async def _build_agent_cloud_mount(
             )
             return None
         tid = str(thread.get("id"))
+        runtime_authority = thread_runtime_authority(thread)
+        if runtime_authority is None:
+            logger.warning(
+                "Thread %s: protected mount requested without open runtime "
+                "generation authority; refusing.",
+                tid,
+            )
+            return None
+        engage_task_key = (tid, runtime_authority.generation)
         row = await postgres_db.get_ro_mount_by_thread(tid)
         if row is None:
             # F-I1: engage-vs-attach race. Create-time engage is
@@ -43053,7 +48551,7 @@ async def _build_agent_cloud_mount(
             # thread (e.g. a second replica handled create — HA) AND no
             # terminal error is already recorded (a refusal/error means the
             # task already ran to completion with nothing to wait for).
-            task = _protected_engage_tasks.get(tid)
+            task = _protected_engage_tasks.get(engage_task_key)
             if task is not None:
                 try:
                     await asyncio.wait_for(asyncio.shield(task), timeout=30)
@@ -43221,6 +48719,13 @@ class ThreadControlRequest(BaseModel):
 
     client_request_id: UUID
     method: Literal["mode.set", "narration.set", "workspace.undo"]
+    session_runtime_generation: UUID | None = Field(
+        None,
+        description=(
+            "Runtime generation rendered with the current session. Pinned "
+            "admission compares it under the thread-row lock."
+        ),
+    )
     mode: (
         Literal[
             "supervised",
@@ -43274,6 +48779,14 @@ async def submit_thread_control(
     thread_owner_id = thread.get("user_id")
     policy_user_id = str(thread_owner_id or user["id"])
     control_payload = body.control_payload()
+    control_metadata = thread_metadata_object(thread)
+    require_control_generation = bool(
+        thread.get("execution_lane") == "pinned"
+        and (
+            protected_cloud_marker_state(control_metadata) != "off"
+            or _require_pinned_status_identity()
+        )
+    )
 
     try:
         existing = await find_existing_thread_control(
@@ -43334,6 +48847,8 @@ async def submit_thread_control(
             verb=body.method,
             payload=control_payload,
             requested_by=actor_id,
+            expected_runtime_generation=body.session_runtime_generation,
+            require_pinned_runtime_generation=require_control_generation,
         )
     except ControlAdmissionNotReady as exc:
         # Registration intentionally keeps the exact pinned-owner capability
@@ -43369,6 +48884,11 @@ async def submit_thread_control(
         "method": admitted.verb,
         "state": admitted.state,
         "duplicate": admitted.duplicate,
+        "session_runtime_generation": (
+            str(admitted.runtime_generation)
+            if admitted.runtime_generation is not None
+            else None
+        ),
     }
 
 
@@ -43810,20 +49330,19 @@ async def _thread_cloud_diff_source(thread_id: str, thread: dict[str, Any]):
     reconciler) stay reviewable — spec §11. Only restage/apply-side workspace
     steps need a live pod.
     """
-    from services.cloud_staging import select_protected_mount
     from services.diff_source import UpperdirDiffSource
 
     row = await postgres_db.get_ro_mount_by_thread(thread_id)
     if not row:
         return None, None, None
-    mount_rows = await postgres_db.list_thread_mounts(thread_id)
-    sel = select_protected_mount(mount_rows)
-    backend = main_cloud_router.for_backend(row["backend"])
-    handle = (
-        ProjectFolderHandle.from_db(str(sel["cloud_handle"]), backend=row["backend"])
-        if sel
-        else None
-    )
+    plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(row)
+    if plan is None:
+        # A legacy summary has no immutable source. It stays rejectable through
+        # the reject endpoint, but review/apply must never relabel it from the
+        # thread's mutable current mount selection.
+        return row, None, None
+    backend = await _resolve_protected_reader_backend(plan)
+    handle = plan.to_project_folder_handle()
     src = UpperdirDiffSource(
         thread_id=thread_id,
         mount_row=row,
@@ -43831,15 +49350,7 @@ async def _thread_cloud_diff_source(thread_id: str, thread: dict[str, Any]):
         handle=handle,
         snapshot_service=snapshot_service,
     )
-    # ``mountpoint``/``workspace_name`` are NOT real ``thread_mounts`` columns
-    # (verified against postgres.list_thread_mounts' SELECT — real rows carry
-    # backend_id/cloud_handle/target_path); ``target_path`` is the fallback
-    # that actually resolves to something on live rows.
-    name = (
-        (sel or {}).get("mountpoint")
-        or (sel or {}).get("workspace_name")
-        or (sel or {}).get("target_path")
-    )
+    name = plan.source.target_path
     return row, src, name
 
 
@@ -43956,47 +49467,156 @@ async def restage_thread_cloud_diff(thread_id: str, request: Request) -> dict[st
 
     if _resolve_workspace_ssh(metadata) is None:
         raise HTTPException(status_code=409, detail={"code": "no_workspace"})
+    row = await postgres_db.get_ro_mount_by_thread(thread_id)
+    authority = _capture_cloud_stage_authority(thread, row or {})
+    if authority is None or authority.get("runtime_retirement_token") is not None:
+        raise HTTPException(
+            status_code=409, detail={"code": "cloud_stage_authority_unavailable"}
+        )
+    task_key = _cloud_stage_task_key(thread_id, authority)
 
     async def _run() -> None:
         try:
-            await stage_thread_cloud_diff(
-                thread_id=thread_id,
-                postgres_db=postgres_db,
-                snapshot_service=snapshot_service,
-            )
+            async with postgres_db.thread_advisory_lock(thread_id):
+                result = await stage_thread_cloud_diff(
+                    thread_id=thread_id,
+                    postgres_db=postgres_db,
+                    snapshot_service=snapshot_service,
+                    authority=authority,
+                )
+            _broadcast_cloud_stage_result(result)
         finally:
-            _cloud_stage_tasks.pop(thread_id, None)
+            _cloud_stage_tasks.pop(task_key, None)
 
-    if thread_id not in _cloud_stage_tasks:
-        _cloud_stage_tasks[thread_id] = asyncio.create_task(_run())
+    if task_key not in _cloud_stage_tasks:
+        _cloud_stage_tasks[task_key] = asyncio.create_task(_run())
     return {"scheduled": True}
 
 
-async def _reset_thread_overlay(thread_id: str, thread: dict[str, Any]) -> bool:
-    """POST the bound agent's ``/cloud-overlay/reset`` after an apply/reject
-    (Task 9's agent route, ``src/api/persistent_app.py``).
+def _current_thread_overlay_reset_authority(
+    thread: Mapping[str, Any],
+) -> dict[str, str] | None:
+    """Return one exact live protected runtime/workspace identity."""
 
-    Same agent host/port resolution as ``_thread_turn_in_flight`` below
-    (``postgres_db.get_agent`` -> ``pod_ip``/``pod_port``) — this module has
-    no dedicated "proxy to the bound agent" helper to reuse verbatim; that
-    pattern is what every other thread->agent HTTP call in this file
-    (``/session/status``, ``/job/*``, ``/system/info``) already uses.
+    metadata = thread_metadata_object(thread)
+    workspace = metadata.get("workspace_container") or {}
+    binding = metadata.get("_workspace_binding") or {}
+    authority = {
+        "agent_id": str(thread.get("agent_id") or ""),
+        "runtime_generation": str(thread.get("runtime_generation") or ""),
+        "runtime_attach_token": str(thread.get("runtime_attach_token") or ""),
+        "workspace_generation": str(binding.get("generation") or ""),
+        "workspace_runtime_incarnation": str(
+            workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or ""
+        ),
+    }
+    try:
+        for value in authority.values():
+            UUID(value)
+    except (TypeError, ValueError):
+        return None
+    if not (
+        thread.get("execution_lane") == "pinned"
+        and metadata.get("protected_cloud") is True
+        and workspace.get("status") == "ready"
+        and binding.get("kind") == "remote"
+        and str(workspace.get("_canvas_workspace_generation") or "")
+        == authority["workspace_generation"]
+    ):
+        return None
+    return authority
 
-    Best-effort and never fatal: a dead/unreachable pod is the NORMAL case
-    (v1 limitation — see ``services.cloud_staging.apply`` module docstring).
-    Any failure (no agent bound, pod gone, non-200, timeout, exception)
-    returns ``False``; only an actual 200 from the agent returns ``True``.
+
+def _capture_thread_overlay_reset_authority(
+    thread: Mapping[str, Any], staged_summary: Mapping[str, Any] | None
+) -> dict[str, str] | None:
+    """Bind overlay reset to the producer of the reviewed staged bytes.
+
+    A review may survive End/Resume.  In that case the current G2 runtime is
+    intentionally *not* the G1 producer and must retain its unreviewed
+    upperdir.  Old summaries without producer identity fail closed.
     """
-    agent_id = thread.get("agent_id")
-    if not agent_id:
+
+    current = _current_thread_overlay_reset_authority(thread)
+    producer = (
+        staged_summary.get("producer") if isinstance(staged_summary, Mapping) else None
+    )
+    if current is None or not isinstance(producer, Mapping):
+        return None
+    if any(str(producer.get(key) or "") != value for key, value in current.items()):
+        return None
+    return current
+
+
+async def _reset_thread_overlay(
+    thread_id: str, authority: Mapping[str, str] | None
+) -> bool:
+    """Reset only the exact protected runtime whose bytes were reviewed.
+
+    This remains best-effort: an ended/dead runtime legitimately returns
+    ``False``.  Unlike the old name-only proxy, however, a resumed successor,
+    rebound pool agent, or replaced workspace is never contacted with an
+    unauthenticated reset.
+    """
+
+    if authority is None:
+        return False
+    expected = dict(authority)
+    agent_id = expected.get("agent_id")
+    generation = expected.get("runtime_generation")
+    attach_token = expected.get("runtime_attach_token")
+    if not agent_id or not generation or not attach_token:
         return False
     try:
+        current = await postgres_db.get_thread(thread_id)
+        if (
+            current is None
+            or current.get("runtime_retirement_token") is not None
+            or _current_thread_overlay_reset_authority(current) != expected
+        ):
+            return False
         agent = await postgres_db.get_agent(str(agent_id))
-        if not agent or not agent.get("pod_ip"):
+        if not (
+            agent
+            and agent.get("pod_ip")
+            and str(agent.get("id") or agent_id) == str(agent_id)
+            and str(agent.get("thread_id") or thread_id) == str(thread_id)
+        ):
+            return False
+        # This is deliberately the final database authority boundary.  A
+        # concurrent process restart after it is still rejected by the agent,
+        # which validates the same generation/attach/workspace tuple locally
+        # before touching the overlay.
+        current = await postgres_db.get_thread(thread_id)
+        if (
+            current is None
+            or current.get("runtime_retirement_token") is not None
+            or _current_thread_overlay_reset_authority(current) != expected
+            or not await postgres_db.pinned_thread_agent_is_reciprocal(
+                thread_id,
+                str(agent_id),
+                expected_runtime_generation=str(generation),
+                expected_attach_token=str(attach_token),
+            )
+        ):
             return False
         url = f"http://{agent['pod_ip']}:{agent['pod_port']}/cloud-overlay/reset"
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url)
+            response = await client.post(
+                url,
+                headers={
+                    "X-Agent-ID": str(agent_id),
+                    "X-Session-Runtime-Generation": str(generation),
+                    "X-Session-Runtime-Attach-Token": str(attach_token),
+                },
+                json={
+                    "thread_id": str(thread_id),
+                    "workspace_generation": expected["workspace_generation"],
+                    "workspace_runtime_incarnation": expected[
+                        "workspace_runtime_incarnation"
+                    ],
+                },
+            )
         return response.status_code == 200
     except Exception as e:
         logger.warning(
@@ -44021,13 +49641,19 @@ async def apply_thread_cloud_diff(
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     _require_protected(thread)
-
     from services.cloud_staging.apply import StagedApplyError, apply_staged_diff
 
     try:
         epoch = int(body.get("epoch", -1))
     except (ValueError, TypeError):
         raise HTTPException(status_code=422, detail={"code": "invalid_epoch"})
+    reset_row = await postgres_db.get_ro_mount_by_thread(thread_id)
+    reset_summary = (
+        reset_row.get("staged_summary")
+        if reset_row and int(reset_row.get("staged_epoch") or -1) == epoch
+        else None
+    )
+    reset_authority = _capture_thread_overlay_reset_authority(thread, reset_summary)
     try:
         result = await apply_staged_diff(
             thread_id=thread_id,
@@ -44035,7 +49661,9 @@ async def apply_thread_cloud_diff(
             postgres_db=postgres_db,
             main_cloud_router=main_cloud_router,
             snapshot_service=snapshot_service,
-            reset_agent_overlay=lambda: _reset_thread_overlay(thread_id, thread),
+            reset_agent_overlay=lambda: _reset_thread_overlay(
+                thread_id, reset_authority
+            ),
         )
     except StagedApplyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -44057,20 +49685,28 @@ async def reject_thread_cloud_diff(
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     _require_protected(thread)
-
     from services.cloud_staging.apply import StagedApplyError, reject_staged_diff
 
     try:
         epoch = int(body.get("epoch", -1))
     except (ValueError, TypeError):
         raise HTTPException(status_code=422, detail={"code": "invalid_epoch"})
+    reset_row = await postgres_db.get_ro_mount_by_thread(thread_id)
+    reset_summary = (
+        reset_row.get("staged_summary")
+        if reset_row and int(reset_row.get("staged_epoch") or -1) == epoch
+        else None
+    )
+    reset_authority = _capture_thread_overlay_reset_authority(thread, reset_summary)
     try:
         result = await reject_staged_diff(
             thread_id=thread_id,
             epoch=epoch,
             postgres_db=postgres_db,
             snapshot_service=snapshot_service,
-            reset_agent_overlay=lambda: _reset_thread_overlay(thread_id, thread),
+            reset_agent_overlay=lambda: _reset_thread_overlay(
+                thread_id, reset_authority
+            ),
         )
     except StagedApplyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -44761,6 +50397,12 @@ async def _end_thread_flow(
     officer_retire_reason: str = "retired",
     officer_post_required: bool = False,
     include_officer_handoff: bool = False,
+    expected_runtime_generation: str | None = None,
+    expected_agent_id: str | None = None,
+    expected_attach_token: str | None = None,
+    require_expected_agent_offline: bool = False,
+    settle_status: Literal["ended", "suspended"] = "ended",
+    local_runtime_quiesced: bool = False,
 ) -> dict[str, Any]:
     """The End funnel body — everything ``end_thread`` does after auth.
 
@@ -44775,14 +50417,27 @@ async def _end_thread_flow(
     is an internal response bridge for that endpoint, never a public request
     field.
     """
+    if permanent and settle_status != "ended":
+        raise ValueError("permanent retirement cannot settle suspended")
     stateless = thread.get("execution_lane") == "stateless"
     initial_status = thread.get("status")
     initial_stateless_authority: dict[str, Any] | None = None
 
     async def _stand_down(
         authoritative_thread: dict[str, Any],
+        *,
+        retirement_authority: Mapping[str, Any] | None = None,
+        converge_authorized: bool = False,
     ) -> dict[str, Any] | None:
-        """Run End-owned side effects only after lifecycle authority is held."""
+        """Run idempotent End-owned stand-down under durable authority.
+
+        For the first linked Officer transition, ``retirement_authority`` is
+        appended in the same database transaction as decommission after the
+        transaction's in-flight refusal point. Every other caller authorizes
+        before entering this helper. ``converge_authorized`` makes a retry of
+        an irrevocable retirement ignore a newly observed Officer-job warning
+        rather than returning a force prompt for work that is already ending.
+        """
 
         authoritative_metadata = thread_metadata_object(authoritative_thread)
         officer_meta = (authoritative_metadata.get("config_override") or {}).get(
@@ -44799,8 +50454,9 @@ async def _end_thread_flow(
                 handoff = await _decommission_officer_post(
                     authoritative_thread,
                     reason=officer_retire_reason,
-                    force=force,
+                    force=force or converge_authorized,
                     allow_orphan_retirement=not officer_post_required,
+                    retirement=retirement_authority,
                 )
             except OfficerPostLifecycleConflict as exc:
                 raise HTTPException(status_code=409, detail=exc.detail) from exc
@@ -44867,29 +50523,567 @@ async def _end_thread_flow(
                     )
 
     if not stateless:
-        # Pinned behavior is unchanged: its resident agent remains the in-flight
-        # authority and the legacy resource cleanup retains best-effort semantics.
-        if not force and await _thread_turn_in_flight(thread):
+        if (
+            not force
+            and expected_runtime_generation is None
+            and not (
+                thread.get("runtime_retirement_token") is not None
+                and thread.get("runtime_retirement_authorized_at") is not None
+            )
+            and await _thread_turn_in_flight(thread)
+        ):
+            # Fast observational no-op for the common non-force refusal.  The
+            # locked post-Begin probe below still catches a turn admitted in
+            # the narrow interval before the token closes durable admission.
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "turn_in_flight: the agent is mid-turn on this session. "
-                    "Retry with ?force=true to end it anyway."
-                ),
+                detail={
+                    "code": "turn_in_flight",
+                    "message": (
+                        "The agent is mid-turn on this session. Retry with "
+                        "force=true to end it anyway."
+                    ),
+                },
             )
-        officer_handoff = await _stand_down(thread)
-        if officer_handoff and officer_handoff.get("blocked_by_in_flight"):
-            return _officer_in_flight_decommission_response(officer_handoff)
-        await _release_thread_resources(thread_id, reclaim_volume=permanent)
-        if permanent:
-            await _delete_auxiliary_state(thread)
-            await postgres_db.delete_thread(thread_id)
-            result: dict[str, Any] = {"status": "deleted"}
-            if include_officer_handoff:
-                result["_officer_handoff"] = officer_handoff
-            return result
-        await postgres_db.end_thread(thread_id)
-        result = {"status": "ended"}
+        if expected_runtime_generation is not None:
+            pre_begin = await postgres_db.get_thread(thread_id)
+            identity_mismatch = bool(
+                pre_begin is None
+                or str(pre_begin.get("runtime_generation") or "")
+                != expected_runtime_generation
+                or str(pre_begin.get("agent_id") or "") != str(expected_agent_id or "")
+                or str(pre_begin.get("runtime_attach_token") or "")
+                != str(expected_attach_token or "")
+            )
+            if (
+                not identity_mismatch
+                and pre_begin is not None
+                and pre_begin.get("runtime_retirement_token") is not None
+            ):
+                pending_context = pre_begin.get("runtime_retirement_context") or {}
+                if isinstance(pending_context, str):
+                    try:
+                        pending_context = json.loads(pending_context)
+                    except (TypeError, ValueError):
+                        pending_context = {}
+                identity_mismatch = bool(
+                    not isinstance(pending_context, Mapping)
+                    or str(pending_context.get("generation") or "")
+                    != expected_runtime_generation
+                    or str(pending_context.get("agent_id") or "")
+                    != str(expected_agent_id or "")
+                    or str(pending_context.get("runtime_attach_token") or "")
+                    != str(expected_attach_token or "")
+                    or bool(pre_begin.get("runtime_retirement_permanent"))
+                    != bool(permanent)
+                    or str(pending_context.get("settle_status") or "") != settle_status
+                )
+            if identity_mismatch:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "pinned_runtime_identity_mismatch"},
+                )
+        begin_identity: dict[str, Any] = {}
+        if expected_runtime_generation is not None:
+            begin_identity = {
+                "expected_runtime_generation": expected_runtime_generation,
+                "expected_agent_id": expected_agent_id,
+                "expected_attach_token": expected_attach_token,
+                "require_agent_offline": require_expected_agent_offline,
+            }
+        retirement = await postgres_db.begin_pinned_thread_retirement(
+            thread_id,
+            permanent=permanent,
+            settle_status=settle_status,
+            **begin_identity,
+        )
+        state = str(retirement.get("state") or "")
+        if state == "missing":
+            return {"status": "deleted"}
+        if state == "settled" and not permanent:
+            return {"status": settle_status}
+        if state != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pinned_retirement_conflict",
+                    "reason": retirement.get("reason") or state,
+                },
+            )
+        already_authorized = retirement.get("authorized_at") is not None
+
+        async def _abort_hidden_preflight() -> str:
+            """Resolve this request's pre-authorization marker exactly.
+
+            ``aborted`` is the only outcome that permits a refusal to be
+            reported as an observational no-op. A concurrent authorization is
+            irrevocable and must converge as ``ending``; an exact hidden
+            marker that somehow survives two CAS attempts is left for the
+            bounded stale-preflight reaper and reported as recovery-required.
+            """
+
+            token = str(retirement["token"])
+            generation = str(retirement["generation"])
+            if await postgres_db.abort_pinned_thread_retirement(
+                thread_id, token=token, generation=generation
+            ):
+                return "aborted"
+            current = await postgres_db.get_thread(thread_id)
+            if current is None:
+                return "superseded"
+            if (
+                str(current.get("runtime_generation") or "") != generation
+                or str(current.get("runtime_retirement_token") or "") != token
+            ):
+                return "superseded"
+            if current.get("runtime_retirement_authorized_at") is not None:
+                return "authorized"
+            if await postgres_db.abort_pinned_thread_retirement(
+                thread_id, token=token, generation=generation
+            ):
+                return "aborted"
+            current = await postgres_db.get_thread(thread_id)
+            if (
+                current is None
+                or str(current.get("runtime_generation") or "") != generation
+                or str(current.get("runtime_retirement_token") or "") != token
+            ):
+                return "superseded"
+            if current.get("runtime_retirement_authorized_at") is not None:
+                return "authorized"
+            return "preflight"
+
+        def _ending_response(*, retry_after_ms: int | None = None) -> dict[str, Any]:
+            response: dict[str, Any] = {
+                "status": "ending",
+                "retirement_disposition": settle_status,
+                "retirement_permanent": bool(permanent),
+            }
+            if retry_after_ms is not None:
+                response["retry_after_ms"] = retry_after_ms
+            return response
+
+        if expected_runtime_generation is not None:
+            captured = retirement.get("context") or {}
+            identity_matches = bool(
+                str(retirement.get("generation") or "") == expected_runtime_generation
+                and str(captured.get("agent_id") or "") == str(expected_agent_id or "")
+                and str(captured.get("runtime_attach_token") or "")
+                == str(expected_attach_token or "")
+            )
+            if not identity_matches:
+                if not retirement.get("reused") and not already_authorized:
+                    abort_outcome = await _abort_hidden_preflight()
+                    if abort_outcome == "authorized":
+                        return _ending_response(retry_after_ms=250)
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "pinned_runtime_identity_mismatch"},
+                )
+
+        # The protected-engage producer and every pinned workspace ensure use
+        # this same cross-replica lock. Admission was closed *before* waiting,
+        # so old work can finish/roll back but no replacement may start.
+        async with postgres_db.try_thread_advisory_lock(thread_id) as lock_owner:
+            if not lock_owner:
+                if already_authorized:
+                    return _ending_response(retry_after_ms=250)
+                abort_outcome = await _abort_hidden_preflight()
+                if abort_outcome == "authorized":
+                    return _ending_response(retry_after_ms=250)
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": (
+                            "pinned_retirement_preflight_busy"
+                            if abort_outcome in {"aborted", "superseded"}
+                            else "pinned_retirement_preflight_recovery_required"
+                        ),
+                        "message": (
+                            "Runtime lifecycle work is still converging; retry End."
+                        ),
+                    },
+                )
+            if not await _pinned_retirement_is_current(retirement):
+                raise HTTPException(
+                    status_code=409, detail="Pinned retirement authority changed"
+                )
+            context = retirement.get("context")
+            context = {} if context is None else context
+            captured_agent = (
+                context.get("agent") if isinstance(context, Mapping) else None
+            )
+            probe_thread = {
+                "agent_id": (captured_agent or {}).get("id")
+                if isinstance(captured_agent, Mapping)
+                else None
+            }
+            if (
+                not already_authorized
+                and not force
+                and await _thread_turn_in_flight(probe_thread)
+            ):
+                abort_outcome = await _abort_hidden_preflight()
+                if abort_outcome == "authorized":
+                    return _ending_response(retry_after_ms=250)
+                if abort_outcome == "preflight":
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "code": "pinned_retirement_preflight_recovery_required"
+                        },
+                    )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "turn_in_flight",
+                        "message": (
+                            "The agent is mid-turn on this session. Retry with "
+                            "force=true to end it anyway."
+                        ),
+                    },
+                )
+
+            authoritative_thread = await postgres_db.get_thread(thread_id)
+            if authoritative_thread is None:
+                return {"status": "deleted"}
+            officer_handoff = None
+            authoritative_metadata = thread_metadata_object(authoritative_thread)
+            officer_cfg = (authoritative_metadata.get("config_override") or {}).get(
+                "officer"
+            ) or {}
+            linked_officer_authorization = bool(
+                not already_authorized
+                and settle_status == "ended"
+                and isinstance(officer_cfg, Mapping)
+                and officer_cfg.get("enabled") in (True, "true", "True", 1)
+                and authoritative_thread.get("project_id") is not None
+            )
+
+            # A linked Officer's no-force in-flight decision and its durable
+            # post mutation share one transaction with authorization. Every
+            # other runtime authorizes before any stand-down/conference
+            # mutation. Thus an unauthorized marker remains safe for the
+            # stale-preflight reaper to clear after a crashed request.
+            if linked_officer_authorization:
+                try:
+                    officer_handoff = await _stand_down(
+                        authoritative_thread,
+                        retirement_authority=retirement,
+                    )
+                except BaseException:
+                    abort_outcome = await asyncio.shield(_abort_hidden_preflight())
+                    if abort_outcome == "authorized":
+                        return _ending_response(retry_after_ms=250)
+                    raise
+                if officer_handoff and officer_handoff.get("blocked_by_in_flight"):
+                    abort_outcome = await _abort_hidden_preflight()
+                    if abort_outcome == "authorized":
+                        return _ending_response(retry_after_ms=250)
+                    if abort_outcome == "preflight":
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "code": "pinned_retirement_preflight_recovery_required"
+                            },
+                        )
+                    return _officer_in_flight_decommission_response(officer_handoff)
+                already_authorized = True
+                retirement["authorized_at"] = True
+            elif not already_authorized:
+                if not await postgres_db.authorize_pinned_thread_retirement(
+                    thread_id,
+                    token=str(retirement["token"]),
+                    generation=str(retirement["generation"]),
+                    settle_status=settle_status,
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "pinned_retirement_authorization_refused"},
+                    )
+                retirement["authorized_at"] = True
+                already_authorized = True
+
+            # Authorization is append-only. Retries must replay these
+            # idempotent obligations instead of skipping them after a crash.
+            if settle_status == "ended" and not linked_officer_authorization:
+                await _stand_down(
+                    authoritative_thread,
+                    converge_authorized=already_authorized,
+                )
+            authoritative_thread = (
+                await postgres_db.get_thread(thread_id) or authoritative_thread
+            )
+
+            runtime_exposed = _retirement_context_runtime_exposed(retirement)
+            local_quiescence = _retirement_has_exact_local_quiescence(
+                retirement, authoritative_thread
+            )
+            if (
+                runtime_exposed
+                and not local_quiescence
+                and _agent_pod_provision_intent_zero_candidate(
+                    retirement, authoritative_thread
+                )
+            ):
+                # The provision intent predates the Pod create effect and no
+                # session owner ever bound. Observe/delete only its exact
+                # attempt-labelled name, then receipt the durable absence.
+                recovered_provision_intent = (
+                    await _recover_agent_pod_provision_intent_zero(
+                        retirement, authoritative_thread
+                    )
+                )
+                if recovered_provision_intent:
+                    authoritative_thread = (
+                        await postgres_db.get_thread(thread_id) or authoritative_thread
+                    )
+                    local_quiescence = _retirement_has_exact_local_quiescence(
+                        retirement, authoritative_thread
+                    )
+            if (
+                runtime_exposed
+                and not local_quiescence
+                and _pre_registration_agent_pod_zero_candidate(
+                    retirement, authoritative_thread
+                )
+            ):
+                # Begin closed registration before this lifecycle lock was
+                # acquired. A complete pre-registration Pod has no session
+                # identity that can ACK, so End owns its exact UID stop and
+                # atomically clears only that captured marker with the proof.
+                recovered_pre_registration = (
+                    await _recover_pre_registration_agent_pod_zero(
+                        retirement, authoritative_thread
+                    )
+                )
+                if recovered_pre_registration:
+                    authoritative_thread = (
+                        await postgres_db.get_thread(thread_id) or authoritative_thread
+                    )
+                    local_quiescence = _retirement_has_exact_local_quiescence(
+                        retirement, authoritative_thread
+                    )
+            prior_soft_settlement = False
+            if permanent and runtime_exposed and not local_quiescence:
+                prior_soft_settlement = (
+                    await postgres_db.pinned_thread_has_prior_soft_settlement(
+                        thread_id,
+                        runtime_generation=str(retirement["generation"]),
+                        retirement_token=str(retirement["token"]),
+                    )
+                )
+            context = retirement.get("context")
+            context = {} if context is None else context
+            captured_agent = (
+                context.get("agent") if isinstance(context, Mapping) else None
+            )
+            captured_agent_pod = (
+                context.get("agent_pod") if isinstance(context, Mapping) else None
+            )
+            captured_actor_shapes_valid = bool(
+                all(
+                    value is None or isinstance(value, Mapping)
+                    for value in (captured_agent, captured_agent_pod)
+                )
+                and all(
+                    not value
+                    or (
+                        str(value.get(name_key) or "")
+                        and str(value.get("pod_uid") or "")
+                    )
+                    for value, name_key in (
+                        (captured_agent, "hostname"),
+                        (captured_agent_pod, "pod_name"),
+                    )
+                    if isinstance(value, Mapping)
+                )
+            )
+            orchestrator_destructive_zero = bool(
+                permanent
+                and runtime_exposed
+                and not local_quiescence
+                and not prior_soft_settlement
+                and isinstance(context, Mapping)
+                and captured_actor_shapes_valid
+                and str(context.get("entry_status") or "") == "ended"
+                and not context.get("agent_id")
+                and not context.get("runtime_attach_token")
+                and authoritative_thread.get("agent_id") is None
+                and authoritative_thread.get("runtime_attach_token") is None
+                and authoritative_thread.get("control_admission_agent_id") is None
+                and str(authoritative_thread.get("status") or "") == "ended"
+            )
+            if runtime_exposed and not (
+                local_quiescence
+                or prior_soft_settlement
+                or orchestrator_destructive_zero
+            ):
+                # Owner End, offline recovery and a lost response may close
+                # admission, but Pod absence/offline status is not proof that
+                # tmux/nohup writers in the workspace stopped.  Return the
+                # durable in-progress state without staging, snapshotting,
+                # revoking or deleting anything.  The exact agent watchdog
+                # performs strict local cleanup, appends the acknowledgement,
+                # then retries this same immutable retirement.
+                if local_runtime_quiesced:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "pinned_local_quiescence_refused",
+                            "message": (
+                                "The exact local cleanup acknowledgement was "
+                                "not persisted."
+                            ),
+                        },
+                    )
+                return {
+                    "status": "ending",
+                    "retirement_disposition": settle_status,
+                    "retirement_permanent": bool(permanent),
+                }
+
+            try:
+                staged_event: dict[str, Any] | None = None
+                authoritative_metadata = thread_metadata_object(authoritative_thread)
+                # A permanent delete intentionally discards both the runtime
+                # and any pending review.  Do not spend minutes materialising
+                # a potentially multi-gigabyte overlay only to delete its
+                # thread/event rows immediately afterwards, and do not let an
+                # unavailable staging backend wedge an otherwise-authorised
+                # permanent deletion.  Soft End/Suspend must finish and
+                # durably announce staging before settlement reopens Resume.
+                if not permanent and authoritative_metadata.get("protected_cloud"):
+                    from services.cloud_staging.stage import stage_thread_cloud_diff
+
+                    ro_row = await postgres_db.get_ro_mount_by_thread(thread_id)
+                    receipt_present = (
+                        authoritative_thread.get("runtime_retirement_stage_receipt")
+                        is not None
+                    )
+                    receipt_valid, receipt_event = _retirement_stage_event_from_receipt(
+                        retirement, authoritative_thread, ro_row
+                    )
+                    if receipt_present and not receipt_valid:
+                        raise RuntimeError(
+                            "protected retirement stage receipt is inconsistent"
+                        )
+                    if receipt_valid:
+                        # A previous attempt crossed the sole visibility CAS;
+                        # workspace/reader cleanup may already have happened.
+                        # Reuse the exact receipt and perform no SSH or S3 IO.
+                        staged_event = receipt_event
+                    else:
+                        stage_authority = _capture_cloud_stage_authority(
+                            authoritative_thread, ro_row or {}
+                        )
+                        if stage_authority is None:
+                            # A protected create may be ended before workspace
+                            # attach or credential delivery.  An engaging (or
+                            # fully probed active) reader grant is an external
+                            # resource, not process exposure: exact-revoke its
+                            # captured attempt before publishing the distinct
+                            # zero-stage receipt.  This deliberately does not
+                            # run the rest of cleanup before mandatory staging.
+                            await _revoke_never_delivered_protected_reader(
+                                retirement,
+                                authoritative_thread,
+                                ro_row,
+                            )
+                            never_engaged = await postgres_db.publish_never_engaged_retirement_stage_receipt(
+                                thread_id,
+                                expected_runtime_generation=str(
+                                    retirement["generation"]
+                                ),
+                                expected_retirement_token=str(retirement["token"]),
+                            )
+                            if never_engaged is None:
+                                raise RuntimeError(
+                                    "protected retirement lacks exact staging authority"
+                                )
+                            authoritative_thread = (
+                                await postgres_db.get_thread(thread_id)
+                                or authoritative_thread
+                            )
+                            receipt_valid, receipt_event = (
+                                _retirement_stage_event_from_receipt(
+                                    retirement,
+                                    authoritative_thread,
+                                    await postgres_db.get_ro_mount_by_thread(thread_id),
+                                )
+                            )
+                            if not receipt_valid:
+                                raise RuntimeError(
+                                    "never-engaged retirement receipt is inconsistent"
+                                )
+                            staged_event = receipt_event
+                        else:
+                            if str(
+                                stage_authority.get("runtime_retirement_token") or ""
+                            ) != str(retirement["token"]):
+                                raise RuntimeError(
+                                    "protected retirement lacks exact staging authority"
+                                )
+                            stage_result = await stage_thread_cloud_diff(
+                                thread_id=thread_id,
+                                postgres_db=postgres_db,
+                                snapshot_service=snapshot_service,
+                                authority=stage_authority,
+                            )
+                            if stage_result is None or stage_result.get("skipped") in {
+                                "authority_changed",
+                                "no_active_mount",
+                                "no_workspace",
+                            }:
+                                raise RuntimeError(
+                                    "protected retirement staging remains retryable"
+                                )
+                            publication = stage_result.get("publication") or {}
+                            if not isinstance(
+                                publication.get("retirement_stage_receipt"), dict
+                            ):
+                                raise RuntimeError(
+                                    "protected retirement staging has no durable receipt"
+                                )
+                            if isinstance(stage_result.get("event"), dict):
+                                staged_event = dict(stage_result["event"])
+                await _cleanup_pinned_thread_retirement(
+                    retirement,
+                    cleanup_agent_pod=(
+                        not runtime_exposed
+                        or (orchestrator_destructive_zero and not prior_soft_settlement)
+                    ),
+                )
+                if permanent:
+                    await _delete_auxiliary_state(authoritative_thread)
+                    await postgres_db.delete_thread(
+                        thread_id,
+                        expected_runtime_retirement_token=str(retirement["token"]),
+                        expected_runtime_generation=str(retirement["generation"]),
+                    )
+                elif not await postgres_db.settle_pinned_thread_retirement(
+                    thread_id,
+                    token=str(retirement["token"]),
+                    generation=str(retirement["generation"]),
+                    final_status=settle_status,
+                    staged_event=staged_event,
+                ):
+                    raise RuntimeError("Pinned retirement settlement CAS failed")
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Pinned retirement remains retryable for thread %s", thread_id
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "pinned_retirement_retry_pending",
+                        "message": "Runtime cleanup is incomplete; retry End.",
+                    },
+                ) from exc
+
+        result: dict[str, Any] = {"status": "deleted" if permanent else settle_status}
         if include_officer_handoff:
             result["_officer_handoff"] = officer_handoff
         return result
@@ -45240,8 +51434,26 @@ async def resume_thread(
             detail="Session execution lane does not support resume",
         )
     if thread.get("status") != "ended":
+        if (
+            execution_lane == LANE_PINNED
+            and thread.get("runtime_retirement_token") is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "session_ending",
+                    "message": (
+                        "This session is still finishing protected runtime "
+                        "cleanup. Resume becomes available after settlement."
+                    ),
+                },
+            )
         raise HTTPException(
-            status_code=409, detail=f"Thread is already {thread.get('status')}"
+            status_code=409,
+            detail={
+                "code": "session_not_ended",
+                "message": "This session has already resumed.",
+            },
         )
 
     metadata = thread.get("metadata") or {}
@@ -45249,7 +51461,34 @@ async def resume_thread(
         try:
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
-            metadata = {}
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "session_metadata_malformed",
+                    "message": "This session's stored state is invalid.",
+                },
+            )
+    protected_marker = protected_cloud_marker_state(metadata)
+    if protected_marker == "malformed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "protected_cloud_malformed",
+                "message": "Protected cloud session state is invalid.",
+            },
+        )
+    if protected_marker == "on" and _thread_workspace_backend(thread) != "sandbox":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "protected_cloud_unsupported_workspace",
+                "message": "Protected cloud sessions require the Container tier.",
+            },
+        )
+    # A legacy ended row may predate create-time materialization of the
+    # effective Officer class.  Resolve and reject it before any drift ACK or
+    # lifecycle write so a failed resume remains exactly ended.
+    await _require_supported_protected_session_class(thread, metadata)
     # Drift must be computed as the THREAD OWNER, never the caller (`user`):
     # require_thread_owner lets admins through for threads they do not own,
     # and admins pass every classify_* check — see _thread_config_drift's
@@ -45377,6 +51616,22 @@ async def resume_thread(
             detail="Thread could not be resumed while workspace cleanup is active",
         )
 
+    # The pre-resume owner snapshot is terminal by construction. Every
+    # provisioning decision below must use the exact row reopened by the
+    # explicit ended->created transaction.
+    thread = await postgres_db.get_thread(thread_id)
+    resume_runtime_authority = thread_runtime_authority(thread)
+    if resume_runtime_authority is None:
+        raise HTTPException(
+            status_code=409, detail=thread_runtime_refusal_detail(thread)
+        )
+    metadata = thread_metadata_object(thread)
+
+    async def _resume_runtime_is_current() -> bool:
+        return same_thread_runtime_authority(
+            await postgres_db.get_thread(thread_id), resume_runtime_authority
+        )
+
     # Reopening a conference re-establishes the officer's hold (centurion.md
     # §4) — the single-writer rule spans the meeting's whole lifetime, not
     # just its first sitting.
@@ -45389,7 +51644,10 @@ async def resume_thread(
     # whenever there's no ACTIVE grant on record — via the same registry
     # ``_schedule_protected_engage`` uses at create, so a concurrent attach
     # can await this task exactly like it would the create-time one.
-    if metadata.get("protected_cloud") and _is_protected_cloud_mode_enabled():
+    if (
+        protected_cloud_marker_state(metadata) == "on"
+        and _is_protected_cloud_mode_enabled()
+    ):
         ro_row = await postgres_db.get_ro_mount_by_thread(thread_id)
         if not ro_row or ro_row.get("status") != "active":
             resume_mount_rows = await postgres_db.list_thread_mounts(thread_id)
@@ -45397,6 +51655,7 @@ async def resume_thread(
                 thread_id,
                 user_id=str(user["id"]),
                 mount_rows=resume_mount_rows,
+                runtime_generation=resume_runtime_authority.generation,
             )
 
     # Provision cloud session folder if missing (e.g. session was created
@@ -45430,12 +51689,19 @@ async def resume_thread(
         and not thread.get("nc_session_folder")
         and not _should_skip_session_folder(existing_mounts)
     )
+    if protected_cloud_marker_state(metadata) == "on":
+        # Protected sessions use the project reader + overlay exclusively.
+        # Never provision/share the legacy live session folder on resume.
+        needs_full_provision = False
+        needs_share_only = False
 
     if needs_full_provision or needs_share_only:
 
         async def _late_cloud_setup(
             tid: str, usr: dict, existing_handle: str | None
         ) -> None:
+            if not await _resume_runtime_is_current():
+                return
             # This thread already exists and carries its origin backend in
             # main_cloud_backend. Dispatch via for_thread so a
             # later active-backend swap can't re-provision it on the wrong
@@ -45443,6 +51709,8 @@ async def resume_thread(
             backend = main_cloud_router.for_thread(thread)
             if not backend.is_initialized and backend.is_configured:
                 await backend.ensure_initialized()
+                if not await _resume_runtime_is_current():
+                    return
             if not backend.is_initialized:
                 return
             try:
@@ -45454,25 +51722,34 @@ async def resume_thread(
                     session_handle = await backend.ensure_session_folder(
                         session_id=tid[:8]
                     )
+                    if not await _resume_runtime_is_current():
+                        return
                 share_handle = None
                 resolved_user_id = await resolve_user_identity_cached(
                     postgres_db, usr, backend
                 )
+                if not await _resume_runtime_is_current():
+                    return
                 if resolved_user_id:
                     share_handle = await backend.share_session_folder(
                         session_handle, resolved_user_id
                     )
+                    if not await _resume_runtime_is_current():
+                        return
                 if not share_handle and existing_handle:
                     # Share still failed (user hasn't signed into cloud yet).
                     # Don't persist — leaving share_handle NULL lets the next
                     # resume retry once autoprovision has materialised them.
                     return
-                await postgres_db.update_thread_main_cloud(
+                if not await postgres_db.update_thread_main_cloud(
                     tid,
                     backend_id=backend.backend_id,
+                    backend_instance_id=str(backend.backend_instance_id),
                     session_handle=session_handle.to_db(),
                     share_handle=share_handle.to_db() if share_handle else None,
-                )
+                    expected_runtime_generation=resume_runtime_authority.generation,
+                ):
+                    return
                 logger.info(
                     "Thread %s: %s cloud session folder",
                     tid,
@@ -45512,6 +51789,12 @@ async def resume_thread(
             # same lock.
             # knowledge-history/done/session_resume_cloud_sync_race_late_provision.md
             await _await_late_cloud_setup(tid)
+            if not await _resume_runtime_is_current():
+                return
+            if not await _await_protected_cloud_runtime_ready(tid):
+                return
+            if not await _resume_runtime_is_current():
+                return
 
             # Serialise concurrent provisioning attempts for the same
             # thread (knowledge-base/knowledge/issues/persistent_thread_double_provisioning_race.md).
@@ -45522,7 +51805,9 @@ async def resume_thread(
             # which the cockpit drives in parallel with this endpoint.
             async with postgres_db.thread_advisory_lock(tid):
                 cur = await postgres_db.get_thread(tid)
-                if not _thread_uses_pinned_execution(cur):
+                if not _thread_uses_pinned_execution(
+                    cur
+                ) or not same_thread_runtime_authority(cur, resume_runtime_authority):
                     logger.warning(
                         "Thread %s: resume reprovision refused for execution lane %r",
                         tid,
@@ -45540,6 +51825,9 @@ async def resume_thread(
 
                 # Try idle pool agent first (instant attach, no pod boot).
                 idle_agent = await _find_idle_persistent_agent()
+                cur = await postgres_db.get_thread(tid)
+                if not same_thread_runtime_authority(cur, resume_runtime_authority):
+                    return
                 if idle_agent:
                     # config_override lives in metadata (no top-level column) and
                     # is stripped of secrets at rest — re-inject from source so the
@@ -45585,6 +51873,9 @@ async def resume_thread(
                         pids,
                         datasources=None,
                         config_name=cfg,
+                        expected_runtime_generation=(
+                            resume_runtime_authority.generation
+                        ),
                     )
                     if ok:
                         logger.info(
@@ -45598,7 +51889,11 @@ async def resume_thread(
                     # the snapshot from before it: a lane transition or a
                     # sibling bind must suppress the dedicated-pod fallback.
                     cur = await postgres_db.get_thread(tid)
-                    if not _thread_uses_pinned_execution(cur):
+                    if not _thread_uses_pinned_execution(
+                        cur
+                    ) or not same_thread_runtime_authority(
+                        cur, resume_runtime_authority
+                    ):
                         logger.warning(
                             "Thread %s: resume pod fallback refused for "
                             "execution lane %r",
@@ -45617,7 +51912,10 @@ async def resume_thread(
 
                 # No idle agent — create a dedicated session pod.
                 pod_name = await agent_provisioner.provision_agent(
-                    purpose="session", thread_id=tid, config_name=cfg
+                    purpose="session",
+                    thread_id=tid,
+                    config_name=cfg,
+                    expected_runtime_generation=(resume_runtime_authority.generation),
                 )
                 if pod_name:
                     return
@@ -45632,8 +51930,16 @@ async def resume_thread(
         config_name = canonical_config_name(thread.get("config_name", "session_base"))
 
         async def _reprovision_legacy(tid: str, cfg: str) -> None:
+            if not await _resume_runtime_is_current():
+                return
+            if not await _await_protected_cloud_runtime_ready(tid):
+                return
+            if not await _resume_runtime_is_current():
+                return
             cur = await postgres_db.get_thread(tid)
-            if not _thread_uses_pinned_execution(cur):
+            if not _thread_uses_pinned_execution(
+                cur
+            ) or not same_thread_runtime_authority(cur, resume_runtime_authority):
                 logger.warning(
                     "Thread %s: legacy resume provisioning refused for "
                     "execution lane %r",
@@ -45641,7 +51947,13 @@ async def resume_thread(
                     cur.get("execution_lane") if cur else None,
                 )
                 return
-            result = await persistent_provisioner.create_agent_pod(tid, config_name=cfg)
+            result = await persistent_provisioner.create_agent_pod(
+                tid,
+                config_name=cfg,
+                expected_runtime_generation=resume_runtime_authority.generation,
+            )
+            if not await _resume_runtime_is_current():
+                return
             if not result.usable:
                 logger.warning(
                     "Thread %s: legacy persistent resume is %s (%s)",
@@ -45661,14 +51973,19 @@ async def resume_thread(
     if execution_lane == LANE_STATELESS:
         _schedule_stateless_workspace_ensure(thread_id)
     else:
-        asyncio.create_task(
-            ensure_session_workspace(
+
+        async def _ensure_resumed_workspace() -> None:
+            if not await _resume_runtime_is_current():
+                return
+            await ensure_session_workspace(
                 thread_id,
                 db=postgres_db,
                 provisioner=container_provisioner,
                 suspension=workspace_suspension_service,
+                expected_runtime_generation=resume_runtime_authority.generation,
             )
-        )
+
+        asyncio.create_task(_ensure_resumed_workspace())
 
     return {"status": "created", "thread_id": thread_id}
 
@@ -45947,11 +52264,13 @@ def _schedule_turn_lock_cleanup(thread_id: str, turn_id: int) -> None:
 
 async def _resolve_thread_for_forwarding(
     thread_id: str, user: dict
-) -> tuple[dict, dict]:
-    """Look up thread + bound agent for orchestrator → agent forwarding.
+) -> tuple[dict, PinnedSessionBinding]:
+    """Resolve one owner-visible thread and its exact pinned runtime binding.
 
-    Returns (thread, agent). Raises HTTPException on auth or routing failures.
-    Restores a suspended workspace if needed (same pattern as the WS proxy).
+    Stateless callers branch before this helper.  All agent/endpoint fields in
+    the result come from one reciprocal DB snapshot rather than independent
+    thread and agent reads.  A suspended pinned workspace is restored before
+    that final snapshot.
     """
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
@@ -45959,53 +52278,56 @@ async def _resolve_thread_for_forwarding(
     # Fail-closed for orphans (user_id IS NULL); admins bypass.
     if not user.get("is_admin") and str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="Not your thread")
-
-    if thread.get("execution_lane") == "stateless":
-        # Stateless restore/create is owned by the distributed nonce/UID
-        # lifecycle. Never fall through to the legacy name-based suspension
-        # restore below, even if an upstream forwarding route regresses its
-        # lane split.
-        _, refusal = stateless_session_workspace_check(thread)
-        if refusal is not None:
-            raise HTTPException(status_code=409, detail=refusal)
-        await ensure_session_workspace(
-            thread_id,
-            db=postgres_db,
-            provisioner=container_provisioner,
-            suspension=workspace_suspension_service,
+    if not _thread_accepts_runtime(thread):
+        raise HTTPException(
+            status_code=409, detail=thread_runtime_refusal_detail(thread)
         )
-        thread = await postgres_db.get_thread(thread_id)
-        if not thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        if thread.get("execution_lane") != "stateless":
+    if thread.get("execution_lane") != "pinned":
+        raise HTTPException(
+            status_code=409,
+            detail="Thread execution lane does not support direct forwarding",
+        )
+
+    async def _refresh_runtime_authority() -> dict[str, Any]:
+        current = await postgres_db.get_thread(thread_id)
+        if not _thread_accepts_runtime(current):
             raise HTTPException(
-                status_code=409,
-                detail="Thread execution lane changed during workspace reconciliation",
+                status_code=409, detail=thread_runtime_refusal_detail(current)
             )
-        if not user.get("is_admin") and str(thread.get("user_id") or "") != str(
+        if not user.get("is_admin") and str(current.get("user_id") or "") != str(
             user["id"]
         ):
             raise HTTPException(status_code=403, detail="Not your thread")
-        _, refusal = stateless_session_workspace_check(thread)
-        if refusal is not None:
-            raise HTTPException(status_code=409, detail=refusal)
-        fresh_metadata = thread.get("metadata") or {}
-        if isinstance(fresh_metadata, str):
-            try:
-                fresh_metadata = json.loads(fresh_metadata)
-            except (json.JSONDecodeError, TypeError):
-                fresh_metadata = {}
-        fresh_workspace = fresh_metadata.get("workspace_container") or {}
-        if (
-            not isinstance(fresh_workspace, dict)
-            or fresh_workspace.get("status") != "ready"
-            or fresh_workspace.get("_snapshot_restore_required") is True
-            or "_stateless_runtime_creation" in fresh_workspace
-        ):
+        if current.get("execution_lane") != "pinned":
             raise HTTPException(
-                status_code=503,
-                detail="Stateless workspace is still reconciling",
+                status_code=409,
+                detail="Thread execution lane does not support direct forwarding",
             )
+        marker = protected_cloud_marker_state(thread_metadata_object(current))
+        if marker == "malformed":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "protected_cloud_malformed",
+                    "message": "Protected cloud session state is invalid.",
+                },
+            )
+        if marker == "on":
+            state, code = await _protected_cloud_delivery_state(
+                current, thread_metadata_object(current)
+            )
+            if state != "ready":
+                raise HTTPException(
+                    status_code=425,
+                    detail={
+                        "code": "protected_cloud_not_ready",
+                        "state": state,
+                        "reason": code,
+                    },
+                )
+        return current
+
+    thread = await _refresh_runtime_authority()
 
     # Restore suspended workspace before forwarding (mirrors persistent_ws_proxy)
     metadata = thread.get("metadata") or {}
@@ -46023,41 +52345,111 @@ async def _resolve_thread_for_forwarding(
                 status_code=503,
                 detail="Failed to restore suspended workspace",
             )
-        thread = await postgres_db.get_thread(thread_id)
+        thread = await _refresh_runtime_authority()
 
-    agent_id = thread.get("agent_id") if thread else None
-    if not agent_id:
+    runtime_authority = thread_runtime_authority(thread)
+    if runtime_authority is None:  # _refresh_runtime_authority proves this
         raise HTTPException(
-            status_code=503,
-            detail="No agent bound to thread — open the SSE stream first",
+            status_code=409, detail=thread_runtime_refusal_detail(thread)
         )
-    agent = await postgres_db.get_agent(str(agent_id))
-    if not agent or not agent.get("pod_ip"):
+    binding = await postgres_db.get_pinned_session_binding(
+        thread_id,
+        expected_runtime_generation=runtime_authority.generation,
+    )
+    if binding is None:
         raise HTTPException(
-            status_code=503,
-            detail="Agent unreachable (no pod_ip)",
+            status_code=409,
+            detail=pinned_binding_invalid_detail(runtime_authority),
         )
-    return thread, agent
+    _require_forwardable_pinned_binding(binding)
+    return thread, binding
+
+
+def _require_forwardable_pinned_binding(binding: PinnedSessionBinding) -> None:
+    """Require a currently live agent status without freezing status equality."""
+
+    if binding.agent_status not in {"ready", "working", "session"}:
+        raise HTTPException(status_code=425, detail="session not ready")
+
+
+def _binding_runtime_authority(
+    binding: PinnedSessionBinding,
+) -> ThreadRuntimeAuthority:
+    return ThreadRuntimeAuthority(
+        thread_id=binding.thread_id,
+        generation=binding.runtime_generation,
+    )
+
+
+async def _revalidate_pinned_forwarding_binding(
+    binding: PinnedSessionBinding,
+) -> PinnedSessionBinding:
+    """Re-read and compare every immutable DB/routing coordinate."""
+
+    current = await postgres_db.get_pinned_session_binding(
+        binding.thread_id,
+        expected_runtime_generation=binding.runtime_generation,
+    )
+    if current is None or current.target_key != binding.target_key:
+        raise HTTPException(
+            status_code=409,
+            detail=pinned_binding_invalid_detail(_binding_runtime_authority(binding)),
+        )
+    _require_forwardable_pinned_binding(current)
+    return current
 
 
 async def _forward_to_agent(
-    agent: dict, path: str, payload: dict, timeout: float = 30.0
+    binding: PinnedSessionBinding,
+    path: str,
+    payload: dict,
+    timeout: float = 30.0,
 ) -> dict[str, Any]:
-    """POST `payload` to the agent pod's REST endpoint at `path`. Returns
-    parsed JSON body. Raises HTTPException on transport/status errors."""
-    agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}{path}"
+    """POST to one exact pinned Pod after a client-boundary DB reread."""
+
+    identity_fingerprint = binding.session_identity_fingerprint
+    forwarded_payload = dict(payload)
+    supplied_fingerprint = forwarded_payload.get("session_identity_fingerprint")
+    if supplied_fingerprint not in (None, identity_fingerprint):
+        raise ValueError("forwarded session identity does not match its binding")
+    forwarded_payload["session_identity_fingerprint"] = identity_fingerprint
+    agent_url = f"http://{binding.pod_ip}:{binding.pod_port}{path}"
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(agent_url, json=payload)
+            # Client/pool entry may await.  Re-read after it so no stale target
+            # receives an effect merely because it was authoritative before
+            # transport setup.  The endpoint validates the fingerprint again
+            # across the final network race.
+            await _revalidate_pinned_forwarding_binding(binding)
+            response = await client.post(agent_url, json=forwarded_payload)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning("Agent forward failed: %s %s -> %s", path, agent.get("id"), e)
+        logger.warning(
+            "Agent forward failed: %s %s -> %s",
+            path,
+            binding.agent_id,
+            e,
+        )
         raise HTTPException(status_code=503, detail=f"Agent unreachable: {e}") from e
+    try:
+        response_body = response.json()
+    except Exception:
+        response_body = None
+    if (
+        response.status_code == 409
+        and isinstance(response_body, dict)
+        and response_body.get("error") == "session_identity_mismatch"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=pinned_binding_invalid_detail(_binding_runtime_authority(binding)),
+        )
     if response.status_code == 503:
-        try:
-            body = response.json()
-        except Exception:
-            body = None
-        if isinstance(body, dict) and body.get("error") == "runtime_terminating":
+        if (
+            isinstance(response_body, dict)
+            and response_body.get("error") == "runtime_terminating"
+        ):
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -46077,10 +52469,11 @@ async def _forward_to_agent(
             status_code=response.status_code,
             detail=response.text[:200],
         )
-    try:
-        return response.json()
-    except Exception:
-        return {"raw": response.text[:500]}
+    return (
+        response_body
+        if isinstance(response_body, dict)
+        else {"raw": response.text[:500]}
+    )
 
 
 async def _no_cursor_replay_start(conn, thread_id: str, epoch: int) -> int:
@@ -46656,7 +53049,7 @@ async def thread_input(
         # queue lane derives the turn number from DB truth (total_turns + 1).
         return await _thread_input_stateless(lane_thread, body.content)
 
-    thread, agent = await _resolve_thread_for_forwarding(thread_id, user)
+    thread, binding = await _resolve_thread_for_forwarding(thread_id, user)
 
     if not body.content or not isinstance(body.content, str):
         raise HTTPException(
@@ -46692,8 +53085,13 @@ async def thread_input(
     async with lock:
         _thread_turn_inflight[thread_id] = turn_id
         try:
+            # Waiting for another tab's turn lock is an authority boundary.
+            # Refuse a same-G Pod/attach/endpoint rotation before constructing
+            # the HTTP client; _forward_to_agent performs the final reread
+            # after client entry as well.
+            await _revalidate_pinned_forwarding_binding(binding)
             result = await _forward_to_agent(
-                agent,
+                binding,
                 "/api/input",
                 {"content": body.content, "turn_id": turn_id},
             )
@@ -46739,11 +53137,13 @@ async def thread_interrupt(
 ) -> Any:
     """Interrupt one exact in-flight turn without exposing its execution lane.
 
-    Pinned sessions retain their direct agent forward. A correlated client is
-    forwarded intact so the agent can reject a retry aimed at an older turn;
-    the historical empty body remains byte-for-byte ``{}``. Stateless sessions
-    commit an exact-lease request for the serving executor and return admission
-    only — that owner applies the verb and journals the authoritative ack.
+    Pinned sessions retain their direct agent forward. Every forwarded body is
+    bound to the exact runtime fingerprint; an otherwise-empty legacy command
+    still targets the active turn observed by that runtime. A correlated
+    client is forwarded intact so the agent can reject a retry aimed at an
+    older turn. Stateless sessions commit an exact-lease request for the
+    serving executor and return admission only — that owner applies the verb
+    and journals the authoritative ack.
     """
     from src.shared.run_queue import LANE_STATELESS
 
@@ -46815,14 +53215,14 @@ async def thread_interrupt(
             },
         )
 
-    _, agent = await _resolve_thread_for_forwarding(thread_id, user)
+    _, binding = await _resolve_thread_for_forwarding(thread_id, user)
     payload: dict[str, Any] = {}
     if correlated and body is not None and body.target_turn_id is not None:
         payload = {
             "client_request_id": str(body.client_request_id),
             "target_turn_id": body.target_turn_id,
         }
-    result = await _forward_to_agent(agent, "/api/interrupt", payload)
+    result = await _forward_to_agent(binding, "/api/interrupt", payload)
     return {"accepted": True, "agent": result}
 
 
@@ -48353,6 +54753,9 @@ async def _phase5_wake_if_suspended(
                 thread.get("execution_lane"),
             )
             return
+        wake_authority = thread_runtime_authority(thread)
+        if wake_authority is None:
+            return
         metadata = thread.get("metadata") or {}
         if isinstance(metadata, str):
             try:
@@ -48385,27 +54788,43 @@ async def _phase5_wake_if_suspended(
                 "magic-link wake: restoring suspended workspace for thread %s",
                 thread_id,
             )
-            ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
-            if not ok:
+            restored = await ensure_session_workspace(
+                thread_id,
+                db=postgres_db,
+                provisioner=container_provisioner,
+                suspension=workspace_suspension_service,
+                expected_runtime_generation=wake_authority.generation,
+            )
+            if restored is None or restored.outcome is EnsureOutcome.FAILED:
                 logger.warning(
-                    "magic-link wake: workspace restore failed for thread %s",
+                    "magic-link wake: workspace restore failed or lost authority "
+                    "for thread %s",
                     thread_id,
                 )
                 return
-            # Reflect on the thread row that we're awake again. The agent
-            # pod's _attach_session will set this to 'active' too, but
-            # writing here closes the window where the attention-sleep
-            # watchdog could re-fire before the agent boots.
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    "UPDATE threads "
-                    "SET status = 'active', "
-                    "    awaiting_user_since = NULL, "
-                    "    extend_count = 0, "
-                    "    control_admission_agent_id = NULL "
-                    "WHERE id = $1 AND status IN ('suspended', 'awaiting_user')",
-                    thread_id,
-                )
+
+        # Publish wake only to the exact post-suspension generation. A G2
+        # restore delayed across another End/Resume cannot wake G3.
+        async with postgres_db.acquire() as conn:
+            woke = await conn.fetchval(
+                "UPDATE threads "
+                "SET status = 'active', "
+                "    awaiting_user_since = NULL, "
+                "    extend_count = 0, "
+                "    control_admission_agent_id = NULL "
+                "WHERE id = $1::uuid "
+                "  AND execution_lane='pinned' "
+                "  AND runtime_generation=$2::uuid "
+                "  AND runtime_retirement_token IS NULL "
+                "  AND status IN ('suspended', 'awaiting_user') "
+                "RETURNING id",
+                thread_id,
+                wake_authority.generation,
+            )
+        if woke is None and not same_thread_runtime_authority(
+            await postgres_db.get_thread(thread_id), wake_authority
+        ):
+            return
 
         # Agent pod may also have been deleted on suspension
         # (workspace_suspension.py:502-504). Re-provision if a persistent
@@ -48413,14 +54832,19 @@ async def _phase5_wake_if_suspended(
         # will restore the LangGraph checkpoint and re-enter permission_check
         # for the same tool_call_id, where the select-first guard picks up
         # the decision we just UPDATEd.
-        if persistent_provisioner is not None and not thread.get("agent_id"):
+        current = await postgres_db.get_thread(thread_id)
+        if not same_thread_runtime_authority(current, wake_authority):
+            return
+        if persistent_provisioner is not None and not current.get("agent_id"):
             config_name = canonical_config_name(
                 thread.get("config_name", "session_base")
             )
 
             async def _create_after_magic_link() -> None:
                 result = await persistent_provisioner.create_agent_pod(
-                    thread_id, config_name=config_name
+                    thread_id,
+                    config_name=config_name,
+                    expected_runtime_generation=wake_authority.generation,
                 )
                 if not result.usable:
                     logger.warning(
@@ -48798,15 +55222,10 @@ async def officer_watchdog(shutdown_event: asyncio.Event) -> None:
 async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
     """Background task: suspend threads stuck in awaiting_user past their TTL.
 
-    Runs every HEADLESS_ATTENTION_SLEEP_INTERVAL_S (default 60s). For each
-    qualifying thread:
-      1. Call workspace_suspension_service.suspend_thread_workspace() —
-         snapshots filesystem to S3, deletes workspace pod/VM, also deletes
-         the bound agent pod (workspace_suspension.py:502-504).
-      2. CAS UPDATE thread.status from 'awaiting_user' → 'suspended'. The
-         CAS guards against the user re-attaching mid-suspend: if status
-         flipped back to 'active' between the SELECT and the UPDATE, we
-         don't clobber it.
+    Runs every HEADLESS_ATTENTION_SLEEP_INTERVAL_S (default 60s). Each
+    qualifying pinned generation enters the same durable retirement funnel as
+    owner End, settling to ``suspended`` only after generation-fenced staging
+    and exact resource cleanup. Resume stays closed for the entire operation.
 
     Best-effort: a transient failure (DB unavailable, suspend service
     error) is logged and retried on the next tick.
@@ -48847,7 +55266,9 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
                     # ttl <= 0 disables the watchdog for that thread, matching
                     # the cockpit UX of "Never auto-suspend".
                     rows = await conn.fetch(
-                        "SELECT t.id "
+                        "SELECT t.id, t.status, t.execution_lane, "
+                        "       t.runtime_generation, t.agent_id, "
+                        "       t.runtime_attach_token "
                         "FROM threads t "
                         "LEFT JOIN users u ON u.id = t.user_id "
                         "WHERE t.status = 'awaiting_user' "
@@ -48877,28 +55298,25 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
                 for row in rows:
                     thread_id = str(row["id"])
                     try:
-                        ok = (
-                            await workspace_suspension_service.suspend_thread_workspace(
-                                thread_id
-                            )
+                        result = await _end_thread_flow(
+                            thread_id,
+                            dict(row),
+                            permanent=False,
+                            force=False,
+                            expected_runtime_generation=str(row["runtime_generation"]),
+                            expected_agent_id=(
+                                str(row["agent_id"])
+                                if row["agent_id"] is not None
+                                else None
+                            ),
+                            expected_attach_token=(
+                                str(row["runtime_attach_token"])
+                                if row["runtime_attach_token"] is not None
+                                else None
+                            ),
+                            settle_status="suspended",
                         )
-                        if not ok:
-                            logger.info(
-                                "attention-sleep: suspend declined for thread %s "
-                                "(workspace not ready or already suspending)",
-                                thread_id,
-                            )
-                            continue
-                        async with postgres_db.acquire() as conn:
-                            updated = await conn.fetchval(
-                                "UPDATE threads "
-                                "SET status = 'suspended', "
-                                "    control_admission_agent_id = NULL "
-                                "WHERE id = $1 AND status = 'awaiting_user' "
-                                "RETURNING id",
-                                thread_id,
-                            )
-                        if updated:
+                        if result.get("status") == "suspended":
                             logger.info(
                                 "attention-sleep: thread %s suspended (was "
                                 "awaiting_user >%dm)",
@@ -48906,14 +55324,11 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
                                 ttl_minutes,
                             )
                         else:
-                            # Concurrent reattach won the race — workspace
-                            # is suspended but the restore path will pick it
-                            # up on the next reattach.
                             logger.info(
-                                "attention-sleep: status flipped during "
-                                "suspend for thread %s; restore path will "
-                                "handle wake",
+                                "attention-sleep: exact retirement declined "
+                                "for thread %s (%s)",
                                 thread_id,
+                                result.get("status"),
                             )
                     except Exception as e:
                         logger.warning(
@@ -54319,10 +60734,9 @@ async def codex_delete_credential(name: str, request: Request) -> dict[str, str]
 # System Settings — Main Cloud (Phase 4, Admin-only)
 # =============================================================================
 # These endpoints drive the cockpit admin "Cloud Storage" panel. GETs
-# return the current effective config with secrets stripped, PUT persists
-# a new config to `system_settings.main_cloud` and triggers a reload, and
-# POST /test does a dry-run connection check with a proposed config
-# without persisting.
+# return the current immutable instance snapshot with secrets stripped, PUT
+# remotely attests and CAS-activates a new instance, and POST /test does a
+# dry-run connection check without persisting.
 #
 # Secret handling: non-secret fields (URLs, usernames, quota) are stored
 # in the `value` JSONB column. Secret fields (passwords, client secrets)
@@ -54385,6 +60799,7 @@ def _current_effective_config() -> dict[str, Any]:
     backend_id = active.backend_id
     result: dict[str, Any] = {
         "backend_id": backend_id,
+        "backend_instance_id": active.backend_instance_id,
         "is_initialized": active.is_initialized,
         "is_configured": active.is_configured,
     }
@@ -54424,7 +60839,6 @@ def _env_var_provenance(env_name: str) -> dict[str, Any]:
     return {
         "env_var": env_name,
         "set": bool(val),
-        "length": len(val) if val else 0,
     }
 
 
@@ -54437,57 +60851,57 @@ async def get_main_cloud_settings(request: Request) -> dict[str, Any]:
     """
     await _require_admin(request)
     effective = _current_effective_config()
-    backend_id = effective["backend_id"]
 
     try:
-        row = await postgres_db.get_system_setting("main_cloud")
+        active_row = await postgres_db.get_active_main_cloud_backend_instance()
     except Exception:
-        row = None
-
+        active_row = None
+    authority = active_row.get("authority") if isinstance(active_row, dict) else None
     overlay_value: dict[str, Any] = {}
     overlay_updated_at: Optional[str] = None
-    overlay_updated_by: Optional[str] = None
     credentials_ref: Optional[str] = None
-    if row:
-        raw = row.get("value") or {}
-        if isinstance(raw, dict):
-            overlay_value = raw
-        credentials_ref = row.get("credentials_ref")
-        ua = row.get("updated_at")
-        overlay_updated_at = ua.isoformat() if ua is not None else None
-        overlay_updated_by = row.get("updated_by")
+    activation_revision = 0
+    secret_refs: dict[str, str] = {}
+    if authority is not None:
+        overlay_value = authority.routing
+        secret_refs = authority.secret_refs
+        overlay_value["__secret_fields__"] = sorted(secret_refs)
+        distinct_refs = set(secret_refs.values())
+        if len(distinct_refs) == 1:
+            credentials_ref = next(iter(distinct_refs))
+        activated_at = active_row.get("activated_at")
+        overlay_updated_at = (
+            activated_at.isoformat() if activated_at is not None else None
+        )
+        activation_revision = int(active_row.get("activation_revision") or 0)
+        effective.update(authority.routing)
+        effective["backend_instance_id"] = authority.backend_instance_id
 
-    # Secret provenance: the adapter-specific env var names.
-    secret_env_by_backend = {
-        "nextcloud": {
-            "admin_password": "NEXTCLOUD_ADMIN_PASSWORD",
-            "agent_password": "NEXTCLOUD_AGENT_PASSWORD",
-            "oidc_client_secret": "NEXTCLOUD_OIDC_CLIENT_SECRET",
-        },
-        "opencloud": {
-            "keycloak_client_secret": "OPENCLOUD_KEYCLOAK_CLIENT_SECRET",
-        },
-    }
     secret_provenance: dict[str, dict[str, Any]] = {}
-    for field, env_name in secret_env_by_backend.get(backend_id, {}).items():
-        # credentials_ref can override the env var name per-field.
-        effective_env = env_name
-        if (
-            credentials_ref
-            and credentials_ref.startswith("env:")
-            and field in overlay_value.get("__secret_fields__", [])
-        ):
-            effective_env = credentials_ref[4:]
-        secret_provenance[field] = _env_var_provenance(effective_env)
+    for field, reference in secret_refs.items():
+        secret_provenance[field] = _env_var_provenance(reference.removeprefix("env:"))
 
     return {
         "effective": effective,
+        "activation_revision": activation_revision,
+        "backend_instance": (
+            {
+                "id": authority.backend_instance_id,
+                "routing_sha256": authority.routing_sha256,
+                "installation_proof_sha256": (authority.installation_proof_sha256),
+                "secret_revision": authority.secret_revision,
+            }
+            if authority is not None
+            else None
+        ),
         "overlay": {
-            "present": bool(row),
+            # Compatibility name for the existing Cockpit form. This is the
+            # immutable active routing snapshot, not system_settings authority.
+            "present": authority is not None,
             "value": overlay_value,
             "credentials_ref": credentials_ref,
             "updated_at": overlay_updated_at,
-            "updated_by": overlay_updated_by,
+            "updated_by": None,
         },
         "secrets": secret_provenance,
         "allowed_backends": sorted(_MAIN_CLOUD_ALLOWED_BACKENDS),
@@ -54498,7 +60912,7 @@ async def get_main_cloud_settings(request: Request) -> dict[str, Any]:
 async def put_main_cloud_settings(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    """Persist a new main-cloud config and hot-reload the router.
+    """Attest and CAS-activate a new main-cloud backend instance.
 
     Admin-only. The request body is ``{"value": {...}, "credentials_ref": "env:..."}``:
 
@@ -54507,10 +60921,10 @@ async def put_main_cloud_settings(
       never persist secrets in the DB. Rotate via the secret store.
     * ``credentials_ref`` is an optional pointer (e.g. ``env:NEW_VAR``)
       that the loader resolves for secret fields at read time.
-    * The handler performs a synchronous reload on the local replica
-      after persisting, so the caller gets a success/failure response
-      reflecting the actual new backend state. Other replicas pick up
-      the change via the pg_notify LISTEN task.
+    * ``expected_activation_revision`` must match the GET snapshot.
+    * Routing edits create a new immutable instance UUID. Secret-reference
+      edits rotate only the exact same proven installation.
+    * Other replicas resolve the durable pointer via the pg_notify LISTEN task.
     """
     admin = await _require_admin(request)
 
@@ -54530,6 +60944,15 @@ async def put_main_cloud_settings(
     if credentials_ref is not None and not isinstance(credentials_ref, str):
         raise HTTPException(
             status_code=400, detail="`credentials_ref` must be a string or null"
+        )
+    expected_activation_revision = body.get("expected_activation_revision")
+    if (
+        type(expected_activation_revision) is not int
+        or expected_activation_revision < 0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="`expected_activation_revision` must be a non-negative integer",
         )
 
     clean_value = _sanitize_main_cloud_value(backend_id, value_in)
@@ -54569,35 +60992,47 @@ async def put_main_cloud_settings(
             ),
         )
 
+    actor = str(admin.get("id") or admin.get("email") or "admin")
     try:
-        stored = await postgres_db.upsert_system_setting(
-            "main_cloud",
-            clean_value,
-            credentials_ref=credentials_ref,
-            updated_by=str(admin.get("id") or admin.get("email") or "admin"),
+        activated = await activate_main_cloud_config(
+            postgres_db,
+            main_cloud_router,
+            db_overlay=probe_overlay,
+            expected_activation_revision=expected_activation_revision,
+            activated_by=actor,
         )
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"failed to persist main cloud setting: {e}"
-        ) from e
-
-    # Local synchronous reload so the PUT response reflects the new state.
-    reload_ok = await main_cloud_router.reload_from_db(stored)
-    if not reload_ok:
-        raise HTTPException(
             status_code=500,
             detail=(
-                "main cloud setting persisted but the new backend failed to "
-                "initialize — check orchestrator logs. The active backend is "
-                "unchanged; rollback the setting or fix the config and retry."
+                "main cloud backend attestation failed; no unverified adapter "
+                f"was activated: {e}"
+            ),
+        ) from e
+    if activated is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "main cloud activation authority changed; reload the current "
+                "settings and retry"
             ),
         )
 
     # Fan-out to other replicas via pg_notify. Best-effort.
-    await fire_reload(postgres_db)
+    authority = activated["authority"]
+    try:
+        await postgres_db.delete_system_setting("main_cloud")
+    except Exception:
+        logger.warning(
+            "Failed to remove inert legacy main_cloud setting after activation",
+            exc_info=True,
+        )
+    await fire_reload(postgres_db, authority.backend_instance_id)
     return {
         "status": "ok",
         "backend_id": backend_id,
+        "backend_instance_id": authority.backend_instance_id,
+        "activation_revision": activated["activation_revision"],
         "reloaded": True,
     }
 
@@ -54677,51 +61112,80 @@ async def test_main_cloud_settings(
 
 @app.post("/api/admin/system-settings/main_cloud/reload")
 async def reload_main_cloud_settings(request: Request) -> dict[str, Any]:
-    """Force a local reload from the current persisted overlay.
+    """Force a local re-attestation of the durable active instance.
 
     Admin-only. Useful when an operator has rotated a secret out-of-band
     (new Keycloak client secret in .env) and wants this orchestrator
-    replica to pick up the new env var without a restart. Does not
-    re-broadcast — other replicas keep their current state and can be
-    reloaded individually or via a rolling restart.
+    replica to rebuild its client after an out-of-band secret-value update.
+    The immutable secret reference and installation proof remain unchanged.
     """
     await _require_admin(request)
     try:
-        overlay = await postgres_db.get_system_setting("main_cloud")
+        ok = await reload_active_main_cloud_instance(
+            postgres_db,
+            main_cloud_router,
+            force_rebuild=True,
+        )
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"failed to read setting: {e}"
+            status_code=500, detail=f"active instance re-attestation failed: {e}"
         ) from e
-    ok = await main_cloud_router.reload_from_db(overlay)
-    if not ok:
+    if ok is not True:
         raise HTTPException(
-            status_code=500,
-            detail="reload failed — new backend did not initialize",
+            status_code=409,
+            detail="active instance changed during re-attestation; retry",
         )
-    return {"status": "ok", "backend_id": main_cloud_router.active.backend_id}
+    return {
+        "status": "ok",
+        "backend_id": main_cloud_router.active.backend_id,
+        "backend_instance_id": main_cloud_router.active_instance_id,
+    }
 
 
 @app.delete("/api/admin/system-settings/main_cloud")
 async def delete_main_cloud_settings(request: Request) -> dict[str, Any]:
-    """Remove the persisted overlay and reload from env vars only.
+    """Attest and activate the current env-described installation.
 
-    Admin-only. Semantically a "reset to defaults" button.
+    History is retained; reset never deletes an instance referenced by an
+    existing project, session, grant, or staged review.
     """
-    await _require_admin(request)
-    existed = await postgres_db.delete_system_setting("main_cloud")
-    if not existed:
-        return {"status": "noop", "existed": False}
-    ok = await main_cloud_router.reload_from_db(None)
-    if not ok:
+    admin = await _require_admin(request)
+    current = await postgres_db.get_active_main_cloud_backend_instance()
+    expected_revision = (
+        int(current.get("activation_revision") or 0) if isinstance(current, dict) else 0
+    )
+    try:
+        activated = await activate_main_cloud_config(
+            postgres_db,
+            main_cloud_router,
+            db_overlay=None,
+            expected_activation_revision=expected_revision,
+            activated_by=str(admin.get("id") or admin.get("email") or "admin"),
+        )
+    except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail="overlay cleared but env-var rebuild failed",
+            detail=f"env-described main cloud attestation failed: {e}",
+        ) from e
+    if activated is None:
+        raise HTTPException(
+            status_code=409,
+            detail="main cloud activation authority changed; reload and retry",
         )
-    await fire_reload(postgres_db)
+    try:
+        await postgres_db.delete_system_setting("main_cloud")
+    except Exception:
+        logger.warning(
+            "Failed to remove inert legacy main_cloud setting", exc_info=True
+        )
+    authority = activated["authority"]
+    await fire_reload(postgres_db, authority.backend_instance_id)
     return {
         "status": "ok",
-        "existed": True,
-        "backend_id": main_cloud_router.active.backend_id,
+        "existed": current is not None,
+        "backend_id": authority.backend_id,
+        "backend_instance_id": authority.backend_instance_id,
+        "activation_revision": activated["activation_revision"],
     }
 
 
@@ -55313,7 +61777,11 @@ async def _ensure_project_cloud_resources(
     project_id_str = str(project["id"])
     project_name = project["name"]
     group_name = f"project-{project_id_str}"
-    backend = main_cloud_router.for_project(project)
+    backend = (
+        main_cloud_router.for_project(project)
+        if project.get("main_cloud_backend")
+        else main_cloud_router.for_owner()
+    )
 
     handle_str = project.get("main_cloud_folder_handle")
     legacy_folder_id = project.get("nextcloud_folder_id")
@@ -55348,10 +61816,14 @@ async def _ensure_project_cloud_resources(
                     await postgres_db.update_project(
                         project_id_str,
                         main_cloud_backend=backend.backend_id,
+                        main_cloud_backend_instance_id=(backend.backend_instance_id),
                         main_cloud_folder_handle=folder_handle.to_db(),
                         nextcloud_folder_id=legacy_id,
                     )
                     project["main_cloud_backend"] = backend.backend_id
+                    project["main_cloud_backend_instance_id"] = (
+                        backend.backend_instance_id
+                    )
                     project["main_cloud_folder_handle"] = folder_handle.to_db()
                     project["nextcloud_folder_id"] = legacy_id
 

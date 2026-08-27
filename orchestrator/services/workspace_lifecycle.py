@@ -88,11 +88,18 @@ async def _create(
             "stateless_creation_generation": stateless_creation_generation,
             "allow_stateless_create": allow_stateless_create,
         }
-    ok = await provisioner.create_workspace(
-        owner,
-        **(ws_config or {}),
-        **strict_kwargs,
-    )
+    if owner.kind == "session" and stateless_creation_generation is None:
+        pinned_create = getattr(provisioner, "create_pinned_thread_workspace", None)
+        if not callable(pinned_create):
+            ok = False
+        else:
+            ok = await pinned_create(owner.id, **(ws_config or {}))
+    else:
+        ok = await provisioner.create_workspace(
+            owner,
+            **(ws_config or {}),
+            **strict_kwargs,
+        )
     return EnsureResult(
         EnsureOutcome.PENDING if ok else EnsureOutcome.FAILED,
         status="creating" if ok else "failed",
@@ -440,9 +447,15 @@ async def ensure_workspace(
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
         )
+    if owner.kind == "session" and s == "pending":
+        # Pinned K8s creates publish a durable multi-resource attempt before the
+        # first API effect.  An SSH/readiness timeout deliberately leaves that
+        # marker pending; re-enter the exact attempt instead of treating it as a
+        # self-progressing phase with no recovery owner.
+        return await _create(owner, provisioner, ws_config)
     # "Already progressing" set — keep in sync with the NOT IN clause in
     # PostgresDB.list_threads_needing_workspace (database/postgres.py).
-    if s in ("created", "creating", "restoring", "suspending", "pending"):
+    if s in ("created", "creating", "restoring", "suspending"):
         return EnsureResult(EnsureOutcome.PENDING, status=s)
     if s == "ready":
         # Legacy drift check. Required-runtime rows returned through the exact

@@ -18,6 +18,11 @@ import main
 from main import _build_protected_cloud_mount
 
 
+_BACKEND_INSTANCE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_THREAD_ID = "11111111-1111-4111-8111-111111111111"
+_RUNTIME_GENERATION = "22222222-2222-4222-8222-222222222222"
+
+
 def _project(
     *, project_id: str, is_default: bool = False, name: str = "Project"
 ) -> dict:
@@ -27,6 +32,7 @@ def _project(
         "name": name,
         "is_default": is_default,
         "main_cloud_backend": "opencloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
         "main_cloud_folder_handle": (
             "opencloud:drive-abc:" if not is_default else None
         ),
@@ -46,6 +52,7 @@ def _backend(*, initialized: bool = True, backend_id: str = "opencloud"):
     backend = MagicMock()
     backend.is_initialized = initialized
     backend.backend_id = backend_id
+    backend.backend_instance_id = _BACKEND_INSTANCE_ID
     backend.resolve_user_identity = AsyncMock(return_value="user-xyz")
     backend.get_user_home = AsyncMock(return_value=_user_home())
     backend.get_project_folder_webdav_url = MagicMock(
@@ -455,10 +462,12 @@ async def test_build_agent_cloud_mount_falls_back_to_session_folder(monkeypatch)
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     router = MagicMock()
-    router.for_backend.return_value = Backend()
+    router.for_thread.return_value = Backend()
+    router.for_backend_instance.return_value = Backend()
     thread = {
         "id": "thread-1",
         "main_cloud_backend": "nextcloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
         "main_cloud_session_handle": "sessions/thread-1",
     }
     rows = [
@@ -468,6 +477,7 @@ async def test_build_agent_cloud_mount_falls_back_to_session_folder(monkeypatch)
             "target_path": "",
             "source_ref": "p-default",
             "backend_id": "nextcloud",
+            "backend_instance_id": _BACKEND_INSTANCE_ID,
             "cloud_handle": (
                 '{"backend":"nextcloud","native_id":"home:alice",'
                 '"vendor_meta":{"kind":"user_home","username":"alice"}}'
@@ -514,7 +524,7 @@ async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     router = MagicMock()
-    router.for_backend.return_value = Backend()
+    router.for_backend_instance.return_value = Backend()
     rows = [
         {
             "id": "mount-home",
@@ -522,6 +532,7 @@ async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
             "target_path": "",
             "source_ref": "p-default",
             "backend_id": "nextcloud",
+            "backend_instance_id": _BACKEND_INSTANCE_ID,
             "cloud_handle": (
                 '{"backend":"nextcloud","native_id":"home:alice",'
                 '"vendor_meta":{"kind":"user_home","username":"alice"}}'
@@ -572,10 +583,11 @@ async def test_build_agent_cloud_mount_vm_runtime_is_readonly_and_public(monkeyp
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     router = MagicMock()
-    router.for_backend.return_value = Backend()
+    router.for_thread.return_value = Backend()
     thread = {
         "id": "t1",
         "main_cloud_backend": "opencloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
         "main_cloud_session_handle": "sessions/t1",
     }
 
@@ -624,10 +636,11 @@ async def test_build_agent_cloud_mount_pod_runtime_is_readwrite_and_internal(
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
     router = MagicMock()
-    router.for_backend.return_value = Backend()
+    router.for_thread.return_value = Backend()
     thread = {
         "id": "t1",
         "main_cloud_backend": "opencloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
         "main_cloud_session_handle": "sessions/t1",
     }
 
@@ -671,10 +684,11 @@ async def test_build_agent_cloud_mount_uses_container_runtime_by_default(monkeyp
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
     router = MagicMock()
-    router.for_backend.return_value = Backend()
+    router.for_thread.return_value = Backend()
     thread = {
         "id": "thread-1",
         "main_cloud_backend": "nextcloud",
+        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
         "main_cloud_session_handle": "sessions/thread-1",
     }
 
@@ -981,6 +995,7 @@ _ACTIVE_NC_ROW = {
     "webdav_url": "https://nc.internal/remote.php/dav/files/srw-reader-abc/Proj/",
     "auth_kind": "basic",
     "status": "active",
+    "runtime_generation": _RUNTIME_GENERATION,
 }
 
 # A live thread_mount row: if the protected branch ever fell through to the
@@ -1013,7 +1028,12 @@ async def test_build_agent_cloud_mount_protected_marker_flag_off_returns_none(
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
     with patch("main._is_protected_cloud_mode_enabled", return_value=False):
         payload = await _build_agent_cloud_mount(
-            {"id": "thread-1"},
+            {
+                "id": _THREAD_ID,
+                "status": "active",
+                "runtime_generation": _RUNTIME_GENERATION,
+                "runtime_retirement_token": None,
+            },
             mount_rows=_LIVE_MOUNT_ROWS,
             metadata={
                 "protected_cloud": True,
@@ -1062,7 +1082,12 @@ async def test_build_agent_cloud_mount_protected_marker_active_row_returns_paylo
         ),
     ):
         payload = await _build_agent_cloud_mount(
-            {"id": "thread-1"},
+            {
+                "id": _THREAD_ID,
+                "status": "active",
+                "runtime_generation": _RUNTIME_GENERATION,
+                "runtime_retirement_token": None,
+            },
             mount_rows=[],
             metadata={
                 "protected_cloud": True,
@@ -1094,7 +1119,7 @@ async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
     # Defensive: no in-flight engage task registered for this thread_id (a
     # leaked registration from another test would take the await-task branch
     # instead of the poll branch this test targets).
-    main._protected_engage_tasks.pop("thread-1", None)
+    main._protected_engage_tasks.pop((_THREAD_ID, _RUNTIME_GENERATION), None)
     with (
         patch("main._is_protected_cloud_mode_enabled", return_value=True),
         patch(
@@ -1104,7 +1129,12 @@ async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
         patch("main.asyncio.sleep", new=AsyncMock()) as sleep,
     ):
         payload = await _build_agent_cloud_mount(
-            {"id": "thread-1"},
+            {
+                "id": _THREAD_ID,
+                "status": "active",
+                "runtime_generation": _RUNTIME_GENERATION,
+                "runtime_retirement_token": None,
+            },
             mount_rows=[],
             metadata={
                 "protected_cloud": True,

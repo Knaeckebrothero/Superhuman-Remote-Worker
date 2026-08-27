@@ -492,6 +492,41 @@ def _make_provisioner_with_k8s():
     mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_ctx.__aexit__ = AsyncMock(return_value=False)
     p._db.acquire.return_value = mock_ctx
+    mock_conn.execute.return_value = "UPDATE 1"
+    thread_id = "11111111-1111-4111-8111-111111111111"
+    generation = "22222222-2222-4222-8222-222222222222"
+    attempt_id = "33333333-3333-4333-8333-333333333333"
+    claim_id = "44444444-4444-4444-8444-444444444444"
+    p._db.get_thread.return_value = {
+        "id": thread_id,
+        "status": "created",
+        "runtime_generation": generation,
+        "runtime_retirement_token": None,
+    }
+    p._db.reserve_pinned_agent_pod_provision_intent.return_value = {
+        "attempt_id": attempt_id,
+        "thread_id": thread_id,
+        "runtime_generation": generation,
+        "provisioner": "persistent",
+        "pod_name": "persistent-thread-abc",
+        "status": "planned",
+        "pod_uid": None,
+        "workspace_claim": {
+            "claim_id": claim_id,
+            "thread_id": thread_id,
+            "created_runtime_generation": generation,
+            "create_attempt": attempt_id,
+            "provisioner": "persistent",
+            "pvc_name": "pvc-persistent-thread-abc",
+            "status": "planned",
+            "pvc_uid": None,
+        },
+    }
+    p._db.publish_pinned_agent_workspace_claim.return_value = True
+    p._db.publish_pinned_agent_pod_provision_intent.return_value = True
+    created_claim = MagicMock()
+    created_claim.metadata.uid = "pvc-uid-created"
+    p._core_api.create_namespaced_persistent_volume_claim.return_value = created_claim
     return p, mock_conn
 
 
@@ -546,6 +581,8 @@ class TestCreateAgentPodK8s:
         incumbent.metadata.labels = {
             "srw/component": "persistent-agent",
             "srw/thread-id": "thread-abc",
+            "srw.io/runtime-generation": "22222222-2222-4222-8222-222222222222",
+            "srw.io/provision-attempt": "33333333-3333-4333-8333-333333333333",
         }
         p._core_api.read_namespaced_pod.side_effect = [not_found, incumbent]
 
@@ -560,6 +597,40 @@ class TestCreateAgentPodK8s:
 
         assert result.status == PersistentPodCreateStatus.ALREADY_CURRENT
         assert result.pod_uid == "existing-uid"
+
+    @pytest.mark.asyncio
+    async def test_retry_adopts_published_attempt_without_new_create(self):
+        p, _ = _make_provisioner_with_k8s()
+        intent = p._db.reserve_pinned_agent_pod_provision_intent.return_value
+        intent["status"] = "published"
+        intent["pod_uid"] = "existing-uid"
+        intent["workspace_claim"]["status"] = "ready"
+        intent["workspace_claim"]["pvc_uid"] = "existing-pvc-uid"
+        incumbent = MagicMock()
+        incumbent.metadata.uid = "existing-uid"
+        incumbent.metadata.deletion_timestamp = None
+        incumbent.metadata.labels = {
+            "srw/component": "persistent-agent",
+            "srw/thread-id": "thread-abc",
+            "srw.io/runtime-generation": intent["runtime_generation"],
+            "srw.io/provision-attempt": str(intent["attempt_id"]),
+        }
+        p._core_api.read_namespaced_pod.return_value = incumbent
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch(
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
+        ):
+            result = await p.create_agent_pod("thread-abc")
+
+        assert result.status == PersistentPodCreateStatus.ALREADY_CURRENT
+        assert result.pod_uid == "existing-uid"
+        p._core_api.create_namespaced_pod.assert_not_called()
+        p._core_api.create_namespaced_persistent_volume_claim.assert_not_called()
+        p._db.publish_pinned_agent_pod_provision_intent.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_terminating_409_is_not_success(self):
@@ -607,6 +678,62 @@ class TestCreateAgentPodK8s:
 
         assert result.status == PersistentPodCreateStatus.FAILED
         assert result.failure_class == "Exception"
+
+    @pytest.mark.asyncio
+    async def test_pvc_timeout_recovery_and_fence_use_exact_persistent_labels(self):
+        p, _ = _make_provisioner_with_k8s()
+        thread_id = "11111111-1111-4111-8111-111111111111"
+        generation = "22222222-2222-4222-8222-222222222222"
+        claim_id = "44444444-4444-4444-8444-444444444444"
+        attempt_id = "33333333-3333-4333-8333-333333333333"
+        pvc_name = "pvc-persistent-11111111-111"
+        timeout = TimeoutError("accepted response lost")
+        p._core_api.create_namespaced_persistent_volume_claim.side_effect = timeout
+        observed = MagicMock()
+        observed.metadata.uid = "persistent-pvc-uid"
+        observed.metadata.labels = {
+            "srw.io/thread-id": thread_id,
+            "srw.io/runtime-generation": generation,
+            "srw.io/workspace-claim": claim_id,
+            "srw.io/provision-attempt": attempt_id,
+            "srw.io/claim-provisioner": "persistent",
+        }
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = observed
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch(
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
+        ):
+            assert (
+                await p.ensure_agent_workspace_claim(
+                    pvc_name,
+                    expected_thread_id=thread_id,
+                    expected_runtime_generation=generation,
+                    expected_claim_id=claim_id,
+                    expected_create_attempt=attempt_id,
+                )
+                == "persistent-pvc-uid"
+            )
+
+        observed.metadata.labels["srw.io/runtime-generation"] = generation
+        observed.metadata.labels["srw.io/workspace-claim-fence"] = "true"
+        p._core_api.create_namespaced_persistent_volume_claim.side_effect = type(
+            "ApiErr", (Exception,), {"status": 409}
+        )()
+        with patch(
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
+        ):
+            assert await p.fence_agent_workspace_claim(
+                pvc_name,
+                expected_thread_id=thread_id,
+                expected_runtime_generation=generation,
+                expected_claim_id=claim_id,
+                expected_create_attempt=attempt_id,
+            ) == {"state": "exact_fence", "pvc_uid": "persistent-pvc-uid"}
 
 
 class TestDeleteAgentPodK8s:

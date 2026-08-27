@@ -441,6 +441,7 @@ class RemoteBackend(WorkspaceBackend):
         expected_host_key_fingerprint: Optional[str] = None,
         workspace_owner_kind: Optional[str] = None,
         workspace_owner_id: Optional[str] = None,
+        workspace_tier: Optional[str] = None,
     ):
         if paramiko is None:
             raise ImportError(
@@ -515,6 +516,13 @@ class RemoteBackend(WorkspaceBackend):
         self._expected_host_key_fingerprint = _validated_expected_host_key_fingerprint(
             expected_host_key_fingerprint
         )
+        if workspace_tier is not None and workspace_tier not in {
+            "sandbox",
+            "vm",
+            "remote",
+        }:
+            raise ValueError("workspace tier must be sandbox, vm, or remote")
+        self._workspace_tier = workspace_tier
 
         if blocked_commands is None:
             self._blocked_commands = DEFAULT_BLOCKED_COMMANDS
@@ -766,10 +774,17 @@ class RemoteBackend(WorkspaceBackend):
                 "Stateless shell process generation is unavailable"
             )
         return (
-            f"export {_WORKSPACE_PROCESS_TAG_ENV}="
-            f"{shlex.quote(self._workspace_process_tag())} "
+            self._workspace_process_env_export() + " "
             f"{_SHELL_PROCESS_TAG_ENV}="
             f"{shlex.quote(self._shell_process_tag(self._shell_generation))}"
+        )
+
+    def _workspace_process_env_export(self) -> str:
+        """Tag every descendant of this exact physical session workspace."""
+
+        return (
+            f"export {_WORKSPACE_PROCESS_TAG_ENV}="
+            f"{shlex.quote(self._workspace_process_tag())}"
         )
 
     def _stateless_process_env_export_for_loaded_generation(self) -> str:
@@ -854,8 +869,10 @@ terminate = sys.argv[3] == "terminate"
 
 ancestors = set()
 pid = os.getpid()
-while pid > 1 and pid not in ancestors:
+while pid >= 1 and pid not in ancestors:
     ancestors.add(pid)
+    if pid == 1:
+        break
     try:
         stat = open(f"/proc/{{pid}}/stat", "rb").read()
         pid = int(stat.rsplit(b") ", 1)[1].split(None, 2)[1])
@@ -927,6 +944,114 @@ __SRW_PROCESS_ZERO_PY__
             tag_argument=shlex.quote(self._workspace_process_tag()),
             terminate=terminate,
         )
+
+    def _dedicated_workspace_uid_process_zero_shell(self, *, terminate: bool) -> str:
+        """Kill/verify every process owned by the dedicated workspace user.
+
+        Protected sandbox workspaces are process-dedicated and sudo is
+        unavailable.  An environment tag is useful diagnostics, but it is not
+        an authority boundary: ``env -u ... setsid`` can deliberately shed it.
+        The kernel UID is the non-bypassable boundary for this workspace Pod.
+        Exclude only the exact SSH cleanup ancestry which must remain alive to
+        report the proof, loop until the UID set is stably empty, and fail
+        closed if any same-UID process cannot be inspected.
+        """
+
+        mode = "terminate" if terminate else "verify"
+        return f"""
+python3 - {mode} <<'__SRW_WORKSPACE_UID_ZERO_PY__'
+import os
+import signal
+import sys
+import time
+
+terminate = sys.argv[1] == "terminate"
+workspace_uid = os.geteuid()
+
+ancestors = set()
+pid = os.getpid()
+while pid >= 1 and pid not in ancestors:
+    ancestors.add(pid)
+    if pid == 1:
+        break
+    try:
+        stat = open(f"/proc/{{pid}}/stat", "rb").read()
+        pid = int(stat.rsplit(b") ", 1)[1].split(None, 2)[1])
+    except (OSError, ValueError, IndexError):
+        break
+
+def process_identity(name):
+    # procfs may expose a PID directory while its status file is transiently
+    # empty/truncated during reap. Re-inspect the exact PID for a bounded
+    # interval; persistent unreadability remains a fail-closed ambiguity.
+    for attempt in range(5):
+        try:
+            status = open(f"/proc/{{name}}/status", "rt").read().splitlines()
+            uid_line = next(line for line in status if line.startswith("Uid:"))
+            real_uid = int(uid_line.split()[1])
+            state_line = next(line for line in status if line.startswith("State:"))
+            return real_uid, state_line.split()[1]
+        except FileNotFoundError:
+            return None
+        except (PermissionError, OSError, StopIteration, ValueError, IndexError):
+            if not os.path.exists(f"/proc/{{name}}"):
+                return None
+            if attempt < 4:
+                time.sleep(0.005)
+                continue
+            print(
+                f"workspace process-zero could not inspect PID {{name}}",
+                file=sys.stderr,
+            )
+            raise SystemExit(86)
+
+def same_uid_processes():
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        candidate = int(name)
+        if candidate in ancestors:
+            continue
+        identity = process_identity(name)
+        if identity is None:
+            continue
+        real_uid, state = identity
+        # A zombie has already lost every userspace execution capability and
+        # cannot mutate the workspace.  Its parent/reaper may need the exact
+        # cleanup SSH ancestry to stay alive long enough to collect it, so a
+        # zombie must not make the process-zero proof self-deadlock.
+        if real_uid == workspace_uid and state != "Z":
+            found.append(candidate)
+    return found
+
+if terminate:
+    for sig, budget in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
+        for candidate in same_uid_processes():
+            try:
+                os.kill(candidate, sig)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            if not same_uid_processes():
+                break
+            time.sleep(0.05)
+
+# Require two stable empty observations so a forking writer cannot cross the
+# single instant at which its parent disappears.
+for _ in range(2):
+    residual = same_uid_processes()
+    if residual:
+        print(
+            "workspace process-zero residual PIDs: "
+            + ",".join(str(candidate) for candidate in residual),
+            file=sys.stderr,
+        )
+        raise SystemExit(85)
+    time.sleep(0.05)
+__SRW_WORKSPACE_UID_ZERO_PY__
+"""
 
     def _stateless_shell_process_zero_shell(self, *, terminate: bool) -> str:
         """Kill/verify only this tmux owner's exact shell generation."""
@@ -3104,6 +3229,31 @@ __SRW_PROCESS_ZERO_PY__
         session = self._tmux_target()
         raw_session_name = shlex.quote(self._session_name)
         default_window = self._tmux_target("default")
+        creation_env = ""
+        identity_options = ""
+        if self.workspace_incarnation_fenced:
+            # Install at pane exec time, not as a later setup keystroke: a
+            # .bashrc hook can fork a detached writer before the first prompt.
+            assert self._workspace_generation is not None
+            assert self._runtime_incarnation is not None
+            self._shell_generation = uuid.uuid4().hex
+            shell_process_tag = self._shell_process_tag(self._shell_generation)
+            creation_env = (
+                f"-e {_WORKSPACE_PROCESS_TAG_ENV}="
+                f"{shlex.quote(self._workspace_process_tag())} "
+                f"-e {_SHELL_PROCESS_TAG_ENV}="
+                f"{shlex.quote(shell_process_tag)} "
+            )
+            identity_options = (
+                f"\\; set-option -t {session} {_TMUX_WORKSPACE_GENERATION_OPTION} "
+                f"{shlex.quote(self._workspace_generation)} "
+                f"\\; set-option -t {session} {_TMUX_RUNTIME_INCARNATION_OPTION} "
+                f"{shlex.quote(self._runtime_incarnation)} "
+                f"\\; set-option -t {session} {_TMUX_GENERATION_OPTION} "
+                f"{shlex.quote(self._shell_generation)} "
+                f"\\; set-option -t {session} {_TMUX_PROCESS_TAG_OPTION} "
+                f"{shlex.quote(shell_process_tag)} "
+            )
         inner = (
             self._pinned_tmux_fence_shell()
             # Keep the established pinned-lane contract: a fresh backend owns
@@ -3111,9 +3261,10 @@ __SRW_PROCESS_ZERO_PY__
             # token + durable generation fence above. Killing first also makes
             # a retry converge after interruption at any creation boundary.
             + f"tmux kill-session -t {session} 2>/dev/null || true\n"
-            + f"tmux new-session -d -s {raw_session_name} "
+            + f"tmux new-session -d -s {raw_session_name} {creation_env}"
             "-x 200 -y 30 -n default "
-            f"\\; set-option -t {session} {_TMUX_SETUP_OPTION} "
+            + identity_options
+            + f"\\; set-option -t {session} {_TMUX_SETUP_OPTION} "
             f"{_TMUX_SETUP_PENDING} "
             f"\\; set-option -w -t {default_window} "
             f"{_TMUX_WINDOW_SETUP_OPTION} {_TMUX_SETUP_PENDING} "
@@ -3513,11 +3664,9 @@ __SRW_PROCESS_ZERO_PY__
                 # output. Only the creator runs it: reattach must preserve cwd,
                 # exported variables and foreground/background processes.
                 setup = NONINTERACTIVE_ENV_EXPORT
-                if (
-                    self._shell_owner_token is not None
-                    and self.workspace_incarnation_fenced
-                ):
-                    setup = f"{self._stateless_process_env_export()}; {setup}"
+                if self.workspace_incarnation_fenced:
+                    process_env = self._stateless_process_env_export()
+                    setup = f"{process_env}; {setup}"
                 if self._sandbox_cwd:
                     setup += f"; cd {self._sandbox_cwd}"
                 self._send_and_wait("default", setup)
@@ -4223,11 +4372,9 @@ __SRW_PROCESS_ZERO_PY__
             # Non-interactive env + working directory (shell/process tabs only).
             if tab_type in ("shell", "process"):
                 setup = NONINTERACTIVE_ENV_EXPORT
-                if (
-                    self._shell_owner_token is not None
-                    and self.workspace_incarnation_fenced
-                ):
-                    setup = f"{self._stateless_process_env_export()}; {setup}"
+                if self.workspace_incarnation_fenced:
+                    process_env = self._stateless_process_env_export()
+                    setup = f"{process_env}; {setup}"
                 if self._sandbox_cwd:
                     setup += f"; cd {self._sandbox_cwd}"
                 self._send_and_wait(name, setup)
@@ -4486,23 +4633,62 @@ __SRW_PROCESS_ZERO_PY__
                     f"tmux set-option -t {self._tmux_target()} "
                     f"{_TMUX_OWNER_TOKEN_OPTION} {shlex.quote(token)}\n"
                 )
+            strict_workspace_process_fence = bool(
+                getattr(self, "_strict_terminal_cleanup", False)
+                and self.workspace_incarnation_fenced
+                and self._shell_owner_token is None
+                and not self._shared_workspace
+                and self._sudo_action == "freeze"
+                and self._workspace_owner_kind == "session"
+                and bool(self._workspace_owner_id)
+                and bool(self._expected_host_key_fingerprint)
+                and self._workspace_tier == "sandbox"
+            )
+            process_environment_check = ""
+            process_zero = ""
+            if strict_workspace_process_fence:
+                expected_workspace_env = shlex.quote(
+                    _WORKSPACE_PROCESS_TAG_ENV + "=" + self._workspace_process_tag()
+                )
+                process_environment_check = (
+                    "_srw_workspace_env=$(tmux show-environment -t "
+                    f"{self._tmux_target()} {_WORKSPACE_PROCESS_TAG_ENV} "
+                    "2>/dev/null || true)\n"
+                    f'[ "$_srw_workspace_env" = {expected_workspace_env} ] '
+                    "|| exit 81\n"
+                )
+                process_zero = self._dedicated_workspace_uid_process_zero_shell(
+                    terminate=True
+                )
             inner = (
                 self._pinned_tmux_fence_shell()
-                + f"tmux has-session -t {self._tmux_target()} 2>/dev/null || exit 0\n"
-                "_srw_id=$(tmux display-message -p "
+                + f"if tmux has-session -t {self._tmux_target()} 2>/dev/null; then\n"
+                "  _srw_id=$(tmux display-message -p "
                 f"-t {self._tmux_target()} '#{{{_TMUX_OWNER_ID_OPTION}}}')\n"
-                f'[ -z "$_srw_id" ] || '
+                f'  [ -z "$_srw_id" ] || '
                 f'[ "$_srw_id" = {shlex.quote(expected_owner)} ] || exit 73\n'
-                f"{token_check}tmux kill-session -t {self._tmux_target()}"
+                + "".join(
+                    f"  {line}\n" for line in process_environment_check.splitlines()
+                )
+                + "".join(f"  {line}\n" for line in token_check.splitlines())
+                + f"  tmux kill-session -t {self._tmux_target()} || exit 77\n"
+                + "fi\n"
+                + process_zero
             )
             self._tmux_exec_checked(
                 self._tmux_lock_command(inner),
-                operation="kill session",
+                operation=(
+                    "retire protected shell and workspace processes"
+                    if strict_workspace_process_fence
+                    else "kill session"
+                ),
                 allow_shell_retired=True,
             )
+            if strict_workspace_process_fence:
+                self._terminal_local_quiescence_protocol = "workspace_process_zero_v1"
         except Exception as e:
             logger.warning(f"Error cleaning up remote tmux session: {e}")
-            if (
+            if getattr(self, "_strict_terminal_cleanup", False) or (
                 self._shell_owner_token is not None
                 and self.workspace_incarnation_fenced
             ):
@@ -4515,6 +4701,53 @@ __SRW_PROCESS_ZERO_PY__
         self._tabs.clear()
         self._shell_initialized = False
         self._shell_generation = None
+
+    def shell_cleanup_strict(self) -> None:
+        """Destroy a pinned shell and require a remote acknowledgement."""
+
+        self._strict_terminal_cleanup = True
+        try:
+            self.shell_cleanup()
+        finally:
+            self._strict_terminal_cleanup = False
+
+    def protected_workspace_zero_cleanup_strict(self) -> str:
+        """Retire and prove zero writers for one exact protected sandbox.
+
+        This narrow primitive is reusable by both the live agent and an
+        orchestrator reconciler after the agent Pod is proven absent. Callers
+        must construct this backend from the captured workspace endpoint,
+        generation, runtime incarnation and pinned SSH host identity. It
+        refuses shared/stateless/VM-shaped authority and returns only the
+        finite proof protocol accepted by retirement settlement.
+        """
+
+        if (
+            self._shell_owner_token is not None
+            or self._shared_workspace
+            or self._sudo_action != "freeze"
+            or not self.workspace_incarnation_fenced
+            or self._workspace_owner_kind != "session"
+            or not self._workspace_owner_id
+            or not self._expected_host_key_fingerprint
+            or self._workspace_tier != "sandbox"
+        ):
+            raise WorkspaceUnavailableError(
+                "Protected workspace zero cleanup lacks exact sandbox authority"
+            )
+        self.shell_cleanup_strict()
+        protocol = self.terminal_local_quiescence_protocol
+        if protocol != "workspace_process_zero_v1":
+            raise WorkspaceUnavailableError(
+                "Protected workspace zero cleanup was not acknowledged"
+            )
+        return protocol
+
+    @property
+    def terminal_local_quiescence_protocol(self) -> str | None:
+        """Return the exact proof minted by strict protected cleanup."""
+
+        return getattr(self, "_terminal_local_quiescence_protocol", None)
 
     def shell_reset_after_timeout(self) -> None:
         """Stop a timed-out command before the SSH transport is recycled.

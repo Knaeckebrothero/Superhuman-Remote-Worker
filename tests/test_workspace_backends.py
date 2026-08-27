@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import re
+import shutil
 import socket
 import stat as stat_module
 import subprocess
@@ -2138,6 +2139,187 @@ class TestRemoteBackendTmuxFences:
         assert " -e SRW_WORKSPACE_PROCESS_TAG=" in command[new_session:first_option]
         assert " -e SRW_SHELL_PROCESS_TAG=" in command[new_session:first_option]
 
+    @staticmethod
+    def _pinned_sandbox_backend() -> RemoteBackend:
+        return RemoteBackend(
+            host="workspace.test",
+            workspace_path="/home/agent-host/workspace",
+            job_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            workspace_generation=_WORKSPACE_GENERATION,
+            runtime_incarnation=_RUNTIME_INCARNATION,
+            expected_host_key_fingerprint="SHA256:" + "A" * 43,
+            workspace_tier="sandbox",
+            sudo_action="freeze",
+        )
+
+    def test_pinned_sandbox_zero_proof_is_kernel_uid_scoped_not_tag_scoped(self):
+        backend = self._pinned_sandbox_backend()
+
+        command = backend._dedicated_workspace_uid_process_zero_shell(terminate=True)
+
+        assert "/proc" in command
+        assert "os.geteuid()" in command
+        assert 'open(f"/proc/{pid}/stat"' in command
+        assert "SIGTERM" in command and "SIGKILL" in command
+        assert "SRW_WORKSPACE_PROCESS_TAG" not in command
+        assert "SRW_SHELL_PROCESS_TAG" not in command
+        assert "raise SystemExit(86)" in command
+
+    def test_pinned_sandbox_uid_zero_kills_tag_cleared_detached_and_forking_writers(
+        self, tmp_path
+    ):
+        """Execute the proof in a disposable PID/user namespace.
+
+        The parent test process is invisible in the namespace, so the cleanup
+        can truthfully scan the whole workspace UID without risking unrelated
+        developer/CI processes. One writer clears both cooperative tags and
+        starts a new session; another forks while the scan begins.
+        """
+
+        unshare = shutil.which("unshare")
+        if unshare is None:
+            pytest.skip("unshare is unavailable")
+        backend = self._pinned_sandbox_backend()
+        cleanup = backend._dedicated_workspace_uid_process_zero_shell(terminate=True)
+        escaped_write = tmp_path / "escaped-after-proof"
+        harness = r"""
+import os
+import subprocess
+import sys
+import threading
+import time
+
+sentinel = os.environ["SRW_UID_ZERO_SENTINEL"]
+writer = subprocess.Popen(
+    [
+        "setsid", "env", "-u", "SRW_WORKSPACE_PROCESS_TAG", "-u",
+        "SRW_SHELL_PROCESS_TAG", "sh", "-c",
+        'trap "" TERM; sleep 8; printf escaped > "$SRW_UID_ZERO_SENTINEL"; '
+        'while :; do sleep 1; done',
+    ],
+    env={**os.environ, "SRW_UID_ZERO_SENTINEL": sentinel},
+)
+forker_code = r'''
+import os, signal, time
+running = True
+children = set()
+def stop(_sig, _frame):
+    global running
+    running = False
+def reap(_sig=None, _frame=None):
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid <= 0:
+            return
+        children.discard(pid)
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGCHLD, reap)
+while running:
+    pid = os.fork()
+    if pid == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        time.sleep(0.15)
+        os._exit(0)
+    children.add(pid)
+    time.sleep(0.005)
+for pid in list(children):
+    try: os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError: pass
+deadline = time.monotonic() + 1
+while children and time.monotonic() < deadline:
+    reap()
+    time.sleep(0.01)
+'''
+forker = subprocess.Popen([sys.executable, "-c", forker_code])
+for process in (writer, forker):
+    threading.Thread(target=process.wait, daemon=True).start()
+time.sleep(0.1)
+completed = subprocess.run(
+    ["bash", "-c", os.environ["SRW_UID_ZERO_COMMAND"]],
+    text=True,
+    capture_output=True,
+    timeout=15,
+    check=False,
+)
+if completed.returncode:
+    print(completed.stderr, file=sys.stderr)
+    raise SystemExit(completed.returncode)
+for process in (writer, forker):
+    deadline = time.monotonic() + 2
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if process.poll() is None:
+        raise SystemExit(91)
+time.sleep(1.1)
+if os.path.exists(sentinel):
+    raise SystemExit(92)
+"""
+        completed = subprocess.run(
+            [
+                unshare,
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+                sys.executable,
+                "-c",
+                harness,
+            ],
+            env={
+                **os.environ,
+                "SRW_UID_ZERO_COMMAND": cleanup,
+                "SRW_UID_ZERO_SENTINEL": str(escaped_write),
+            },
+            text=True,
+            capture_output=True,
+            timeout=25,
+            check=False,
+        )
+        if completed.returncode != 0 and "Operation not permitted" in completed.stderr:
+            pytest.skip("unprivileged PID/user namespaces are unavailable")
+        assert completed.returncode == 0, completed.stderr
+        assert not escaped_write.exists()
+
+    def test_pinned_sandbox_strict_cleanup_mints_only_workspace_zero_proof(self):
+        backend = self._pinned_sandbox_backend()
+
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            assert backend.protected_workspace_zero_cleanup_strict() == (
+                "workspace_process_zero_v1"
+            )
+
+        command = execute.call_args.args[0]
+        assert "/proc" in command
+        assert "SRW_WORKSPACE_PROCESS_TAG" in command  # tmux ownership check
+        assert "os.geteuid()" in command  # tag-cleared descendants still covered
+        assert backend.terminal_local_quiescence_protocol == (
+            "workspace_process_zero_v1"
+        )
+
+    def test_vm_cannot_mint_sandbox_process_zero_proof(self):
+        backend = RemoteBackend(
+            host="workspace.test",
+            workspace_path="/home/agent-host/workspace",
+            job_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            workspace_generation=_WORKSPACE_GENERATION,
+            runtime_incarnation=_RUNTIME_INCARNATION,
+            expected_host_key_fingerprint="SHA256:" + "A" * 43,
+            workspace_tier="vm",
+            sudo_action="allow",
+        )
+
+        with (
+            patch.object(backend, "_tmux_exec_checked") as execute,
+            pytest.raises(WorkspaceUnavailableError, match="sandbox authority"),
+        ):
+            backend.protected_workspace_zero_cleanup_strict()
+        execute.assert_not_called()
+
     def test_worker_process_tag_uses_exact_job_workspace_owner(self):
         job_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         backend = RemoteBackend(
@@ -3746,6 +3928,22 @@ class TestRemoteBackendShellOperations:
         execute.assert_called_once()
         assert "tmux has-session" in execute.call_args.args[0]
         assert "kill-session" in execute.call_args.args[0]
+
+    def test_strict_pinned_shell_cleanup_propagates_lost_ack(self, remote_backend):
+        backend, _, _ = remote_backend
+
+        with patch.object(
+            backend,
+            "_tmux_exec_checked",
+            side_effect=RuntimeError("SSH response lost"),
+        ):
+            with pytest.raises(
+                WorkspaceUnavailableError,
+                match="terminal retirement was not acknowledged",
+            ):
+                backend.shell_cleanup_strict()
+
+        assert backend._strict_terminal_cleanup is False
 
     def test_timeout_reset_requires_exact_pinned_owner_before_kill(
         self, remote_backend

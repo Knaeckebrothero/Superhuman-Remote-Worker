@@ -1,10 +1,8 @@
-"""Postgres LISTEN-based reload coordinator for the main cloud backend.
+"""Postgres LISTEN-based reload coordinator for main-cloud activation.
 
-Phase 4 adds an admin settings UI that writes ``system_settings.main_cloud``
-via a REST endpoint. Every orchestrator replica must pick up the change
-without a pod restart, so we fire a Postgres ``NOTIFY`` on a well-known
-channel and each replica holds a long-running LISTEN task that rebuilds
-the active backend when a notification arrives.
+Every orchestrator replica must pick up the durable active-instance pointer
+without a pod restart, so activation emits ``NOTIFY`` on a well-known channel
+and each replica rebuilds the exact retained instance named by PostgreSQL.
 
 Design notes:
 
@@ -14,16 +12,10 @@ Design notes:
 * ``conn.add_listener`` registers a callback that fires from asyncpg's
   internal dispatch task. The callback is synchronous, so we enqueue the
   reload work onto the event loop via ``asyncio.create_task``.
-* If the connection drops (network blip, DB restart), the loop
-  reconnects with exponential backoff. Configuration changes that hit
-  a different replica during the reconnect window are caught by the
-  ``DEBOUNCE_SECONDS`` sweep at reconnect time — we always re-read the
-  overlay from the DB before swapping the backend, so missed NOTIFYs
-  only result in a stale replica for ``DEBOUNCE_SECONDS`` at worst.
-* Local (single-pod) installs don't strictly need NOTIFY — the PUT
-  handler calls ``main_cloud_router.reload_from_db`` synchronously
-  before returning. The LISTEN task is there for multi-replica K8s
-  deployments where one pod's PUT has to fan out to the others.
+* Every callback re-reads the pointer after adapter attestation, so a delayed
+  notification can never re-activate a superseded instance.
+* Local installs synchronously swap after the activation CAS; LISTEN is the
+  fan-out path for other replicas.
 """
 
 from __future__ import annotations
@@ -33,6 +25,7 @@ import logging
 from typing import Any, Awaitable, Callable, Optional
 
 from . import RELOAD_CHANNEL
+from .instance_registry import reload_active_main_cloud_instance
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +53,9 @@ async def run_listen_loop(
         The orchestrator's shared ``PostgresDB`` instance. Must already
         be connected.
     reload_callback:
-        An async callable invoked with no arguments each time a
-        notification arrives. Implementations re-read the overlay from
-        the DB and call ``MainCloudRouter.reload_from_db``.
+        An async callable invoked with no arguments each time a notification
+        arrives. Implementations re-read and attest the durable active
+        backend-instance pointer.
     shutdown_event:
         Cooperative shutdown flag. The loop exits cleanly when this is
         set and any in-flight notification finishes.
@@ -163,11 +156,8 @@ async def _sleep_or_shutdown(seconds: float, shutdown_event: asyncio.Event) -> N
 async def fire_reload(db: Any, payload: str = "") -> None:
     """Broadcast a config-change notification to every orchestrator replica.
 
-    Callers (the PUT handler) invoke this after persisting the new
-    ``system_settings.main_cloud`` row. The local replica also performs
-    a synchronous reload inside the PUT handler so the caller gets an
-    accurate success/failure response; this NOTIFY is the fan-out to
-    other replicas in a multi-pod deployment.
+    Callers invoke this after the active-instance CAS and local swap. This is
+    the fan-out to other replicas in a multi-pod deployment.
     """
     try:
         await db.notify_channel(RELOAD_CHANNEL, payload)
@@ -180,20 +170,19 @@ async def fire_reload(db: Any, payload: str = "") -> None:
 
 
 async def _reload_from_db_and_swap(db: Any, main_cloud_router: Any) -> Optional[bool]:
-    """Fetch the overlay from DB and reload the router.
+    """Fetch, attest, reread, and install the durable active instance.
 
     Factored out so ``run_listen_loop``'s callback and the PUT handler's
     synchronous reload share a single implementation. Returns:
         * True  — reload succeeded.
-        * False — reload attempted but the new backend failed to init.
-        * None  — DB unavailable or overlay missing; no change.
+        * False — the pointer changed during attestation; no stale swap.
+        * None  — no active instance exists or DB is unavailable.
     """
     try:
-        overlay = await db.get_system_setting("main_cloud")
+        return await reload_active_main_cloud_instance(db, main_cloud_router)
     except Exception as e:
         logger.error(
-            "Main cloud config reload: failed to read system_settings.main_cloud: %s",
+            "Main cloud instance reload failed: %s",
             e,
         )
         return None
-    return await main_cloud_router.reload_from_db(overlay)

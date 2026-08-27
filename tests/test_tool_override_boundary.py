@@ -651,6 +651,7 @@ class TestLiveSessionSanitiser:
 # to a validator-level test. These two classes drive the endpoints.
 
 SESSION_THREAD_ID = "11111111-2222-3333-4444-555555555555"
+SESSION_RUNTIME_GENERATION = "66666666-7777-4888-8999-aaaaaaaaaaaa"
 SESSION_USER_ID = str(uuid.uuid4())
 SESSION_DATASOURCE_ID = str(uuid.uuid4())
 
@@ -674,6 +675,14 @@ def session_create_env(monkeypatch):
     db = SimpleNamespace(
         get_user_settings=AsyncMock(return_value={}),
         create_thread=AsyncMock(return_value=SESSION_THREAD_ID),
+        get_thread=AsyncMock(
+            return_value={
+                "id": SESSION_THREAD_ID,
+                "status": "created",
+                "runtime_generation": SESSION_RUNTIME_GENERATION,
+                "runtime_retirement_token": None,
+            }
+        ),
         acquire=MagicMock(return_value=acquire_cm),
         merge_thread_workspace_context=AsyncMock(return_value=True),
         list_thread_mounts=AsyncMock(return_value=[]),
@@ -1208,11 +1217,14 @@ class TestPrepareBoundary:
             lambda: SimpleNamespace(
                 get_thread=AsyncMock(
                     return_value={
-                        "id": "t1",
+                        "id": SESSION_THREAD_ID,
                         "user_id": "u1",
                         "agent_id": None,
                         "config_name": "session_base",
                         "execution_lane": "pinned",
+                        "status": "created",
+                        "runtime_generation": SESSION_RUNTIME_GENERATION,
+                        "runtime_retirement_token": None,
                     }
                 )
             ),
@@ -1231,7 +1243,7 @@ class TestPrepareBoundary:
         client, do_prepare = prepare_env
 
         resp = client.post(
-            "/api/sessions/t1/prepare",
+            f"/api/sessions/{SESSION_THREAD_ID}/prepare",
             json={"config_override": {"tools": {"canvas": ["run_command"]}}},
         )
 
@@ -1243,7 +1255,7 @@ class TestPrepareBoundary:
         client, do_prepare = prepare_env
 
         resp = client.post(
-            "/api/sessions/t1/prepare",
+            f"/api/sessions/{SESSION_THREAD_ID}/prepare",
             json={"config_override": {"tools": {"canvas": True, "research": []}}},
         )
 
@@ -1258,7 +1270,12 @@ class TestPrepareBoundary:
         """The shipped cockpit posts `{}` — no behaviour change for it."""
         client, do_prepare = prepare_env
 
-        assert client.post("/api/sessions/t1/prepare", json={}).status_code == 202
+        assert (
+            client.post(
+                f"/api/sessions/{SESSION_THREAD_ID}/prepare", json={}
+            ).status_code
+            == 202
+        )
         assert do_prepare.call_args.kwargs["config_override"] is None
 
 

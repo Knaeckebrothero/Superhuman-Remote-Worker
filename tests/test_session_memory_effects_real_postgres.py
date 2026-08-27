@@ -59,7 +59,22 @@ async def _schema_applied(pg_dsn):
                 id uuid PRIMARY KEY,
                 execution_lane text NOT NULL DEFAULT 'pinned',
                 status text NOT NULL DEFAULT 'ended',
-                metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+                metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+                agent_id uuid,
+                control_admission_agent_id uuid,
+                runtime_attach_token uuid,
+                runtime_generation uuid NOT NULL DEFAULT gen_random_uuid(),
+                runtime_retirement_token uuid,
+                runtime_retirement_permanent boolean,
+                runtime_retirement_authorized_at timestamptz,
+                runtime_retirement_context jsonb,
+                runtime_retirement_local_quiescence jsonb,
+                runtime_retirement_external_cleanup jsonb,
+                runtime_authority_exposed boolean NOT NULL DEFAULT false
+            );
+            CREATE TABLE agents (
+                id uuid PRIMARY KEY,
+                thread_id uuid
             );
             CREATE TABLE run_queue (
                 unit_id uuid PRIMARY KEY,
@@ -73,6 +88,18 @@ async def _schema_applied(pg_dsn):
                 status text,
                 quarantine_reason text,
                 updated_at timestamptz
+            );
+            CREATE TABLE cloud_ro_mounts (
+                thread_id uuid,
+                status text
+            );
+            CREATE TABLE thread_agent_pod_provision_intents (
+                thread_id uuid,
+                status text
+            );
+            CREATE TABLE thread_agent_workspace_claims (
+                thread_id uuid,
+                status text
             );
             CREATE TABLE thread_turn_commits (thread_id uuid);
             CREATE TABLE thread_rewinds (thread_id uuid);
@@ -115,8 +142,10 @@ async def db(pool):
     async with pool.acquire() as connection:
         await connection.execute(
             "TRUNCATE completion_effects, job_completion_commands, "
-            "docker_workspace_leases, thread_turn_commits, thread_rewinds, "
-            "thread_messages, jobs, run_queue, threads"
+            "docker_workspace_leases, cloud_ro_mounts, "
+            "thread_agent_pod_provision_intents, "
+            "thread_agent_workspace_claims, thread_turn_commits, "
+            "thread_rewinds, thread_messages, jobs, run_queue, agents, threads"
         )
     database = PostgresDB.__new__(PostgresDB)
     database._pool = pool

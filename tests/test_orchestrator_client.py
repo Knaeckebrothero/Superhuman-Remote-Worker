@@ -16,6 +16,11 @@ from src.api.orchestrator_client import (
 )
 
 
+RUNTIME_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+RUNTIME_ATTACH_TOKEN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+RUNTIME_RETIREMENT_TOKEN = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+
+
 class TestGetAgentIp:
     """Tests for get_agent_ip function."""
 
@@ -83,6 +88,105 @@ class TestOrchestratorClient:
         await client.connect()
         await client.close()
         assert client._client is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome", "expected"),
+        [
+            ("released", True),
+            ("already_detached", True),
+            ("unsafe", False),
+            ("unchanged", False),
+        ],
+    )
+    async def test_release_thread_agent_requires_confirmed_outcome(
+        self, client, outcome, expected
+    ):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": outcome}
+        client.agent_id = "agent-a"
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+        client._client = MagicMock()
+        client._client.post = AsyncMock(return_value=response)
+
+        assert (
+            await client.release_thread_agent(
+                "thread-a",
+                agent_pod_uid="pod-uid-a",
+                local_runtime_quiesced=True,
+                local_quiescence_protocol="agent_runtime_zero_v1",
+            )
+            is expected
+        )
+        assert client._client.post.await_args.kwargs["json"] == {
+            "agent_id": "agent-a",
+            "session_runtime_generation": RUNTIME_GENERATION,
+            "session_runtime_attach_token": RUNTIME_ATTACH_TOKEN,
+            "agent_pod_uid": "pod-uid-a",
+            "local_runtime_quiesced": True,
+            "local_quiescence_protocol": "agent_runtime_zero_v1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_release_thread_agent_rejects_malformed_success_body(self, client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": True}
+        client.agent_id = "agent-a"
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+        client._client = MagicMock()
+        client._client.post = AsyncMock(return_value=response)
+
+        assert (
+            await client.release_thread_agent(
+                "thread-a",
+                agent_pod_uid="pod-uid-a",
+                local_runtime_quiesced=True,
+                local_quiescence_protocol="agent_runtime_zero_v1",
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_release_thread_agent_requires_quiescence_before_http(self, client):
+        client.agent_id = "agent-a"
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+        client._client = MagicMock()
+        client._client.post = AsyncMock()
+
+        assert await client.release_thread_agent("thread-a") is False
+        client._client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_release_thread_agent_accepts_exact_pre_setup_proof(self, client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": "already_detached"}
+        client.agent_id = "agent-a"
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+        client._client = MagicMock()
+        client._client.post = AsyncMock(return_value=response)
+
+        assert await client.release_thread_agent(
+            "thread-a",
+            agent_pod_uid="pod-uid-a",
+            local_runtime_quiesced=True,
+            local_quiescence_protocol="agent_attach_not_started_v1",
+            workspace_generation="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            workspace_runtime_incarnation=("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        )
+        assert client._client.post.await_args.kwargs["json"] == {
+            "agent_id": "agent-a",
+            "session_runtime_generation": RUNTIME_GENERATION,
+            "session_runtime_attach_token": RUNTIME_ATTACH_TOKEN,
+            "agent_pod_uid": "pod-uid-a",
+            "local_runtime_quiesced": True,
+            "local_quiescence_protocol": "agent_attach_not_started_v1",
+            "workspace_generation": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "workspace_runtime_incarnation": ("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        }
 
     @pytest.mark.asyncio
     async def test_connect_includes_user_id_header_when_user_id_set(self):
@@ -153,6 +257,86 @@ class TestOrchestratorClient:
             assert client.agent_id == "agent-123"
             assert client.heartbeat_interval == 60
             mock_client.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_thread_registration_echoes_and_adopts_exact_runtime_generation(
+        self, client
+    ):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "agent_id": "agent-123",
+            "heartbeat_interval_seconds": 60,
+            "pinned_runtime_generation_contract": 1,
+            "session_runtime_generation": RUNTIME_GENERATION,
+            "session_runtime_attach_token": RUNTIME_ATTACH_TOKEN,
+        }
+        client._client = MagicMock()
+        client._client.post = AsyncMock(return_value=response)
+
+        with patch.dict(
+            os.environ,
+            {"SESSION_RUNTIME_GENERATION": RUNTIME_GENERATION},
+        ):
+            assert await client.register(agent_mode="persistent", thread_id="thread-a")
+
+        body = client._client.post.await_args.kwargs["json"]
+        assert body["session_runtime_generation"] == RUNTIME_GENERATION
+        assert client.session_runtime_generation == RUNTIME_GENERATION
+        assert client.session_runtime_attach_token == RUNTIME_ATTACH_TOKEN
+        assert client.pinned_runtime_generation_contract is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "generation",
+        [None, "not-a-uuid", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+    )
+    async def test_advertised_thread_registration_rejects_missing_malformed_or_mismatch(
+        self, client, generation
+    ):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "agent_id": "agent-123",
+            "heartbeat_interval_seconds": 60,
+            "pinned_runtime_generation_contract": 1,
+            "session_runtime_generation": generation,
+            "session_runtime_attach_token": RUNTIME_ATTACH_TOKEN,
+        }
+        client._client = MagicMock()
+        client._client.post = AsyncMock(return_value=response)
+
+        with patch.dict(
+            os.environ,
+            {"SESSION_RUNTIME_GENERATION": RUNTIME_GENERATION},
+        ):
+            assert not await client.register(
+                agent_mode="persistent", thread_id="thread-a"
+            )
+        assert client.agent_id is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("attach_token", [None, "not-a-uuid", True, 1])
+    async def test_advertised_thread_registration_rejects_missing_or_malformed_token(
+        self, client, attach_token
+    ):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "agent_id": "agent-123",
+            "heartbeat_interval_seconds": 60,
+            "pinned_runtime_generation_contract": 1,
+            "session_runtime_generation": RUNTIME_GENERATION,
+            "session_runtime_attach_token": attach_token,
+        }
+        client._client = MagicMock()
+        client._client.post = AsyncMock(return_value=response)
+
+        with patch.dict(
+            os.environ,
+            {"SESSION_RUNTIME_GENERATION": RUNTIME_GENERATION},
+        ):
+            assert not await client.register(
+                agent_mode="persistent", thread_id="thread-a"
+            )
+        assert client.agent_id is None
 
     @pytest.mark.asyncio
     async def test_register_failure(self, client):
@@ -234,6 +418,199 @@ class TestOrchestratorClient:
             assert payload["status"] == "working"
             assert payload["current_job_id"] == "job-7"
             assert payload["metrics"]["graph_progress"] == 9
+
+    @pytest.mark.asyncio
+    async def test_pinned_heartbeat_echoes_runtime_identity(self, client):
+        client.agent_id = "agent-123"
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": "ok"}
+        client._client = MagicMock()
+        client._client.post = AsyncMock(return_value=response)
+
+        await client.heartbeat(status="session")
+
+        assert client._client.post.await_args.kwargs["json"] == {
+            "status": "session",
+            "session_runtime_generation": RUNTIME_GENERATION,
+            "session_runtime_attach_token": RUNTIME_ATTACH_TOKEN,
+        }
+
+    @pytest.mark.asyncio
+    async def test_pinned_status_echoes_exact_runtime_identity(self, client):
+        response = MagicMock(status_code=200)
+        client._client = MagicMock()
+        client._client.put = AsyncMock(return_value=response)
+        client.pinned_runtime_generation_contract = True
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+
+        assert await client.update_thread_status(
+            "thread-a",
+            "active",
+            pinned_agent_id="agent-123",
+        )
+
+        assert client._client.put.await_args.kwargs["json"] == {
+            "status": "active",
+            "agent_id": "agent-123",
+            "session_runtime_generation": RUNTIME_GENERATION,
+            "session_runtime_attach_token": RUNTIME_ATTACH_TOKEN,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["ending", "ended"])
+    @pytest.mark.parametrize("disposition", ["ended", "suspended"])
+    async def test_pinned_terminal_status_echoes_exact_retirement_disposition(
+        self, client, status, disposition
+    ):
+        response = MagicMock(status_code=200)
+        client._client = MagicMock()
+        client._client.put = AsyncMock(return_value=response)
+        client.pinned_runtime_generation_contract = True
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+
+        assert await client.update_thread_status(
+            "thread-a",
+            status,
+            pinned_agent_id="agent-123",
+            retirement_disposition=disposition,
+        )
+
+        assert client._client.put.await_args.kwargs["json"] == {
+            "status": status,
+            "retirement_disposition": disposition,
+            "agent_id": "agent-123",
+            "session_runtime_generation": RUNTIME_GENERATION,
+            "session_runtime_attach_token": RUNTIME_ATTACH_TOKEN,
+        }
+
+    @pytest.mark.asyncio
+    async def test_exact_retirement_outcome_requires_matching_append_only_receipt(
+        self, client
+    ):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "status": "settled_or_superseded",
+            "retirement_disposition": "ended",
+            "retirement_permanent": False,
+            "outcome": "settled",
+            "settled_at": "2026-08-26T12:00:00+00:00",
+        }
+        client._client = MagicMock()
+        client._client.get = AsyncMock(return_value=response)
+
+        outcome = await client.get_thread_retirement_outcome(
+            "thread-a",
+            pinned_agent_id="agent-123",
+            session_runtime_generation=RUNTIME_GENERATION,
+            session_runtime_attach_token=RUNTIME_ATTACH_TOKEN,
+            session_runtime_retirement_token=RUNTIME_RETIREMENT_TOKEN,
+            retirement_disposition="ended",
+            retirement_permanent=False,
+        )
+
+        assert outcome == response.json.return_value
+        client._client.get.assert_awaited_once_with(
+            "http://localhost:8085/api/agents/threads/thread-a/retirement-outcome",
+            headers={
+                "X-Agent-ID": "agent-123",
+                "X-Session-Runtime-Generation": RUNTIME_GENERATION,
+                "X-Session-Runtime-Attach-Token": RUNTIME_ATTACH_TOKEN,
+                "X-Session-Runtime-Retirement-Token": RUNTIME_RETIREMENT_TOKEN,
+                "X-Retirement-Disposition": "ended",
+                "X-Retirement-Permanent": "false",
+            },
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"status": "settled_or_superseded"},
+            {
+                "status": "settled_or_superseded",
+                "retirement_disposition": "suspended",
+                "retirement_permanent": False,
+                "outcome": "settled",
+                "settled_at": "2026-08-26T12:00:00+00:00",
+            },
+            {
+                "status": "settled_or_superseded",
+                "retirement_disposition": "ended",
+                "retirement_permanent": False,
+                "outcome": "unknown",
+                "settled_at": "2026-08-26T12:00:00+00:00",
+            },
+        ],
+    )
+    async def test_retirement_outcome_fails_closed_on_malformed_or_wrong_receipt(
+        self, client, payload
+    ):
+        response = MagicMock(status_code=200)
+        response.json.return_value = payload
+        client._client = MagicMock()
+        client._client.get = AsyncMock(return_value=response)
+
+        assert (
+            await client.get_thread_retirement_outcome(
+                "thread-a",
+                pinned_agent_id="agent-123",
+                session_runtime_generation=RUNTIME_GENERATION,
+                session_runtime_attach_token=RUNTIME_ATTACH_TOKEN,
+                session_runtime_retirement_token=RUNTIME_RETIREMENT_TOKEN,
+                retirement_disposition="ended",
+                retirement_permanent=False,
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_generic_200_does_not_prove_exact_local_quiescence(self, client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": "ending"}
+        client._client = MagicMock()
+        client._client.put = AsyncMock(return_value=response)
+        client.pinned_runtime_generation_contract = True
+
+        assert not await client.update_thread_status(
+            "thread-a",
+            "ended",
+            pinned_agent_id="agent-123",
+            session_runtime_generation=RUNTIME_GENERATION,
+            session_runtime_attach_token=RUNTIME_ATTACH_TOKEN,
+            retirement_disposition="ended",
+            retirement_permanent=False,
+            session_runtime_retirement_token=RUNTIME_RETIREMENT_TOKEN,
+            local_runtime_quiesced=True,
+            local_quiescence_protocol="workspace_process_zero_v1",
+            workspace_generation=RUNTIME_GENERATION,
+            workspace_runtime_incarnation=RUNTIME_ATTACH_TOKEN,
+        )
+
+    @pytest.mark.asyncio
+    async def test_suspend_echoes_exact_runtime_identity_headers(self, client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"suspended": True}
+        client.agent_id = "agent-123"
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+        client._client = MagicMock()
+        client._client.post = AsyncMock(return_value=response)
+
+        assert await client.suspend_thread("thread-a")
+
+        client._client.post.assert_awaited_once_with(
+            "http://localhost:8085/api/agents/threads/thread-a/suspend",
+            timeout=300.0,
+            headers={
+                "X-Agent-ID": "agent-123",
+                "X-Session-Runtime-Generation": RUNTIME_GENERATION,
+                "X-Session-Runtime-Attach-Token": RUNTIME_ATTACH_TOKEN,
+            },
+        )
 
     @pytest.mark.asyncio
     async def test_heartbeat_returns_intents(self, client):
@@ -1053,8 +1430,32 @@ class TestGetThreadWorkspace:
             await client.get_thread_workspace("tid-1")
 
             mock_http.get.assert_called_once_with(
-                "http://localhost:8085/api/agents/threads/tid-1/workspace"
+                "http://localhost:8085/api/agents/threads/tid-1/workspace",
+                headers=None,
             )
+
+    @pytest.mark.asyncio
+    async def test_sends_exact_agent_identity_on_workspace_credential_reads(
+        self, client
+    ):
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {"status": "creating"}
+        client.agent_id = "00000000-0000-0000-0000-0000000000a1"
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.get = AsyncMock(return_value=mock_response)
+            await client.get_thread_workspace("tid-1")
+
+        mock_http.get.assert_awaited_once_with(
+            "http://localhost:8085/api/agents/threads/tid-1/workspace",
+            headers={
+                "X-Agent-ID": client.agent_id,
+                "X-Session-Runtime-Generation": RUNTIME_GENERATION,
+                "X-Session-Runtime-Attach-Token": RUNTIME_ATTACH_TOKEN,
+            },
+        )
 
     @pytest.mark.asyncio
     async def test_returns_parsed_json_on_200(self, client):
@@ -1144,3 +1545,49 @@ class TestGetThreadWorkspace:
             result = await client.get_thread_workspace("tid-1")
             assert result == {"status": "pending"}
             mock_connect.assert_awaited_once()
+
+
+class TestGetThreadLifecycle:
+    @pytest.fixture
+    def client(self):
+        client = OrchestratorClient(
+            orchestrator_url="http://localhost:8085",
+            pod_ip="10.0.0.5",
+            pod_port=8001,
+            hostname="test-agent",
+            config_name="persistent_defaults",
+            pid=12345,
+        )
+        client.agent_id = "00000000-0000-4000-8000-0000000000a1"
+        client.session_runtime_generation = RUNTIME_GENERATION
+        client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
+        return client
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [403, 404, 409])
+    async def test_exact_authority_refusal_terminates_stale_runtime(
+        self, client, status_code
+    ):
+        response = MagicMock(status_code=status_code)
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.get = AsyncMock(return_value=response)
+
+            result = await client.get_thread_lifecycle("tid-1")
+
+        assert result == {"status": "runtime_moved", "authority_refused": True}
+        mock_http.get.assert_awaited_once_with(
+            "http://localhost:8085/api/agents/threads/tid-1/lifecycle",
+            headers={
+                "X-Agent-ID": client.agent_id,
+                "X-Session-Runtime-Generation": RUNTIME_GENERATION,
+                "X-Session-Runtime-Attach-Token": RUNTIME_ATTACH_TOKEN,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_transient_server_failure_remains_retryable(self, client):
+        response = MagicMock(status_code=503)
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.get = AsyncMock(return_value=response)
+
+            assert await client.get_thread_lifecycle("tid-1") is None

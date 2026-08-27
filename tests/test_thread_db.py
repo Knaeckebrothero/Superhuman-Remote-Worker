@@ -969,6 +969,8 @@ class TestEndThread:
                 {
                     "status": "ended",
                     "execution_lane": "stateless",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
                     "metadata": metadata,
                 },
                 {"unit_kind": "session_turn"},
@@ -990,6 +992,8 @@ class TestEndThread:
             return_value={
                 "status": "ended",
                 "execution_lane": "pinned",
+                "runtime_generation": None,
+                "runtime_retirement_token": None,
                 "metadata": {},
             }
         )
@@ -1010,6 +1014,8 @@ class TestEndThread:
             return_value={
                 "status": "ended",
                 "execution_lane": "stateless",
+                "runtime_generation": None,
+                "runtime_retirement_token": None,
                 "metadata": {"_stateless_workspace_retirement_pending": True},
             }
         )
@@ -1024,6 +1030,8 @@ class TestEndThread:
                 {
                     "status": "ended",
                     "execution_lane": "stateless",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
                     "metadata": {
                         "_stateless_workspace_retirement_settled": {
                             "terminal_token": 7,
@@ -1058,6 +1066,8 @@ class TestEndThread:
             return_value={
                 "status": "ended",
                 "execution_lane": "stateless",
+                "runtime_generation": None,
+                "runtime_retirement_token": None,
                 "metadata": {"_stateless_workspace_retirement_pending": malformed},
             }
         )
@@ -1073,6 +1083,8 @@ class TestEndThread:
             return_value={
                 "status": "ended",
                 "execution_lane": "stateless",
+                "runtime_generation": None,
+                "runtime_retirement_token": None,
                 "metadata": {
                     "_stateless_workspace_retirement_settled": {
                         "terminal_token": 7,
@@ -1149,6 +1161,8 @@ class TestEndThread:
                 {
                     "status": "ended",
                     "execution_lane": "stateless",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
                     "metadata": metadata,
                 },
                 {"unit_kind": "session_turn", "state": "done", "lease_token": 8},
@@ -1192,6 +1206,8 @@ class TestEndThread:
                 {
                     "status": "ended",
                     "execution_lane": "stateless",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
                     "metadata": metadata,
                 },
                 {"unit_kind": "session_turn"},
@@ -1233,6 +1249,8 @@ class TestEndThread:
             return_value={
                 "status": "ended",
                 "execution_lane": "stateless",
+                "runtime_generation": None,
+                "runtime_retirement_token": None,
                 "metadata": metadata,
             }
         )
@@ -1243,10 +1261,10 @@ class TestEndThread:
 
 
 class TestInactiveThreadControlCapability:
-    """Every reaper-owned inactive transition closes pinned admission."""
+    """Reapers nominate exact owners; the retirement funnel closes admission."""
 
     @pytest.mark.asyncio
-    async def test_orphan_end_closes_control_admission(self):
+    async def test_orphan_end_returns_exact_retirement_candidates(self):
         conn = _mock_conn()
         conn.fetch = AsyncMock(return_value=[])
         db = _make_db_with_conn(conn)
@@ -1254,11 +1272,15 @@ class TestInactiveThreadControlCapability:
         await db.mark_orphaned_threads_ended()
 
         sql = " ".join(conn.fetch.call_args[0][0].split())
-        assert "status = 'ended'" in sql
-        assert "control_admission_agent_id = NULL" in sql
+        assert "SELECT thread.id, thread.status, thread.runtime_generation" in sql
+        assert "thread.agent_id, thread.runtime_attach_token" in sql
+        assert "thread.status IN ('created', 'active')" in sql
+        assert "thread.runtime_retirement_token IS NULL" in sql
+        assert "agent.status = 'offline'" in sql
+        assert "UPDATE threads" not in sql
 
     @pytest.mark.asyncio
-    async def test_orphan_suspend_closes_control_admission(self):
+    async def test_orphan_suspend_returns_exact_retirement_candidates(self):
         conn = _mock_conn()
         conn.fetch = AsyncMock(return_value=[])
         db = _make_db_with_conn(conn)
@@ -1266,9 +1288,12 @@ class TestInactiveThreadControlCapability:
         await db.mark_orphaned_threads_suspended()
 
         sql = " ".join(conn.fetch.call_args[0][0].split())
-        assert "status = 'suspended'" in sql
-        assert "agent_id = NULL" in sql
-        assert "control_admission_agent_id = NULL" in sql
+        assert "SELECT thread.id, thread.status, thread.runtime_generation" in sql
+        assert "thread.agent_id, thread.runtime_attach_token" in sql
+        assert "thread.status IN ('awaiting_user', 'suspended')" in sql
+        assert "thread.runtime_retirement_token IS NULL" in sql
+        assert "agent.status = 'offline'" in sql
+        assert "UPDATE threads" not in sql
 
 
 # =============================================================================
@@ -1312,11 +1337,13 @@ class TestAgentDeletionControlCapability:
     @pytest.mark.asyncio
     async def test_delete_agent_closes_exact_capability_before_delete(self):
         conn = self._transactional_conn("UPDATE 1", "DELETE 1")
+        conn.fetchval = AsyncMock(return_value=False)
         db = _make_db_with_conn(conn)
 
         deleted = await db.delete_agent("11111111-1111-4111-8111-111111111111")
 
         assert deleted is True
+        assert "SELECT EXISTS" in conn.fetchval.await_args.args[0]
         assert conn.execute.await_count == 2
         assert (
             "control_admission_agent_id = NULL"

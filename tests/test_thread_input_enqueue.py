@@ -18,9 +18,25 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.shared.pinned_session_identity import PinnedSessionBinding
+
 THREAD_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER = {"id": "user-1", "is_admin": False}
 _USE_DB_THREAD = object()
+
+
+def _pinned_binding() -> PinnedSessionBinding:
+    return PinnedSessionBinding(
+        thread_id=THREAD_ID,
+        runtime_generation="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        agent_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        runtime_attach_token="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        agent_hostname="persistent-aaaaaaaaaaaa",
+        pod_uid="pod-uid-a",
+        pod_ip="10.0.0.9",
+        pod_port=8001,
+        agent_status="session",
+    )
 
 
 class _FakeTxn:
@@ -626,9 +642,15 @@ async def test_pinned_thread_takes_legacy_forward_with_lock(monkeypatch):
     db = FakeDB(pinned, conn)
     _patch_common(monkeypatch, orch_main, db)
 
-    agent = {"id": "agent-1", "pod_ip": "10.0.0.9", "pod_port": 8001}
-    resolve_spy = AsyncMock(return_value=(pinned, agent))
+    binding = _pinned_binding()
+    resolve_spy = AsyncMock(return_value=(pinned, binding))
     monkeypatch.setattr(orch_main, "_resolve_thread_for_forwarding", resolve_spy)
+    revalidate_spy = AsyncMock(return_value=binding)
+    monkeypatch.setattr(
+        orch_main,
+        "_revalidate_pinned_forwarding_binding",
+        revalidate_spy,
+    )
     forward_spy = AsyncMock(
         return_value={"accepted": True, "turn_id": 5, "queue_depth": 1}
     )
@@ -646,6 +668,7 @@ async def test_pinned_thread_takes_legacy_forward_with_lock(monkeypatch):
 
     resolve_spy.assert_awaited_once()
     lock_spy.assert_called_once_with(THREAD_ID, 6)
+    revalidate_spy.assert_awaited_once_with(binding)
     forward_spy.assert_awaited_once()
     args = forward_spy.await_args.args
     assert args[1] == "/api/input"
@@ -688,15 +711,242 @@ async def test_interrupt_on_pinned_lane_still_forwards(monkeypatch):
         "require_thread_owner",
         AsyncMock(return_value=(dict(USER), pinned)),
     )
-    agent = {"id": "agent-1", "pod_ip": "10.0.0.9", "pod_port": 8001}
+    binding = _pinned_binding()
     monkeypatch.setattr(
         orch_main,
         "_resolve_thread_for_forwarding",
-        AsyncMock(return_value=(pinned, agent)),
+        AsyncMock(return_value=(pinned, binding)),
     )
     forward_spy = AsyncMock(return_value={"ok": True})
     monkeypatch.setattr(orch_main, "_forward_to_agent", forward_spy)
 
     out = await orch_main.thread_interrupt(THREAD_ID, MagicMock(), None)
-    forward_spy.assert_awaited_once_with(agent, "/api/interrupt", {})
+    forward_spy.assert_awaited_once_with(binding, "/api/interrupt", {})
     assert out == {"accepted": True, "agent": {"ok": True}}
+
+
+@pytest.mark.asyncio
+async def test_exact_forward_rechecks_after_client_entry_and_adds_fingerprint(
+    monkeypatch,
+):
+    from orchestrator import main as orch_main
+
+    binding = _pinned_binding()
+    order: list[str] = []
+    observed: dict = {}
+
+    class _Response:
+        status_code = 202
+        text = '{"accepted":true}'
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {"accepted": True}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            order.append("client_enter")
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, *, json):
+            order.append("post")
+            observed.update(url=url, json=json)
+            return _Response()
+
+    async def _revalidate(current):
+        order.append("db_recheck")
+        assert current is binding
+        return binding
+
+    monkeypatch.setattr(orch_main.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(
+        orch_main,
+        "_revalidate_pinned_forwarding_binding",
+        _revalidate,
+    )
+
+    result = await orch_main._forward_to_agent(
+        binding,
+        "/api/input",
+        {"content": "hello", "turn_id": 6},
+    )
+
+    assert result == {"accepted": True}
+    assert order == ["client_enter", "db_recheck", "post"]
+    assert observed == {
+        "url": "http://10.0.0.9:8001/api/input",
+        "json": {
+            "content": "hello",
+            "turn_id": 6,
+            "session_identity_fingerprint": binding.session_identity_fingerprint,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_exact_forward_binding_loss_after_client_entry_sends_nothing(
+    monkeypatch,
+):
+    from fastapi import HTTPException
+
+    from orchestrator import main as orch_main
+
+    binding = _pinned_binding()
+    post = AsyncMock()
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return await post(*args, **kwargs)
+
+    refusal = HTTPException(
+        status_code=409,
+        detail={
+            "code": "session_binding_invalid",
+            "pinned_runtime_generation_contract": 1,
+            "session_runtime_generation": binding.runtime_generation,
+        },
+    )
+    monkeypatch.setattr(orch_main.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(
+        orch_main,
+        "_revalidate_pinned_forwarding_binding",
+        AsyncMock(side_effect=refusal),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await orch_main._forward_to_agent(
+            binding,
+            "/api/input",
+            {"content": "must not move"},
+        )
+
+    assert caught.value is refusal
+    post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_identity_mismatch_becomes_generation_bound_refusal(monkeypatch):
+    from fastapi import HTTPException
+
+    from orchestrator import main as orch_main
+
+    binding = _pinned_binding()
+
+    class _Response:
+        status_code = 409
+        text = '{"error":"session_identity_mismatch"}'
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {"error": "session_identity_mismatch", "retryable": True}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return _Response()
+
+    monkeypatch.setattr(orch_main.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(
+        orch_main,
+        "_revalidate_pinned_forwarding_binding",
+        AsyncMock(return_value=binding),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await orch_main._forward_to_agent(binding, "/api/interrupt", {})
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail == {
+        "code": "session_binding_invalid",
+        "message": "This session binding is no longer authoritative.",
+        "pinned_runtime_generation_contract": 1,
+        "session_runtime_generation": binding.runtime_generation,
+    }
+
+
+@pytest.mark.asyncio
+async def test_pinned_input_rechecks_binding_after_turn_lock_before_forward(
+    monkeypatch,
+):
+    from fastapi import HTTPException
+
+    from orchestrator import main as orch_main
+
+    pinned = _stateless_thread(execution_lane="pinned")
+    binding = _pinned_binding()
+    db = FakeDB(pinned, FakeConn())
+    _patch_common(monkeypatch, orch_main, db)
+    monkeypatch.setattr(
+        orch_main,
+        "_resolve_thread_for_forwarding",
+        AsyncMock(return_value=(pinned, binding)),
+    )
+    order: list[str] = []
+
+    class _Lock:
+        @staticmethod
+        def locked():
+            return False
+
+        async def __aenter__(self):
+            order.append("lock_enter")
+            return self
+
+        async def __aexit__(self, *args):
+            order.append("lock_exit")
+            return False
+
+    monkeypatch.setattr(orch_main, "_ensure_thread_turn_lock", lambda *_: _Lock())
+    monkeypatch.setattr(orch_main, "_schedule_turn_lock_cleanup", MagicMock())
+    refusal = HTTPException(
+        status_code=409,
+        detail={"code": "session_binding_invalid"},
+    )
+
+    async def _reject(_binding):
+        order.append("binding_recheck")
+        raise refusal
+
+    monkeypatch.setattr(
+        orch_main,
+        "_revalidate_pinned_forwarding_binding",
+        _reject,
+    )
+    forward = AsyncMock()
+    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+
+    with pytest.raises(HTTPException) as caught:
+        await orch_main.thread_input(
+            THREAD_ID,
+            orch_main.ThreadInputRequest(content="stay exact"),
+            MagicMock(),
+        )
+
+    assert caught.value is refusal
+    assert order == ["lock_enter", "binding_recheck", "lock_exit"]
+    forward.assert_not_awaited()

@@ -20,6 +20,7 @@ JOB_B = "22222222-2222-4222-8222-222222222222"
 THREAD_A = "33333333-3333-4333-8333-333333333333"
 THREAD_B = "44444444-4444-4444-8444-444444444444"
 FINGERPRINT = "SHA256:durable-inventory-test"
+RUNTIME_GENERATION = "55555555-5555-4555-8555-555555555555"
 
 
 def _compact(query: str) -> str:
@@ -32,6 +33,7 @@ class _InventoryConnection:
     def __init__(self) -> None:
         self.jobs: dict[str, dict[str, Any]] = {}
         self.threads: dict[str, dict[str, Any]] = {}
+        self.authorized_thread_deletes: set[str] = set()
         self.inventory: dict[tuple[str, int], dict[str, Any]] = {}
         self.lock = asyncio.Lock()
         self.fail_owner_update_once = False
@@ -52,6 +54,55 @@ class _InventoryConnection:
 
     async def fetchrow(self, query: str, *args):
         sql = _compact(query)
+        if (
+            sql.startswith(
+                "SELECT execution_lane, status::text AS status, metadata, agent_id"
+            )
+            and "FROM threads WHERE id = $1::uuid FOR UPDATE" in sql
+        ):
+            thread_id = str(args[0])
+            if thread_id not in self.threads:
+                return None
+            if thread_id not in self.authorized_thread_deletes:
+                raise AssertionError(
+                    "thread deletion fixture lacks terminal retirement authority"
+                )
+            return {
+                "execution_lane": "stateless",
+                "status": "ended",
+                "metadata": {
+                    "_stateless_workspace_retirement_settled": {
+                        "terminal_token": 0,
+                        "cleanup_complete": True,
+                        "permanent": True,
+                        "backing_id": None,
+                        "runtime_incarnation": None,
+                        "snapshot_restore_required": False,
+                    }
+                },
+                "agent_id": None,
+                "control_admission_agent_id": None,
+                "runtime_attach_token": None,
+                "runtime_generation": RUNTIME_GENERATION,
+                "runtime_retirement_token": None,
+                "runtime_retirement_permanent": None,
+                "runtime_retirement_authorized_at": None,
+                "runtime_retirement_context": None,
+                "runtime_retirement_local_quiescence": None,
+                "runtime_retirement_external_cleanup": None,
+                "runtime_authority_exposed": False,
+                "live_docker_workspace_lease": any(
+                    row.get("owner_kind") == "thread"
+                    and str(row.get("owner_id")) == thread_id
+                    and row["status"] in {"ready", "releasing"}
+                    for row in self.inventory.values()
+                ),
+                "live_protected_ro": False,
+                "unresolved_agent_pod_provision_intent": False,
+                "unresolved_agent_workspace_claim": False,
+            }
+        if sql.startswith("SELECT unit_kind, state, lease_token FROM run_queue"):
+            return None
         if (
             "SELECT execution_lane, status::text AS status, metadata FROM threads"
             in sql
@@ -130,7 +181,9 @@ class _InventoryConnection:
 
     async def fetch(self, query: str, *args):
         sql = _compact(query)
-        if "FROM completion_effects" in sql:
+        if "FROM completion_effects" in sql or sql.startswith(
+            "SELECT id FROM agents WHERE thread_id="
+        ):
             return []
         raise AssertionError(f"unexpected fetch: {sql}")
 
@@ -274,6 +327,8 @@ class _InventoryConnection:
                 "DELETE FROM thread_messages",
             )
         ):
+            return "DELETE 0"
+        if sql.startswith("DELETE FROM run_queue"):
             return "DELETE 0"
         if sql.startswith("DELETE FROM jobs"):
             return (
@@ -431,6 +486,7 @@ async def test_quarantine_survives_owner_deletion_and_blocks_reallocation(
     if kind == "job":
         assert await db.delete_job(first_id) is True
     else:
+        connection.authorized_thread_deletes.add(first_id)
         await db.delete_thread(first_id)
     assert first_id not in owners
     durable = connection.inventory[("workspace-1", 30022)]
@@ -467,6 +523,7 @@ async def test_deleting_live_owner_conservatively_quarantines_inventory(
     if kind == "job":
         await db.delete_job(owner_id)
     else:
+        connection.authorized_thread_deletes.add(owner_id)
         await db.delete_thread(owner_id)
 
     row = connection.inventory[("workspace-1", 30022)]
@@ -504,6 +561,7 @@ async def test_delete_during_release_blocks_stale_finalizer_and_reallocation(
     if kind == "job":
         assert await db.delete_job(first_id) is True
     else:
+        connection.authorized_thread_deletes.add(first_id)
         await db.delete_thread(first_id)
 
     row = connection.inventory[("workspace-1", 30022)]

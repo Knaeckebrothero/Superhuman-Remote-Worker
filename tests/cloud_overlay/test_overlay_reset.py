@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -8,6 +9,30 @@ from src.services.cloud_overlay.overlay_mount import (
     OverlayMountError,
     OverlayMountManager,
 )
+
+
+_RESET_THREAD_ID = "thread-12345678"
+_RESET_AGENT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+_RESET_RUNTIME_GENERATION = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+_RESET_ATTACH_TOKEN = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+_RESET_WORKSPACE_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_RESET_RUNTIME_INCARNATION = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
+def _reset_headers() -> dict[str, str]:
+    return {
+        "X-Agent-ID": _RESET_AGENT_ID,
+        "X-Session-Runtime-Generation": _RESET_RUNTIME_GENERATION,
+        "X-Session-Runtime-Attach-Token": _RESET_ATTACH_TOKEN,
+    }
+
+
+def _reset_body() -> dict[str, str]:
+    return {
+        "thread_id": _RESET_THREAD_ID,
+        "workspace_generation": _RESET_WORKSPACE_GENERATION,
+        "workspace_runtime_incarnation": _RESET_RUNTIME_INCARNATION,
+    }
 
 
 class FakeRemoteBackend:
@@ -179,6 +204,9 @@ def _stub_session(overlay, rclone):
         def __init__(self) -> None:
             self.overlay_mount_manager = overlay
             self.cloud_mount_manager = rclone
+            self.protected_cloud_required = True
+            self.protected_workspace_generation = _RESET_WORKSPACE_GENERATION
+            self.protected_workspace_runtime_incarnation = _RESET_RUNTIME_INCARNATION
 
     return _StubSession()
 
@@ -189,11 +217,21 @@ def post_reset(monkeypatch):
     import src.api.persistent_app as app_mod
     from fastapi.testclient import TestClient
 
-    app = app_mod.create_persistent_app("dummy_config", "thread-12345678")
+    app = app_mod.create_persistent_app("dummy_config", _RESET_THREAD_ID)
+    monkeypatch.setattr(app_mod, "_thread_id", _RESET_THREAD_ID)
+    monkeypatch.setattr(
+        app_mod, "_session_runtime_generation", _RESET_RUNTIME_GENERATION
+    )
+    monkeypatch.setattr(app_mod, "_session_runtime_attach_token", _RESET_ATTACH_TOKEN)
+    monkeypatch.setattr(app_mod, "_registered_pinned_agent_id", lambda: _RESET_AGENT_ID)
 
-    def _post(session):
+    def _post(session, *, headers=None, body=None):
         monkeypatch.setattr(app_mod, "_session", session)
-        return TestClient(app).post("/cloud-overlay/reset")
+        return TestClient(app).post(
+            "/cloud-overlay/reset",
+            headers=_reset_headers() if headers is None else headers,
+            json=_reset_body() if body is None else body,
+        )
 
     return _post
 
@@ -257,3 +295,46 @@ def test_route_success_returns_ok_true(post_reset):
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
     assert rclone.calls == 1  # lower refreshed exactly once, all mounts
+
+
+@pytest.mark.parametrize(
+    "surface,key",
+    [
+        ("header", "X-Agent-ID"),
+        ("header", "X-Session-Runtime-Generation"),
+        ("header", "X-Session-Runtime-Attach-Token"),
+        ("body", "thread_id"),
+        ("body", "workspace_generation"),
+        ("body", "workspace_runtime_incarnation"),
+    ],
+)
+@pytest.mark.parametrize("mutation", ["missing", "stale"])
+def test_route_409s_every_missing_or_stale_reset_authority(
+    post_reset, surface, key, mutation
+):
+    headers = _reset_headers()
+    body = _reset_body()
+    target = headers if surface == "header" else body
+    if mutation == "missing":
+        target.pop(key)
+    else:
+        target[key] = "stale-authority"
+
+    session = _stub_session(object(), _FakeRcloneManager())
+    session.reset_cloud_overlay = MagicMock()
+    resp = post_reset(session, headers=headers, body=body)
+
+    assert resp.status_code == 409
+    assert resp.json() == {"error": "stale cloud overlay reset authority"}
+    session.reset_cloud_overlay.assert_not_called()
+
+
+def test_route_rejects_unprotected_session_before_reset(post_reset):
+    session = _stub_session(object(), _FakeRcloneManager())
+    session.protected_cloud_required = False
+    session.reset_cloud_overlay = MagicMock()
+
+    resp = post_reset(session)
+
+    assert resp.status_code == 409
+    session.reset_cloud_overlay.assert_not_called()

@@ -593,9 +593,15 @@ class ShellManager:
             working_dir=working_dir,
         )
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, strict: bool = False) -> None:
         """Kill the backend tmux session and clear local tab stubs."""
-        self._backend.shell_cleanup()
+        if strict:
+            cleanup = getattr(self._backend, "shell_cleanup_strict", None)
+            if not callable(cleanup):
+                raise RuntimeError("backend lacks strict shell cleanup")
+            cleanup()
+        else:
+            self._backend.shell_cleanup()
         self._tabs.clear()
 
     def is_alive(self) -> bool:

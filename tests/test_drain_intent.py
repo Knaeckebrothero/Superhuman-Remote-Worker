@@ -31,6 +31,14 @@ _PERSISTENT_GLOBALS = (
     "_loop_user_queue",
     "_loop_task",
     "_orchestrator_client",
+    "_session_runtime_generation",
+    "_session_runtime_attach_token",
+    "_retirement_admission_identity",
+    "_retirement_admission_disposition",
+    "_retirement_admission_token",
+    "_retirement_admission_permanent",
+    "_pending_drain_suspend",
+    "_pending_drain_suspend_retry_task",
     "_terminating",
     "_max_sessions_per_process",
 )
@@ -51,6 +59,14 @@ class TestPersistentDrainHandler:
         persistent_app._tool_inflight = False
         persistent_app._loop_user_queue = None
         persistent_app._orchestrator_client = None
+        persistent_app._session_runtime_generation = None
+        persistent_app._session_runtime_attach_token = None
+        persistent_app._retirement_admission_identity = None
+        persistent_app._retirement_admission_disposition = None
+        persistent_app._retirement_admission_token = None
+        persistent_app._retirement_admission_permanent = None
+        persistent_app._pending_drain_suspend = None
+        persistent_app._pending_drain_suspend_retry_task = None
         yield
         for name, value in saved.items():
             setattr(persistent_app, name, value)
@@ -58,6 +74,9 @@ class TestPersistentDrainHandler:
     def _attach_parked_session(self, persistent_app):
         """Simulate an attached session parked between turns."""
         persistent_app._session = MagicMock()
+        persistent_app._session.workspace_generation = None
+        persistent_app._session.workspace_runtime_incarnation = None
+        persistent_app._session.local_quiescence_protocol = "agent_runtime_zero_v1"
         persistent_app._thread_id = "tid-drain-1"
         persistent_app._awaiting_input = True
         persistent_app._tool_inflight = False
@@ -89,10 +108,21 @@ class TestPersistentDrainHandler:
         from src.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
+        runtime_generation = "55555555-5555-4555-8555-555555555555"
+        runtime_attach_token = "77777777-7777-4777-8777-777777777777"
+        persistent_app._session_runtime_generation = runtime_generation
+        persistent_app._session_runtime_attach_token = runtime_attach_token
         order = []
 
         async def terminate(*_args, **_kwargs):
             order.append("terminate")
+
+        async def begin(*_args, **_kwargs):
+            order.append("begin")
+            persistent_app._retirement_admission_token = (
+                "99999999-9999-4999-8999-999999999999"
+            )
+            return True
 
         async def suspend(*_args, **_kwargs):
             order.append("suspend")
@@ -106,6 +136,11 @@ class TestPersistentDrainHandler:
                 "_terminate_session",
                 new=AsyncMock(side_effect=terminate),
             ) as detach,
+            patch.object(
+                persistent_app,
+                "_begin_exact_session_retirement",
+                new=AsyncMock(side_effect=begin),
+            ) as begin_retirement,
             patch.object(persistent_app, "_broadcast") as broadcast,
             patch.object(persistent_app, "_schedule_exit") as exit_,
         ):
@@ -120,11 +155,28 @@ class TestPersistentDrainHandler:
             mark_thread=False,
             preserve_shell=False,
         )
-        client.suspend_thread.assert_awaited_once_with("tid-drain-1")
-        assert order == ["terminate", "suspend"]
+        client.suspend_thread.assert_awaited_once_with(
+            "tid-drain-1",
+            pinned_agent_id=None,
+            session_runtime_generation=runtime_generation,
+            session_runtime_attach_token=runtime_attach_token,
+            session_runtime_retirement_token=("99999999-9999-4999-8999-999999999999"),
+            local_runtime_quiesced=True,
+            local_quiescence_protocol="agent_runtime_zero_v1",
+            workspace_generation=None,
+            workspace_runtime_incarnation=None,
+        )
+        assert order == ["begin", "terminate", "suspend"]
+        begin_retirement.assert_awaited_once_with(
+            pinned_agent_id=None,
+            retirement_disposition="suspended",
+        )
         client.update_thread_status.assert_not_awaited()
         exit_.assert_called_once()
-        assert broadcast.call_args[0][0] == "session.suspended"
+        # The exact orchestrator settlement transaction journals the truthful
+        # session.suspended outcome. The agent must not pre-publish it before
+        # snapshot/cleanup/CAS succeeds.
+        broadcast.assert_not_called()
         assert persistent_app._drain_intent_handled is True
 
     @pytest.mark.asyncio
@@ -135,6 +187,11 @@ class TestPersistentDrainHandler:
         client.suspend_thread = AsyncMock(return_value=False)
 
         with (
+            patch.object(
+                persistent_app,
+                "_begin_exact_session_retirement",
+                new=AsyncMock(return_value=True),
+            ),
             patch.object(persistent_app, "_terminate_session", new=AsyncMock()),
             patch.object(persistent_app, "_broadcast"),
             patch.object(persistent_app, "_schedule_exit") as exit_,
@@ -144,8 +201,120 @@ class TestPersistentDrainHandler:
             )
         # Fallback goes through the client with the captured thread_id —
         # the module-global _thread_id is already cleared by teardown.
-        client.update_thread_status.assert_awaited_once_with("tid-drain-1", "ended")
+        client.update_thread_status.assert_awaited_once_with(
+            "tid-drain-1",
+            "ended",
+            pinned_agent_id=None,
+            session_runtime_generation=None,
+            session_runtime_attach_token=None,
+        )
         exit_.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_exact_suspend_ambiguity_retries_in_background_without_ended(self):
+        from src.api import persistent_app
+
+        client = self._attach_parked_session(persistent_app)
+        generation = "55555555-5555-4555-8555-555555555555"
+        attach_token = "77777777-7777-4777-8777-777777777777"
+        persistent_app._session_runtime_generation = generation
+        persistent_app._session_runtime_attach_token = attach_token
+        client.suspend_thread = AsyncMock(side_effect=[False, True])
+
+        async def begin(*_args, **_kwargs):
+            persistent_app._retirement_admission_token = (
+                "99999999-9999-4999-8999-999999999999"
+            )
+            return True
+
+        with (
+            patch.object(
+                persistent_app,
+                "_begin_exact_session_retirement",
+                new=AsyncMock(side_effect=begin),
+            ),
+            patch.object(persistent_app, "_terminate_session", new=AsyncMock()),
+            patch.object(persistent_app, "_schedule_exit") as exit_,
+        ):
+            await persistent_app._handle_heartbeat_intents(
+                {"intents": {"should_drain": True}}
+            )
+
+        assert client.suspend_thread.await_count == 2
+        assert (
+            client.suspend_thread.await_args_list[0]
+            == (client.suspend_thread.await_args_list[1])
+        )
+        client.update_thread_status.assert_not_awaited()
+        assert persistent_app._pending_drain_suspend is None
+        assert persistent_app._drain_intent_handled is True
+        exit_.assert_called_once_with(delay=1.0)
+
+    @pytest.mark.asyncio
+    async def test_local_teardown_failure_never_settles_or_exits(self):
+        from src.api import persistent_app
+
+        client = self._attach_parked_session(persistent_app)
+        persistent_app._session_runtime_generation = (
+            "55555555-5555-4555-8555-555555555555"
+        )
+        persistent_app._session_runtime_attach_token = (
+            "77777777-7777-4777-8777-777777777777"
+        )
+        original_session = persistent_app._session
+
+        with (
+            patch.object(
+                persistent_app,
+                "_begin_exact_session_retirement",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                persistent_app,
+                "_terminate_session",
+                new=AsyncMock(side_effect=RuntimeError("writer did not drain")),
+            ),
+            patch.object(persistent_app, "_schedule_exit") as exit_,
+        ):
+            await persistent_app._handle_heartbeat_intents(
+                {"intents": {"should_drain": True}}
+            )
+
+        assert persistent_app._session is original_session
+        assert persistent_app._pending_drain_suspend["locally_quiesced"] is False
+        assert persistent_app._drain_intent_handled is False
+        client.suspend_thread.assert_not_awaited()
+        client.update_thread_status.assert_not_awaited()
+        exit_.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retirement_begin_failure_preserves_session_for_retry(self):
+        from src.api import persistent_app
+
+        client = self._attach_parked_session(persistent_app)
+        original_session = persistent_app._session
+        with (
+            patch.object(
+                persistent_app,
+                "_begin_exact_session_retirement",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(
+                persistent_app,
+                "_terminate_session",
+                new=AsyncMock(),
+            ) as detach,
+            patch.object(persistent_app, "_schedule_exit") as exit_,
+        ):
+            await persistent_app._handle_heartbeat_intents(
+                {"intents": {"should_drain": True}}
+            )
+
+        detach.assert_not_awaited()
+        client.suspend_thread.assert_not_awaited()
+        exit_.assert_not_called()
+        assert persistent_app._session is original_session
+        assert persistent_app._drain_intent_handled is False
 
     @pytest.mark.asyncio
     async def test_turn_in_flight_defers(self):
@@ -207,6 +376,11 @@ class TestPersistentDrainHandler:
         persistent_app._awaiting_input = False  # busy on the first tick
 
         with (
+            patch.object(
+                persistent_app,
+                "_begin_exact_session_retirement",
+                new=AsyncMock(return_value=True),
+            ),
             patch.object(persistent_app, "_terminate_session", new=AsyncMock()),
             patch.object(persistent_app, "_update_thread_status", new=AsyncMock()),
             patch.object(persistent_app, "_broadcast"),
@@ -232,6 +406,11 @@ class TestPersistentDrainHandler:
         client = self._attach_parked_session(persistent_app)
 
         with (
+            patch.object(
+                persistent_app,
+                "_begin_exact_session_retirement",
+                new=AsyncMock(return_value=True),
+            ),
             patch.object(
                 persistent_app, "_terminate_session", new=AsyncMock()
             ) as detach,
@@ -343,24 +522,61 @@ class TestOrchestratorInactiveCapabilityFence:
     async def test_drain_suspend_closes_control_admission(self):
         from orchestrator import main as orch_main
 
-        db, conn = self._db()
-        suspension = MagicMock()
-        suspension.is_enabled = True
-        suspension.suspend_thread_workspace = AsyncMock(return_value=True)
+        generation = "55555555-5555-4555-8555-555555555555"
+        attach = "77777777-7777-4777-8777-777777777777"
+        retirement = "99999999-9999-4999-8999-999999999999"
+        agent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        db, _conn = self._db()
+        thread = {
+            "id": "tid-drain-1",
+            "status": "active",
+            "execution_lane": "pinned",
+            "agent_id": agent,
+            "runtime_generation": generation,
+            "runtime_attach_token": attach,
+            "runtime_retirement_token": retirement,
+        }
+        db.get_thread = AsyncMock(return_value=thread)
+        db.begin_pinned_thread_retirement = AsyncMock(
+            return_value={
+                "state": "pending",
+                "token": retirement,
+                "generation": generation,
+                "context": {"settle_status": "suspended"},
+            }
+        )
+        db.acknowledge_pinned_thread_local_quiescence = AsyncMock(
+            return_value={"version": 1}
+        )
+        end_flow = AsyncMock(return_value={"status": "suspended"})
         with (
             patch.object(orch_main, "require_internal", AsyncMock()),
             patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "workspace_suspension_service", suspension),
+            patch.object(orch_main, "_end_thread_flow", end_flow),
         ):
             request = MagicMock()
-            request.headers = {}
+            request.headers = {
+                "X-Agent-ID": agent,
+                "X-Session-Runtime-Generation": generation,
+                "X-Session-Runtime-Attach-Token": attach,
+                "X-Session-Runtime-Retirement-Token": retirement,
+                "X-Session-Local-Quiesced": "true",
+                "X-Session-Local-Quiescence-Protocol": "agent_runtime_zero_v1",
+            }
             result = await orch_main.agent_suspend_thread(request, "tid-drain-1")
 
         assert result == {"suspended": True, "status": "suspended"}
-        sql = " ".join(conn.fetchval.await_args.args[0].split())
-        assert "status = 'suspended'" in sql
-        assert "agent_id = NULL" in sql
-        assert "control_admission_agent_id = NULL" in sql
+        db.begin_pinned_thread_retirement.assert_awaited_once_with(
+            "tid-drain-1",
+            permanent=False,
+            settle_status="suspended",
+            expected_runtime_generation=generation,
+            expected_agent_id=agent,
+            expected_attach_token=attach,
+            expected_retirement_token=retirement,
+        )
+        db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()
+        end_flow.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_recycle_boundary_bypasses_workspace_snapshot_and_never_ends(self):
@@ -413,7 +629,6 @@ class TestOrchestratorInactiveCapabilityFence:
             return_value={
                 "id": "tid-drain-1",
                 "status": "active",
-                "execution_lane": "pinned",
                 "project_id": "project-1" if officer else None,
             }
         )
@@ -446,7 +661,7 @@ class TestOrchestratorInactiveCapabilityFence:
         recycler.acknowledge_parked_boundary.assert_awaited_once_with(
             thread_id="tid-drain-1", agent_id=None
         )
-        db.get_thread.assert_not_awaited()
+        db.get_thread.assert_awaited_once_with("tid-drain-1")
         suspension.suspend_thread_workspace.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -489,7 +704,7 @@ class TestOrchestratorInactiveCapabilityFence:
             await orch_main.agent_suspend_thread(request, "tid-drain-1")
 
         assert exc.value.status_code == 409
-        db.get_thread.assert_not_awaited()
+        db.get_thread.assert_awaited_once_with("tid-drain-1")
         suspension.suspend_thread_workspace.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -518,11 +733,13 @@ class TestOrchestratorInactiveCapabilityFence:
             )
 
         assert result == {"status": "suspended"}
-        db.get_thread.assert_not_awaited()
+        db.get_thread.assert_awaited_once_with("tid-drain-1")
         suspend_resources.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_no_active_generation_retains_legacy_suspend(self):
+    async def test_no_active_generation_refuses_identityless_legacy_suspend(self):
+        from fastapi import HTTPException
+
         from orchestrator import main as orch_main
         from orchestrator.services.persistent_recycler import (
             ParkedBoundaryAcknowledgement,
@@ -550,12 +767,14 @@ class TestOrchestratorInactiveCapabilityFence:
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main, "_persistent_thread_recycler", recycler),
             patch.object(orch_main, "workspace_suspension_service", suspension),
+            pytest.raises(HTTPException) as exc,
         ):
-            result = await orch_main.agent_suspend_thread(request, "tid-drain-1")
+            await orch_main.agent_suspend_thread(request, "tid-drain-1")
 
-        assert result == {"suspended": True, "status": "suspended"}
-        suspension.suspend_thread_workspace.assert_awaited_once_with("tid-drain-1")
-        assert conn.fetchval.await_count == 1
+        assert exc.value.status_code == 409
+        assert exc.value.detail["code"] == "pinned_local_quiescence_required"
+        suspension.suspend_thread_workspace.assert_not_awaited()
+        conn.fetchval.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_legacy_agent_end_closes_control_admission(self):

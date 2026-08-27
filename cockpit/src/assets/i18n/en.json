@@ -1257,7 +1257,7 @@
       "agentUser": "Agent user",
       "credentialsRef": "Credentials ref (optional)",
       "secretProvenance": "Secret provenance",
-      "secretSet": "set ({{chars}} chars)",
+      "secretSet": "set",
       "secretUnset": "unset",
       "testing": "Testing…",
       "test": "Test",
@@ -1273,7 +1273,7 @@
         "saved": "Saved — active backend is now {{backend}}",
         "savedReloaded": "Saved — active backend is now {{backend}} (reloaded)",
         "saveFailed": "Save failed",
-        "overlayCleared": "Overlay cleared — active backend rebuilt from env vars",
+        "overlayCleared": "Environment configuration attested and activated; backend history was retained",
         "resetFailed": "Reset failed"
       }
     },
@@ -1705,6 +1705,11 @@
       "endedAt": "Session ended {{ date }}",
       "resume": "Resume"
     },
+    "ending": {
+      "eyebrow": "Finishing safely",
+      "title": "Ending this session…",
+      "body": "The agent is finishing local work and preserving any protected-cloud review. You can resume after completion is confirmed."
+    },
     "startup": {
       "title": "Starting session",
       "titleResume": "Resuming session",
@@ -1774,7 +1779,9 @@
       "default": "Type a message... (Enter to send, Shift+Enter for newline)",
       "defaultMobile": "Type a message...",
       "resuming": "Resuming session…",
-      "endedSendResumes": "Type a message — sending resumes the session"
+      "ending": "Session is finishing safely…",
+      "endedSendResumes": "Type a message — sending resumes the session",
+      "suspendedSendResumes": "Type a message — sending wakes the session"
     },
     "upload": {
       "stage": "Uploading {{done}} of {{total}}…",
@@ -3414,10 +3421,12 @@
     },
     "sessions": {
       "resumeFailed": "Couldn't resume the session.",
+      "stillEnding": "This session is still finishing. Keep this page open, then try Resume again.",
       "endFailed": "Couldn't end the session.",
       "deleteFailed": "Couldn't delete the session.",
       "createFailed": "Couldn't create the session.",
-      "renameFailed": "Couldn't rename the session."
+      "renameFailed": "Couldn't rename the session.",
+      "bindingInvalid": "This session connection is no longer authoritative. Wait for the session to recover or contact an administrator."
     },
     "cloudDiff": {
       "applyFailed": "Couldn't apply the staged changes.",

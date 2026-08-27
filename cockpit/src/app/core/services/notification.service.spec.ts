@@ -86,6 +86,47 @@ describe('NotificationService.handleSseEvent', () => {
     expect(toast.info).not.toHaveBeenCalled();
   });
 
+  it('preserves exact runtime identity on lifecycle frames', () => {
+    const {service} = createService();
+
+    service.handleSseEvent({
+      type: 'session.lifecycle',
+      thread_id: 't-1',
+      session_runtime_generation: '55555555-5555-4555-8555-555555555555',
+      state: 'booting',
+    });
+
+    expect(service.lifecycleEvent()).toMatchObject({
+      thread_id: 't-1',
+      session_runtime_generation: '55555555-5555-4555-8555-555555555555',
+      state: 'booting',
+    });
+  });
+
+  it('exposes cloud.diff_staged as a typed review wake-up edge', () => {
+    const {service} = createService();
+    const event = {
+      type: 'cloud.diff_staged',
+      thread_id: 't-1',
+      session_runtime_generation: '55555555-5555-4555-8555-555555555555',
+      staged_epoch: 8,
+      file_count: 3,
+      counts: {added: 1, modified: 1, deleted: 1},
+      mount_id: 'reader-1',
+    };
+
+    service.handleSseEvent(event);
+
+    expect(service.cloudDiffStagedEvent()).toEqual({
+      thread_id: event.thread_id,
+      session_runtime_generation: event.session_runtime_generation,
+      staged_epoch: 8,
+      file_count: 3,
+      counts: event.counts,
+      mount_id: 'reader-1',
+    });
+  });
+
   it('unknown frame types are ignored without toasting', () => {
     const {service, toast} = createService();
 

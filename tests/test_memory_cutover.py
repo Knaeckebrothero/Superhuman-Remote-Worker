@@ -1020,6 +1020,14 @@ class TestTeardownWiring:
         with (
             patch("src.api.persistent_app._session", session),
             patch("src.api.persistent_app._thread_id", "tid"),
+            patch(
+                "src.api.persistent_app._update_thread_status",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "src.api.persistent_app._terminate_session",
+                new=AsyncMock(),
+            ),
         ):
             await _handle_archive(ws)
 
@@ -1044,7 +1052,14 @@ class TestTeardownWiring:
         with (
             patch("src.api.persistent_app._session", session),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._update_thread_status", new=AsyncMock()),
+            patch(
+                "src.api.persistent_app._update_thread_status",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "src.api.persistent_app._terminate_session",
+                new=AsyncMock(),
+            ),
         ):
             await _handle_idle_archive(None)
 

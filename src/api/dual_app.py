@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
@@ -45,6 +46,10 @@ from ..shared.workspace_contract import (
     WorkspaceContractError,
     validate_worker_workspace_projection,
 )
+from ..shared.pinned_session_identity import (
+    PINNED_SESSION_READY_IDENTITY_CONTRACT,
+    pinned_session_ready_identity_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +73,12 @@ _agent: Optional[UniversalAgent] = None
 _config_path: Optional[str] = None
 _orchestrator_client: Optional[OrchestratorClient] = None
 _heartbeat_task: Optional[asyncio.Task] = None
+_session_attach_task: Optional[asyncio.Task] = None
+# One-way proof boundary for a delivered warm attach.  Before ``setup_started``
+# flips, no PersistentSession, backend, workspace request, writer, or side task
+# has been constructed.  Once it flips it is never reset for this exact
+# G/attach claim: every failure must produce real process-zero proof instead.
+_session_attach_claim: Optional[dict[str, Any]] = None
 _shutdown_requested = False
 _started_at: Optional[datetime] = None
 _pending_exit_task: Optional[asyncio.Task] = None
@@ -134,6 +145,88 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
         metrics["memory"] = memory
 
     return metrics or None
+
+
+def _canonical_optional_runtime_uuid(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError):
+        raise ValueError("malformed runtime identity") from None
+
+
+def _same_session_attach_claim(
+    claim: dict[str, Any],
+    *,
+    require_setup_started: bool | None = None,
+) -> bool:
+    """Match the exact in-process attach claim, including its one-way latch."""
+
+    if _session_attach_claim is not claim:
+        return False
+    if require_setup_started is not None and (
+        claim.get("setup_started") is not require_setup_started
+    ):
+        return False
+    return True
+
+
+async def _release_unstarted_session_attach(claim: dict[str, Any]) -> bool:
+    """Retry one pre-setup attach abort until its exact G rotation is proven."""
+
+    global _pod_state, _session_attach_claim, _session_attach_task
+
+    import src.api.persistent_app as pa
+
+    if not _same_session_attach_claim(claim, require_setup_started=False):
+        return False
+    receipt = {
+        "thread_id": claim["thread_id"],
+        "session_runtime_generation": claim["session_runtime_generation"],
+        "session_runtime_attach_token": claim["session_runtime_attach_token"],
+        "agent_pod_uid": claim["agent_pod_uid"],
+        "local_runtime_quiesced": True,
+        "local_quiescence_protocol": "agent_attach_not_started_v1",
+        "workspace_generation": claim.get("workspace_generation"),
+        "workspace_runtime_incarnation": claim.get("workspace_runtime_incarnation"),
+    }
+    pa._orchestrator_client = _orchestrator_client
+    if not pa._retain_failed_attach_release_receipt(receipt):
+        logger.error(
+            "Pre-setup attach abort for thread %s conflicts with a retained proof",
+            claim["thread_id"],
+        )
+        return False
+    confirmed = await pa._release_failed_attach_receipt_until_confirmed(
+        claim["thread_id"],
+        runtime_generation=claim["session_runtime_generation"],
+        runtime_attach_token=claim["session_runtime_attach_token"],
+    )
+    if not confirmed:
+        return False
+
+    cleared = False
+    async with _state_lock:
+        if _pod_state is PodState.SESSION and _same_session_attach_claim(
+            claim, require_setup_started=False
+        ):
+            if _orchestrator_client is not None:
+                _orchestrator_client.clear_runtime_actor()
+                _orchestrator_client.clear_session_runtime_identity(
+                    expected_generation=claim["session_runtime_generation"],
+                    expected_attach_token=claim["session_runtime_attach_token"],
+                )
+            _pod_state = PodState.IDLE
+            _session_attach_claim = None
+            cleared = True
+    if not cleared:
+        # The DB release was exact, but a successor already owns the local
+        # latch. Never clear its client identity or advertise this pod idle.
+        return True
+    if _session_attach_task is asyncio.current_task():
+        _session_attach_task = None
+    return True
 
 
 def _memory_health_for_heartbeat() -> Optional[Dict[str, Any]]:
@@ -451,6 +544,7 @@ async def lifespan(app: FastAPI):
         _shutdown_requested, \
         _orchestrator_client, \
         _heartbeat_task, \
+        _session_attach_task, \
         _started_at
 
     _started_at = datetime.now()
@@ -487,6 +581,16 @@ async def lifespan(app: FastAPI):
     # --- Shutdown ---
     logger.info("Shutting down dual-mode agent...")
     _shutdown_requested = True
+
+    # The session attach endpoint returns before heavy setup.  Cancel and await
+    # that owned task before deregistering its orchestrator client so its
+    # exact binding-release cleanup cannot race a closed transport.
+    if _session_attach_task is not None and not _session_attach_task.done():
+        _session_attach_task.cancel()
+        try:
+            await _session_attach_task
+        except asyncio.CancelledError:
+            pass
 
     # Drain: send immediate draining heartbeat
     if _orchestrator_client and _orchestrator_client.agent_id:
@@ -645,6 +749,7 @@ async def _reset_to_idle(
     orchestrator's stuck-working/session sweep catches it within 60s.
     """
     global _pod_state, _current_job_id, _current_job_task
+    global _session_attach_claim
 
     logger.info(f"Resetting to IDLE after: {source}")
 
@@ -677,13 +782,14 @@ async def _reset_to_idle(
             logger.warning(f"File handler cleanup during reset failed: {e}")
     finally:
         async with _state_lock:
+            # Scrub thread/project authority before publishing IDLE. Otherwise
+            # a successor can claim the pod between the state flip and these
+            # synchronous clears, then lose its freshly adopted identity.
+            if _orchestrator_client is not None:
+                _orchestrator_client.clear_runtime_actor()
+                _orchestrator_client.clear_session_runtime_identity()
+            _session_attach_claim = None
             _pod_state = PodState.IDLE
-
-        # Back in the pool: the next session may belong to a different thread
-        # and a different project, so the actor scoped to the last one must not
-        # survive the transition.
-        if _orchestrator_client is not None:
-            _orchestrator_client.clear_runtime_actor()
 
         if _orchestrator_client and _orchestrator_client.agent_id:
             last_err: Optional[Exception] = None
@@ -1019,11 +1125,38 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             import src.api.persistent_app as pa
 
             session_ready = pa._session_ready()
+            protected_required = bool(
+                pa._session is not None
+                and getattr(pa._session, "protected_cloud_required", False) is True
+            )
+            protected_ready = bool(
+                protected_required
+                and session_ready is True
+                and pa._session is not None
+                and pa._session.protected_cloud_ready() is True
+            )
+            session_identity_fingerprint = pinned_session_ready_identity_fingerprint(
+                thread_id=pa._thread_id,
+                runtime_generation=pa._session_runtime_generation,
+                agent_id=pa._registered_pinned_agent_id(),
+                runtime_attach_token=pa._session_runtime_attach_token,
+                pod_uid=os.environ.get("POD_UID"),
+            )
             return ReadyResponse(
                 ready=session_ready,
                 message="Session ready" if session_ready else "Session initializing",
                 connections=status["connections"],
-                capabilities={"durable_input_delivery": True},
+                session_identity_fingerprint=session_identity_fingerprint,
+                capabilities={
+                    "durable_input_delivery": True,
+                    "pinned_session_identity_contract": (
+                        PINNED_SESSION_READY_IDENTITY_CONTRACT
+                    ),
+                    # Exact integer protocol version: the orchestrator rejects
+                    # bool/float/string lookalikes from mixed-version agents.
+                    "protected_cloud_contract": 1,
+                    "protected_cloud_ready": protected_ready,
+                },
             )
 
         return ReadyResponse(
@@ -1404,11 +1537,65 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
     @app.post("/session/attach", tags=["Session"])
     async def session_attach(request: dict = {}) -> JSONResponse:
-        global _pod_state
+        global _pod_state, _session_attach_task, _session_attach_claim
 
         thread_id = request.get("thread_id")
         if not thread_id:
             return JSONResponse({"error": "thread_id is required"}, status_code=400)
+        runtime_contract = bool(
+            type(request.get("pinned_runtime_generation_contract")) is int
+            and request["pinned_runtime_generation_contract"] == 1
+        )
+        try:
+            runtime_generation = (
+                str(UUID(str(request.get("session_runtime_generation"))))
+                if request.get("session_runtime_generation") is not None
+                else None
+            )
+            runtime_attach_token = (
+                str(UUID(str(request.get("session_runtime_attach_token"))))
+                if request.get("session_runtime_attach_token") is not None
+                else None
+            )
+            workspace_generation = _canonical_optional_runtime_uuid(
+                request.get("workspace_generation")
+            )
+            workspace_runtime_incarnation = _canonical_optional_runtime_uuid(
+                request.get("workspace_runtime_incarnation")
+            )
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "exact session runtime identity is required"},
+                status_code=409,
+            )
+        if runtime_contract and (
+            runtime_generation is None or runtime_attach_token is None
+        ):
+            return JSONResponse(
+                {"error": "exact session runtime identity is required"},
+                status_code=409,
+            )
+        if bool(workspace_generation) != bool(workspace_runtime_incarnation):
+            return JSONResponse(
+                {"error": "exact workspace runtime identity is required"},
+                status_code=409,
+            )
+
+        pod_uid = str(os.environ.get("POD_UID") or "").strip()
+        if runtime_contract and not pod_uid:
+            return JSONResponse(
+                {"error": "exact agent pod identity is required"},
+                status_code=409,
+            )
+        attach_claim = {
+            "thread_id": thread_id,
+            "session_runtime_generation": runtime_generation,
+            "session_runtime_attach_token": runtime_attach_token,
+            "agent_pod_uid": pod_uid,
+            "workspace_generation": workspace_generation,
+            "workspace_runtime_incarnation": workspace_runtime_incarnation,
+            "setup_started": False,
+        }
 
         async with _state_lock:
             if _pod_state != PodState.IDLE:
@@ -1417,6 +1604,27 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     status_code=409,
                 )
             _pod_state = PodState.SESSION
+            _session_attach_claim = attach_claim
+
+        if (
+            _orchestrator_client is not None
+            and runtime_generation is not None
+            and not _orchestrator_client.adopt_session_runtime_identity(
+                runtime_generation,
+                runtime_attach_token,
+                contract_advertised=runtime_contract,
+            )
+        ):
+            async with _state_lock:
+                if _same_session_attach_claim(
+                    attach_claim, require_setup_started=False
+                ):
+                    _pod_state = PodState.IDLE
+                    _session_attach_claim = None
+            return JSONResponse(
+                {"error": "exact session runtime identity is required"},
+                status_code=409,
+            )
 
         # Actor identity BEFORE any session setup, and synchronously, because
         # the answer decides whether this pod may serve the session at all.
@@ -1433,12 +1641,21 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     "Refusing session %s: no runtime actor identity for this pod",
                     thread_id,
                 )
-                async with _state_lock:
-                    _pod_state = PodState.IDLE
-                try:
-                    await _orchestrator_client.release_thread_agent(thread_id)
-                except Exception as e:
-                    logger.warning(f"Failed to release binding after refusal: {e}")
+                if (
+                    runtime_generation is not None
+                    and runtime_attach_token is not None
+                    and _same_session_attach_claim(
+                        attach_claim, require_setup_started=False
+                    )
+                ):
+                    # This is the sole weak-proof boundary: no session/backend/
+                    # workspace setup task exists yet, and the one-way claim
+                    # latch still says setup never began. Retain a tracked
+                    # retry owner until the exact G rotation is confirmed.
+                    _session_attach_task = asyncio.create_task(
+                        _release_unstarted_session_attach(attach_claim),
+                        name=f"dual-attach-pre-setup-release:{thread_id}",
+                    )
                 return JSONResponse(
                     {"error": "pod cannot obtain runtime actor identity"},
                     status_code=409,
@@ -1451,7 +1668,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             # Without this, `_pod_state = PodState.IDLE` below creates a
             # closure-local variable instead of resetting the module global,
             # leaving the agent permanently stuck reporting `session` status.
-            global _pod_state
+            global _pod_state, _session_attach_task, _session_attach_claim
             try:
                 import src.api.persistent_app as pa
 
@@ -1463,15 +1680,25 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 await pa._attach_session(
                     thread_id=thread_id,
                     config_override=request.get("config_override"),
+                    resolved_config=request.get("resolved_config"),
                     project_ids=request.get("project_ids"),
                     datasources=request.get("datasources"),
                     # Thread's config beats this pod's boot config — dual
                     # pool pods boot as workers ('defaults'); see
                     # knowledge-base/knowledge/issues/session_config_name_plumbing.md (hole B).
                     config_name=request.get("config_name"),
+                    runtime_actor=request.get("runtime_actor"),
+                    pinned_status_identity_contract=request.get(
+                        "pinned_status_identity_contract"
+                    ),
+                    pinned_runtime_generation_contract=request.get(
+                        "pinned_runtime_generation_contract"
+                    ),
+                    session_runtime_generation=runtime_generation,
+                    session_runtime_attach_token=runtime_attach_token,
                 )
                 logger.info(f"Session setup complete for thread {thread_id}")
-            except Exception:
+            except BaseException as attach_error:
                 logger.exception(f"Session setup failed for thread {thread_id}")
                 import src.api.persistent_app as pa
 
@@ -1479,28 +1706,76 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 # _detach_session short-circuits when _session is None and
                 # never clears _thread_id, so we have to do it explicitly.
                 pa._thread_id = None
-                async with _state_lock:
-                    _pod_state = PodState.IDLE
-                if _orchestrator_client and _orchestrator_client.agent_id:
-                    try:
-                        await _orchestrator_client.heartbeat(
-                            status="ready",
-                            job_id=None,
-                            metrics=_get_agent_metrics(),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to send ready heartbeat after attach failure: {e}"
-                        )
+                # Release the exact reciprocal DB reservation before this pod
+                # advertises itself idle.  The endpoint treats an already-
+                # replaced binding as a successful/benign no-op, so ``True``
+                # means either our pair was cleared or successor authority
+                # already won.  A transport failure leaves this pod in
+                # SESSION/non-ready rather than creating an idle double-owner.
+                release_confirmed = False
                 if _orchestrator_client:
                     try:
-                        await _orchestrator_client.release_thread_agent(thread_id)
+                        release_confirmed = (
+                            await pa._release_failed_attach_receipt_until_confirmed(
+                                thread_id,
+                                runtime_generation=runtime_generation,
+                                runtime_attach_token=runtime_attach_token,
+                            )
+                        )
                     except Exception as e:
                         logger.warning(
                             f"Failed to release thread→agent binding for {thread_id}: {e}"
                         )
+                if release_confirmed:
+                    async with _state_lock:
+                        if _same_session_attach_claim(
+                            attach_claim, require_setup_started=True
+                        ):
+                            if _orchestrator_client is not None:
+                                _orchestrator_client.clear_runtime_actor()
+                                _orchestrator_client.clear_session_runtime_identity(
+                                    expected_generation=runtime_generation,
+                                    expected_attach_token=runtime_attach_token,
+                                )
+                            _pod_state = PodState.IDLE
+                            _session_attach_claim = None
+                # The normal heartbeat loop observes IDLE after the exact
+                # claim clear. Do not fire a detached ``ready`` heartbeat here:
+                # a successor can claim the pod between this task and the POST,
+                # which would overwrite its reserved SESSION state.
+                if isinstance(attach_error, asyncio.CancelledError):
+                    raise
+            finally:
+                if _session_attach_task is asyncio.current_task() and (
+                    _pod_state is PodState.IDLE or pa._session is not None
+                ):
+                    _session_attach_task = None
 
-        asyncio.create_task(_setup_session())
+        setup_coro = _setup_session()
+        try:
+            setup_task = asyncio.create_task(setup_coro)
+        except BaseException as task_error:
+            setup_coro.close()
+            # Task creation itself did not cross the setup boundary. Retire the
+            # exact delivered claim with the same pre-setup proof; if delivery
+            # is ambiguous this request remains blocked/non-ready until the
+            # exact replay is confirmed.
+            await _release_unstarted_session_attach(attach_claim)
+            logger.error(
+                "Failed to schedule session setup for thread %s (%s)",
+                thread_id,
+                type(task_error).__name__,
+            )
+            return JSONResponse(
+                {"error": "session setup could not be scheduled"},
+                status_code=500,
+            )
+        # ``asyncio.create_task`` never runs the coroutine inline. There is no
+        # await between task creation and this one-way flip, so the task cannot
+        # enter PersistentSession/backend setup while the weak proof remains
+        # available.
+        attach_claim["setup_started"] = True
+        _session_attach_task = setup_task
 
         return JSONResponse(
             {

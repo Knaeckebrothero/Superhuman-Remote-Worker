@@ -14,15 +14,16 @@ export interface ConfigDriftItem {
 export type ResumeOutcome =
     | {kind: 'ok'}
     | {kind: 'drift'; items: ConfigDriftItem[]}
-    | {kind: 'benign'}
+    | {kind: 'not_ended'}
     | {kind: 'error'; status: number};
 
 /** Classify a failed resume.
  *
- *  409 stays benign: it means the thread was not actually 'ended' (a
- *  double-click), and connect()'s cold path is self-healing. Everything else
- *  used to be swallowed by the same catch, which is why a 403 rendered as a
- *  dead button with no message at all.
+ *  The typed ``session_not_ended`` 409 is distinct, but not proof of a
+ *  successor life: the agent can journal ``session.ended`` before the
+ *  orchestrator has entered/settled retirement. The caller keeps its terminal
+ *  review plane latched and asks the owner to retry. Other 409s include
+ *  protected-cloud class/tier refusals and remain ordinary visible errors.
  *
  *  428 carries the drift list under `error.detail.drift` — FastAPI wraps the
  *  raised `HTTPException(428, detail={...})` payload under a `detail` key, so
@@ -32,7 +33,8 @@ export type ResumeOutcome =
  */
 export function classifyResumeError(err: unknown): ResumeOutcome {
     const status = (err as {status?: number})?.status ?? 0;
-    if (status === 409) return {kind: 'benign'};
+    const code = (err as {error?: {detail?: {code?: unknown}}})?.error?.detail?.code;
+    if (status === 409 && code === 'session_not_ended') return {kind: 'not_ended'};
     if (status === 428) {
         const detail = (err as {error?: {detail?: {drift?: ConfigDriftItem[]}}})
             ?.error?.detail;

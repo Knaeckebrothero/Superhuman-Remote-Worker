@@ -36,6 +36,7 @@ from typing import Any
 
 from services.cloud.errors import CloudBackendError
 from services.cloud_staging.stage import staging_manifest_key, staging_tar_key
+from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
 
 # Sentinel for the summary/manifest/tar memo fields below: distinguishes "not
 # computed yet" from a computed-and-cached ``None`` (no diff available).
@@ -201,17 +202,33 @@ class UpperdirDiffSource:
         ("Manifest-only summaries"). ``summary()`` is the only caller that
         matters for cost; keeping this function tar-free is the whole point.
         """
-        if self._mount_row.get("staged_summary") is None:
+        staged_summary = self._mount_row.get("staged_summary")
+        if not isinstance(staged_summary, dict):
+            return None
+        source = ProtectedMountSourceIdentity.from_binding(
+            self._mount_row.get("source_binding"),
+            expected_sha256=str(self._mount_row.get("source_binding_sha256") or ""),
+        )
+        if source is None or not (
+            staged_summary.get("source_binding") == source.binding
+            and staged_summary.get("source_binding_sha256") == source.sha256
+        ):
             return None
         raw = await self._snapshot_service.get_blob(
-            staging_manifest_key(self._thread_id)
+            staging_manifest_key(self._thread_id, self._mount_row.get("staged_summary"))
         )
         if raw is None:
             return None
         try:
-            return json.loads(raw)
+            manifest = json.loads(raw)
         except (ValueError, TypeError):
             return None
+        if not isinstance(manifest, dict) or not (
+            manifest.get("source_binding") == source.binding
+            and manifest.get("source_binding_sha256") == source.sha256
+        ):
+            return None
+        return manifest
 
     async def _get_tar(self) -> tarfile.TarFile | None:
         """Download the tar and verify content-binding (design §5 addendum),
@@ -230,7 +247,7 @@ class UpperdirDiffSource:
             self._tar_cache = None
             return None
         tar_bytes = await self._snapshot_service.get_blob(
-            staging_tar_key(self._thread_id)
+            staging_tar_key(self._thread_id, self._mount_row.get("staged_summary"))
         )
         if tar_bytes is None:
             self._tar_cache = None
@@ -286,6 +303,8 @@ class UpperdirDiffSource:
                 "epoch": manifest.get("epoch"),
                 "staged_at": manifest.get("staged_at"),
                 "counts": manifest.get("counts"),
+                "source_binding": manifest.get("source_binding"),
+                "source_binding_sha256": manifest.get("source_binding_sha256"),
             },
         )
         return self._summary_cache

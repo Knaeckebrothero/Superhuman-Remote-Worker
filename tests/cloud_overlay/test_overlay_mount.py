@@ -325,8 +325,57 @@ def test_stateless_adoption_fails_closed_on_exact_overlay_config_change():
     assert [op for _token, op in runtime.operations[before:]] == [
         "cloud overlay overlay_adopt_probe"
     ]
+    # Attach rollback owns no resident resource on mismatch.  It must remain
+    # local-only and must not execute even an identity-fenced unmount script.
+    assert changed.rollback_failed_mount() is False
+    assert [op for _token, op in runtime.operations[before:]] == [
+        "cloud overlay overlay_adopt_probe"
+    ]
     assert runtime.upper_bytes == b"belongs to the original overlay layout"
     assert runtime.work_epoch == 0
+
+
+def test_stateless_cold_partial_mount_runs_exact_identity_rollback():
+    class PartialMountBackend(ClaimFencedBackend):
+        def exec_claim_resource(
+            self, command: str, timeout: int = 30, *, operation: str
+        ) -> str:
+            if "overlay_mount.sh" in command:
+                self.runtime.operations.append((self.token, operation))
+                self.runtime.overlay_state = "healthy"
+                return "__SRW_OVERLAY_FAILED__ rc=71\n"
+            if "overlay_failed_mount_rollback.sh" in command:
+                self.runtime.operations.append((self.token, operation))
+                self.runtime.overlay_state = "absent"
+                return "__SRW_OVERLAY_OK__\n"
+            return super().exec_claim_resource(
+                command, timeout=timeout, operation=operation
+            )
+
+    runtime = SharedOverlayRuntime()
+    backend = PartialMountBackend(runtime, token=1)
+    manager = _manager(backend)
+
+    with pytest.raises(OverlayMountError, match="did not report OK"):
+        manager.mount()
+
+    assert runtime.overlay_state == "healthy"
+    assert manager.rollback_failed_mount() is True
+    assert runtime.overlay_state == "absent"
+    assert [op for _token, op in runtime.operations] == [
+        "cloud overlay overlay_adopt_probe",
+        "cloud overlay overlay_mount",
+        "cloud overlay overlay_failed_mount_rollback",
+    ]
+    rollback = next(
+        body
+        for path, body in runtime.files.items()
+        if path.endswith("overlay_failed_mount_rollback.sh")
+    )
+    assert manager._identity_value("creating") in rollback
+    assert manager._identity_value("active") in rollback
+    assert "rm -rf -- /home/agent-host/.overlay/upper" not in rollback
+    assert "rm -rf -- /home/agent-host/.overlay/work" not in rollback
 
 
 def test_successor_converges_crash_after_mount_before_active_publication():

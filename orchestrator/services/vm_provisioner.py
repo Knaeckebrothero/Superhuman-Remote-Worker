@@ -621,13 +621,18 @@ class VMProvisioner:
         identity: VMTeardownIdentity,
         *,
         purge_disk: bool = True,
+        entity_type: str = "job",
     ) -> VMTeardownResult:
         """Delete only the VM/rootdisk incarnation captured in an intent."""
 
         generation = _provision_generation(identity.provision_generation)
         if generation is None:
             return VMTeardownResult("identity_invalid", False)
-        current_generation = await self._current_provision_generation("job", job_id)
+        if entity_type not in {"job", "thread"}:
+            return VMTeardownResult("identity_invalid", False)
+        current_generation = await self._current_provision_generation(
+            entity_type, job_id
+        )
         if current_generation != generation:
             return VMTeardownResult("identity_superseded", False)
         probe = await self._probe_vm_teardown_identity(job_id, generation)
@@ -646,6 +651,7 @@ class VMProvisioner:
             provision_generation=generation,
             expected_vm_uid=_safe_vm_uid(identity.vm_uid),
             expected_rootdisk_pvc_uid=_safe_vm_uid(identity.rootdisk_pvc_uid),
+            entity_type=entity_type,
         )
         reprobe = await self._probe_vm_teardown_identity(job_id, generation)
         reclassification = self._classify_captured_probe(
@@ -830,13 +836,14 @@ class VMProvisioner:
         provision_generation: str | None,
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
+        entity_type: str = "job",
     ) -> bool:
         generation = _provision_generation(provision_generation)
         if self._nats_available:
             kwargs: dict[str, Any] = {
                 "purge_disk": purge_disk,
                 "provision_generation": generation,
-                "entity_type": "job",
+                "entity_type": entity_type,
             }
             if expected_vm_uid is not None:
                 kwargs["expected_vm_uid"] = expected_vm_uid
@@ -846,7 +853,7 @@ class VMProvisioner:
 
         if self._http_available:
             kwargs = {
-                "entity_type": "job",
+                "entity_type": entity_type,
                 "purge_disk": purge_disk,
                 "provision_generation": generation,
             }
@@ -857,6 +864,37 @@ class VMProvisioner:
             return await self._delete_http(job_id, **kwargs)
 
         return False
+
+    async def delete_thread_vm_exact(
+        self,
+        thread_id: str,
+        *,
+        provision_generation: str,
+        expected_vm_uid: str,
+        expected_rootdisk_pvc_uid: str | None,
+        purge_disk: bool,
+    ) -> bool:
+        """Delete one captured thread VM incarnation, never its successor."""
+
+        generation = _provision_generation(provision_generation)
+        vm_uid = _safe_vm_uid(expected_vm_uid)
+        rootdisk_uid = _safe_vm_uid(expected_rootdisk_pvc_uid)
+        if (
+            generation is None
+            or vm_uid is None
+            or (purge_disk and rootdisk_uid is None)
+        ):
+            return False
+        if await self._current_provision_generation("thread", thread_id) != generation:
+            return False
+        return await self._delete_vm_with_identity(
+            thread_id,
+            purge_disk=purge_disk,
+            provision_generation=generation,
+            expected_vm_uid=vm_uid,
+            expected_rootdisk_pvc_uid=rootdisk_uid,
+            entity_type="thread",
+        )
 
     async def release_vm(
         self,
@@ -1549,6 +1587,7 @@ class VMProvisioner:
             # Never let a previous VM incarnation's UID authenticate the next
             # one between create dispatch and the admitted controller result.
             "vm_uid": None,
+            "_runtime_incarnation": None,
             # A PVC name is reusable.  Only the newly admitted immutable UID
             # may authenticate this incarnation's rootdisk for metering.
             "rootdisk_pvc_uid": None,
@@ -1597,6 +1636,11 @@ class VMProvisioner:
         cpu_cores: int = 8,
         memory: str = "16Gi",
         description: str = "",
+        *,
+        expected_runtime_generation: str | None = None,
+        expected_agent_id: str | None = None,
+        expected_attach_token: str | None = None,
+        expected_vm_context: Mapping[str, Any] | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM for a persistent thread.
 
@@ -1606,13 +1650,40 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
-        # See create_vm: reset the reap counter / stale endpoint and stamp
-        # provisioned_at before backend dispatch (thread-scoped context).
+        # Thread VM creation is a lifecycle effect, not a best-effort metadata
+        # merge.  Install its authenticated provision generation under the
+        # exact open pinned T/G/actor tuple before NATS or HTTP can observe a
+        # request.  A stale route read, End, Resume, rebind, or DB failure is a
+        # hard refusal with zero external calls.
         fresh_context = self._fresh_provision_ctx()
+        fresh_context["status"] = "provisioning"
         generation = fresh_context["provision_generation"]
-        await self._set_thread_vm_context(thread_id, fresh_context)
+        if self._db is None or expected_runtime_generation is None:
+            return False
+        begin_impl = getattr(self._db, "begin_pinned_thread_vm_provisioning", None)
+        if not callable(begin_impl):
+            return False
+        try:
+            persisted = await begin_impl(
+                thread_id,
+                expected_runtime_generation=expected_runtime_generation,
+                expected_agent_id=expected_agent_id,
+                expected_attach_token=expected_attach_token,
+                expected_vm_context=expected_vm_context,
+                provision_context=fresh_context,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to install pinned VM provision authority for %s",
+                thread_id,
+            )
+            return False
+        if not persisted:
+            return False
+
+        result: bool | dict[str, Any]
         if self._nats_available:
-            return await nats_bridge.request_vm_create(
+            result = await nats_bridge.request_vm_create(
                 job_id=thread_id,
                 agent_config=agent_config,
                 vm_image=vm_image,
@@ -1620,11 +1691,11 @@ class VMProvisioner:
                 memory=memory,
                 description=description,
                 entity_type="thread",
+                set_provisioning=False,
                 provision_generation=generation,
             )
-
-        if self._http_available:
-            return await self._create_http(
+        elif self._http_available:
+            result = await self._create_http(
                 job_id=thread_id,
                 agent_config=agent_config,
                 vm_image=vm_image,
@@ -1632,10 +1703,21 @@ class VMProvisioner:
                 memory=memory,
                 description=description,
                 entity_type="thread",
+                set_provisioning=False,
                 provision_generation=generation,
             )
-
-        return False
+        else:
+            result = False
+        if not result:
+            await self._set_thread_vm_context_if_generation(
+                thread_id,
+                generation,
+                {
+                    "status": "failed",
+                    "error": "VM create dispatch was not accepted",
+                },
+            )
+        return result
 
     async def delete_thread_vm(self, thread_id: str, purge_disk: bool = True) -> bool:
         """Delete a VM for a persistent thread.

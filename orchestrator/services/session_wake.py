@@ -67,7 +67,12 @@ from uuid import UUID, uuid4
 import httpx
 
 from services.session_lifecycle import probe_ready
+from services.session_runtime_admission import (
+    thread_requests_protected_cloud,
+    thread_runtime_authority,
+)
 from src.shared.job_outcome import effective_job_status
+from src.shared.pinned_session_identity import PinnedSessionBinding
 from services.usage_ledger import llm_tokens_from_rows
 
 logger = logging.getLogger(__name__)
@@ -411,7 +416,7 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
         return WakeDeliveryResult.FAILED
     agent = await _resolve_live_agent(db, thread)
     if agent is not None:
-        outcome = await _inject_live(agent, text, delivery_id=delivery_id)
+        outcome = await _inject_live(agent, text, delivery_id=delivery_id, db=db)
     else:
         outcome = WakeDeliveryResult.FAILED
     if outcome == WakeDeliveryResult.EXECUTED:
@@ -446,7 +451,9 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
 # --------------------------------------------------------------------------
 
 
-async def _resolve_live_agent(db: Any, thread: dict[str, Any]) -> Optional[dict]:
+async def _resolve_live_agent(
+    db: Any, thread: dict[str, Any]
+) -> Optional[PinnedSessionBinding]:
     """Return the agent pod serving this thread, or None if it isn't live.
 
     Copied from ``GET /api/sessions/{thread_id}/connection`` — the only path
@@ -468,31 +475,49 @@ async def _resolve_live_agent(db: Any, thread: dict[str, Any]) -> Optional[dict]
     background delivery has no business mutating session bindings on the way
     past.
     """
-    agent_id = thread.get("agent_id")
-    if not agent_id:
+    runtime_authority = thread_runtime_authority(thread)
+    if runtime_authority is None:
         return None
     try:
-        agent = await db.get_agent(str(agent_id))
+        binding = await db.get_pinned_session_binding(
+            runtime_authority.thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+        )
     except Exception:
         return None
-    if agent is None or agent.get("status") == "offline":
+    if binding is None or binding.agent_status not in ("ready", "working", "session"):
         return None
-    if not agent.get("pod_ip"):
-        return None
-    if agent.get("status") not in ("ready", "working", "session"):
-        return None
-    # Defensive pod_port: a NULL column would make int(None) raise.
     if not await probe_ready(
-        str(agent["pod_ip"]),
-        int(agent.get("pod_port") or 8001),
+        binding.pod_ip,
+        binding.pod_port,
         required_capability="durable_input_delivery",
+        require_protected_cloud=thread_requests_protected_cloud(thread),
+        expected_session_identity_fingerprint=binding.session_identity_fingerprint,
     ):
         return None
-    return agent
+
+    try:
+        current = await db.get_pinned_session_binding(
+            runtime_authority.thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+        )
+    except Exception:
+        return None
+    if (
+        current is None
+        or current.target_key != binding.target_key
+        or current.agent_status not in ("ready", "working", "session")
+    ):
+        return None
+    return current
 
 
 async def _inject_live(
-    agent: dict[str, Any], text: str, *, delivery_id: str
+    binding: PinnedSessionBinding,
+    text: str,
+    *,
+    delivery_id: str,
+    db: Any,
 ) -> WakeDeliveryResult:
     """POST input and report the durable execution boundary it reached.
 
@@ -508,8 +533,8 @@ async def _inject_live(
     Split timeout on purpose: a flat 30s against a black-holed pod IP would burn
     30s inside the drain for every dead session.
     """
-    pod_ip = str(agent["pod_ip"])
-    pod_port = int(agent.get("pod_port") or 8001)
+    pod_ip = binding.pod_ip
+    pod_port = binding.pod_port
     url = f"http://{pod_ip}:{pod_port}/api/input"
     try:
         headers: dict[str, str] = {}
@@ -519,12 +544,34 @@ async def _inject_live(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(10.0, connect=3.0)
         ) as client:
+            # Entering a client may itself await pool/transport setup. Re-read
+            # the exact joined target after that boundary so a same-G Pod/IP
+            # rotation cannot receive an old wake. The effect endpoint also
+            # validates the fingerprint, but avoiding the stale POST entirely
+            # keeps selection truthful and covers transports that fail before
+            # the body reaches the agent.
+            try:
+                current = await db.get_pinned_session_binding(
+                    binding.thread_id,
+                    expected_runtime_generation=binding.runtime_generation,
+                )
+            except Exception:
+                return WakeDeliveryResult.FAILED
+            if (
+                current is None
+                or current.target_key != binding.target_key
+                or current.agent_status not in ("ready", "working", "session")
+            ):
+                return WakeDeliveryResult.FAILED
             resp = await client.post(
                 url,
                 json={
                     "content": text,
                     "role": "event",
                     "delivery_id": str(UUID(str(delivery_id))),
+                    "session_identity_fingerprint": (
+                        binding.session_identity_fingerprint
+                    ),
                 },
                 headers=headers,
             )
@@ -1232,7 +1279,12 @@ async def deliver_officer_note(db: Any, thread: dict[str, Any], text: str) -> st
         try:
             agent = await _resolve_live_agent(db, thread)
             if agent is not None:
-                outcome = await _inject_live(agent, text, delivery_id=delivery_id)
+                outcome = await _inject_live(
+                    agent,
+                    text,
+                    delivery_id=delivery_id,
+                    db=db,
+                )
                 if outcome == WakeDeliveryResult.EXECUTED:
                     return "live"
         except Exception:
@@ -1414,7 +1466,12 @@ async def drain_pending_event_wakes(
                 state_patch = None
             agent = await _resolve_live_agent(db, thread)
             if agent is not None:
-                outcome = await _inject_live(agent, text, delivery_id=delivery_id)
+                outcome = await _inject_live(
+                    agent,
+                    text,
+                    delivery_id=delivery_id,
+                    db=db,
+                )
                 if outcome is True or outcome == WakeDeliveryResult.EXECUTED:
                     await db.finish_session_wake_events(ids)
                     delivered += 1

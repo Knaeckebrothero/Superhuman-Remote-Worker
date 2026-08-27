@@ -74,10 +74,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable
 
-from ..cloud import ProjectFolderHandle
 from ..diff_source import UpperdirDiffSource
 from ..job_cloud_baseline import detect_external_mods_against_baseline
-from . import select_protected_mount
+from .source_identity import ProtectedMountSourceIdentity
 from .stage import staging_manifest_key, staging_tar_key
 
 logger = logging.getLogger(__name__)
@@ -129,14 +128,36 @@ async def apply_staged_diff(
         thread_id=thread_id, epoch=epoch, postgres_db=postgres_db
     )
 
-    mount_rows = await postgres_db.list_thread_mounts(thread_id)
-    sel = select_protected_mount(mount_rows)
-    if sel is None:
-        raise StagedApplyError(409, {"code": "no_protected_mount"})
-    backend = main_cloud_router.for_backend(row["backend"])
-    handle = ProjectFolderHandle.from_db(
-        str(sel["cloud_handle"]), backend=row["backend"]
+    source = ProtectedMountSourceIdentity.from_binding(
+        row.get("source_binding"),
+        expected_sha256=str(row.get("source_binding_sha256") or ""),
     )
+    staged_summary = row.get("staged_summary")
+    if (
+        source is None
+        or not isinstance(staged_summary, dict)
+        or not (
+            staged_summary.get("source_binding") == source.binding
+            and staged_summary.get("source_binding_sha256") == source.sha256
+        )
+    ):
+        raise StagedApplyError(409, {"code": "staged_source_invalid"})
+    try:
+        backend = main_cloud_router.for_backend_instance(
+            source.backend_instance_id,
+            expected_backend_id="nextcloud",
+        )
+    except Exception:
+        authority = await postgres_db.get_main_cloud_backend_instance(
+            source.backend_instance_id,
+            expected_backend_id="nextcloud",
+        )
+        if authority is None:
+            raise StagedApplyError(
+                409, {"code": "staged_backend_unavailable"}
+            ) from None
+        backend = await main_cloud_router.resolve_backend_instance(authority)
+    handle = source.to_project_folder_handle()
 
     src = UpperdirDiffSource(
         thread_id=thread_id,
@@ -154,6 +175,11 @@ async def apply_staged_diff(
         # anymore; the ``ensure_tar_bound()`` probe below is what catches
         # that, before any write.
         raise StagedApplyError(410, {"code": "staging_missing"})
+    if not (
+        summary.meta.get("source_binding") == source.binding
+        and summary.meta.get("source_binding_sha256") == source.sha256
+    ):
+        raise StagedApplyError(409, {"code": "staged_source_invalid"})
 
     # Second epoch pin: ``_load_pinned_mount_row`` above validated the
     # caller's epoch against the DB row BEFORE any S3 read. A concurrent
@@ -257,7 +283,12 @@ async def apply_staged_diff(
     overlay_reset = await reset_agent_overlay()
     new_baseline = await backend.capture_etag_baseline(handle)
     if not await postgres_db.update_ro_mount_baseline(
-        row["id"], new_baseline, require_active=False
+        row["id"],
+        new_baseline,
+        require_active=False,
+        expected_engage_attempt=str(row.get("engage_attempt") or ""),
+        expected_source_binding_sha256=source.sha256,
+        expected_staged_epoch=row["staged_epoch"],
     ):
         logger.warning(
             "apply: thread %s baseline update matched no row (id=%s) — "
@@ -265,11 +296,25 @@ async def apply_staged_diff(
             thread_id,
             row["id"],
         )
-    await snapshot_service.delete_blob(staging_tar_key(thread_id))
-    await snapshot_service.delete_blob(staging_manifest_key(thread_id))
+        return {
+            "applied": applied,
+            "deleted": deleted,
+            "errors": ["staging authority changed before baseline publication"],
+        }
+    await snapshot_service.delete_blob(
+        staging_tar_key(thread_id, row.get("staged_summary"))
+    )
+    await snapshot_service.delete_blob(
+        staging_manifest_key(thread_id, row.get("staged_summary"))
+    )
     new_epoch = row["staged_epoch"] + 1
     if not await postgres_db.update_ro_mount_staging(
-        row["id"], staged_epoch=new_epoch, staged_summary=None, require_active=False
+        row["id"],
+        staged_epoch=new_epoch,
+        staged_summary=None,
+        require_active=False,
+        expected_engage_attempt=str(row.get("engage_attempt") or ""),
+        expected_source_binding_sha256=source.sha256,
     ):
         logger.warning(
             "apply: thread %s staging update matched no row (id=%s) — "
@@ -277,6 +322,11 @@ async def apply_staged_diff(
             thread_id,
             row["id"],
         )
+        return {
+            "applied": applied,
+            "deleted": deleted,
+            "errors": ["staging authority changed before review settlement"],
+        }
     logger.info(
         "apply: thread %s applied %d, deleted %d, epoch -> %d (overlay_reset=%s)",
         thread_id,
@@ -313,14 +363,28 @@ async def reject_staged_diff(
     )
 
     overlay_reset = await reset_agent_overlay()
-    await snapshot_service.delete_blob(staging_tar_key(thread_id))
-    await snapshot_service.delete_blob(staging_manifest_key(thread_id))
     new_epoch = row["staged_epoch"] + 1
     # require_active=False: same rationale as apply's bookkeeping — the
     # idle-drain reconciler can revoke this row before the user reviews an
     # ended thread's staged diff; reject must still be able to clear it.
+    source = ProtectedMountSourceIdentity.from_binding(
+        row.get("source_binding"),
+        expected_sha256=str(row.get("source_binding_sha256") or ""),
+    )
+    exact_kwargs = (
+        {
+            "expected_engage_attempt": str(row.get("engage_attempt") or ""),
+            "expected_source_binding_sha256": source.sha256,
+        }
+        if source is not None
+        else {}
+    )
     if not await postgres_db.update_ro_mount_staging(
-        row["id"], staged_epoch=new_epoch, staged_summary=None, require_active=False
+        row["id"],
+        staged_epoch=new_epoch,
+        staged_summary=None,
+        require_active=False,
+        **exact_kwargs,
     ):
         logger.warning(
             "reject: thread %s staging update matched no row (id=%s) — "
@@ -328,6 +392,13 @@ async def reject_staged_diff(
             thread_id,
             row["id"],
         )
+        raise StagedApplyError(409, {"code": "staging_authority_changed"})
+    await snapshot_service.delete_blob(
+        staging_tar_key(thread_id, row.get("staged_summary"))
+    )
+    await snapshot_service.delete_blob(
+        staging_manifest_key(thread_id, row.get("staged_summary"))
+    )
     logger.info(
         "reject: thread %s rejected staged diff, epoch -> %d (overlay_reset=%s)",
         thread_id,

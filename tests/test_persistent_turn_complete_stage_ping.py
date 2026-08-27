@@ -22,6 +22,11 @@ import pytest
 import src.api.persistent_app as papp
 
 
+GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+ATTACH_TOKEN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+AGENT_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+
+
 # =============================================================================
 # _should_notify_cloud_stage — the gate condition
 # =============================================================================
@@ -91,9 +96,18 @@ class TestNotifyCloudStage:
             patch.object(papp, "_thread_id", "tid-1"),
             patch("httpx.AsyncClient", client_cls),
         ):
-            await papp._notify_cloud_stage()
+            await papp._notify_cloud_stage(
+                agent_id=AGENT_ID,
+                session_runtime_generation=GENERATION,
+                session_runtime_attach_token=ATTACH_TOKEN,
+            )
 
-        assert client_cls.call_args.kwargs["headers"] == {"X-Internal-Key": "secret"}
+        assert client_cls.call_args.kwargs["headers"] == {
+            "X-Internal-Key": "secret",
+            "X-Agent-ID": AGENT_ID,
+            "X-Session-Runtime-Generation": GENERATION,
+            "X-Session-Runtime-Attach-Token": ATTACH_TOKEN,
+        }
         client.post.assert_awaited_once_with(
             "http://orch:8085/api/agents/threads/tid-1/cloud-stage"
         )
@@ -106,12 +120,19 @@ class TestNotifyCloudStage:
 
         with (
             patch.object(papp, "_thread_id", "tid-2"),
+            patch.object(papp, "_session_runtime_attach_token", None),
             patch("httpx.AsyncClient", client_cls),
         ):
-            await papp._notify_cloud_stage()
+            await papp._notify_cloud_stage(
+                agent_id=AGENT_ID,
+                session_runtime_generation=GENERATION,
+            )
 
         # No key configured -> no X-Internal-Key header at all.
-        assert client_cls.call_args.kwargs["headers"] == {}
+        assert client_cls.call_args.kwargs["headers"] == {
+            "X-Agent-ID": AGENT_ID,
+            "X-Session-Runtime-Generation": GENERATION,
+        }
         client.post.assert_awaited_once_with(
             "http://localhost:8085/api/agents/threads/tid-2/cloud-stage"
         )
@@ -125,18 +146,26 @@ class TestNotifyCloudStage:
 
         with (
             patch.object(papp, "_thread_id", "tid-3"),
+            patch.object(papp, "_session_runtime_attach_token", None),
             patch("httpx.AsyncClient", client_cls),
         ):
-            await papp._notify_cloud_stage()  # must not raise
+            await papp._notify_cloud_stage(
+                agent_id=AGENT_ID,
+                session_runtime_generation=GENERATION,
+            )  # must not raise
 
     @pytest.mark.asyncio
     async def test_never_raises_when_client_construction_fails(self, monkeypatch):
         monkeypatch.setenv("MCP_INTERNAL_KEY", "secret")
         with (
             patch.object(papp, "_thread_id", "tid-4"),
+            patch.object(papp, "_session_runtime_attach_token", None),
             patch("httpx.AsyncClient", side_effect=RuntimeError("boom")),
         ):
-            await papp._notify_cloud_stage()  # must not raise
+            await papp._notify_cloud_stage(
+                agent_id=AGENT_ID,
+                session_runtime_generation=GENERATION,
+            )  # must not raise
 
 
 # =============================================================================
@@ -165,11 +194,23 @@ class TestLoopOnTurnCompleteStagePing:
             patch.object(papp, "_thread_id", "tid"),
             patch.object(papp, "_broadcast", MagicMock()),
             patch.object(papp, "_notify_cloud_stage", mock_notify),
+            patch.object(
+                papp,
+                "_orchestrator_client",
+                MagicMock(agent_id=AGENT_ID),
+            ),
+            patch.object(papp, "_session_runtime_generation", GENERATION),
+            patch.object(papp, "_session_runtime_attach_token", ATTACH_TOKEN),
         ):
             await papp._loop_on_turn_complete(turn_id=5, metrics={})
             await asyncio.sleep(0)  # let the fire-and-forget task run
 
-        mock_notify.assert_awaited_once()
+        mock_notify.assert_awaited_once_with(
+            "tid",
+            agent_id=AGENT_ID,
+            session_runtime_generation=GENERATION,
+            session_runtime_attach_token=ATTACH_TOKEN,
+        )
 
     @pytest.mark.asyncio
     async def test_does_not_schedule_ping_when_overlay_inactive(self):

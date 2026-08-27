@@ -626,6 +626,22 @@
       "properties": {
         "enabled": {
           "type": "boolean"
+        },
+        "protectedEffect": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "hmacSecretName": { "type": "string" },
+            "hmacVaultPath": { "type": "string" },
+            "fpmImage": { "type": "string", "minLength": 1 },
+            "nginxImage": { "type": "string", "minLength": 1 },
+            "queueBoundSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+            "handlerBoundSeconds": { "type": "integer", "minimum": 1, "maximum": 60 },
+            "clockSkewBoundSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+            "safetyMarginSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+            "capabilityMaxAgeSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+            "maxChildren": { "type": "integer", "minimum": 1, "maximum": 64 }
+          }
         }
       }
     },

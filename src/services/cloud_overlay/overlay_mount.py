@@ -59,6 +59,11 @@ class OverlayMountManager:
         # the workspace-side lease fence rejects execution.
         self._controller_id = secrets.token_hex(8)
         self._active = False
+        # Set only when this controller crossed the ABSENT -> cold-mount
+        # boundary (or the historical pinned replacement boundary).  An adopt
+        # mismatch is explicitly *not* ownership of the resident overlay and
+        # must never authorize remote teardown during attach rollback.
+        self._cold_mount_attempted = False
 
     @property
     def active(self) -> bool:
@@ -130,6 +135,7 @@ class OverlayMountManager:
                 # Pinned/custom backends keep the historical idempotent
                 # remount behaviour.  Adoption is a stateless handoff
                 # semantic, not a pinned-lane behaviour change.
+                self._cold_mount_attempted = True
                 self._run(
                     "overlay_mount.sh",
                     self._mount_script(replace_existing=True),
@@ -160,6 +166,7 @@ class OverlayMountManager:
                 self.heal(remount_lower)
                 disposition = "healed"
             elif _OVERLAY_ABSENT in probe:
+                self._cold_mount_attempted = True
                 self._run("overlay_mount.sh", self._mount_script(), timeout=60)
                 disposition = "cold"
             else:
@@ -176,6 +183,32 @@ class OverlayMountManager:
                 disposition,
                 time.perf_counter() - started,
             )
+
+    def rollback_failed_mount(self) -> bool:
+        """Retire only a cold overlay this controller actually attempted.
+
+        A stateless adopt mismatch/unrecognized probe describes somebody
+        else's resident resource.  In that case rollback is local-only.  A
+        cold mount can fail after FUSE and identity publication but before the
+        workspace symlink, so the remote rollback script is also fenced by the
+        exact creating/active identity before it unmounts anything.
+
+        Returns whether a remote rollback was attempted.
+        """
+
+        if not self._cold_mount_attempted:
+            self.detach_local()
+            return False
+        try:
+            self._run(
+                "overlay_failed_mount_rollback.sh",
+                self._failed_mount_rollback_script(),
+                timeout=45,
+                require_ok=False,
+            )
+            return True
+        finally:
+            self._active = False
 
     def detach_local(self) -> None:
         """Forget this controller without touching workspace-side mounts.
@@ -524,6 +557,32 @@ if ! mountpoint -q {merged}; then
   rm -f -- {identity}
 fi
 {terminal_check}
+echo "{_OVERLAY_OK}"
+"""
+
+    def _failed_mount_rollback_script(self) -> str:
+        """Unmount only this config's partially published cold overlay."""
+
+        merged = shlex.quote(self.merged)
+        identity = shlex.quote(self._identity_path)
+        creating = shlex.quote(self._identity_value("creating"))
+        active = shlex.quote(self._identity_value("active"))
+        return f"""#!/usr/bin/env bash
+set +e
+identity_value="$(cat {identity} 2>/dev/null || true)"
+if [ "${{identity_value}}" != {creating} ] && [ "${{identity_value}}" != {active} ]; then
+  echo "{_OVERLAY_MISMATCH} rollback-refused"
+  exit 0
+fi
+if mountpoint -q {merged}; then
+  fusermount3 -u {merged} 2>/dev/null || fusermount -u {merged} 2>/dev/null
+fi
+if mountpoint -q {merged}; then
+  fusermount3 -uz {merged} 2>/dev/null || fusermount -uz {merged} 2>/dev/null
+fi
+if ! mountpoint -q {merged}; then
+  rm -f -- {identity}
+fi
 echo "{_OVERLAY_OK}"
 """
 

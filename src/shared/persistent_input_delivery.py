@@ -45,17 +45,22 @@ async def lock_runtime_authority(
     thread_id: str | UUID,
     agent_id: str | UUID,
     pod_uid: str,
+    runtime_generation: str | UUID,
+    runtime_attach_token: str | UUID,
 ) -> None:
     """Lock and prove exact reciprocal thread/agent/pod authority."""
 
     thread_uuid = UUID(str(thread_id))
     agent_uuid = UUID(str(agent_id))
+    runtime_uuid = UUID(str(runtime_generation))
+    attach_uuid = UUID(str(runtime_attach_token))
     pod = str(pod_uid or "").strip()
     if not pod:
         raise InputDeliveryAuthorityLost("runtime pod identity is unavailable")
 
     thread = await conn.fetchrow(
-        "SELECT id, agent_id, status, execution_lane FROM threads "
+        "SELECT id, agent_id, status, execution_lane, runtime_generation, "
+        "runtime_attach_token, runtime_retirement_token FROM threads "
         "WHERE id = $1 FOR UPDATE",
         thread_uuid,
     )
@@ -64,6 +69,9 @@ async def lock_runtime_authority(
         or str(thread["agent_id"] or "") != str(agent_uuid)
         or str(thread["execution_lane"] or "pinned") == "stateless"
         or str(thread["status"] or "") in {"ended", "suspended"}
+        or str(thread["runtime_generation"] or "") != str(runtime_uuid)
+        or str(thread["runtime_attach_token"] or "") != str(attach_uuid)
+        or thread["runtime_retirement_token"] is not None
     ):
         raise InputDeliveryAuthorityLost("thread runtime authority was lost")
 
@@ -92,6 +100,7 @@ async def persist_input_delivery(
     agent_id: str | UUID | None = None,
     pod_uid: str | None = None,
     runtime_generation: str | UUID | None = None,
+    runtime_attach_token: str | UUID | None = None,
 ) -> dict[str, Any]:
     """Atomically persist one transcript row and optionally claim execution.
 
@@ -104,7 +113,7 @@ async def persist_input_delivery(
     thread_uuid = UUID(str(thread_id))
     row_id = message_row_id(delivery_uuid)
     source_value = str(source or "unknown")[:80]
-    identity = (agent_id, pod_uid, runtime_generation)
+    identity = (agent_id, pod_uid, runtime_generation, runtime_attach_token)
     has_identity = all(value is not None for value in identity)
     if any(value is not None for value in identity) and not has_identity:
         raise InputDeliveryAuthorityLost("incomplete runtime identity")
@@ -115,6 +124,8 @@ async def persist_input_delivery(
             thread_id=thread_uuid,
             agent_id=str(agent_id),
             pod_uid=str(pod_uid),
+            runtime_generation=str(runtime_generation),
+            runtime_attach_token=str(runtime_attach_token),
         )
     else:
         # Transcript FK + activity updates follow the same parent-first order.
@@ -191,7 +202,11 @@ async def persist_input_delivery(
     if stored_content != str(content) and source_value != "officer_wake":
         raise InputDeliveryConflict("stable input identity conflicts with transcript")
 
-    if has_identity and str(delivery["state"]) not in {"admitted", "settled"}:
+    if has_identity and str(delivery["state"]) not in {
+        "admitted",
+        "settled",
+        "cancelled",
+    }:
         same_runtime = (
             str(delivery["owner_agent_id"] or "") == str(agent_id)
             and str(delivery["owner_pod_uid"] or "") == str(pod_uid)
@@ -245,14 +260,21 @@ async def claim_pending_input_deliveries(
     agent_id: str | UUID,
     pod_uid: str,
     runtime_generation: str | UUID,
+    runtime_attach_token: str | UUID,
 ) -> list[dict[str, Any]]:
     """Claim every persisted/unadmitted input for one attached runtime."""
 
     thread_uuid = UUID(str(thread_id))
     agent_uuid = UUID(str(agent_id))
     runtime_uuid = UUID(str(runtime_generation))
+    attach_uuid = UUID(str(runtime_attach_token))
     await lock_runtime_authority(
-        conn, thread_id=thread_uuid, agent_id=agent_uuid, pod_uid=pod_uid
+        conn,
+        thread_id=thread_uuid,
+        agent_id=agent_uuid,
+        pod_uid=pod_uid,
+        runtime_generation=runtime_uuid,
+        runtime_attach_token=attach_uuid,
     )
     rows = await conn.fetch(
         """
@@ -313,6 +335,7 @@ async def mark_input_delivery_queued(
     agent_id: str | UUID,
     pod_uid: str,
     runtime_generation: str | UUID,
+    runtime_attach_token: str | UUID,
     claim_generation: int,
 ) -> bool:
     row = await conn.fetchrow(
@@ -329,6 +352,9 @@ async def mark_input_delivery_queued(
            AND delivery.owner_runtime_generation = $5
            AND thread.id = delivery.thread_id
            AND thread.agent_id = delivery.owner_agent_id
+           AND thread.runtime_generation = $6
+           AND thread.runtime_attach_token = $7
+           AND thread.runtime_retirement_token IS NULL
            AND agent.id = delivery.owner_agent_id
            AND agent.thread_id = thread.id
            AND agent.pod_uid = delivery.owner_pod_uid
@@ -340,6 +366,8 @@ async def mark_input_delivery_queued(
         UUID(str(agent_id)),
         str(pod_uid),
         UUID(str(runtime_generation)),
+        UUID(str(runtime_generation)),
+        UUID(str(runtime_attach_token)),
     )
     return row is not None
 
@@ -351,12 +379,13 @@ async def transition_input_delivery(
     agent_id: str | UUID,
     pod_uid: str,
     runtime_generation: str | UUID,
+    runtime_attach_token: str | UUID,
     claim_generation: int,
     transition: str,
     turn_number: int | None = None,
     reason: str | None = None,
 ) -> bool:
-    """CAS one exact owner through admitted, settled, or deferred."""
+    """CAS one exact owner through admitted, settled, deferred, or cancelled."""
 
     if transition == "admitted":
         states = ("owned", "queued")
@@ -386,8 +415,21 @@ async def transition_input_delivery(
             "deferred_at = statement_timestamp(), queued_at = NULL, "
             "updated_at = statement_timestamp()"
         )
+    elif transition == "cancelled":
+        states = ("owned", "queued")
+        assignments = (
+            "state = 'cancelled', cancelled_at = statement_timestamp(), "
+            "cancelled_turn_number = $6, "
+            "cancelled_reason = LEFT(COALESCE($7, 'human_stop_before_provider'), 120), "
+            "queued_at = NULL, deferred_reason = NULL, deferred_at = NULL, "
+            "updated_at = statement_timestamp()"
+        )
     else:  # pragma: no cover - caller contract
         raise ValueError(f"unsupported input delivery transition: {transition}")
+
+    source_fence = (
+        "AND delivery.source = 'direct_human'" if transition == "cancelled" else ""
+    )
 
     row = await conn.fetchrow(
         f"""
@@ -400,8 +442,12 @@ async def transition_input_delivery(
            AND delivery.owner_agent_id = $4
            AND delivery.owner_pod_uid = $5
            AND delivery.owner_runtime_generation = $8
+           {source_fence}
            AND thread.id = delivery.thread_id
            AND thread.agent_id = delivery.owner_agent_id
+           AND thread.runtime_generation = $9
+           AND thread.runtime_attach_token = $10
+           AND thread.runtime_retirement_token IS NULL
            AND agent.id = delivery.owner_agent_id
            AND agent.thread_id = thread.id
            AND agent.pod_uid = delivery.owner_pod_uid
@@ -418,6 +464,8 @@ async def transition_input_delivery(
         turn_number,
         reason,
         UUID(str(runtime_generation)),
+        UUID(str(runtime_generation)),
+        UUID(str(runtime_attach_token)),
     )
     return row is not None
 

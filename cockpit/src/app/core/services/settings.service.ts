@@ -1,6 +1,6 @@
-import {inject, Injectable, signal} from '@angular/core';
-import {HttpClient} from '@angular/common/http';
-import {catchError, Observable, of, tap} from 'rxjs';
+import { inject, Injectable, signal } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { catchError, Observable, of, tap } from 'rxjs';
 import {
   ApiKeyEntry,
   ApiKeySetRequest,
@@ -9,9 +9,9 @@ import {
   ResolvedDefaults,
   UserSettings,
 } from '../models/api.model';
-import {environment} from '../environment';
-import {AdminProvidersService} from './admin-providers.service';
-import {ReadinessService} from './readiness.service';
+import { environment } from '../environment';
+import { AdminProvidersService } from './admin-providers.service';
+import { ReadinessService } from './readiness.service';
 
 @Injectable({ providedIn: 'root' })
 export class SettingsService {
@@ -78,14 +78,21 @@ export class SettingsService {
       .pipe(catchError(() => of([])));
   }
 
-  setProjectApiKey(projectId: string, provider: string, body: ApiKeySetRequest): Observable<ApiKeyEntry> {
-    return this.http
-      .put<ApiKeyEntry>(`${this.baseUrl}/projects/${projectId}/api-keys/${provider}`, body);
+  setProjectApiKey(
+    projectId: string,
+    provider: string,
+    body: ApiKeySetRequest,
+  ): Observable<ApiKeyEntry> {
+    return this.http.put<ApiKeyEntry>(
+      `${this.baseUrl}/projects/${projectId}/api-keys/${provider}`,
+      body,
+    );
   }
 
   deleteProjectApiKey(projectId: string, provider: string): Observable<{ status: string }> {
-    return this.http
-      .delete<{ status: string }>(`${this.baseUrl}/projects/${projectId}/api-keys/${provider}`);
+    return this.http.delete<{ status: string }>(
+      `${this.baseUrl}/projects/${projectId}/api-keys/${provider}`,
+    );
   }
 
   // ── Codex Proxy (Admin) ───────────────────────────────────────
@@ -93,7 +100,9 @@ export class SettingsService {
   getCodexStatus(): Observable<CodexStatus> {
     return this.http
       .get<CodexStatus>(`${this.baseUrl}/codex/status`)
-      .pipe(catchError(() => of({ connected: false, reachable: false, accounts: [], model_count: 0 })));
+      .pipe(
+        catchError(() => of({ connected: false, reachable: false, accounts: [], model_count: 0 })),
+      );
   }
 
   getCodexModels(): Observable<{ models: string[] }> {
@@ -111,13 +120,13 @@ export class SettingsService {
   }
 
   startCodexLogin(): Observable<{ auth_url: string; state: string }> {
-    return this.http
-      .post<{ auth_url: string; state: string }>(`${this.baseUrl}/codex/login`, {});
+    return this.http.post<{ auth_url: string; state: string }>(`${this.baseUrl}/codex/login`, {});
   }
 
   pollCodexLogin(state: string): Observable<{ status: string }> {
-    return this.http
-      .get<{ status: string }>(`${this.baseUrl}/codex/login/poll`, { params: { state } });
+    return this.http.get<{ status: string }>(`${this.baseUrl}/codex/login/poll`, {
+      params: { state },
+    });
   }
 
   completeCodexLogin(callbackUrl: string): Observable<Record<string, unknown>> {
@@ -182,6 +191,7 @@ export class SettingsService {
 
 export interface MainCloudEffectiveConfig {
   backend_id: string;
+  backend_instance_id?: string | null;
   is_initialized: boolean;
   is_configured: boolean;
   base_url?: string | null;
@@ -205,11 +215,17 @@ export interface MainCloudOverlay {
 export interface MainCloudSecretProvenance {
   env_var: string;
   set: boolean;
-  length: number;
 }
 
 export interface MainCloudSettingsResponse {
   effective: MainCloudEffectiveConfig;
+  activation_revision: number;
+  backend_instance: {
+    id: string;
+    routing_sha256: string;
+    installation_proof_sha256: string;
+    secret_revision: number;
+  } | null;
   overlay: MainCloudOverlay;
   secrets: Record<string, MainCloudSecretProvenance>;
   allowed_backends: string[];
@@ -218,11 +234,14 @@ export interface MainCloudSettingsResponse {
 export interface MainCloudSettingsRequest {
   value: Record<string, unknown>;
   credentials_ref: string | null;
+  expected_activation_revision?: number;
 }
 
 export interface MainCloudPutResponse {
   status: string;
   backend_id: string;
+  backend_instance_id: string;
+  activation_revision: number;
   reloaded: boolean;
 }
 

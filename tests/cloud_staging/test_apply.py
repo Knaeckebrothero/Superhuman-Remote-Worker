@@ -36,6 +36,9 @@ from orchestrator.services.cloud_staging.stage import (
     staging_manifest_key,
     staging_tar_key,
 )
+from orchestrator.services.cloud_staging.source_identity import (
+    ProtectedMountSourceIdentity,
+)
 from orchestrator.services.job_cloud_baseline import (
     detect_external_mods_against_baseline,
 )
@@ -43,6 +46,14 @@ from orchestrator.services.job_cloud_baseline import (
 from tests.cloud.fake import FakeMainCloudBackend
 
 THREAD_ID = "thread-apply-1"
+_ENGAGE_ATTEMPT = "11111111-1111-4111-8111-111111111111"
+_SOURCE = ProtectedMountSourceIdentity(
+    backend_instance_id="22222222-2222-4222-8222-222222222222",
+    source_ref="33333333-3333-4333-8333-333333333333",
+    target_path="projects/proj",
+    native_id="1",
+    mountpoint="proj",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -74,6 +85,8 @@ def _manifest(
         "entries": entries,
         "skipped": [],
         "tar_sha256": hashlib.sha256(tar_bytes).hexdigest(),
+        "source_binding": _SOURCE.binding,
+        "source_binding_sha256": _SOURCE.sha256,
     }
 
 
@@ -83,10 +96,20 @@ def _mount_row(
     staged_summary=...,
     etag_baseline: dict | None = None,
     row_id: str = "mount-1",
-    backend: str = "fake",
+    backend: str = "nextcloud",
 ) -> dict:
     if staged_summary is ...:
-        staged_summary = {"counts": {}, "signature": "sig", "tar_sha256": "irrelevant"}
+        staged_summary = {
+            "counts": {},
+            "signature": "sig",
+            "tar_sha256": "irrelevant",
+            "source_binding": _SOURCE.binding,
+            "source_binding_sha256": _SOURCE.sha256,
+        }
+    elif isinstance(staged_summary, dict):
+        staged_summary = dict(staged_summary)
+        staged_summary.setdefault("source_binding", _SOURCE.binding)
+        staged_summary.setdefault("source_binding_sha256", _SOURCE.sha256)
     return {
         "id": row_id,
         "status": "active",
@@ -94,6 +117,9 @@ def _mount_row(
         "staged_epoch": epoch,
         "staged_summary": staged_summary,
         "etag_baseline": etag_baseline if etag_baseline is not None else {},
+        "engage_attempt": _ENGAGE_ATTEMPT,
+        "source_binding": _SOURCE.binding,
+        "source_binding_sha256": _SOURCE.sha256,
     }
 
 
@@ -134,7 +160,7 @@ def _db(*, mount_row, thread_mounts) -> MagicMock:
 
 def _cloud_router(backend) -> MagicMock:
     router = MagicMock()
-    router.for_backend = MagicMock(return_value=backend)
+    router.for_backend_instance = MagicMock(return_value=backend)
     return router
 
 
@@ -192,6 +218,29 @@ class _FaultyPutBackend(FakeMainCloudBackend):
 
 
 class TestApplyGates:
+    @pytest.mark.asyncio
+    async def test_legacy_staging_without_source_fails_apply_closed(self):
+        row = _mount_row(epoch=5)
+        row.pop("source_binding")
+        row.pop("source_binding_sha256")
+        row["staged_summary"].pop("source_binding")
+        row["staged_summary"].pop("source_binding_sha256")
+        db = _db(mount_row=row, thread_mounts=[])
+        router = _cloud_router(FakeMainCloudBackend())
+
+        with pytest.raises(StagedApplyError) as exc:
+            await apply_staged_diff(
+                thread_id=THREAD_ID,
+                epoch=5,
+                postgres_db=db,
+                main_cloud_router=router,
+                snapshot_service=_snapshot_service(),
+                reset_agent_overlay=AsyncMock(return_value=True),
+            )
+
+        assert exc.value.detail == {"code": "staged_source_invalid"}
+        router.for_backend_instance.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_apply_epoch_stale_409(self):
         row = _mount_row(epoch=5)
@@ -323,9 +372,8 @@ class TestApplyGates:
         svc.delete_blob.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_no_protected_mount_409(self):
-        """Mount rows exist but none is the protected one (no
-        nextcloud+cloud_handle row) — 409 before any backend/S3 touch."""
+    async def test_current_mount_selection_cannot_retarget_staged_source(self):
+        """Mutable mount rows are ignored; the immutable A staging is used."""
         row = _mount_row(epoch=5)
         # Neither row satisfies select_protected_mount: wrong backend_id, or
         # a nextcloud row with no cloud_handle.
@@ -349,10 +397,14 @@ class TestApplyGates:
                 reset_agent_overlay=AsyncMock(return_value=True),
             )
 
-        assert ei.value.status_code == 409
-        assert ei.value.detail == {"code": "no_protected_mount"}
-        router.for_backend.assert_not_called()
-        svc.get_blob.assert_not_awaited()
+        assert ei.value.status_code == 410
+        assert ei.value.detail == {"code": "staging_missing"}
+        router.for_backend_instance.assert_called_once_with(
+            _SOURCE.backend_instance_id,
+            expected_backend_id="nextcloud",
+        )
+        svc.get_blob.assert_awaited_once()
+        db.list_thread_mounts.assert_not_awaited()
         db.update_ro_mount_staging.assert_not_awaited()
 
 
@@ -508,6 +560,47 @@ class TestApplyTornTar:
 
 
 class TestApplyWrites:
+    @pytest.mark.asyncio
+    async def test_staged_a_never_writes_current_replacement_b(self):
+        """A staged source is immutable even after thread_mounts selects B."""
+
+        tar_bytes = _build_tar([("upper/new.txt", b"from-a")])
+        entries = [{"path": "new.txt", "status": "added", "size": 6, "binary": False}]
+        manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
+        backend_a, native_a = await _seeded_backend()
+        backend_b, native_b = await _seeded_backend()
+        assert native_a == native_b == _SOURCE.native_id
+        row = _mount_row(epoch=5)
+        db = _db(
+            mount_row=row,
+            thread_mounts=[_thread_mounts_row(cloud_handle=native_b)],
+        )
+        svc = _snapshot_service(
+            {
+                staging_tar_key(THREAD_ID): tar_bytes,
+                staging_manifest_key(THREAD_ID): json.dumps(manifest).encode(),
+            }
+        )
+        router = _cloud_router(backend_a)
+        router.for_backend = MagicMock(return_value=backend_b)
+
+        result = await apply_staged_diff(
+            thread_id=THREAD_ID,
+            epoch=5,
+            postgres_db=db,
+            main_cloud_router=router,
+            snapshot_service=svc,
+            reset_agent_overlay=AsyncMock(return_value=True),
+        )
+
+        assert result["errors"] == []
+        assert any(
+            call[0] == "put_project_folder_file_bytes" for call in backend_a.calls
+        )
+        assert _write_ops(backend_b) == []
+        router.for_backend.assert_not_called()
+        db.list_thread_mounts.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_apply_deletes_before_creates(self):
         tar_bytes = _build_tar([("upper/new.txt", b"created")])
@@ -745,9 +838,16 @@ class TestApplySuccess:
 
         backend.capture_etag_baseline = _capture
 
-        async def _update_baseline(row_id, baseline, *, require_active=True):
+        async def _update_baseline(
+            row_id, baseline, *, require_active=True, **authority
+        ):
             call_order.append("update_baseline")
             assert require_active is False  # bookkeeping must tolerate a revoked row
+            assert authority == {
+                "expected_engage_attempt": _ENGAGE_ATTEMPT,
+                "expected_source_binding_sha256": _SOURCE.sha256,
+                "expected_staged_epoch": 5,
+            }
             return True
 
         db.update_ro_mount_baseline = AsyncMock(side_effect=_update_baseline)
@@ -759,10 +859,19 @@ class TestApplySuccess:
         svc.delete_blob = AsyncMock(side_effect=_delete_blob)
 
         async def _update_staging(
-            row_id, *, staged_epoch, staged_summary, require_active=True
+            row_id,
+            *,
+            staged_epoch,
+            staged_summary,
+            require_active=True,
+            **authority,
         ):
             call_order.append("update_staging")
             assert require_active is False
+            assert authority == {
+                "expected_engage_attempt": _ENGAGE_ATTEMPT,
+                "expected_source_binding_sha256": _SOURCE.sha256,
+            }
             return True
 
         db.update_ro_mount_staging = AsyncMock(side_effect=_update_staging)
@@ -824,7 +933,12 @@ class TestApplySuccess:
         assert result["overlay_reset"] is False
         # Staging still clears even though the overlay reset failed.
         db.update_ro_mount_staging.assert_awaited_once_with(
-            row["id"], staged_epoch=6, staged_summary=None, require_active=False
+            row["id"],
+            staged_epoch=6,
+            staged_summary=None,
+            require_active=False,
+            expected_engage_attempt=_ENGAGE_ATTEMPT,
+            expected_source_binding_sha256=_SOURCE.sha256,
         )
 
 
@@ -834,6 +948,30 @@ class TestApplySuccess:
 
 
 class TestReject:
+    @pytest.mark.asyncio
+    async def test_legacy_staging_without_source_remains_rejectable(self):
+        row = _mount_row(epoch=5)
+        row.pop("source_binding")
+        row.pop("source_binding_sha256")
+        row["staged_summary"].pop("source_binding")
+        row["staged_summary"].pop("source_binding_sha256")
+        db = _db(mount_row=row, thread_mounts=[])
+
+        result = await reject_staged_diff(
+            thread_id=THREAD_ID,
+            epoch=5,
+            postgres_db=db,
+            snapshot_service=_snapshot_service(),
+            reset_agent_overlay=AsyncMock(return_value=True),
+        )
+
+        assert result["rejected"] is True
+        assert db.update_ro_mount_staging.await_args.kwargs == {
+            "staged_epoch": 6,
+            "staged_summary": None,
+            "require_active": False,
+        }
+
     @pytest.mark.asyncio
     async def test_reject_clears_without_writes(self):
         row = _mount_row(epoch=5)
@@ -857,7 +995,12 @@ class TestReject:
         svc.delete_blob.assert_any_await(staging_tar_key(THREAD_ID))
         svc.delete_blob.assert_any_await(staging_manifest_key(THREAD_ID))
         db.update_ro_mount_staging.assert_awaited_once_with(
-            row["id"], staged_epoch=6, staged_summary=None, require_active=False
+            row["id"],
+            staged_epoch=6,
+            staged_summary=None,
+            require_active=False,
+            expected_engage_attempt=_ENGAGE_ATTEMPT,
+            expected_source_binding_sha256=_SOURCE.sha256,
         )
         db.update_ro_mount_baseline.assert_not_awaited()
         # Reject never resolves a mount/backend at all.
@@ -928,7 +1071,9 @@ class _RevokedAwareDB:
     async def list_thread_mounts(self, thread_id):
         return self._thread_mounts
 
-    async def update_ro_mount_baseline(self, row_id, baseline, *, require_active=True):
+    async def update_ro_mount_baseline(
+        self, row_id, baseline, *, require_active=True, **_authority
+    ):
         self.baseline_calls.append((row_id, baseline, require_active))
         if require_active and self._row.get("status") != "active":
             return False
@@ -936,7 +1081,13 @@ class _RevokedAwareDB:
         return True
 
     async def update_ro_mount_staging(
-        self, row_id, *, staged_epoch, staged_summary, require_active=True
+        self,
+        row_id,
+        *,
+        staged_epoch,
+        staged_summary,
+        require_active=True,
+        **_authority,
     ):
         self.staging_calls.append(
             {

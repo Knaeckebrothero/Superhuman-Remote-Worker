@@ -323,7 +323,38 @@ rotation cautions are documented in
 **Git, cloud, admin credentials:**
 - `GITEA_ADMIN_USER`, `GITEA_ADMIN_PASSWORD` (internal Gitea only)
 - `NEXTCLOUD_ADMIN_USER`, `NEXTCLOUD_ADMIN_PASSWORD`, `NEXTCLOUD_AGENT_USER`, `NEXTCLOUD_AGENT_PASSWORD` (internal Nextcloud only)
+- `NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY` when
+  `nextcloud.protectedEffect.enabled=true`. Use at least 32 bytes from a
+  dedicated random source. Chart-created mode generates and preserves it;
+  ExternalSecret mode reads it only from
+  `nextcloud.protectedEffect.hmacVaultPath`, while pre-created Secret mode
+  names a dedicated Secret with `hmacSecretName`.
 - `CLOUD_SERVICE_USER`, `CLOUD_SERVICE_PASSWORD` (the agent's account on whichever cloud backend is active)
+
+### Protected Nextcloud effect lane
+
+`agent.protectedCloudModeEnabled=true` with bundled Nextcloud requires
+`nextcloud.protectedEffect.enabled=true`. The chart then adds an internal-only
+Nginx Service and a dedicated Nextcloud PHP-FPM pool. The pool authenticates an
+exact attempt-scoped request and checks its absolute deadline in an
+`auto_prepend_file` before Nextcloud starts; FPM's
+`request_terminate_timeout` supplies the hard wall-clock handler bound. The
+ordinary Nextcloud Service remains the read and cleanup path.
+
+The chart derives one non-secret configuration digest from all timing values
+and the exact verifier/FPM/Nginx files, and supplies that digest to both the
+server capability and the orchestrator's retained backend authority. Do not
+manually set the URL or digest in Helm. Do not rotate
+`NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY` while any `cloud_ro_effect_intents` row is
+retained; drain/reconcile those attempts first and keep the old key resolvable
+for historical cleanup. Never place this key in the main application Vault
+path or Secret: dynamic agent Pods consume that shared bundle through
+`envFrom`, while only the orchestrator and bounded FPM pool may sign effects.
+The chart-created dedicated Secret is immutable and ESO uses CreatedOnce
+refresh semantics. External Nextcloud is fail-closed for protected mode:
+client or reverse-proxy timeouts are not an equivalent causal fence, so an
+external installation needs the same server-enforced capability/deadline/FPM
+contract before it can be admitted.
 
 **LLM provider keys** (any combination, depending on which providers you use):
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `TAVILY_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `UNPAYWALL_EMAIL`
@@ -613,6 +644,33 @@ helm upgrade srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
 
 The chart preserves `APP_ENCRYPTION_KEY` across upgrades when `secrets.create=true`
 via `lookup`. ESO mode reads from Vault on each refresh interval.
+
+### Migration 0185 pinned-runtime cutover
+
+Migration 0185 is not rolling-compatible with pre-0185 pinned-runtime writers.
+An ordinary upgrade leaves
+`orchestrator.runtimeAuthorityMigrationMaintenanceAck=false`: a new pod refuses
+the pending migration while the old ready pod remains available.
+
+For the one-time cutover, first put create, Resume, prepare, and input admission
+into maintenance. End or suspend all pinned sessions, wait for in-flight
+provisioning/engage/stage/terminal work, and remove old warm-pool and dedicated
+agent pods. Then upgrade with:
+
+```bash
+helm upgrade srw oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker \
+  --version <new-version> \
+  -n srw -f my-values.yaml \
+  --set orchestrator.runtimeAuthorityMigrationMaintenanceAck=true
+```
+
+That value supplies the exact migration acknowledgement and changes only the
+orchestrator Deployment to `Recreate`, preventing old/new orchestrator overlap.
+Do not use `helm upgrade --atomic` for this cutover. After migration 0185
+commits, never roll back to an image with old pinned-runtime writers; roll
+forward instead. Verify the migration ledger and lifecycle smoke tests before
+reopening admission, then clear the acknowledgement on a later all-new-version
+upgrade.
 
 ---
 

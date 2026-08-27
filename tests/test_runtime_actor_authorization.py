@@ -25,6 +25,8 @@ SUCCESSOR_THREAD = str(uuid4())
 USER_ID = str(uuid4())
 ACCESS_TOKEN = "sra_" + ("A" * 43)
 AGENT_ID = str(uuid4())
+RUNTIME_GENERATION = "22222222-2222-2222-2222-222222222222"
+RUNTIME_ATTACH_TOKEN = "33333333-3333-3333-3333-333333333333"
 
 
 def _request(*values: str) -> MagicMock:
@@ -288,6 +290,11 @@ class _CurrentStateDB:
         return {
             "id": thread_id,
             "status": "active",
+            "execution_lane": "pinned",
+            "runtime_generation": RUNTIME_GENERATION,
+            "agent_id": AGENT_ID,
+            "runtime_attach_token": RUNTIME_ATTACH_TOKEN,
+            "runtime_retirement_token": None,
             "project_id": PROJECT_A,
             "user_id": USER_ID,
             "metadata": {},
@@ -518,10 +525,11 @@ class _LivenessConn:
     fails a test instead of silently widening the slide.
     """
 
-    def __init__(self, grants):
+    def __init__(self, grants, *, exact_update_result="UPDATE 1"):
         self.grants = grants
         self.fetched: list[tuple] = []
         self.executed: list[tuple] = []
+        self.exact_update_result = exact_update_result
 
     @property
     def select_sql(self) -> str:
@@ -545,19 +553,38 @@ class _LivenessConn:
 
     async def execute(self, sql, *args):
         self.executed.append((sql, args))
-        grant_id, next_expires_at = args
+        if len(args) != 6:
+            raise AssertionError("liveness updates require exact pinned identity")
+        if self.exact_update_result != "UPDATE 1":
+            return self.exact_update_result
+
+        grant_id, next_expires_at, _, agent_id, _, _ = args
         for grant in self.grants:
-            if grant["id"] == grant_id and grant["revoked_at"] is None:
+            if (
+                grant["id"] == grant_id
+                and grant["revoked_at"] is None
+                and str(grant.get("agent_id") or "") == str(agent_id)
+            ):
                 grant["refresh_expires_at"] = next_expires_at
-        return "UPDATE 1"
+                return "UPDATE 1"
+        return "UPDATE 0"
 
 
 class _LivenessDB(_CurrentStateDB):
     """Durable state for ``_current_actor`` plus the grant table."""
 
-    def __init__(self, grants, *, thread_status: str = "active") -> None:
+    def __init__(
+        self,
+        grants,
+        *,
+        thread_status: str = "active",
+        exact_update_result: str = "UPDATE 1",
+    ) -> None:
         super().__init__()
-        self.conn = _LivenessConn(grants)
+        self.conn = _LivenessConn(
+            grants,
+            exact_update_result=exact_update_result,
+        )
         self.thread_status = thread_status
 
     async def get_thread(self, thread_id):
@@ -583,6 +610,7 @@ def _liveness_grant(
     expires_in_seconds: int,
     caller_kind: str = "officer",
     thread_id: str | None = OFFICER_THREAD,
+    agent_id: str | None = AGENT_ID,
     revoked: bool = False,
 ):
     from datetime import datetime, timedelta, timezone
@@ -596,9 +624,53 @@ def _liveness_grant(
         "project_role": "owner",
         "thread_id": thread_id,
         "officer_incarnation": 0,
+        "agent_id": agent_id,
         "refresh_expires_at": now + timedelta(seconds=expires_in_seconds),
         "revoked_at": now if revoked else None,
     }
+
+
+async def _slide_current_runtime(db) -> bool:
+    return await service.slide_thread_grant_on_liveness(
+        db,
+        OFFICER_THREAD,
+        agent_id=AGENT_ID,
+        session_runtime_generation=RUNTIME_GENERATION,
+        session_runtime_attach_token=RUNTIME_ATTACH_TOKEN,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_id", "runtime_generation", "runtime_attach_token"),
+    [
+        (None, RUNTIME_GENERATION, RUNTIME_ATTACH_TOKEN),
+        (AGENT_ID, None, RUNTIME_ATTACH_TOKEN),
+        (AGENT_ID, RUNTIME_GENERATION, None),
+    ],
+    ids=["missing-agent", "missing-generation", "missing-attach-token"],
+)
+async def test_heartbeat_never_slides_without_complete_pinned_identity(
+    agent_id,
+    runtime_generation,
+    runtime_attach_token,
+):
+    grant = _liveness_grant(expires_in_seconds=3600)
+    db = _LivenessDB([grant])
+    before = grant["refresh_expires_at"]
+
+    slid = await service.slide_thread_grant_on_liveness(
+        db,
+        OFFICER_THREAD,
+        agent_id=agent_id,
+        session_runtime_generation=runtime_generation,
+        session_runtime_attach_token=runtime_attach_token,
+    )
+
+    assert slid is False
+    assert grant["refresh_expires_at"] == before
+    assert db.conn.fetched == []
+    assert db.conn.executed == []
 
 
 @pytest.mark.asyncio
@@ -610,7 +682,7 @@ async def test_heartbeat_slides_a_grant_inside_the_throttle_window():
     db = _LivenessDB([grant])
     before = grant["refresh_expires_at"]
 
-    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+    slid = await _slide_current_runtime(db)
 
     assert slid is True
     assert grant["refresh_expires_at"] > before
@@ -618,12 +690,20 @@ async def test_heartbeat_slides_a_grant_inside_the_throttle_window():
         seconds=service.REFRESH_TTL_SECONDS - 60
     )
     assert len(db.conn.executed) == 1
-    assert "refresh_expires_at = $2" in db.conn.executed[0][0]
+    sql, args = db.conn.executed[0]
+    assert "refresh_expires_at = $2" in sql
     # Stamp what the refresh path stamps, so both slides look alike in the row.
-    assert "last_refreshed_at = now()" in db.conn.executed[0][0]
+    assert "last_refreshed_at = now()" in sql
     # Belt-and-braces against a grant expiring between the SELECT and the
     # UPDATE — even that race must not revive it.
-    assert "refresh_expires_at > now()" in db.conn.executed[0][0]
+    assert "refresh_expires_at > now()" in sql
+    assert "grant.agent_id = thread.agent_id" in sql
+    assert args[2:] == (
+        OFFICER_THREAD,
+        AGENT_ID,
+        RUNTIME_GENERATION,
+        RUNTIME_ATTACH_TOKEN,
+    )
 
 
 @pytest.mark.asyncio
@@ -634,7 +714,7 @@ async def test_heartbeat_does_not_write_when_the_grant_is_far_from_expiry():
     db = _LivenessDB([grant])
     before = grant["refresh_expires_at"]
 
-    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+    slid = await _slide_current_runtime(db)
 
     assert slid is False
     assert grant["refresh_expires_at"] == before
@@ -650,7 +730,7 @@ async def test_heartbeat_never_slides_a_worker_grant():
     db = _LivenessDB([grant])
     before = grant["refresh_expires_at"]
 
-    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+    slid = await _slide_current_runtime(db)
 
     assert slid is False
     assert grant["refresh_expires_at"] == before
@@ -666,7 +746,7 @@ async def test_heartbeat_never_slides_a_revoked_grant():
     db = _LivenessDB([grant])
     before = grant["refresh_expires_at"]
 
-    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+    slid = await _slide_current_runtime(db)
 
     assert slid is False
     assert grant["refresh_expires_at"] == before
@@ -683,7 +763,7 @@ async def test_heartbeat_never_revives_an_already_expired_grant():
     db = _LivenessDB([grant])
     before = grant["refresh_expires_at"]
 
-    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+    slid = await _slide_current_runtime(db)
 
     assert slid is False
     assert grant["refresh_expires_at"] == before
@@ -700,11 +780,56 @@ async def test_heartbeat_does_not_slide_a_grant_whose_thread_ended():
     db = _LivenessDB([grant], thread_status="ended")
     before = grant["refresh_expires_at"]
 
-    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+    slid = await _slide_current_runtime(db)
 
     assert slid is False
     assert grant["refresh_expires_at"] == before
     assert db.conn.executed == []
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_grant_slide_rechecks_exact_runtime_at_update_boundary():
+    """End->Resume after the heartbeat CAS cannot slide G2's grant."""
+
+    grant = _liveness_grant(expires_in_seconds=3600)
+    db = _LivenessDB([grant], exact_update_result="UPDATE 0")
+    before = grant["refresh_expires_at"]
+
+    slid = await service.slide_thread_grant_on_liveness(
+        db,
+        OFFICER_THREAD,
+        agent_id=AGENT_ID,
+        session_runtime_generation=RUNTIME_GENERATION,
+        session_runtime_attach_token=RUNTIME_ATTACH_TOKEN,
+    )
+
+    assert slid is False
+    assert grant["refresh_expires_at"] == before
+    sql, args = db.conn.executed[0]
+    assert "thread.runtime_generation = $5::uuid" in sql
+    assert "thread.runtime_retirement_token IS NULL" in sql
+    assert "thread.runtime_attach_token" in sql
+    assert "grant.agent_id = thread.agent_id" in sql
+    assert args[2:] == (
+        OFFICER_THREAD,
+        AGENT_ID,
+        RUNTIME_GENERATION,
+        RUNTIME_ATTACH_TOKEN,
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_never_slides_another_agents_grant():
+    grant = _liveness_grant(expires_in_seconds=3600, agent_id=str(uuid4()))
+    db = _LivenessDB([grant])
+    before = grant["refresh_expires_at"]
+
+    slid = await _slide_current_runtime(db)
+
+    assert slid is False
+    assert grant["refresh_expires_at"] == before
+    sql, _ = db.conn.executed[0]
+    assert "grant.agent_id = thread.agent_id" in sql
 
 
 @pytest.mark.asyncio
@@ -718,7 +843,7 @@ async def test_heartbeat_does_not_slide_a_grant_the_refresh_path_would_refuse():
         "incarnations": [{"thread_id": OFFICER_THREAD}],
     }
 
-    slid = await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+    slid = await _slide_current_runtime(db)
 
     assert slid is False
     assert db.conn.executed == []
@@ -750,7 +875,7 @@ async def test_a_quiet_officer_alive_for_days_never_loses_its_grant():
     for tick in range(1, ticks + 1):
         for row in db.conn.grants:
             row["refresh_expires_at"] -= timedelta(seconds=tick_seconds)
-        await service.slide_thread_grant_on_liveness(db, OFFICER_THREAD)
+        await _slide_current_runtime(db)
         elapsed_hours = tick * tick_seconds / 3600
         assert grant["refresh_expires_at"] > datetime.now(timezone.utc), (
             f"grant expired after {elapsed_hours:.1f}h of an alive, quiet "

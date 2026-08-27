@@ -554,6 +554,67 @@ class TestReleaseThreadWorkspace:
             "thread-inventory-host", 30022
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("terminal_status", ["released", "quarantined"])
+    async def test_terminal_mirror_is_reattested_against_exact_inventory(
+        self, terminal_status
+    ):
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
+        provisioner = DockerProvisioner()
+        db = AsyncMock()
+        db.get_thread.return_value = {
+            "metadata": {
+                "workspace_container": {
+                    "status": terminal_status,
+                    "host": "workspace-1",
+                    "port": 30022,
+                    "provisioner": "docker",
+                    "_docker_workspace_lease_id": "lease-1",
+                }
+            }
+        }
+        db.transition_docker_workspace_lease.return_value = None
+        provisioner._db = db
+
+        assert await provisioner.release_thread_workspace("thread-1") is False
+        db.transition_docker_workspace_lease.assert_awaited_once_with(
+            owner_kind="thread",
+            owner_id="thread-1",
+            expected_lease_id="lease-1",
+            expected_statuses={terminal_status},
+            updates={"status": terminal_status},
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_quarantine_refuses_released_mirror_without_inventory_effect(
+        self,
+    ):
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
+        provisioner = DockerProvisioner()
+        db = AsyncMock()
+        db.get_thread.return_value = {
+            "metadata": {
+                "workspace_container": {
+                    "status": "released",
+                    "host": "workspace-1",
+                    "port": 30022,
+                    "provisioner": "docker",
+                    "_docker_workspace_lease_id": "lease-1",
+                }
+            }
+        }
+        provisioner._db = db
+
+        assert (
+            await provisioner.release_thread_workspace(
+                "thread-1", force_quarantine=True
+            )
+            is False
+        )
+        db.transition_docker_workspace_lease.assert_not_awaited()
+
 
 class TestVMAssignment:
     """Tests for QEMU-in-Docker VM assignment."""

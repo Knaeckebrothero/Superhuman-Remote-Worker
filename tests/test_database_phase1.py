@@ -5,7 +5,7 @@ Tests the new PostgresDB and Neo4jDB classes.
 
 import json
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -17,7 +17,9 @@ class TestPostgresDB:
 
     def test_init_without_connection_string_uses_env(self):
         """Test that PostgresDB reads from environment."""
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        with patch.dict(
+            "os.environ", {"DATABASE_URL": "postgresql://test"}, clear=True
+        ):
             db = PostgresDB()
             assert db._connection_string == "postgresql://test"
             assert not db.is_connected
@@ -39,7 +41,9 @@ class TestPostgresDB:
 
     def test_namespaces_initialized(self):
         """Test that namespaces are initialized."""
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        with patch.dict(
+            "os.environ", {"DATABASE_URL": "postgresql://test"}, clear=True
+        ):
             db = PostgresDB()
             assert hasattr(db, "jobs")
             assert hasattr(db, "config_overrides")
@@ -63,19 +67,21 @@ class TestPostgresDB:
 
     @pytest.mark.asyncio
     async def test_connect_disconnect(self):
-        """Test connection lifecycle (requires database)."""
-        # Skip if no DATABASE_URL
-        import os
+        """Test connection lifecycle without reaching an ambient database."""
+        pool = MagicMock()
+        pool.close = AsyncMock()
+        create_pool = AsyncMock(return_value=pool)
 
-        if not os.getenv("DATABASE_URL"):
-            pytest.skip("DATABASE_URL not set")
+        with patch("src.database.postgres_db.asyncpg.create_pool", create_pool):
+            db = PostgresDB(connection_string="postgresql://test")
+            await db.connect()
+            assert db.is_connected
 
-        db = PostgresDB()
-        await db.connect()
-        assert db.is_connected
+            await db.close()
+            assert not db.is_connected
 
-        await db.close()
-        assert not db.is_connected
+        create_pool.assert_awaited_once()
+        pool.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_jobs_merge_context_strips_server_owned_pull_request(self):
@@ -109,10 +115,14 @@ class TestNeo4jDB:
 
     def test_connect_disconnect_no_driver(self):
         """Test connection lifecycle without actual Neo4j."""
-        db = Neo4jDB(uri="bolt://nonexistent", username="neo4j", password="test")
-        # Should return False if connection fails
-        result = db.connect()
-        assert isinstance(result, bool)
+        graph_database = MagicMock()
+        graph_database.driver.side_effect = RuntimeError("service unavailable")
+
+        with patch("src.database.neo4j_db.GraphDatabase", graph_database):
+            db = Neo4jDB(uri="bolt://nonexistent", username="neo4j", password="test")
+            # Should return False if connection fails.
+            result = db.connect()
+            assert result is False
 
         db.close()  # Should not raise
         assert not db.is_connected
@@ -123,7 +133,9 @@ class TestDependencyInjection:
 
     def test_postgres_instance_creation(self):
         """Test PostgresDB instance creation."""
-        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        with patch.dict(
+            "os.environ", {"DATABASE_URL": "postgresql://test"}, clear=True
+        ):
             db = PostgresDB()
             assert isinstance(db, PostgresDB)
 

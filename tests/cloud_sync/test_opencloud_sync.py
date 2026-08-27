@@ -60,10 +60,6 @@ def _token_response(token="abc123", expires_in=300):
 def sync_with_mocks(tmp_path: Path, monkeypatch):
     """OpenCloud sync with mocked httpx token fetch and webdav3 client."""
     fake_dav = _FakeDav()
-    monkeypatch.setattr(
-        "webdav3.client.Client",
-        MagicMock(return_value=fake_dav),
-    )
 
     fake_httpx = MagicMock()
     fake_httpx.post = AsyncMock(return_value=_token_response())
@@ -77,6 +73,14 @@ def sync_with_mocks(tmp_path: Path, monkeypatch):
         client_secret=SECRET,
     )
     sync._httpx = fake_httpx
+
+    async def fake_dav_client():
+        # Preserve token fetch/refresh behavior without importing the optional
+        # WebDAV transport merely to replace it with a fake.
+        await sync._get_token()
+        return fake_dav
+
+    monkeypatch.setattr(sync, "_dav", fake_dav_client)
     return sync, fake_dav, fake_httpx
 
 
@@ -258,10 +262,6 @@ def _routed_token_post():
 def impersonation_sync(tmp_path: Path, monkeypatch):
     """OpenCloud sync configured for user-impersonation mode."""
     fake_dav = _FakeDav()
-    monkeypatch.setattr(
-        "webdav3.client.Client",
-        MagicMock(return_value=fake_dav),
-    )
 
     fake_httpx = MagicMock()
     fake_httpx.post = _routed_token_post()
@@ -276,6 +276,14 @@ def impersonation_sync(tmp_path: Path, monkeypatch):
         target_user_sub=TARGET_SUB,
     )
     sync._httpx = fake_httpx
+
+    async def fake_dav_client():
+        # Keep the real service-token/exchange path while replacing only the
+        # optional WebDAV transport boundary.
+        await sync._get_token()
+        return fake_dav
+
+    monkeypatch.setattr(sync, "_dav", fake_dav_client)
     return sync, fake_dav, fake_httpx
 
 

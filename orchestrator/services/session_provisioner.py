@@ -18,6 +18,11 @@ from services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
 )
 from services.stateless_workspace_gate import stateless_session_workspace_check
+from services.session_runtime_admission import (
+    ThreadRuntimeAuthority,
+    same_thread_runtime_authority,
+    thread_runtime_authority,
+)
 from services.workspace_binding import ensure_virtual_thread_workspace_binding
 from services.workspace_lifecycle import (
     EnsureOutcome,
@@ -62,6 +67,8 @@ async def ensure_session_workspace(
     provisioner,
     suspension,
     _workspace_lifecycle_lock_held: bool = False,
+    expected_runtime_generation: str | None = None,
+    _pinned_runtime_lock_held: bool = False,
 ) -> Optional[EnsureResult]:
     """Idempotently drive a session's *container* workspace toward ready.
 
@@ -72,6 +79,31 @@ async def ensure_session_workspace(
     thread = await db.get_thread(thread_id)
     if not thread or thread.get("status") == "ended":
         return None
+
+    pinned_authority: ThreadRuntimeAuthority | None = None
+    if thread.get("execution_lane") == "pinned":
+        pinned_authority = thread_runtime_authority(thread)
+        if pinned_authority is None:
+            return None
+        if (
+            expected_runtime_generation is not None
+            and pinned_authority.generation != expected_runtime_generation
+        ):
+            return None
+        expected_runtime_generation = pinned_authority.generation
+        if not _pinned_runtime_lock_held:
+            lock_impl = getattr(type(db), "thread_advisory_lock", None)
+            if callable(lock_impl):
+                async with lock_impl(db, thread_id):
+                    return await ensure_session_workspace(
+                        thread_id,
+                        db=db,
+                        provisioner=provisioner,
+                        suspension=suspension,
+                        _workspace_lifecycle_lock_held=(_workspace_lifecycle_lock_held),
+                        expected_runtime_generation=expected_runtime_generation,
+                        _pinned_runtime_lock_held=True,
+                    )
 
     if thread.get("execution_lane") == "stateless":
         _, refusal = stateless_session_workspace_check(thread)
@@ -111,7 +143,10 @@ async def ensure_session_workspace(
             thread_id,
             vm_ctx.get("status"),
         )
-        await suspension.restore(WorkspaceOwner.session(thread_id))
+        await suspension.restore(
+            WorkspaceOwner.session(thread_id),
+            _pinned_runtime_lock_held=_pinned_runtime_lock_held,
+        )
         return EnsureResult(EnsureOutcome.PENDING, status="restoring")
 
     backend = _thread_backend(thread)
@@ -209,6 +244,20 @@ async def ensure_session_workspace(
             lifecycle_lock_held=_workspace_lifecycle_lock_held,
         ),
     )
+
+    if pinned_authority is not None:
+        fresh = await db.get_thread(thread_id)
+        if not same_thread_runtime_authority(fresh, pinned_authority):
+            fresh_metadata = _thread_metadata(fresh or {})
+            fresh_workspace = fresh_metadata.get("workspace_container") or {}
+            runtime_uid = fresh_workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+            if runtime_uid:
+                await provisioner.delete_workspace(
+                    WorkspaceOwner.session(thread_id),
+                    expected_runtime_incarnation=str(runtime_uid),
+                    wait_for_exact_absence=True,
+                )
+            return None
 
     if requires_runtime_attestation:
         # Terminal cleanup can race an already-started Kubernetes create. The

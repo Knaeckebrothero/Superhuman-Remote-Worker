@@ -63,6 +63,8 @@ class TestProtocolSatisfaction:
         assert isinstance(be.backend_id, str)
         assert isinstance(be.is_configured, bool)
         assert isinstance(be.is_initialized, bool)
+        assert be.backend_instance_id is None
+        assert be.installation_proof_sha256 is None
         assert isinstance(be.webdav_credentials, dict)
 
 

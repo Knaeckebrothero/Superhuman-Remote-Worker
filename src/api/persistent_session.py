@@ -192,6 +192,14 @@ class PersistentSession:
     # Set only by the stateless executor. It must reach RemoteBackend before
     # workspace/Git initialization can issue its first tmux command.
     shell_owner_token: Optional[int] = None
+    # Exact attach-time safety requirement.  When true, setup must establish
+    # the sole read-only Nextcloud lower and its capture overlay before tools
+    # or readiness can exist; pinned degraded-mount fallback is forbidden.
+    protected_cloud_required: bool = False
+    # New pinned-runtime contract. Physical workspaces must carry an exact
+    # generation/incarnation/SSH identity and terminal cleanup must produce the
+    # tier-specific local zero-writer proof before settlement can be ACKed.
+    pinned_runtime_identity_required: bool = False
 
     # Permission mode (switchable at runtime)
     permission_mode: str = "supervised"
@@ -266,11 +274,28 @@ class PersistentSession:
     # claim has no cloud target so pending rows for a removed/degraded mount
     # cannot be hidden merely by omitting the coordinator payload.
     cloud_sync_workspace_generation: str = ""
+    workspace_generation: str = ""
+    workspace_runtime_incarnation: str = ""
+    workspace_backend_tier: str = ""
+    # Backend constructed/connected before WorkspaceManager publication. A
+    # mid-setup failure must still retire it and prove zero writers before a
+    # failed-attach release rotates the runtime generation.
+    _workspace_backend_for_cleanup: Optional[Any] = None
     # Lazy rclone cloud mounts (initialized from cloud_mount payload)
     cloud_mount_manager: Optional[Any] = None
     cloud_mount_error: Optional[str] = None
     # Capture overlay stacked on the RO lower for protected sessions (B9)
     overlay_mount_manager: Optional[Any] = None
+    # Exact physical workspace identity that authorized this protected
+    # overlay. Retained for destructive reset fencing; never inferred from a
+    # mutable remote endpoint at decision time.
+    protected_workspace_generation: str = ""
+    protected_workspace_runtime_incarnation: str = ""
+    # Set only after strict protected cleanup proves that the dedicated
+    # workspace UID has no remaining writer (including detached browser/IDE
+    # and tag-cleared setsid descendants). The agent may echo this exact
+    # protocol in the final retirement ACK; absence always fails closed.
+    local_quiescence_protocol: str = ""
     # mount_id of the protected_lower rclone mount, read from the mount
     # payload at overlay-creation time (never re-derived) so the ENOTCONN
     # monitor can target restart_mount() at the right mount (Task 11).
@@ -278,6 +303,10 @@ class PersistentSession:
     # ENOTCONN watchdog task for the capture overlay; started alongside the
     # overlay mount, cancelled in cleanup() (Task 11).
     _cloud_overlay_monitor_task: Optional[asyncio.Task] = None
+    # Controller ownership (``active``) is not a liveness proof: a mounted
+    # overlay remains active while its dead lower returns ENOTCONN. Runtime
+    # admission additionally requires this exact post-probe health latch.
+    _protected_cloud_health_ready: bool = False
 
     # Datasource connections keyed by type (for ToolContext)
     datasources: Dict[str, Any] = field(default_factory=dict)
@@ -401,6 +430,13 @@ class PersistentSession:
         #    (officer_knowledge_plane.md §3.1, K1). Runs before any resource
         #    is created so a mis-bound officer fails the attach outright.
         self._enforce_officer_knowledge_invariant()
+        if self.protected_cloud_required and (
+            not isinstance(workspace_override, dict)
+            or workspace_override.get("backend") != "sandbox"
+        ):
+            raise WorkspaceUnavailableError(
+                "protected cloud requires a sandbox workspace"
+            )
 
         # 1. Create workspace (with optional remote backend + git)
         await self._setup_workspace(
@@ -618,6 +654,7 @@ class PersistentSession:
         base_path = os.getenv("WORKSPACE_PATH", "./workspace")
 
         effective_backend = (workspace_override or {}).get("backend") or ws_data.backend
+        self.workspace_backend_tier = str(effective_backend or "")
         remote_cfg = (workspace_override or {}).get("remote") or ws_data.remote
         workspace_generation = (workspace_override or {}).get("workspace_generation")
         workspace_runtime_incarnation = (workspace_override or {}).get(
@@ -626,6 +663,8 @@ class PersistentSession:
         workspace_ssh_host_key_fingerprint = (workspace_override or {}).get(
             "workspace_ssh_host_key_fingerprint"
         )
+        self.workspace_generation = str(workspace_generation or "")
+        self.workspace_runtime_incarnation = str(workspace_runtime_incarnation or "")
 
         # No-workspace tiers (virtual/none): no SSH workspace pod. Build the
         # lite backend directly, with git off (§8 — lite tiers have no git).
@@ -639,6 +678,7 @@ class PersistentSession:
                 mounts=(workspace_override or {}).get("mounts") or ws_data.mounts,
             )
             workspace_backend = create_lite_backend(lite_cfg, job_id=self.thread_id)
+            self._workspace_backend_for_cleanup = workspace_backend
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, workspace_backend.connect)
             # Setup asks the store "does this exist?" dozens of times about
@@ -670,14 +710,20 @@ class PersistentSession:
                 "No workspace configured. Persistent sessions require "
                 "an isolated workspace (sandbox or vm) with SSH credentials."
             )
-        if self.shell_owner_token is not None and (
+        physical_identity_required = bool(
+            self.shell_owner_token is not None
+            or self.protected_cloud_required
+            or self.pinned_runtime_identity_required
+        )
+        if physical_identity_required and (
             not workspace_generation
             or not workspace_runtime_incarnation
             or not workspace_ssh_host_key_fingerprint
         ):
             raise WorkspaceUnavailableError(
-                "A stateless physical session requires an orchestrator-attested "
-                "workspace backing, runtime incarnation, and SSH host identity"
+                "An exact pinned/stateless physical session requires an "
+                "orchestrator-attested workspace backing, runtime incarnation, "
+                "and SSH host identity"
             )
 
         from ..core.backends.remote import RemoteBackend
@@ -710,21 +756,21 @@ class PersistentSession:
                     ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
                     workspace_generation=(
-                        workspace_generation
-                        if self.shell_owner_token is not None
-                        else None
+                        workspace_generation if physical_identity_required else None
                     ),
                     runtime_incarnation=(
                         workspace_runtime_incarnation
-                        if self.shell_owner_token is not None
+                        if physical_identity_required
                         else None
                     ),
                     expected_host_key_fingerprint=(
                         workspace_ssh_host_key_fingerprint
-                        if self.shell_owner_token is not None
+                        if physical_identity_required
                         else None
                     ),
+                    workspace_tier=str(effective_backend),
                 )
+                self._workspace_backend_for_cleanup = workspace_backend
                 if self.shell_owner_token is not None:
                     workspace_backend.set_shell_owner_token(self.shell_owner_token)
                 # Only the internal attach API can attest that this exact SSH
@@ -755,11 +801,12 @@ class PersistentSession:
                 )
                 break
             except Exception as e:
-                if self.shell_owner_token is not None and isinstance(
+                if physical_identity_required and isinstance(
                     e, WorkspaceAuthenticationError
                 ):
                     raise WorkspaceUnavailableError(
-                        f"Stateless workspace SSH identity attestation failed: {e}"
+                        "Pinned/stateless workspace SSH identity attestation "
+                        f"failed: {e}"
                     ) from e
                 elapsed = time.monotonic() - start
                 if elapsed >= max_duration:
@@ -932,6 +979,13 @@ class PersistentSession:
         real directory probe and this method propagates failures for stateless
         claims so :meth:`setup` stops before shell/tool construction.
         """
+        self._protected_cloud_health_ready = False
+        if self.protected_cloud_required and not self._protected_cloud_config_valid(
+            cloud_mount_cfg
+        ):
+            raise WorkspaceUnavailableError(
+                "protected-cloud mount contract is missing or malformed"
+            )
         if not cloud_mount_cfg:
             return
         # Background officer (officer_knowledge_plane.md §4): the project/cloud
@@ -942,15 +996,19 @@ class PersistentSession:
         from ..tools.registry import officer_ceiling_active
 
         if officer_ceiling_active(getattr(self.config, "officer", None)):
+            if self.protected_cloud_required:
+                raise WorkspaceUnavailableError(
+                    "protected cloud is not supported for an officer runtime"
+                )
             logger.info(
                 "Background officer session: refusing project cloud mount "
                 "(object plane; officer_knowledge_plane.md §4)"
             )
             return
         if not self.workspace_manager:
-            if self.shell_owner_token is not None:
+            if self.shell_owner_token is not None or self.protected_cloud_required:
                 raise WorkspaceUnavailableError(
-                    "stateless cloud mount requires an attached workspace"
+                    "cloud mount requires an attached workspace"
                 )
             return
         try:
@@ -971,7 +1029,7 @@ class PersistentSession:
             self.cloud_mount_error = str(e)
             self.cloud_mount_manager = None
             logger.warning("Failed to start cloud mount manager: %s", e)
-            if self.shell_owner_token is not None:
+            if self.shell_owner_token is not None or self.protected_cloud_required:
                 raise
             return
 
@@ -1005,6 +1063,11 @@ class PersistentSession:
                         self._protected_mount_id
                     ),
                 )
+                if not await asyncio.to_thread(self.overlay_mount_manager.health_check):
+                    raise WorkspaceUnavailableError(
+                        "protected-cloud overlay failed its initial health proof"
+                    )
+                self._protected_cloud_health_ready = True
                 logger.info(
                     "Capture overlay mounted for protected session %s", self.thread_id
                 )
@@ -1015,7 +1078,29 @@ class PersistentSession:
                     name=f"cloud-overlay-monitor-{self.thread_id[:8]}",
                 )
             except Exception as e:
+                self._protected_cloud_health_ready = False
                 self.cloud_mount_error = f"overlay: {e}"
+                # ``mount()`` can publish the remote overlay successfully and
+                # then fail while creating the workspace-facing symlink.  The
+                # manager is therefore potentially live even though the call
+                # raised.  Retire that exact partially-started controller
+                # before dropping our only handle to it; otherwise cleanup of
+                # the lower alone leaves a resident overlay behind.
+                failed_overlay = self.overlay_mount_manager
+                if failed_overlay is not None:
+                    try:
+                        if self.shell_owner_token is not None:
+                            await asyncio.to_thread(
+                                failed_overlay.rollback_failed_mount
+                            )
+                        else:
+                            await asyncio.to_thread(failed_overlay.unmount)
+                    except Exception as overlay_close_err:
+                        logger.warning(
+                            "Error tearing down partial overlay after mount "
+                            "failure: %s",
+                            overlay_close_err,
+                        )
                 self.overlay_mount_manager = None
                 self._protected_mount_id = None
                 # Fail-safe: a protected session whose overlay failed to mount
@@ -1053,8 +1138,107 @@ class PersistentSession:
                         close_err,
                     )
                 self.cloud_mount_manager = None
-                if self.shell_owner_token is not None:
+                if self.shell_owner_token is not None or self.protected_cloud_required:
                     raise
+
+        if self.protected_cloud_required and not self.protected_cloud_ready():
+            self._protected_cloud_health_ready = False
+            try:
+                if self.overlay_mount_manager is not None:
+                    await asyncio.to_thread(self.overlay_mount_manager.unmount)
+            finally:
+                self.overlay_mount_manager = None
+                if self.cloud_mount_manager is not None:
+                    await self.cloud_mount_manager.aclose()
+                self.cloud_mount_manager = None
+                self._protected_mount_id = None
+            raise WorkspaceUnavailableError(
+                "protected-cloud lower and capture overlay are not both active"
+            )
+
+    @staticmethod
+    def _protected_cloud_config_valid(payload: Any) -> bool:
+        """Validate every protected field that can drive mount/delete work."""
+
+        if not isinstance(payload, dict):
+            return False
+        overlay = payload.get("overlay")
+        mounts = payload.get("mounts")
+        if (
+            type(payload.get("version")) is not int
+            or payload.get("version") != 1
+            or payload.get("driver") != "rclone"
+            or payload.get("protected") is not True
+            or payload.get("skip_workspace_links") is not True
+            or payload.get("fallback") is not False
+            or not isinstance(overlay, dict)
+            or overlay.get("lower") != "/cloud/lower"
+            or overlay.get("upper") != "/home/agent-host/.overlay/upper"
+            or overlay.get("work") != "/home/agent-host/.overlay/work"
+            or overlay.get("merged") != "/cloud/merged"
+            or not isinstance(overlay.get("quota_bytes"), int)
+            or isinstance(overlay.get("quota_bytes"), bool)
+            or overlay.get("quota_bytes") <= 0
+            or not isinstance(mounts, list)
+            or len(mounts) != 1
+        ):
+            return False
+        lower = mounts[0]
+        if not isinstance(lower, dict):
+            return False
+        source = lower.get("source")
+        source_config = source.get("config") if isinstance(source, dict) else None
+        auth = lower.get("auth")
+        return bool(
+            isinstance(lower.get("mount_id"), str)
+            and lower.get("mount_id")
+            and lower.get("mount_kind") == "protected_lower"
+            and lower.get("backend") == "nextcloud"
+            and lower.get("target_path") == "/cloud/lower"
+            and lower.get("workspace_name") == "lower"
+            and lower.get("access") == "read_only"
+            and isinstance(source, dict)
+            and source.get("type") == "webdav"
+            and isinstance(source_config, dict)
+            and source_config.get("vendor") == "nextcloud"
+            and isinstance(source_config.get("url"), str)
+            and source_config.get("url")
+            and isinstance(source_config.get("user"), str)
+            and source_config.get("user")
+            and isinstance(auth, dict)
+            and auth.get("type") == "basic"
+            and isinstance(auth.get("password"), str)
+            and auth.get("password")
+        )
+
+    def protected_cloud_ready(self) -> bool:
+        """Joined lower-controller + overlay readiness invariant."""
+
+        if not self.protected_cloud_required:
+            return True
+        manager = self.cloud_mount_manager
+        overlay = self.overlay_mount_manager
+        if (
+            manager is None
+            or getattr(manager, "active", False) is not True
+            or overlay is None
+            or getattr(overlay, "active", False) is not True
+            or not isinstance(self._protected_mount_id, str)
+            or not self._protected_mount_id
+            or self._protected_cloud_health_ready is not True
+        ):
+            return False
+        states = getattr(manager, "mounts", None)
+        if not isinstance(states, list) or len(states) != 1:
+            return False
+        state = states[0]
+        return bool(
+            getattr(state, "mount_id", None) == self._protected_mount_id
+            and getattr(state, "mount_kind", None) == "protected_lower"
+            and getattr(state, "target_path", None) == "/cloud/lower"
+            and getattr(overlay, "lower", None) == "/cloud/lower"
+            and getattr(overlay, "merged", None) == "/cloud/merged"
+        )
 
     async def _cloud_overlay_monitor_loop(self) -> None:
         """ENOTCONN watchdog for the protected overlay (design §11.6 #3).
@@ -1076,10 +1260,16 @@ class PersistentSession:
                 await asyncio.sleep(_CLOUD_OVERLAY_MONITOR_INTERVAL_SECONDS)
                 overlay = self.overlay_mount_manager
                 if overlay is None or not overlay.active:
+                    self._protected_cloud_health_ready = False
                     continue
                 healthy = await asyncio.to_thread(overlay.health_check)
                 if healthy:
+                    self._protected_cloud_health_ready = True
                     continue
+                # Close all runtime effect admission before a heal touches the
+                # lower. Overlay.active intentionally stays true while the
+                # resident controller is being repaired.
+                self._protected_cloud_health_ready = False
                 logger.warning(
                     "cloud overlay unhealthy (ENOTCONN) — healing thread=%s",
                     self.thread_id,
@@ -1102,9 +1292,15 @@ class PersistentSession:
                     overlay.heal,
                     lambda: cloud_mount_manager.restart_mount(protected_mount_id),
                 )
+                if not await asyncio.to_thread(overlay.health_check):
+                    raise WorkspaceUnavailableError(
+                        "protected-cloud overlay remained unhealthy after heal"
+                    )
+                self._protected_cloud_health_ready = True
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                self._protected_cloud_health_ready = False
                 logger.error("overlay heal failed (will retry next probe): %s", e)
 
     def reset_cloud_overlay(self) -> None:
@@ -1119,9 +1315,19 @@ class PersistentSession:
         overlay = self.overlay_mount_manager
         if overlay is None or not overlay.active:
             raise CloudOverlayUnavailable("no active cloud overlay")
-        overlay.reset_upper(
-            refresh_lower=lambda: self.cloud_mount_manager.refresh_vfs()
-        )
+        self._protected_cloud_health_ready = False
+        try:
+            overlay.reset_upper(
+                refresh_lower=lambda: self.cloud_mount_manager.refresh_vfs()
+            )
+            if not overlay.health_check():
+                raise CloudOverlayUnavailable(
+                    "cloud overlay remained unhealthy after reset"
+                )
+            self._protected_cloud_health_ready = True
+        except Exception:
+            self._protected_cloud_health_ready = False
+            raise
 
     def _scope_skills_for_tool_names(self, tool_names: List[str]) -> None:
         """Apply capability-aware optional-skill scope without mutating a base config."""
@@ -3059,6 +3265,12 @@ class PersistentSession:
         adopt or heal.  Pinned detach/drain and genuine thread end keep their
         historical destructive unmount behaviour.
         """
+        # Revoke input/provider/tool admission synchronously before any await
+        # or remote cleanup. The monitor/controller active flags may remain
+        # true until their teardown completes.
+        self._protected_cloud_health_ready = False
+        if not preserve_shell and not preserve_workspace_daemons:
+            self.local_quiescence_protocol = ""
         if preserve_workspace_daemons and self.shell_owner_token is None:
             # Cleanup must remain best-effort and complete, so do not raise in
             # this late teardown path.  Ignore the invalid disposition and
@@ -3075,12 +3287,32 @@ class PersistentSession:
         shell_retirement_error: Exception | None = None
         backend_retirement_error: Exception | None = None
         resident_cleanup_error: Exception | None = None
+        browser_shutdown_error: Exception | None = None
         local_handoff_error: Exception | None = None
         strict_local_handoff = bool(
             self.shell_owner_token is not None and preserve_workspace_daemons
         )
+        exact_pinned_terminal = bool(
+            (
+                self.pinned_runtime_identity_required is True
+                or self.protected_cloud_required is True
+            )
+            and self.shell_owner_token is None
+            and not preserve_shell
+            and not preserve_workspace_daemons
+        )
+        strict_pinned_physical_cleanup = bool(
+            exact_pinned_terminal
+            and self.workspace_backend_tier in {"sandbox", "vm", "remote"}
+        )
+        strict_sandbox_cleanup = bool(
+            strict_pinned_physical_cleanup and self.workspace_backend_tier == "sandbox"
+        )
+        strict_terminal_cleanup = bool(
+            self.shell_owner_token is not None or exact_pinned_terminal
+        )
         strict_resident_cleanup = bool(
-            self.shell_owner_token is not None and not preserve_workspace_daemons
+            strict_terminal_cleanup and not preserve_workspace_daemons
         )
         if self.workspace_manager:
             from ..core.virtual_dirs import unwrap_backend
@@ -3095,11 +3327,33 @@ class PersistentSession:
                 # may still hold this object in a thread; it must not submit
                 # another tmux command during the handoff.
                 retire_shell_owner()
+        elif self._workspace_backend_for_cleanup is not None:
+            backend_for_cleanup = self._workspace_backend_for_cleanup
+            retire_shell_owner = getattr(
+                backend_for_cleanup, "retire_shell_owner", None
+            )
+            if retire_shell_owner is not None:
+                retire_shell_owner()
 
         # Belt for partial-attach and non-standard cleanup call sites. The
         # ordinary app teardown invokes this before its journal closes; this
         # idempotent call ensures no alternate path can skip the RAM barrier.
         await self.quiesce_background_tasks()
+
+        # Ask the browser daemon to stop cleanly before the kernel-level UID
+        # sweep below. A lost/malformed daemon acknowledgement is not itself a
+        # zero-writer proof, so retain the error until strict shell retirement
+        # either proves the whole dedicated workspace UID empty or fails.
+        if strict_pinned_physical_cleanup and self.tool_context is not None:
+            try:
+                await self.tool_context.close_browser(strict=True)
+            except Exception as exc:
+                browser_shutdown_error = exc
+                logger.warning(
+                    "Protected browser shutdown was not acknowledged; "
+                    "requiring workspace UID zero proof: %s",
+                    exc,
+                )
 
         if self.tool_context is not None:
             self.tool_context.citation_verdict_callback = None
@@ -3114,7 +3368,10 @@ class PersistentSession:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                if strict_local_handoff:
+                if strict_resident_cleanup:
+                    resident_cleanup_error = exc
+                    logger.error("Workspace overlay monitor did not stop: %s", exc)
+                elif strict_local_handoff:
                     local_handoff_error = exc
                     logger.error("Stateless overlay monitor did not stop: %s", exc)
                 else:
@@ -3183,19 +3440,18 @@ class PersistentSession:
 
         if self.shell_manager and not preserve_shell:
             try:
-                self.shell_manager.cleanup()
+                if strict_pinned_physical_cleanup:
+                    self.shell_manager.cleanup(strict=True)
+                else:
+                    self.shell_manager.cleanup()
             except Exception as e:
-                if self.shell_owner_token is not None:
-                    # Stateless terminal teardown is an acknowledged remote
-                    # mutation, not best-effort local cleanup. Keep the backend
-                    # retryable and surface failure after the remaining local
-                    # resources have been made inert. A successor can also
-                    # reconcile the fenced record if lifecycle teardown removes
-                    # this runtime before the retry lands.
+                if strict_terminal_cleanup:
+                    # Stateless and protected terminal teardown are
+                    # acknowledged remote mutations, not best-effort local
+                    # cleanup. Keep the backend retryable and surface failure
+                    # after the remaining local resources have been made inert.
                     shell_retirement_error = e
-                    logger.error(
-                        "Stateless shell retirement was not acknowledged: %s", e
-                    )
+                    logger.error("Session shell retirement was not acknowledged: %s", e)
                 else:
                     logger.warning(f"Shell cleanup error: {e}")
         elif self.shell_manager:
@@ -3203,6 +3459,45 @@ class PersistentSession:
                 "Preserving remote shell for session handoff: thread=%s",
                 self.thread_id,
             )
+
+        if (
+            strict_sandbox_cleanup
+            and self.shell_manager is None
+            and backend_for_cleanup is not None
+            and shell_retirement_error is None
+        ):
+            try:
+                protocol = backend_for_cleanup.protected_workspace_zero_cleanup_strict()
+                if protocol != "workspace_process_zero_v1":
+                    raise WorkspaceUnavailableError(
+                        "Sandbox workspace process-zero proof is unavailable"
+                    )
+            except Exception as exc:
+                shell_retirement_error = exc
+
+        if strict_pinned_physical_cleanup and shell_retirement_error is None:
+            protocol = getattr(
+                backend_for_cleanup,
+                "terminal_local_quiescence_protocol",
+                None,
+            )
+            if strict_sandbox_cleanup and protocol == "workspace_process_zero_v1":
+                # The UID proof covers browser-exec, Chromium, code-server and
+                # detached writers even when their cooperative tag was
+                # cleared. It is strictly stronger than the daemon response.
+                self.local_quiescence_protocol = protocol
+                browser_shutdown_error = None
+            elif strict_sandbox_cleanup:
+                shell_retirement_error = WorkspaceUnavailableError(
+                    "Sandbox workspace process-zero proof is unavailable"
+                )
+            else:
+                # VM/remote process-zero belongs to the orchestrator actuator,
+                # which can prove the exact VM generation/UID after this live
+                # agent is absent. Never forge that stronger proof locally.
+                shell_retirement_error = WorkspaceUnavailableError(
+                    "Workspace actuator zero proof is required"
+                )
 
         # Close datasource connections
         if self.datasources or self._datasource_clients:
@@ -3225,7 +3520,7 @@ class PersistentSession:
         # transport reset and would let cancelled sync work reconnect after the
         # claim/session handoff.
         if (
-            self.workspace_manager
+            backend_for_cleanup is not None
             and resident_cleanup_error is None
             and local_handoff_error is None
         ):
@@ -3251,12 +3546,13 @@ class PersistentSession:
             elif hasattr(backend, "retire"):
                 try:
                     backend.retire()
+                    self._workspace_backend_for_cleanup = None
                     logger.info("Remote workspace backend retired")
                 except Exception as e:
-                    if self.shell_owner_token is not None:
+                    if strict_terminal_cleanup:
                         backend_retirement_error = e
                         logger.error(
-                            "Stateless backend retirement was not acknowledged: %s",
+                            "Session backend retirement was not acknowledged: %s",
                             e,
                         )
                     else:
@@ -3267,23 +3563,74 @@ class PersistentSession:
                         backend.disconnect()
                         logger.info("Remote workspace backend disconnected")
                 except Exception as e:
-                    if self.shell_owner_token is not None:
+                    if strict_terminal_cleanup:
                         backend_retirement_error = e
                         logger.error(
-                            "Stateless backend disconnect was not acknowledged: %s",
+                            "Session backend disconnect was not acknowledged: %s",
                             e,
                         )
                     else:
                         logger.warning(f"Backend disconnect error: {e}")
 
+        if (
+            exact_pinned_terminal
+            and self.workspace_backend_tier in {"virtual", "none"}
+            and shell_retirement_error is None
+            and browser_shutdown_error is None
+            and resident_cleanup_error is None
+            and local_handoff_error is None
+            and backend_retirement_error is None
+        ):
+            # No external workspace exists. The common teardown has already
+            # joined the loop, watchdogs, side tasks and ordered event writer;
+            # cleanup's own background-task and backend retirement is the final
+            # local actor proof.
+            self.local_quiescence_protocol = "agent_runtime_zero_v1"
+
+        if (
+            exact_pinned_terminal
+            and not self.workspace_backend_tier
+            and backend_for_cleanup is None
+            and self.shell_manager is None
+            and self.overlay_mount_manager is None
+            and self.cloud_mount_manager is None
+            and shell_retirement_error is None
+            and browser_shutdown_error is None
+            and resident_cleanup_error is None
+            and local_handoff_error is None
+            and backend_retirement_error is None
+        ):
+            # Attach failed before any external workspace/backend was
+            # constructed. The already-joined agent tasks/writer are the
+            # complete effect surface for this partial delivery.
+            self.local_quiescence_protocol = "agent_runtime_zero_v1"
+
+        if (
+            exact_pinned_terminal
+            and not self.local_quiescence_protocol
+            and shell_retirement_error is None
+            and browser_shutdown_error is None
+            and resident_cleanup_error is None
+            and local_handoff_error is None
+            and backend_retirement_error is None
+        ):
+            shell_retirement_error = WorkspaceUnavailableError(
+                "No trusted local quiescence protocol is available for this "
+                "workspace tier"
+            )
+
         logger.info(f"PersistentSession cleaned up: thread={self.thread_id}")
         if shell_retirement_error is not None:
             raise WorkspaceUnavailableError(
-                "Stateless session shell retirement remains unacknowledged"
+                "Session shell retirement remains unacknowledged"
             ) from shell_retirement_error
+        if browser_shutdown_error is not None:
+            raise WorkspaceUnavailableError(
+                "Workspace browser retirement remains unacknowledged"
+            ) from browser_shutdown_error
         if resident_cleanup_error is not None:
             raise WorkspaceUnavailableError(
-                "Stateless workspace residents remain active"
+                "Workspace residents remain active"
             ) from resident_cleanup_error
         if local_handoff_error is not None:
             raise WorkspaceUnavailableError(
@@ -3291,5 +3638,5 @@ class PersistentSession:
             ) from local_handoff_error
         if backend_retirement_error is not None:
             raise WorkspaceUnavailableError(
-                "Stateless session backend retirement remains unacknowledged"
+                "Session backend retirement remains unacknowledged"
             ) from backend_retirement_error

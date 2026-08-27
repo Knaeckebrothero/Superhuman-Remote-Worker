@@ -305,6 +305,8 @@ class TestBroadcastCursor:
             epoch=3,
             on_terminal_failure=lambda _events, _reason: None,
             pinned_agent_id=agent_id,
+            pinned_runtime_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            pinned_runtime_attach_token="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         )
         writer.start()
         mod._event_writer = writer
@@ -523,6 +525,162 @@ class TestOrderedPersistentEventWriter:
         pool.acquire.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_pinned_flush_locks_exact_live_runtime_then_reciprocal_agent(self):
+        import src.api.persistent_app as mod
+
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        agent_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        generation = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        attach_token = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        calls = []
+
+        class _Txn:
+            async def __aenter__(self):
+                calls.append(("begin", ()))
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                calls.append(("commit", ()))
+                return False
+
+        class _Conn:
+            def transaction(self):
+                return _Txn()
+
+            async def fetchval(self, sql, *args):
+                calls.append((sql, args))
+                return 1
+
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=self._pool(_Conn()),
+            thread_id=thread_id,
+            epoch=4,
+            on_terminal_failure=lambda _events, _reason: None,
+            pinned_agent_id=agent_id,
+            pinned_runtime_generation=generation,
+            pinned_runtime_attach_token=attach_token,
+        )
+
+        inserted = await writer._write_batch(
+            [mod._QueuedPersistentEvent(4, 1, "token", {"content": "one"})]
+        )
+
+        assert inserted == 1
+        assert calls[0][0] == "begin"
+        assert "FROM threads" in calls[1][0]
+        assert "runtime_retirement_token IS NULL" in calls[1][0]
+        assert (
+            "status IN ('created', 'active', 'awaiting_user', 'suspended')"
+            in calls[1][0]
+        )
+        assert "events_epoch = $5" in calls[1][0]
+        assert "FOR NO KEY UPDATE" in calls[1][0]
+        assert calls[1][1] == (thread_id, agent_id, generation, attach_token, 4)
+        assert "FROM agents" in calls[2][0]
+        assert calls[2][1] == (agent_id, thread_id)
+        assert "INSERT INTO thread_events" in calls[3][0]
+        assert calls[4][0] == "commit"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failed_fence", ["thread", "agent"])
+    async def test_pinned_flush_rejects_retired_or_nonreciprocal_runtime(
+        self, failed_fence
+    ):
+        import src.api.persistent_app as mod
+
+        calls = []
+
+        class _Txn:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                return False
+
+        class _Conn:
+            def transaction(self):
+                return _Txn()
+
+            async def fetchval(self, sql, *args):
+                calls.append((sql, args))
+                if failed_fence == "thread" and "FROM threads" in sql:
+                    return None
+                if failed_fence == "agent" and "FROM agents" in sql:
+                    return None
+                if "INSERT INTO thread_events" in sql:
+                    raise AssertionError("INSERT must not execute after a failed fence")
+                return 1
+
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=self._pool(_Conn()),
+            thread_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            epoch=4,
+            on_terminal_failure=lambda _events, _reason: None,
+            pinned_agent_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            pinned_runtime_generation="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            pinned_runtime_attach_token="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        )
+
+        assert (
+            await writer._write_batch(
+                [mod._QueuedPersistentEvent(4, 1, "token", {"content": "late"})]
+            )
+            == 0
+        )
+        assert not any("INSERT INTO thread_events" in sql for sql, _args in calls)
+
+    @pytest.mark.asyncio
+    async def test_pinned_flush_allows_exact_suspended_attach(self):
+        """A resumable suspended row may journal before its active CAS.
+
+        Attach starts the ordered writer before the final ``active`` status
+        transition and can emit protected workspace diagnostics in that
+        interval.  The retirement token and exact reciprocal runtime identity
+        remain the authority fence; excluding ``suspended`` would terminally
+        close the writer on its first valid frame.
+        """
+        import src.api.persistent_app as mod
+
+        seen_sql: list[str] = []
+
+        class _Txn:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                return False
+
+        class _Conn:
+            def transaction(self):
+                return _Txn()
+
+            async def fetchval(self, sql, *_args):
+                seen_sql.append(sql)
+                return 1
+
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=self._pool(_Conn()),
+            thread_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            epoch=4,
+            on_terminal_failure=lambda _events, _reason: None,
+            pinned_agent_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            pinned_runtime_generation="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            pinned_runtime_attach_token="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        )
+
+        assert (
+            await writer._write_batch(
+                [mod._QueuedPersistentEvent(4, 1, "status", {"state": "creating"})]
+            )
+            == 1
+        )
+        assert (
+            "status IN ('created', 'active', 'awaiting_user', 'suspended')"
+            in seen_sql[0]
+        )
+        assert any("INSERT INTO thread_events" in sql for sql in seen_sql)
+
+    @pytest.mark.asyncio
     async def test_canvas_failure_retries_then_sends_unjournaled_reconcile(self):
         import src.api.persistent_app as mod
 
@@ -616,13 +774,23 @@ class TestInterruptModeSelection:
         mod._loop_interrupt_flag = None
         mod._tool_inflight = False
 
-    def test_loop_on_tool_start_sets_inflight(self):
+    def test_loop_on_tool_start_does_not_claim_execution_inflight(self):
         import src.api.persistent_app as mod
 
         async def _run():
             await mod._loop_on_tool_start("read_file", {"path": "/x"}, "tc1")
 
         asyncio.run(_run())
+        assert mod._tool_inflight is False
+
+    def test_loop_on_tool_execution_start_sets_inflight_at_effect_boundary(self):
+        import src.api.persistent_app as mod
+
+        async def _run():
+            await mod._loop_on_tool_execution_start("read_file", "tc1")
+
+        with patch.object(mod, "_protected_cloud_runtime_ready", return_value=True):
+            asyncio.run(_run())
         assert mod._tool_inflight is True
 
     def test_loop_on_tool_result_clears_inflight(self):
@@ -650,7 +818,11 @@ class TestPersistentGraphInterruptModes:
 
     @pytest.mark.asyncio
     async def test_hard_interrupt_drops_partial_aimessage(self):
-        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+        from langchain_core.messages import (
+            AIMessage,
+            HumanMessage,
+            SystemMessage,
+        )
 
         from src.persistent_graph import PersistentLoopCallbacks, _execute_turn
 
@@ -712,11 +884,16 @@ class TestPersistentGraphInterruptModes:
 
     @pytest.mark.asyncio
     async def test_graceful_interrupt_preserves_partial_aimessage(self):
-        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+        from langchain_core.messages import (
+            AIMessage,
+            AIMessageChunk,
+            HumanMessage,
+            SystemMessage,
+        )
 
         from src.persistent_graph import PersistentLoopCallbacks, _execute_turn
 
-        chunk1 = AIMessage(content="Tool calling now")
+        chunk1 = AIMessageChunk(content="Tool calling now")
 
         async def _astream(msgs, **kw):
             yield chunk1
@@ -725,16 +902,26 @@ class TestPersistentGraphInterruptModes:
         llm.reasoning = None
         llm.astream = _astream
 
-        # Site 1: None → enter the LLM call.
-        # Site 2 mid-stream: "graceful" → break, but keep the partial.
-        interrupt_seq = [None, "graceful", None, None]
+        # Arm only after the first streamed token. Provider-admission gained
+        # additional pre-stream interrupt probes, so a positional call-count
+        # fixture would test the old topology rather than the semantic seam.
+        token_streamed = False
+        interrupt_consumed = False
+
+        async def _on_token(_text):
+            nonlocal token_streamed
+            token_streamed = True
 
         def _check_interrupt():
-            return interrupt_seq.pop(0) if interrupt_seq else None
+            nonlocal interrupt_consumed
+            if token_streamed and not interrupt_consumed:
+                interrupt_consumed = True
+                return "graceful"
+            return None
 
         callbacks = PersistentLoopCallbacks(
             get_user_input=AsyncMock(return_value="hello"),
-            on_token=AsyncMock(),
+            on_token=AsyncMock(side_effect=_on_token),
             on_thinking=AsyncMock(),
             on_tool_start=AsyncMock(),
             on_tool_result=AsyncMock(),
@@ -878,8 +1065,11 @@ class TestAgentRestInputEndpointsNoSession:
 
         # Stand up a minimal session so we get past the 503 gate.
         mod._session = MagicMock()
+        mod._session.protected_cloud_required = False
         mod._loop_user_queue = _asyncio.Queue()
         mod._loop_last_user_content = [""]
+        mod._retirement_admission_identity = None
+        mod._termination_admission_fenced = False
 
         try:
             app = create_persistent_app("interactive")
@@ -906,10 +1096,17 @@ class TestAgentRestInputEndpointsNoSession:
 
         import src.api.persistent_app as mod
 
+        exact_session_fingerprint = "sha256:" + ("a" * 64)
+
         async def receive():
             return {
                 "type": "http.request",
-                "body": json.dumps({"content": "hello from REST"}).encode(),
+                "body": json.dumps(
+                    {
+                        "content": "hello from REST",
+                        "session_identity_fingerprint": exact_session_fingerprint,
+                    }
+                ).encode(),
                 "more_body": False,
             }
 
@@ -954,6 +1151,7 @@ class TestAgentRestInputEndpointsNoSession:
         mod._loop_last_user_content = [""]
         mod._hard_interrupt_event = asyncio.Event()
         mod._input_runtime_generation = str(uuid4())
+        mod._session_runtime_attach_token = str(uuid4())
         mod._queued_input_claims.clear()
         mod._session = SimpleNamespace(
             llm_with_tools=object(),
@@ -991,6 +1189,11 @@ class TestAgentRestInputEndpointsNoSession:
                 patch.object(mod, "_early_title_from_prompt", new=AsyncMock()),
                 patch.object(
                     mod,
+                    "_current_pinned_session_identity_fingerprint",
+                    return_value=exact_session_fingerprint,
+                ),
+                patch.object(
+                    mod,
                     "_orchestrator_client",
                     new=SimpleNamespace(agent_id=str(uuid4())),
                 ),
@@ -1014,6 +1217,7 @@ class TestAgentRestInputEndpointsNoSession:
             mod._loop_user_queue = None
             mod._hard_interrupt_event = None
             mod._input_runtime_generation = None
+            mod._session_runtime_attach_token = None
             mod._queued_input_claims.clear()
 
 

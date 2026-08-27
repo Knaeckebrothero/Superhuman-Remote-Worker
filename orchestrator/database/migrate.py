@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import hashlib
 import logging
+import os
+import re
 import time
 from pathlib import Path
 
@@ -28,21 +32,34 @@ LOCK_ID = 0x5352575F4D4947  # "SRW_MIG" packed into int64.
 # this one serializes each non-transactional operation through its ledger write.
 NOTX_LOCK_ID = 0x5352575F4E5458  # "SRW_NOTX" packed into int64.
 NOTX_SUFFIX = ".notx.sql"
+MAINTENANCE_GATES_ENV = "MIGRATION_MAINTENANCE_GATES"
+_MAINTENANCE_GATE_RE = re.compile(
+    r"^--[ \t]*maintenance-gate:[ \t]*([a-z0-9][a-z0-9-]*)[ \t]*$",
+    re.MULTILINE,
+)
+_MAINTENANCE_GATE_DECL_RE = re.compile(
+    r"^[ \t]*--[ \t]*maintenance-gate:[^\r\n]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_STANDARD_STRINGS_SETTING_RE = re.compile(
+    r"\bstandard_conforming_strings\b",
+    re.IGNORECASE,
+)
 
 log = logging.getLogger(__name__)
 
 DDL = """
-CREATE TABLE IF NOT EXISTS schema_migrations (
+CREATE TABLE IF NOT EXISTS public.schema_migrations (
     filename       TEXT         PRIMARY KEY,
     checksum       TEXT         NOT NULL,
-    applied_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    applied_at     TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
     applied_by     TEXT         NOT NULL DEFAULT current_user,
     execution_ms   INTEGER      NOT NULL,
     success        BOOLEAN      NOT NULL DEFAULT TRUE,
     error          TEXT
 );
 CREATE INDEX IF NOT EXISTS schema_migrations_dirty_idx
-    ON schema_migrations(filename) WHERE success = FALSE;
+    ON public.schema_migrations(filename) WHERE success = FALSE;
 """
 
 # Columns the runner needs on schema_migrations. ``CREATE TABLE IF NOT
@@ -77,6 +94,298 @@ def _is_notx(path: Path) -> bool:
     return path.name.endswith(NOTX_SUFFIX)
 
 
+def _maintenance_gate(sql: str) -> str | None:
+    """Return the one operator acknowledgement required by a migration.
+
+    Most migrations must remain rolling-compatible and have no gate. A rare
+    drained-window migration declares an exact, reviewable header such as::
+
+        -- maintenance-gate: pinned-runtime-authority-v1
+
+    The runner checks the gate while holding the migration advisory lock. A
+    from-zero migration chain is inherently free of old application writers;
+    an existing chain requires the named acknowledgement in
+    ``MIGRATION_MAINTENANCE_GATES``. Multiple declarations are rejected rather
+    than silently weakening an operator contract.
+    """
+
+    declarations = _MAINTENANCE_GATE_DECL_RE.findall(sql)
+    if not declarations:
+        return None
+    if len(declarations) != 1:
+        raise RuntimeError("migration declares more than one maintenance gate")
+    match = _MAINTENANCE_GATE_RE.fullmatch(declarations[0])
+    if match is None:
+        raise RuntimeError("migration declares a malformed maintenance gate")
+    return match.group(1)
+
+
+def _acknowledged_maintenance_gates() -> frozenset[str]:
+    return frozenset(
+        item.strip()
+        for item in os.getenv(MAINTENANCE_GATES_ENV, "").split(",")
+        if item.strip()
+    )
+
+
+def _postgres_identifier_continuation(char: str) -> bool:
+    """Match PostgreSQL's unquoted identifier continuation characters.
+
+    PostgreSQL's scanner accepts every high-bit byte in an identifier, not
+    only Unicode characters Python classifies as alphanumeric. Lexer boundary
+    decisions must therefore treat any decoded non-ASCII code point as an
+    identifier continuation too.
+    """
+
+    return bool(
+        char
+        and (
+            char in {"_", "$"}
+            or (char.isascii() and char.isalnum())
+            or ord(char) >= 128
+        )
+    )
+
+
+def _top_level_sql_statements(sql: str) -> list[tuple[int, int, int]]:
+    """Return ``(span start, code start, span end)`` for SQL statements.
+
+    Migration files contain PL/pgSQL bodies, comments, and quoted strings, so
+    looking for ``BEGIN;``/``COMMIT;`` with a line regex is not safe. This
+    deliberately small lexer finds only semicolons in the outer SQL stream;
+    dollar-quoted function bodies and quoted/commented text remain opaque.
+    """
+
+    statements: list[tuple[int, int, int]] = []
+    statement_start = 0
+    length = len(sql)
+    index = 0
+    state = "normal"
+    block_depth = 0
+    dollar_delimiter = ""
+    single_quote_backslash_escapes = False
+
+    while index < length:
+        char = sql[index]
+        following = sql[index + 1] if index + 1 < length else ""
+
+        if state == "line_comment":
+            if char in "\r\n":
+                state = "normal"
+            index += 1
+            continue
+        if state == "block_comment":
+            if char == "/" and following == "*":
+                block_depth += 1
+                index += 2
+                continue
+            if char == "*" and following == "/":
+                block_depth -= 1
+                index += 2
+                if block_depth == 0:
+                    state = "normal"
+                continue
+            index += 1
+            continue
+        if state == "single_quote":
+            if single_quote_backslash_escapes and char == "\\":
+                index += 2
+                continue
+            if char == "'":
+                if following == "'":
+                    index += 2
+                    continue
+                state = "normal"
+            index += 1
+            continue
+        if state == "double_quote":
+            if char == '"':
+                if following == '"':
+                    index += 2
+                    continue
+                state = "normal"
+            index += 1
+            continue
+        if state == "dollar_quote":
+            if sql.startswith(dollar_delimiter, index):
+                index += len(dollar_delimiter)
+                state = "normal"
+            else:
+                index += 1
+            continue
+
+        if char == "-" and following == "-":
+            state = "line_comment"
+            index += 2
+            continue
+        if char == "/" and following == "*":
+            state = "block_comment"
+            block_depth = 1
+            index += 2
+            continue
+        if char == "'":
+            # With PostgreSQL's default ``standard_conforming_strings=on``, a
+            # backslash is ordinary text in ``'...'`` and must not hide a
+            # following quote/semicolon from this lexer. Only an explicit
+            # E-string gives backslash its escape meaning. The prefix must be
+            # a standalone token rather than the tail of an identifier.
+            single_quote_backslash_escapes = bool(
+                index > 0
+                and sql[index - 1] in {"e", "E"}
+                and (index < 2 or not _postgres_identifier_continuation(sql[index - 2]))
+            )
+            state = "single_quote"
+            index += 1
+            continue
+        if char == '"':
+            state = "double_quote"
+            index += 1
+            continue
+        if char == "$":
+            delimiter = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", sql[index:])
+            # PostgreSQL requires whitespace/punctuation before a dollar-
+            # quoted string; otherwise ``prefix$tag$`` is one unquoted
+            # identifier. Treating the identifier tail as a delimiter could
+            # hide a later transaction-control statement from this lexer.
+            if delimiter is not None and (
+                index == 0 or not _postgres_identifier_continuation(sql[index - 1])
+            ):
+                dollar_delimiter = delimiter.group(0)
+                state = "dollar_quote"
+                index += len(dollar_delimiter)
+                continue
+        if char == ";":
+            statement_end = index + 1
+            code_start = _leading_sql_code_offset(sql, statement_start, statement_end)
+            if code_start < statement_end:
+                statements.append((statement_start, code_start, statement_end))
+            statement_start = statement_end
+        index += 1
+
+    code_start = _leading_sql_code_offset(sql, statement_start, length)
+    if code_start < length:
+        statements.append((statement_start, code_start, length))
+    return statements
+
+
+def _leading_sql_code_offset(sql: str, start: int, end: int) -> int:
+    """Skip whitespace and outer SQL comments inside one statement span."""
+
+    index = start
+    while index < end:
+        if sql[index].isspace():
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            carriage_return = sql.find("\r", index + 2, end)
+            line_feed = sql.find("\n", index + 2, end)
+            newline_candidates = tuple(
+                position for position in (carriage_return, line_feed) if position >= 0
+            )
+            if not newline_candidates:
+                return end
+            newline = min(newline_candidates)
+            index = newline + 1
+            if sql[newline] == "\r" and index < end and sql[index] == "\n":
+                index += 1
+            continue
+        if sql.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < end and depth:
+                if sql.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif sql.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                raise RuntimeError("migration contains an unterminated SQL comment")
+            continue
+        break
+    return index
+
+
+def _leading_sql_keywords(sql: str, *, limit: int = 2) -> tuple[str, ...]:
+    """Return leading unquoted keywords with SQL comments as separators."""
+
+    keywords: list[str] = []
+    index = 0
+    length = len(sql)
+    while len(keywords) < limit:
+        index = _leading_sql_code_offset(sql, index, length)
+        if index >= length or not (sql[index].isascii() and sql[index].isalpha()):
+            break
+        start = index
+        index += 1
+        while index < length and _postgres_identifier_continuation(sql[index]):
+            index += 1
+        token = sql[start:index]
+        if not token.isascii():
+            break
+        keywords.append(token.upper())
+    return tuple(keywords)
+
+
+def _is_transaction_control_statement(sql: str) -> bool:
+    keywords = _leading_sql_keywords(sql)
+    if not keywords:
+        return False
+    if keywords[0] in {"BEGIN", "COMMIT", "END", "ROLLBACK", "ABORT"}:
+        return True
+    return keywords[:2] in {("START", "TRANSACTION"), ("PREPARE", "TRANSACTION")}
+
+
+def _runner_owned_transaction_sql(sql: str) -> str:
+    """Remove a reviewed file wrapper so the runner owns the only transaction.
+
+    Historical migrations include a top-level ``BEGIN; ... COMMIT;`` wrapper.
+    Sending those bytes inside ``asyncpg.Connection.transaction()`` lets the
+    file's COMMIT prematurely commit both DDL and the xact advisory lock before
+    the runner records its ledger row. Strip only an exact whole-file wrapper;
+    reject every other outer transaction-control shape before executing SQL.
+    """
+
+    if _STANDARD_STRINGS_SETTING_RE.search(sql):
+        raise RuntimeError(
+            "migration may not change the runner-owned "
+            "standard_conforming_strings setting"
+        )
+
+    statements = _top_level_sql_statements(sql)
+    controls: list[tuple[int, int, int, str]] = []
+    for start, code_start, end in statements:
+        code = sql[code_start:end].strip()
+        if _leading_sql_keywords(code)[:2] == ("RESET", "ALL"):
+            raise RuntimeError(
+                "migration may not reset all runner-owned session settings"
+            )
+        if _is_transaction_control_statement(code):
+            controls.append((start, code_start, end, code))
+    if not controls:
+        return sql
+
+    first = statements[0]
+    last = statements[-1]
+    if (
+        len(controls) != 2
+        or controls[0][:3] != first
+        or controls[1][:3] != last
+        or controls[0][3].upper() != "BEGIN;"
+        or controls[1][3].upper() != "COMMIT;"
+    ):
+        raise RuntimeError(
+            "transactional migration contains transaction control outside "
+            "an exact whole-file BEGIN;/COMMIT; wrapper"
+        )
+
+    _, begin_code_start, begin_end, _ = controls[0]
+    commit_start, _, commit_end, _ = controls[1]
+    return sql[:begin_code_start] + sql[begin_end:commit_start] + sql[commit_end:]
+
+
 async def _acquire_notx_lock(conn: asyncpg.Connection) -> None:
     """Acquire the session lock without blocking a concurrent-index build.
 
@@ -85,8 +394,73 @@ async def _acquire_notx_lock(conn: asyncpg.Connection) -> None:
     for the advisory lock, producing a deadlock. Short try-lock statements end
     before the build needs to advance to its next phase.
     """
-    while not await conn.fetchval("SELECT pg_try_advisory_lock($1)", NOTX_LOCK_ID):
+    while not await conn.fetchval(
+        "SELECT pg_catalog.pg_try_advisory_lock($1)", NOTX_LOCK_ID
+    ):
         await asyncio.sleep(0.05)
+
+
+async def _force_runner_session_settings(conn: asyncpg.Connection) -> None:
+    """Install the parser/schema settings assumed by the migration runner."""
+
+    await conn.execute(
+        "SET SESSION standard_conforming_strings = on; "
+        # Leaving pg_catalog implicit makes PostgreSQL resolve catalog
+        # functions before public while retaining public as the target schema
+        # for historical unqualified migration DDL.
+        "SET SESSION search_path = public"
+    )
+    if await conn.fetchval("SHOW standard_conforming_strings") != "on":
+        raise RuntimeError("database refused standard_conforming_strings=on")
+    if await conn.fetchval("SELECT pg_catalog.current_schema()") != "public":
+        raise RuntimeError("database has no usable public migration schema")
+
+
+@asynccontextmanager
+async def _transactional_runner_connection(
+    pool: asyncpg.Pool,
+) -> AsyncIterator[asyncpg.Connection]:
+    """Acquire one connection plus the bootstrap/transaction session lock.
+
+    ``CREATE TABLE IF NOT EXISTS`` is not race-free when two sessions create
+    the same relation concurrently: PostgreSQL can still raise a duplicate
+    catalog-key violation. A session lock must therefore begin before the
+    ledger exists. The inner transaction also takes the xact-scoped form so
+    the schema changes and success row retain their database-owned atomic
+    boundary; this outer belt only spans bootstrap and fresh-chain detection.
+    Waiters use try-lock polling and return the connection between attempts.
+    That keeps a fleet of starting replicas from occupying every pool slot
+    while the lock owner needs to record a migration failure.
+    """
+
+    conn: asyncpg.Connection | None = None
+    while conn is None:
+        candidate = await pool.acquire()
+        try:
+            acquired = await candidate.fetchval(
+                "SELECT pg_catalog.pg_try_advisory_lock($1)", LOCK_ID
+            )
+        except BaseException:
+            await pool.release(candidate)
+            raise
+        if acquired is True:
+            conn = candidate
+            break
+        await pool.release(candidate)
+        await asyncio.sleep(0.05)
+
+    try:
+        await _force_runner_session_settings(conn)
+        yield conn
+    finally:
+        try:
+            unlocked = await conn.fetchval(
+                "SELECT pg_catalog.pg_advisory_unlock($1)", LOCK_ID
+            )
+            if unlocked is not True:
+                raise RuntimeError("migration runner lost its session advisory lock")
+        finally:
+            await pool.release(conn)
 
 
 def discover(migrations_dir: Path) -> list[Path]:
@@ -117,27 +491,6 @@ def discover(migrations_dir: Path) -> list[Path]:
     return files
 
 
-async def _record_failure(
-    pool: asyncpg.Pool, filename: str, checksum: str, ms: int, error: str
-) -> None:
-    """Write the failure row on a fresh connection — the outer txn is rolling back."""
-    async with pool.acquire() as failconn:
-        await failconn.execute(
-            "INSERT INTO schema_migrations(filename, checksum, "
-            "execution_ms, success, error) VALUES($1,$2,$3,FALSE,$4) "
-            "ON CONFLICT (filename) DO UPDATE SET "
-            "checksum = EXCLUDED.checksum, "
-            "applied_at = now(), "
-            "execution_ms = EXCLUDED.execution_ms, "
-            "success = FALSE, "
-            "error = EXCLUDED.error",
-            filename,
-            checksum,
-            ms,
-            error[:8000],
-        )
-
-
 async def _record_failure_on_connection(
     conn: asyncpg.Connection,
     filename: str,
@@ -145,13 +498,13 @@ async def _record_failure_on_connection(
     ms: int,
     error: str,
 ) -> None:
-    """Record a non-transactional failure while its session lock is held."""
+    """Record a failure after rollback or outside a transaction."""
     await conn.execute(
-        "INSERT INTO schema_migrations(filename, checksum, "
+        "INSERT INTO public.schema_migrations(filename, checksum, "
         "execution_ms, success, error) VALUES($1,$2,$3,FALSE,$4) "
         "ON CONFLICT (filename) DO UPDATE SET "
         "checksum = EXCLUDED.checksum, "
-        "applied_at = now(), "
+        "applied_at = CURRENT_TIMESTAMP, "
         "applied_by = current_user, "
         "execution_ms = EXCLUDED.execution_ms, "
         "success = FALSE, "
@@ -163,6 +516,29 @@ async def _record_failure_on_connection(
     )
 
 
+async def _require_migration_ledger_shape(conn: asyncpg.Connection) -> None:
+    """Reject a same-name legacy ledger before any migration query uses it."""
+
+    existing_columns = {
+        row["column_name"]
+        for row in await conn.fetch(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'schema_migrations' "
+            "AND table_schema = 'public'"
+        )
+    }
+    missing = REQUIRED_COLUMNS - existing_columns
+    if missing:
+        raise RuntimeError(
+            f"schema_migrations table exists but is missing columns "
+            f"{sorted(missing)}; this is most likely a legacy table "
+            f"from before the migration runner. Drop it manually "
+            f"(DROP TABLE public.schema_migrations) and let the runner "
+            f"recreate it. See knowledge-base/knowledge/db_migration.md "
+            f"§Operational runbook."
+        )
+
+
 async def _record_success_on_connection(
     conn: asyncpg.Connection,
     filename: str,
@@ -171,11 +547,11 @@ async def _record_success_on_connection(
 ) -> None:
     """Record a non-transactional success, replacing its dirty row if any."""
     await conn.execute(
-        "INSERT INTO schema_migrations"
+        "INSERT INTO public.schema_migrations"
         "(filename, checksum, execution_ms) VALUES($1,$2,$3) "
         "ON CONFLICT (filename) DO UPDATE SET "
         "checksum = EXCLUDED.checksum, "
-        "applied_at = now(), "
+        "applied_at = CURRENT_TIMESTAMP, "
         "applied_by = current_user, "
         "execution_ms = EXCLUDED.execution_ms, "
         "success = TRUE, "
@@ -201,17 +577,17 @@ async def _concurrent_index_state(
             i.indnkeyatts,
             i.indnatts,
             am.amname AS access_method,
-            i.indrelid = to_regclass($2) AS expected_table,
+            i.indrelid = pg_catalog.to_regclass($2) AS expected_table,
             ARRAY(
-                SELECT pg_get_indexdef(i.indexrelid, position, TRUE)
-                FROM generate_series(1, i.indnkeyatts) AS position
+                SELECT pg_catalog.pg_get_indexdef(i.indexrelid, position, TRUE)
+                FROM pg_catalog.generate_series(1, i.indnkeyatts) AS position
                 ORDER BY position
             ) AS key_definitions,
-            pg_get_expr(i.indpred, i.indrelid) AS predicate
-        FROM pg_index AS i
-        JOIN pg_class AS index_class ON index_class.oid = i.indexrelid
-        JOIN pg_am AS am ON am.oid = index_class.relam
-        WHERE i.indexrelid = to_regclass($1)
+            pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS predicate
+        FROM pg_catalog.pg_index AS i
+        JOIN pg_catalog.pg_class AS index_class ON index_class.oid = i.indexrelid
+        JOIN pg_catalog.pg_am AS am ON am.oid = index_class.relam
+        WHERE i.indexrelid = pg_catalog.to_regclass($1)
         """,
         recovery.index_name,
         recovery.table_name,
@@ -251,7 +627,7 @@ async def _require_applied_recovery_dependency(
             f"recovery dependency {filename!r} is missing for {migrations_dir}"
         )
     row = await conn.fetchrow(
-        "SELECT checksum, success FROM schema_migrations WHERE filename = $1",
+        "SELECT checksum, success FROM public.schema_migrations WHERE filename = $1",
         filename,
     )
     checksum = _checksum(path.read_text())
@@ -335,36 +711,43 @@ async def run_migrations(
 
     transactional = [p for p in files if not _is_notx(p)]
     non_transactional = [p for p in files if _is_notx(p)]
-
-    async with pool.acquire() as conn:
-        await conn.execute(DDL)
-
-        existing_columns = {
-            r["column_name"]
-            for r in await conn.fetch(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = 'schema_migrations' "
-                "AND table_schema = ANY(current_schemas(FALSE))"
-            )
-        }
-        missing = REQUIRED_COLUMNS - existing_columns
-        if missing:
+    for path in non_transactional:
+        if _maintenance_gate(path.read_text()) is not None:
             raise RuntimeError(
-                f"schema_migrations table exists but is missing columns "
-                f"{sorted(missing)}; this is most likely a legacy table "
-                f"from before the migration runner. Drop it manually "
-                f"(DROP TABLE schema_migrations) and let the runner "
-                f"recreate it. See knowledge-base/knowledge/db_migration.md §Operational "
-                f"runbook."
+                f"maintenance-gated migration {path.name!r} must be "
+                "transactional so its history check and schema change share "
+                "the migration advisory-lock transaction"
             )
+
+    async with _transactional_runner_connection(pool) as conn:
+        ledger_preexisting = bool(
+            await conn.fetchval(
+                "SELECT pg_catalog.to_regclass('public.schema_migrations') IS NOT NULL"
+            )
+        )
+        if not dry_run:
+            # Ordinary failures need the ledger to survive the migration
+            # transaction so their dirty row can be recorded after rollback.
+            await conn.execute(DDL)
+            await _require_migration_ledger_shape(conn)
 
         # Transactional pass — wrapped under the advisory lock + outer txn.
+        transaction_failure: tuple[str, str, int, str] | None = None
         try:
             async with conn.transaction():
-                await conn.execute("SELECT pg_advisory_xact_lock($1)", LOCK_ID)
+                await conn.execute(
+                    "SELECT pg_catalog.pg_advisory_xact_lock($1)", LOCK_ID
+                )
+                if dry_run:
+                    # Dry-run bootstrap and index repair are part of the same
+                    # rollback boundary as migration DDL and tentative rows.
+                    # No cleanup-by-drop is needed (or safe) afterward.
+                    await conn.execute(DDL)
+                    await _require_migration_ledger_shape(conn)
 
                 dirty_rows = await conn.fetch(
-                    "SELECT filename, checksum, error FROM schema_migrations "
+                    "SELECT filename, checksum, error "
+                    "FROM public.schema_migrations "
                     "WHERE success = FALSE ORDER BY filename"
                 )
                 unrecoverable_dirty = [
@@ -401,10 +784,26 @@ async def run_migrations(
                 applied = {
                     r["filename"]: r["checksum"]
                     for r in await conn.fetch(
-                        "SELECT filename, checksum FROM schema_migrations "
+                        "SELECT filename, checksum "
+                        "FROM public.schema_migrations "
                         "WHERE success = TRUE ORDER BY filename"
                     )
                 }
+                existing_application_relations = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM pg_catalog.pg_class relation
+                         JOIN pg_catalog.pg_namespace namespace
+                            ON namespace.oid = relation.relnamespace
+                         WHERE namespace.nspname <> 'information_schema'
+                           AND namespace.nspname !~ '^pg_'
+                           AND relation.oid IS DISTINCT FROM
+                               pg_catalog.to_regclass('public.schema_migrations')
+                           AND relation.relkind IN ('r','p','v','m','S','f')
+                    )
+                    """
+                )
 
                 for path in files:
                     if path.name in applied:
@@ -429,6 +828,8 @@ async def run_migrations(
                         len(applied),
                         migrations_dir.name,
                     )
+                    if dry_run:
+                        raise DryRunRollback()
                     return
 
                 if pending_tx:
@@ -437,21 +838,54 @@ async def run_migrations(
                         len(pending_tx),
                         migrations_dir.name,
                     )
+                # A missing/empty ledger alone is not a fresh-install proof:
+                # a restored schema_current or legacy database may have lost
+                # its migration history.  Inspect the application schema under
+                # the same migration lock and bypass a maintenance gate only
+                # when both history and user relations are genuinely absent.
+                fresh_chain = bool(
+                    not ledger_preexisting
+                    and not applied
+                    and not existing_application_relations
+                )
+                acknowledged_gates = _acknowledged_maintenance_gates()
                 for path in pending_tx:
                     sql = path.read_text()
+                    execution_sql = _runner_owned_transaction_sql(sql)
+                    maintenance_gate = _maintenance_gate(sql)
+                    if (
+                        maintenance_gate is not None
+                        and not fresh_chain
+                        and maintenance_gate not in acknowledged_gates
+                    ):
+                        raise RuntimeError(
+                            f"maintenance-gated migration {path.name!r} requires "
+                            f"{MAINTENANCE_GATES_ENV} to include "
+                            f"{maintenance_gate!r}; drain every old mutating "
+                            "application/agent writer and use the migration's "
+                            "documented no-overlap deployment procedure before "
+                            "acknowledging it"
+                        )
                     log.info("→ %s", path.name)
                     t0 = time.monotonic()
                     try:
-                        await conn.execute(sql)
+                        # A previous migration may have changed session-level
+                        # settings. Reassert the lexer/schema contract at the
+                        # final boundary immediately before every file.
+                        await _force_runner_session_settings(conn)
+                        await conn.execute(execution_sql)
                     except Exception as exc:
                         ms = int((time.monotonic() - t0) * 1000)
-                        await _record_failure(
-                            pool, path.name, _checksum(sql), ms, str(exc)
+                        transaction_failure = (
+                            path.name,
+                            _checksum(sql),
+                            ms,
+                            str(exc),
                         )
                         raise
                     ms = int((time.monotonic() - t0) * 1000)
                     await conn.execute(
-                        "INSERT INTO schema_migrations"
+                        "INSERT INTO public.schema_migrations"
                         "(filename, checksum, execution_ms) "
                         "VALUES($1,$2,$3)",
                         path.name,
@@ -465,6 +899,13 @@ async def run_migrations(
         except DryRunRollback:
             log.info("dry-run: transactional pass rolled back")
             return
+        except Exception:
+            # A dry run is observational even when the migration body fails.
+            # Its enclosing transaction rolls back bootstrap DDL, migration
+            # DDL, and tentative rows; never replace that with a dirty row.
+            if not dry_run and transaction_failure is not None:
+                await _record_failure_on_connection(conn, *transaction_failure)
+            raise
 
     # Non-transactional pass — run outside any txn, one connection per migration
     # so the runner survives the kinds of operations that demand it (CREATE
@@ -482,12 +923,13 @@ async def run_migrations(
 
     for path in non_transactional:
         async with pool.acquire() as conn:
+            await _force_runner_session_settings(conn)
             await _acquire_notx_lock(conn)
             try:
                 # A second runner may have completed this migration while this
                 # connection waited for the session lock, so re-read the row.
                 applied_row = await conn.fetchrow(
-                    "SELECT checksum FROM schema_migrations "
+                    "SELECT checksum FROM public.schema_migrations "
                     "WHERE filename = $1 AND success = TRUE",
                     path.name,
                 )
@@ -529,7 +971,9 @@ async def run_migrations(
                 )
                 log.info("✓ %s (%d ms)", path.name, ms)
             finally:
-                await conn.execute("SELECT pg_advisory_unlock($1)", NOTX_LOCK_ID)
+                await conn.execute(
+                    "SELECT pg_catalog.pg_advisory_unlock($1)", NOTX_LOCK_ID
+                )
 
 
 async def _main() -> int:

@@ -182,6 +182,52 @@ class TestRedactThreadMetadataShape:
         assert "_workspace_binding" not in out["metadata"]
         assert out["metadata"]["keep"] is True
 
+    def test_runtime_retirement_authority_is_redacted_to_safe_state(self):
+        main = self._main()
+        internal = {
+            "runtime_generation": "generation-secret",
+            "runtime_attach_token": "attach-secret",
+            "runtime_attach_abort_receipt": {"runtime_attach_token": "attach-secret"},
+            "runtime_authority_exposed": True,
+            "runtime_retirement_token": "retirement-secret",
+            "runtime_retirement_permanent": False,
+            "runtime_retirement_started_at": "2026-08-26T00:00:00Z",
+            "runtime_retirement_authorized_at": "2026-08-26T00:00:01Z",
+            "runtime_retirement_context": {
+                "settle_status": "suspended",
+                "agent": {"pod_ip": "10.0.0.8"},
+            },
+            "runtime_retirement_stage_receipt": {"tar_key": "private"},
+            "runtime_retirement_local_quiescence": {
+                "runtime_attach_token": "attach-secret"
+            },
+            "runtime_retirement_external_cleanup": {
+                "captured_resources": {"grant_handle": "private"}
+            },
+        }
+        out = main._redact_thread_metadata({"id": "t", "metadata": {}, **internal})
+        for key in internal:
+            assert key not in out
+        assert out["runtime_retirement_pending"] is True
+        assert out["retirement_disposition"] == "suspended"
+        assert "secret" not in repr(out)
+        assert "10.0.0.8" not in repr(out)
+
+    def test_hidden_retirement_preflight_is_not_public_ending(self):
+        main = self._main()
+        out = main._redact_thread_metadata(
+            {
+                "id": "t",
+                "metadata": {},
+                "runtime_retirement_token": "hidden-token",
+                "runtime_retirement_authorized_at": None,
+                "runtime_retirement_context": {"settle_status": "ended"},
+            }
+        )
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_disposition"] is None
+        assert "hidden-token" not in repr(out)
+
 
 class TestRedactJobWorkspaceAuthority:
     def test_public_job_projection_is_coordinate_and_credential_free(self):

@@ -1257,7 +1257,7 @@
       "agentUser": "Agent-Benutzer",
       "credentialsRef": "Credentials-Referenz (optional)",
       "secretProvenance": "Secret-Provenienz",
-      "secretSet": "gesetzt ({{chars}} Zeichen)",
+      "secretSet": "gesetzt",
       "secretUnset": "nicht gesetzt",
       "testing": "Wird getestet…",
       "test": "Testen",
@@ -1273,7 +1273,7 @@
         "saved": "Gespeichert — aktives Backend ist jetzt {{backend}}",
         "savedReloaded": "Gespeichert — aktives Backend ist jetzt {{backend}} (neu geladen)",
         "saveFailed": "Speichern fehlgeschlagen",
-        "overlayCleared": "Überlagerung entfernt — aktives Backend wurde aus Env-Variablen neu aufgebaut",
+        "overlayCleared": "Umgebungskonfiguration geprüft und aktiviert; der Backend-Verlauf wurde beibehalten",
         "resetFailed": "Zurücksetzen fehlgeschlagen"
       }
     },
@@ -1705,6 +1705,11 @@
       "endedAt": "Sitzung beendet {{ date }}",
       "resume": "Fortsetzen"
     },
+    "ending": {
+      "eyebrow": "Sicherer Abschluss",
+      "title": "Sitzung wird beendet…",
+      "body": "Der Agent schließt lokale Arbeit ab und erhält eine mögliche geschützte Cloud-Prüfung. Nach bestätigtem Abschluss kann die Sitzung fortgesetzt werden."
+    },
     "startup": {
       "title": "Sitzung wird gestartet",
       "titleResume": "Sitzung wird fortgesetzt",
@@ -1774,7 +1779,9 @@
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)",
       "defaultMobile": "Nachricht eingeben...",
       "resuming": "Sitzung wird fortgesetzt…",
-      "endedSendResumes": "Nachricht schreiben — Senden setzt die Sitzung fort"
+      "ending": "Sitzung wird sicher abgeschlossen…",
+      "endedSendResumes": "Nachricht schreiben — Senden setzt die Sitzung fort",
+      "suspendedSendResumes": "Nachricht schreiben — Senden weckt die Sitzung auf"
     },
     "upload": {
       "stage": "{{done}} von {{total}} werden hochgeladen…",
@@ -3414,10 +3421,12 @@
     },
     "sessions": {
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden.",
+      "stillEnding": "Diese Sitzung wird noch beendet. Lass diese Seite geöffnet und versuche Fortsetzen danach erneut.",
       "endFailed": "Sitzung konnte nicht beendet werden.",
       "deleteFailed": "Sitzung konnte nicht gelöscht werden.",
       "createFailed": "Sitzung konnte nicht erstellt werden.",
-      "renameFailed": "Sitzung konnte nicht umbenannt werden."
+      "renameFailed": "Sitzung konnte nicht umbenannt werden.",
+      "bindingInvalid": "Diese Sitzungsverbindung ist nicht mehr autoritativ. Warte auf die Wiederherstellung der Sitzung oder wende dich an einen Administrator."
     },
     "cloudDiff": {
       "applyFailed": "Änderungen konnten nicht übernommen werden.",

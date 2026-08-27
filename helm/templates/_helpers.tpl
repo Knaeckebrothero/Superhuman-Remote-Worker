@@ -217,6 +217,86 @@ Usage: {{ include "srw.serviceName" (dict "context" . "component" "postgres") }}
 {{- end }}
 
 {{/*
+Canonical, non-secret identity for the bundled Nextcloud protected-effect
+lane. The bundle digests make a verifier/runtime change a new configuration
+authority even when every timing knob remains unchanged.
+*/}}
+{{- define "srw.nextcloudProtectedEffectConfigJson" -}}
+{{- $effect := .Values.nextcloud.protectedEffect -}}
+{{- dict
+      "version" 1
+      "queue_bound_seconds" (int $effect.queueBoundSeconds)
+      "handler_bound_seconds" (int $effect.handlerBoundSeconds)
+      "clock_skew_bound_seconds" (int $effect.clockSkewBoundSeconds)
+      "safety_margin_seconds" (int $effect.safetyMarginSeconds)
+      "capability_max_age_seconds" (int $effect.capabilityMaxAgeSeconds)
+      "max_children" (int $effect.maxChildren)
+      "max_body_bytes" 65536
+      "common_sha256" (.Files.Get "files/nextcloud-protected-effect/common.php" | sha256sum)
+      "prepend_sha256" (.Files.Get "files/nextcloud-protected-effect/prepend.php" | sha256sum)
+      "capability_sha256" (.Files.Get "files/nextcloud-protected-effect/capability.php" | sha256sum)
+      "fpm_launcher_sha256" (.Files.Get "files/nextcloud-protected-effect/start-fpm.sh" | sha256sum)
+      "nginx_sha256" (.Files.Get "files/nextcloud-protected-effect/nginx.conf" | sha256sum)
+    | toJson -}}
+{{- end }}
+
+{{- define "srw.nextcloudProtectedEffectConfigSha256" -}}
+{{- include "srw.nextcloudProtectedEffectConfigJson" . | sha256sum -}}
+{{- end }}
+
+{{- define "srw.nextcloudProtectedEffectName" -}}
+{{- $base := include "srw.fullname" . | trunc 46 | trimSuffix "-" -}}
+{{- printf "%s-protected-effect" $base -}}
+{{- end }}
+
+{{- define "srw.nextcloudProtectedEffectSecretName" -}}
+{{- if .Values.nextcloud.protectedEffect.hmacSecretName -}}
+{{- .Values.nextcloud.protectedEffect.hmacSecretName -}}
+{{- else -}}
+{{- include "srw.nextcloudProtectedEffectName" . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.nextcloudProtectedEffectValidate" -}}
+{{- $effect := .Values.nextcloud.protectedEffect -}}
+{{- $protectedCloud := eq (lower (toString .Values.agent.protectedCloudModeEnabled)) "true" -}}
+{{- if and $protectedCloud .Values.nextcloud.enabled (not $effect.enabled) -}}
+  {{- fail "agent.protectedCloudModeEnabled=true with bundled Nextcloud requires nextcloud.protectedEffect.enabled=true" -}}
+{{- end -}}
+{{- if and $protectedCloud (eq (default "" .Values.cloud.externalBackend) "nextcloud") -}}
+  {{- fail "agent.protectedCloudModeEnabled=true is not supported for external Nextcloud without an attested server-enforced protected-effect lane" -}}
+{{- end -}}
+{{- if $effect.enabled -}}
+  {{- if not (and .Values.nextcloud.enabled .Values.nextcloud.internal) -}}
+    {{- fail "nextcloud.protectedEffect.enabled requires bundled nextcloud.enabled=true and nextcloud.internal=true; external Nextcloud is ineligible without an equivalent server-enforced effect lane" -}}
+  {{- end -}}
+  {{- if and .Values.externalSecrets.enabled (not $effect.hmacSecretName) (not $effect.hmacVaultPath) -}}
+    {{- fail "nextcloud.protectedEffect.enabled with External Secrets requires nextcloud.protectedEffect.hmacVaultPath (a dedicated path that is never imported into agent pods) or hmacSecretName" -}}
+  {{- end -}}
+  {{- if and (not .Values.externalSecrets.enabled) (not .Values.secrets.create) (not $effect.hmacSecretName) -}}
+    {{- fail "nextcloud.protectedEffect.enabled requires a dedicated hmacSecretName unless secrets.create or externalSecrets is managing the protected-effect Secret" -}}
+  {{- end -}}
+  {{- $timings := dict
+        "queueBoundSeconds" $effect.queueBoundSeconds
+        "handlerBoundSeconds" $effect.handlerBoundSeconds
+        "clockSkewBoundSeconds" $effect.clockSkewBoundSeconds
+        "safetyMarginSeconds" $effect.safetyMarginSeconds
+        "capabilityMaxAgeSeconds" $effect.capabilityMaxAgeSeconds -}}
+  {{- range $name, $value := $timings -}}
+    {{- if or (le (int $value) 0) (gt (int $value) 86400) -}}
+      {{- fail (printf "nextcloud.protectedEffect.%s must be an integer between 1 and 86400" $name) -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if gt (int $effect.handlerBoundSeconds) 60 -}}
+    {{- fail "nextcloud.protectedEffect.handlerBoundSeconds must not exceed the protected Nginx lane's 65-second read ceiling" -}}
+  {{- end -}}
+  {{- if or (le (int $effect.maxChildren) 0) (gt (int $effect.maxChildren) 64) -}}
+    {{- fail "nextcloud.protectedEffect.maxChildren must be an integer between 1 and 64" -}}
+  {{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Domain-derived URLs. Each component host is `global.hostnames.<key>` when
 set, otherwise `<subdomain>.<global.domain>`. Centralised in srw.host so a
 single override propagates to ingress, configmap, OIDC redirects, and the

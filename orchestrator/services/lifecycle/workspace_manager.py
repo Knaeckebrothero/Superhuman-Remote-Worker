@@ -861,7 +861,10 @@ class WorkspaceInstanceManager:
                 "volume_ephemeral", True
             ):
                 try:
-                    await self._provisioner.create_workspace(owner)
+                    if owner.kind == "session":
+                        await self._provisioner.create_pinned_thread_workspace(owner.id)
+                    else:
+                        await self._provisioner.create_workspace(owner)
                 except Exception:
                     logger.exception("PVC give_up recreate failed for %s", inst.id)
             return
@@ -889,7 +892,12 @@ class WorkspaceInstanceManager:
                     return
                 try:
                     async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                        await self._provisioner.create_workspace(owner)
+                        if owner.kind == "session":
+                            await self._provisioner.create_pinned_thread_workspace(
+                                owner.id
+                            )
+                        else:
+                            await self._provisioner.create_workspace(owner)
                     if not await self._permit_external(permit):
                         return
                 except Exception:

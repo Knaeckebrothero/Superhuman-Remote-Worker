@@ -101,6 +101,7 @@ POST   /api/agents/threads/{thread_id}/messages                                 
 POST   /api/agents/threads/{thread_id}/officer/notify                                   internal:require_internal
 POST   /api/agents/threads/{thread_id}/officer/wake                                     internal:require_internal
 POST   /api/agents/threads/{thread_id}/release-agent                                    internal:require_internal
+GET    /api/agents/threads/{thread_id}/retirement-outcome                               internal:require_internal
 POST   /api/agents/threads/{thread_id}/rewind                                           gated:require_thread_owner
 PUT    /api/agents/threads/{thread_id}/status                                           internal:require_internal
 POST   /api/agents/threads/{thread_id}/suspend                                          internal:require_internal

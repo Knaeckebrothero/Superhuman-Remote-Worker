@@ -576,7 +576,13 @@ class DockerProvisioner:
                 thread_id,
             )
 
-    async def release_thread_workspace(self, thread_id: str) -> bool:
+    async def release_thread_workspace(
+        self,
+        thread_id: str,
+        *,
+        expected_lease_id: str | None = None,
+        force_quarantine: bool = False,
+    ) -> bool:
         """Release a workspace assigned to a persistent thread."""
         if not self._db:
             return False
@@ -599,15 +605,37 @@ class DockerProvisioner:
 
         if ctx.get("provisioner") != "docker":
             return False
+        if expected_lease_id is not None and str(
+            ctx.get("_docker_workspace_lease_id") or ""
+        ) != str(expected_lease_id):
+            return False
+        current_status = str(ctx.get("status") or "")
+        if current_status in {"released", "quarantined"}:
+            if force_quarantine and current_status == "released":
+                # A released endpoint may already have been allocated under a
+                # new lease. Never relabel it quarantined by stale owner JSON.
+                return False
+            terminal = await self._db.transition_docker_workspace_lease(
+                owner_kind="thread",
+                owner_id=thread_id,
+                expected_lease_id=ctx.get("_docker_workspace_lease_id"),
+                expected_statuses={current_status},
+                updates={"status": current_status},
+            )
+            return terminal is not None and str(terminal.get("status") or "") == (
+                current_status
+            )
 
         # Claim the release before snapshot/reset. Only one replica can move a
         # concrete lease from ready to releasing, and Canvas is revoked in the
         # same DB update before the static host is touched.
+        if current_status not in {"ready", "releasing"}:
+            return False
         releasing = await self._db.transition_docker_workspace_lease(
             owner_kind="thread",
             owner_id=thread_id,
             expected_lease_id=ctx.get("_docker_workspace_lease_id"),
-            expected_statuses={"ready"},
+            expected_statuses={current_status},
             updates={
                 "status": "releasing",
                 CANVAS_WORKSPACE_GENERATION_KEY: None,
@@ -641,8 +669,8 @@ class DockerProvisioner:
                     thread_id,
                 )
 
-        if not self._trusted_dev_reuse:
-            await self._db.transition_docker_workspace_lease(
+        if force_quarantine or not self._trusted_dev_reuse:
+            quarantined = await self._db.transition_docker_workspace_lease(
                 owner_kind="thread",
                 owner_id=thread_id,
                 expected_lease_id=lease_id,
@@ -653,13 +681,25 @@ class DockerProvisioner:
                     CANVAS_WORKSPACE_GENERATION_KEY: None,
                 },
             )
+            if quarantined is None or str(quarantined.get("status") or "") != (
+                "quarantined"
+            ):
+                logger.error(
+                    "Docker provisioner: exact quarantine did not commit for %s",
+                    thread_id,
+                )
+                return False
             logger.warning(
                 "Docker provisioner: quarantined %s:%d; safe reuse requires "
                 "controller-attested container recreation",
                 host,
                 port,
             )
-            return False
+            # Quarantine removes the host from allocation and is the only safe
+            # terminal disposition after protected strict UID-zero (which also
+            # kills code-server). Trusted-dev file reset may never revive or
+            # reassign that same container. It is not a cleanup failure.
+            return True
 
         try:
             cleaned = await self._reset_workspace_via_ssh(host, port)
@@ -702,6 +742,44 @@ class DockerProvisioner:
             thread_id,
         )
         return True
+
+    async def fence_thread_workspace_lease(
+        self, thread_id: str, *, expected_lease_id: str
+    ) -> bool:
+        """Make one exact Docker lease non-reallocatable before process zero."""
+
+        if not self._db:
+            return False
+        try:
+            thread = await self._db.get_thread(thread_id)
+            metadata = (thread or {}).get("metadata") or {}
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            ctx = metadata.get("workspace_container") or {}
+        except Exception:
+            logger.exception("Failed to read Docker lease fence for %s", thread_id)
+            return False
+        if (
+            not isinstance(ctx, dict)
+            or ctx.get("provisioner") != "docker"
+            or str(ctx.get("_docker_workspace_lease_id") or "")
+            != str(expected_lease_id)
+        ):
+            return False
+        current_status = str(ctx.get("status") or "")
+        if current_status not in {"ready", "releasing"}:
+            return False
+        fenced = await self._db.transition_docker_workspace_lease(
+            owner_kind="thread",
+            owner_id=thread_id,
+            expected_lease_id=expected_lease_id,
+            expected_statuses={current_status},
+            updates={
+                "status": "releasing",
+                CANVAS_WORKSPACE_GENERATION_KEY: None,
+            },
+        )
+        return fenced is not None and str(fenced.get("status") or "") == "releasing"
 
     # ------------------------------------------------------------------
     # VM assignment (QEMU-in-Docker, Phase 4)

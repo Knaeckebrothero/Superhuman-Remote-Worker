@@ -20,13 +20,17 @@ bug the feature exists to remove:
 
 from __future__ import annotations
 
+import ast
 import asyncio
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 
 from services import session_wake
+from src.shared.pinned_session_identity import PinnedSessionBinding
 
 # Captured at import, before the autouse fixture replaces it with a mock — the
 # two tests below need the REAL implementation.
@@ -35,6 +39,39 @@ _REAL_NOTIFY_OWNER = session_wake._notify_owner
 JOB_ID = "3f2a1b8c-0000-4000-8000-000000000001"
 THREAD_ID = "aa11bb22-0000-4000-8000-000000000002"
 AGENT_ID = "cc33dd44-0000-4000-8000-000000000003"
+RUNTIME_GENERATION = "dd44ee55-0000-4000-8000-000000000004"
+ATTACH_TOKEN = "ee55ff66-0000-4000-8000-000000000005"
+POD_UID = "ff660077-0000-4000-8000-000000000006"
+
+
+def test_every_production_live_inject_supplies_the_exact_db_recheck() -> None:
+    """No caller may bypass the post-client-entry joined authority read."""
+
+    repository = Path(__file__).resolve().parents[1]
+    calls: list[tuple[str, int]] = []
+    for relative in (
+        "orchestrator/services/session_wake.py",
+        "orchestrator/main.py",
+    ):
+        tree = ast.parse((repository / relative).read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            name = (
+                function.id
+                if isinstance(function, ast.Name)
+                else function.attr
+                if isinstance(function, ast.Attribute)
+                else ""
+            )
+            if name != "_inject_live":
+                continue
+            calls.append((relative, node.lineno))
+            assert any(keyword.arg == "db" for keyword in node.keywords), (
+                f"{relative}:{node.lineno} bypasses the exact DB recheck"
+            )
+    assert len(calls) == 5
 
 
 # --------------------------------------------------------------------------
@@ -60,11 +97,14 @@ class _FakeAsyncClient:
     next_status = 200
     next_delivery_state = "admitted"
     raises: Exception | None = None
+    on_enter = None
 
     def __init__(self, *a, **kw):
         self.init_kwargs = kw
 
     async def __aenter__(self):
+        if _FakeAsyncClient.on_enter is not None:
+            _FakeAsyncClient.on_enter()
         return self
 
     async def __aexit__(self, *a):
@@ -102,15 +142,58 @@ def _thread(**over) -> dict:
         "status": "active",
         "agent_id": AGENT_ID,
         "title": "Theme work",
+        "execution_lane": "pinned",
+        "runtime_generation": RUNTIME_GENERATION,
+        "runtime_attach_token": ATTACH_TOKEN,
+        "runtime_retirement_token": None,
+        "metadata": {},
     }
     t.update(over)
     return t
 
 
 def _agent(**over) -> dict:
-    a = {"id": AGENT_ID, "status": "session", "pod_ip": "10.1.2.3", "pod_port": 8001}
+    a = {
+        "id": AGENT_ID,
+        "thread_id": THREAD_ID,
+        "status": "session",
+        "pod_ip": "10.1.2.3",
+        "pod_port": 8001,
+        "hostname": "srw-agent-wake",
+        "pod_uid": POD_UID,
+    }
     a.update(over)
     return a
+
+
+def _binding(thread: dict | None, agent: dict | None) -> PinnedSessionBinding | None:
+    if (
+        thread is None
+        or agent is None
+        or thread.get("execution_lane") != "pinned"
+        or thread.get("status")
+        not in {"created", "active", "awaiting_user", "suspended"}
+        or thread.get("runtime_retirement_token") is not None
+        or str(thread.get("agent_id") or "") != str(agent.get("id") or "")
+        or str(agent.get("thread_id") or "") != str(thread.get("id") or "")
+    ):
+        return None
+    try:
+        return PinnedSessionBinding.from_mapping(
+            {
+                "thread_id": thread.get("id"),
+                "runtime_generation": thread.get("runtime_generation"),
+                "agent_id": agent.get("id"),
+                "runtime_attach_token": thread.get("runtime_attach_token"),
+                "agent_hostname": agent.get("hostname"),
+                "pod_uid": agent.get("pod_uid"),
+                "pod_ip": agent.get("pod_ip"),
+                "pod_port": agent.get("pod_port"),
+                "agent_status": agent.get("status"),
+            }
+        )
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _db(*, claimed=None, thread=None, agent=None) -> SimpleNamespace:
@@ -126,6 +209,8 @@ def _db(*, claimed=None, thread=None, agent=None) -> SimpleNamespace:
         mark_job_wake_pending=AsyncMock(return_value=True),
         get_thread=AsyncMock(return_value=thread),
         get_agent=AsyncMock(return_value=agent),
+        pinned_thread_agent_is_reciprocal=AsyncMock(return_value=True),
+        get_pinned_session_binding=AsyncMock(return_value=_binding(thread, agent)),
         get_expert_by_id=AsyncMock(return_value=None),
         save_thread_message=save_thread_message,
         persist_thread_input_delivery=save_thread_message,
@@ -142,6 +227,7 @@ def _reset_http(monkeypatch):
     _FakeAsyncClient.next_status = 200
     _FakeAsyncClient.next_delivery_state = "admitted"
     _FakeAsyncClient.raises = None
+    _FakeAsyncClient.on_enter = None
     monkeypatch.setattr(session_wake.httpx, "AsyncClient", _FakeAsyncClient)
     monkeypatch.setattr(session_wake, "probe_ready", AsyncMock(return_value=True))
     monkeypatch.setattr(session_wake, "_notify_owner", AsyncMock())
@@ -228,6 +314,7 @@ async def test_live_session_receives_the_input_as_role_event():
     # family — without it the transcript claims the user said this.
     assert body["role"] == "event"
     assert body["content"].startswith("[JOB_FINISHED]")
+    assert body["session_identity_fingerprint"].startswith("sha256:")
     db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
     db.save_thread_message.assert_not_awaited()
 
@@ -338,7 +425,113 @@ async def test_probe_failure_falls_back_to_durable(monkeypatch):
         "10.1.2.3",
         8001,
         required_capability="durable_input_delivery",
+        require_protected_cloud=False,
+        expected_session_identity_fingerprint=ANY,
     )
+
+
+@pytest.mark.parametrize(
+    "changed_binding",
+    [
+        replace(_binding(_thread(), _agent()), agent_hostname="successor-agent"),
+        replace(_binding(_thread(), _agent()), pod_uid="successor-pod-uid"),
+        replace(_binding(_thread(), _agent()), pod_ip="10.9.8.7"),
+        replace(_binding(_thread(), _agent()), pod_port=9001),
+        replace(
+            _binding(_thread(), _agent()),
+            agent_id="11111111-2222-4333-8444-555555555555",
+        ),
+        replace(
+            _binding(_thread(), _agent()),
+            runtime_attach_token="99999999-8888-4777-8666-555555555555",
+        ),
+    ],
+    ids=["hostname", "pod_uid", "pod_ip", "pod_port", "agent_id", "attach"],
+)
+@pytest.mark.asyncio
+async def test_post_probe_binding_change_never_reaches_live_input(changed_binding):
+    """A stale ready Pod cannot receive a wake after any DB target rotation."""
+
+    thread = _thread()
+    agent = _agent()
+    original = _binding(thread, agent)
+    assert original is not None
+    db = _db(claimed=[_claim_row()], thread=thread, agent=agent)
+    db.get_pinned_session_binding.side_effect = [original, changed_binding]
+
+    assert await session_wake.drain_pending_wakes(db) == 0
+
+    assert _FakeAsyncClient.posts == []
+    db.save_thread_message.assert_awaited_once()
+    db.finish_job_wake.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_probe_live_status_transition_keeps_the_same_target():
+    """Heartbeat state may advance while the physical target remains exact."""
+
+    thread = _thread()
+    agent = _agent(status="ready")
+    original = _binding(thread, agent)
+    assert original is not None
+    db = _db(claimed=[_claim_row()], thread=thread, agent=agent)
+    db.get_pinned_session_binding.side_effect = [
+        original,
+        replace(original, agent_status="working"),
+        replace(original, agent_status="working"),
+    ]
+
+    assert await session_wake.drain_pending_wakes(db) == 1
+    assert len(_FakeAsyncClient.posts) == 1
+
+
+@pytest.mark.parametrize(
+    "changed_binding",
+    [
+        replace(_binding(_thread(), _agent()), pod_uid="successor-pod-uid"),
+        replace(_binding(_thread(), _agent()), agent_status="offline"),
+    ],
+    ids=["pod_uid", "offline_status"],
+)
+@pytest.mark.asyncio
+async def test_client_entry_binding_rotation_never_reaches_old_target(
+    changed_binding,
+):
+    """Client setup is an await boundary, so exact DB authority follows it."""
+
+    thread = _thread()
+    agent = _agent()
+    original = _binding(thread, agent)
+    assert original is not None
+    rotated = {"value": False}
+    db = _db(claimed=[_claim_row()], thread=thread, agent=agent)
+
+    async def _current_binding(*_args, **_kwargs):
+        return changed_binding if rotated["value"] else original
+
+    db.get_pinned_session_binding.side_effect = _current_binding
+    _FakeAsyncClient.on_enter = lambda: rotated.__setitem__("value", True)
+
+    assert await session_wake.drain_pending_wakes(db) == 0
+    assert _FakeAsyncClient.posts == []
+    db.save_thread_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_probe_offline_status_never_reaches_live_input():
+    thread = _thread()
+    agent = _agent(status="ready")
+    original = _binding(thread, agent)
+    assert original is not None
+    db = _db(claimed=[_claim_row()], thread=thread, agent=agent)
+    db.get_pinned_session_binding.side_effect = [
+        original,
+        replace(original, agent_status="offline"),
+    ]
+
+    assert await session_wake.drain_pending_wakes(db) == 0
+    assert _FakeAsyncClient.posts == []
+    db.save_thread_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio

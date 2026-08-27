@@ -301,6 +301,64 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # Internal authority-creating lane for protected RO-reader attempts. The
+  # orchestrator still uses the ordinary Nextcloud URL for reads and cleanup;
+  # only the five signed, deadline-bounded POSTs enter this FPM pool.
+  nextcloud-protected-effect-fpm:
+    profiles: ["nextcloud"]
+    image: docker.io/library/nextcloud:31-fpm
+    container_name: srw-nextcloud-protected-effect-fpm
+    entrypoint: ["/bin/sh", "/opt/srw-protected-effect/start-fpm.sh"]
+    environment:
+      # Empty is allowed at Compose interpolation time so unrelated profiles
+      # still start; start-fpm.sh fails this service closed if the key is absent.
+      NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY: "${NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY:-}"
+      NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256: "${NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256:-3b9abd06ecd4b396ec944b82990a69ba6a2313e84ebaf0473e9f50701af0a5e1}"
+      NEXTCLOUD_PROTECTED_EFFECT_QUEUE_BOUND_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_QUEUE_BOUND_SECONDS:-30}"
+      NEXTCLOUD_PROTECTED_EFFECT_HANDLER_BOUND_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_HANDLER_BOUND_SECONDS:-10}"
+      NEXTCLOUD_PROTECTED_EFFECT_CLOCK_SKEW_BOUND_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_CLOCK_SKEW_BOUND_SECONDS:-2}"
+      NEXTCLOUD_PROTECTED_EFFECT_SAFETY_MARGIN_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_SAFETY_MARGIN_SECONDS:-5}"
+      NEXTCLOUD_PROTECTED_EFFECT_CAPABILITY_MAX_AGE_SECONDS: "${NEXTCLOUD_PROTECTED_EFFECT_CAPABILITY_MAX_AGE_SECONDS:-5}"
+      NEXTCLOUD_PROTECTED_EFFECT_MAX_CHILDREN: "${NEXTCLOUD_PROTECTED_EFFECT_MAX_CHILDREN:-2}"
+    volumes:
+      - nextcloud_dev_data:/var/www/html
+      - nextcloud_protected_effect_run:/run/srw-nextcloud
+      - ./helm/files/nextcloud-protected-effect:/opt/srw-protected-effect:ro,Z
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/srw-nextcloud/protected-effect.sock"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  nextcloud-protected-effect:
+    profiles: ["nextcloud"]
+    image: docker.io/library/nginx:1.27-alpine-slim
+    container_name: srw-nextcloud-protected-effect
+    entrypoint: ["nginx", "-g", "daemon off;", "-c", "/opt/srw-protected-effect/nginx.conf"]
+    volumes:
+      - nextcloud_protected_effect_run:/run/srw-nextcloud
+      - ./helm/files/nextcloud-protected-effect:/opt/srw-protected-effect:ro,Z
+    ports:
+      - "${NEXTCLOUD_PROTECTED_EFFECT_PORT:-8801}:8080"
+    depends_on:
+      nextcloud-protected-effect-fpm:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O /dev/null
+          --header='X-SRW-Backend-Instance: 99999999-9999-4999-8999-999999999999'
+          http://localhost:8080/index.php/apps/srw_protected_effect/api/v1/capability
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   # OpenCloud — greenfield main-cloud default since Phase 3. Runs by default
   # in `podman-compose -f docker-compose.dev.yaml up -d`. The orchestrator
   # (running on the host with hot-reload) reaches it at http://localhost:9200.
@@ -651,6 +709,8 @@ volumes:
     name: srw_gitea_dev_data
   nextcloud_dev_data:
     name: srw_nextcloud_dev_data
+  nextcloud_protected_effect_run:
+    name: srw_nextcloud_protected_effect_run
   opencloud_dev_data:
     name: srw_opencloud_dev_data
   opencloud_dev_config:

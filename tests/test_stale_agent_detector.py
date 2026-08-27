@@ -1,6 +1,7 @@
 """Unit tests for stale-agent background sweeps."""
 
 import asyncio
+from contextlib import asynccontextmanager
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,12 +33,83 @@ def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
     )
     db.mark_stuck_session_agents_ready = AsyncMock(return_value=0)
     db.reap_orphaned_session_agents = AsyncMock(return_value=[])
+    db.list_retryable_thread_attach_abort_successors = AsyncMock(return_value=[])
     db.mark_orphaned_threads_ended = AsyncMock(return_value=[])
     db.mark_orphaned_threads_suspended = AsyncMock(return_value=[])
+    db.abort_stale_pinned_retirement_preflights = AsyncMock(return_value=[])
+    db.list_retryable_pinned_retirements = AsyncMock(return_value=[])
     db.recover_orphaned_jobs = AsyncMock(return_value=OrphanRecoveryBatch())
     db.recover_expired_lease_jobs = AsyncMock(return_value=LeaseRecoveryBatch())
     db.gc_offline_agents = AsyncMock(return_value=0)
     return db
+
+
+@pytest.mark.asyncio
+async def test_detector_retries_durable_attach_abort_after_request_task_failure():
+    """The leader/startup sweep owns G2 even if the request-local task dies."""
+
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    candidate = {
+        "thread_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+        "retired_runtime_generation": "11111111-1111-4111-8111-111111111111",
+        "retired_attach_token": "22222222-2222-4222-8222-222222222222",
+        "retired_agent_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+        "successor_generation": "55555555-5555-4555-8555-555555555555",
+        "quiescence_protocol": "agent_attach_not_started_v1",
+        "workspace_generation": None,
+        "workspace_runtime_incarnation": None,
+    }
+    db.list_retryable_thread_attach_abort_successors = AsyncMock(
+        return_value=[candidate]
+    )
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value=candidate)
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    db.acquire = MagicMock(side_effect=acquire)
+    reconcile = AsyncMock(side_effect=[RuntimeError("transient"), True])
+    main._attach_abort_successor_tasks.clear()
+    original_schedule = main._schedule_attach_abort_successor
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_reconcile_attach_abort_successor", reconcile),
+    ):
+        first = original_schedule(
+            candidate["thread_id"],
+            retired_runtime_generation=candidate["retired_runtime_generation"],
+            retired_attach_token=candidate["retired_attach_token"],
+            retired_agent_id=candidate["retired_agent_id"],
+        )
+        await first
+        assert not main._attach_abort_successor_tasks
+
+        scheduled = []
+
+        def schedule_from_sweep(*args, **kwargs):
+            task = original_schedule(*args, **kwargs)
+            scheduled.append(task)
+            return task
+
+        with (
+            patch.object(main, "_schedule_attach_abort_successor", schedule_from_sweep),
+            patch.object(main, "_trigger_dispatch", MagicMock()),
+            patch.object(main, "_release_thread_resources", AsyncMock()),
+            patch.object(main, "_suspend_thread_resources", AsyncMock()),
+        ):
+            await main.stale_agent_detector(shutdown_event)
+        assert len(scheduled) == 1
+        await scheduled[0]
+
+    assert reconcile.await_count == 2
+    db.list_retryable_thread_attach_abort_successors.assert_awaited_once_with(limit=25)
+    # The same detector pass continues through unrelated recovery work.
+    db.recover_orphaned_jobs.assert_awaited_once()
+    db.gc_offline_agents.assert_awaited_once_with(retention_hours=24)
 
 
 @pytest.mark.asyncio

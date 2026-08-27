@@ -43,7 +43,10 @@ REPOSITORY_ID = "cccccccc-cccc-4ccc-8ccc-ccccccccccc3"
 
 
 def _make_db(update_result="UPDATE 1"):
-    from orchestrator.database.postgres import PostgresDB
+    from orchestrator.database.postgres import (
+        PostgresDB,
+        _thread_datasource_lock_key,
+    )
 
     db = PostgresDB.__new__(PostgresDB)
     conn = AsyncMock()
@@ -60,6 +63,14 @@ def _make_db(update_result="UPDATE 1"):
     pool = MagicMock()
     pool.acquire = MagicMock(return_value=pool_cm)
     db._pool = pool
+    db._test_datasource_lock_keys = []
+
+    @asynccontextmanager
+    async def datasource_lock(thread_id, **_kwargs):
+        db._test_datasource_lock_keys.append(_thread_datasource_lock_key(thread_id))
+        yield
+
+    db.thread_datasource_lock = datasource_lock
     return db, conn
 
 
@@ -114,9 +125,7 @@ class TestSetThreadDatasourceIds:
         assert patch["datasource_ids"] == []
         assert patch["datasource_selection"]["policy_revisions"] == {}
         conn.fetch.assert_not_awaited()
-        assert conn.execute.await_args_list[0].args[0] == (
-            "SELECT pg_advisory_xact_lock($1)"
-        )
+        assert db._test_datasource_lock_keys
         conn.transaction.assert_called_once()
 
     @pytest.mark.asyncio
@@ -156,8 +165,8 @@ class TestSetThreadDatasourceIds:
 
         # The shared delivery/write lock is acquired before the revision
         # snapshot. The metadata UPDATE itself is never reached.
-        assert conn.execute.await_count == 1
-        assert conn.execute.await_args.args[0] == "SELECT pg_advisory_xact_lock($1)"
+        assert conn.execute.await_count == 0
+        assert db._test_datasource_lock_keys
 
     @pytest.mark.asyncio
     async def test_delivery_lock_uses_same_key_as_empty_selection_writer(self):
@@ -165,7 +174,7 @@ class TestSetThreadDatasourceIds:
 
         async with db.thread_datasource_lock(THREAD_ID):
             pass
-        delivery_key = conn.execute.await_args.args[1]
+        delivery_key = db._test_datasource_lock_keys[-1]
 
         conn.reset_mock()
         await db.set_thread_datasource_ids(
@@ -173,7 +182,7 @@ class TestSetThreadDatasourceIds:
             [],
             datasource_policy_revisions={},
         )
-        writer_key = conn.execute.await_args_list[0].args[1]
+        writer_key = db._test_datasource_lock_keys[-1]
 
         assert delivery_key == writer_key
 

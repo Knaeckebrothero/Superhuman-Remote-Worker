@@ -39,6 +39,7 @@ class AdmittedControl:
     verb: str
     state: str
     duplicate: bool
+    runtime_generation: UUID | None = None
 
 
 class ControlAdmissionError(RuntimeError):
@@ -87,7 +88,7 @@ async def find_existing_thread_control(
         row = await conn.fetchrow(
             "SELECT request.id, request.request_seq, "
             "request.client_request_id, request.verb, request.payload, "
-            "request.outcome "
+            "request.outcome, request.runtime_generation "
             "FROM thread_control_requests request "
             "JOIN threads thread ON thread.id = request.thread_id "
             "WHERE request.thread_id = $1 "
@@ -110,6 +111,7 @@ async def find_existing_thread_control(
         verb=str(row["verb"]),
         state=str(row["outcome"] or "pending"),
         duplicate=True,
+        runtime_generation=row.get("runtime_generation"),
     )
 
 
@@ -122,6 +124,8 @@ async def admit_thread_control(
     verb: str,
     payload: dict[str, Any],
     requested_by: str,
+    expected_runtime_generation: UUID | str | None = None,
+    require_pinned_runtime_generation: bool = False,
 ) -> AdmittedControl:
     """Admit one already-authorized session-control request.
 
@@ -133,13 +137,20 @@ async def admit_thread_control(
     """
     tid = UUID(str(thread_id))
     uid = UUID(str(owner_user_id)) if owner_user_id is not None else None
+    expected_generation = (
+        UUID(str(expected_runtime_generation))
+        if expected_runtime_generation is not None
+        else None
+    )
     payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     async with db.acquire() as conn:
         async with conn.transaction():
             thread = await conn.fetchrow(
                 "SELECT id, user_id, agent_id, status, execution_lane, "
-                "       control_seq_hwm, control_admission_agent_id, metadata "
+                "       control_seq_hwm, control_admission_agent_id, metadata, "
+                "       runtime_generation, runtime_retirement_token, "
+                "       runtime_attach_token "
                 "FROM threads WHERE id = $1 FOR UPDATE",
                 tid,
             )
@@ -148,7 +159,8 @@ async def admit_thread_control(
 
             existing = await conn.fetchrow(
                 "SELECT id, request_seq, client_request_id, verb, payload, "
-                "       outcome FROM thread_control_requests "
+                "       outcome, runtime_generation "
+                "FROM thread_control_requests "
                 "WHERE thread_id = $1 AND client_request_id = $2",
                 tid,
                 client_request_id,
@@ -161,6 +173,13 @@ async def admit_thread_control(
                     raise ControlAdmissionError(
                         "client_request_id was already used for a different control"
                     )
+                if (
+                    expected_generation is not None
+                    and existing.get("runtime_generation") != expected_generation
+                ):
+                    raise ControlAdmissionError(
+                        "client_request_id belongs to a different session runtime"
+                    )
                 return AdmittedControl(
                     id=existing["id"],
                     request_seq=int(existing["request_seq"]),
@@ -168,6 +187,7 @@ async def admit_thread_control(
                     verb=str(existing["verb"]),
                     state=str(existing["outcome"] or "pending"),
                     duplicate=True,
+                    runtime_generation=existing.get("runtime_generation"),
                 )
 
             if thread["status"] not in {"created", "active", "awaiting_user"}:
@@ -183,6 +203,23 @@ async def admit_thread_control(
                 )
 
             lane = str(thread["execution_lane"] or "")
+            current_generation = thread.get("runtime_generation")
+            if thread.get("runtime_retirement_token") is not None:
+                raise ControlAdmissionError(
+                    "Session runtime retirement is still in progress"
+                )
+            if (
+                expected_generation is not None
+                and expected_generation != current_generation
+            ):
+                raise ControlAdmissionError(
+                    "Session runtime changed before control admission"
+                )
+            if lane == LANE_PINNED:
+                if require_pinned_runtime_generation and expected_generation is None:
+                    raise ControlAdmissionError(
+                        "Pinned controls require the current session runtime generation"
+                    )
             if verb == WORKSPACE_UNDO_VERB and lane != LANE_STATELESS:
                 raise ControlAdmissionError(
                     "Workspace undo uses the live session transport on the "
@@ -290,16 +327,19 @@ async def admit_thread_control(
                 raise ControlAdmissionError("Unsupported control verb")
             await conn.execute(
                 "UPDATE threads SET control_seq_hwm = $2, "
-                "last_activity = now() WHERE id = $1",
+                "last_activity = now() WHERE id = $1 "
+                "AND runtime_generation = $3::uuid "
+                "AND runtime_retirement_token IS NULL",
                 tid,
                 request_seq,
+                current_generation,
             )
 
             request_id = await conn.fetchval(
                 "INSERT INTO thread_control_requests ("
                 "thread_id, request_seq, client_request_id, verb, payload, "
-                "requested_by, accepted_agent_id"
-                ") VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7) RETURNING id",
+                "requested_by, accepted_agent_id, runtime_generation"
+                ") VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8) RETURNING id",
                 tid,
                 request_seq,
                 client_request_id,
@@ -307,6 +347,7 @@ async def admit_thread_control(
                 payload_json,
                 requested_by,
                 accepted_agent_id,
+                current_generation,
             )
 
             state = "pending"
@@ -344,4 +385,5 @@ async def admit_thread_control(
                 verb=verb,
                 state=state,
                 duplicate=False,
+                runtime_generation=current_generation,
             )

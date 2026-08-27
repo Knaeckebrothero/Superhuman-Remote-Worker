@@ -24,9 +24,21 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as orch_main
+from orchestrator.services.cloud.protected_reader_authority import (
+    ProtectedNextcloudReaderGrantPlan,
+)
+from orchestrator.services.cloud_staging.source_identity import (
+    ProtectedMountSourceIdentity,
+)
 from src.api.persistent_app import _load_expert_config
 from src.core.tool_policy import ToolPolicyError, validate_tool_override_fragment
 from src.shared.runtime_actor import RuntimeActorContext
+
+
+_ATTACH_THREAD_ID = "10000000-0000-4000-8000-000000000001"
+_ATTACH_AGENT_ID = "20000000-0000-4000-8000-000000000002"
+_ATTACH_RUNTIME_GENERATION = "30000000-0000-4000-8000-000000000003"
+_ATTACH_TOKEN = "40000000-0000-4000-8000-000000000004"
 
 
 class _FakeResponse:
@@ -100,12 +112,12 @@ def _patch_session_attach_reservation():
         patch.object(
             orch_main,
             "_reserve_session_attach_binding",
-            AsyncMock(return_value=True),
+            AsyncMock(return_value=_ATTACH_TOKEN),
         ),
         patch.object(
             orch_main,
             "_release_session_attach_binding",
-            AsyncMock(),
+            AsyncMock(return_value="released"),
         ),
     ):
         yield
@@ -117,7 +129,7 @@ def _patch_session_runtime_actor_mint():
 
     actor = RuntimeActorContext(
         caller_kind="human",
-        thread_id="tid-1",
+        thread_id=_ATTACH_THREAD_ID,
         access_credential="sra_" + ("A" * 43),
         refresh_credential="srr_" + ("B" * 43),
     )
@@ -566,25 +578,40 @@ class TestSessionWorkspaceBackendDefaultChain:
 class TestSendSessionAttachPayload:
     """Hole B, orchestrator side: the attach payload carries config_name."""
 
+    thread_id = _ATTACH_THREAD_ID
+    agent_id = _ATTACH_AGENT_ID
+    generation = _ATTACH_RUNTIME_GENERATION
+    attach_token = _ATTACH_TOKEN
+
+    def _thread(self, **overrides):
+        thread = {
+            "id": self.thread_id,
+            "execution_lane": "pinned",
+            "status": "created",
+            "agent_id": self.agent_id,
+            "runtime_generation": self.generation,
+            "runtime_attach_token": self.attach_token,
+            "runtime_retirement_token": None,
+            "user_id": None,
+            "metadata": {},
+        }
+        thread.update(overrides)
+        return thread
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("execution_lane", ["stateless", "future-lane"])
     async def test_attach_refuses_every_non_pinned_lane_before_http(
         self, execution_lane
     ):
-        thread = {
-            "id": "tid-1",
-            "execution_lane": execution_lane,
-            "user_id": None,
-            "metadata": {},
-        }
+        thread = self._thread(execution_lane=execution_lane)
         with patch.object(
             orch_main.postgres_db,
             "get_thread",
             AsyncMock(return_value=thread),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
             )
 
         assert ok is False
@@ -593,12 +620,7 @@ class TestSendSessionAttachPayload:
     @pytest.mark.asyncio
     async def test_attach_reservation_miss_never_reaches_http(self):
         """A lost lane/detachment CAS cannot start an agent-side attach."""
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": None,
-            "metadata": {},
-        }
+        thread = self._thread()
         with (
             patch.object(
                 orch_main.postgres_db,
@@ -608,22 +630,31 @@ class TestSendSessionAttachPayload:
             patch.object(
                 orch_main,
                 "_assemble_session_attach_payload",
-                AsyncMock(return_value={"thread_id": "tid-1"}),
+                AsyncMock(
+                    return_value={
+                        "thread_id": self.thread_id,
+                        "session_runtime_generation": self.generation,
+                    }
+                ),
             ),
             patch.object(
                 orch_main,
                 "_reserve_session_attach_binding",
-                AsyncMock(return_value=False),
+                AsyncMock(return_value=None),
             ) as reserve,
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
             )
 
         assert ok is False
-        reserve.assert_awaited_once_with("a1", "tid-1")
+        reserve.assert_awaited_once_with(
+            self.agent_id,
+            self.thread_id,
+            expected_runtime_generation=self.generation,
+        )
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
@@ -643,9 +674,13 @@ class TestSendSessionAttachPayload:
             "acquire",
             MagicMock(return_value=acquire),
         ):
-            reserved = await _REAL_RESERVE_SESSION_ATTACH_BINDING("a1", "tid-1")
+            reserved = await _REAL_RESERVE_SESSION_ATTACH_BINDING(
+                self.agent_id,
+                self.thread_id,
+                expected_runtime_generation=self.generation,
+            )
 
-        assert reserved is False
+        assert reserved is None
         assert conn.execute.await_count == 1
         assert "execution_lane = $3" in conn.execute.await_args.args[0]
         assert "control_admission_agent_id = NULL" in conn.execute.await_args.args[0]
@@ -667,9 +702,13 @@ class TestSendSessionAttachPayload:
             "acquire",
             MagicMock(return_value=acquire),
         ):
-            reserved = await _REAL_RESERVE_SESSION_ATTACH_BINDING("a1", "tid-1")
+            reserved = await _REAL_RESERVE_SESSION_ATTACH_BINDING(
+                self.agent_id,
+                self.thread_id,
+                expected_runtime_generation=self.generation,
+            )
 
-        assert reserved is False
+        assert reserved is None
         assert conn.execute.await_count == 2
         assert "execution_lane = $3" in conn.execute.await_args_list[0].args[0]
         assert "current_job_id IS NULL" in conn.execute.await_args_list[1].args[0]
@@ -679,17 +718,12 @@ class TestSendSessionAttachPayload:
 
     @pytest.mark.asyncio
     async def test_successful_reservation_precedes_http_delivery(self):
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": None,
-            "metadata": {},
-        }
+        thread = self._thread()
         order: list[str] = []
 
-        async def reserve(*_args):
+        async def reserve(*_args, **_kwargs):
             order.append("reserve")
-            return True
+            return self.attach_token
 
         async def post(_self, url, json=None):
             assert order == ["reserve"]
@@ -706,7 +740,12 @@ class TestSendSessionAttachPayload:
             patch.object(
                 orch_main,
                 "_assemble_session_attach_payload",
-                AsyncMock(return_value={"thread_id": "tid-1"}),
+                AsyncMock(
+                    return_value={
+                        "thread_id": self.thread_id,
+                        "session_runtime_generation": self.generation,
+                    }
+                ),
             ),
             patch.object(
                 orch_main,
@@ -717,8 +756,8 @@ class TestSendSessionAttachPayload:
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
             )
 
         assert ok is True
@@ -726,12 +765,7 @@ class TestSendSessionAttachPayload:
 
     @pytest.mark.asyncio
     async def test_409_retains_reservation_because_same_thread_is_ambiguous(self):
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": None,
-            "metadata": {},
-        }
+        thread = self._thread()
         _FakeAsyncClient.response_status = 409
         with (
             patch.object(
@@ -742,22 +776,31 @@ class TestSendSessionAttachPayload:
             patch.object(
                 orch_main,
                 "_assemble_session_attach_payload",
-                AsyncMock(return_value={"thread_id": "tid-1"}),
+                AsyncMock(
+                    return_value={
+                        "thread_id": self.thread_id,
+                        "session_runtime_generation": self.generation,
+                    }
+                ),
             ),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
             patch.object(
                 orch_main,
                 "_reserve_session_attach_binding",
-                AsyncMock(return_value=True),
+                AsyncMock(return_value=self.attach_token),
             ) as reserve,
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
             )
 
         assert ok is True
-        reserve.assert_awaited_once_with("a1", "tid-1")
+        reserve.assert_awaited_once_with(
+            self.agent_id,
+            self.thread_id,
+            expected_runtime_generation=self.generation,
+        )
         assert [call["url"] for call in _FakeAsyncClient.calls] == [
             "http://10.0.0.1:8001/session/attach"
         ]
@@ -765,12 +808,7 @@ class TestSendSessionAttachPayload:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status_code", [422, 500])
     async def test_ambiguous_http_failure_retains_reservation(self, status_code):
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": None,
-            "metadata": {},
-        }
+        thread = self._thread()
         _FakeAsyncClient.response_status = status_code
         with (
             patch.object(
@@ -781,13 +819,18 @@ class TestSendSessionAttachPayload:
             patch.object(
                 orch_main,
                 "_assemble_session_attach_payload",
-                AsyncMock(return_value={"thread_id": "tid-1"}),
+                AsyncMock(
+                    return_value={
+                        "thread_id": self.thread_id,
+                        "session_runtime_generation": self.generation,
+                    }
+                ),
             ),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
             )
 
         assert ok is True
@@ -795,12 +838,7 @@ class TestSendSessionAttachPayload:
     @pytest.mark.asyncio
     async def test_ambiguous_attach_log_does_not_echo_secret_response(self, caplog):
         private_material = "-----BEGIN OPENSSH PRIVATE KEY-----hidden"
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": None,
-            "metadata": {},
-        }
+        thread = self._thread()
         _FakeAsyncClient.response_status = 422
         _FakeAsyncClient.response_text = private_material
         with (
@@ -812,13 +850,18 @@ class TestSendSessionAttachPayload:
             patch.object(
                 orch_main,
                 "_assemble_session_attach_payload",
-                AsyncMock(return_value={"thread_id": "tid-1"}),
+                AsyncMock(
+                    return_value={
+                        "thread_id": self.thread_id,
+                        "session_runtime_generation": self.generation,
+                    }
+                ),
             ),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
             )
 
         assert ok is True
@@ -827,12 +870,7 @@ class TestSendSessionAttachPayload:
 
     @pytest.mark.asyncio
     async def test_transport_failure_retains_reservation(self):
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": None,
-            "metadata": {},
-        }
+        thread = self._thread()
         _FakeAsyncClient.raise_on_post = TimeoutError("response lost")
         with (
             patch.object(
@@ -843,13 +881,18 @@ class TestSendSessionAttachPayload:
             patch.object(
                 orch_main,
                 "_assemble_session_attach_payload",
-                AsyncMock(return_value={"thread_id": "tid-1"}),
+                AsyncMock(
+                    return_value={
+                        "thread_id": self.thread_id,
+                        "session_runtime_generation": self.generation,
+                    }
+                ),
             ),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
             )
 
         assert ok is True
@@ -873,7 +916,7 @@ class TestSendSessionAttachPayload:
             return True
 
         async def save_detach():
-            async with orch_main.postgres_db.thread_datasource_lock("tid-1"):
+            async with orch_main.postgres_db.thread_datasource_lock(self.thread_id):
                 order.append("save")
 
         with (
@@ -890,8 +933,12 @@ class TestSendSessionAttachPayload:
         ):
             attach_task = asyncio.create_task(
                 orch_main._send_session_attach(
-                    {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                    "tid-1",
+                    {
+                        "id": self.agent_id,
+                        "pod_ip": "10.0.0.1",
+                        "pod_port": 8001,
+                    },
+                    self.thread_id,
                 )
             )
             await delivery_started.wait()
@@ -914,13 +961,11 @@ class TestSendSessionAttachPayload:
     async def test_attach_overlays_first_class_control_scalars_on_resolved_config(
         self, stored_narration, expected_narration
     ):
-        thread = {
-            "id": "tid-1",
-            "user_id": "owner-1",
-            "metadata": {},
-            "permission_mode": "autonomous",
-            "narration_mode": stored_narration,
-        }
+        thread = self._thread(
+            user_id="owner-1",
+            permission_mode="autonomous",
+            narration_mode=stored_narration,
+        )
         resolved = {
             "agent": {
                 "interactive": {
@@ -955,7 +1000,7 @@ class TestSendSessionAttachPayload:
                 orch_main, "_resolve_session_config", AsyncMock(return_value=resolved)
             ),
         ):
-            payload = await orch_main._assemble_session_attach_payload("tid-1")
+            payload = await orch_main._assemble_session_attach_payload(self.thread_id)
 
         interactive = payload["resolved_config"]["agent"]["interactive"]
         assert interactive == {
@@ -965,13 +1010,11 @@ class TestSendSessionAttachPayload:
 
     @pytest.mark.asyncio
     async def test_attach_materializes_scalars_in_legacy_config_fallback(self):
-        thread = {
-            "id": "tid-1",
-            "user_id": "owner-1",
-            "metadata": {},
-            "permission_mode": "auto_accept",
-            "narration_mode": "auto",
-        }
+        thread = self._thread(
+            user_id="owner-1",
+            permission_mode="auto_accept",
+            narration_mode="auto",
+        )
         with (
             patch.object(
                 orch_main.postgres_db,
@@ -999,7 +1042,7 @@ class TestSendSessionAttachPayload:
             ),
         ):
             payload = await orch_main._assemble_session_attach_payload(
-                "tid-1", config_override={"llm": {"model": "m"}}
+                self.thread_id, config_override={"llm": {"model": "m"}}
             )
 
         assert payload["resolved_config"] is None
@@ -1011,12 +1054,7 @@ class TestSendSessionAttachPayload:
     @pytest.mark.asyncio
     async def test_payload_carries_config_name(self):
         _FakeAsyncClient.response_status = 500
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": None,
-            "metadata": {},
-        }
+        thread = self._thread()
         with (
             patch.object(
                 orch_main.postgres_db,
@@ -1032,8 +1070,8 @@ class TestSendSessionAttachPayload:
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
                 {"llm": {"model": "m"}},
                 ["p1"],
                 datasources=None,
@@ -1044,19 +1082,17 @@ class TestSendSessionAttachPayload:
         call = _FakeAsyncClient.calls[0]
         assert call["url"] == "http://10.0.0.1:8001/session/attach"
         assert call["json"]["config_name"] == "session_base"
-        assert call["json"]["thread_id"] == "tid-1"
+        assert call["json"]["thread_id"] == self.thread_id
         assert call["json"]["runtime_actor"]["caller_kind"] == "human"
         assert call["json"]["runtime_actor"]["access_credential"].startswith("sra_")
 
     @pytest.mark.asyncio
     async def test_attach_refuses_revoked_persisted_datasource_before_http(self):
         datasource_id = "11111111-2222-3333-4444-555555555555"
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "metadata": {"datasource_ids": [datasource_id]},
-        }
+        thread = self._thread(
+            user_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            metadata={"datasource_ids": [datasource_id]},
+        )
         denied = HTTPException(
             status_code=403,
             detail="One or more selected connectors are unavailable",
@@ -1086,8 +1122,8 @@ class TestSendSessionAttachPayload:
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
                 {},
                 [],
                 datasources=[{"type": "kb", "datasource_id": datasource_id}],
@@ -1105,12 +1141,9 @@ class TestSendSessionAttachPayload:
     @pytest.mark.asyncio
     async def test_attach_refuses_revoked_native_project_before_http(self):
         project_id = "99999999-2222-3333-4444-555555555555"
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "metadata": {},
-        }
+        thread = self._thread(
+            user_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
         denied = HTTPException(
             status_code=403,
             detail="One or more attached projects are unavailable",
@@ -1140,8 +1173,8 @@ class TestSendSessionAttachPayload:
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
                 {},
                 [project_id],
                 datasources=None,
@@ -1157,12 +1190,10 @@ class TestSendSessionAttachPayload:
         stale_id = "11111111-2222-4333-8444-555555555555"
         current_id = "66666666-7777-4888-8999-aaaaaaaaaaaa"
         project_id = "99999999-2222-4333-8444-555555555555"
-        thread = {
-            "id": "tid-1",
-            "execution_lane": "pinned",
-            "user_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-            "metadata": {"datasource_ids": [current_id]},
-        }
+        thread = self._thread(
+            user_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            metadata={"datasource_ids": [current_id]},
+        )
         current_row = {
             "id": current_id,
             "type": "kb",
@@ -1207,8 +1238,8 @@ class TestSendSessionAttachPayload:
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
                 {},
                 ["stale-project"],
                 datasources=[{"type": "kb", "datasource_id": stale_id}],
@@ -1228,7 +1259,380 @@ class TestSendSessionAttachPayload:
 
 class TestColdSessionDatasourceDelivery:
     @pytest.mark.asyncio
+    async def test_pinned_workspace_owner_is_exact_and_strict_mode_is_staged(
+        self, monkeypatch
+    ):
+        agent_a = "00000000-0000-0000-0000-0000000000a1"
+        agent_b = "00000000-0000-0000-0000-0000000000b2"
+        generation = "00000000-0000-4000-8000-0000000000d4"
+        attach_token = "00000000-0000-4000-8000-0000000000e5"
+        thread = {
+            "id": "00000000-0000-0000-0000-0000000000c3",
+            "execution_lane": "pinned",
+            "status": "created",
+            "agent_id": agent_b,
+            "runtime_generation": generation,
+            "runtime_attach_token": attach_token,
+            "runtime_retirement_token": None,
+        }
+        reciprocal = AsyncMock(return_value=True)
+        with patch.object(
+            orch_main.postgres_db,
+            "pinned_thread_agent_is_reciprocal",
+            reciprocal,
+        ):
+            assert (
+                await orch_main._require_pinned_workspace_credential_owner(
+                    thread, agent_b, generation, attach_token
+                )
+                == agent_b
+            )
+            with pytest.raises(HTTPException) as stale:
+                await orch_main._require_pinned_workspace_credential_owner(
+                    thread, agent_a, generation, attach_token
+                )
+            assert stale.value.status_code == 409
+            assert stale.value.detail["code"] == "pinned_runtime_identity_mismatch"
+
+            # A compatibility override remains available for isolated rollback
+            # tests, but the post-0185 application default is strict.
+            monkeypatch.setenv("REQUIRE_PINNED_STATUS_IDENTITY", "false")
+            assert (
+                await orch_main._require_pinned_workspace_credential_owner(
+                    thread, None, None, None
+                )
+                is None
+            )
+            monkeypatch.setenv("REQUIRE_PINNED_STATUS_IDENTITY", "true")
+            with pytest.raises(HTTPException) as missing:
+                await orch_main._require_pinned_workspace_credential_owner(
+                    thread, None, None, None
+                )
+            assert missing.value.detail["code"] == "pinned_status_identity_required"
+
+            monkeypatch.delenv("REQUIRE_PINNED_STATUS_IDENTITY", raising=False)
+            protected = {
+                **thread,
+                "metadata": {"protected_cloud": True},
+            }
+            with pytest.raises(HTTPException) as protected_missing:
+                await orch_main._require_pinned_workspace_credential_owner(
+                    protected, None, None, None
+                )
+            assert (
+                protected_missing.value.detail["code"]
+                == "pinned_status_identity_required"
+            )
+
+        reciprocal.assert_awaited_once_with(
+            thread["id"],
+            agent_b,
+            expected_runtime_generation=generation,
+            expected_attach_token=attach_token,
+            expected_ro_mount_id=None,
+            expected_ro_engage_attempt=None,
+            expected_ro_grant_handle=None,
+            expected_ro_reader_id=None,
+            expected_ro_webdav_url=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_old_runtime_crossing_end_resume_cannot_receive_successor_credentials(
+        self,
+    ):
+        agent_a = "00000000-0000-0000-0000-0000000000a1"
+        agent_b = "00000000-0000-0000-0000-0000000000b2"
+        thread_id = "00000000-0000-0000-0000-0000000000c3"
+        generation_a = "00000000-0000-4000-8000-0000000000d4"
+        generation_b = "00000000-0000-4000-8000-0000000000d5"
+        attach_a = "00000000-0000-4000-8000-0000000000e6"
+        entry = {
+            "id": thread_id,
+            "execution_lane": "pinned",
+            "status": "created",
+            "agent_id": agent_a,
+            "runtime_generation": generation_a,
+            "runtime_attach_token": attach_a,
+            "runtime_retirement_token": None,
+            "user_id": None,
+            "project_id": None,
+            "metadata": {"config_override": {"llm": {"api_key": "secret-sentinel"}}},
+        }
+        successor = {
+            **entry,
+            "status": "active",
+            "agent_id": agent_b,
+            "runtime_generation": generation_b,
+            "runtime_attach_token": "00000000-0000-4000-8000-0000000000e7",
+            "metadata": {},
+        }
+
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(side_effect=[entry, successor]),
+            ),
+            patch.object(
+                orch_main.postgres_db,
+                "pinned_thread_agent_is_reciprocal",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(
+                orch_main.postgres_db,
+                "list_thread_mounts",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main,
+                "_agent_canvas_workspace_capabilities",
+                return_value=(False, False, False),
+            ),
+            patch.object(
+                orch_main, "_resolve_thread_datasources", AsyncMock(return_value=None)
+            ),
+            patch.object(
+                orch_main, "_build_agent_cloud_mount", AsyncMock(return_value=None)
+            ),
+            patch.object(orch_main, "_build_agent_cloud_sync", return_value=None),
+            patch.object(
+                orch_main,
+                "_inject_thread_dispatch_credentials",
+                AsyncMock(return_value={"llm": {"api_key": "secret-sentinel"}}),
+            ),
+            patch.object(
+                orch_main, "_resolve_session_config", AsyncMock(return_value=None)
+            ),
+            patch.object(
+                orch_main,
+                "_resolve_thread_repositories",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                orch_main.postgres_db,
+                "managed_repository_authorities_are_current",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(
+                orch_main,
+                "_inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+        ):
+            with pytest.raises(HTTPException) as denied:
+                await orch_main._agent_get_thread_workspace_locked(
+                    thread_id,
+                    presented_agent_id=agent_a,
+                    presented_runtime_generation=generation_a,
+                    presented_attach_token=attach_a,
+                )
+
+        assert denied.value.status_code == 409
+        assert denied.value.detail["code"] == "pinned_runtime_identity_mismatch"
+        assert "secret-sentinel" not in str(denied.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_prepared_protected_reader_attempt_is_fenced_at_response_boundary(
+        self,
+    ):
+        """A same-G A1 -> A2 grant rotation cannot leak A1 credentials.
+
+        The expensive response is prepared from A1. Immediately before the
+        final joined owner/RO query, another replica has published A2 for the
+        same thread generation. The response must be refused, not splice A1's
+        password into a thread snapshot that merely still has the same G.
+        """
+
+        thread_id = "00000000-0000-4000-8000-0000000000c3"
+        agent_id = "00000000-0000-4000-8000-0000000000a1"
+        generation = "00000000-0000-4000-8000-0000000000d4"
+        attach_token = "00000000-0000-4000-8000-0000000000e5"
+        attempt_a1 = "00000000-0000-4000-8000-0000000000f1"
+        attempt_a2 = "00000000-0000-4000-8000-0000000000f2"
+        backend_instance_id = "00000000-0000-4000-8000-000000000061"
+        project_id = "00000000-0000-4000-8000-000000000062"
+        mount_rows = [
+            {
+                "id": "00000000-0000-4000-8000-000000000071",
+                "mount_kind": "project",
+                "backend_id": "nextcloud",
+                "backend_instance_id": backend_instance_id,
+                "source_kind": "project_folder",
+                "source_ref": project_id,
+                "target_path": "projects/proj",
+                "cloud_handle": (
+                    '{"backend":"nextcloud","native_id":"42",'
+                    '"vendor_meta":{"mountpoint":"Proj"}}'
+                ),
+            }
+        ]
+        source = ProtectedMountSourceIdentity.from_mount_row(mount_rows[0])
+        assert source is not None
+        plan = ProtectedNextcloudReaderGrantPlan(
+            engage_attempt=attempt_a1,
+            backend_instance_id=backend_instance_id,
+            source=source,
+        )
+        ro_a1 = {
+            "id": "00000000-0000-4000-8000-000000000081",
+            "selected_mount_id": mount_rows[0]["id"],
+            "thread_id": thread_id,
+            "user_id": "user-1",
+            "backend": "nextcloud",
+            "backend_instance_id": backend_instance_id,
+            "reader_id": plan.reader_id,
+            "grant_group_id": plan.group_id,
+            "grant_handle": plan.grant_handle,
+            "grant_handle_sha256": plan.grant_handle_sha256,
+            "source_binding": source.binding,
+            "source_binding_sha256": source.sha256,
+            "credentials": "credential-a1-sentinel",
+            "webdav_url": (
+                "https://nc.internal/remote.php/dav/files/"
+                f"{plan.reader_id}/{plan.mountpoint}/"
+            ),
+            "auth_kind": "basic",
+            "status": "active",
+            "etag_baseline": {},
+            "runtime_generation": generation,
+            "engage_attempt": attempt_a1,
+        }
+        workspace = {
+            "status": "ready",
+            "pod_ip": "10.42.0.10",
+            "pod_port": 30022,
+            "_canvas_workspace_generation": ("00000000-0000-4000-8000-000000000091"),
+            "_runtime_incarnation": "00000000-0000-4000-8000-000000000092",
+        }
+        thread = {
+            "id": thread_id,
+            "execution_lane": "pinned",
+            "status": "created",
+            "agent_id": agent_id,
+            "runtime_generation": generation,
+            "runtime_attach_token": attach_token,
+            "runtime_retirement_token": None,
+            "user_id": "user-1",
+            "project_id": None,
+            "metadata": {
+                "protected_cloud": True,
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace_container": workspace,
+                "_workspace_binding": {
+                    "generation": workspace["_canvas_workspace_generation"],
+                    "kind": "remote",
+                    "backing_id": "k8s-pvc:agent-workspaces:pvc-uid-a1",
+                    "ssh_host_key_fingerprint": "SHA256:trusted-a1",
+                    "runtime_incarnation": workspace["_runtime_incarnation"],
+                },
+            },
+        }
+        state = {"attempt": attempt_a1}
+
+        async def get_thread(_thread_id):
+            return thread
+
+        async def reciprocal(_thread_id, _agent_id, **kwargs):
+            expected_attempt = kwargs.get("expected_ro_engage_attempt")
+            if expected_attempt is not None:
+                # The peer publication lands after A1 was prepared but before
+                # the joined final owner/RO snapshot evaluates its predicates.
+                state["attempt"] = attempt_a2
+            return expected_attempt is None or expected_attempt == state["attempt"]
+
+        reciprocal_check = AsyncMock(side_effect=reciprocal)
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(side_effect=get_thread),
+            ),
+            patch.object(
+                orch_main.postgres_db,
+                "pinned_thread_agent_is_reciprocal",
+                reciprocal_check,
+            ),
+            patch.object(
+                orch_main,
+                "_protected_cloud_delivery_state",
+                AsyncMock(return_value=("ready", None)),
+            ),
+            patch.object(
+                orch_main.postgres_db,
+                "get_ro_mount_by_thread",
+                AsyncMock(return_value=ro_a1),
+            ),
+            patch.object(
+                orch_main.postgres_db,
+                "list_thread_mounts",
+                AsyncMock(return_value=mount_rows),
+            ),
+            patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main,
+                "_agent_canvas_workspace_capabilities",
+                return_value=(False, False, False),
+            ),
+            patch.object(
+                orch_main, "_resolve_thread_datasources", AsyncMock(return_value=None)
+            ),
+            patch.object(
+                orch_main, "_build_agent_cloud_mount", AsyncMock(return_value=None)
+            ),
+            patch.object(orch_main, "_build_agent_cloud_sync", return_value=None),
+            patch.object(
+                orch_main,
+                "_inject_thread_dispatch_credentials",
+                AsyncMock(return_value={"workspace": {"backend": "sandbox"}}),
+            ),
+            patch.object(
+                orch_main, "_resolve_session_config", AsyncMock(return_value=None)
+            ),
+            patch.object(
+                orch_main, "_resolve_thread_repositories", AsyncMock(return_value=None)
+            ),
+            patch.object(
+                orch_main.postgres_db,
+                "managed_repository_authorities_are_current",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(
+                orch_main,
+                "_inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+        ):
+            with pytest.raises(HTTPException) as denied:
+                await orch_main._agent_get_thread_workspace_locked(
+                    thread_id,
+                    presented_agent_id=agent_id,
+                    presented_runtime_generation=generation,
+                    presented_attach_token=attach_token,
+                )
+
+        assert denied.value.status_code == 409
+        assert denied.value.detail["code"] == "pinned_runtime_identity_mismatch"
+        assert "credential-a1-sentinel" not in str(denied.value.detail)
+        assert reciprocal_check.await_count == 2
+        assert (
+            reciprocal_check.await_args_list[-1].kwargs["expected_ro_engage_attempt"]
+            == attempt_a1
+        )
+
+    @pytest.mark.asyncio
     async def test_live_detach_commits_before_cold_handler_refetches(self):
+        thread_id = _ATTACH_THREAD_ID
         datasource_a = "11111111-2222-4333-8444-555555555555"
         state = {"datasource_ids": [datasource_a]}
         gate = asyncio.Lock()
@@ -1244,15 +1648,20 @@ class TestColdSessionDatasourceDelivery:
             # Return a fresh row so a pre-lock read would retain A even after
             # the writer replaces the canonical metadata with [].
             return {
-                "id": "tid-1",
+                "id": thread_id,
                 "execution_lane": "pinned",
+                "status": "created",
+                "agent_id": _ATTACH_AGENT_ID,
+                "runtime_generation": _ATTACH_RUNTIME_GENERATION,
+                "runtime_attach_token": _ATTACH_TOKEN,
+                "runtime_retirement_token": None,
                 "user_id": None,
                 "project_id": None,
                 "metadata": {"datasource_ids": list(state["datasource_ids"])},
             }
 
         async def save_detach():
-            async with orch_main.postgres_db.thread_datasource_lock("tid-1"):
+            async with orch_main.postgres_db.thread_datasource_lock(thread_id):
                 assert state["datasource_ids"] == [datasource_a]
                 writer_entered.set()
                 await allow_writer_commit.wait()
@@ -1266,6 +1675,11 @@ class TestColdSessionDatasourceDelivery:
                 side_effect=lambda _thread_id: shared_lock(),
             ),
             patch.object(orch_main.postgres_db, "get_thread", get_thread),
+            patch.object(
+                orch_main.postgres_db,
+                "pinned_thread_agent_is_reciprocal",
+                AsyncMock(return_value=True),
+            ),
             patch.object(
                 orch_main.postgres_db,
                 "list_thread_mounts",
@@ -1294,7 +1708,18 @@ class TestColdSessionDatasourceDelivery:
             writer = asyncio.create_task(save_detach())
             await writer_entered.wait()
             cold_response = asyncio.create_task(
-                orch_main.agent_get_thread_workspace(object(), "tid-1")
+                orch_main.agent_get_thread_workspace(
+                    SimpleNamespace(
+                        headers={
+                            "X-Agent-ID": _ATTACH_AGENT_ID,
+                            "X-Session-Runtime-Generation": (
+                                _ATTACH_RUNTIME_GENERATION
+                            ),
+                            "X-Session-Runtime-Attach-Token": _ATTACH_TOKEN,
+                        }
+                    ),
+                    thread_id,
+                )
             )
             await asyncio.sleep(0)
 
@@ -1308,14 +1733,20 @@ class TestColdSessionDatasourceDelivery:
 
         assert response["datasources"] is None
         assert datasource_a not in str(response)
-        get_thread.assert_awaited_once_with("tid-1")
+        assert get_thread.await_count == 2
+        assert all(call.args == (thread_id,) for call in get_thread.await_args_list)
 
     @pytest.mark.asyncio
     async def test_attach_discards_stale_payload_after_detach_all(self):
         stale_id = "11111111-2222-4333-8444-555555555555"
         thread = {
-            "id": "tid-1",
+            "id": _ATTACH_THREAD_ID,
             "execution_lane": "pinned",
+            "status": "created",
+            "agent_id": _ATTACH_AGENT_ID,
+            "runtime_generation": _ATTACH_RUNTIME_GENERATION,
+            "runtime_attach_token": _ATTACH_TOKEN,
+            "runtime_retirement_token": None,
             "user_id": None,
             "metadata": {"datasource_ids": []},
         }
@@ -1341,8 +1772,12 @@ class TestColdSessionDatasourceDelivery:
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
-                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
-                "tid-1",
+                {
+                    "id": _ATTACH_AGENT_ID,
+                    "pod_ip": "10.0.0.1",
+                    "pod_port": 8001,
+                },
+                _ATTACH_THREAD_ID,
                 {},
                 [],
                 datasources=[{"type": "kb", "datasource_id": stale_id}],
@@ -1376,7 +1811,9 @@ class TestAttachRoutesForwardConfigName:
         import src.api.persistent_app as papp
 
         assert 'config_name=request.get("config_name")' in inspect.getsource(dual_app)
-        assert 'config_name=request.get("config_name")' in inspect.getsource(papp)
+        assert '"config_name": request.get("config_name")' in inspect.getsource(
+            papp._admit_pool_session_attach
+        )
 
     def test_dual_detach_uses_rest_detach_reason(self):
         """Both detach routes must terminate with the documented
@@ -1516,40 +1953,133 @@ class TestEndedSessionKeepsItsVolume:
     deletes workspaces at the far end.
     """
 
-    @staticmethod
-    def _thread():
-        return {"id": "t1", "user_id": "u1", "agent_id": None, "metadata": {}}
+    thread_id = "50000000-0000-4000-8000-000000000001"
+    runtime_generation = "50000000-0000-4000-8000-000000000002"
+    retirement_token = "50000000-0000-4000-8000-000000000003"
+    workspace_generation = "50000000-0000-4000-8000-000000000004"
+    workspace_runtime = "50000000-0000-4000-8000-000000000005"
+    workspace_pvc_uid = "50000000-0000-4000-8000-000000000006"
+
+    def _thread(self):
+        return {
+            "id": self.thread_id,
+            "user_id": "u1",
+            "agent_id": None,
+            "execution_lane": "pinned",
+            "status": "created",
+            "runtime_generation": self.runtime_generation,
+            "runtime_attach_token": None,
+            "runtime_retirement_token": None,
+            "metadata": {
+                "workspace_container": {
+                    "status": "ready",
+                    "provisioner": "k8s",
+                    "_canvas_workspace_generation": self.workspace_generation,
+                    "_runtime_incarnation": self.workspace_runtime,
+                },
+                "_workspace_binding": {
+                    "generation": self.workspace_generation,
+                    "kind": "remote",
+                    "backing_id": f"k8s-pvc:{self.workspace_pvc_uid}",
+                },
+            },
+        }
 
     async def _run_end_thread(self, *, permanent: bool):
         """Drive the real DELETE endpoint, capturing the reclaim decision.
 
-        Returns ``(result, seen, db)`` — ``seen`` holds the kwargs
-        ``_release_thread_resources`` was called with.
+        Returns ``(result, release_workspace, db)`` so the assertion reaches
+        the exact Kubernetes actuator that owns PVC retention/deletion.
         """
-        seen: dict = {}
-
-        async def _release(thread_id, *, reclaim_volume=False):
-            seen["thread_id"] = thread_id
-            seen["reclaim_volume"] = reclaim_volume
+        thread = self._thread()
+        retirement = {
+            "state": "pending",
+            "token": self.retirement_token,
+            "generation": self.runtime_generation,
+            "permanent": permanent,
+            "authorized_at": None,
+            "context": {
+                "thread_id": self.thread_id,
+                "generation": self.runtime_generation,
+                "settle_status": "ended",
+                "runtime_authority_exposed": False,
+                "agent_id": None,
+                "runtime_attach_token": None,
+                "agent": {},
+                "agent_pod": {},
+                "route": {},
+                "workspace_container": thread["metadata"]["workspace_container"],
+                "workspace_binding": thread["metadata"]["_workspace_binding"],
+                "workspace_backend": "sandbox",
+                "vm": {},
+                "protected_ro": {},
+            },
+        }
 
         db = SimpleNamespace(
-            end_thread=AsyncMock(),
+            begin_pinned_thread_retirement=AsyncMock(return_value=retirement),
+            authorize_pinned_thread_retirement=AsyncMock(return_value=True),
+            settle_pinned_thread_retirement=AsyncMock(return_value=True),
             delete_thread=AsyncMock(),
-            get_thread=AsyncMock(return_value=self._thread()),
+            get_thread=AsyncMock(return_value=thread),
             merge_thread_config_override=AsyncMock(),
+            try_thread_advisory_lock=MagicMock(
+                side_effect=_owned_workspace_lifecycle_lock
+            ),
+            pinned_retirement_external_cleanup_complete=AsyncMock(return_value=False),
+            clear_pinned_retirement_physical_runtime_endpoint=AsyncMock(
+                return_value=True
+            ),
+        )
+        teardown_identity = SimpleNamespace(
+            pod_uid=self.workspace_runtime,
+            pvc_uid=self.workspace_pvc_uid,
+        )
+        release_workspace = AsyncMock(return_value=True)
+        provisioner = SimpleNamespace(
+            is_available=True,
+            capture_workspace_teardown_identity=AsyncMock(
+                return_value=teardown_identity
+            ),
+            release_workspace=release_workspace,
         )
         with (
             patch.object(
                 orch_main,
                 "require_thread_owner",
-                AsyncMock(return_value=({"sub": "u1"}, self._thread())),
+                AsyncMock(return_value=({"sub": "u1"}, thread)),
             ),
             patch.object(
                 orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
             ),
             patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
-            patch.object(orch_main, "_release_thread_resources", _release),
             patch.object(orch_main, "postgres_db", db),
+            patch.object(
+                orch_main,
+                "_pinned_retirement_is_current",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(
+                orch_main,
+                "_reconcile_workspace_provision_intent_for_retirement",
+                AsyncMock(return_value=False),
+            ),
+            patch.object(
+                orch_main,
+                "_stop_captured_retirement_agent",
+                AsyncMock(),
+            ),
+            patch.object(
+                orch_main,
+                "_reconcile_agent_workspace_claim_for_retirement",
+                AsyncMock(),
+            ),
+            patch.object(
+                orch_main,
+                "session_router",
+                SimpleNamespace(teardown_route=AsyncMock(return_value=True)),
+            ),
+            patch.object(orch_main, "container_provisioner", provisioner),
             patch.object(
                 orch_main, "snapshot_service", SimpleNamespace(is_available=False)
             ),
@@ -1558,20 +2088,29 @@ class TestEndedSessionKeepsItsVolume:
             ),
         ):
             result = await orch_main.end_thread(
-                "t1", SimpleNamespace(), permanent=permanent, force=True
+                self.thread_id,
+                SimpleNamespace(),
+                permanent=permanent,
+                force=True,
             )
-        return result, seen, db
+        return result, release_workspace, db
 
     @pytest.mark.asyncio
     async def test_soft_end_keeps_the_workspace_volume(self):
         """A soft end leaves the thread in 'ended', which /resume accepts — so
         reclaiming here would hand the user an empty workspace on a session they
         never deleted. Same reasoning that already keeps the Gitea repo."""
-        result, seen, db = await self._run_end_thread(permanent=False)
+        result, release_workspace, db = await self._run_end_thread(permanent=False)
 
         assert result == {"status": "ended"}
-        assert seen["reclaim_volume"] is False
-        db.end_thread.assert_awaited_once_with("t1")
+        assert release_workspace.await_args.kwargs["reclaim_volume"] is False
+        db.settle_pinned_thread_retirement.assert_awaited_once_with(
+            self.thread_id,
+            token=self.retirement_token,
+            generation=self.runtime_generation,
+            final_status="ended",
+            staged_event=None,
+        )
         db.delete_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1579,11 +2118,15 @@ class TestEndedSessionKeepsItsVolume:
         """The other half — without this the invariant would be trivially
         satisfiable by never reclaiming anything, and every deleted session
         would leak a 10Gi volume until the namespace quota rejects new ones."""
-        result, seen, db = await self._run_end_thread(permanent=True)
+        result, release_workspace, db = await self._run_end_thread(permanent=True)
 
         assert result == {"status": "deleted"}
-        assert seen["reclaim_volume"] is True
-        db.delete_thread.assert_awaited_once_with("t1")
+        assert release_workspace.await_args.kwargs["reclaim_volume"] is True
+        db.delete_thread.assert_awaited_once_with(
+            self.thread_id,
+            expected_runtime_retirement_token=self.retirement_token,
+            expected_runtime_generation=self.runtime_generation,
+        )
 
     @pytest.mark.asyncio
     async def test_stateless_end_refuses_unattested_workspace_before_cleanup(self):

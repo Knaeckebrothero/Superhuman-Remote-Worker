@@ -97,6 +97,7 @@ def _patched_app(monkeypatch, session, *, turn_open=False):
     monkeypatch.setattr(app_mod, "_tool_inflight", False)
     monkeypatch.setattr(app_mod, "_loop_user_queue", asyncio.Queue())
     monkeypatch.setattr(app_mod, "_loop_interrupt_flag", None)
+    monkeypatch.setattr(app_mod, "_loop_interrupt_target_turn_id", None)
     monkeypatch.setattr(app_mod, "_hard_interrupt_event", asyncio.Event())
     monkeypatch.setattr(
         app_mod, "_resolve_event_journal_epoch", AsyncMock(return_value=7)
@@ -217,6 +218,34 @@ def test_rewind_validates_target_before_interrupting(monkeypatch):
     assert errors
     assert pa._loop_interrupt_flag is None  # interrupt path never entered
     assert pa._loop_user_queue.qsize() == 1  # drain never ran — item still queued
+
+
+def test_rewind_interrupt_is_scoped_to_the_active_turn(monkeypatch):
+    session, conn, _ = _mk_session([_human("m", "x")])
+    conn.get_live_message.return_value = {"seq": 3, "role": "human", "content": "x"}
+    app_mod, ws_sent = _patched_app(monkeypatch, session, turn_open=True)
+    observed = []
+    original_signal = app_mod._signal_interrupt_for_turn
+
+    def _signal_and_park(turn_id):
+        mode = original_signal(turn_id)
+        observed.append((turn_id, mode, app_mod._loop_interrupt_target_turn_id))
+        app_mod._turn_event_open = False
+        app_mod._clear_loop_interrupt(target_turn_id=turn_id)
+        return mode
+
+    monkeypatch.setattr(app_mod, "_signal_interrupt_for_turn", _signal_and_park)
+
+    _run_rewind(
+        app_mod,
+        MagicMock(),
+        {"message_id": "m", "mode": "conversation", "request_id": "r"},
+    )
+
+    assert observed == [(9, "hard", 9)]
+    assert app_mod._loop_interrupt_flag is None
+    assert app_mod._loop_interrupt_target_turn_id is None
+    assert [payload for method, payload in ws_sent if method == "rewind.ack"]
 
 
 def test_rewind_code_mode_requires_git(monkeypatch):

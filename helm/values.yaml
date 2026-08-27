@@ -129,6 +129,17 @@ orchestrator:
   # 2+ on any cluster with more than one node; the PDB below follows
   # automatically, and `databases.profile: ha` is the data-tier counterpart.
   replicas: 1
+  # -- One-shot acknowledgement for the drained pinned-runtime authority
+  # migration. Keep false during an ordinary rolling upgrade: a new pod then
+  # refuses pending migration 0185 while the old ready pod keeps serving.
+  # Before setting true, place the service in maintenance, end/drain every
+  # pinned session, delete old warm/dedicated agent writers, and wait for
+  # in-flight provisioning/staging effects. True injects the exact migration
+  # gate and changes the orchestrator Deployment strategy to Recreate so the
+  # old ReplicaSet is gone before the migration transaction starts. Do not use
+  # Helm --atomic or roll back to an old image after 0185 commits. Clear this
+  # value again on the next all-new-version rollout.
+  runtimeAuthorityMigrationMaintenanceAck: false
   resources:
     requests:
       memory: "256Mi"
@@ -434,6 +445,11 @@ agent:
   # Default OFF (prod-safe); the dev/experimental values file turns it on.
   # See knowledge-base/knowledge/design/cloud_access_unification.md §8 Phase 1.
   protectedCloudModeEnabled: "false"
+  # -- Require every pinned lifecycle/credential write to carry exact runtime
+  # generation and attach identity. Migration 0185 is a drained maintenance
+  # cutover rather than a mixed-version reader-first rollout, so this remains
+  # true after the cutover and must never be disabled while 0185 is installed.
+  requirePinnedStatusIdentity: "true"
   # -- Effective context ceiling (tokens) for models routed via the system codex
   # proxy, whose ChatGPT-OAuth backend caps context ~400K regardless of the
   # model's true API window. Compaction fires at 80% of this. Set 0 to disable
@@ -515,6 +531,15 @@ agent:
     app:
       min: "1"
       max: "3"
+  # -- Allow pinned agents to write terminal `cancelled` input-delivery rows.
+  # Reader-first rollout only: leave false through the migration/reader deploy,
+  # drain or replace every old persistent/warm agent, then enable and roll the
+  # agent fleet. Once a cancellation is written, never roll back below an
+  # 0183-aware reader; deleting only the ledger row exposes its surviving
+  # transcript row to old model-history readers. Rollback requires tombstoning
+  # or deleting that transcript/thread, or an old-reader-compatible exclusion.
+  # See the design note.
+  persistentInputCancellationEnabled: false
   # -- Stateless executor Deployment (knowledge-base/knowledge/features/stateless_agents.md §5.8;
   # templates/agent/stateless-deployment.yaml). A static pool of generic agent
   # processes running `--mode stateless` that PULL work units from the
@@ -2124,6 +2149,44 @@ nextcloud:
   replicas: 0
   storageClass: ""
   storageSize: "10Gi"
+  # Internal-only authority-creating lane for protected read-only grants.
+  # It shares the bundled Nextcloud code/data volume but runs in a dedicated
+  # Nginx + PHP-FPM pool. The FPM auto-prepend verifier authenticates an exact
+  # attempt-scoped request and rejects an expired queued request before
+  # Nextcloud boots; request_terminate_timeout supplies the hard handler bound.
+  # External Nextcloud installations are deliberately ineligible unless they
+  # deploy and attest an equivalent server-side lane.
+  protectedEffect:
+    enabled: false
+    # The HMAC root must never live in the shared application Secret: dynamic
+    # agent Pods consume that bundle via envFrom. ESO therefore reads a
+    # dedicated Vault path, while pre-created-secret users name a dedicated
+    # immutable Secret here. Chart-created mode generates its own Secret.
+    hmacSecretName: ""
+    hmacVaultPath: ""
+    fpmImage: docker.io/library/nextcloud:31-fpm
+    nginxImage: docker.io/library/nginx:1.27-alpine-slim
+    queueBoundSeconds: 30
+    handlerBoundSeconds: 10
+    clockSkewBoundSeconds: 2
+    safetyMarginSeconds: 5
+    capabilityMaxAgeSeconds: 5
+    maxChildren: 2
+    resources:
+      fpm:
+        requests:
+          memory: "128Mi"
+          cpu: "50m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      nginx:
+        requests:
+          memory: "16Mi"
+          cpu: "10m"
+        limits:
+          memory: "64Mi"
+          cpu: "100m"
   resources:
     requests:
       memory: "256Mi"
