@@ -101,6 +101,20 @@ async def test_history_excludes_summary_marker_rows():
 
 
 @pytest.mark.asyncio
+async def test_history_excludes_cancelled_and_other_unadmitted_delivery_rows():
+    """Cockpit keeps the transcript row; the agent restore must not model it."""
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetch = AsyncMock(return_value=[])
+
+    await db.get_thread_messages_history("t1")
+
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    assert "thread_input_deliveries" in sql
+    for state in ("persisted", "owned", "queued", "deferred", "cancelled"):
+        assert f"'{state}'" in sql
+
+
+@pytest.mark.asyncio
 async def test_history_supports_since_turn_for_checkpoint_resume():
     """Resume-from-checkpoint loads only the tail (turn > B), skipping rows
     the persisted summary already covers. Without ``since_turn`` the query is

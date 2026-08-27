@@ -30,11 +30,21 @@ from orchestrator.services.cloud_staging.stage import (
     staging_manifest_key,
     staging_tar_key,
 )
+from orchestrator.services.cloud_staging.source_identity import (
+    ProtectedMountSourceIdentity,
+)
 from orchestrator.services.diff_source import DiffEntrySummary, UpperdirDiffSource
 
 from tests.cloud.fake import FakeMainCloudBackend
 
 THREAD_ID = "thread-upper-1"
+_SOURCE = ProtectedMountSourceIdentity(
+    backend_instance_id="11111111-1111-4111-8111-111111111111",
+    source_ref="22222222-2222-4222-8222-222222222222",
+    target_path="projects/example",
+    native_id="1",
+    mountpoint="Example",
+)
 
 
 def _build_tar(members: list[tuple[str, bytes]]) -> bytes:
@@ -67,6 +77,8 @@ def _manifest(
         "tar_sha256": (
             hashlib.sha256(tar_bytes).hexdigest() if tar_sha256 is None else tar_sha256
         ),
+        "source_binding": _SOURCE.binding,
+        "source_binding_sha256": _SOURCE.sha256,
     }
 
 
@@ -82,13 +94,22 @@ def _snapshot_service(blobs: dict[str, bytes]):
 
 def _mount_row(staged: bool = True):
     if not staged:
-        return {"id": "mount-1", "staged_summary": None}
+        return {
+            "id": "mount-1",
+            "staged_summary": None,
+            "source_binding": _SOURCE.binding,
+            "source_binding_sha256": _SOURCE.sha256,
+        }
     return {
         "id": "mount-1",
+        "source_binding": _SOURCE.binding,
+        "source_binding_sha256": _SOURCE.sha256,
         "staged_summary": {
             "counts": {},
             "signature": "sig",
             "tar_sha256": "irrelevant",
+            "source_binding": _SOURCE.binding,
+            "source_binding_sha256": _SOURCE.sha256,
         },
     }
 
@@ -153,6 +174,8 @@ async def test_summary_maps_manifest_entries_and_meta():
         "epoch": 9,
         "staged_at": "2026-07-12T00:00:00Z",
         "counts": {"added": 1, "modified": 1, "deleted": 1},
+        "source_binding": _SOURCE.binding,
+        "source_binding_sha256": _SOURCE.sha256,
     }
 
 

@@ -31,6 +31,7 @@ PROJECT_ID = UUID("33333333-cccc-4444-8888-333333333333")
 AGENT_ID = UUID("44444444-dddd-4444-8888-444444444444")
 REQUEST_ID = UUID("55555555-eeee-4444-8888-555555555555")
 CLIENT_REQUEST_ID = UUID("66666666-ffff-4444-8888-666666666666")
+RUNTIME_GENERATION = UUID("77777777-aaaa-4444-8888-777777777777")
 
 
 class _AsyncContext:
@@ -152,6 +153,9 @@ def _thread(**overrides: Any) -> dict[str, Any]:
         "execution_lane": "stateless",
         "control_seq_hwm": 4,
         "control_admission_agent_id": None,
+        "runtime_generation": RUNTIME_GENERATION,
+        "runtime_retirement_token": None,
+        "runtime_attach_token": None,
         "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
     }
     row.update(overrides)
@@ -309,6 +313,7 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
         "method": "mode.set",
         "state": "pending",
         "duplicate": False,
+        "session_runtime_generation": None,
     }
     assert "execution_lane" not in result
     owner.assert_awaited_once_with(
@@ -327,6 +332,8 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
         verb="mode.set",
         payload={"mode": "supervised"},
         requested_by=str(OWNER_ID),
+        expected_runtime_generation=None,
+        require_pinned_runtime_generation=False,
     )
     audit.assert_awaited_once()
 
@@ -604,6 +611,76 @@ async def test_exact_pinned_ended_status_refuses_successor_binding():
 
     assert exc.value.status_code == 409
     conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["active", "awaiting_user"])
+async def test_exact_pinned_live_status_refuses_stale_pre_resume_agent(status):
+    import main as orchestrator_main
+
+    successor = UUID("88888888-8888-4888-8888-888888888888")
+    conn = MagicMock()
+    conn.transaction = lambda: _AsyncContext()
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "id": THREAD_ID,
+            "agent_id": successor,
+            "execution_lane": "pinned",
+            "status": "created",
+            "metadata": {},
+        }
+    )
+    conn.fetchval = AsyncMock()
+    db = MagicMock()
+    db.acquire = lambda: _AsyncContext(conn)
+    db.get_thread = AsyncMock(
+        return_value={
+            "execution_lane": "pinned",
+            "status": "created",
+            "agent_id": successor,
+        }
+    )
+
+    with (
+        patch.object(orchestrator_main, "require_internal", AsyncMock()),
+        patch.object(orchestrator_main, "postgres_db", db),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await orchestrator_main.agent_update_thread_status(
+                MagicMock(),
+                str(THREAD_ID),
+                orchestrator_main.AgentThreadStatusRequest(
+                    status=status,
+                    agent_id=AGENT_ID,
+                ),
+            )
+
+    assert exc.value.status_code == 409
+    conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strict_pinned_status_phase_rejects_missing_identity(monkeypatch):
+    import main as orchestrator_main
+
+    db = MagicMock()
+    db.get_thread = AsyncMock(
+        return_value={"execution_lane": "pinned", "status": "active"}
+    )
+    monkeypatch.setenv("REQUIRE_PINNED_STATUS_IDENTITY", "true")
+    with (
+        patch.object(orchestrator_main, "require_internal", AsyncMock()),
+        patch.object(orchestrator_main, "postgres_db", db),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await orchestrator_main.agent_update_thread_status(
+                MagicMock(),
+                str(THREAD_ID),
+                orchestrator_main.AgentThreadStatusRequest(status="awaiting_user"),
+            )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "pinned_status_identity_required"
 
 
 @pytest.mark.asyncio
@@ -910,7 +987,7 @@ async def test_pinned_admission_captures_exact_reciprocal_agent_fence():
 
     updates = _calls(conn, "execute", "control_seq_hwm")
     assert len(updates) == 1
-    assert updates[0][2] == (THREAD_ID, 5)
+    assert updates[0][2] == (THREAD_ID, 5, RUNTIME_GENERATION)
     assert "permission_mode" not in updates[0][1]
 
     inserts = _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
@@ -923,6 +1000,7 @@ async def test_pinned_admission_captures_exact_reciprocal_agent_fence():
         '{"mode":"auto_accept"}',
         str(OWNER_ID),
         AGENT_ID,
+        RUNTIME_GENERATION,
     )
     assert not _calls(conn, "fetchval", "control_input_seq = GREATEST")
 
@@ -1044,14 +1122,16 @@ async def test_stateless_admission_advances_control_watermark_without_human_inpu
         verb="narration.set",
         state="pending",
         duplicate=False,
+        runtime_generation=RUNTIME_GENERATION,
     )
     updates = _calls(conn, "execute", "control_seq_hwm")
     assert len(updates) == 1
-    assert updates[0][2] == (THREAD_ID, 11)
+    assert updates[0][2] == (THREAD_ID, 11, RUNTIME_GENERATION)
     assert "narration_mode" not in updates[0][1]
 
     inserts = _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
-    assert inserts[0][2][-1] is None  # Stateless admission has no agent credential.
+    assert inserts[0][2][-2] is None  # Stateless admission has no agent credential.
+    assert inserts[0][2][-1] == RUNTIME_GENERATION
 
     watermark = _calls(conn, "fetchval", "control_input_seq = GREATEST")
     assert len(watermark) == 1

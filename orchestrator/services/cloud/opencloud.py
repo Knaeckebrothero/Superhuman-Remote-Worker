@@ -39,6 +39,7 @@ from .base import (
     RoReaderGrant,
     UserHome,
 )
+from .backend_instance_authority import main_cloud_installation_proof_sha256
 from .config import OpenCloudSettings
 from .etag_baseline import PropfindError, capture_etag_baseline
 from .errors import CloudBackendError, CloudBackendErrorKind
@@ -121,6 +122,8 @@ class OpenCloudBackend:
 
         self._initialized = False
         self._client: Optional[httpx.AsyncClient] = None
+        self._backend_instance_id: Optional[str] = None
+        self._installation_proof_sha256: Optional[str] = None
 
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -149,6 +152,21 @@ class OpenCloudBackend:
     @property
     def is_initialized(self) -> bool:
         return self._initialized
+
+    @property
+    def backend_instance_id(self) -> Optional[str]:
+        return self._backend_instance_id
+
+    @property
+    def installation_proof_sha256(self) -> Optional[str]:
+        return self._installation_proof_sha256
+
+    def bind_backend_instance(self, backend_instance_id: str) -> None:
+        """Bind the DB-adopted installation UUID exactly once."""
+
+        if self._backend_instance_id not in {None, backend_instance_id}:
+            raise RuntimeError("OpenCloud backend instance authority changed")
+        self._backend_instance_id = backend_instance_id
 
     @property
     def webdav_credentials(self) -> dict[str, str]:
@@ -329,6 +347,10 @@ class OpenCloudBackend:
             ) = await self._ensure_agent_home_space()
             self._agent_home_webdav_base = (
                 f"{self._base_url}/dav/spaces/{self._agent_home_drive_id}"
+            )
+            self._installation_proof_sha256 = main_cloud_installation_proof_sha256(
+                backend_id=self.backend_id,
+                remote_identity=str(self._agent_home_drive_id),
             )
 
             self._initialized = True

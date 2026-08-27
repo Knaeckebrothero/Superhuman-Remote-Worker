@@ -27,6 +27,11 @@ from .runtime_actor import (
     issue_runtime_actor_bootstrap,
     issue_runtime_actor_pod_bootstrap,
 )
+from .session_runtime_admission import (
+    ThreadRuntimeAuthority,
+    same_thread_runtime_authority,
+    thread_runtime_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +258,35 @@ class AgentProvisioner:
     # Pod lifecycle
     # =========================================================================
 
+    async def _session_runtime_authority(
+        self, thread_id: str | None
+    ) -> ThreadRuntimeAuthority | None:
+        if not thread_id or self._db is None:
+            return None
+        try:
+            return thread_runtime_authority(await self._db.get_thread(thread_id))
+        except Exception:
+            logger.exception(
+                "Session runtime generation read failed before provisioning: %s",
+                thread_id,
+            )
+            return None
+
+    async def _same_session_runtime_authority(
+        self, expected: ThreadRuntimeAuthority | None
+    ) -> bool:
+        if expected is None or self._db is None:
+            return False
+        try:
+            return same_thread_runtime_authority(
+                await self._db.get_thread(expected.thread_id), expected
+            )
+        except Exception:
+            logger.exception(
+                "Session runtime generation recheck failed: %s", expected.thread_id
+            )
+            return False
+
     async def provision_agent(
         self,
         purpose: str,
@@ -263,6 +297,7 @@ class AgentProvisioner:
         memory_request: str = "512Mi",
         cpu_limit: str = "1000m",
         memory_limit: str = "2Gi",
+        expected_runtime_generation: str | None = None,
     ) -> Optional[str]:
         """Create an on-demand agent pod.
 
@@ -282,14 +317,41 @@ class AgentProvisioner:
                 "python agent.py --port 8001 --loop"
             )
             return None
+        if purpose == "session" and expected_runtime_generation is not None:
+            session_authority = ThreadRuntimeAuthority(
+                thread_id=str(thread_id or ""),
+                generation=str(expected_runtime_generation),
+            )
+            if not await self._same_session_runtime_authority(session_authority):
+                return None
+        else:
+            session_authority = (
+                await self._session_runtime_authority(thread_id)
+                if purpose == "session"
+                else None
+            )
+        if purpose == "session" and session_authority is None:
+            logger.info(
+                "Refusing agent pod provision for non-preparable session %s",
+                thread_id,
+            )
+            return None
 
         # Capacity check with reservation-aware eviction
         counts = await self.active_counts_by_purpose()
+        if purpose == "session" and not await self._same_session_runtime_authority(
+            session_authority
+        ):
+            return None
         total = counts["total"]
         if total >= self._max_agents:
             # At capacity — try to evict an idle agent of the OTHER purpose
             # if this purpose has reserved slots configured.
             evicted = await self._try_evict_for_reservation(purpose, counts)
+            if purpose == "session" and not await self._same_session_runtime_authority(
+                session_authority
+            ):
+                return None
             if not evicted:
                 logger.warning(
                     "Agent pool at capacity (%d/%d) — cannot provision new %s agent",
@@ -327,6 +389,7 @@ class AgentProvisioner:
         config_name = _normalize_config_name(config_name, purpose)
         short_id = uuid4().hex[:8]
         pod_name = f"srw-agent-{purpose[0]}-{short_id}"
+        provision_attempt: str | None = None
 
         # Session agents get a PVC-backed /workspace; job agents keep emptyDir.
         # The pod name is random per provision (srw-agent-s-<8hex>), so the
@@ -341,37 +404,60 @@ class AgentProvisioner:
         pvc_name: Optional[str] = None
         if self._pvc_enabled and purpose == "session" and thread_id:
             pvc_name = f"pvc-agent-s-{thread_id[:12]}"
-            pvc_status = await self._create_pvc(
-                pvc_name,
-                size=self._pvc_size,
-                # Full thread id (not the pod's truncated `srw/thread-id`
-                # label) — the lifecycle reaper resolves PVC → thread row by
-                # this value, and a 12-char prefix is not a thread key.
-                labels={"srw/thread-id": thread_id},
+
+        if purpose == "session" and thread_id:
+            # Persist both the chosen Pod name and the deterministic PVC claim
+            # before either Kubernetes effect. A timeout can otherwise leave
+            # a bootstrap-bearing Pod or user-data volume with no UID owner.
+            candidate_attempt = str(uuid4())
+            intent = await self._db.reserve_pinned_agent_pod_provision_intent(
+                thread_id,
+                expected_runtime_generation=session_authority.generation,
+                attempt_id=candidate_attempt,
+                pod_name=pod_name,
+                provisioner="agent",
+                pvc_name=pvc_name,
             )
-            if not pvc_status:
-                # Fail closed. An emptyDir fallback here would hand the user a
-                # session that looks healthy and then loses its agent-local
-                # state on the next pod recycle — precisely the failure the PVC
-                # exists to prevent — with nothing in the UI to explain it.
-                # Better a visible provision failure the caller can retry.
-                logger.error(
-                    "Session agent PVC %s could not be created for thread %s — "
-                    "aborting provision instead of silently starting a "
-                    "non-durable agent pod",
-                    pvc_name,
-                    thread_id,
-                )
-                now_iso = datetime.now(timezone.utc).isoformat()
-                await self._set_thread_context(
-                    thread_id,
-                    {
-                        "status": "failed",
-                        "error": "PVC creation failed",
-                        "updated_at": now_iso,
-                    },
-                )
+            if not isinstance(intent, dict):
                 return None
+            pod_name = str(intent.get("pod_name") or "")
+            provision_attempt = str(intent.get("attempt_id") or "")
+            if not pod_name or not provision_attempt:
+                return None
+            workspace_claim = intent.get("workspace_claim")
+            if pvc_name:
+                if not isinstance(workspace_claim, dict):
+                    return None
+                claim_id = str(workspace_claim.get("claim_id") or "")
+                claim_attempt = str(workspace_claim.get("create_attempt") or "")
+                claim_uid = await self._ensure_pinned_agent_pvc(
+                    pvc_name,
+                    thread_id=thread_id,
+                    runtime_generation=str(
+                        workspace_claim.get("created_runtime_generation") or ""
+                    ),
+                    claim_id=claim_id,
+                    create_attempt=claim_attempt,
+                    expected_pvc_uid=(
+                        str(workspace_claim.get("pvc_uid") or "") or None
+                    ),
+                )
+                if (
+                    not claim_uid
+                    or not await self._db.publish_pinned_agent_workspace_claim(
+                        thread_id,
+                        expected_runtime_generation=session_authority.generation,
+                        claim_id=claim_id,
+                        pvc_name=pvc_name,
+                        pvc_uid=claim_uid,
+                    )
+                ):
+                    logger.error(
+                        "Session agent PVC %s lacks exact durable authority for %s",
+                        pvc_name,
+                        thread_id,
+                    )
+                    return None
 
         runtime_actor_bootstrap: Optional[str] = None
         runtime_actor_pod_bootstrap: Optional[str] = None
@@ -380,6 +466,8 @@ class AgentProvisioner:
                 runtime_actor_bootstrap = await issue_runtime_actor_bootstrap(
                     self._db, thread_id
                 )
+                if not await self._same_session_runtime_authority(session_authority):
+                    return None
             except Exception:
                 logger.exception(
                     "Could not issue runtime actor bootstrap for session %s; "
@@ -419,14 +507,66 @@ class AgentProvisioner:
             pvc_name=pvc_name,
             runtime_actor_bootstrap=runtime_actor_bootstrap,
             runtime_actor_pod_bootstrap=runtime_actor_pod_bootstrap,
+            session_runtime_generation=(
+                session_authority.generation if session_authority else None
+            ),
+            provision_attempt=provision_attempt,
         )
 
+        if purpose == "session" and not await self._same_session_runtime_authority(
+            session_authority
+        ):
+            return None
+
         try:
-            await asyncio.to_thread(
+            created_pod = await asyncio.to_thread(
                 self._core_api.create_namespaced_pod,
                 namespace=self._namespace,
                 body=manifest,
             )
+            created_uid = str(
+                getattr(getattr(created_pod, "metadata", None), "uid", "") or ""
+            )
+            if not created_uid:
+                try:
+                    observed = await asyncio.to_thread(
+                        self._core_api.read_namespaced_pod,
+                        name=pod_name,
+                        namespace=self._namespace,
+                    )
+                    observed_labels = dict(
+                        getattr(getattr(observed, "metadata", None), "labels", None)
+                        or {}
+                    )
+                    if (
+                        observed_labels.get("srw.io/runtime-generation")
+                        == (session_authority.generation if session_authority else None)
+                        and observed_labels.get("srw.io/thread-id") == str(thread_id)
+                        and observed_labels.get("srw.io/provision-attempt")
+                        == provision_attempt
+                    ):
+                        created_uid = str(
+                            getattr(getattr(observed, "metadata", None), "uid", "")
+                            or ""
+                        )
+                except Exception:
+                    logger.warning(
+                        "Could not resolve exact created agent Pod identity: %s",
+                        pod_name,
+                    )
+            if purpose == "session" and not await self._same_session_runtime_authority(
+                session_authority
+            ):
+                logger.info(
+                    "Session %s ended during pod creation; deleting orphan %s",
+                    thread_id,
+                    pod_name,
+                )
+                if created_uid:
+                    await self.delete_agent_pod_exact(
+                        pod_name, expected_pod_uid=created_uid
+                    )
+                return None
             logger.info(
                 "Agent pod created: %s (purpose=%s, config=%s)",
                 pod_name,
@@ -436,35 +576,134 @@ class AgentProvisioner:
 
             # For sessions, store pod info in thread metadata
             if purpose == "session" and thread_id:
+                if not await self._db.publish_pinned_agent_pod_provision_intent(
+                    thread_id,
+                    expected_runtime_generation=session_authority.generation,
+                    attempt_id=provision_attempt,
+                    pod_name=pod_name,
+                    pod_uid=created_uid,
+                    namespace=self._namespace,
+                ):
+                    if created_uid:
+                        await self.delete_agent_pod_exact(
+                            pod_name, expected_pod_uid=created_uid
+                        )
+                    return None
                 now_iso = datetime.now(timezone.utc).isoformat()
-                await self._set_thread_context(
+                published = await self._set_thread_context(
                     thread_id,
                     {
                         "status": "created",
                         "pod_name": pod_name,
                         "namespace": self._namespace,
+                        "pod_uid": created_uid or None,
+                        "provision_attempt": provision_attempt,
+                        "runtime_generation": session_authority.generation,
                         "created_at": now_iso,
                         "updated_at": now_iso,
                     },
+                    expected_runtime_generation=session_authority.generation,
                 )
+                if (
+                    not created_uid
+                    or not published
+                    or not await self._same_session_runtime_authority(session_authority)
+                ):
+                    if created_uid:
+                        await self.delete_agent_pod_exact(
+                            pod_name, expected_pod_uid=created_uid
+                        )
+                    return None
 
             return pod_name
         except Exception as e:
             if hasattr(e, "status") and e.status == 409:
-                logger.info("Agent pod already exists: %s", pod_name)
-                return pod_name
+                try:
+                    incumbent = await asyncio.to_thread(
+                        self._core_api.read_namespaced_pod,
+                        name=pod_name,
+                        namespace=self._namespace,
+                    )
+                except Exception:
+                    return None
+                labels = dict(
+                    getattr(getattr(incumbent, "metadata", None), "labels", None) or {}
+                )
+                exact = purpose != "session" or (
+                    session_authority is not None
+                    and labels.get("srw.io/runtime-generation")
+                    == session_authority.generation
+                    and labels.get("srw.io/thread-id") == str(thread_id)
+                    and labels.get("srw.io/provision-attempt") == provision_attempt
+                    and await self._same_session_runtime_authority(session_authority)
+                )
+                if exact:
+                    incumbent_uid = str(
+                        getattr(getattr(incumbent, "metadata", None), "uid", "") or ""
+                    )
+                    if purpose == "session" and (
+                        not incumbent_uid
+                        or not await self._db.publish_pinned_agent_pod_provision_intent(
+                            thread_id,
+                            expected_runtime_generation=session_authority.generation,
+                            attempt_id=provision_attempt,
+                            pod_name=pod_name,
+                            pod_uid=incumbent_uid,
+                            namespace=self._namespace,
+                        )
+                    ):
+                        return None
+                    logger.info("Exact agent pod already exists: %s", pod_name)
+                    return pod_name
+                logger.warning("Conflicting agent pod exists: %s", pod_name)
+                return None
 
             logger.error("Failed to create agent pod %s: %s", pod_name, e)
             if purpose == "session" and thread_id:
-                now_iso = datetime.now(timezone.utc).isoformat()
-                await self._set_thread_context(
-                    thread_id,
-                    {
-                        "status": "failed",
-                        "error": str(e),
-                        "updated_at": now_iso,
-                    },
-                )
+                # A non-409 exception can be an accepted-then-timeout. Leave
+                # the durable intent planned; a retry/leader/End observes the
+                # exact attempt-labelled name and either promotes its UID or
+                # deletes it. Never publish a partial ``agent_pod`` failure.
+                try:
+                    incumbent = await asyncio.to_thread(
+                        self._core_api.read_namespaced_pod,
+                        name=pod_name,
+                        namespace=self._namespace,
+                    )
+                    labels = dict(
+                        getattr(getattr(incumbent, "metadata", None), "labels", None)
+                        or {}
+                    )
+                    incumbent_uid = str(
+                        getattr(getattr(incumbent, "metadata", None), "uid", "") or ""
+                    )
+                    exact = bool(
+                        incumbent_uid
+                        and labels.get("srw.io/thread-id") == str(thread_id)
+                        and labels.get("srw.io/runtime-generation")
+                        == session_authority.generation
+                        and labels.get("srw.io/provision-attempt") == provision_attempt
+                    )
+                    if (
+                        exact
+                        and await self._same_session_runtime_authority(
+                            session_authority
+                        )
+                        and await self._db.publish_pinned_agent_pod_provision_intent(
+                            thread_id,
+                            expected_runtime_generation=session_authority.generation,
+                            attempt_id=provision_attempt,
+                            pod_name=pod_name,
+                            pod_uid=incumbent_uid,
+                            namespace=self._namespace,
+                        )
+                    ):
+                        return pod_name
+                except Exception:
+                    logger.info(
+                        "Agent Pod create outcome remains owned by intent %s",
+                        provision_attempt,
+                    )
             return None
 
     async def delete_agent_pod(self, pod_name: str) -> bool:
@@ -595,6 +834,339 @@ class AgentProvisioner:
             # claimant container has an observed terminal state.
             return "unknown"
         return "unknown"
+
+    async def agent_pod_provision_intent_authority(
+        self,
+        pod_name: str,
+        *,
+        expected_thread_id: str,
+        expected_runtime_generation: str,
+        expected_attempt_id: str,
+    ) -> dict[str, str | None]:
+        """Observe one pre-effect Pod name through its immutable labels."""
+
+        name = str(pod_name or "").strip()
+        if not self._k8s_available or not name:
+            return {"state": "unknown", "pod_uid": None}
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return {"state": "exact_absent", "pod_uid": None}
+            return {"state": "unknown", "pod_uid": None}
+        metadata = getattr(pod, "metadata", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
+        pod_uid = str(getattr(metadata, "uid", "") or "")
+        if not pod_uid:
+            return {"state": "unknown", "pod_uid": None}
+        exact = bool(
+            labels.get("srw/managed-by") == "agent-provisioner"
+            and labels.get("srw/purpose") == "session"
+            and labels.get("srw.io/thread-id") == str(expected_thread_id)
+            and labels.get("srw.io/runtime-generation")
+            == str(expected_runtime_generation)
+            and labels.get("srw.io/provision-attempt") == str(expected_attempt_id)
+        )
+        is_fence = labels.get("srw.io/provision-fence") == "true"
+        return {
+            "state": (
+                "exact_fence"
+                if exact and is_fence
+                else "exact_present"
+                if exact
+                else "replacement"
+            ),
+            "pod_uid": pod_uid if exact else None,
+        }
+
+    async def fence_agent_pod_provision_intent(
+        self,
+        pod_name: str,
+        *,
+        expected_thread_id: str,
+        expected_runtime_generation: str,
+        expected_attempt_id: str,
+    ) -> dict[str, str | None]:
+        """Causally close an ambiguous create with the same Kubernetes name.
+
+        A linearizable GET returning 404 can run before an already-dispatched
+        create commits.  A second CREATE for the same name cannot: either the
+        credential-bearing request won and this call observes its UID, or this
+        secret-free, unschedulable fence Pod wins and every delayed request is
+        forced to ``AlreadyExists``.  The database revokes the attempt before
+        callers enter this method.
+        """
+
+        name = str(pod_name or "").strip()
+        if not self._k8s_available or not name:
+            return {"state": "unknown", "pod_uid": None}
+        labels = {
+            "app": "srw-agent",
+            "srw/managed-by": "agent-provisioner",
+            "srw/purpose": "session",
+            "srw.io/thread-id": str(expected_thread_id),
+            "srw.io/runtime-generation": str(expected_runtime_generation),
+            "srw.io/provision-attempt": str(expected_attempt_id),
+            "srw.io/provision-fence": "true",
+        }
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": name,
+                "namespace": self._namespace,
+                "labels": labels,
+            },
+            "spec": {
+                "automountServiceAccountToken": False,
+                "restartPolicy": "Never",
+                # No scheduler in the deployment owns this name. Even if a
+                # cluster adds one accidentally, the container has no SRW
+                # credentials and exits immediately.
+                "schedulerName": "srw-retirement-fence",
+                "containers": [
+                    {
+                        "name": "fence",
+                        "image": self._agent_image,
+                        "command": ["/bin/sh", "-c", "exit 0"],
+                    }
+                ],
+            },
+        }
+        incumbent = None
+        try:
+            incumbent = await asyncio.to_thread(
+                self._core_api.create_namespaced_pod,
+                namespace=self._namespace,
+                body=manifest,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) != 409:
+                # A lost fence response may still have committed. Observe an
+                # exact object, but never turn a concurrent 404 into proof.
+                try:
+                    incumbent = await asyncio.to_thread(
+                        self._core_api.read_namespaced_pod,
+                        name=name,
+                        namespace=self._namespace,
+                    )
+                except Exception:
+                    return {"state": "unknown", "pod_uid": None}
+            else:
+                try:
+                    incumbent = await asyncio.to_thread(
+                        self._core_api.read_namespaced_pod,
+                        name=name,
+                        namespace=self._namespace,
+                    )
+                except Exception:
+                    return {"state": "unknown", "pod_uid": None}
+        metadata = getattr(incumbent, "metadata", None)
+        actual_labels = dict(getattr(metadata, "labels", None) or {})
+        pod_uid = str(getattr(metadata, "uid", "") or "")
+        exact = bool(
+            pod_uid
+            and actual_labels.get("srw/managed-by") == "agent-provisioner"
+            and actual_labels.get("srw/purpose") == "session"
+            and actual_labels.get("srw.io/thread-id") == str(expected_thread_id)
+            and actual_labels.get("srw.io/runtime-generation")
+            == str(expected_runtime_generation)
+            and actual_labels.get("srw.io/provision-attempt")
+            == str(expected_attempt_id)
+        )
+        is_fence = actual_labels.get("srw.io/provision-fence") == "true"
+        return {
+            "state": (
+                "exact_fence"
+                if exact and is_fence
+                else "exact_original"
+                if exact
+                else "replacement"
+            ),
+            "pod_uid": pod_uid if exact else None,
+        }
+
+    async def agent_workspace_claim_authority(
+        self,
+        pvc_name: str,
+        *,
+        expected_thread_id: str,
+        expected_runtime_generation: str,
+        expected_claim_id: str,
+        expected_create_attempt: str,
+        expected_pvc_uid: str | None = None,
+    ) -> dict[str, str | None]:
+        """Classify one durable agent-workspace PVC by immutable labels/UID."""
+
+        name = str(pvc_name or "").strip()
+        if not self._k8s_available or not name:
+            return {"state": "unknown", "pvc_uid": None}
+        try:
+            claim = await asyncio.to_thread(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return {"state": "exact_absent", "pvc_uid": None}
+            return {"state": "unknown", "pvc_uid": None}
+        metadata = getattr(claim, "metadata", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
+        pvc_uid = str(getattr(metadata, "uid", "") or "")
+        exact = bool(
+            pvc_uid
+            and labels.get("srw.io/thread-id") == str(expected_thread_id)
+            and labels.get("srw.io/runtime-generation")
+            == str(expected_runtime_generation)
+            and labels.get("srw.io/workspace-claim") == str(expected_claim_id)
+            and labels.get("srw.io/provision-attempt") == str(expected_create_attempt)
+            and labels.get("srw.io/claim-provisioner") == "agent"
+        )
+        if expected_pvc_uid and pvc_uid != str(expected_pvc_uid):
+            exact = False
+        is_fence = labels.get("srw.io/workspace-claim-fence") == "true"
+        return {
+            "state": (
+                "exact_fence"
+                if exact and is_fence
+                else "exact_present"
+                if exact
+                else "replacement"
+            ),
+            "pvc_uid": pvc_uid if exact else None,
+        }
+
+    async def ensure_agent_workspace_claim(
+        self,
+        pvc_name: str,
+        *,
+        expected_thread_id: str,
+        expected_runtime_generation: str,
+        expected_claim_id: str,
+        expected_create_attempt: str,
+        expected_pvc_uid: str | None = None,
+    ) -> str | None:
+        """Create/re-attest the exact retained PVC during a soft retirement."""
+
+        return await self._ensure_pinned_agent_pvc(
+            pvc_name,
+            thread_id=expected_thread_id,
+            runtime_generation=expected_runtime_generation,
+            claim_id=expected_claim_id,
+            create_attempt=expected_create_attempt,
+            expected_pvc_uid=expected_pvc_uid,
+        )
+
+    async def fence_agent_workspace_claim(
+        self,
+        pvc_name: str,
+        *,
+        expected_thread_id: str,
+        expected_runtime_generation: str,
+        expected_claim_id: str,
+        expected_create_attempt: str,
+    ) -> dict[str, str | None]:
+        """Acquire a PVC name with an inert, non-provisioning tombstone."""
+
+        name = str(pvc_name or "").strip()
+        if not self._k8s_available or not name:
+            return {"state": "unknown", "pvc_uid": None}
+        labels = {
+            "app": "srw-agent",
+            "srw/component": "agent-workspace-pvc",
+            "srw.io/component": "agent-workspace",
+            "srw/thread-id": str(expected_thread_id),
+            "srw.io/thread-id": str(expected_thread_id),
+            "srw.io/runtime-generation": str(expected_runtime_generation),
+            "srw.io/workspace-claim": str(expected_claim_id),
+            "srw.io/provision-attempt": str(expected_create_attempt),
+            "srw.io/claim-provisioner": "agent",
+            "srw.io/workspace-claim-fence": "true",
+        }
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": name,
+                "namespace": self._namespace,
+                "labels": labels,
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                # Empty storageClass prevents dynamic provisioning. The object
+                # occupies the API key but can never carry thread data.
+                "storageClassName": "",
+                "resources": {"requests": {"storage": "1Mi"}},
+            },
+        }
+        incumbent = None
+        try:
+            incumbent = await asyncio.to_thread(
+                self._core_api.create_namespaced_persistent_volume_claim,
+                namespace=self._namespace,
+                body=manifest,
+            )
+        except Exception:
+            try:
+                incumbent = await asyncio.to_thread(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=name,
+                    namespace=self._namespace,
+                )
+            except Exception:
+                return {"state": "unknown", "pvc_uid": None}
+        metadata = getattr(incumbent, "metadata", None)
+        actual_labels = dict(getattr(metadata, "labels", None) or {})
+        pvc_uid = str(getattr(metadata, "uid", "") or "")
+        exact = bool(
+            pvc_uid
+            and actual_labels.get("srw.io/thread-id") == str(expected_thread_id)
+            and actual_labels.get("srw.io/runtime-generation")
+            == str(expected_runtime_generation)
+            and actual_labels.get("srw.io/workspace-claim") == str(expected_claim_id)
+            and actual_labels.get("srw.io/provision-attempt")
+            == str(expected_create_attempt)
+            and actual_labels.get("srw.io/claim-provisioner") == "agent"
+        )
+        is_fence = actual_labels.get("srw.io/workspace-claim-fence") == "true"
+        return {
+            "state": (
+                "exact_fence"
+                if exact and is_fence
+                else "exact_original"
+                if exact
+                else "replacement"
+            ),
+            "pvc_uid": pvc_uid if exact else None,
+        }
+
+    async def delete_agent_workspace_claim_exact(
+        self,
+        pvc_name: str,
+        *,
+        expected_pvc_uid: str,
+    ) -> bool:
+        """Delete only one immutable PVC UID; never a same-name successor."""
+
+        name = str(pvc_name or "").strip()
+        uid = str(expected_pvc_uid or "").strip()
+        if not self._k8s_available or not name or not uid:
+            return False
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_persistent_volume_claim,
+                name=name,
+                namespace=self._namespace,
+                body={"preconditions": {"uid": uid}},
+            )
+            return True
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404
 
     async def delete_agent_pod_exact(
         self,
@@ -1430,6 +2002,8 @@ class AgentProvisioner:
         pvc_name: Optional[str] = None,
         runtime_actor_bootstrap: Optional[str] = None,
         runtime_actor_pod_bootstrap: Optional[str] = None,
+        session_runtime_generation: Optional[str] = None,
+        provision_attempt: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for an agent.
 
@@ -1476,12 +2050,16 @@ class AgentProvisioner:
             labels["app.kubernetes.io/component"] = "agent"
         if thread_id:
             labels["srw/thread-id"] = thread_id[:12]
+        if session_runtime_generation:
+            labels["srw.io/runtime-generation"] = session_runtime_generation
             # Full-value label consumed by the per-session Service selector
             # built by the session router (knowledge-base/knowledge/features/direct_session_websockets.md).
             # The legacy `srw/thread-id` label above is kept for backwards-compat
             # with the lifecycle reconciler, which still selects on the truncated
             # form. K8s label values cap at 63 chars; a UUID fits.
             labels["srw.io/thread-id"] = thread_id
+        if provision_attempt:
+            labels["srw.io/provision-attempt"] = provision_attempt
         # Build SHA label — lets the lifecycle reconciler enumerate stale
         # pods by selector without joining to the agents table. Set when
         # the image tag follows the `:sha-XXXXXXX` convention; absent for
@@ -1543,6 +2121,10 @@ class AgentProvisioner:
                     {
                         "name": "SESSION_BOUND_THREAD_ID",
                         "value": thread_id or "",
+                    },
+                    {
+                        "name": "SESSION_RUNTIME_GENERATION",
+                        "value": session_runtime_generation or "",
                     },
                     {
                         "name": "SRW_RUNTIME_ACTOR_BOOTSTRAP",
@@ -1884,16 +2466,125 @@ class AgentProvisioner:
             logger.error("Failed to create session agent PVC %s: %s", pvc_name, e)
             return None
 
-    async def _set_thread_context(self, thread_id: str, updates: dict) -> None:
+    async def _ensure_pinned_agent_pvc(
+        self,
+        pvc_name: str,
+        *,
+        thread_id: str,
+        runtime_generation: str,
+        claim_id: str,
+        create_attempt: str,
+        expected_pvc_uid: str | None,
+    ) -> str | None:
+        """Create/observe only the exact durable PVC claim and return its UID."""
+
+        if not self._k8s_available or not all(
+            (pvc_name, thread_id, runtime_generation, claim_id, create_attempt)
+        ):
+            return None
+        labels = {
+            "app": "srw-agent",
+            "srw/component": "agent-workspace-pvc",
+            "srw.io/component": "agent-workspace",
+            "srw/thread-id": str(thread_id),
+            "srw.io/thread-id": str(thread_id),
+            "srw.io/runtime-generation": str(runtime_generation),
+            "srw.io/workspace-claim": str(claim_id),
+            "srw.io/provision-attempt": str(create_attempt),
+            "srw.io/claim-provisioner": "agent",
+        }
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": pvc_name,
+                "namespace": self._namespace,
+                "labels": labels,
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": self._storage_class,
+                "resources": {"requests": {"storage": self._pvc_size}},
+            },
+        }
+
+        async def _read_exact() -> str | None:
+            try:
+                claim = await asyncio.to_thread(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+            except Exception:
+                return None
+            metadata = getattr(claim, "metadata", None)
+            actual_labels = dict(getattr(metadata, "labels", None) or {})
+            actual_uid = str(getattr(metadata, "uid", "") or "")
+            if not (
+                actual_uid
+                and actual_labels.get("srw.io/thread-id") == str(thread_id)
+                and actual_labels.get("srw.io/runtime-generation")
+                == str(runtime_generation)
+                and actual_labels.get("srw.io/workspace-claim") == str(claim_id)
+                and actual_labels.get("srw.io/provision-attempt") == str(create_attempt)
+                and actual_labels.get("srw.io/claim-provisioner") == "agent"
+            ):
+                return None
+            if expected_pvc_uid and actual_uid != str(expected_pvc_uid):
+                return None
+            return actual_uid
+
+        if expected_pvc_uid:
+            return await _read_exact()
+        try:
+            created = await asyncio.to_thread(
+                self._core_api.create_namespaced_persistent_volume_claim,
+                namespace=self._namespace,
+                body=manifest,
+            )
+            created_uid = str(
+                getattr(getattr(created, "metadata", None), "uid", "") or ""
+            )
+            return created_uid or await _read_exact()
+        except Exception:
+            # 409 and accepted-then-timeout share the same exact observation.
+            # A 404 remains ambiguous and leaves the DB intent planned.
+            return await _read_exact()
+
+    async def _delete_pvc(self, pvc_name: str) -> bool:
+        """Delete a newly-created session PVC after lifecycle refusal."""
+
+        if not self._k8s_available:
+            return False
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=self._namespace,
+            )
+            return True
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return True
+            logger.warning("Failed to delete refused session PVC %s: %s", pvc_name, exc)
+            return False
+
+    async def _set_thread_context(
+        self,
+        thread_id: str,
+        updates: dict,
+        *,
+        expected_runtime_generation: str | None = None,
+    ) -> bool:
         """Store agent pod status in thread metadata under ``agent_pod``."""
         if not self._db:
-            return
+            return False
 
         try:
             import json
 
             async with self._db.acquire() as conn:
-                await conn.execute(
+                result = await conn.execute(
                     """
                     UPDATE threads
                     SET metadata      = jsonb_set(
@@ -1904,14 +2595,20 @@ class AgentProvisioner:
                                         ),
                         last_activity = CURRENT_TIMESTAMP
                     WHERE id = $1
+                      AND status IN ('created','active','awaiting_user','suspended')
+                      AND runtime_retirement_token IS NULL
+                      AND ($3::uuid IS NULL OR runtime_generation = $3::uuid)
                     """,
                     thread_id,
                     json.dumps(updates),
+                    expected_runtime_generation,
                 )
+            return result == "UPDATE 1"
         except Exception:
             logger.exception(
                 "Failed to update agent pod context for thread %s", thread_id
             )
+            return False
 
 
 # Module-level singleton

@@ -2781,16 +2781,20 @@ async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
     from unittest.mock import AsyncMock, MagicMock
 
     from services import container_provisioner as module
-    from services.workspace_lifecycle import WorkspaceOwner
 
+    runtime_generation = "33333333-3333-4333-8333-333333333333"
     runtime_incarnation = "22222222-2222-4222-8222-222222222222"
+    backing_id = f"k8s-pod:agent-workspaces:{runtime_incarnation}"
 
     class _PinnedSessionDB:
         def __init__(self):
-            self.bind_thread_workspace_backing = AsyncMock(
-                return_value={"workspace_generation": str(GENERATION)}
-            )
             self.merge_thread_workspace_context = AsyncMock(return_value=True)
+            self.published: dict[str, str] = {}
+            self.ready: dict[str, str] | None = None
+
+        @asynccontextmanager
+        async def thread_advisory_lock(self, _thread_id):
+            yield True
 
         async def stateless_thread_workspace_creation_requires_authority(
             self, _thread_id
@@ -2800,15 +2804,69 @@ async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
         async def get_workspace_network_tier(self, *_args):
             return "internet-only"
 
-        async def get_thread(self, *_args):
-            return None
+        async def get_thread(self, thread_id):
+            return {
+                "id": thread_id,
+                "status": "active",
+                "execution_lane": "pinned",
+                "runtime_generation": runtime_generation,
+                "runtime_retirement_token": None,
+                "agent_id": None,
+                "runtime_attach_token": None,
+                "metadata": {"workspace_container": {"status": "deleted"}},
+            }
+
+        async def reserve_pinned_thread_workspace_provision_intent(
+            self, thread_id, **kwargs
+        ):
+            return {
+                "attempt_id": kwargs["attempt_id"],
+                "thread_id": thread_id,
+                "runtime_generation": kwargs["expected_runtime_generation"],
+                "pod_name": kwargs["pod_name"],
+                "pvc_name": kwargs["pvc_name"],
+                "seed_configmap_name": kwargs["seed_configmap_name"],
+                "service_name": kwargs["service_name"],
+                "retained_pvc_uid": None,
+                "retained_service_uid": None,
+            }
+
+        async def publish_pinned_thread_workspace_provision_resource(
+            self, _thread_id, **kwargs
+        ):
+            self.published[kwargs["resource"]] = kwargs["resource_uid"]
+            return True
+
+        async def complete_pinned_thread_workspace_provision_intent(
+            self, _thread_id, **kwargs
+        ):
+            if kwargs["expected_pod_uid"] != self.published.get("pod"):
+                return None
+            self.ready = {
+                "_canvas_workspace_generation": str(GENERATION),
+                module.WORKSPACE_RUNTIME_INCARNATION_KEY: kwargs["expected_pod_uid"],
+            }
+            return {
+                "runtime_incarnation": kwargs["expected_pod_uid"],
+                "workspace_generation": str(GENERATION),
+                "backing_id": backing_id,
+            }
 
     provisioner = module.ContainerProvisioner()
     provisioner._k8s_available = True
     provisioner._namespace = "agent-workspaces"
     provisioner._db = _PinnedSessionDB()
     provisioner._core_api = MagicMock()
-    owner = WorkspaceOwner.session(THREAD_ID)
+    provisioner._pvc_enabled = False
+    monkeypatch.setattr(
+        provisioner, "_resolve_ide_seed_files", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        provisioner, "_resolve_ide_extensions", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        provisioner, "_resolve_ide_needs_state", AsyncMock(return_value=False)
+    )
 
     def create_pod(**kwargs):
         body = kwargs["body"]
@@ -2843,23 +2901,23 @@ async def test_k8s_ready_context_pairs_backing_generation_with_pod_uid(
         "_trusted_pod_ssh_identity",
         AsyncMock(
             return_value=(
-                "k8s-pvc:agent-workspaces:claim-uid",
-                "SHA256:trusted",
+                backing_id,
+                "SHA256:" + ("A" * 43),
                 runtime_incarnation,
             )
         ),
     )
 
-    assert await provisioner.create_workspace(owner) is True
+    assert await provisioner.create_pinned_thread_workspace(THREAD_ID) is True
 
-    updates = [
-        call.args[1]
-        for call in provisioner._db.merge_thread_workspace_context.await_args_list
-    ]
-    assert updates[0]["_canvas_workspace_generation"] is None
-    assert updates[0][module.WORKSPACE_RUNTIME_INCARNATION_KEY] == runtime_incarnation
-    assert updates[-1]["_canvas_workspace_generation"] == str(GENERATION)
-    assert updates[-1][module.WORKSPACE_RUNTIME_INCARNATION_KEY] == runtime_incarnation
+    # Exact pinned provisioning publishes Pending and Ready through the
+    # intent transaction; the provisioner must not revive the legacy split
+    # merge path around those writes.
+    provisioner._db.merge_thread_workspace_context.assert_not_awaited()
+    assert provisioner._db.ready == {
+        "_canvas_workspace_generation": str(GENERATION),
+        module.WORKSPACE_RUNTIME_INCARNATION_KEY: runtime_incarnation,
+    }
 
 
 def test_vm_clones_regenerate_host_keys_but_canvas_remains_fail_closed() -> None:
@@ -3013,7 +3071,9 @@ async def test_default_docker_thread_release_revokes_then_quarantines_without_cl
     provisioner._db = db
     provisioner._reset_workspace_via_ssh = AsyncMock(return_value=True)
 
-    assert await provisioner.release_thread_workspace(THREAD_ID) is False
+    # Exact quarantine is a successful terminal release: the host is fenced
+    # from allocation until controller-attested container recreation.
+    assert await provisioner.release_thread_workspace(THREAD_ID) is True
     provisioner._reset_workspace_via_ssh.assert_not_awaited()
     assert transitions == [
         {"status": "releasing", "_canvas_workspace_generation": None},

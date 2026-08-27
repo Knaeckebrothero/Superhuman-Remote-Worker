@@ -31,6 +31,9 @@ from src.shared.cloud_sync_generations import (
 
 
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
+RUNTIME_GENERATION = "22222222-2222-4222-8222-222222222222"
+AGENT_ID = "33333333-3333-4333-8333-333333333333"
+RUNTIME_ATTACH_TOKEN = "44444444-4444-4444-8444-444444444444"
 WORKSPACE_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 WORKSPACE_RUNTIME_INCARNATION = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 WORKSPACE_SSH_HOST_KEY_FINGERPRINT = "SHA256:trusted"
@@ -457,6 +460,12 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
         "id": THREAD_ID,
         "user_id": None,
         "project_id": None,
+        "status": "active",
+        "execution_lane": "pinned",
+        "runtime_generation": RUNTIME_GENERATION,
+        "runtime_retirement_token": None,
+        "agent_id": AGENT_ID,
+        "runtime_attach_token": RUNTIME_ATTACH_TOKEN,
         "metadata": {
             "workspace_container": {
                 "status": "ready",
@@ -480,6 +489,11 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
             orch_main.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=[]),
+        ),
+        patch.object(
+            orch_main.postgres_db,
+            "pinned_thread_agent_is_reciprocal",
+            AsyncMock(return_value=True),
         ),
         patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
         patch.object(
@@ -522,7 +536,12 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
             side_effect=lambda value, **_kwargs: value,
         ),
     ):
-        response = await orch_main._agent_get_thread_workspace_locked(THREAD_ID)
+        response = await orch_main._agent_get_thread_workspace_locked(
+            THREAD_ID,
+            presented_agent_id=AGENT_ID,
+            presented_runtime_generation=RUNTIME_GENERATION,
+            presented_attach_token=RUNTIME_ATTACH_TOKEN,
+        )
 
     assert response["workspace_generation"] == WORKSPACE_GENERATION
     assert response["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
@@ -558,9 +577,30 @@ async def _internal_workspace_response_for_lite_thread(
 ):
     import orchestrator.main as orch_main
 
+    def _with_live_runtime(row):
+        normalized = dict(row)
+        normalized.setdefault("status", "active")
+        normalized.setdefault("runtime_generation", RUNTIME_GENERATION)
+        normalized.setdefault("runtime_retirement_token", None)
+        if normalized.get("execution_lane") == "pinned":
+            normalized.setdefault("agent_id", AGENT_ID)
+            normalized.setdefault("runtime_attach_token", RUNTIME_ATTACH_TOKEN)
+        return normalized
+
+    thread = _with_live_runtime(thread)
     get_thread = AsyncMock(return_value=thread)
     if thread_reads is not None:
-        get_thread.side_effect = thread_reads
+        normalized_reads = [_with_live_runtime(row) for row in thread_reads]
+        read_index = 0
+
+        async def _read_thread(*_args, **_kwargs):
+            nonlocal read_index
+            row = normalized_reads[min(read_index, len(normalized_reads) - 1)]
+            read_index += 1
+            return row
+
+        get_thread.side_effect = _read_thread
+    pinned = thread.get("execution_lane") == "pinned"
     with (
         patch.object(
             orch_main.postgres_db,
@@ -571,6 +611,11 @@ async def _internal_workspace_response_for_lite_thread(
             orch_main.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=[]),
+        ),
+        patch.object(
+            orch_main.postgres_db,
+            "pinned_thread_agent_is_reciprocal",
+            AsyncMock(return_value=True),
         ),
         patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
         patch.object(
@@ -615,7 +660,12 @@ async def _internal_workspace_response_for_lite_thread(
             side_effect=lambda value, **_kwargs: value,
         ),
     ):
-        return await orch_main._agent_get_thread_workspace_locked(THREAD_ID)
+        return await orch_main._agent_get_thread_workspace_locked(
+            THREAD_ID,
+            presented_agent_id=AGENT_ID if pinned else None,
+            presented_runtime_generation=RUNTIME_GENERATION if pinned else None,
+            presented_attach_token=RUNTIME_ATTACH_TOKEN if pinned else None,
+        )
 
 
 def _stateless_sandbox_thread() -> dict:
@@ -623,6 +673,7 @@ def _stateless_sandbox_thread() -> dict:
         "id": THREAD_ID,
         "user_id": None,
         "project_id": None,
+        "status": "active",
         "execution_lane": "stateless",
         "metadata": {
             "config_override": {"workspace": {"backend": "sandbox"}},
@@ -849,6 +900,41 @@ async def test_internal_workspace_rechecks_row_after_delayed_live_probe():
     assert response["workspace_runtime_incarnation"] is None
     assert response["workspace_ssh_host_key_fingerprint"] is None
     schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_final_read_rejects_real_nonready_replacement():
+    """Response redaction must not weaken the final durable U1 -> U2 fence."""
+    import copy
+
+    import orchestrator.main as orch_main
+
+    old = _stateless_sandbox_thread()
+    old["metadata"]["workspace_container"]["status"] = "creating"
+    replacement = copy.deepcopy(old)
+    replacement["metadata"]["workspace_container"].update(
+        {
+            "_canvas_workspace_generation": ("55555555-5555-4555-8555-555555555555"),
+            "_runtime_incarnation": "66666666-6666-4666-8666-666666666666",
+        }
+    )
+    replacement["metadata"]["_workspace_binding"]["generation"] = (
+        "55555555-5555-4555-8555-555555555555"
+    )
+    schedule = MagicMock()
+
+    with (
+        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await _internal_workspace_response_for_lite_thread(
+            old,
+            thread_reads=[old, replacement],
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == {"code": "workspace_runtime_identity_changed"}
+    schedule.assert_called_once_with(THREAD_ID)
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 
 class JobStatus(str, Enum):
@@ -160,9 +160,14 @@ class ReadyResponse(BaseModel):
     connections: Dict[str, bool] = Field(
         ..., description="Connection status for dependencies"
     )
-    capabilities: Dict[str, bool] = Field(
+    capabilities: Dict[str, StrictBool | StrictInt] = Field(
         default_factory=dict,
         description="Server-owned runtime protocol capabilities",
+    )
+    session_identity_fingerprint: Optional[str] = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        description="Non-secret fingerprint of the exact pinned runtime binding",
     )
 
 

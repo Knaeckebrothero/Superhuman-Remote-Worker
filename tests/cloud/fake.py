@@ -45,6 +45,8 @@ class FakeMainCloudBackend:
         fail_mode: Optional[CloudBackendErrorKind] = None,
     ) -> None:
         self._initialized = start_initialized
+        self._backend_instance_id: Optional[str] = None
+        self._installation_proof_sha256: Optional[str] = None
         self._fail_mode = fail_mode
         self._users: dict[str, dict[str, str]] = {}
         self._groups: dict[str, set[str]] = {}
@@ -106,6 +108,19 @@ class FakeMainCloudBackend:
     @property
     def is_initialized(self) -> bool:
         return self._initialized
+
+    @property
+    def backend_instance_id(self) -> Optional[str]:
+        return self._backend_instance_id
+
+    @property
+    def installation_proof_sha256(self) -> Optional[str]:
+        return self._installation_proof_sha256
+
+    def bind_backend_instance(self, backend_instance_id: str) -> None:
+        if self._backend_instance_id not in {None, backend_instance_id}:
+            raise RuntimeError("fake backend instance authority changed")
+        self._backend_instance_id = backend_instance_id
 
     @property
     def webdav_credentials(self) -> dict[str, str]:

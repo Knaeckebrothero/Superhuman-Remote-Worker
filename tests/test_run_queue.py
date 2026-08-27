@@ -63,6 +63,7 @@ from src.shared.run_queue import (
     heartbeat_unit,
     list_active,
     open_interrupt_admission,
+    park_unit,
     queue_depth_for,
     reap_expired,
     record_control_seq,
@@ -1834,6 +1835,69 @@ class TestParking:
         assert row["attempts_since_completion"] == 0
         claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="p1")
         assert claimed is not None and claimed.unit_id == u
+
+    async def test_exact_claim_park_is_nonclaimable_until_explicit_unpark(self, conn):
+        u = uuid4()
+        await enqueue_unit(
+            conn,
+            unit_id=u,
+            unit_kind=SESSION,
+            input_seq=11,
+        )
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="p1")
+        assert claimed is not None
+        assert await open_interrupt_admission(
+            conn,
+            unit_id=u,
+            lease_token=claimed.lease_token,
+            turn_id=4,
+        )
+        before = await _row(conn, u)
+
+        assert (
+            await park_unit(
+                conn,
+                unit_id=u,
+                lease_token=claimed.lease_token - 1,
+            )
+            is None
+        )
+        assert (await _row(conn, u))["state"] == STATE_LEASED
+
+        assert (
+            await park_unit(
+                conn,
+                unit_id=u,
+                lease_token=claimed.lease_token,
+            )
+            == STATE_PARKED
+        )
+        parked = await _row(conn, u)
+        assert parked["state"] == STATE_PARKED
+        assert parked["lease_token"] == claimed.lease_token
+        assert parked["input_seq"] == before["input_seq"]
+        assert parked["consumed_seq"] == before["consumed_seq"]
+        assert (
+            parked["attempts_since_completion"] == before["attempts_since_completion"]
+        )
+        assert parked["leased_by"] is None
+        assert parked["last_leased_by"] is None
+        assert parked["leased_until"] is None
+        assert parked["interrupt_admission_lease_token"] is None
+        assert parked["interrupt_admission_turn_id"] is None
+
+        reenqueue = await enqueue_unit(
+            conn,
+            unit_id=u,
+            unit_kind=SESSION,
+            input_seq=12,
+        )
+        assert reenqueue.status == ENQUEUE_PARKED
+        assert await claim_unit(conn, unit_kind=SESSION, pod_name="p2") is None
+
+        assert await unpark_unit(conn, unit_id=u) is True
+        successor = await claim_unit(conn, unit_kind=SESSION, pod_name="p2")
+        assert successor is not None and successor.unit_id == u
 
     async def test_enqueue_on_parked_records_input_but_stays_parked(self, conn):
         u = uuid4()

@@ -19,23 +19,37 @@ from services.session_provisioner import (  # noqa: E402
 from services.workspace_lifecycle import EnsureOutcome, WorkspaceOwner  # noqa: E402
 
 
+PINNED_THREAD_ID = "11111111-1111-4111-8111-111111111111"
+PINNED_THREAD_ID_2 = "22222222-2222-4222-8222-222222222222"
+PINNED_RUNTIME_GENERATION = "33333333-3333-4333-8333-333333333333"
+
+
+def _pinned_thread(thread_id: str, *, workspace_status: str) -> dict:
+    return {
+        "id": thread_id,
+        "status": "active",
+        "execution_lane": "pinned",
+        "runtime_generation": PINNED_RUNTIME_GENERATION,
+        "runtime_retirement_token": None,
+        "metadata": {"workspace_container": {"status": workspace_status}},
+    }
+
+
 @pytest.mark.asyncio
 async def test_failed_session_workspace_is_recreated():
     """Regression for the stuck RAG session: a 'failed' workspace on an active
     thread must be recreated, not left stuck."""
     db = AsyncMock()
     db.get_thread = AsyncMock(
-        return_value={
-            "id": "t1",
-            "status": "active",
-            "metadata": {"workspace_container": {"status": "failed"}},
-        }
+        return_value=_pinned_thread(PINNED_THREAD_ID, workspace_status="failed")
     )
     prov = AsyncMock()
-    prov.create_workspace = AsyncMock(return_value=True)
+    prov.create_pinned_thread_workspace = AsyncMock(return_value=True)
     susp = AsyncMock()
-    res = await ensure_session_workspace("t1", db=db, provisioner=prov, suspension=susp)
-    prov.create_workspace.assert_awaited()  # recreated — not stuck
+    res = await ensure_session_workspace(
+        PINNED_THREAD_ID, db=db, provisioner=prov, suspension=susp
+    )
+    prov.create_pinned_thread_workspace.assert_awaited_once_with(PINNED_THREAD_ID)
     assert res.outcome in (EnsureOutcome.PENDING, EnsureOutcome.READY)
 
 
@@ -110,9 +124,11 @@ async def test_pinned_ready_workspace_keeps_phase_only_drift_probe():
     db = AsyncMock()
     db.get_thread = AsyncMock(
         return_value={
-            "id": "t1",
+            "id": PINNED_THREAD_ID,
             "status": "active",
             "execution_lane": "pinned",
+            "runtime_generation": PINNED_RUNTIME_GENERATION,
+            "runtime_retirement_token": None,
             "metadata": {
                 "config_override": {"workspace": {"backend": "sandbox"}},
                 "workspace_container": {
@@ -127,35 +143,33 @@ async def test_pinned_ready_workspace_keeps_phase_only_drift_probe():
     prov.workspace_pod_authority = AsyncMock(return_value="exact_live")
 
     res = await ensure_session_workspace(
-        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+        PINNED_THREAD_ID, db=db, provisioner=prov, suspension=AsyncMock()
     )
 
     assert res.outcome == EnsureOutcome.READY
-    prov.workspace_pod_live.assert_awaited_once_with(WorkspaceOwner.session("t1"))
+    prov.workspace_pod_live.assert_awaited_once_with(
+        WorkspaceOwner.session(PINNED_THREAD_ID)
+    )
 
 
 @pytest.mark.asyncio
 async def test_reconcile_iterates_and_counts():
     db = AsyncMock()
     db.list_threads_needing_workspace = AsyncMock(
-        return_value=[{"id": "t1"}, {"id": "t2"}]
+        return_value=[{"id": PINNED_THREAD_ID}, {"id": PINNED_THREAD_ID_2}]
     )
 
     async def _get_thread(tid):
-        return {
-            "id": tid,
-            "status": "active",
-            "metadata": {"workspace_container": {"status": "failed"}},
-        }
+        return _pinned_thread(tid, workspace_status="failed")
 
     db.get_thread = AsyncMock(side_effect=_get_thread)
     prov = AsyncMock()
-    prov.create_workspace = AsyncMock(return_value=True)
+    prov.create_pinned_thread_workspace = AsyncMock(return_value=True)
     n = await reconcile_session_workspaces(
         db=db, provisioner=prov, suspension=AsyncMock()
     )
     assert n == 2
-    assert prov.create_workspace.await_count == 2
+    assert prov.create_pinned_thread_workspace.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -465,22 +479,18 @@ async def test_container_thread_with_no_vm_context_is_untouched():
     flowing through ensure_workspace's own branch."""
     db = AsyncMock()
     db.get_thread = AsyncMock(
-        return_value={
-            "id": "t-pod",
-            "status": "active",
-            "metadata": {"workspace_container": {"status": "failed"}},
-        }
+        return_value=_pinned_thread(PINNED_THREAD_ID, workspace_status="failed")
     )
     prov = AsyncMock()
-    prov.create_workspace = AsyncMock(return_value=True)
+    prov.create_pinned_thread_workspace = AsyncMock(return_value=True)
     susp = AsyncMock()
 
     res = await ensure_session_workspace(
-        "t-pod", db=db, provisioner=prov, suspension=susp
+        PINNED_THREAD_ID, db=db, provisioner=prov, suspension=susp
     )
 
     # unchanged: falls through to ensure_workspace, which recreates
-    prov.create_workspace.assert_awaited()
+    prov.create_pinned_thread_workspace.assert_awaited_once_with(PINNED_THREAD_ID)
     assert res is not None
 
 

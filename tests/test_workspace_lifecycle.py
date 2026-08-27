@@ -64,7 +64,7 @@ CREATION_GENERATION = "33333333-3333-4333-8333-333333333333"
         ("created", False, EnsureOutcome.PENDING),  # transient in-progress
         ("creating", False, EnsureOutcome.PENDING),
         ("restoring", False, EnsureOutcome.PENDING),
-        ("pending", False, EnsureOutcome.PENDING),
+        ("pending", True, EnsureOutcome.PENDING),
         ("ready", False, EnsureOutcome.READY),
         ("weird-unknown", False, EnsureOutcome.PENDING),  # truly unknown -> wait
     ],
@@ -72,6 +72,7 @@ CREATION_GENERATION = "33333333-3333-4333-8333-333333333333"
 async def test_ensure_session_transitions(status, expect_create, outcome):
     prov = AsyncMock()
     prov.create_workspace = AsyncMock(return_value=True)
+    prov.create_pinned_thread_workspace = AsyncMock(return_value=True)
     susp = AsyncMock()
     susp.restore = AsyncMock(return_value=True)
     res = await ensure_workspace(
@@ -82,9 +83,10 @@ async def test_ensure_session_transitions(status, expect_create, outcome):
     )
     assert res.outcome == outcome
     if expect_create:
-        prov.create_workspace.assert_awaited()
+        prov.create_pinned_thread_workspace.assert_awaited_once_with("t1")
     else:
-        prov.create_workspace.assert_not_called()
+        prov.create_pinned_thread_workspace.assert_not_awaited()
+    prov.create_workspace.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -138,6 +140,7 @@ async def test_ensure_suspended_job_also_fire_and_forget():
 async def test_ensure_create_failure_returns_FAILED():
     prov = AsyncMock()
     prov.create_workspace = AsyncMock(return_value=False)
+    prov.create_pinned_thread_workspace = AsyncMock(return_value=False)
     susp = AsyncMock()
     res = await ensure_workspace(
         _WO.session("t1"),
@@ -146,6 +149,8 @@ async def test_ensure_create_failure_returns_FAILED():
         current_status=None,
     )
     assert res.outcome == EnsureOutcome.FAILED
+    prov.create_pinned_thread_workspace.assert_awaited_once_with("t1")
+    prov.create_workspace.assert_not_awaited()
 
 
 # =============================================================================
@@ -160,6 +165,7 @@ async def test_ensure_ready_recreates_when_pod_confirmed_dead():
     """ready + probe says the pod is gone/tombstone (False) → recreate."""
     prov = AsyncMock()
     prov.create_workspace = AsyncMock(return_value=True)
+    prov.create_pinned_thread_workspace = AsyncMock(return_value=True)
     prov.workspace_pod_live = AsyncMock(return_value=False)
     susp = AsyncMock()
     owner = _WO.session("t1")
@@ -168,7 +174,8 @@ async def test_ensure_ready_recreates_when_pod_confirmed_dead():
     )
     assert res.outcome == EnsureOutcome.PENDING  # _create → creating/PENDING
     prov.workspace_pod_live.assert_awaited_once_with(owner)
-    prov.create_workspace.assert_awaited()
+    prov.create_pinned_thread_workspace.assert_awaited_once_with("t1")
+    prov.create_workspace.assert_not_awaited()
 
 
 @pytest.mark.asyncio

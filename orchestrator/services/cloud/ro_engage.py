@@ -24,9 +24,14 @@ REFUSE: fail-closed, not a config bug.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
+
+import httpx
 
 from . import ro_probe
 from .base import RoReaderGrant
+from .protected_effect_client import ProtectedNextcloudEffectExecutor
+from .protected_reader_authority import ProtectedNextcloudReaderGrantPlan
 
 logger = logging.getLogger(__name__)
 
@@ -58,44 +63,125 @@ class RoEngageRefused(Exception):
     """The RO gate refused to engage — protected mode must NOT mount."""
 
 
+class RoEngageCleanupPending(RoEngageRefused):
+    """The failed attempt remains durably revoking behind its effect fence."""
+
+
+async def revoke_ro_mount_attempt(
+    *,
+    backend,
+    postgres_db,
+    row_id: str,
+    thread_id: str,
+    runtime_generation: str,
+    plan: ProtectedNextcloudReaderGrantPlan,
+) -> bool:
+    """Contain and settle one exact attempt; never infer remote absence."""
+
+    if not await postgres_db.begin_ro_mount_revocation_if_matches(
+        row_id,
+        expected_thread_id=thread_id,
+        expected_runtime_generation=runtime_generation,
+        plan=plan,
+    ):
+        return False
+    await backend.revoke_protected_reader_attempt(plan)
+    return await postgres_db.finish_ro_mount_revocation_if_matches(
+        row_id,
+        expected_thread_id=thread_id,
+        expected_runtime_generation=runtime_generation,
+        plan=plan,
+    )
+
+
 async def engage_ro_mount(
     *,
     backend,
-    handle,
-    user_key: str,
+    plan: ProtectedNextcloudReaderGrantPlan,
+    credentials: str,
+    selected_mount_id: str,
     thread_id: str,
     user_id: str,
     postgres_db,
     http_client_factory,
+    admission_check: Callable[[], Awaitable[bool]] | None = None,
+    expected_runtime_generation: str,
+    effect_dispatcher: (
+        Callable[[str, str, bytes], Awaitable[httpx.Response]] | None
+    ) = None,
 ) -> RoReaderGrant:
-    """Provision + verify a read-only mount grant, fail-closed.
+    """Persist, provision, and verify one attempt-scoped read-only grant.
 
     ``http_client_factory(credentials, reader_id)`` returns an httpx-like
     client authenticated AS THE READER (so the probe exercises the reader's
-    real rights) — ``reader_id`` is ``grant.reader_id`` itself, never
-    re-derived by the caller. On success the ``cloud_ro_mounts`` row is
-    persisted, and — UNLESS this is a resume re-engage on a thread whose row
-    already carries a live staging (``staged_summary`` not ``None``), in
-    which case the prior baseline is preserved as-is (see the capture block
-    below) — the etag baseline (design §3.4) is captured and persisted
-    against it. The grant is returned either way; on any failure (including
-    a baseline capture/persist failure — without one neither the staged-diff
-    manifest nor the apply conflict gate can classify writes) the grant is
-    revoked — along with the ``cloud_ro_mounts`` row, if it already
-    persisted — and ``RoEngageRefused`` is raised.
+    real rights). The encrypted final password and immutable source/attempt row
+    commit before the first Nextcloud mutation. Every authority-creating POST
+    then passes through the signed effect executor. A failure first transitions
+    the exact row to ``revoking`` and performs attempt-unique containment; it
+    becomes ``revoked`` only after every durable dispatch horizon has elapsed.
     """
-    await backend.ensure_ro_reader(user_key=user_key)
-    grant = await backend.mint_ro_grant(handle, user_key=user_key, grant_key=thread_id)
+
+    async def _require_admission() -> None:
+        if admission_check is not None and not await admission_check():
+            raise RoEngageRefused("session lifecycle no longer admits a runtime")
+
+    if not isinstance(plan, ProtectedNextcloudReaderGrantPlan):
+        raise RoEngageRefused("protected reader attempt authority is malformed")
+    handle = plan.to_project_folder_handle()
+    grant = backend.build_protected_reader_grant(
+        plan,
+        credentials=credentials,
+    )
+    dispatch = effect_dispatcher
+    if dispatch is None:
+        dispatch = ProtectedNextcloudEffectExecutor(
+            postgres_db=postgres_db,
+            transport=backend,
+            thread_id=thread_id,
+            runtime_generation=expected_runtime_generation,
+            plan=plan,
+        )
+
+    await _require_admission()
     canary = None
-    row_id: str | None = None  # set once persisted, so the rollback is row-aware
+    row_id: str | None = None
     try:
+        installed = await postgres_db.install_ro_mount_engage_intent(
+            thread_id=thread_id,
+            user_id=user_id,
+            selected_mount_id=selected_mount_id,
+            expected_runtime_generation=expected_runtime_generation,
+            plan=plan,
+            credentials=credentials,
+            webdav_url=grant.webdav_url,
+            auth_kind=grant.auth_kind,
+        )
+        if installed is None:
+            raise RoEngageRefused(
+                "session or protected source changed before intent persistence"
+            )
+        row_id = str(installed["id"])
+
+        await _require_admission()
+        provisioned = await backend.grant_protected_reader_attempt(
+            plan,
+            credentials=credentials,
+            dispatch_effect=dispatch,
+        )
+        if provisioned != grant:
+            raise RoEngageRefused(
+                "protected reader effect returned a different credential authority"
+            )
+        await _require_admission()
         canary = await backend.seed_canary_fixture(handle)
+        await _require_admission()
         # Probe AS THE READER using its freshly minted credential.
         client = http_client_factory(grant.credentials, grant.reader_id)
 
         floors = await ro_probe.check_version_floors(
             client, grant.webdav_url, backend=backend.backend_id
         )
+        await _require_admission()
         if not floors.ok:
             raise RoEngageRefused(
                 f"version floor check failed: {floors.failures or floors.inconclusive}"
@@ -119,24 +205,13 @@ async def engage_ro_mount(
             version_ref=canary.version_ref,
             trash_ref=canary.trash_ref,
         )
+        await _require_admission()
         if not result.ok:
             raise RoEngageRefused(
                 "read-only probe did not pass: "
                 f"failures={result.failures} inconclusive={result.inconclusive} "
                 f"skipped={result.skipped}"
             )
-
-        row_id = await postgres_db.create_ro_mount(
-            thread_id=thread_id,
-            user_id=user_id,
-            backend=backend.backend_id,
-            reader_id=grant.reader_id,
-            grant_handle=grant.grant_handle,
-            credentials=grant.credentials,
-            webdav_url=grant.webdav_url,
-            auth_kind=grant.auth_kind,
-        )
-        logger.info("RO mount engaged for thread %s (row %s)", thread_id, row_id)
 
         # Etag baseline (design §3.4): without it neither the staged-diff
         # manifest nor the apply conflict gate can classify writes, so a
@@ -158,43 +233,59 @@ async def engage_ro_mount(
         # apply/reject (clears staging too) should ever move the baseline
         # forward — re-engage must not.
         existing_row = await postgres_db.get_ro_mount_by_thread(thread_id)
+        await _require_admission()
         if existing_row is not None and existing_row.get("staged_summary") is not None:
+            baseline = existing_row.get("etag_baseline")
+            if not isinstance(baseline, dict):
+                raise RoEngageRefused("existing staging has no valid etag baseline")
             logger.info(
                 "RO mount re-engage for thread %s: existing staging binds to "
                 "prior baseline — preserving",
                 thread_id,
             )
-            return grant
-
-        try:
-            baseline = await backend.capture_etag_baseline(handle)
-        except Exception as e:
-            raise RoEngageRefused(f"etag baseline capture failed: {e}") from e
-        if not await postgres_db.update_ro_mount_baseline(row_id, baseline):
-            # False = the row is no longer active (e.g. the reconciler
-            # revoked it mid-engage) — the baseline did NOT persist, so
-            # engage must not report success.
+        else:
+            try:
+                baseline = await backend.capture_etag_baseline(handle)
+                await _require_admission()
+            except Exception as e:
+                raise RoEngageRefused(f"etag baseline capture failed: {e}") from e
+        if not await postgres_db.activate_ro_mount_attempt_with_baseline(
+            row_id,
+            baseline,
+            thread_id=thread_id,
+            user_id=user_id,
+            selected_mount_id=selected_mount_id,
+            expected_runtime_generation=expected_runtime_generation,
+            plan=plan,
+        ):
             raise RoEngageRefused(
-                "etag baseline persist failed: cloud_ro_mounts row no longer active"
+                "etag baseline publication failed: engage authority changed"
             )
 
+        await _require_admission()
+        logger.info("RO mount engaged for thread %s (row %s)", thread_id, row_id)
         return grant
-    except Exception:
-        # Fail closed: roll the grant back so no partial RO access lingers —
-        # and if the row already persisted (baseline-stage refusals fire
-        # after create_ro_mount), mark it revoked too, so no status='active'
-        # row with dead credentials and a NULL baseline survives.
-        try:
-            await backend.revoke_ro_grant(grant.grant_handle, user_key=user_key)
-        except Exception:  # pragma: no cover - best effort
-            logger.exception("failed to revoke RO grant during engage rollback")
+    except BaseException as original_error:
         if row_id is not None:
             try:
-                await postgres_db.mark_ro_mount_revoked(row_id)
-            except Exception:  # pragma: no cover - best effort
-                logger.exception(
-                    "failed to mark RO mount row revoked during engage rollback"
+                settled = await revoke_ro_mount_attempt(
+                    backend=backend,
+                    postgres_db=postgres_db,
+                    row_id=row_id,
+                    thread_id=thread_id,
+                    runtime_generation=expected_runtime_generation,
+                    plan=plan,
                 )
+            except BaseException:
+                logger.exception(
+                    "protected reader attempt cleanup remains pending for %s",
+                    plan.engage_attempt,
+                )
+                settled = False
+            if not settled and isinstance(original_error, Exception):
+                raise RoEngageCleanupPending(
+                    "protected reader cleanup is still pending"
+                ) from original_error
         raise
     finally:
         if canary is not None:

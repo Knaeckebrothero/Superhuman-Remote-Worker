@@ -48,6 +48,8 @@ async def test_create_ro_mount_encrypts_credentials():
         credentials="s3cr3t-app-pw",
         webdav_url="https://nc/remote.php/dav/files/srw-reader-abc/Proj/",
         auth_kind="basic",
+        expected_runtime_generation="33333333-3333-4333-8333-333333333333",
+        engage_attempt="44444444-4444-4444-8444-444444444444",
     )
     assert row_id == "row-uuid"
     # The credential passed to SQL must be ciphertext, not the plaintext.

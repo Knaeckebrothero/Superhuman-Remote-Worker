@@ -10,6 +10,9 @@ from orchestrator.services.session_tokens import (
 )
 
 
+SESSION_IDENTITY_FINGERPRINT = "sha256:" + ("a" * 64)
+
+
 @pytest.fixture
 def svc():
     """A SessionTokenService with a fixed secret and 60s TTL."""
@@ -19,7 +22,11 @@ def svc():
 def test_mint_returns_token_payload_and_expiry(svc):
     """Minting yields a token string and the absolute expiry timestamp."""
     before = int(time.time())
-    token, expires_at = svc.mint(user_id="u1", thread_id="t1")
+    token, expires_at = svc.mint(
+        user_id="u1",
+        thread_id="t1",
+        session_identity_fingerprint=SESSION_IDENTITY_FINGERPRINT,
+    )
     after = int(time.time())
 
     assert isinstance(token, str) and len(token) > 0
@@ -28,11 +35,16 @@ def test_mint_returns_token_payload_and_expiry(svc):
 
 def test_validate_accepts_valid_token(svc):
     """A freshly minted token validates and exposes its claims."""
-    token, _ = svc.mint(user_id="u1", thread_id="t1")
+    token, _ = svc.mint(
+        user_id="u1",
+        thread_id="t1",
+        session_identity_fingerprint=SESSION_IDENTITY_FINGERPRINT,
+    )
     claims = svc.validate(token)
 
     assert claims["sub"] == "u1"
     assert claims["tid"] == "t1"
+    assert claims["sif"] == SESSION_IDENTITY_FINGERPRINT
     assert claims["aud"] == "agent"
     assert "exp" in claims
     assert "iat" in claims
@@ -42,7 +54,11 @@ def test_validate_accepts_valid_token(svc):
 def test_validate_rejects_wrong_signature(svc):
     """A token signed by a different secret is rejected."""
     other = SessionTokenService(secret="different-secret", ttl_seconds=60)
-    token, _ = other.mint(user_id="u1", thread_id="t1")
+    token, _ = other.mint(
+        user_id="u1",
+        thread_id="t1",
+        session_identity_fingerprint=SESSION_IDENTITY_FINGERPRINT,
+    )
 
     with pytest.raises(InvalidSessionTokenError):
         svc.validate(token)
@@ -91,7 +107,7 @@ def test_validate_rejects_malformed_token(svc):
 
 
 def test_validate_rejects_token_missing_required_claims(svc):
-    """A token missing `sub`, `tid`, `aud`, `iat`, or `exp` is rejected.
+    """A token missing `sub`, `tid`, `sif`, `aud`, `iat`, or `exp` is rejected.
 
     Defensive boundary: validate() must reject incomplete tokens so callers
     don't need to recheck claim presence.
@@ -113,3 +129,16 @@ def test_validate_rejects_token_missing_required_claims(svc):
     )
     with pytest.raises(InvalidSessionTokenError):
         svc.validate(incomplete)
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    ["", "sha256:", "sha256:" + ("g" * 64), "sha256:" + ("a" * 63)],
+)
+def test_mint_refuses_malformed_session_identity(fingerprint, svc):
+    with pytest.raises(ValueError, match="identity fingerprint"):
+        svc.mint(
+            user_id="u1",
+            thread_id="t1",
+            session_identity_fingerprint=fingerprint,
+        )

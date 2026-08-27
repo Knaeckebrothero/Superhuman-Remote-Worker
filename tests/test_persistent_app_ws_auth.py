@@ -3,14 +3,49 @@
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+from unittest.mock import MagicMock
 
 from orchestrator.services.session_tokens import SessionTokenService
+from src.shared.pinned_session_identity import (
+    pinned_session_ready_identity_fingerprint,
+)
+
+
+THREAD_ID = "11111111-1111-4111-8111-111111111111"
+RUNTIME_GENERATION = "22222222-2222-4222-8222-222222222222"
+AGENT_ID = "33333333-3333-4333-8333-333333333333"
+ATTACH_TOKEN = "44444444-4444-4444-8444-444444444444"
+POD_UID = "55555555-5555-4555-8555-555555555555"
+
+
+def _fingerprint(*, generation: str = RUNTIME_GENERATION) -> str:
+    value = pinned_session_ready_identity_fingerprint(
+        thread_id=THREAD_ID,
+        runtime_generation=generation,
+        agent_id=AGENT_ID,
+        runtime_attach_token=ATTACH_TOKEN,
+        pod_uid=POD_UID,
+    )
+    assert value is not None
+    return value
 
 
 @pytest.fixture(autouse=True)
 def configure_pod_env(monkeypatch):
     monkeypatch.setenv("SESSION_JWT_SECRET", "test-pod-secret-do-not-use")
-    monkeypatch.setenv("SESSION_BOUND_THREAD_ID", "t1")
+    monkeypatch.setenv("SESSION_BOUND_THREAD_ID", THREAD_ID)
+    monkeypatch.setenv("POD_UID", POD_UID)
+
+    import src.api.persistent_app as pa
+
+    monkeypatch.setattr(pa, "_thread_id", THREAD_ID)
+    monkeypatch.setattr(pa, "_session_runtime_generation", RUNTIME_GENERATION)
+    monkeypatch.setattr(pa, "_session_runtime_attach_token", ATTACH_TOKEN)
+    monkeypatch.setattr(
+        pa,
+        "_orchestrator_client",
+        MagicMock(agent_id=AGENT_ID),
+    )
 
 
 @pytest.fixture
@@ -20,7 +55,7 @@ def app():
     # config_path is required; we never actually run the lifespan / session,
     # but the constructor needs a value. A dummy string is fine — the route
     # under test (the validator gate on /ws/chat) doesn't touch it.
-    return create_persistent_app("dummy_config", "t1")
+    return create_persistent_app("dummy_config", THREAD_ID)
 
 
 def _connect_and_capture_close(client: TestClient, url: str) -> int:
@@ -50,7 +85,9 @@ def test_ws_chat_rejects_missing_token(app):
 def test_ws_chat_rejects_token_for_other_thread(app):
     """Token's `tid` doesn't match pod's bound thread → close with 4403."""
     other_token, _ = SessionTokenService("test-pod-secret-do-not-use").mint(
-        "u1", "OTHER-thread"
+        "u1",
+        "66666666-6666-4666-8666-666666666666",
+        session_identity_fingerprint=_fingerprint(),
     )
     client = TestClient(app)
     code = _connect_and_capture_close(client, f"/ws/chat?t={other_token}")
@@ -59,7 +96,11 @@ def test_ws_chat_rejects_token_for_other_thread(app):
 
 def test_ws_chat_rejects_invalid_signature(app):
     """Token signed with a different secret → close with 4401."""
-    bad_token, _ = SessionTokenService("WRONG-SECRET").mint("u1", "t1")
+    bad_token, _ = SessionTokenService("WRONG-SECRET").mint(
+        "u1",
+        THREAD_ID,
+        session_identity_fingerprint=_fingerprint(),
+    )
     client = TestClient(app)
     code = _connect_and_capture_close(client, f"/ws/chat?t={bad_token}")
     assert code == 4401
@@ -73,8 +114,8 @@ def test_ws_chat_rejects_when_pod_misconfigured(app, monkeypatch):
     assert code == 4500
 
 
-def test_ws_chat_accepts_valid_token(app):
-    """Token with matching tid → validator does NOT close as 4401/4403/4500.
+def test_ws_chat_accepts_valid_token(app, monkeypatch):
+    """Token with matching exact identity passes the validator gate.
 
     The session itself isn't started so ``handle_persistent_websocket`` will
     drop the connection shortly after — but the close code must come from
@@ -82,16 +123,35 @@ def test_ws_chat_accepts_valid_token(app):
     are 4401 (auth), 4403 (mismatch), and 4500 (misconfig). Anything else
     means the validator allowed the request through.
     """
-    token, _ = SessionTokenService("test-pod-secret-do-not-use").mint("u1", "t1")
-    client = TestClient(app)
-    try:
-        code = _connect_and_capture_close(client, f"/ws/chat?t={token}")
-    except Exception:
-        # The downstream session-not-active path may raise — that's a sign
-        # the validator passed (we got past the gate).
-        return
-    # If we got a clean close code from downstream, it must NOT be one of
-    # the validator's rejection codes.
-    assert code not in (4401, 4403, 4500), (
-        f"Validator unexpectedly rejected valid token with code {code}"
+    import src.api.persistent_app as pa
+
+    async def _accepted_downstream(ws):
+        await ws.accept()
+        await ws.close(code=4000, reason="validator passed")
+
+    # The real downstream handler also uses 4403 when no live session object
+    # exists. Stub it so this test identifies the validator boundary rather
+    # than conflating two independent exact-identity checks.
+    monkeypatch.setattr(pa, "handle_persistent_websocket", _accepted_downstream)
+
+    token, _ = SessionTokenService("test-pod-secret-do-not-use").mint(
+        "u1",
+        THREAD_ID,
+        session_identity_fingerprint=_fingerprint(),
     )
+    client = TestClient(app)
+    code = _connect_and_capture_close(client, f"/ws/chat?t={token}")
+    assert code == 4000
+
+
+def test_ws_chat_rejects_predecessor_generation_token(app):
+    predecessor_generation = "77777777-7777-4777-8777-777777777777"
+    token, _ = SessionTokenService("test-pod-secret-do-not-use").mint(
+        "u1",
+        THREAD_ID,
+        session_identity_fingerprint=_fingerprint(generation=predecessor_generation),
+    )
+
+    code = _connect_and_capture_close(TestClient(app), f"/ws/chat?t={token}")
+
+    assert code == 4403

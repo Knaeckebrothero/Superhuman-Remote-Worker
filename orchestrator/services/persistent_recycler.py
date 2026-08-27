@@ -321,6 +321,10 @@ class PersistentThreadRecycler:
                 )
                 recycle = {
                     "generation": generation,
+                    "runtime_generation": str(thread.get("runtime_generation") or ""),
+                    "old_runtime_attach_token": str(
+                        thread.get("runtime_attach_token") or ""
+                    ),
                     "phase": phase,
                     "reason": str(reason)[:64],
                     "expected_build_sha": target_build_sha,
@@ -479,14 +483,20 @@ class PersistentThreadRecycler:
                     return ParkedBoundaryAcknowledgement(
                         True, False, "drain_authority_mismatch"
                     )
+                # A parked recycle boundary is a physical-agent handoff, not
+                # a user-visible session suspension.  Keep the thread in the
+                # same lifecycle/generation while the durable recycle state
+                # and reciprocal old-agent pointer fence all replacement
+                # work.  Writing ``suspended`` here previously reopened the
+                # generic wake/prepare path before old-pod cleanup finished.
                 result = await conn.execute(
                     """
                     UPDATE threads
-                       SET status = 'suspended',
-                           awaiting_user_since = NULL,
+                       SET awaiting_user_since = NULL,
                            control_admission_agent_id = NULL
                      WHERE id = $1
                        AND agent_id = $2
+                       AND runtime_retirement_token IS NULL
                        AND status IN ('created', 'active', 'awaiting_user', 'suspended')
                     """,
                     thread_uuid,
@@ -723,6 +733,18 @@ class PersistentThreadRecycler:
                 old_agent_id = current.get("old_agent_id")
                 if old_agent_id:
                     old_uuid = uuid.UUID(str(old_agent_id))
+                    try:
+                        runtime_generation = uuid.UUID(
+                            str(current.get("runtime_generation") or "")
+                        )
+                        old_attach_token = uuid.UUID(
+                            str(current.get("old_runtime_attach_token") or "")
+                        )
+                    except (TypeError, ValueError):
+                        # A pre-0185/malformed recycle has no proof-bearing
+                        # detach edge. Preserve it for operator/reconciler
+                        # recovery; never broaden into a pointer-only clear.
+                        return recycle or None
                     # Grant is locked after agent, preserving the runtime actor
                     # lifecycle order. DELETE's database trigger revokes it and
                     # retains the immutable agent UUID provenance snapshot.
@@ -731,13 +753,21 @@ class PersistentThreadRecycler:
                         "WHERE agent_id = $1 AND revoked_at IS NULL FOR UPDATE",
                         old_uuid,
                     )
-                    await conn.execute(
+                    cleared = await conn.execute(
                         "UPDATE threads SET agent_id = NULL, "
-                        "control_admission_agent_id = NULL "
-                        "WHERE id = $1 AND agent_id = $2",
+                        "control_admission_agent_id = NULL, "
+                        "runtime_attach_token = NULL "
+                        "WHERE id = $1 AND agent_id = $2 "
+                        "AND runtime_generation = $3 "
+                        "AND runtime_attach_token = $4 "
+                        "AND runtime_retirement_token IS NULL",
                         thread_uuid,
                         old_uuid,
+                        runtime_generation,
+                        old_attach_token,
                     )
+                    if cleared != "UPDATE 1":
+                        return None
                     await conn.execute("DELETE FROM agents WHERE id = $1", old_uuid)
 
                 recycle.update(
@@ -934,6 +964,8 @@ class PersistentThreadRecycler:
         now = _iso()
         next_recycle = {
             "generation": generation,
+            "runtime_generation": str(thread.get("runtime_generation") or ""),
+            "old_runtime_attach_token": str(thread.get("runtime_attach_token") or ""),
             "phase": "awaiting_old_pod_exit",
             "reason": "desired_image_changed_during_recycle",
             "expected_build_sha": target_build_sha,
@@ -1215,6 +1247,16 @@ class PersistentThreadRecycler:
                 recycle.update(extras or {})
                 recycle.update({"phase": phase, "updated_at": _iso()})
                 agent_pod[_RECYCLE_KEY] = recycle
+                new_pod_uid = str((extras or {}).get("new_pod_uid") or "")
+                if phase == "awaiting_replacement" and new_pod_uid:
+                    # Registration binds only when the immutable thread-side
+                    # Pod marker agrees with the new agent row. Publish that
+                    # complete tuple in the same phase CAS that accepts the
+                    # exact create/observation; retaining the old UID would
+                    # either wedge registration or tempt a broad identity
+                    # overwrite at bind time.
+                    agent_pod["pod_name"] = f"persistent-{str(thread_uuid)[:12]}"
+                    agent_pod["pod_uid"] = new_pod_uid
                 metadata["agent_pod"] = agent_pod
                 await self._write_thread_metadata(conn, thread_uuid, metadata)
                 return recycle
@@ -1263,7 +1305,9 @@ class PersistentThreadRecycler:
         thread_row = await conn.fetchrow(
             """
             SELECT id, project_id, user_id, status::text AS status,
-                   execution_lane, agent_id, config_name, metadata
+                   execution_lane, agent_id, config_name, metadata,
+                   runtime_generation, runtime_attach_token,
+                   runtime_retirement_token
               FROM threads
              WHERE id=$1
              FOR UPDATE
@@ -1276,6 +1320,7 @@ class PersistentThreadRecycler:
         if (
             str(thread.get("status")) not in _LIVE_THREAD_STATUSES
             or str(thread.get("execution_lane") or "pinned") != "pinned"
+            or thread.get("runtime_retirement_token") is not None
         ):
             return None
         metadata = _json_object(thread.get("metadata"))

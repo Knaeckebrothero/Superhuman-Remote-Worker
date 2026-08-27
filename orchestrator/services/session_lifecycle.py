@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 
 from services.notification_feed import notification_feed
+from services.session_runtime_admission import thread_runtime_is_preparable
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +51,22 @@ async def wait_for_binding(thread_id: str, timeout_s: int) -> bool:
     interval = 2
     while asyncio.get_event_loop().time() < deadline:
         thread = await postgres_db.get_thread(thread_id)
+        if not thread_runtime_is_preparable(thread):
+            return False
         if thread and thread.get("agent_id"):
             return True
         await asyncio.sleep(interval)
     return False
 
 
-async def wait_for_ready(pod_ip: str, pod_port: int, timeout_s: int) -> bool:
+async def wait_for_ready(
+    pod_ip: str,
+    pod_port: int,
+    timeout_s: int,
+    *,
+    require_protected_cloud: bool = False,
+    expected_session_identity_fingerprint: str | None = None,
+) -> bool:
     """Poll the agent pod's /ready until it returns ready=true, or timeout.
 
     The agent's ``/ready`` returns ``ready=true`` only once
@@ -68,7 +78,14 @@ async def wait_for_ready(pod_ip: str, pod_port: int, timeout_s: int) -> bool:
     deadline = asyncio.get_event_loop().time() + timeout_s
     interval = 2
     while asyncio.get_event_loop().time() < deadline:
-        if await probe_ready(pod_ip, pod_port):
+        if await probe_ready(
+            pod_ip,
+            pod_port,
+            require_protected_cloud=require_protected_cloud,
+            expected_session_identity_fingerprint=(
+                expected_session_identity_fingerprint
+            ),
+        ):
             return True
         await asyncio.sleep(interval)
     return False
@@ -79,6 +96,8 @@ async def probe_ready(
     pod_port: int,
     *,
     required_capability: str | None = None,
+    require_protected_cloud: bool = False,
+    expected_session_identity_fingerprint: str | None = None,
 ) -> bool:
     """Single-shot probe of the agent pod's /ready endpoint.
 
@@ -98,13 +117,34 @@ async def probe_ready(
             if resp.status_code != 200:
                 return False
             payload = resp.json()
-            if not bool(payload.get("ready")):
+            # Readiness is a security boundary for protected sessions.  Do not
+            # let JSON truthiness turn malformed mixed-version payloads such
+            # as ``"false"`` or ``1`` into an affirmative readiness signal.
+            if payload.get("ready") is not True:
                 return False
-            if required_capability is None:
-                return True
             capabilities = payload.get("capabilities")
-            return isinstance(capabilities, dict) and bool(
-                capabilities.get(required_capability)
-            )
+            if not isinstance(capabilities, dict):
+                return (
+                    required_capability is None
+                    and not require_protected_cloud
+                    and expected_session_identity_fingerprint is None
+                )
+            if expected_session_identity_fingerprint is not None and not (
+                type(capabilities.get("pinned_session_identity_contract")) is int
+                and capabilities["pinned_session_identity_contract"] == 1
+                and payload.get("session_identity_fingerprint")
+                == expected_session_identity_fingerprint
+            ):
+                return False
+            protected_contract = capabilities.get("protected_cloud_contract")
+            if require_protected_cloud and not (
+                type(protected_contract) is int
+                and protected_contract == 1
+                and capabilities.get("protected_cloud_ready") is True
+            ):
+                return False
+            if required_capability is not None:
+                return capabilities.get(required_capability) is True
+            return True
     except Exception:
         return False

@@ -850,6 +850,7 @@ class WorkspaceSuspensionService:
         expected_runtime_incarnation: str | None = None,
         stateless_creation_generation: str | None = None,
         allow_stateless_create: bool = False,
+        _pinned_runtime_lock_held: bool = False,
     ) -> bool:
         """Owner-keyed restore: job -> restore_workspace, session -> restore_thread_workspace."""
         if owner.kind == "job":
@@ -865,17 +866,22 @@ class WorkspaceSuspensionService:
             and stateless_creation_generation is None
             and not allow_stateless_create
         ):
-            return await self.restore_thread_workspace(owner.id)
-        if stateless_creation_generation is None and not allow_stateless_create:
+            if not _pinned_runtime_lock_held:
+                return await self.restore_thread_workspace(owner.id)
             return await self.restore_thread_workspace(
-                owner.id,
-                expected_runtime_incarnation=expected_runtime_incarnation,
+                owner.id, _pinned_runtime_lock_held=True
             )
+        if stateless_creation_generation is None and not allow_stateless_create:
+            kwargs = {"expected_runtime_incarnation": expected_runtime_incarnation}
+            if _pinned_runtime_lock_held:
+                kwargs["_pinned_runtime_lock_held"] = True
+            return await self.restore_thread_workspace(owner.id, **kwargs)
         return await self.restore_thread_workspace(
             owner.id,
             expected_runtime_incarnation=expected_runtime_incarnation,
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
+            _pinned_runtime_lock_held=_pinned_runtime_lock_held,
         )
 
     # =========================================================================
@@ -1135,6 +1141,7 @@ class WorkspaceSuspensionService:
         expected_runtime_incarnation: str | None = None,
         stateless_creation_generation: str | None = None,
         allow_stateless_create: bool = False,
+        _pinned_runtime_lock_held: bool = False,
     ) -> bool:
         """Provision a fresh workspace and extract the S3 snapshot into it.
 
@@ -1147,6 +1154,31 @@ class WorkspaceSuspensionService:
 
         thread = await self._db.get_thread(thread_id)
         if not thread:
+            return False
+
+        if thread.get("execution_lane") == "pinned" and not _pinned_runtime_lock_held:
+            lock_impl = getattr(type(self._db), "thread_advisory_lock", None)
+            if callable(lock_impl):
+                async with lock_impl(self._db, thread_id) as lock_acquired:
+                    if lock_acquired is not True:
+                        logger.error(
+                            "Refusing pinned workspace restore without owning "
+                            "the runtime advisory lock (thread %s)",
+                            thread_id,
+                        )
+                        return False
+                    return await self.restore_thread_workspace(
+                        thread_id,
+                        expected_runtime_incarnation=expected_runtime_incarnation,
+                        stateless_creation_generation=stateless_creation_generation,
+                        allow_stateless_create=allow_stateless_create,
+                        _pinned_runtime_lock_held=True,
+                    )
+            logger.error(
+                "Refusing pinned workspace restore without the runtime "
+                "advisory-lock implementation (thread %s)",
+                thread_id,
+            )
             return False
 
         metadata = thread.get("metadata") or {}
@@ -1251,12 +1283,11 @@ class WorkspaceSuspensionService:
                 )
                 return False
 
-        if is_vm:
-            await self._db.merge_thread_vm_context(
-                thread_id,
-                {"status": "restoring"},
-            )
-        elif not reuse_existing_runtime:
+        if (
+            not is_vm
+            and not reuse_existing_runtime
+            and thread.get("execution_lane") != "pinned"
+        ):
             await self._db.merge_thread_workspace_context(
                 thread_id,
                 {
@@ -1274,17 +1305,33 @@ class WorkspaceSuspensionService:
             reattach_reason = ""
 
             if is_vm and self._vm_provisioner and self._vm_provisioner.is_available:
-                ok = await self._vm_provisioner.create_thread_vm(thread_id)
+                generation = str(thread.get("runtime_generation") or "")
+                try:
+                    if generation != str(UUID(generation)):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+                raw_vm = metadata.get("vm")
+                if raw_vm is not None and not isinstance(raw_vm, dict):
+                    return False
+                ok = await self._vm_provisioner.create_thread_vm(
+                    thread_id,
+                    expected_runtime_generation=generation,
+                    expected_agent_id=(
+                        str(thread["agent_id"])
+                        if thread.get("agent_id") is not None
+                        else None
+                    ),
+                    expected_attach_token=(
+                        str(thread["runtime_attach_token"])
+                        if thread.get("runtime_attach_token") is not None
+                        else None
+                    ),
+                    expected_vm_context=(dict(raw_vm) if raw_vm is not None else None),
+                )
                 if not ok:
                     logger.error(
                         "Failed to create VM for restore of thread %s", thread_id
-                    )
-                    await self._db.merge_thread_vm_context(
-                        thread_id,
-                        {
-                            "status": "failed",
-                            "error": "VM creation failed on restore",
-                        },
                     )
                     return False
 
@@ -1319,29 +1366,36 @@ class WorkspaceSuspensionService:
             else:
                 # K8s container (default)
                 if not reuse_existing_runtime:
-                    create_kwargs: dict[str, Any] = {}
-                    if stateless_creation_generation is not None:
-                        create_kwargs = {
-                            "stateless_creation_generation": (
-                                stateless_creation_generation
-                            ),
-                            "allow_stateless_create": allow_stateless_create,
-                        }
-                    ok = await self._container_provisioner.create_workspace(
-                        WorkspaceOwner.session(thread_id),
-                        **create_kwargs,
-                    )
+                    if thread.get("execution_lane") == "pinned":
+                        ok = await self._container_provisioner.create_pinned_thread_workspace(
+                            thread_id,
+                            runtime_lock_held=True,
+                        )
+                    else:
+                        create_kwargs: dict[str, Any] = {}
+                        if stateless_creation_generation is not None:
+                            create_kwargs = {
+                                "stateless_creation_generation": (
+                                    stateless_creation_generation
+                                ),
+                                "allow_stateless_create": allow_stateless_create,
+                            }
+                        ok = await self._container_provisioner.create_workspace(
+                            WorkspaceOwner.session(thread_id),
+                            **create_kwargs,
+                        )
                     if not ok:
                         logger.error(
                             "Failed to create pod for restore of thread %s", thread_id
                         )
-                        await self._db.merge_thread_workspace_context(
-                            thread_id,
-                            {
-                                "status": "failed",
-                                "error": "pod creation failed on restore",
-                            },
-                        )
+                        if thread.get("execution_lane") != "pinned":
+                            await self._db.merge_thread_workspace_context(
+                                thread_id,
+                                {
+                                    "status": "failed",
+                                    "error": "pod creation failed on restore",
+                                },
+                            )
                         return False
 
                 thread = await self._db.get_thread(thread_id)

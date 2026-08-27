@@ -4,6 +4,23 @@ Domain:    {{ .Values.global.domain }}
 Namespace: {{ .Release.Namespace }}
 License:   accepted ({{ include "srw.fullname" . }} will start)
 
+{{- if .Values.orchestrator.runtimeAuthorityMigrationMaintenanceAck }}
+
+PINNED RUNTIME AUTHORITY CUTOVER
+================================
+The one-shot migration 0185 acknowledgement was enabled. This release uses a
+Recreate orchestrator deployment and supplies only the exact
+`pinned-runtime-authority-v1` migration gate.
+
+Before reopening admission, verify that every old mutating orchestrator and
+warm/dedicated agent was drained, migration 0185 is successful in
+`schema_migrations`, and the new orchestrator is ready. Do not use Helm
+`--atomic` for this cutover and never roll back to a pre-0185 image after the
+migration commits. Clear
+`orchestrator.runtimeAuthorityMigrationMaintenanceAck` on a later all-new
+version rollout.
+{{- end }}
+
 Services:
   Cockpit:       {{ include "srw.cockpitUrl" . }}
   API:           {{ include "srw.apiUrl" . }}
@@ -46,6 +63,23 @@ Back it up now:
 External Secrets Operator is enabled. Ensure `app_encryption_key` exists
 in the Vault path `{{ .Values.externalSecrets.vaultPath }}` — the
 orchestrator will refuse to start without it.
+{{- end }}
+
+{{- if .Values.nextcloud.protectedEffect.enabled }}
+
+Protected Nextcloud effects
+===========================
+The internal bounded effect lane is enabled at:
+
+  http://{{ include "srw.nextcloudProtectedEffectName" . }}
+
+Ensure dedicated Secret `{{ include "srw.nextcloudProtectedEffectSecretName" . }}` contains a stable
+NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY of at least 32 bytes. Do not rotate that
+key while cloud_ro_effect_intents are retained, and never copy it into the
+shared application Secret consumed by agent Pods. The configuration digest is
+derived by the chart and must not be overridden. External Nextcloud endpoints
+are not eligible for protected cloud mode without an equivalent server-side
+deadline and hard FPM handler bound.
 {{- end }}
 
 {{- if .Values.llm.seed.enabled }}

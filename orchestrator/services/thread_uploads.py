@@ -1720,6 +1720,48 @@ async def purge_attested_stateless_virtual_workspace(
         return False
 
 
+async def purge_attested_pinned_virtual_workspace(
+    thread: dict[str, Any],
+    *,
+    expected_runtime_generation: str,
+    expected_retirement_token: str,
+) -> bool:
+    """Purge one exact pinned virtual prefix under authorized retirement.
+
+    The caller holds the thread lifecycle lock.  The immutable T/G pair closes
+    every upload/Resume path while the joined blocking rclone operation runs;
+    the database cleanup CAS rechecks the same binding before removing it.
+    """
+
+    if (
+        thread.get("execution_lane") != "pinned"
+        or str(thread.get("runtime_generation") or "")
+        != str(expected_runtime_generation)
+        or str(thread.get("runtime_retirement_token") or "")
+        != str(expected_retirement_token)
+        or thread.get("runtime_retirement_authorized_at") is None
+        or thread.get("runtime_retirement_permanent") is not True
+    ):
+        return False
+    try:
+        target = resolve_thread_upload_destination(thread)
+    except ThreadUploadError:
+        return False
+    if not isinstance(target, _VirtualTarget):
+        return False
+    try:
+        return bool(await _joined_blocking_call(_virtual_purge_prefix, target))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to purge pinned virtual workspace for thread %s: %s",
+            thread.get("id"),
+            exc,
+        )
+        return False
+
+
 @asynccontextmanager
 async def _virtual_upload_slot():
     """Acquire an object-store upload slot with a bounded queue wait."""

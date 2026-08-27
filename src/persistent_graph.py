@@ -618,18 +618,34 @@ class PersistentLoopCallbacks:
     )
 
     # Synchronous lifecycle predicate checked immediately before retrieval,
-    # compaction and every concrete provider invocation/retry.  This is the
-    # runtime's last process-local admission decision; it deliberately does not
-    # claim atomicity with an external Kubernetes DELETE. Dedicated persistent
-    # pods wire the preStop sentinel into it; other runtimes leave it unset.
+    # compaction and every concrete provider invocation/retry. Dedicated
+    # persistent pods wire the preStop sentinel into it; other runtimes leave it
+    # unset.
     before_provider_admission: Optional[Callable[[], bool]] = None
+
+    # Exact remote-authority proof performed immediately before every concrete
+    # provider invocation/retry.  Pinned runtimes lock and verify
+    # (thread, agent, pod, runtime generation, attach token) while also proving
+    # that no durable retirement token exists.  It is deliberately separate
+    # from ``before_provider_admission``: the latter is the fast process-local
+    # guard, while this awaited gate observes an owner Force-End that may land
+    # between lifecycle-watchdog polls.
+    before_provider_execution: Optional[Callable[[], Awaitable[bool]]] = None
 
     # Durable pinned-input execution lifecycle. The transport supplies an
     # exact delivery/claim identity on dict-shaped input. Admission is invoked
     # once at the first provider boundary; defer/settle are generation-fenced
     # database transitions. Legacy/plain-string callers leave these unset.
-    admit_input_delivery: Optional[Callable[[str, int, int], Awaitable[bool]]] = None
+    admit_input_delivery: Optional[
+        Callable[[str, int, int], Awaitable[bool | None]]
+    ] = None
     defer_input_delivery: Optional[Callable[[str, int, str], Awaitable[bool]]] = None
+    cancel_input_delivery: Optional[Callable[[str, int, int, str], Awaitable[bool]]] = (
+        None
+    )
+    defer_and_requeue_input_delivery: Optional[
+        Callable[[str, int, str, str, str, str], Awaitable[Any | None]]
+    ] = None
     settle_input_delivery: Optional[Callable[[str, int], Awaitable[bool]]] = None
 
     # Deterministic LF-5 fault seam. Invoked only after an assistant response
@@ -641,6 +657,13 @@ class PersistentLoopCallbacks:
     after_assistant_tool_calls_persisted: Optional[
         Callable[[AIMessage], Awaitable[Any]]
     ] = None
+
+    # Exact per-turn external-effect boundary. The persistent transport uses
+    # this immediately before a bound, approved tool's real ``ainvoke`` to
+    # distinguish a pre-provider shutdown (safe to retry) from a partial turn
+    # that may already have produced external side effects. UI on_tool_start is
+    # intentionally insufficient because it also renders unbound tool errors.
+    on_tool_execution_start: Optional[Callable[[str, str], Awaitable[None]]] = None
 
     def __post_init__(self) -> None:
         # Back-compat: callers that still pass the deprecated on_vm_upgrade_needed
@@ -947,6 +970,12 @@ async def run_persistent_loop(
     # A successful provider turn or any different error breaks the streak.
     pairing_error_signature: Optional[str] = None
     pairing_error_count = 0
+    # A stopped server-owned wake is durable debt, not disposable user intent.
+    # Reclaim it into a fresh generation and run it before anything already in
+    # the process queue. Keeping this one-item priority slot inside the loop
+    # avoids a clean return (which the pinned transport interprets as session
+    # completion) and prevents queued human input B from overtaking wake A.
+    priority_user_input: Any | None = None
 
     # Send system prompt as first message if not already present. Re-stamp the
     # date: a resumed session's prompt was built whenever the session was
@@ -962,7 +991,11 @@ async def run_persistent_loop(
     while True:
         # --- Wait for user input ---
         try:
-            user_input = await callbacks.get_user_input()
+            if priority_user_input is not None:
+                user_input = priority_user_input
+                priority_user_input = None
+            else:
+                user_input = await callbacks.get_user_input()
         except asyncio.CancelledError:
             logger.info("Persistent loop cancelled while waiting for input")
             return
@@ -977,9 +1010,13 @@ async def run_persistent_loop(
         input_persist_role: Optional[str] = None
         input_delivery_id: Optional[str] = None
         input_claim_generation: Optional[int] = None
+        input_delivery_source: Optional[str] = None
         if isinstance(user_input, dict):
             input_msg_id = user_input.get("id")
             input_delivery_id = user_input.get("delivery_id")
+            raw_delivery_source = user_input.get("source")
+            if raw_delivery_source is not None:
+                input_delivery_source = str(raw_delivery_source)
             raw_claim_generation = user_input.get("claim_generation")
             if raw_claim_generation is not None:
                 try:
@@ -992,6 +1029,10 @@ async def run_persistent_loop(
             # accept-time persist used, instead of flipping the row to 'human'.
             input_persist_role = user_input.get("role")
             user_input = user_input.get("content", "")
+
+        has_input_delivery = (
+            input_delivery_id is not None and input_claim_generation is not None
+        )
 
         if not user_input or user_input == INTERRUPT_SENTINEL:
             continue
@@ -1066,30 +1107,130 @@ async def run_persistent_loop(
             memory_scope_kind = "thread"
             memory_scope_id = str(memory_thread_id) if memory_thread_id else None
 
-        await callbacks.on_turn_start(turn_id)
-        # Reconcile the accept-time row (turn_number was a guess there) — or
-        # create it for inputs that bypassed the REST/WS accept path. Upsert
-        # by message id either way.
-        if callbacks.persist_message is not None:
-            await callbacks.persist_message(user_msg)
+        input_delivery_outcome: Optional[str] = None
+        input_delivery_removed_from_context = False
 
-        async def _defer_current_delivery(reason: str) -> None:
-            if (
-                input_delivery_id is not None
-                and input_claim_generation is not None
-                and callbacks.defer_input_delivery is not None
-            ):
-                await callbacks.defer_input_delivery(
-                    input_delivery_id,
-                    input_claim_generation,
-                    reason,
+        def _remove_current_delivery_from_context() -> None:
+            nonlocal input_delivery_removed_from_context
+            messages[:] = [msg for msg in messages if msg is not user_msg]
+            input_delivery_removed_from_context = True
+
+        async def _defer_current_delivery(reason: str) -> bool:
+            nonlocal input_delivery_outcome
+            if input_delivery_id is None or input_claim_generation is None:
+                return True
+            if input_delivery_outcome is not None:
+                return input_delivery_outcome == "deferred"
+            if callbacks.defer_input_delivery is None:
+                return False
+            try:
+                deferred = bool(
+                    await callbacks.defer_input_delivery(
+                        input_delivery_id,
+                        input_claim_generation,
+                        reason,
+                    )
                 )
+            except Exception:
+                logger.exception(
+                    "Pinned input deferral callback failed (delivery=%s)",
+                    input_delivery_id[:8],
+                )
+                return False
+            if deferred:
+                input_delivery_outcome = "deferred"
+            return deferred
+
+        async def _cancel_current_delivery(reason: str) -> bool:
+            nonlocal input_delivery_outcome
+            if input_delivery_id is None or input_claim_generation is None:
+                return True
+            if input_delivery_outcome is not None:
+                return input_delivery_outcome == "cancelled"
+            if callbacks.cancel_input_delivery is None:
+                return False
+            try:
+                cancelled = bool(
+                    await callbacks.cancel_input_delivery(
+                        input_delivery_id,
+                        input_claim_generation,
+                        turn_id,
+                        reason,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Pinned input cancellation callback failed (delivery=%s)",
+                    input_delivery_id[:8],
+                )
+                return False
+            if cancelled:
+                input_delivery_outcome = "cancelled"
+            return cancelled
+
+        async def _report_delivery_finalization_failure() -> None:
+            # Authority is ambiguous, so quarantine this exact unadmitted input
+            # from all same-process model/auxiliary consumers. The durable
+            # ledger remains the sole recovery authority.
+            _remove_current_delivery_from_context()
+            logger.error(
+                "Pinned input pre-provider finalization lost delivery authority "
+                "(delivery=%s source=%s)",
+                (input_delivery_id or "")[:8],
+                input_delivery_source,
+            )
+            await callbacks.on_error(
+                "The session was halted because a queued input could not be "
+                "reconciled safely. No later queued input was run.",
+                turn_id=turn_id,
+            )
+
+        try:
+            await callbacks.on_turn_start(turn_id)
+            # Reconcile the accept-time row (turn_number was a guess there) — or
+            # create it for inputs that bypassed the REST/WS accept path. Upsert
+            # by message id either way.
+            if callbacks.persist_message is not None:
+                await callbacks.persist_message(user_msg)
+        except asyncio.CancelledError:
+            if input_delivery_id is None or input_claim_generation is None:
+                raise
+            finalized = await _defer_current_delivery(
+                "turn_cancelled_before_start_complete"
+            )
+            if finalized:
+                _remove_current_delivery_from_context()
+            else:
+                _remove_current_delivery_from_context()
+                logger.error(
+                    "Cancelled turn lost input deferral authority (delivery=%s)",
+                    (input_delivery_id or "")[:8],
+                )
+            return
+        except Exception:
+            if input_delivery_id is None or input_claim_generation is None:
+                raise
+            logger.exception("Turn %s failed before start completed", turn_id)
+            finalized = await _defer_current_delivery(
+                "turn_failed_before_start_complete"
+            )
+            if finalized:
+                _remove_current_delivery_from_context()
+            else:
+                await _report_delivery_finalization_failure()
+            if callbacks.on_turn_settled is not None:
+                await callbacks.on_turn_settled(turn_id)
+            return
 
         if (
             callbacks.before_provider_admission is not None
             and not callbacks.before_provider_admission()
         ):
-            await _defer_current_delivery("runtime_terminating_before_turn")
+            finalized = (
+                await _defer_current_delivery("runtime_terminating_before_turn")
+                if has_input_delivery
+                else True
+            )
             await callbacks.on_error(
                 "Persistent runtime termination admission is closed; this "
                 "input remains durable for the replacement and no provider "
@@ -1098,11 +1239,20 @@ async def run_persistent_loop(
             )
             if callbacks.on_turn_settled is not None:
                 await callbacks.on_turn_settled(turn_id)
+            if not finalized:
+                await _report_delivery_finalization_failure()
+                return
+            if has_input_delivery:
+                _remove_current_delivery_from_context()
             continue
         if callbacks.before_turn_authorization is not None:
             authorized, reason = await callbacks.before_turn_authorization()
             if not authorized:
-                await _defer_current_delivery("runtime_authorization_unavailable")
+                finalized = (
+                    await _defer_current_delivery("runtime_authorization_unavailable")
+                    if has_input_delivery
+                    else True
+                )
                 await callbacks.on_error(
                     "Officer runtime authorization is unavailable; this turn "
                     "was durably recorded but no model request was made. "
@@ -1111,6 +1261,11 @@ async def run_persistent_loop(
                 )
                 if callbacks.on_turn_settled is not None:
                     await callbacks.on_turn_settled(turn_id)
+                if not finalized:
+                    await _report_delivery_finalization_failure()
+                    return
+                if has_input_delivery:
+                    _remove_current_delivery_from_context()
                 continue
         tool_calls_this_turn = 0
         # Stateless terminal frames must not outrun the fenced transaction
@@ -1131,9 +1286,11 @@ async def run_persistent_loop(
         result = None
         halt_after_turn = False
         input_delivery_admitted = False
+        input_delivery_authority_failed = False
 
         async def _admit_current_delivery() -> bool:
-            nonlocal input_delivery_admitted
+            nonlocal input_delivery_admitted, input_delivery_authority_failed
+            nonlocal input_delivery_outcome
             if input_delivery_id is None or input_claim_generation is None:
                 return True
             if input_delivery_admitted:
@@ -1142,18 +1299,36 @@ async def run_persistent_loop(
                 callbacks.before_provider_admission is not None
                 and not callbacks.before_provider_admission()
             ):
-                await _defer_current_delivery("runtime_terminating_before_provider")
                 return False
             if callbacks.admit_input_delivery is None:
                 # A delivery-bearing item without its durable transition is a
                 # mixed-version unsafe shape. Fail closed before model spend.
-                await _defer_current_delivery("delivery_admission_unavailable")
+                input_delivery_authority_failed = True
                 return False
-            input_delivery_admitted = await callbacks.admit_input_delivery(
-                input_delivery_id,
-                input_claim_generation,
-                turn_id,
-            )
+            try:
+                admission = await callbacks.admit_input_delivery(
+                    input_delivery_id,
+                    input_claim_generation,
+                    turn_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Pinned input admission callback failed (delivery=%s)",
+                    input_delivery_id[:8],
+                )
+                input_delivery_authority_failed = True
+                return False
+            if admission is None:
+                # The transport admitted and then generation-fenced the row
+                # back to deferred when the termination fence closed in the
+                # same boundary race.
+                input_delivery_outcome = "deferred"
+                return False
+            input_delivery_admitted = bool(admission)
+            if input_delivery_admitted:
+                input_delivery_outcome = "admitted"
+            else:
+                input_delivery_authority_failed = True
             return input_delivery_admitted
 
         try:
@@ -1176,19 +1351,93 @@ async def run_persistent_loop(
                 before_first_provider_admission=_admit_current_delivery,
             )
             tool_calls_this_turn = result.tool_calls_made
-            if result.admission_closed and not input_delivery_admitted:
-                await _defer_current_delivery("runtime_terminating_before_provider")
+            if input_delivery_authority_failed:
+                halt_after_turn = True
+                await _report_delivery_finalization_failure()
+            elif (
+                has_input_delivery
+                and result.admission_closed
+                and not input_delivery_admitted
+            ):
+                finalized = await _defer_current_delivery(
+                    "runtime_terminating_before_provider"
+                )
+                if not finalized:
+                    halt_after_turn = True
+                    await _report_delivery_finalization_failure()
+                else:
+                    _remove_current_delivery_from_context()
+            elif (
+                has_input_delivery
+                and result.interrupted
+                and not input_delivery_admitted
+            ):
+                if input_delivery_source == "direct_human":
+                    finalized = await _cancel_current_delivery(
+                        "human_stop_before_provider"
+                    )
+                else:
+                    # Event/officer input is outbox debt, not disposable human
+                    # intent. Keep it retryable and reclaim it ahead of any B
+                    # already queued in this runtime.
+                    requeue = callbacks.defer_and_requeue_input_delivery
+                    if (
+                        requeue is None
+                        or input_delivery_id is None
+                        or input_claim_generation is None
+                    ):
+                        finalized = False
+                    else:
+                        try:
+                            priority_user_input = await requeue(
+                                input_delivery_id,
+                                input_claim_generation,
+                                str(user_input),
+                                input_persist_role or "event",
+                                input_delivery_source or "officer_wake",
+                                "turn_interrupted_before_provider",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Pinned input priority requeue callback failed "
+                                "(delivery=%s)",
+                                input_delivery_id[:8],
+                            )
+                            priority_user_input = None
+                        finalized = priority_user_input is not None
+                        if finalized:
+                            input_delivery_outcome = "deferred"
+                if finalized:
+                    # The transcript row is the user's visible audit trail (or
+                    # the wake outbox's stable row), but unadmitted intent must
+                    # leave live model context. A successor restores/requeues it
+                    # exactly once from the delivery ledger.
+                    _remove_current_delivery_from_context()
+                if not finalized:
+                    halt_after_turn = True
+                    await _report_delivery_finalization_failure()
             pairing_error_signature = None
             pairing_error_count = 0
         except asyncio.CancelledError:
             logger.info(f"Turn {turn_id} cancelled")
-            if not input_delivery_admitted:
-                await _defer_current_delivery("turn_cancelled_before_provider")
+            if has_input_delivery and not input_delivery_admitted:
+                finalized = await _defer_current_delivery(
+                    "turn_cancelled_before_provider"
+                )
+                if finalized:
+                    _remove_current_delivery_from_context()
+                else:
+                    await _report_delivery_finalization_failure()
             return
         except Exception as e:
             logger.exception(f"Error in turn {turn_id}")
-            if not input_delivery_admitted:
-                await _defer_current_delivery("turn_failed_before_provider")
+            if has_input_delivery and not input_delivery_admitted:
+                finalized = await _defer_current_delivery("turn_failed_before_provider")
+                if not finalized:
+                    halt_after_turn = True
+                    await _report_delivery_finalization_failure()
+                else:
+                    _remove_current_delivery_from_context()
             signature = _strict_pairing_error_signature(e)
             if signature is not None:
                 # Repair the mutable source of the next provider request, not
@@ -1245,6 +1494,7 @@ async def run_persistent_loop(
         )
         if (
             not defer_memory_extraction_to_outbox
+            and not input_delivery_removed_from_context
             and provider_admission_open
             and not (result is not None and result.admission_closed)
         ):
@@ -1297,13 +1547,23 @@ async def run_persistent_loop(
                     logger.warning(f"Memory extraction failed (non-fatal): {e}")
 
         turn_metrics = result.metrics if result else None
-        await callbacks.on_turn_complete(
-            turn_id,
-            turn_metrics,
-            str(user_msg.id),
-            memory_scope_kind,
-            memory_scope_id,
-        )
+        if input_delivery_removed_from_context:
+            await callbacks.on_turn_complete(
+                turn_id,
+                turn_metrics,
+                str(user_msg.id),
+                memory_scope_kind,
+                memory_scope_id,
+                skip_message_reconcile=True,
+            )
+        else:
+            await callbacks.on_turn_complete(
+                turn_id,
+                turn_metrics,
+                str(user_msg.id),
+                memory_scope_kind,
+                memory_scope_id,
+            )
         for error_args, error_kwargs in deferred_errors:
             # _execute_turn's timeout callback predates turn correlation and
             # supplies only the message. The outer loop owns the exact id.
@@ -1316,7 +1576,7 @@ async def run_persistent_loop(
             # push before publishing the durable turn mapping.  The executor's
             # full-turn acknowledgement is below this block, so it cannot cancel
             # the loop between commit and mapping during a pod handoff.
-            if tool_context:
+            if tool_context and not input_delivery_removed_from_context:
                 ws_mgr = getattr(tool_context, "workspace_manager", None)
                 git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
                 if git_mgr and git_mgr.is_active:
@@ -1379,15 +1639,29 @@ async def run_persistent_loop(
                 and input_claim_generation is not None
                 and callbacks.settle_input_delivery is not None
             ):
-                settled = await callbacks.settle_input_delivery(
-                    input_delivery_id,
-                    input_claim_generation,
-                )
+                try:
+                    settled = await callbacks.settle_input_delivery(
+                        input_delivery_id,
+                        input_claim_generation,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Pinned input settlement callback failed (delivery=%s)",
+                        input_delivery_id[:8],
+                    )
+                    settled = False
                 if not settled:
                     logger.error(
                         "Pinned input settlement lost delivery authority (delivery=%s)",
                         input_delivery_id[:8],
                     )
+                    await callbacks.on_error(
+                        "The session was halted because the completed input "
+                        "could not be settled safely. No later queued input "
+                        "was run.",
+                        turn_id=turn_id,
+                    )
+                    halt_after_turn = True
 
         if halt_after_turn:
             return
@@ -1520,6 +1794,21 @@ async def _execute_turn(
             first_provider_admitted = True
         return first_provider_admitted and not _provider_admission_closed()
 
+    async def _admit_provider_execution() -> bool:
+        """Prove current authority at the last await before provider I/O."""
+
+        if _provider_admission_closed():
+            return False
+        gate = callbacks.before_provider_execution
+        if gate is not None:
+            try:
+                if not bool(await gate()):
+                    return False
+            except Exception:
+                logger.exception("Exact provider runtime-authority check failed")
+                return False
+        return not _provider_admission_closed()
+
     async def _persist(msg: Any) -> None:
         """Persist a message the instant it's appended to history.
 
@@ -1583,6 +1872,16 @@ async def _execute_turn(
 
     if _provider_admission_closed():
         return _closed_result()
+    # Stop may already be pending when this delivery is dequeued (the PC-18
+    # race). Consume it before memory/knowledge retrieval or any other
+    # auxiliary provider can observe the unadmitted intent.
+    if callbacks.check_interrupt():
+        return TurnResult(
+            turn_id=0,
+            messages_added=messages_added,
+            tool_calls_made=tool_calls_made,
+            interrupted=True,
+        )
 
     # MemoryManager seam read path (memory overhaul Phase 1 cutover): one
     # assemble() replaces the two direct-store blocks below, which stay
@@ -2123,6 +2422,8 @@ async def _execute_turn(
                     return _closed_result()
                 if not await _admit_first_provider():
                     return _closed_result()
+                if not await _admit_provider_execution():
+                    return _closed_result()
                 _stream = llm_with_tools.astream(_provider_input())
                 _aiter = _stream.__aiter__()
                 _llm_attempt = 0
@@ -2169,7 +2470,7 @@ async def _execute_turn(
                             stream_finish_reason = None
                             response = None
                             _reasoning_buf.clear()
-                            if _provider_admission_closed():
+                            if not await _admit_provider_execution():
                                 return _closed_result()
                             _stream = llm_with_tools.astream(_provider_input())
                             _aiter = _stream.__aiter__()
@@ -2261,7 +2562,7 @@ async def _execute_turn(
                         "retrying with ainvoke"
                     )
                     response_content = ""
-                    if _provider_admission_closed():
+                    if not await _admit_provider_execution():
                         return _closed_result()
                     response = await asyncio.wait_for(
                         llm_with_tools.ainvoke(_provider_input()),
@@ -2386,7 +2687,7 @@ async def _execute_turn(
                     logger.info(
                         f"Streaming not supported ({err_name}), falling back to ainvoke"
                     )
-                    if _provider_admission_closed():
+                    if not await _admit_provider_execution():
                         return _closed_result()
                     response = await llm_with_tools.ainvoke(_provider_input())
                     # Reasoning first: the non-streaming capture path parks it
@@ -2637,7 +2938,7 @@ async def _execute_turn(
                 )
                 retry: Optional[AIMessage] = None
                 try:
-                    if _provider_admission_closed():
+                    if not await _admit_provider_execution():
                         return _closed_result()
                     retry = await asyncio.wait_for(
                         llm_with_tools.ainvoke(_provider_input()), timeout=llm_timeout
@@ -2934,6 +3235,12 @@ async def _execute_turn(
 
             # Execute tool (resolved above, before the permission gate)
             is_error = False
+            # This is a safety boundary, not a tool result. A stateless
+            # runtime that cannot classify a possible external effect must
+            # fail before invocation; do not flatten that failure into a
+            # ToolMessage and continue the turn.
+            if callbacks.on_tool_execution_start is not None:
+                await callbacks.on_tool_execution_start(tool_name, tool_call_id)
             try:
                 result = await tool.ainvoke(tool_args)
                 result_str = str(result) if result is not None else ""

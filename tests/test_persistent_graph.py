@@ -9,6 +9,7 @@ with fallback, timeout, tool execution loop, VM upgrade detection).
 
 import asyncio
 import logging
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,10 +23,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from src.core.workspace_backend import WorkspaceUnavailableError
+
 from src.persistent_graph import (
     APPROVE_SENTINEL,
     DENY_SENTINEL,
     INTERRUPT_SENTINEL,
+    PermissionOutcome,
     PersistentLoopCallbacks,
     TurnResult,
     _execute_turn,
@@ -60,6 +64,7 @@ def _make_callbacks(**overrides) -> PersistentLoopCallbacks:
         on_token=AsyncMock(),
         on_thinking=AsyncMock(),
         on_tool_start=AsyncMock(),
+        on_tool_execution_start=AsyncMock(),
         on_tool_result=AsyncMock(),
         permission_check=AsyncMock(return_value=True),
         on_turn_start=AsyncMock(),
@@ -3302,11 +3307,23 @@ class TestToolExecutionLoop:
         llm.reasoning = None
         llm.astream = _astream
 
+        execution_order = []
         tool = _make_tool("search", "search results")
+
+        async def _invoke(args):
+            execution_order.append(("ainvoke", args))
+            return "search results"
+
+        tool.ainvoke = AsyncMock(side_effect=_invoke)
         tool_ctx = MagicMock()
         tool_ctx.consume_freeze_request.return_value = None
 
-        callbacks = _make_callbacks()
+        async def _execution_start(name, tool_call_id):
+            execution_order.append(("execution_start", name, tool_call_id))
+
+        callbacks = _make_callbacks(
+            on_tool_execution_start=AsyncMock(side_effect=_execution_start)
+        )
         messages = [SystemMessage(content="sys"), HumanMessage(content="find stuff")]
 
         result = await _execute_turn(
@@ -3328,9 +3345,413 @@ class TestToolExecutionLoop:
 
         tool.ainvoke.assert_called_once_with({"q": "test"})
         callbacks.on_tool_start.assert_called_once_with("search", {"q": "test"}, "tc1")
+        callbacks.on_tool_execution_start.assert_awaited_once_with("search", "tc1")
+        assert execution_order == [
+            ("execution_start", "search", "tc1"),
+            ("ainvoke", {"q": "test"}),
+        ]
         callbacks.on_tool_result.assert_called_once_with(
             "search", "search results", "tc1", is_error=False
         )
+
+    @pytest.mark.asyncio
+    async def test_remote_retirement_between_provider_calls_blocks_second_effect(self):
+        """A Force-End need not wait for the lifecycle watchdog to be seen."""
+
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "read", "args": {}, "id": "tc1"}],
+        )
+        provider_calls = 0
+
+        async def _astream(_messages, **_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            yield response_with_tool
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        tool = _make_tool("read", "ok")
+        authority = AsyncMock(side_effect=[True, False])
+        callbacks = _make_callbacks(before_provider_execution=authority)
+
+        result = await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={"read": tool},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(
+                    side_effect=lambda messages, *args, **kwargs: messages
+                )
+            ),
+            messages=[SystemMessage(content="sys"), HumanMessage(content="go")],
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+
+        assert result.admission_closed is True
+        assert provider_calls == 1
+        assert authority.await_count == 2
+        tool.ainvoke.assert_awaited_once_with({})
+
+    @pytest.mark.asyncio
+    async def test_remote_retirement_after_first_provider_blocks_real_tool_effect(self):
+        """The durable authority fence wins before a watchdog can poll End.
+
+        Provider one returns a real tool call while the exact pinned life is
+        live.  Owner End then installs its retirement token at the visible
+        tool-start boundary, but the process-local retirement latch deliberately
+        remains open (the lifecycle watchdog has not observed it).  The actual
+        production provider/tool callbacks must consult the same remote row and
+        refuse before ``ainvoke``; no second provider or fabricated tool result
+        may follow.
+        """
+
+        from src.api import persistent_app as pa
+
+        generation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        attach_token = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        agent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        state = {"retirement_authorized": False}
+
+        async def verify_authority(**_kwargs):
+            return not state["retirement_authorized"]
+
+        db = SimpleNamespace(
+            verify_pinned_runtime_effect_authority=AsyncMock(
+                side_effect=verify_authority
+            )
+        )
+        session = SimpleNamespace(
+            postgres_conn=db,
+            protected_cloud_required=False,
+        )
+        provider_calls = 0
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "write", "args": {}, "id": "tc1"}],
+        )
+
+        async def stream(_messages, **_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            yield response_with_tool
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = stream
+        tool = _make_tool("write", "must not run")
+
+        async def authorize_end_after_provider(*_args):
+            state["retirement_authorized"] = True
+            # The delayed lifecycle watchdog has not installed the local latch.
+            assert pa._retirement_admission_identity is None
+
+        callbacks = _make_callbacks(
+            before_provider_execution=pa._loop_runtime_effect_authority_current,
+            on_tool_start=authorize_end_after_provider,
+            on_tool_execution_start=pa._loop_on_tool_execution_start,
+        )
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "thread-a"),
+            patch.object(
+                pa, "_orchestrator_client", SimpleNamespace(agent_id=agent_id)
+            ),
+            patch.object(pa, "_pinned_runtime_generation_enabled", True),
+            patch.object(pa, "_input_runtime_generation", generation),
+            patch.object(pa, "_session_runtime_generation", generation),
+            patch.object(pa, "_session_runtime_attach_token", attach_token),
+            patch.object(pa, "_retirement_admission_identity", None),
+            patch.object(pa, "_termination_admission_fenced", False),
+            patch.object(pa, "_tool_inflight", False),
+            patch.dict(pa.os.environ, {"POD_UID": "pod-uid-a"}),
+        ):
+            with pytest.raises(pa.TerminationAdmissionClosed):
+                await _execute_turn(
+                    llm_with_tools=llm,
+                    tool_map={"write": tool},
+                    context_manager=AsyncMock(
+                        ensure_within_limits=AsyncMock(
+                            side_effect=lambda messages, *args, **kwargs: messages
+                        )
+                    ),
+                    messages=[
+                        SystemMessage(content="sys"),
+                        HumanMessage(content="go"),
+                    ],
+                    callbacks=callbacks,
+                    llm_timeout=600,
+                    auxiliary_llm=None,
+                    config=_make_config(),
+                )
+
+            assert provider_calls == 1
+            assert db.verify_pinned_runtime_effect_authority.await_count == 2
+            tool.ainvoke.assert_not_awaited()
+            callbacks.on_tool_result.assert_not_awaited()
+            assert pa._tool_inflight is False
+
+    @pytest.mark.asyncio
+    async def test_execution_identity_failure_aborts_before_tool_invoke(self):
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "write", "args": {}, "id": "tc1"}],
+        )
+        llm = _make_streaming_llm(response_with_tool)
+        tool = _make_tool("write", "must not run")
+        callbacks = _make_callbacks(
+            on_tool_execution_start=AsyncMock(
+                side_effect=RuntimeError("stateless identity missing")
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="stateless identity missing"):
+            await _execute_turn(
+                llm_with_tools=llm,
+                tool_map={"write": tool},
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(
+                        side_effect=lambda messages, *args, **kwargs: messages
+                    )
+                ),
+                messages=[SystemMessage(content="sys"), HumanMessage(content="go")],
+                callbacks=callbacks,
+                llm_timeout=600,
+                auxiliary_llm=None,
+                config=_make_config(),
+            )
+
+        callbacks.on_tool_execution_start.assert_awaited_once_with("write", "tc1")
+        tool.ainvoke.assert_not_awaited()
+        callbacks.on_tool_result.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_protected_loss_at_execution_gate_never_latches_tool_inflight(self):
+        from src.api import persistent_app as pa
+
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "write", "args": {}, "id": "tc1"}],
+        )
+        llm = _make_streaming_llm(response_with_tool)
+        tool = _make_tool("write", "must not run")
+        state = {"ready": True}
+
+        async def _tool_start(name, args, tool_call_id):
+            assert state["ready"] is True
+            await pa._loop_on_tool_start(name, args, tool_call_id)
+            # Mount health drops after the visible/permission phase but before
+            # the exact external-effect boundary.
+            state["ready"] = False
+
+        callbacks = _make_callbacks(
+            on_tool_start=_tool_start,
+            on_tool_execution_start=pa._loop_on_tool_execution_start,
+        )
+        session = SimpleNamespace(
+            protected_cloud_required=True,
+            protected_cloud_ready=lambda: state["ready"],
+        )
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_tool_inflight", False),
+            patch.object(pa, "_schedule_protected_input_reclaim"),
+            patch.object(pa, "_broadcast"),
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="protected cloud"):
+                await _execute_turn(
+                    llm_with_tools=llm,
+                    tool_map={"write": tool},
+                    context_manager=AsyncMock(
+                        ensure_within_limits=AsyncMock(
+                            side_effect=lambda messages, *args, **kwargs: messages
+                        )
+                    ),
+                    messages=[
+                        SystemMessage(content="sys"),
+                        HumanMessage(content="go"),
+                    ],
+                    callbacks=callbacks,
+                    llm_timeout=600,
+                    auxiliary_llm=None,
+                    config=_make_config(),
+                )
+
+            tool.ainvoke.assert_not_awaited()
+            callbacks.on_tool_result.assert_not_called()
+            assert pa._tool_inflight is False
+
+    @pytest.mark.asyncio
+    async def test_malformed_stateless_identity_never_invokes_tool(self):
+        from src.api import persistent_app as pa
+        from src.api.lease_context import LeaseHandle, current_lease
+
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "write", "args": {}, "id": "tc1"}],
+        )
+        llm = _make_streaming_llm(response_with_tool)
+        tool = _make_tool("write", "must not run")
+        callbacks = _make_callbacks(
+            on_tool_execution_start=pa._loop_on_tool_execution_start
+        )
+        lease = LeaseHandle()
+        lease.update("claimed-thread", 23)
+        lease_context = current_lease.set(lease)
+        try:
+            with (
+                patch.object(pa, "_session", SimpleNamespace(turn_count=1)),
+                patch.object(pa, "_thread_id", "wrong-thread"),
+                patch.object(pa, "_turn_tool_execution_identity", None),
+                patch.object(
+                    pa,
+                    "_turn_tool_execution_external_hook",
+                    MagicMock(),
+                ),
+            ):
+                with pytest.raises(RuntimeError, match="exact claimant identity"):
+                    await _execute_turn(
+                        llm_with_tools=llm,
+                        tool_map={"write": tool},
+                        context_manager=AsyncMock(
+                            ensure_within_limits=AsyncMock(
+                                side_effect=lambda messages, *args, **kwargs: messages
+                            )
+                        ),
+                        messages=[
+                            SystemMessage(content="sys"),
+                            HumanMessage(content="go"),
+                        ],
+                        callbacks=callbacks,
+                        llm_timeout=600,
+                        auxiliary_llm=None,
+                        config=_make_config(),
+                    )
+
+                assert lease.lost.is_set()
+                tool.ainvoke.assert_not_awaited()
+                callbacks.on_tool_result.assert_not_called()
+        finally:
+            current_lease.reset(lease_context)
+
+    @pytest.mark.asyncio
+    async def test_stateless_identity_without_executor_handoff_never_invokes_tool(self):
+        from src.api import persistent_app as pa
+        from src.api.lease_context import LeaseHandle, current_lease
+
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "write", "args": {}, "id": "tc1"}],
+        )
+        llm = _make_streaming_llm(response_with_tool)
+        tool = _make_tool("write", "must not run")
+        callbacks = _make_callbacks(
+            on_tool_execution_start=pa._loop_on_tool_execution_start
+        )
+        lease = LeaseHandle()
+        lease.update("claimed-thread", 24)
+        lease_context = current_lease.set(lease)
+        try:
+            with (
+                patch.object(pa, "_session", SimpleNamespace(turn_count=1)),
+                patch.object(pa, "_thread_id", "claimed-thread"),
+                patch.object(pa, "_turn_tool_execution_identity", None),
+                patch.object(pa, "_turn_tool_execution_external_hook", None),
+            ):
+                with pytest.raises(RuntimeError, match="exact claimant identity"):
+                    await _execute_turn(
+                        llm_with_tools=llm,
+                        tool_map={"write": tool},
+                        context_manager=AsyncMock(
+                            ensure_within_limits=AsyncMock(
+                                side_effect=lambda messages, *args, **kwargs: messages
+                            )
+                        ),
+                        messages=[
+                            SystemMessage(content="sys"),
+                            HumanMessage(content="go"),
+                        ],
+                        callbacks=callbacks,
+                        llm_timeout=600,
+                        auxiliary_llm=None,
+                        config=_make_config(),
+                    )
+
+                assert lease.lost.is_set()
+                assert pa._turn_tool_execution_identity == (
+                    "claimed-thread",
+                    24,
+                    1,
+                )
+                tool.ainvoke.assert_not_awaited()
+                callbacks.on_tool_result.assert_not_called()
+        finally:
+            current_lease.reset(lease_context)
+
+    @pytest.mark.asyncio
+    async def test_pinned_tool_executes_without_queue_identity(self):
+        from src.api import persistent_app as pa
+        from src.api.lease_context import current_lease
+
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "read", "args": {}, "id": "tc1"}],
+        )
+        final_response = _make_llm_response("done")
+        call_count = 0
+
+        async def _astream(messages, **kwargs):
+            nonlocal call_count
+            del messages, kwargs
+            call_count += 1
+            yield response_with_tool if call_count == 1 else final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        tool = _make_tool("read", "ok")
+        callbacks = _make_callbacks(
+            on_tool_execution_start=pa._loop_on_tool_execution_start
+        )
+        lease_context = current_lease.set(None)
+        try:
+            with (
+                patch.object(
+                    pa,
+                    "_session",
+                    SimpleNamespace(protected_cloud_required=False),
+                ),
+                patch.object(pa, "_turn_tool_execution_identity", None),
+                patch.object(pa, "_turn_tool_execution_external_hook", None),
+            ):
+                result = await _execute_turn(
+                    llm_with_tools=llm,
+                    tool_map={"read": tool},
+                    context_manager=AsyncMock(
+                        ensure_within_limits=AsyncMock(
+                            side_effect=lambda messages, *args, **kwargs: messages
+                        )
+                    ),
+                    messages=[
+                        SystemMessage(content="sys"),
+                        HumanMessage(content="go"),
+                    ],
+                    callbacks=callbacks,
+                    llm_timeout=600,
+                    auxiliary_llm=None,
+                    config=_make_config(),
+                )
+
+                assert result.tool_calls_made == 1
+                tool.ainvoke.assert_awaited_once_with({})
+                assert pa._turn_tool_execution_identity is None
+        finally:
+            current_lease.reset(lease_context)
 
     @pytest.mark.asyncio
     async def test_permission_denied_tool(self):
@@ -3375,6 +3796,7 @@ class TestToolExecutionLoop:
 
         tool.ainvoke.assert_not_called()
         callbacks.on_tool_start.assert_not_called()
+        callbacks.on_tool_execution_start.assert_not_awaited()
         assert result.tool_calls_made == 0
 
         # Check the refusal was reported to the model. An *explicit* deny
@@ -3384,6 +3806,64 @@ class TestToolExecutionLoop:
         # knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md).
         tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
         assert any("declined" in m.content.lower() for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_unanswered_permission_never_crosses_execution_boundary(self):
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "waiting", "args": {}, "id": "tc1"}],
+        )
+        llm = _make_streaming_llm(response_with_tool)
+        tool = _make_tool("waiting", "must not run")
+        callbacks = _make_callbacks(
+            permission_check=AsyncMock(return_value=PermissionOutcome.NO_ANSWER)
+        )
+
+        result = await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={"waiting": tool},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=[SystemMessage(content="sys"), HumanMessage(content="go")],
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+
+        assert result.tool_calls_made == 0
+        tool.ainvoke.assert_not_awaited()
+        callbacks.on_tool_execution_start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pre_tool_interrupt_never_crosses_execution_boundary(self):
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "waiting", "args": {}, "id": "tc1"}],
+        )
+        llm = _make_streaming_llm(response_with_tool)
+        tool = _make_tool("waiting", "must not run")
+        callbacks = _make_callbacks(
+            after_assistant_tool_calls_persisted=AsyncMock(return_value=True)
+        )
+
+        result = await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={"waiting": tool},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=[SystemMessage(content="sys"), HumanMessage(content="go")],
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+        )
+
+        assert result.interrupted is True
+        tool.ainvoke.assert_not_awaited()
+        callbacks.on_tool_execution_start.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unknown_tool(self):
@@ -3426,6 +3906,7 @@ class TestToolExecutionLoop:
 
         assert result.tool_calls_made == 0
         callbacks.on_tool_result.assert_called_once()
+        callbacks.on_tool_execution_start.assert_not_awaited()
         # The message names the cause rather than only the symptom, so the
         # model can re-plan instead of retrying — see
         # _unavailable_tool_message and TestUnboundToolSkipsThePermissionGate.

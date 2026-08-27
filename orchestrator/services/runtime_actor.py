@@ -74,6 +74,9 @@ INCIDENT_NOTIFICATION_CLAIM_SECONDS = int(
 
 _TOKEN_RE = re.compile(r"^sr(?:a|r|b)_[A-Za-z0-9_-]{32,128}$")
 _SENSITIVE_ACTIONS = frozenset({"machine_tags", "charter"})
+_LIVE_PINNED_THREAD_STATUSES = frozenset(
+    {"created", "active", "awaiting_user", "suspended"}
+)
 
 
 class RuntimeActorCredentialError(Exception):
@@ -185,6 +188,27 @@ def _metadata(thread: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _exact_live_pinned_runtime(thread: Any) -> bool:
+    """Return whether a thread still owns one usable pinned runtime life.
+
+    A retirement Begin deliberately leaves the reciprocal thread/agent binding
+    in place until physical quiescence and settlement finish.  That pointer is
+    therefore insufficient credential authority: every Officer boundary must
+    also observe the exact generation/attachment and absence of the immutable
+    retirement token in the same locked or joined snapshot.
+    """
+
+    return bool(
+        thread
+        and str(thread.get("execution_lane") or "") == "pinned"
+        and str(thread.get("status") or "") in _LIVE_PINNED_THREAD_STATUSES
+        and thread.get("runtime_generation") is not None
+        and thread.get("agent_id") is not None
+        and thread.get("runtime_attach_token") is not None
+        and thread.get("runtime_retirement_token") is None
+    )
+
+
 async def _thread_project_ids(db: Any, thread: dict[str, Any]) -> list[str]:
     """Derive the same native-project ordering as the attach boundary."""
 
@@ -217,6 +241,13 @@ async def derive_runtime_actor(
     if not thread or str(thread.get("status") or "") == "ended":
         raise RuntimeActorCredentialError(
             "runtime_not_current", "The bound session is not current."
+        )
+    lane = str(thread.get("execution_lane") or "")
+    if lane not in {"pinned", "stateless"} or (
+        lane == "pinned" and not _exact_live_pinned_runtime(thread)
+    ):
+        raise RuntimeActorCredentialError(
+            "runtime_not_current", "The bound runtime is not current."
         )
     durable_projects = await _thread_project_ids(db, thread)
     if project_ids is not None:
@@ -325,8 +356,9 @@ async def _lock_officer_mint_authority(
             "runtime_not_current", "The Officer post incarnation changed.", actor=actor
         )
     thread = await conn.fetchrow(
-        "SELECT id, project_id, user_id, status, metadata, agent_id FROM threads "
-        "WHERE id = $1::uuid FOR UPDATE",
+        "SELECT id, project_id, user_id, status, metadata, execution_lane, "
+        "runtime_generation, runtime_attach_token, runtime_retirement_token, "
+        "agent_id FROM threads WHERE id = $1::uuid FOR UPDATE",
         actor.thread_id,
     )
     bound = await conn.fetchrow(
@@ -349,7 +381,7 @@ async def _lock_officer_mint_authority(
         or str(thread.get("project_id") or "") != str(post["project_id"])
         or str(thread.get("user_id") or "") != str(actor.user_id)
         or str(thread.get("agent_id") or "") != str(agent_id)
-        or str(thread.get("status") or "") == "ended"
+        or not _exact_live_pinned_runtime(thread)
         or officer.get("enabled") not in {True, "true", "True", 1}
         or bound is None
         or str(bound.get("thread_id") or "") != str(thread["id"])
@@ -713,6 +745,11 @@ async def _actor_for_access(db: Any, token: str) -> RuntimeActorContext:
                    g.revoked_at, g.agent_id,
                    a.expires_at AS access_expires_at,
                    t.agent_id AS current_thread_agent_id,
+                   t.execution_lane AS current_thread_execution_lane,
+                   t.status AS current_thread_status,
+                   t.runtime_generation AS current_thread_runtime_generation,
+                   t.runtime_attach_token AS current_thread_runtime_attach_token,
+                   t.runtime_retirement_token AS current_thread_retirement_token,
                    bound.thread_id AS current_agent_thread_id,
                    bound.status AS current_agent_status,
                    bound.last_heartbeat AS current_agent_heartbeat
@@ -750,8 +787,17 @@ async def _actor_for_access(db: Any, token: str) -> RuntimeActorContext:
         )
     if actor.caller_kind == "officer":
         heartbeat = _as_utc(row.get("current_agent_heartbeat"))
+        exact_thread = {
+            "execution_lane": row.get("current_thread_execution_lane"),
+            "status": row.get("current_thread_status"),
+            "runtime_generation": row.get("current_thread_runtime_generation"),
+            "agent_id": row.get("current_thread_agent_id"),
+            "runtime_attach_token": row.get("current_thread_runtime_attach_token"),
+            "runtime_retirement_token": row.get("current_thread_retirement_token"),
+        }
         binding_current = (
             row.get("agent_id") is not None
+            and _exact_live_pinned_runtime(exact_thread)
             and row.get("current_thread_agent_id") == row.get("agent_id")
             and row.get("current_agent_thread_id") == row.get("thread_id")
             and str(row.get("current_agent_status") or "")
@@ -1102,7 +1148,9 @@ async def _lock_officer_authority_for_grant(
         )
     thread = await conn.fetchrow(
         """
-        SELECT id, project_id, user_id, status, metadata, agent_id
+        SELECT id, project_id, user_id, status, metadata, execution_lane,
+               runtime_generation, runtime_attach_token,
+               runtime_retirement_token, agent_id
           FROM threads
          WHERE id = $1
          FOR UPDATE
@@ -1171,7 +1219,7 @@ async def _lock_officer_authority_for_grant(
         and grant.get("user_id") == thread.get("user_id")
         and int(grant.get("officer_incarnation") or 0) == current_incarnation
         and thread.get("project_id") == post.get("project_id")
-        and str(thread.get("status") or "") != "ended"
+        and _exact_live_pinned_runtime(thread)
         and officer.get("enabled") in {True, "true", "True", 1}
         and live_agent
         and (grant.get("agent_id") is None or grant.get("agent_id") == agent.get("id"))
@@ -1270,7 +1318,7 @@ async def lock_current_officer_runtime_grant(
     if (
         post.get("thread_id") != thread.get("id")
         or post.get("project_id") != thread.get("project_id")
-        or str(thread.get("status") or "") == "ended"
+        or not _exact_live_pinned_runtime(thread)
         or officer.get("enabled") not in {True, "true", "True", 1}
         or agent is None
         or agent.get("id") != thread.get("agent_id")
@@ -1671,7 +1719,14 @@ async def refresh_runtime_actor_request(db: Any, request: Any) -> RuntimeActorCo
     return exchange.actor
 
 
-async def slide_thread_grant_on_liveness(db: Any, thread_id: str) -> bool:
+async def slide_thread_grant_on_liveness(
+    db: Any,
+    thread_id: str,
+    *,
+    agent_id: str | None = None,
+    session_runtime_generation: str | None = None,
+    session_runtime_attach_token: str | None = None,
+) -> bool:
     """Slide a live thread's grants forward because the thread is still ALIVE.
 
     ``refresh_runtime_actor_request`` already slides the window, but only from
@@ -1696,6 +1751,13 @@ async def slide_thread_grant_on_liveness(db: Any, thread_id: str) -> bool:
 
     Returns True when at least one grant was slid.
     """
+
+    # A heartbeat only licenses a grant extension when it proves the complete
+    # identity of the exact pinned runtime that produced it.  Older or partial
+    # heartbeat payloads remain valid liveness reports, but cannot extend
+    # runtime-actor authority.
+    if not (agent_id and session_runtime_generation and session_runtime_attach_token):
+        return False
 
     now = datetime.now(timezone.utc)
     async with db.acquire() as conn:
@@ -1743,19 +1805,37 @@ async def slide_thread_grant_on_liveness(db: Any, thread_id: str) -> bool:
             # this path must leave to expire.
             continue
         async with db.acquire() as conn:
-            await conn.execute(
+            updated = await conn.execute(
                 """
-                UPDATE runtime_actor_grants
+                UPDATE runtime_actor_grants AS grant
                    SET last_refreshed_at = now(),
                        refresh_expires_at = $2
-                 WHERE id = $1
-                   AND revoked_at IS NULL
-                   AND refresh_expires_at > now()
+                  FROM threads AS thread
+                  JOIN agents AS agent
+                    ON agent.id = thread.agent_id
+                   AND agent.thread_id = thread.id
+                 WHERE grant.id = $1
+                   AND grant.thread_id = thread.id
+                   AND grant.agent_id = thread.agent_id
+                   AND thread.id = $3::uuid
+                   AND thread.execution_lane = 'pinned'
+                   AND thread.status IN ('created', 'active', 'awaiting_user')
+                   AND thread.runtime_retirement_token IS NULL
+                   AND thread.agent_id = $4::uuid
+                   AND thread.runtime_generation = $5::uuid
+                   AND thread.runtime_attach_token
+                       IS NOT DISTINCT FROM $6::uuid
+                   AND grant.revoked_at IS NULL
+                   AND grant.refresh_expires_at > now()
                 """,
                 row["id"],
                 next_refresh_expires_at,
+                thread_id,
+                agent_id,
+                session_runtime_generation,
+                session_runtime_attach_token,
             )
-        slid = True
+        slid = updated == "UPDATE 1" or slid
     return slid
 
 
@@ -1790,8 +1870,10 @@ async def maintain_current_officer_runtime(
                 if post is None or str(post.get("thread_id") or "") != str(thread_id):
                     return OfficerRuntimeMaintenance(False, "not_current")
                 thread = await conn.fetchrow(
-                    "SELECT id, project_id, user_id, status, metadata, agent_id "
-                    "FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    "SELECT id, project_id, user_id, status, metadata, "
+                    "execution_lane, runtime_generation, runtime_attach_token, "
+                    "runtime_retirement_token, agent_id FROM threads "
+                    "WHERE id = $1::uuid FOR UPDATE",
                     str(thread_id),
                 )
                 incarnations = post.get("incarnations") or []
@@ -1844,6 +1926,15 @@ async def maintain_current_officer_runtime(
                     or officer.get("enabled") not in {True, "true", "True", 1}
                 ):
                     return OfficerRuntimeMaintenance(False, "not_current")
+                if not _exact_live_pinned_runtime(thread):
+                    return OfficerRuntimeMaintenance(
+                        False,
+                        "lifecycle_pending",
+                        project_id=str(post["project_id"]),
+                        thread_id=str(thread["id"]),
+                        officer_incarnation=incarnation,
+                        failure_code="exact_runtime_authority_missing",
+                    )
                 agent = (
                     await conn.fetchrow(
                         "SELECT id, thread_id, status, last_heartbeat FROM agents "

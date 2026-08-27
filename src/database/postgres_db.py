@@ -423,10 +423,10 @@ class PostgresDB:
                 thread_id,
             )
 
-    async def update_thread_status(self, thread_id: str, status: str) -> None:
-        """Update thread status."""
+    async def update_thread_status(self, thread_id: str, status: str) -> bool:
+        """Update a live thread status without reviving an ended row."""
         async with self.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 """
                 UPDATE threads
                 SET status        = $2,
@@ -436,10 +436,12 @@ class PostgresDB:
                         ELSE control_admission_agent_id
                     END
                 WHERE id = $1
+                  AND (status <> 'ended' OR $2 = 'ended')
                 """,
                 thread_id,
                 status,
             )
+        return result == "UPDATE 1"
 
     async def get_thread_messages_history(
         self,
@@ -498,7 +500,7 @@ class PostgresDB:
                     SELECT 1 FROM thread_input_deliveries AS delivery
                      WHERE delivery.message_id = message.id
                        AND delivery.state IN (
-                           'persisted', 'owned', 'queued', 'deferred'
+                           'persisted', 'owned', 'queued', 'deferred', 'cancelled'
                        )
                   )
         """
@@ -1353,6 +1355,7 @@ class PostgresDB:
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
+        runtime_attach_token: str,
     ) -> Dict[str, Any]:
         """Persist and claim one pinned input in a parent-first transaction."""
 
@@ -1371,6 +1374,7 @@ class PostgresDB:
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
                 )
 
     async def claim_pending_pinned_input_deliveries(
@@ -1380,6 +1384,7 @@ class PostgresDB:
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
+        runtime_attach_token: str,
     ) -> List[Dict[str, Any]]:
         """Reclaim persisted but unadmitted input after attach/restart."""
 
@@ -1393,6 +1398,7 @@ class PostgresDB:
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
                 )
 
     async def mark_pinned_input_delivery_queued(
@@ -1403,6 +1409,7 @@ class PostgresDB:
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
+        runtime_attach_token: str,
         claim_generation: int,
     ) -> bool:
         from src.shared.persistent_input_delivery import (
@@ -1417,6 +1424,8 @@ class PostgresDB:
                     thread_id=thread_id,
                     agent_id=agent_id,
                     pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
                 )
                 return await mark_input_delivery_queued(
                     conn,
@@ -1424,6 +1433,7 @@ class PostgresDB:
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
                     claim_generation=claim_generation,
                 )
 
@@ -1435,6 +1445,7 @@ class PostgresDB:
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
+        runtime_attach_token: str,
         claim_generation: int,
         transition: str,
         turn_number: Optional[int] = None,
@@ -1452,6 +1463,8 @@ class PostgresDB:
                     thread_id=thread_id,
                     agent_id=agent_id,
                     pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
                 )
                 return await transition_input_delivery(
                     conn,
@@ -1459,11 +1472,49 @@ class PostgresDB:
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
                     claim_generation=claim_generation,
                     transition=transition,
                     turn_number=turn_number,
                     reason=reason,
                 )
+
+    async def verify_pinned_runtime_effect_authority(
+        self,
+        *,
+        thread_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        runtime_attach_token: str,
+    ) -> bool:
+        """Prove the exact pinned runtime is still allowed external effects.
+
+        The shared lock also requires ``runtime_retirement_token IS NULL``.
+        Provider and tool boundaries call this immediately before external I/O
+        so owner-authorized retirement cannot wait for the lifecycle watchdog's
+        next poll to close admission.
+        """
+
+        from src.shared.persistent_input_delivery import (
+            InputDeliveryAuthorityLost,
+            lock_runtime_authority,
+        )
+
+        try:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    await lock_runtime_authority(
+                        conn,
+                        thread_id=thread_id,
+                        agent_id=agent_id,
+                        pod_uid=pod_uid,
+                        runtime_generation=runtime_generation,
+                        runtime_attach_token=runtime_attach_token,
+                    )
+            return True
+        except InputDeliveryAuthorityLost:
+            return False
 
     async def get_pinned_input_delivery(
         self, delivery_id: str

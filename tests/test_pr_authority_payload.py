@@ -14,6 +14,8 @@ JOB_ID = "11111111-1111-4111-8111-111111111111"
 PROJECT_ID = "44444444-4444-4444-8444-444444444444"
 AGENT_ID = "55555555-5555-4555-8555-555555555555"
 RUNTIME_ID = "66666666-6666-4666-8666-666666666666"
+RUNTIME_GENERATION = "88888888-8888-4888-8888-888888888888"
+RUNTIME_ATTACH_TOKEN = "99999999-9999-4999-8999-999999999999"
 
 
 def _repository_row() -> dict:
@@ -212,6 +214,13 @@ async def test_persistent_reattach_payload_uses_resolved_repository_uuid():
         "id": "77777777-7777-4777-8777-777777777777",
         "user_id": None,
         "project_id": PROJECT_ID,
+        "status": "active",
+        "execution_lane": "pinned",
+        "runtime_generation": RUNTIME_GENERATION,
+        "agent_id": AGENT_ID,
+        "control_admission_agent_id": AGENT_ID,
+        "runtime_attach_token": RUNTIME_ATTACH_TOKEN,
+        "runtime_retirement_token": None,
         "metadata": {"datasource_ids": [DATASOURCE_ID]},
         "permission_mode": "autonomous",
         "narration_mode": "silent",
@@ -243,7 +252,9 @@ async def test_persistent_reattach_payload_uses_resolved_repository_uuid():
             orch_main, "mint_thread_runtime_actor", AsyncMock(return_value=actor)
         ),
     ):
-        payload = await orch_main._assemble_session_attach_payload(thread["id"])
+        payload = await orch_main._assemble_session_attach_payload(
+            thread["id"], runtime_agent_id=AGENT_ID
+        )
 
     assert payload is not None
     assert payload["datasources"][0]["datasource_id"] == DATASOURCE_ID

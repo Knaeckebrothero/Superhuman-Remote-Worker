@@ -14,12 +14,47 @@ out-of-scope for unit tests — it's exercised in cluster.
 
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
 import security.access as access_module
+
+
+_PINNED_THREAD_ID = "11111111-1111-4111-8111-111111111111"
+_PINNED_GENERATION = "22222222-2222-4222-8222-222222222222"
+_PINNED_ATTACH_TOKEN = "33333333-3333-4333-8333-333333333333"
+
+
+def _pinned_thread(
+    *, agent_id: str | None, runtime_attach_token: str | None = None
+) -> dict:
+    return {
+        "id": _PINNED_THREAD_ID,
+        "execution_lane": "pinned",
+        "status": "created",
+        "runtime_generation": _PINNED_GENERATION,
+        "runtime_retirement_token": None,
+        "agent_id": agent_id,
+        "runtime_attach_token": runtime_attach_token,
+        "metadata": {},
+    }
+
+
+def _registration_thread_reads(
+    *,
+    initial_agent_id: str | None,
+    final_agent_id: str,
+    initial_reads: int = 2,
+) -> list[dict]:
+    initial = _pinned_thread(agent_id=initial_agent_id)
+    final = _pinned_thread(
+        agent_id=final_agent_id,
+        runtime_attach_token=_PINNED_ATTACH_TOKEN,
+    )
+    return [initial] * initial_reads + [final] * 4
 
 
 def _make_request(headers: dict[str, str] | None = None) -> MagicMock:
@@ -206,7 +241,8 @@ class TestPureInternalEndpoints:
             pod_ip="10.0.0.1",
             hostname="agent-1",
             agent_mode="persistent",
-            thread_id="thread-1",
+            thread_id=_PINNED_THREAD_ID,
+            session_runtime_generation=UUID(_PINNED_GENERATION),
         )
         db = MagicMock()
         db.register_agent = AsyncMock(
@@ -241,18 +277,18 @@ class TestPureInternalEndpoints:
             pod_ip="10.0.0.1",
             hostname="agent-1",
             agent_mode="persistent",
-            thread_id="thread-1",
+            thread_id=_PINNED_THREAD_ID,
+            session_runtime_generation=UUID(_PINNED_GENERATION),
         )
         db = MagicMock()
         db.register_agent = AsyncMock(
             return_value={"agent_id": "agent-new", "heartbeat_interval_seconds": 20}
         )
+        db.fetchrow = AsyncMock(return_value=None)
         db.get_thread = AsyncMock(
-            return_value={
-                "id": "thread-1",
-                "execution_lane": "pinned",
-                "agent_id": None,
-            }
+            side_effect=_registration_thread_reads(
+                initial_agent_id=None, final_agent_id="agent-new"
+            )
         )
         db.delete_agent = AsyncMock()
         db.update_thread_agent = AsyncMock()
@@ -267,7 +303,7 @@ class TestPureInternalEndpoints:
             patch.object(
                 orch_main,
                 "_bind_registered_persistent_agent",
-                AsyncMock(return_value=True),
+                AsyncMock(return_value=_PINNED_ATTACH_TOKEN),
             ) as bind,
         ):
             response = await orch_main.register_agent(MagicMock(), reg)
@@ -280,7 +316,9 @@ class TestPureInternalEndpoints:
         )
         assert db.register_agent.await_args.kwargs["insert_only"] is True
         assert db.register_agent.await_args.kwargs["expected_agent_id"] is None
-        bind.assert_awaited_once_with("thread-1", "agent-new", None)
+        bind.assert_awaited_once_with(
+            _PINNED_THREAD_ID, "agent-new", None, _PINNED_GENERATION
+        )
         db.delete_agent.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -292,15 +330,16 @@ class TestPureInternalEndpoints:
             pod_ip="10.0.0.2",
             hostname="agent-loser",
             agent_mode="persistent",
-            thread_id="thread-1",
+            thread_id=_PINNED_THREAD_ID,
+            session_runtime_generation=UUID(_PINNED_GENERATION),
         )
         db = MagicMock()
         db.get_thread = AsyncMock(
-            return_value={
-                "id": "thread-1",
-                "execution_lane": "pinned",
-                "agent_id": "agent-winner",
-            }
+            side_effect=_registration_thread_reads(
+                initial_agent_id="agent-winner",
+                final_agent_id="agent-winner",
+                initial_reads=4,
+            )
         )
         db.get_agent = AsyncMock(
             return_value={
@@ -336,15 +375,16 @@ class TestPureInternalEndpoints:
             pod_ip="10.0.0.2",
             hostname="agent-winner-host",
             agent_mode="persistent",
-            thread_id="thread-1",
+            thread_id=_PINNED_THREAD_ID,
+            session_runtime_generation=UUID(_PINNED_GENERATION),
         )
         db = MagicMock()
         db.get_thread = AsyncMock(
-            return_value={
-                "id": "thread-1",
-                "execution_lane": "pinned",
-                "agent_id": "agent-winner",
-            }
+            side_effect=_registration_thread_reads(
+                initial_agent_id="agent-winner",
+                final_agent_id="agent-winner",
+                initial_reads=4,
+            )
         )
         db.get_agent = AsyncMock(
             return_value={
@@ -359,6 +399,7 @@ class TestPureInternalEndpoints:
                 "heartbeat_interval_seconds": 20,
             }
         )
+        db.fetchrow = AsyncMock(return_value=None)
         db.delete_agent = AsyncMock()
         lock_cm = AsyncMock()
         lock_cm.__aenter__.return_value = None
@@ -371,7 +412,7 @@ class TestPureInternalEndpoints:
             patch.object(
                 orch_main,
                 "_bind_registered_persistent_agent",
-                AsyncMock(return_value=True),
+                AsyncMock(return_value=_PINNED_ATTACH_TOKEN),
             ) as bind,
         ):
             response = await orch_main.register_agent(MagicMock(), reg)
@@ -381,7 +422,12 @@ class TestPureInternalEndpoints:
             db.register_agent.await_args.kwargs["expected_agent_id"] == "agent-winner"
         )
         assert db.register_agent.await_args.kwargs["insert_only"] is False
-        bind.assert_awaited_once_with("thread-1", "agent-winner", "agent-winner")
+        bind.assert_awaited_once_with(
+            _PINNED_THREAD_ID,
+            "agent-winner",
+            "agent-winner",
+            _PINNED_GENERATION,
+        )
         db.delete_agent.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -396,15 +442,16 @@ class TestPureInternalEndpoints:
             pod_ip="10.0.0.2",
             hostname="agent-owner-host",
             agent_mode="persistent",
-            thread_id="thread-1",
+            thread_id=_PINNED_THREAD_ID,
+            session_runtime_generation=UUID(_PINNED_GENERATION),
         )
         db = MagicMock()
         db.get_thread = AsyncMock(
-            return_value={
-                "id": "thread-1",
-                "execution_lane": "pinned",
-                "agent_id": "agent-owner",
-            }
+            side_effect=_registration_thread_reads(
+                initial_agent_id="agent-owner",
+                final_agent_id="agent-owner",
+                initial_reads=4,
+            )
         )
         db.get_agent = AsyncMock(
             return_value={
@@ -419,6 +466,7 @@ class TestPureInternalEndpoints:
                 "heartbeat_interval_seconds": 20,
             }
         )
+        db.fetchrow = AsyncMock(return_value=None)
         lock_cm = AsyncMock()
         lock_cm.__aenter__.return_value = None
         lock_cm.__aexit__.return_value = False
@@ -430,7 +478,7 @@ class TestPureInternalEndpoints:
             patch.object(
                 orch_main,
                 "_bind_registered_persistent_agent",
-                AsyncMock(return_value=True),
+                AsyncMock(return_value=_PINNED_ATTACH_TOKEN),
             ),
         ):
             await orch_main.register_agent(MagicMock(), reg)
@@ -447,15 +495,16 @@ class TestPureInternalEndpoints:
             pod_ip="10.0.0.2",
             hostname="agent-replacement-host",
             agent_mode="persistent",
-            thread_id="thread-1",
+            thread_id=_PINNED_THREAD_ID,
+            session_runtime_generation=UUID(_PINNED_GENERATION),
         )
         db = MagicMock()
         db.get_thread = AsyncMock(
-            return_value={
-                "id": "thread-1",
-                "execution_lane": "pinned",
-                "agent_id": "agent-offline",
-            }
+            side_effect=_registration_thread_reads(
+                initial_agent_id="agent-offline",
+                final_agent_id="agent-fresh",
+                initial_reads=4,
+            )
         )
         db.get_agent = AsyncMock(
             return_value={
@@ -470,6 +519,7 @@ class TestPureInternalEndpoints:
                 "heartbeat_interval_seconds": 20,
             }
         )
+        db.fetchrow = AsyncMock(return_value=None)
         lock_cm = AsyncMock()
         lock_cm.__aenter__.return_value = None
         lock_cm.__aexit__.return_value = False
@@ -481,14 +531,19 @@ class TestPureInternalEndpoints:
             patch.object(
                 orch_main,
                 "_bind_registered_persistent_agent",
-                AsyncMock(return_value=True),
+                AsyncMock(return_value=_PINNED_ATTACH_TOKEN),
             ) as bind,
         ):
             await orch_main.register_agent(MagicMock(), reg)
 
         assert db.register_agent.await_args.kwargs["expected_agent_id"] is None
         assert db.register_agent.await_args.kwargs["insert_only"] is True
-        bind.assert_awaited_once_with("thread-1", "agent-fresh", "agent-offline")
+        bind.assert_awaited_once_with(
+            _PINNED_THREAD_ID,
+            "agent-fresh",
+            "agent-offline",
+            _PINNED_GENERATION,
+        )
 
     @pytest.mark.asyncio
     async def test_missing_snapshotted_owner_refuses_before_upsert(self):
@@ -499,16 +554,11 @@ class TestPureInternalEndpoints:
             pod_ip="10.0.0.2",
             hostname="agent-replacement",
             agent_mode="persistent",
-            thread_id="thread-1",
+            thread_id=_PINNED_THREAD_ID,
+            session_runtime_generation=UUID(_PINNED_GENERATION),
         )
         db = MagicMock()
-        db.get_thread = AsyncMock(
-            return_value={
-                "id": "thread-1",
-                "execution_lane": "pinned",
-                "agent_id": "agent-missing",
-            }
-        )
+        db.get_thread = AsyncMock(return_value=_pinned_thread(agent_id="agent-missing"))
         db.get_agent = AsyncMock(return_value=None)
         db.register_agent = AsyncMock()
         lock_cm = AsyncMock()
@@ -535,19 +585,15 @@ class TestPureInternalEndpoints:
             pod_ip="10.0.0.1",
             hostname="agent-1",
             agent_mode="persistent",
-            thread_id="thread-1",
+            thread_id=_PINNED_THREAD_ID,
+            session_runtime_generation=UUID(_PINNED_GENERATION),
         )
         db = MagicMock()
         db.register_agent = AsyncMock(
             return_value={"agent_id": "agent-new", "heartbeat_interval_seconds": 20}
         )
-        db.get_thread = AsyncMock(
-            return_value={
-                "id": "thread-1",
-                "execution_lane": "pinned",
-                "agent_id": None,
-            }
-        )
+        db.fetchrow = AsyncMock(return_value=None)
+        db.get_thread = AsyncMock(return_value=_pinned_thread(agent_id=None))
         lock_cm = AsyncMock()
         lock_cm.__aenter__.return_value = None
         lock_cm.__aexit__.return_value = False
@@ -559,7 +605,7 @@ class TestPureInternalEndpoints:
             patch.object(
                 orch_main,
                 "_bind_registered_persistent_agent",
-                AsyncMock(return_value=False),
+                AsyncMock(return_value=None),
             ),
             pytest.raises(HTTPException) as exc,
         ):
@@ -573,34 +619,39 @@ class TestPureInternalEndpoints:
         import main as orch_main
 
         conn = AsyncMock()
-        conn.execute = AsyncMock(side_effect=["UPDATE 0", "UPDATE 1"])
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        transaction = AsyncMock()
+        transaction.__aenter__.return_value = None
+        transaction.__aexit__.return_value = False
+        conn.transaction = MagicMock(return_value=transaction)
         acquire = AsyncMock()
         acquire.__aenter__.return_value = conn
         acquire.__aexit__.return_value = False
         db = MagicMock()
         db.acquire = MagicMock(return_value=acquire)
 
-        with patch.object(orch_main, "postgres_db", db):
+        with (
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "uuid4", return_value=UUID(_PINNED_ATTACH_TOKEN)),
+        ):
             bound = await orch_main._bind_registered_persistent_agent(
-                "thread-1", "agent-new", None
+                _PINNED_THREAD_ID,
+                "agent-new",
+                None,
+                _PINNED_GENERATION,
             )
 
-        assert bound is False
+        assert bound is None
         assert "execution_lane = $3" in conn.execute.await_args_list[0].args[0]
         assert "agent_id IS NULL" in conn.execute.await_args_list[0].args[0]
         assert conn.execute.await_args_list[0].args[1:] == (
-            "thread-1",
+            _PINNED_THREAD_ID,
             "agent-new",
             "pinned",
+            _PINNED_GENERATION,
+            _PINNED_ATTACH_TOKEN,
         )
-        assert (
-            "WHERE id = $1 AND thread_id = $2"
-            in (conn.execute.await_args_list[1].args[0])
-        )
-        assert conn.execute.await_args_list[1].args[1:] == (
-            "agent-new",
-            "thread-1",
-        )
+        assert conn.execute.await_count == 1
 
     @pytest.mark.asyncio
     async def test_final_persistent_bind_cas_matches_the_snapshotted_owner(self):
@@ -608,25 +659,41 @@ class TestPureInternalEndpoints:
 
         conn = AsyncMock()
         conn.execute = AsyncMock(return_value="UPDATE 1")
+        transaction = AsyncMock()
+        transaction.__aenter__.return_value = None
+        transaction.__aexit__.return_value = False
+        conn.transaction = MagicMock(return_value=transaction)
         acquire = AsyncMock()
         acquire.__aenter__.return_value = conn
         acquire.__aexit__.return_value = False
         db = MagicMock()
         db.acquire = MagicMock(return_value=acquire)
 
-        with patch.object(orch_main, "postgres_db", db):
+        with (
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "uuid4", return_value=UUID(_PINNED_ATTACH_TOKEN)),
+        ):
             bound = await orch_main._bind_registered_persistent_agent(
-                "thread-1", "agent-new", "agent-offline-snapshot"
+                _PINNED_THREAD_ID,
+                "agent-new",
+                "agent-offline-snapshot",
+                _PINNED_GENERATION,
             )
 
-        assert bound is True
-        assert "agent_id = $4" in conn.execute.await_args.args[0]
-        assert conn.execute.await_args.args[1:] == (
-            "thread-1",
+        assert bound == _PINNED_ATTACH_TOKEN
+        thread_update = conn.execute.await_args_list[0]
+        assert "agent_id = $4" in thread_update.args[0]
+        assert thread_update.args[1:] == (
+            _PINNED_THREAD_ID,
             "agent-new",
             "pinned",
             "agent-offline-snapshot",
+            _PINNED_GENERATION,
+            _PINNED_ATTACH_TOKEN,
         )
+        reciprocal = conn.execute.await_args_list[1]
+        assert "UPDATE agents SET thread_id=$2::uuid" in reciprocal.args[0]
+        assert reciprocal.args[1:] == ("agent-new", _PINNED_THREAD_ID)
 
     @pytest.mark.asyncio
     async def test_agent_heartbeat_without_key_401(self, fake_request):
@@ -668,6 +735,9 @@ class TestPureInternalEndpoints:
             current_job_id="11111111-1111-1111-1111-111111111111",
             metrics={"memory_mb": 128, "graph_progress": 9},
             aux_degraded=None,
+            session_runtime_generation=None,
+            session_runtime_attach_token=None,
+            require_pinned_identity=True,
         )
         # The legacy keys are the back-compat contract for older agent builds.
         # `job_status` was added alongside them (Defect 3 of
@@ -760,6 +830,9 @@ class TestPureInternalEndpoints:
             current_job_id="11111111-1111-1111-1111-111111111111",
             metrics={"memory_mb": 256, "graph_progress": 2},
             aux_degraded=None,
+            session_runtime_generation=None,
+            session_runtime_attach_token=None,
+            require_pinned_identity=True,
         )
 
     # -- runtime-actor liveness slide ------------------------------------
@@ -795,7 +868,13 @@ class TestPureInternalEndpoints:
             result = await agent_heartbeat(fake_request, "agent-1", hb)
 
         assert result["status"] == "ok"
-        slide.assert_awaited_once_with(fake_db, thread_id)
+        slide.assert_awaited_once_with(
+            fake_db,
+            thread_id,
+            agent_id="agent-1",
+            session_runtime_generation=None,
+            session_runtime_attach_token=None,
+        )
 
     @pytest.mark.asyncio
     async def test_agent_heartbeat_without_a_bound_thread_slides_nothing(

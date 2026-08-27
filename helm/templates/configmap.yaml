@@ -352,6 +352,9 @@ data:
   COMPLETION_FINALIZER_INLINE_DELAY_SECONDS: {{ .Values.orchestrator.completionFinalizerInlineDelaySeconds | default 0 | quote }}
   # Two-stage rollout fence for the interim dedicated Officer-pod owner.
   PERSISTENT_AGENT_RECONCILIATION_ENABLED: {{ .Values.orchestrator.persistentAgentReconciliationEnabled | default false | quote }}
+  # Reader-first rollout gate for terminal direct-human input cancellation.
+  # Provisioned pinned agents inherit this ConfigMap via envFrom.
+  PERSISTENT_INPUT_CANCELLATION_ENABLED: {{ .Values.agent.persistentInputCancellationEnabled | default false | quote }}
   # Admin-only exact-binding longevity/fault verification seam. Dark in every
   # normal profile and consumed only by the orchestrator.
   OFFICER_RUNTIME_VERIFICATION_ENABLED: {{ .Values.orchestrator.officerRuntimeVerificationEnabled | default false | quote }}
@@ -449,6 +452,9 @@ data:
   # Protected cloud mode: RO-reader provisioning + capture overlay. Read by the
   # orchestrator's RO engage gate + reader reconciler. Default-off (prod-safe).
   PROTECTED_CLOUD_MODE_ENABLED: {{ .Values.agent.protectedCloudModeEnabled | default "false" | quote }}
+  # Exact-owner lifecycle CAS. Migration 0185 uses a drained maintenance
+  # cutover, so every post-cutover pinned runtime must carry this identity.
+  REQUIRE_PINNED_STATUS_IDENTITY: {{ .Values.agent.requirePinnedStatusIdentity | default "true" | quote }}
   # Dynamic Canvas workspace-port live preview master gate. The orchestrator
   # derives the positive attach capability and rechecks every mutation; agents
   # never infer support from this environment value. Provisioned agents inherit
@@ -667,6 +673,11 @@ data:
   NEXTCLOUD_PUBLIC_URL: {{ include "srw.cloudUrl" . | quote }}
   NEXTCLOUD_ADMIN_USER: {{ "admin" | quote }}
   NEXTCLOUD_AGENT_USER: {{ "agent-service" | quote }}
+  {{- if .Values.nextcloud.protectedEffect.enabled }}
+  # Server-enforced bounded lane for the five attempt-scoped authority POSTs.
+  NEXTCLOUD_PROTECTED_EFFECT_URL: {{ printf "http://%s" (include "srw.nextcloudProtectedEffectName" .) | quote }}
+  NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
+  {{- end }}
 
   # Nextcloud / WebDAV datasource (optional)
   DEFAULT_DS_WEBDAV_URL: {{ printf "http://%s/remote.php/dav/files/admin/" (include "srw.serviceName" (dict "context" . "component" "nextcloud")) | quote }}

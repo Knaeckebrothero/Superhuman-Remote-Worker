@@ -30,6 +30,9 @@ import { UploadStatus } from '../models/file.model';
 import { PersistentThreadTransportBridge } from './persistent-thread-transport-bridge.service';
 import { CanvasService } from './canvas.service';
 
+const SESSION_RUNTIME_GENERATION = '55555555-5555-4555-8555-555555555555';
+const SESSION_RUNTIME_GENERATION_B = '66666666-6666-4666-8666-666666666666';
+
 // ---------------------------------------------------------------------------
 // Test scaffolding
 // ---------------------------------------------------------------------------
@@ -205,7 +208,20 @@ function createService(
   // the PersistentChatService constructor effect reads. Tests fire phase
   // transitions by setting this signal directly.
   const mockNotifications: any = {
-    lifecycleEvent: signal<{ thread_id: string; state: string; reason?: string } | null>(null),
+    lifecycleEvent: signal<{
+      thread_id: string;
+      state: string;
+      reason?: string;
+      session_runtime_generation?: string;
+    } | null>(null),
+    cloudDiffStagedEvent: signal<{
+      thread_id: string;
+      session_runtime_generation: string;
+      staged_epoch: number;
+      file_count: number;
+      counts: { added: number; modified: number; deleted: number };
+      mount_id: string;
+    } | null>(null),
   };
 
   // TestBed gives us the ChangeDetectionScheduler that effect() needs.
@@ -275,6 +291,8 @@ function activeSessionGet(url: string) {
     ws_url: 'ws://agent.test',
     token: 'test-token',
     expires_at: 0,
+    pinned_runtime_generation_contract: 1,
+    session_runtime_generation: SESSION_RUNTIME_GENERATION,
   });
 }
 
@@ -369,6 +387,59 @@ describe('PersistentChatService — protected cloud probe', () => {
     service.threadId.set('t1');
     await service.refreshCloudDiffCount();
     expect(service.cloudChangesCount()).toBe(0);
+  });
+
+  it('does not let an older same-thread probe erase a newer staged summary', async () => {
+    const { service, mockApi } = createService();
+    const old = new Subject<any>();
+    const fresh = new Subject<any>();
+    mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValueOnce(old).mockReturnValueOnce(fresh);
+    service.threadId.set('t1');
+
+    const oldRead = service.refreshCloudDiffCount();
+    const freshRead = service.refreshCloudDiffCount();
+    fresh.next({ kind: 'ok', data: summary() });
+    fresh.complete();
+    await freshRead;
+    old.next({
+      kind: 'ok',
+      data: summary({
+        staged_at: null,
+        counts: { added: 0, modified: 0, deleted: 0 },
+      }),
+    });
+    old.complete();
+    await oldRead;
+
+    expect(service.cloudChangesCount()).toBe(4);
+    expect(service.cloudStagedAt()).toBe('2026-08-24T09:18:00Z');
+  });
+
+  it('refreshes from the authoritative summary on a matching live stage notification', async () => {
+    const { service, mockApi, notifications } = createService();
+    mockApi.getThreadCloudDiffOutcome = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'ok', data: summary() }));
+    service.threadId.set('t1');
+    (service as any).intentionalClose = false;
+    (service as any).sessionRuntimeGeneration = SESSION_RUNTIME_GENERATION;
+
+    notifications.cloudDiffStagedEvent.set({
+      thread_id: 't1',
+      session_runtime_generation: SESSION_RUNTIME_GENERATION,
+      staged_epoch: 5,
+      // Deliberately disagree with the endpoint. The event is a wake-up edge,
+      // not reviewed summary authority.
+      file_count: 999,
+      counts: { added: 999, modified: 0, deleted: 0 },
+      mount_id: 'reader-1',
+    });
+    TestBed.tick();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockApi.getThreadCloudDiffOutcome).toHaveBeenCalledTimes(1);
+    expect(service.cloudChangesCount()).toBe(4);
   });
 
   it('offers a project folder only once it matches the protected mount', async () => {
@@ -1033,7 +1104,7 @@ describe('PersistentChatService — connect()', () => {
     expect(sseInstances[0].url).not.toContain('last_event_id');
   });
 
-  it('does not open SSE for ended threads — shows resume card instead', async () => {
+  it('opens an SSE-only review plane for ended threads and never opens control', async () => {
     const { service, mockHttp, sseInstances } = createService();
     mockHttp.get.mockImplementation((url: string) => {
       if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
@@ -1042,7 +1113,8 @@ describe('PersistentChatService — connect()', () => {
 
     await service.connect('thread-ended');
 
-    expect(sseInstances).toHaveLength(0);
+    expect(sseInstances).toHaveLength(1);
+    expect((service as any).controlWs).toBeNull();
     expect(service.connectionState()).toBe('disconnected');
     expect(service.threadStatus()).toBe('ended');
   });
@@ -1666,12 +1738,15 @@ describe('PersistentChatService — resume config drift', () => {
     expect(sseInstances).toHaveLength(0);
   });
 
-  it('falls through to connect() on a 409 without setting error or drift', async () => {
+  it('does not treat typed session_not_ended as proof of a successor life', async () => {
     const { service, mockHttp, sseInstances } = createService();
     service.threadId.set('thread-A');
     mockHttp.post.mockImplementation((url: string) =>
       url.endsWith('/persistent/threads/thread-A/resume')
-        ? throwError(() => ({ status: 409 }))
+        ? throwError(() => ({
+            status: 409,
+            error: { detail: { code: 'session_not_ended' } },
+          }))
         : of({}),
     );
     mockHttp.get.mockImplementation((url: string) => {
@@ -1688,11 +1763,152 @@ describe('PersistentChatService — resume config drift', () => {
 
     await service.resumeSession();
 
-    expect(service.error()).toBeNull();
+    expect(service.error()).not.toBeNull();
     expect(service.pendingDrift()).toBeNull();
-    // 409 is benign (double-click) — falls through to a real connect().
-    expect(sseInstances).toHaveLength(1);
-    expect(sseInstances[0].url).toContain('/persistent/threads/thread-A/stream');
+    expect(sseInstances).toHaveLength(0);
+  });
+
+  it('keeps terminal review live when Resume races pre-settlement End', async () => {
+    vi.useFakeTimers();
+    const ctx = createService();
+    try {
+      let staged = false;
+      ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockImplementation(() =>
+        of({
+          kind: 'ok',
+          data: {
+            thread_id: 'thread-ending',
+            epoch: staged ? 10 : 9,
+            staged_at: staged ? '2026-08-26T06:00:00Z' : null,
+            protected_mount: 'Project cloud',
+            counts: { added: staged ? 4 : 0, modified: 0, deleted: 0 },
+            files: [],
+          },
+        }),
+      );
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      ctx.mockHttp.post.mockImplementation((url: string) =>
+        url.endsWith('/persistent/threads/thread-ending/resume')
+          ? throwError(() => ({
+              status: 409,
+              error: { detail: { code: 'session_not_ended' } },
+            }))
+          : of({}),
+      );
+
+      await ctx.service.connect('thread-ending');
+      (ctx.service as any)._protectedCloud.set(true);
+      const endedSse = ctx.sseInstances[0];
+      const oldWs = ctx.wsInstances[0];
+      fireSseMessage(
+        endedSse,
+        {
+          method: 'session.ended',
+          params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+        },
+        '9:42',
+      );
+      expect((ctx.service as any).terminalControlThreadId).toBe('thread-ending');
+      expect(oldWs.close).toHaveBeenCalled();
+
+      const connectionCallsBefore = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/thread-ending/connection'),
+      ).length;
+      await ctx.service.resumeSession();
+      await Promise.resolve();
+
+      expect(ctx.service.error()).toBe('errors.sessions.stillEnding');
+      expect((ctx.service as any).terminalControlThreadId).toBe('thread-ending');
+      expect((ctx.service as any).terminalCloudProbeThreadId).toBe('thread-ending');
+      expect((ctx.service as any).resumedFromEpoch).toBeNull();
+      expect(endedSse.close).not.toHaveBeenCalled();
+      expect(ctx.wsInstances).toHaveLength(1);
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/thread-ending/connection'),
+        ),
+      ).toHaveLength(connectionCallsBefore);
+      expect(ctx.service.cloudChangesCount()).toBe(0);
+
+      staged = true;
+      (ctx.service as any)._handleEvent({
+        method: 'cloud.diff_staged',
+        params: {
+          thread_id: 'thread-ending',
+          session_runtime_generation: SESSION_RUNTIME_GENERATION,
+          staged_epoch: 10,
+          file_count: 4,
+          counts: { added: 4, modified: 0, deleted: 0 },
+          mount_id: 'reader-1',
+        },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(ctx.service.cloudChangesCount()).toBe(4);
+      expect(ctx.service.cloudStagedAt()).toBe('2026-08-26T06:00:00Z');
+      expect((ctx.service as any).terminalControlThreadId).toBe('thread-ending');
+      expect(ctx.wsInstances).toHaveLength(1);
+    } finally {
+      ctx.service.disconnect();
+      vi.useRealTimers();
+    }
+  });
+
+  it('surfaces a protected-cloud 409 and preserves the ended SSE review plane', async () => {
+    const ctx = createService();
+    ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValue(
+      of({
+        kind: 'ok',
+        data: {
+          thread_id: 'thread-protected',
+          epoch: 2,
+          staged_at: '2026-08-26T00:00:00Z',
+          protected_mount: 'Project cloud',
+          counts: { added: 2, modified: 1, deleted: 1 },
+          files: [],
+        },
+      }),
+    );
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
+      if (url.endsWith('/persistent/threads/thread-protected')) {
+        return of({
+          status: 'ended',
+          title: 'Protected',
+          total_turns: 0,
+          metadata: { protected_cloud: true },
+        });
+      }
+      if (url.endsWith('/cloud/staged-summary')) {
+        return of({ total: 4, files: [], protected_mount: 'Project cloud' });
+      }
+      if (url.endsWith('/citations')) return of({ citations: [] });
+      return of({ status: 'ended' });
+    });
+    ctx.mockHttp.post.mockImplementation((url: string) =>
+      url.endsWith('/persistent/threads/thread-protected/resume')
+        ? throwError(() => ({
+            status: 409,
+            error: {
+              detail: { code: 'protected_cloud_unsupported_session_class' },
+            },
+          }))
+        : of({}),
+    );
+
+    await ctx.service.connect('thread-protected');
+    ctx.service.cloudChangesCount.set(4);
+    ctx.service.cloudDiffPanelOpen.set(true);
+    const preservedSse = ctx.sseInstances[0];
+    await ctx.service.resumeSession();
+
+    expect(ctx.service.error()).not.toBeNull();
+    expect(ctx.service.threadId()).toBe('thread-protected');
+    expect(ctx.service.cloudChangesCount()).toBe(4);
+    expect(ctx.service.cloudDiffPanelOpen()).toBe(true);
+    expect(preservedSse.close).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(0);
   });
 
   it('disconnect() clears a pending drift', () => {
@@ -1982,6 +2198,103 @@ describe('PersistentChatService — SSE event dispatch', () => {
     // enabled (no 'ended' resume card) and the next send wakes the session.
     expect(service.threadStatus()).toBe('suspended');
     expect(service.isWaitingForInput()).toBe(false);
+  });
+
+  it('generation-fences delayed suspend frames after the same thread reconnects', async () => {
+    const { service, es } = await setup();
+    const generation2 = '66666666-6666-4666-8666-666666666666';
+    const connection = (generation: string) => ({
+      state: 'ready',
+      control_socket: 'none',
+      ws_url: null,
+      token: null,
+      expires_at: null,
+      pinned_runtime_generation_contract: 1,
+      session_runtime_generation: generation,
+    });
+
+    (service as any)._installControlTransport('thread-X', connection(SESSION_RUNTIME_GENERATION));
+    fireSseMessage(
+      es,
+      {
+        method: 'session.suspended',
+        params: {
+          session_runtime_generation: SESSION_RUNTIME_GENERATION,
+          message: 'G1 suspended',
+        },
+      },
+      '1:1',
+    );
+    expect(service.threadStatus()).toBe('suspended');
+
+    // A successor life on the same thread has installed G2. Replayed G1 and
+    // legacy/malformed frames cannot regress its UI; only exact G2 applies.
+    service.threadStatus.set('active');
+    (service as any)._reopenTerminalControl('thread-X');
+    (service as any)._installControlTransport('thread-X', connection(generation2));
+    for (const generation of [SESSION_RUNTIME_GENERATION, undefined, 'not-a-uuid']) {
+      fireSseMessage(
+        es,
+        {
+          method: 'session.suspended',
+          params: {
+            ...(generation === undefined ? {} : { session_runtime_generation: generation }),
+            message: 'stale suspend',
+          },
+        },
+        '1:2',
+      );
+      expect(service.threadStatus()).toBe('active');
+    }
+
+    fireSseMessage(
+      es,
+      {
+        method: 'session.suspended',
+        params: {
+          session_runtime_generation: generation2,
+          message: 'G2 suspended',
+        },
+      },
+      '2:1',
+    );
+    expect(service.threadStatus()).toBe('suspended');
+  });
+
+  it('remembers the exact runtime contract per thread across A → B → A navigation', async () => {
+    const { service, es } = await setup();
+    const generationB = '77777777-7777-4777-8777-777777777777';
+    const connection = (generation: string) => ({
+      state: 'ready',
+      control_socket: 'none',
+      ws_url: null,
+      token: null,
+      expires_at: null,
+      pinned_runtime_generation_contract: 1,
+      session_runtime_generation: generation,
+    });
+
+    (service as any)._installControlTransport('thread-X', connection(SESSION_RUNTIME_GENERATION));
+    service.threadId.set('thread-B');
+    (service as any)._installControlTransport('thread-B', connection(generationB));
+
+    // Returning to A clears the currently installed generation while its
+    // /connection request is still in flight. Exact-contract evidence for B
+    // must not overwrite A's evidence and reopen the legacy no-generation
+    // compatibility path during this gap.
+    service.threadId.set('thread-X');
+    service.threadStatus.set('active');
+    (service as any).sessionRuntimeGeneration = null;
+    fireSseMessage(
+      es,
+      {
+        method: 'session.suspended',
+        params: { message: 'legacy replay from A' },
+      },
+      '1:2',
+    );
+
+    expect(service.threadStatus()).toBe('active');
   });
 
   it('surfaces error frames via sanitized error signal', async () => {
@@ -2370,7 +2683,8 @@ describe('PersistentChatService — SSE event dispatch', () => {
       const tool = service
         .currentStreamingTurn()
         ?.events.find((event) => event.kind === 'tool_call' && event.id === 'tc-unanswered') as
-        ToolCallEvent | undefined;
+        | ToolCallEvent
+        | undefined;
       expect(tool).toBeDefined();
       expect(tool?.decision).toBe('expired');
       expect(tool?.status).toBe('expired');
@@ -2912,6 +3226,50 @@ describe('PersistentChatService — REST sends', () => {
     expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual(['bring it back']);
   });
 
+  it('wakes a suspended thread without /resume and flushes its queued send once', async () => {
+    const ctx = createService();
+    ctx.service.threadId.set('thread-suspended-send');
+    ctx.service.threadStatus.set('active');
+    (ctx.service as any).sessionRuntimeGeneration = SESSION_RUNTIME_GENERATION;
+    (ctx.service as any).runtimeGenerationContractThreads.add('thread-suspended-send');
+    (ctx.service as any)._settleSuspendedControl('thread-suspended-send');
+    expect(ctx.service.threadStatus()).toBe('suspended');
+
+    const connect = vi.spyOn(ctx.service, 'connect').mockResolvedValue();
+    ctx.mockHttp.post.mockClear();
+
+    await expect(ctx.service.sendMessage('wake and continue')).resolves.toBe(true);
+
+    expect(connect).toHaveBeenCalledOnce();
+    expect(connect).toHaveBeenCalledWith('thread-suspended-send', {
+      preserveReviewPlane: true,
+    });
+    expect(
+      ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+        String(call[0]).endsWith('/persistent/threads/thread-suspended-send/resume'),
+      ),
+    ).toBe(false);
+    expect(ctx.service.outbox().map((item) => item.displayContent)).toEqual(['wake and continue']);
+
+    // The successor runtime is now authoritative. Its first ready edge owns
+    // the one outbox flush; the stale suspended generation cannot settle or
+    // stage anything into this control moment.
+    (ctx.service as any).sessionRuntimeGeneration = SESSION_RUNTIME_GENERATION_B;
+    ctx.service.sessionReady.set(true);
+    await (ctx.service as any)._flushOutbox();
+    expect(
+      ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/persistent/threads/thread-suspended-send/input'),
+      ),
+    ).toHaveLength(1);
+    expect(ctx.service.outbox()).toEqual([]);
+
+    const staleApplies = (ctx.service as any)._runtimeSessionFrameApplies({
+      session_runtime_generation: SESSION_RUNTIME_GENERATION,
+    });
+    expect(staleApplies).toBe(false);
+  });
+
   it('sendMessage with an attachment on an ended thread resumes FIRST and uploads after', async () => {
     // Pre-Task-4 the upload ran above the ended-thread branch, so on a
     // pod/VM-tier ended thread it 409'd against a torn-down workspace,
@@ -2983,22 +3341,140 @@ describe('PersistentChatService — REST sends', () => {
     );
     ctx.mockCache.getThreadCursor.mockResolvedValue({ epoch: 9, seq: 40 });
     await ctx.service.connect('thread-r');
-    ctx.mockHttp.get.mockImplementation(() =>
-      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
-    );
+    ctx.service.cloudChangesCount.set(4);
+    ctx.service.cloudDiffPanelOpen.set(true);
+    (ctx.service as any).controlOutbox = [
+      { threadId: 'thread-r', frame: JSON.stringify({ method: 'approve' }) },
+    ];
+    (ctx.service as any).durableControlOutbox = [
+      {
+        threadId: 'thread-r',
+        request: { method: 'mode.set', mode: 'autonomous', client_request_id: 'old' },
+        attempts: 0,
+        ordinal: 1,
+      },
+    ];
+    (ctx.service as any).pendingCanvasSourceUpdate = {
+      threadId: 'thread-r',
+      control: { method: 'canvas.source_updated', presentation_revision: 3 },
+    };
+    (ctx.service as any)._retireTerminalControl('thread-r');
+    expect((ctx.service as any).controlOutbox).toEqual([]);
+    expect((ctx.service as any).durableControlOutbox).toEqual([]);
+    expect((ctx.service as any).pendingCanvasSourceUpdate).toBeNull();
+
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
 
     await ctx.service.resumeSession();
     const es = ctx.sseInstances[ctx.sseInstances.length - 1];
     fireSseOpen(es);
+    const resumedWs = ctx.wsInstances.at(-1);
+    resumedWs?.onopen?.();
+    expect(
+      resumedWs?.send.mock.calls.some((call: any[]) => String(call[0]).includes('approve')),
+    ).toBe(false);
+    expect(ctx.service.cloudChangesCount()).toBe(4);
+    expect(ctx.service.cloudDiffPanelOpen()).toBe(true);
 
     // Old epoch's tail replays.
     fireSseMessage(es, { method: 'session.idle_timeout', params: { timeout_minutes: 30 } }, '9:41');
     fireSseMessage(es, { method: 'session.ended', params: {} }, '9:42');
     expect(ctx.service.threadStatus()).not.toBe('ended');
+    expect(ctx.service.cloudChangesCount()).toBe(4);
+    expect(ctx.service.cloudDiffPanelOpen()).toBe(true);
 
     // A genuine terminal frame on the NEW epoch must still land.
-    fireSseMessage(es, { method: 'session.ended', params: {} }, '10:7');
+    fireSseMessage(
+      es,
+      {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      },
+      '10:7',
+    );
     expect(ctx.service.threadStatus()).toBe('ended');
+  });
+
+  it('uses the tab-local SSE cursor when the cache cannot provide the Resume watermark', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(() =>
+      of({ status: 'ended', total_turns: 0, messages: [], total: 0 }),
+    );
+    await ctx.service.connect('thread-local-cursor');
+    const endedEs = ctx.sseInstances.at(-1)!;
+    fireSseMessage(endedEs, { method: 'session.ended', params: {} }, '9:42');
+
+    ctx.mockCache.getThreadCursor.mockRejectedValue(new Error('indexeddb unavailable'));
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.resumeSession();
+    const resumedEs = ctx.sseInstances.at(-1)!;
+
+    fireSseMessage(resumedEs, { method: 'session.ended', params: {} }, '9:43');
+
+    expect(ctx.service.threadStatus()).not.toBe('ended');
+    expect((ctx.service as any).resumedFromEpoch).toBe(9);
+  });
+
+  it('does not let an old SSE metadata request retire the same thread after Resume', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(() =>
+      of({ status: 'ended', total_turns: 0, messages: [], total: 0 }),
+    );
+    await ctx.service.connect('thread-meta-resume');
+    const oldEs = ctx.sseInstances.at(-1)!;
+    const staleMeta = new Subject<any>();
+    let holdOldMeta = true;
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (holdOldMeta && url.endsWith('/persistent/threads/thread-meta-resume')) {
+        holdOldMeta = false;
+        return staleMeta;
+      }
+      return activeSessionGet(url);
+    });
+
+    fireSseOpen(oldEs);
+    await ctx.service.resumeSession();
+    const resumedWs = ctx.wsInstances.at(-1)!;
+    const resumedEs = ctx.sseInstances.at(-1)!;
+
+    staleMeta.next({ status: 'ended', title: 'stale', total_turns: 0 });
+    staleMeta.complete();
+    await Promise.resolve();
+
+    expect(ctx.service.threadStatus()).not.toBe('ended');
+    expect((ctx.service as any).terminalControlThreadId).toBeNull();
+    expect(resumedWs.close).not.toHaveBeenCalled();
+    expect(resumedEs.close).not.toHaveBeenCalled();
+  });
+
+  it('does not let pre-terminal active metadata hide a terminal SSE state', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.connect('thread-meta-end');
+    const es = ctx.sseInstances.at(-1)!;
+    const ws = ctx.wsInstances.at(-1)!;
+    const staleMeta = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      url.endsWith('/persistent/threads/thread-meta-end') ? staleMeta : activeSessionGet(url),
+    );
+
+    fireSseOpen(es);
+    fireSseMessage(
+      es,
+      {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      },
+      '4:9',
+    );
+    staleMeta.next({ status: 'active', title: 'stale active', total_turns: 0 });
+    staleMeta.complete();
+    await Promise.resolve();
+
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect((ctx.service as any).terminalControlThreadId).toBe('thread-meta-end');
+    expect(ws.close).toHaveBeenCalled();
+    expect(es.close).not.toHaveBeenCalled();
   });
 
   it('applies a terminal frame that carries no event id', async () => {
@@ -3020,12 +3496,20 @@ describe('PersistentChatService — REST sends', () => {
     expect(ctx.service.threadStatus()).toBe('ended');
   });
 
-  it('sendMessage on 409 conflict silently no-ops (server has the turn)', async () => {
+  it('keeps a distinct sibling-tab message queued on turn_in_flight 409', async () => {
     const ctx = await readySession();
-    ctx.mockHttp.post.mockReturnValue(throwError(() => ({ status: 409 })));
-    await ctx.service.sendMessage('dup');
-    // No error surfaced — 409 is a race we accept.
-    expect(ctx.service.error()).toBeNull();
+    ctx.mockHttp.post.mockReturnValue(
+      throwError(() => ({
+        status: 409,
+        error: { error: 'turn_in_flight' },
+      })),
+    );
+    await ctx.service.sendMessage('beta from tab B');
+    await Promise.resolve();
+    expect(ctx.service.outbox().map((item) => item.displayContent)).toEqual(['beta from tab B']);
+    expect(ctx.service.outboxStalled()).toBe(true);
+    expect(ctx.service.pendingTurnCount()).toBe(0);
+    expect(ctx.service.error()).not.toBeNull();
   });
 
   it('keeps the bubble + queued item and sets the banner on a hard POST failure (no drop, no retry)', async () => {
@@ -3145,14 +3629,43 @@ describe('PersistentChatService — REST sends', () => {
     );
   });
 
-  it('keeps the bubble and resolves true on a 409 dup', async () => {
+  it('keeps the bubble and queued identity on a generic 409', async () => {
     const ctx = await readySession();
     ctx.mockHttp.post.mockReturnValue(throwError(() => ({ status: 409 })));
     const ok = await ctx.service.sendMessage('dup');
     expect(ok).toBe(true);
     const present = ctx.service.turns().some((t) => isUserTurn(t) && t.content === 'dup');
     expect(present).toBe(true);
-    expect(ctx.service.error()).toBeNull();
+    expect(ctx.service.outbox()).toHaveLength(1);
+    expect(ctx.service.error()).not.toBeNull();
+  });
+
+  it('retires sibling-tab control on session_ending without claiming its input', async () => {
+    const ctx = await readySession();
+    const es = ctx.sseInstances[0];
+    ctx.mockHttp.post.mockReturnValue(
+      throwError(() => ({
+        status: 409,
+        error: {
+          detail: {
+            code: 'session_ending',
+            message: 'Session retirement is in progress',
+            retirement_disposition: 'ended',
+          },
+        },
+      })),
+    );
+
+    await ctx.service.sendMessage('must not be mistaken for tab A');
+    await Promise.resolve();
+
+    expect(ctx.service.threadStatus()).toBe('ending');
+    expect(ctx.service.sessionReady()).toBe(false);
+    expect(ctx.service.outbox().map((item) => item.displayContent)).toEqual([
+      'must not be mistaken for tab A',
+    ]);
+    expect(ctx.service.pendingTurnCount()).toBe(0);
+    expect(es.close).not.toHaveBeenCalled();
   });
 
   it('interrupt POSTs to /interrupt', async () => {
@@ -3410,6 +3923,8 @@ describe('PersistentChatService — control commands', () => {
             ws_url: null,
             token: null,
             expires_at: null,
+            pinned_runtime_generation_contract: 1,
+            session_runtime_generation: SESSION_RUNTIME_GENERATION,
           })
         : activeSessionGet(url),
     );
@@ -3623,6 +4138,7 @@ describe('PersistentChatService — control commands', () => {
       {
         method: 'workspace.undo',
         client_request_id: expect.any(String),
+        session_runtime_generation: SESSION_RUNTIME_GENERATION,
       },
     );
   });
@@ -3733,6 +4249,7 @@ describe('PersistentChatService — control commands', () => {
         method: 'mode.set',
         mode: 'auto_accept',
         client_request_id: expect.any(String),
+        session_runtime_generation: SESSION_RUNTIME_GENERATION,
       },
     );
     expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
@@ -3748,6 +4265,7 @@ describe('PersistentChatService — control commands', () => {
         method: 'narration.set',
         mode: 'silent',
         client_request_id: expect.any(String),
+        session_runtime_generation: SESSION_RUNTIME_GENERATION,
       },
     );
     expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
@@ -3757,7 +4275,15 @@ describe('PersistentChatService — control commands', () => {
     const ctx = createService();
     ctx.mockHttp.get.mockImplementation((url: string) =>
       url.endsWith('/connection')
-        ? of({ state: 'ready', control_socket: 'none' })
+        ? of({
+            state: 'ready',
+            control_socket: 'none',
+            ws_url: null,
+            token: null,
+            expires_at: null,
+            pinned_runtime_generation_contract: 1,
+            session_runtime_generation: SESSION_RUNTIME_GENERATION,
+          })
         : activeSessionGet(url),
     );
     await ctx.service.connect('thread-socketless-control');
@@ -3771,6 +4297,37 @@ describe('PersistentChatService — control commands', () => {
       expect.stringMatching(/\/persistent\/threads\/thread-socketless-control\/controls$/),
       expect.objectContaining({ method: 'mode.set', mode: 'autonomous' }),
     );
+  });
+
+  it.each([
+    ['missing generation', undefined, 1],
+    ['malformed generation', 'not-a-runtime-generation', 1],
+    ['malformed contract', SESSION_RUNTIME_GENERATION, true],
+  ])('fails durable controls closed for %s', async (_label, generation, contract) => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      url.endsWith('/connection')
+        ? of({
+            state: 'ready',
+            control_socket: 'none',
+            ws_url: null,
+            token: null,
+            expires_at: null,
+            pinned_runtime_generation_contract: contract,
+            session_runtime_generation: generation,
+          })
+        : activeSessionGet(url),
+    );
+    await ctx.service.connect('thread-control-fail-closed');
+    fireSseOpen(ctx.sseInstances[0]);
+    ctx.mockHttp.post.mockClear();
+
+    ctx.service.setMode('autonomous');
+
+    expect(
+      ctx.mockHttp.post.mock.calls.some((call: any[]) => String(call[0]).endsWith('/controls')),
+    ).toBe(false);
+    expect(ctx.service.error()).not.toBeNull();
   });
 
   it('treats HTTP success as admission only and applies the journal result', async () => {
@@ -4323,6 +4880,10 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       }
       return of(opts.threadMeta ?? { status: 'active', total_turns: 0 });
     };
+  }
+
+  async function flushMicrotasks(rounds = 8): Promise<void> {
+    for (let index = 0; index < rounds; index++) await Promise.resolve();
   }
 
   it('warm reconnect (already bound): GETs /connection, opens WS at returned ws_url, skips /prepare', async () => {
@@ -5312,6 +5873,1348 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
     expect(lifecycleEs).toBeUndefined();
   });
 
+  it('a terminal SSE cancels a delayed 425 before it can POST prepare or restart control', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const connection = new Subject<any>();
+      ctx.mockHttp.get.mockImplementation((url: string) => {
+        if (url.endsWith('/connection')) return connection;
+        if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
+        if (url.endsWith('/state')) {
+          return of({
+            thread_id: 'terminal-425',
+            permission_mode: 'supervised',
+            narration_mode: 'auto',
+            turn_count: 0,
+            turn_in_flight: false,
+            message_count: 0,
+            pending_permissions: [],
+            event_cursor: { epoch: 4, seq: 0 },
+            replay_cursor: { epoch: 4, seq: 0 },
+            snapshot_source: 'durable_journal',
+          });
+        }
+        if (url.endsWith('/citations')) return of({ citations: [] });
+        return of({ status: 'active', total_turns: 0 });
+      });
+
+      const connecting = ctx.service.connect('terminal-425');
+      await flushMicrotasks();
+      expect(ctx.sseInstances).toHaveLength(1);
+      fireSseMessage(ctx.sseInstances[0], { method: 'session.ended', params: {} }, '4:1');
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+
+      connection.error({ status: 425 });
+      await connecting;
+      await vi.advanceTimersByTimeAsync(610_000);
+      window.dispatchEvent(new Event('focus'));
+      window.dispatchEvent(new Event('online'));
+      await flushMicrotasks();
+
+      const connectionCalls = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/terminal-425/connection'),
+      );
+      const prepareCalls = ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/terminal-425/prepare'),
+      );
+      expect(connectionCalls).toHaveLength(1);
+      expect(prepareCalls).toHaveLength(0);
+      expect(ctx.wsInstances).toHaveLength(0);
+      expect(ctx.service.sessionReady()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a terminal SSE cancels an unresolved prepare response and every continuation', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const prepare = new Subject<any>();
+      ctx.mockHttp.get.mockImplementation(
+        connectGetMock({ connectionResponses: [throwError(() => ({ status: 425 }))] }),
+      );
+      ctx.mockHttp.post.mockImplementation((url: string) =>
+        url.endsWith('/prepare') ? prepare : of({}),
+      );
+
+      const connecting = ctx.service.connect('terminal-during-prepare');
+      await flushMicrotasks(20);
+      expect(
+        ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/terminal-during-prepare/prepare'),
+        ),
+      ).toHaveLength(1);
+
+      fireSseMessage(ctx.sseInstances[0], { method: 'session.ended', params: {} }, '5:1');
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+      prepare.next({ state: 'provisioning' });
+      prepare.complete();
+      await connecting;
+      await vi.advanceTimersByTimeAsync(1_100_000);
+      window.dispatchEvent(new Event('focus'));
+      window.dispatchEvent(new Event('online'));
+      await flushMicrotasks();
+
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/terminal-during-prepare/connection'),
+        ),
+      ).toHaveLength(1);
+      expect(ctx.wsInstances).toHaveLength(0);
+      expect(ctx.service.sessionReady()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps terminal review SSE liveness separate from agent Connected state', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(connectGetMock());
+    await ctx.service.connect('terminal-sse-only');
+    const firstSse = ctx.sseInstances[0];
+    const controlCount = ctx.wsInstances.length;
+
+    fireSseMessage(firstSse, { method: 'session.ended', params: {} }, '5:1');
+    fireSseOpen(firstSse);
+    expect(ctx.service.connectionState()).toBe('disconnected');
+    expect(ctx.service.isConnected()).toBe(false);
+    expect(firstSse.close).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(controlCount);
+
+    // A watchdog/focus-style journal reconnect stays SSE-only too. It may
+    // reconcile metadata/review but can never advertise or reopen control.
+    ctx.service.reconnectNow();
+    await flushMicrotasks();
+    const reopened = ctx.sseInstances.at(-1)!;
+    expect(reopened).not.toBe(firstSse);
+    fireSseOpen(reopened);
+    await flushMicrotasks();
+    expect(ctx.service.connectionState()).toBe('disconnected');
+    expect(ctx.service.isConnected()).toBe(false);
+    expect(reopened.close).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(controlCount);
+    expect(
+      ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/terminal-sse-only/connection'),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('a terminal SSE drops a late ready poll response without opening control', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const poll = new Subject<any>();
+      ctx.mockHttp.get.mockImplementation(
+        connectGetMock({
+          connectionResponses: [throwError(() => ({ status: 425 })), poll],
+        }),
+      );
+      ctx.mockHttp.post.mockReturnValue(of({ state: 'provisioning' }));
+
+      const connecting = ctx.service.connect('terminal-during-poll');
+      await flushMicrotasks(20);
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/terminal-during-poll/connection'),
+        ),
+      ).toHaveLength(2);
+
+      fireSseMessage(ctx.sseInstances[0], { method: 'session.ended', params: {} }, '6:1');
+      poll.next({
+        state: 'ready',
+        control_socket: 'websocket',
+        ws_url: 'wss://api.example.com/stale-ready',
+        token: 'stale',
+        expires_at: 0,
+      });
+      poll.complete();
+      await connecting;
+      await vi.advanceTimersByTimeAsync(1_100_000);
+
+      expect(ctx.wsInstances).toHaveLength(0);
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/terminal-during-poll/connection'),
+        ),
+      ).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a terminal SSE cancels the readiness backoff before another poll', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(
+        connectGetMock({
+          connectionResponses: [
+            throwError(() => ({ status: 425 })),
+            throwError(() => ({ status: 425 })),
+          ],
+        }),
+      );
+      ctx.mockHttp.post.mockReturnValue(of({ state: 'provisioning' }));
+
+      const connecting = ctx.service.connect('terminal-during-backoff');
+      await flushMicrotasks(20);
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/terminal-during-backoff/connection'),
+        ),
+      ).toHaveLength(2);
+
+      fireSseMessage(ctx.sseInstances[0], { method: 'session.ended', params: {} }, '7:1');
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1_100_000);
+      await connecting;
+      window.dispatchEvent(new Event('focus'));
+      window.dispatchEvent(new Event('online'));
+      await flushMicrotasks();
+
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/terminal-during-backoff/connection'),
+        ),
+      ).toHaveLength(2);
+      expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+      expect(ctx.wsInstances).toHaveLength(0);
+      expect(ctx.service.sessionReady()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('terminal retirement cancels an armed control reconnect and ignores late lifecycle ready', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(connectGetMock());
+      await ctx.service.connect('terminal-reconnect-timer');
+      expect(ctx.wsInstances).toHaveLength(1);
+
+      ctx.wsInstances[0].onclose?.({ code: 1006, reason: 'drop' } as CloseEvent);
+      fireSseMessage(ctx.sseInstances[0], { method: 'session.ended', params: {} }, '8:1');
+      ctx.notifications.lifecycleEvent.set({
+        thread_id: 'terminal-reconnect-timer',
+        state: 'ready',
+      });
+      TestBed.tick();
+      await vi.advanceTimersByTimeAsync(1_100_000);
+
+      expect(ctx.wsInstances).toHaveLength(1);
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.service.startupPhase()).toBeNull();
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/terminal-reconnect-timer/connection'),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('terminal retirement drops a late fresh-token response after a 4401 close', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const freshToken = new Subject<any>();
+      ctx.mockHttp.get.mockImplementation(
+        connectGetMock({
+          connectionResponses: [
+            of({
+              state: 'ready',
+              control_socket: 'websocket',
+              ws_url: 'wss://api.example.com/initial-token',
+              token: 'initial',
+              expires_at: 0,
+            }),
+            freshToken,
+          ],
+        }),
+      );
+      await ctx.service.connect('terminal-fresh-token');
+      ctx.wsInstances[0].onclose?.({ code: 4401, reason: 'expired' } as CloseEvent);
+      await flushMicrotasks();
+
+      fireSseMessage(ctx.sseInstances[0], { method: 'session.ended', params: {} }, '9:1');
+      freshToken.next({
+        state: 'ready',
+        control_socket: 'websocket',
+        ws_url: 'wss://api.example.com/stale-token',
+        token: 'stale',
+        expires_at: 0,
+      });
+      freshToken.complete();
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(1_100_000);
+
+      expect(ctx.wsInstances).toHaveLength(1);
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/terminal-fresh-token/connection'),
+        ),
+      ).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('only the typed nested session_ended 409 is terminal; a generic 409 retries', async () => {
+    vi.useFakeTimers();
+    try {
+      const terminal = createService();
+      terminal.mockHttp.get.mockImplementation(
+        connectGetMock({
+          connectionResponses: [
+            throwError(() => ({
+              status: 409,
+              error: { detail: { code: 'session_ended' } },
+            })),
+          ],
+        }),
+      );
+      await terminal.service.connect('typed-ended');
+      expect(terminal.service.threadStatus()).toBe('ended');
+      expect(terminal.sseInstances[0].close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(terminal.wsInstances).toHaveLength(0);
+
+      const transient = createService();
+      transient.mockHttp.get.mockImplementation(
+        connectGetMock({
+          connectionResponses: [
+            throwError(() => ({ status: 409, error: { detail: 'agent booting' } })),
+            of({
+              state: 'ready',
+              control_socket: 'websocket',
+              ws_url: 'wss://api.example.com/p/generic/ws?t=fresh',
+              token: 'fresh',
+              expires_at: 0,
+            }),
+          ],
+        }),
+      );
+      await transient.service.connect('generic-409');
+      expect(transient.service.threadStatus()).not.toBe('ended');
+      await vi.advanceTimersByTimeAsync(500);
+      await flushMicrotasks();
+      expect(transient.wsInstances.at(-1)?.url).toContain('/p/generic/ws');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the exact-generation contract after terminal refusal and Resume', async () => {
+    const ctx = createService();
+    const resumedConnection = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation(
+      connectGetMock({
+        connectionResponses: [
+          throwError(() => ({
+            status: 409,
+            error: {
+              detail: {
+                code: 'session_ended',
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: SESSION_RUNTIME_GENERATION,
+              },
+            },
+          })),
+          resumedConnection,
+        ],
+      }),
+    );
+
+    await ctx.service.connect('terminal-contract-resume');
+    expect(ctx.service.threadStatus()).toBe('ended');
+
+    const resume = ctx.service.resumeSession();
+    await flushMicrotasks(20);
+    const resumedSse = ctx.sseInstances.at(-1)!;
+    fireSseOpen(resumedSse);
+
+    // The exact G1 REST refusal permanently upgrades this thread to the
+    // generation-bound event contract. Resume reopens control for G2, but a
+    // delayed legacy/generationless G1 journal tail must not retire it while
+    // the exact G2 /connection response is still in flight.
+    fireSseMessage(resumedSse, { method: 'session.ended', params: {} }, '18:1');
+    expect(ctx.service.threadStatus()).not.toBe('ended');
+    expect(ctx.service.sessionReady()).toBe(false);
+    expect(ctx.wsInstances).toHaveLength(0);
+
+    resumedConnection.next({
+      state: 'ready',
+      control_socket: 'websocket',
+      ws_url: 'wss://api.example.com/p/terminal-contract-g2/ws?t=fresh',
+      token: 'fresh',
+      expires_at: 0,
+      pinned_runtime_generation_contract: 1,
+      session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+    });
+    resumedConnection.complete();
+    await resume;
+
+    expect(ctx.wsInstances).toHaveLength(1);
+    expect(ctx.wsInstances[0].url).toContain('/p/terminal-contract-g2/ws');
+    expect(ctx.service.sessionReady()).toBe(true);
+    expect(ctx.service.threadStatus()).not.toBe('ended');
+  });
+
+  it('latches an exact binding refusal without hiding SSE review or consuming queued input', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValue(
+        of({
+          kind: 'ok',
+          data: {
+            thread_id: 'binding-invalid',
+            epoch: 3,
+            staged_at: '2026-08-26T14:00:00Z',
+            counts: { added: 1, modified: 0, deleted: 0 },
+            protected_mount: 'cloud',
+            files: [],
+          },
+        }),
+      );
+      ctx.mockHttp.get.mockImplementation(
+        connectGetMock({
+          connectionResponses: [
+            throwError(() => ({
+              status: 409,
+              error: {
+                detail: {
+                  code: 'session_binding_invalid',
+                  pinned_runtime_generation_contract: 1,
+                  session_runtime_generation: SESSION_RUNTIME_GENERATION,
+                },
+              },
+            })),
+          ],
+        }),
+      );
+
+      await ctx.service.connect('binding-invalid');
+      const initialSse = ctx.sseInstances[0];
+      fireSseOpen(initialSse);
+      await ctx.service.sendMessage('keep this queued');
+
+      expect(ctx.service.connectionState()).toBe('error');
+      expect(ctx.service.error()).toBe('errors.sessions.bindingInvalid');
+      expect(ctx.service.threadStatus()).toBe('active');
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.service.outbox().map((item) => item.displayContent)).toEqual(['keep this queued']);
+      expect(initialSse.close).not.toHaveBeenCalled();
+      expect(ctx.wsInstances).toHaveLength(0);
+
+      ctx.notifications.cloudDiffStagedEvent.set({
+        thread_id: 'binding-invalid',
+        session_runtime_generation: SESSION_RUNTIME_GENERATION,
+        staged_epoch: 3,
+        file_count: 1,
+        counts: { added: 1, modified: 0, deleted: 0 },
+        mount_id: 'reader-1',
+      });
+      TestBed.tick();
+      await flushMicrotasks();
+      expect(ctx.mockApi.getThreadCloudDiffOutcome).toHaveBeenCalledTimes(1);
+      expect(ctx.service.cloudChangesCount()).toBe(1);
+
+      // Manual and watchdog review-plane reopens must preserve the explicit
+      // control error and never restart connection/prepare for the same G.
+      ctx.service.reconnectNow();
+      await vi.advanceTimersByTimeAsync(0);
+      const manualSse = ctx.sseInstances.at(-1)!;
+      fireSseOpen(manualSse);
+      expect(ctx.service.connectionState()).toBe('error');
+      expect(ctx.service.error()).toBe('errors.sessions.bindingInvalid');
+
+      await vi.advanceTimersByTimeAsync(50_000);
+      const watchdogSse = ctx.sseInstances.at(-1)!;
+      expect(watchdogSse).not.toBe(manualSse);
+      fireSseOpen(watchdogSse);
+      expect(ctx.service.connectionState()).toBe('error');
+      expect(ctx.service.error()).toBe('errors.sessions.bindingInvalid');
+      expect(ctx.service.outbox().map((item) => item.displayContent)).toEqual(['keep this queued']);
+
+      const connectionCalls = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/binding-invalid/connection'),
+      );
+      const prepareCalls = ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/binding-invalid/prepare'),
+      );
+      expect(connectionCalls).toHaveLength(1);
+      expect(prepareCalls).toHaveLength(0);
+      expect(ctx.wsInstances).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('latches an exact input refusal, retires G1 controls, and keeps the message queued', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const liveWs = createMockWs();
+      const reviewSse = createMockEventSource();
+      liveWs.onopen = vi.fn();
+      liveWs.onmessage = vi.fn();
+      liveWs.onerror = vi.fn();
+      liveWs.onclose = vi.fn();
+      ctx.service.threadId.set('binding-invalid-input');
+      ctx.service.threadStatus.set('active');
+      ctx.service.sessionReady.set(true);
+      (ctx.service as any).sessionRuntimeGeneration = SESSION_RUNTIME_GENERATION;
+      (ctx.service as any).controlWs = liveWs;
+      (ctx.service as any).sse = reviewSse;
+      (ctx.service as any).controlWsOpening = true;
+      (ctx.service as any).controlWsReconnectTimer = setTimeout(() => undefined, 60_000);
+      (ctx.service as any).controlWsWatchdogTimer = setInterval(() => undefined, 60_000);
+      (ctx.service as any).controlOutbox = [
+        { threadId: 'binding-invalid-input', frame: JSON.stringify({ method: 'approve' }) },
+      ];
+      (ctx.service as any).pendingPermissions.set([{ id: 'approval-g1', tool: 'shell' }]);
+      const openingGeneration = (ctx.service as any).controlWsOpeningGeneration;
+      ctx.mockHttp.post.mockReturnValue(
+        throwError(() => ({
+          status: 409,
+          error: {
+            detail: {
+              code: 'session_binding_invalid',
+              pinned_runtime_generation_contract: 1,
+              session_runtime_generation: SESSION_RUNTIME_GENERATION,
+            },
+          },
+        })),
+      );
+
+      await ctx.service.sendMessage('keep this exact input queued');
+      await flushMicrotasks(20);
+
+      expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+      expect(ctx.service.outbox().map((item) => item.displayContent)).toEqual([
+        'keep this exact input queued',
+      ]);
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.service.connectionState()).toBe('error');
+      expect(ctx.service.error()).toBe('errors.sessions.bindingInvalid');
+      expect(ctx.service.outboxStalled()).toBe(true);
+      expect((ctx.service as any).controlWsOpeningGeneration).toBe(openingGeneration + 1);
+      expect((ctx.service as any).controlWsOpening).toBe(false);
+      expect((ctx.service as any).controlWsReconnectTimer).toBeNull();
+      expect((ctx.service as any).controlWsWatchdogTimer).toBeNull();
+      expect((ctx.service as any).controlWs).toBeNull();
+      expect((ctx.service as any).controlOutbox).toEqual([]);
+      expect(ctx.service.pendingPermissions()).toEqual([]);
+      expect(liveWs.close).toHaveBeenCalledWith(1000);
+      expect(liveWs.onopen).toBeNull();
+      expect(liveWs.onmessage).toBeNull();
+      expect(liveWs.onerror).toBeNull();
+      expect(liveWs.onclose).toBeNull();
+      expect(reviewSse.close).not.toHaveBeenCalled();
+
+      (ctx.service as any)._sendControl({ method: 'approve' });
+      expect(liveWs.send).not.toHaveBeenCalled();
+      expect((ctx.service as any).controlOutbox).toEqual([]);
+
+      ctx.service.retryQueuedSends();
+      await flushMicrotasks(10);
+      expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+      expect(ctx.service.error()).toBe('errors.sessions.bindingInvalid');
+      expect(ctx.service.outbox()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not let a delayed G1 input refusal overwrite terminal retirement', async () => {
+    const ctx = createService();
+    const response = new Subject<unknown>();
+    ctx.service.threadId.set('binding-input-terminal-race');
+    ctx.service.threadStatus.set('active');
+    ctx.service.sessionReady.set(true);
+    (ctx.service as any).sessionRuntimeGeneration = SESSION_RUNTIME_GENERATION;
+    ctx.mockHttp.post.mockReturnValue(response);
+
+    await ctx.service.sendMessage('remain queued after End');
+    await flushMicrotasks(10);
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+
+    (ctx.service as any)._retireTerminalControl(
+      'binding-input-terminal-race',
+      SESSION_RUNTIME_GENERATION,
+    );
+    response.error({
+      status: 409,
+      error: {
+        detail: {
+          code: 'session_binding_invalid',
+          pinned_runtime_generation_contract: 1,
+          session_runtime_generation: SESSION_RUNTIME_GENERATION,
+        },
+      },
+    });
+    await flushMicrotasks(20);
+
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect(ctx.service.connectionState()).toBe('disconnected');
+    expect((ctx.service as any).terminalControlThreadId).toBe('binding-input-terminal-race');
+    expect((ctx.service as any).invalidBindingRuntime).toBeNull();
+    expect(ctx.service.error()).not.toBe('errors.sessions.bindingInvalid');
+    expect(ctx.service.outbox()).toHaveLength(1);
+    expect(ctx.service.outboxStalled()).toBe(true);
+  });
+
+  it('does not let a delayed G1 input refusal poison an installed G2 binding', async () => {
+    const ctx = createService();
+    const response = new Subject<unknown>();
+    const g2Ws = createMockWs();
+    ctx.service.threadId.set('binding-input-successor-race');
+    ctx.service.threadStatus.set('active');
+    ctx.service.sessionReady.set(true);
+    (ctx.service as any).sessionRuntimeGeneration = SESSION_RUNTIME_GENERATION;
+    ctx.mockHttp.post.mockReturnValue(response);
+
+    await ctx.service.sendMessage('retry me under G2');
+    await flushMicrotasks(10);
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+
+    (ctx.service as any).controlWsOpeningGeneration++;
+    (ctx.service as any).sessionRuntimeGeneration = SESSION_RUNTIME_GENERATION_B;
+    (ctx.service as any).controlWs = g2Ws;
+    response.error({
+      status: 409,
+      error: {
+        detail: {
+          code: 'session_binding_invalid',
+          pinned_runtime_generation_contract: 1,
+          session_runtime_generation: SESSION_RUNTIME_GENERATION,
+        },
+      },
+    });
+    await flushMicrotasks(20);
+
+    expect((ctx.service as any).sessionRuntimeGeneration).toBe(SESSION_RUNTIME_GENERATION_B);
+    expect((ctx.service as any).invalidBindingRuntime).toBeNull();
+    expect((ctx.service as any).controlWs).toBe(g2Ws);
+    expect(g2Ws.close).not.toHaveBeenCalled();
+    expect(ctx.service.sessionReady()).toBe(true);
+    expect(ctx.service.outbox()).toHaveLength(1);
+    expect(ctx.service.outboxStalled()).toBe(true);
+
+    (ctx.service as any)._sendControl({ method: 'approve' });
+    expect(g2Ws.send).toHaveBeenCalledWith(JSON.stringify({ method: 'approve' }));
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 2 }));
+    ctx.service.retryQueuedSends();
+    await flushMicrotasks(20);
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(2);
+    expect(ctx.service.outbox()).toEqual([]);
+  });
+
+  it('ignores same-G lifecycle noise after binding refusal and reconnects only for G2', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      connectGetMock({
+        connectionResponses: [
+          throwError(() => ({
+            status: 409,
+            error: {
+              detail: {
+                code: 'session_binding_invalid',
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: SESSION_RUNTIME_GENERATION,
+              },
+            },
+          })),
+          of({
+            state: 'ready',
+            control_socket: 'websocket',
+            ws_url: 'wss://api.example.com/p/binding-g2/ws?t=fresh',
+            token: 'fresh',
+            expires_at: 0,
+            pinned_runtime_generation_contract: 1,
+            session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+          }),
+        ],
+      }),
+    );
+
+    await ctx.service.connect('binding-successor');
+    fireSseOpen(ctx.sseInstances[0]);
+    await ctx.service.sendMessage('run on the successor');
+
+    ctx.notifications.lifecycleEvent.set({
+      thread_id: 'binding-successor',
+      state: 'ready',
+      session_runtime_generation: SESSION_RUNTIME_GENERATION,
+    });
+    TestBed.tick();
+    await flushMicrotasks();
+    expect(ctx.wsInstances).toHaveLength(0);
+    expect(ctx.service.connectionState()).toBe('error');
+    expect(ctx.service.outbox()).toHaveLength(1);
+
+    ctx.notifications.lifecycleEvent.set({
+      thread_id: 'binding-successor',
+      state: 'ready',
+      session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+    });
+    TestBed.tick();
+    await flushMicrotasks(20);
+
+    expect(ctx.wsInstances).toHaveLength(1);
+    expect(ctx.wsInstances[0].url).toContain('/p/binding-g2/ws');
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.service.sessionReady()).toBe(true);
+    expect(ctx.service.error()).toBeNull();
+    expect(ctx.service.outbox()).toEqual([]);
+    expect(
+      ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/binding-successor/prepare'),
+      ),
+    ).toBe(false);
+  });
+
+  it('lets exact G2 terminal authority cancel a paused binding-recovery GET', async () => {
+    const ctx = createService();
+    const recoveryConnection = new Subject<any>();
+    ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValue(
+      of({
+        kind: 'ok',
+        data: {
+          thread_id: 'binding-recovery-terminal',
+          epoch: 4,
+          staged_at: '2026-08-26T14:01:00Z',
+          counts: { added: 0, modified: 1, deleted: 0 },
+          protected_mount: 'cloud',
+          files: [],
+        },
+      }),
+    );
+    ctx.mockHttp.get.mockImplementation(
+      connectGetMock({
+        connectionResponses: [
+          throwError(() => ({
+            status: 409,
+            error: {
+              detail: {
+                code: 'session_binding_invalid',
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: SESSION_RUNTIME_GENERATION,
+              },
+            },
+          })),
+          recoveryConnection,
+        ],
+      }),
+    );
+
+    await ctx.service.connect('binding-recovery-terminal');
+    const es = ctx.sseInstances[0];
+    fireSseOpen(es);
+    ctx.notifications.lifecycleEvent.set({
+      thread_id: 'binding-recovery-terminal',
+      state: 'ready',
+      session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+    });
+    TestBed.tick();
+    await flushMicrotasks(20);
+
+    expect(ctx.service.connectionState()).toBe('connecting');
+    expect(
+      ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/binding-recovery-terminal/connection'),
+      ),
+    ).toHaveLength(2);
+
+    ctx.notifications.cloudDiffStagedEvent.set({
+      thread_id: 'binding-recovery-terminal',
+      session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+      staged_epoch: 4,
+      file_count: 1,
+      counts: { added: 0, modified: 1, deleted: 0 },
+      mount_id: 'reader-2',
+    });
+    TestBed.tick();
+    await flushMicrotasks();
+    expect(ctx.mockApi.getThreadCloudDiffOutcome).toHaveBeenCalledTimes(1);
+    expect(ctx.service.cloudChangesCount()).toBe(1);
+
+    fireSseMessage(
+      es,
+      {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION_B },
+      },
+      '13:1',
+    );
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect(ctx.service.connectionState()).toBe('disconnected');
+
+    recoveryConnection.next({
+      state: 'ready',
+      control_socket: 'websocket',
+      ws_url: 'wss://api.example.com/p/binding-recovery-terminal/ws?t=stale',
+      token: 'stale',
+      expires_at: 0,
+      pinned_runtime_generation_contract: 1,
+      session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+    });
+    recoveryConnection.complete();
+    await flushMicrotasks(20);
+
+    expect(ctx.wsInstances).toHaveLength(0);
+    expect(ctx.service.sessionReady()).toBe(false);
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect(es.close).not.toHaveBeenCalled();
+  });
+
+  it('ignores delayed G1 terminal journal after G2 wakes binding recovery', async () => {
+    const ctx = createService();
+    const recoveryConnection = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation(
+      connectGetMock({
+        connectionResponses: [
+          throwError(() => ({
+            status: 409,
+            error: {
+              detail: {
+                code: 'session_binding_invalid',
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: SESSION_RUNTIME_GENERATION,
+              },
+            },
+          })),
+          recoveryConnection,
+        ],
+      }),
+    );
+
+    await ctx.service.connect('binding-recovery-stale-terminal');
+    const es = ctx.sseInstances[0];
+    fireSseOpen(es);
+    ctx.notifications.lifecycleEvent.set({
+      thread_id: 'binding-recovery-stale-terminal',
+      state: 'ready',
+      session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+    });
+    TestBed.tick();
+    await flushMicrotasks(20);
+
+    fireSseMessage(
+      es,
+      {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      },
+      '14:1',
+    );
+    expect(ctx.service.threadStatus()).toBe('active');
+    expect(ctx.service.connectionState()).toBe('connecting');
+
+    recoveryConnection.next({
+      state: 'ready',
+      control_socket: 'websocket',
+      ws_url: 'wss://api.example.com/p/binding-recovery-g2/ws?t=fresh',
+      token: 'fresh',
+      expires_at: 0,
+      pinned_runtime_generation_contract: 1,
+      session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+    });
+    recoveryConnection.complete();
+    await flushMicrotasks(20);
+
+    expect(ctx.wsInstances).toHaveLength(1);
+    expect(ctx.wsInstances[0].url).toContain('/p/binding-recovery-g2/ws');
+    expect(ctx.service.sessionReady()).toBe(true);
+    expect(ctx.service.threadStatus()).toBe('active');
+    expect(ctx.service.connectionState()).toBe('connected');
+  });
+
+  it('does not install a rejected generation returned during G2 recovery', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      connectGetMock({
+        connectionResponses: [
+          throwError(() => ({
+            status: 409,
+            error: {
+              detail: {
+                code: 'session_binding_invalid',
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: SESSION_RUNTIME_GENERATION,
+              },
+            },
+          })),
+          of({
+            state: 'ready',
+            control_socket: 'websocket',
+            ws_url: 'wss://api.example.com/p/rejected-generation/ws?t=stale',
+            token: 'stale',
+            expires_at: 0,
+            pinned_runtime_generation_contract: 1,
+            session_runtime_generation: SESSION_RUNTIME_GENERATION,
+          }),
+        ],
+      }),
+    );
+
+    await ctx.service.connect('binding-rejected-response');
+    fireSseOpen(ctx.sseInstances[0]);
+    ctx.notifications.lifecycleEvent.set({
+      thread_id: 'binding-rejected-response',
+      state: 'ready',
+      session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+    });
+    TestBed.tick();
+    await flushMicrotasks(20);
+
+    expect(ctx.wsInstances).toHaveLength(0);
+    expect(ctx.service.sessionReady()).toBe(false);
+    expect(ctx.service.connectionState()).toBe('error');
+    expect(ctx.service.error()).toBe('errors.sessions.bindingInvalid');
+  });
+
+  it('records exact G3 terminal refusal during G2 recovery for late staged review', async () => {
+    const generationC = '77777777-7777-4777-8777-777777777777';
+    const ctx = createService();
+    ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValue(
+      of({
+        kind: 'ok',
+        data: {
+          thread_id: 'binding-terminal-g3',
+          epoch: 5,
+          staged_at: '2026-08-26T14:02:00Z',
+          counts: { added: 0, modified: 0, deleted: 2 },
+          protected_mount: 'cloud',
+          files: [],
+        },
+      }),
+    );
+    ctx.mockHttp.get.mockImplementation(
+      connectGetMock({
+        connectionResponses: [
+          throwError(() => ({
+            status: 409,
+            error: {
+              detail: {
+                code: 'session_binding_invalid',
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: SESSION_RUNTIME_GENERATION,
+              },
+            },
+          })),
+          throwError(() => ({
+            status: 409,
+            error: {
+              detail: {
+                code: 'session_ended',
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: generationC,
+              },
+            },
+          })),
+        ],
+      }),
+    );
+
+    await ctx.service.connect('binding-terminal-g3');
+    fireSseOpen(ctx.sseInstances[0]);
+    ctx.notifications.lifecycleEvent.set({
+      thread_id: 'binding-terminal-g3',
+      state: 'ready',
+      session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+    });
+    TestBed.tick();
+    await flushMicrotasks(20);
+
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect(ctx.service.connectionState()).toBe('disconnected');
+    expect(ctx.wsInstances).toHaveLength(0);
+
+    ctx.notifications.cloudDiffStagedEvent.set({
+      thread_id: 'binding-terminal-g3',
+      session_runtime_generation: generationC,
+      staged_epoch: 5,
+      file_count: 2,
+      counts: { added: 0, modified: 0, deleted: 2 },
+      mount_id: 'reader-3',
+    });
+    TestBed.tick();
+    await flushMicrotasks();
+
+    expect(ctx.mockApi.getThreadCloudDiffOutcome).toHaveBeenCalledTimes(1);
+    expect(ctx.service.cloudChangesCount()).toBe(2);
+  });
+
+  it('does not terminal-latch a malformed binding-invalid 409', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      connectGetMock({
+        connectionResponses: [
+          throwError(() => ({
+            status: 409,
+            error: {
+              detail: {
+                code: 'session_binding_invalid',
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: 'not-a-generation',
+              },
+            },
+          })),
+          of({
+            state: 'ready',
+            control_socket: 'websocket',
+            ws_url: 'wss://api.example.com/p/malformed-retry/ws?t=fresh',
+            token: 'fresh',
+            expires_at: 0,
+            pinned_runtime_generation_contract: 1,
+            session_runtime_generation: SESSION_RUNTIME_GENERATION,
+          }),
+        ],
+      }),
+    );
+
+    await ctx.service.connect('binding-malformed');
+    fireSseOpen(ctx.sseInstances[0]);
+
+    expect(ctx.wsInstances).toHaveLength(1);
+    expect(ctx.wsInstances[0].url).toContain('/p/malformed-retry/ws');
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.service.sessionReady()).toBe(true);
+  });
+
+  it('polls a bound-but-booting generic 409 past the short reconnect budget without prepare', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const booting = Array.from({ length: 15 }, () =>
+        throwError(() => ({ status: 409, error: { detail: 'agent booting' } })),
+      );
+      ctx.mockHttp.get.mockImplementation(
+        connectGetMock({
+          connectionResponses: [
+            ...booting,
+            of({
+              state: 'ready',
+              control_socket: 'websocket',
+              ws_url: 'wss://api.example.com/p/slow-boot/ws?t=fresh',
+              token: 'fresh',
+              expires_at: 0,
+              pinned_runtime_generation_contract: 1,
+              session_runtime_generation: SESSION_RUNTIME_GENERATION,
+            }),
+          ],
+        }),
+      );
+
+      const connecting = ctx.service.connect('generic-409-slow-boot');
+      await flushMicrotasks(20);
+      await vi.advanceTimersByTimeAsync(35_000);
+      await connecting;
+
+      const connectionCalls = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/generic-409-slow-boot/connection'),
+      );
+      expect(connectionCalls.length).toBe(16);
+      expect(
+        ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/generic-409-slow-boot/prepare'),
+        ),
+      ).toBe(false);
+      expect(ctx.wsInstances.at(-1)?.url).toContain('/p/slow-boot/ws');
+      expect(ctx.service.sessionReady()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('terminal retirement cancels the long generic-409 readiness poll', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(
+        connectGetMock({
+          connectionResponses: [
+            throwError(() => ({ status: 409, error: { detail: 'agent booting' } })),
+            throwError(() => ({ status: 409, error: { detail: 'agent booting' } })),
+          ],
+        }),
+      );
+
+      const connecting = ctx.service.connect('generic-409-terminal');
+      await flushMicrotasks(20);
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/generic-409-terminal/connection'),
+        ),
+      ).toHaveLength(2);
+
+      fireSseMessage(ctx.sseInstances[0], { method: 'session.ended', params: {} }, '9:2');
+      await vi.advanceTimersByTimeAsync(1_100_000);
+      await connecting;
+
+      expect(
+        ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/generic-409-terminal/connection'),
+        ),
+      ).toHaveLength(2);
+      expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+      expect(ctx.wsInstances).toHaveLength(0);
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the full bounded terminal probe chain after an existing diff is resolved', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const summary = (added: number, stagedAt: string | null) => ({
+        thread_id: 'late-stage',
+        epoch: added ? 8 : 7,
+        staged_at: stagedAt,
+        counts: { added, modified: 0, deleted: 0 },
+        protected_mount: 'cloud',
+        files: [],
+      });
+      ctx.mockApi.getThreadCloudDiffOutcome = vi
+        .fn()
+        .mockReturnValueOnce(of({ kind: 'ok', data: summary(4, '2026-08-26T00:00:00Z') }))
+        .mockReturnValueOnce(of({ kind: 'ok', data: summary(0, null) }))
+        .mockReturnValueOnce(of({ kind: 'ok', data: summary(6, '2026-08-26T00:00:10Z') }))
+        .mockReturnValue(of({ kind: 'ok', data: summary(6, '2026-08-26T00:00:10Z') }));
+      ctx.service.threadId.set('late-stage');
+      (ctx.service as any).intentionalClose = false;
+      (ctx.service as any)._protectedCloud.set(true);
+      ctx.service.cloudChangesCount.set(4);
+
+      (ctx.service as any)._retireTerminalControl('late-stage');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.cloudChangesCount()).toBe(4);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(ctx.service.cloudChangesCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(ctx.service.cloudChangesCount()).toBe(6);
+      expect(ctx.service.cloudStagedAt()).toBe('2026-08-26T00:00:10Z');
+      expect(ctx.mockApi.getThreadCloudDiffOutcome).toHaveBeenCalledTimes(3);
+      expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+      expect(ctx.wsInstances).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('discovers a durable staged diff after the final terminal fallback probe', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let staged = false;
+      ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockImplementation(() =>
+        of({
+          kind: 'ok',
+          data: {
+            thread_id: 'late-stage-event',
+            epoch: staged ? 12 : 11,
+            staged_at: staged ? '2026-08-26T05:00:00Z' : null,
+            counts: { added: staged ? 4 : 0, modified: 0, deleted: 0 },
+            protected_mount: 'cloud',
+            files: [],
+          },
+        }),
+      );
+      ctx.service.threadId.set('late-stage-event');
+      (ctx.service as any).intentionalClose = false;
+      (ctx.service as any)._protectedCloud.set(true);
+      (ctx.service as any).sessionRuntimeGeneration = SESSION_RUNTIME_GENERATION;
+      (ctx.service as any)._retireTerminalControl('late-stage-event');
+
+      // Exhaust the complete bounded fallback schedule. The durable event is
+      // the edge that closes the valid >9 minute archive-stage blind spot.
+      await vi.advanceTimersByTimeAsync(600_000);
+      const callsAfterFallback = ctx.mockApi.getThreadCloudDiffOutcome.mock.calls.length;
+      expect(callsAfterFallback).toBe(9);
+      expect(ctx.service.cloudChangesCount()).toBe(0);
+
+      staged = true;
+      (ctx.service as any)._handleEvent({
+        method: 'cloud.diff_staged',
+        params: {
+          thread_id: 'late-stage-event',
+          session_runtime_generation: SESSION_RUNTIME_GENERATION,
+          staged_epoch: 12,
+          // Event counts are a wake-up hint only; the summary below is the
+          // reviewed-data authority and must win even under mutation.
+          file_count: 999,
+          counts: { added: 999, modified: 0, deleted: 0 },
+          mount_id: 'reader-1',
+        },
+      });
+      await flushMicrotasks();
+
+      expect(ctx.mockApi.getThreadCloudDiffOutcome).toHaveBeenCalledTimes(callsAfterFallback + 1);
+      expect(ctx.service.cloudChangesCount()).toBe(4);
+      expect(ctx.service.cloudStagedAt()).toBe('2026-08-26T05:00:00Z');
+      expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+      expect(ctx.wsInstances).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects a retired staged event across quick Resume and accepts only G2', async () => {
+    const ctx = createService();
+    const generation2 = '66666666-6666-4666-8666-666666666666';
+    ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValue(
+      of({
+        kind: 'ok',
+        data: {
+          thread_id: 'stage-resume',
+          epoch: 13,
+          staged_at: '2026-08-26T05:10:00Z',
+          counts: { added: 1, modified: 0, deleted: 0 },
+          protected_mount: 'cloud',
+          files: [],
+        },
+      }),
+    );
+    ctx.service.threadId.set('stage-resume');
+    (ctx.service as any).intentionalClose = false;
+    (ctx.service as any)._protectedCloud.set(true);
+    (ctx.service as any).sessionRuntimeGeneration = SESSION_RUNTIME_GENERATION;
+    (ctx.service as any)._retireTerminalControl('stage-resume');
+    (ctx.service as any)._reopenTerminalControl('stage-resume');
+
+    const frame = (generation: string) => ({
+      method: 'cloud.diff_staged',
+      params: {
+        thread_id: 'stage-resume',
+        session_runtime_generation: generation,
+        staged_epoch: 13,
+        file_count: 1,
+        counts: { added: 1, modified: 0, deleted: 0 },
+        mount_id: 'reader-1',
+      },
+    });
+
+    // Before G2 /connection installs its identity, a delayed G1 publication
+    // cannot use the reopened review plane as authority.
+    (ctx.service as any)._handleEvent(frame(SESSION_RUNTIME_GENERATION));
+    await flushMicrotasks();
+    expect(ctx.mockApi.getThreadCloudDiffOutcome).not.toHaveBeenCalled();
+
+    (ctx.service as any).sessionRuntimeGeneration = generation2;
+    (ctx.service as any)._handleEvent(frame(SESSION_RUNTIME_GENERATION));
+    await flushMicrotasks();
+    expect(ctx.mockApi.getThreadCloudDiffOutcome).not.toHaveBeenCalled();
+
+    (ctx.service as any)._handleEvent(frame(generation2));
+    await flushMicrotasks();
+    expect(ctx.mockApi.getThreadCloudDiffOutcome).toHaveBeenCalledTimes(1);
+    expect(ctx.service.cloudChangesCount()).toBe(1);
+  });
+
+  it('starts late-diff probing when protected metadata arrives after the terminal latch', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.service.threadId.set('late-meta');
+      (ctx.service as any).intentionalClose = false;
+      ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValue(
+        of({
+          kind: 'ok',
+          data: {
+            thread_id: 'late-meta',
+            epoch: 3,
+            staged_at: null,
+            counts: { added: 0, modified: 0, deleted: 0 },
+            protected_mount: 'cloud',
+            files: [],
+          },
+        }),
+      );
+      ctx.mockHttp.get.mockReturnValue(
+        of({
+          id: 'late-meta',
+          status: 'ended',
+          metadata: { protected_cloud: true },
+          mounts: [],
+        }),
+      );
+
+      (ctx.service as any)._retireTerminalControl('late-meta');
+      expect((ctx.service as any).terminalCloudProbeThreadId).toBeNull();
+      await (ctx.service as any).loadThreadMeta('late-meta');
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect((ctx.service as any).terminalCloudProbeThreadId).toBe('late-meta');
+      // One metadata-triggered read plus the first bounded terminal retry.
+      expect(ctx.mockApi.getThreadCloudDiffOutcome.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+      expect(ctx.wsInstances).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cold-loads an ended protected thread as SSE-only and discovers its review', async () => {
+    const ctx = createService();
+    ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValue(
+      of({
+        kind: 'ok',
+        data: {
+          thread_id: 'cold-ended',
+          epoch: 5,
+          staged_at: '2026-08-26T01:00:00Z',
+          counts: { added: 2, modified: 1, deleted: 1 },
+          protected_mount: 'cloud',
+          files: [],
+        },
+      }),
+    );
+    ctx.mockHttp.get.mockImplementation(
+      connectGetMock({
+        threadMeta: {
+          id: 'cold-ended',
+          status: 'ended',
+          metadata: { protected_cloud: true },
+          mounts: [],
+        },
+      }),
+    );
+
+    await ctx.service.connect('cold-ended');
+    await flushMicrotasks();
+
+    expect(ctx.sseInstances).toHaveLength(1);
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(0);
+    expect(ctx.service.cloudChangesCount()).toBe(4);
+    expect(
+      ctx.mockHttp.get.mock.calls.some((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/cold-ended/connection'),
+      ),
+    ).toBe(false);
+    expect(
+      ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/cold-ended/prepare'),
+      ),
+    ).toBe(false);
+  });
+
   it('NotificationService lifecycle events update startupPhase for the active thread', async () => {
     const ctx = createService();
     ctx.mockHttp.get.mockImplementation(
@@ -5368,6 +7271,128 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
     expect(ctx.service.startupPhase()).toBe('connecting');
   });
 
+  it('ignores a delayed lifecycle frame from a retired runtime generation', async () => {
+    const generationA = SESSION_RUNTIME_GENERATION;
+    const generationB = '66666666-6666-4666-8666-666666666666';
+    const ctx = createService();
+    let connectionGeneration = generationA;
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      url.endsWith('/connection')
+        ? of({
+            state: 'ready',
+            control_socket: 'none',
+            ws_url: null,
+            token: null,
+            expires_at: null,
+            pinned_runtime_generation_contract: 1,
+            session_runtime_generation: connectionGeneration,
+          })
+        : activeSessionGet(url),
+    );
+    await ctx.service.connect('lifecycle-generation-fence');
+    (ctx.service as any)._retireTerminalControl('lifecycle-generation-fence');
+    (ctx.service as any)._reopenTerminalControl('lifecycle-generation-fence');
+    connectionGeneration = generationB;
+    await (ctx.service as any)._openControlWs('lifecycle-generation-fence');
+    ctx.service.sessionReady.set(false);
+    ctx.service.startupPhase.set(null);
+
+    ctx.notifications.lifecycleEvent.set({
+      thread_id: 'lifecycle-generation-fence',
+      state: 'failed',
+      reason: 'stale G1',
+      session_runtime_generation: generationA,
+    });
+    TestBed.tick();
+    expect(ctx.service.startupPhase()).toBeNull();
+    expect(ctx.service.error()).not.toBe('stale G1');
+
+    ctx.notifications.lifecycleEvent.set({
+      thread_id: 'lifecycle-generation-fence',
+      state: 'booting',
+      session_runtime_generation: generationB,
+    });
+    TestBed.tick();
+    expect(ctx.service.startupPhase()).toBe('booting');
+  });
+
+  it('REST-observed End after a CLOSED SSE retires control and reopens only the SSE review plane', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let ended = false;
+      ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValue(
+        of({
+          kind: 'ok',
+          data: {
+            thread_id: 'rest-ended',
+            epoch: 7,
+            staged_at: '2026-08-26T02:00:00Z',
+            counts: { added: 1, modified: 0, deleted: 0 },
+            protected_mount: 'cloud',
+            files: [],
+          },
+        }),
+      );
+      ctx.mockHttp.get.mockImplementation((url: string) => {
+        if (url.endsWith('/connection')) {
+          return of({
+            state: 'ready',
+            control_socket: 'websocket',
+            ws_url: 'wss://api.example.com/p/rest-ended/ws?t=one',
+            token: 'one',
+            expires_at: 0,
+          });
+        }
+        if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
+        if (url.endsWith('/state')) {
+          return of({
+            thread_id: 'rest-ended',
+            permission_mode: 'supervised',
+            narration_mode: 'auto',
+            turn_count: 0,
+            turn_in_flight: false,
+            message_count: 0,
+            pending_permissions: [],
+            event_cursor: { epoch: 7, seq: 0 },
+            replay_cursor: { epoch: 7, seq: 0 },
+            snapshot_source: 'durable_journal',
+          });
+        }
+        if (url.endsWith('/citations')) return of({ citations: [] });
+        return of({
+          id: 'rest-ended',
+          status: ended ? 'ended' : 'active',
+          metadata: ended ? { protected_cloud: true } : {},
+          mounts: [],
+        });
+      });
+
+      await ctx.service.connect('rest-ended');
+      fireSseOpen(ctx.sseInstances[0]);
+      ended = true;
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(1_500);
+      await flushMicrotasks();
+
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(ctx.wsInstances[0].close).toHaveBeenCalledWith(1000);
+      expect(ctx.sseInstances.length).toBeGreaterThanOrEqual(2);
+      expect(ctx.service.cloudChangesCount()).toBe(1);
+      const connectionCalls = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/rest-ended/connection'),
+      );
+      expect(connectionCalls).toHaveLength(1);
+      expect(
+        ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+          String(call[0]).endsWith('/api/sessions/rest-ended/prepare'),
+        ),
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('WS close code 4401 re-fetches /connection and reopens WS with the fresh token', async () => {
     const ctx = createService();
     ctx.mockHttp.get.mockImplementation(
@@ -5412,6 +7437,62 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
     expect(ctx.wsInstances.length).toBeGreaterThanOrEqual(2);
     const secondWs = ctx.wsInstances[ctx.wsInstances.length - 1];
     expect(secondWs.url).toBe('wss://api.example.com/p/t3/ws?t=tok-B');
+  });
+
+  it('latches a typed binding refusal during token refresh and yields to exact terminal state', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      connectGetMock({
+        connectionResponses: [
+          of({
+            state: 'ready',
+            control_socket: 'websocket',
+            ws_url: 'wss://api.example.com/p/token-binding/ws?t=old',
+            token: 'old',
+            expires_at: 0,
+            pinned_runtime_generation_contract: 1,
+            session_runtime_generation: SESSION_RUNTIME_GENERATION,
+          }),
+          throwError(() => ({
+            status: 409,
+            error: {
+              detail: {
+                code: 'session_binding_invalid',
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: SESSION_RUNTIME_GENERATION,
+              },
+            },
+          })),
+        ],
+      }),
+    );
+
+    await ctx.service.connect('token-binding');
+    const es = ctx.sseInstances[0];
+    fireSseOpen(es);
+    ctx.wsInstances[0].onclose?.({ code: 4401, reason: 'token expired' } as CloseEvent);
+    await flushMicrotasks(20);
+
+    expect(ctx.wsInstances).toHaveLength(1);
+    expect(ctx.service.connectionState()).toBe('error');
+    expect(ctx.service.error()).toBe('errors.sessions.bindingInvalid');
+    expect(ctx.service.threadStatus()).toBe('active');
+
+    // Exact lifecycle authority supersedes a transport refusal. The ended
+    // review plane must not remain covered by stale binding-error copy.
+    fireSseMessage(
+      es,
+      {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      },
+      '12:1',
+    );
+
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect(ctx.service.connectionState()).toBe('disconnected');
+    expect(ctx.service.error()).toBeNull();
+    expect(es.close).not.toHaveBeenCalled();
   });
 });
 
@@ -5460,9 +7541,10 @@ describe('PersistentChatService — endSession()', () => {
     vi.clearAllMocks();
   });
 
-  it('DELETEs the thread, tears down SSE/WS, resets state', async () => {
+  it('renders soft End as ending, retires control, and preserves the SSE review plane', async () => {
     const ctx = createService();
     ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    ctx.mockHttp.delete.mockReturnValue(of({ status: 'ending', retirement_disposition: 'ended' }));
     await ctx.service.connect('thread-e');
     fireSseOpen(ctx.sseInstances[0]);
 
@@ -5472,25 +7554,178 @@ describe('PersistentChatService — endSession()', () => {
     expect(deleteCalls.length).toBe(1);
     expect(deleteCalls[0][0]).toContain('/persistent/threads/thread-e');
     expect(deleteCalls[0][0]).not.toContain('permanent=true');
-    expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
     expect(ctx.wsInstances[0].close).toHaveBeenCalledWith(1000);
     expect(ctx.service.connectionState()).toBe('disconnected');
     expect(ctx.service.sessionReady()).toBe(false);
+    expect(ctx.service.threadStatus()).toBe('ending');
+    expect(ctx.service.endedAt()).toBeNull();
   });
 
-  it('tears down locally even if DELETE fails', async () => {
+  it('converges a terminal frame before DELETE completion without losing review or buffered text', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      const deletion = new Subject<any>();
+      ctx.mockHttp.delete.mockReturnValue(deletion);
+      await ctx.service.connect('thread-end-race');
+      fireSseOpen(ctx.sseInstances[0]);
+      ctx.service.cloudChangesCount.set(3);
+      ctx.service.cloudDiffPanelOpen.set(true);
+
+      fireSseMessage(
+        ctx.sseInstances[0],
+        { method: 'turn.started', params: { turn_id: 9 } },
+        '5:1',
+      );
+      fireSseMessage(
+        ctx.sseInstances[0],
+        { method: 'token', params: { content: 'kept before end' } },
+        '5:2',
+      );
+      const ending = ctx.service.endSession();
+      await Promise.resolve();
+
+      fireSseMessage(
+        ctx.sseInstances[0],
+        {
+          method: 'session.ended',
+          params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+        },
+        '5:3',
+      );
+      deletion.next({ status: 'ending', retirement_disposition: 'ended' });
+      deletion.complete();
+      await ending;
+      await vi.advanceTimersByTimeAsync(500);
+
+      const assistant = ctx.service.turns().find(isAssistantTurn) as AssistantTurn;
+      expect(assistant.events.map((event) => (event as TextEvent).content).join('')).toContain(
+        'kept before end',
+      );
+      expect(assistant.status).not.toBe('streaming');
+      expect(ctx.service.conversation().activeAssistantTurnId).toBeNull();
+      expect(ctx.service.isWaitingForInput()).toBe(false);
+      expect((ctx.service as any).pendingTurnCount()).toBe(0);
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+      expect(ctx.service.cloudChangesCount()).toBe(3);
+      expect(ctx.service.cloudDiffPanelOpen()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('preserves control, SSE, and review when DELETE fails ambiguously', async () => {
     const ctx = createService();
-    ctx.mockHttp.get.mockImplementation(() =>
-      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
-    );
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
     await ctx.service.connect('thread-f');
     fireSseOpen(ctx.sseInstances[0]);
+    ctx.service.cloudChangesCount.set(2);
+    ctx.service.cloudDiffPanelOpen.set(true);
 
     ctx.mockHttp.delete.mockImplementation(() => throwError(() => new Error('boom')));
 
     await expect(ctx.service.endSession()).rejects.toThrow('boom');
-    expect(ctx.service.connectionState()).toBe('disconnected');
-    expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+    expect(ctx.wsInstances[0].close).not.toHaveBeenCalled();
+    expect(ctx.service.cloudChangesCount()).toBe(2);
+    expect(ctx.service.cloudDiffPanelOpen()).toBe(true);
+  });
+
+  it('prompts for force only on the exact typed turn_in_flight 409', async () => {
+    const confirmSpy = vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
+    try {
+      const generic = createService();
+      generic.mockHttp.get.mockImplementation(activeSessionGet);
+      await generic.service.connect('thread-generic-conflict');
+      generic.mockHttp.delete.mockReturnValue(
+        throwError(() => ({
+          status: 409,
+          error: { detail: { code: 'pinned_retirement_conflict' } },
+        })),
+      );
+
+      await expect(generic.service.endSession()).rejects.toMatchObject({ status: 409 });
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(generic.service.threadStatus()).toBe('active');
+      expect(generic.wsInstances[0].close).not.toHaveBeenCalled();
+
+      const guarded = createService();
+      guarded.mockHttp.get.mockImplementation(activeSessionGet);
+      await guarded.service.connect('thread-turn-in-flight');
+      guarded.mockHttp.delete
+        .mockReturnValueOnce(
+          throwError(() => ({
+            status: 409,
+            error: { detail: { code: 'turn_in_flight' } },
+          })),
+        )
+        .mockReturnValueOnce(of({ status: 'ending', retirement_disposition: 'ended' }));
+
+      await guarded.service.endSession();
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(guarded.mockHttp.delete.mock.calls[1][0]).toContain('force=true');
+      expect(guarded.service.threadStatus()).toBe('ending');
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+
+  it('reconstructs an SSE-only ending view from the safe pending boolean', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(() =>
+      of({
+        status: 'active',
+        runtime_retirement_pending: true,
+        retirement_disposition: 'ended',
+        ended_at: null,
+        total_turns: 0,
+        messages: [],
+        total: 0,
+        thread_id: 'thread-reload-ending',
+        permission_mode: 'supervised',
+        narration_mode: 'auto',
+        turn_count: 0,
+        turn_in_flight: false,
+        message_count: 0,
+        running_tool: null,
+        pending_permissions: [],
+        event_cursor: { epoch: 1, seq: 0 },
+        replay_cursor: { epoch: 1, seq: 0 },
+        snapshot_source: 'durable_journal',
+      }),
+    );
+
+    await ctx.service.connect('thread-reload-ending');
+
+    expect(ctx.service.threadStatus()).toBe('ending');
+    expect(ctx.service.retirementDisposition()).toBe('ended');
+    expect(ctx.service.endedAt()).toBeNull();
+    expect(ctx.sseInstances).toHaveLength(1);
+    expect(ctx.wsInstances).toHaveLength(0);
+    expect(
+      ctx.mockHttp.get.mock.calls.some((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/thread-reload-ending/connection'),
+      ),
+    ).toBe(false);
+    expect(
+      ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+        String(call[0]).endsWith('/sessions/thread-reload-ending/prepare'),
+      ),
+    ).toBe(false);
+  });
+
+  it('does not queue input while retirement is pending', async () => {
+    const ctx = createService();
+    ctx.service.threadId.set('thread-ending-input');
+    ctx.service.threadStatus.set('ending');
+
+    await expect(ctx.service.sendMessage('must not cross retirement')).resolves.toBe(false);
+    expect(ctx.service.outbox()).toEqual([]);
+    expect(ctx.mockHttp.post).not.toHaveBeenCalled();
   });
 
   it('skips DELETE when no thread is connected', async () => {
@@ -6188,6 +8423,7 @@ describe('PersistentChatService — control frame delivery across a reconnect', 
 
   /** Queue a frame with no live socket, then reconnect and drain. */
   function reconnect(service: any, wsInstances: any[], threadId: string) {
+    service.intentionalClose = false;
     service._installControlWs(threadId, 'ws://reconnected');
     const ws = wsInstances.at(-1);
     ws.onopen();
@@ -6266,7 +8502,11 @@ describe('PersistentChatService — control frame delivery across a reconnect', 
       { threadId: 'thread-a', frame: JSON.stringify({ method: 'approve' }) },
     ];
 
-    const ws = reconnect(service, wsInstances, 'thread-b');
+    (service as any).intentionalClose = false;
+    service._installControlWs('thread-b', 'ws://reconnected');
+    const ws = wsInstances.at(-1);
+    service.threadId.set('thread-b');
+    ws.onopen();
     expect(ws.send).not.toHaveBeenCalled();
     expect((service as any).controlOutbox).toHaveLength(0);
   });
@@ -6279,7 +8519,11 @@ describe('PersistentChatService — control frame delivery across a reconnect', 
 
     // onopen's own ownership guard rejects the mismatched socket before the
     // drain, so the command stays queued for thread-a's real socket.
-    const ws = reconnect(service, wsInstances, 'thread-b');
+    (service as any).intentionalClose = false;
+    service._installControlWs('thread-a', 'ws://reconnected');
+    const ws = wsInstances.at(-1);
+    service.threadId.set('thread-b');
+    ws.onopen();
     expect(ws.send).not.toHaveBeenCalled();
     expect((service as any).controlOutbox).toHaveLength(1);
   });
@@ -7183,7 +9427,7 @@ describe('PersistentChatService — Phase 2: send-liveness kickstart', () => {
     expect(reconnectSpy).not.toHaveBeenCalled();
   });
 
-  it('arms the kickstart on a 409 turn_in_flight (queued-flush / dup path)', async () => {
+  it('does not arm the kickstart for an unproven 409 conflict', async () => {
     const { service } = await connectOpened();
     const reconnectSpy = vi.spyOn(service, 'reconnectNow').mockImplementation(() => {});
 
@@ -7191,7 +9435,7 @@ describe('PersistentChatService — Phase 2: send-liveness kickstart', () => {
 
     await (service as any)._postInput('dup');
     await vi.advanceTimersByTimeAsync(5_001);
-    expect(reconnectSpy).toHaveBeenCalledTimes(1);
+    expect(reconnectSpy).not.toHaveBeenCalled();
   });
 
   it('disconnect() clears a pending kickstart timer', async () => {
@@ -7662,7 +9906,7 @@ describe('PersistentChatService — awaiting-turn state (queued input visibility
     expect(ctx.service.isStreaming()).toBe(true);
   });
 
-  it('a 409 duplicate does not inflate the ledger', async () => {
+  it('a 409 conflict stays queued and does not inflate the ledger', async () => {
     const ctx = await readySession();
     ctx.mockHttp.post.mockImplementation((url: string) =>
       String(url).endsWith('/input') ? throwError(() => ({ status: 409 })) : of({}),
@@ -7670,7 +9914,7 @@ describe('PersistentChatService — awaiting-turn state (queued input visibility
     await ctx.service.sendMessage('dupe');
     await Promise.resolve();
 
-    expect(ctx.service.outbox()).toEqual([]); // 409 still drains the item
+    expect(ctx.service.outbox()).toHaveLength(1);
     expect(ctx.service.pendingTurnCount()).toBe(0);
     expect(ctx.service.isAwaitingTurn()).toBe(false);
   });

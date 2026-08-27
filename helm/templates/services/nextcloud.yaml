@@ -1,3 +1,4 @@
+{{- include "srw.nextcloudProtectedEffectValidate" . -}}
 {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
 apiVersion: v1
 kind: ConfigMap
@@ -6,6 +7,20 @@ metadata:
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
 data:
+  {{- if .Values.nextcloud.protectedEffect.enabled }}
+  common.php: |
+{{ .Files.Get "files/nextcloud-protected-effect/common.php" | indent 4 }}
+  prepend.php: |
+{{ .Files.Get "files/nextcloud-protected-effect/prepend.php" | indent 4 }}
+  capability.php: |
+{{ .Files.Get "files/nextcloud-protected-effect/capability.php" | indent 4 }}
+  start-fpm.sh: |
+{{ .Files.Get "files/nextcloud-protected-effect/start-fpm.sh" | indent 4 }}
+  nginx.conf: |
+{{ .Files.Get "files/nextcloud-protected-effect/nginx.conf" | indent 4 }}
+  protected-effect-config.json: |
+    {{ include "srw.nextcloudProtectedEffectConfigJson" . }}
+  {{- end }}
   setup-nextcloud.sh: |
     #!/bin/bash
     # =============================================================================
@@ -173,6 +188,10 @@ spec:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 8 }}
+      {{- if .Values.nextcloud.protectedEffect.enabled }}
+      annotations:
+        checksum/protected-effect-config: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
+      {{- end }}
     spec:
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -281,6 +300,101 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.nextcloud.resources | nindent 12 }}
+        {{- if .Values.nextcloud.protectedEffect.enabled }}
+        - name: nextcloud-protected-effect-fpm
+          image: {{ .Values.nextcloud.protectedEffect.fpmImage | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - /opt/srw-protected-effect/start-fpm.sh
+          env:
+            - name: NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.nextcloudProtectedEffectSecretName" . }}
+                  key: NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY
+                  optional: false
+            - name: NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256
+              value: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
+            - name: NEXTCLOUD_PROTECTED_EFFECT_QUEUE_BOUND_SECONDS
+              value: {{ .Values.nextcloud.protectedEffect.queueBoundSeconds | quote }}
+            - name: NEXTCLOUD_PROTECTED_EFFECT_HANDLER_BOUND_SECONDS
+              value: {{ .Values.nextcloud.protectedEffect.handlerBoundSeconds | quote }}
+            - name: NEXTCLOUD_PROTECTED_EFFECT_CLOCK_SKEW_BOUND_SECONDS
+              value: {{ .Values.nextcloud.protectedEffect.clockSkewBoundSeconds | quote }}
+            - name: NEXTCLOUD_PROTECTED_EFFECT_SAFETY_MARGIN_SECONDS
+              value: {{ .Values.nextcloud.protectedEffect.safetyMarginSeconds | quote }}
+            - name: NEXTCLOUD_PROTECTED_EFFECT_CAPABILITY_MAX_AGE_SECONDS
+              value: {{ .Values.nextcloud.protectedEffect.capabilityMaxAgeSeconds | quote }}
+            - name: NEXTCLOUD_PROTECTED_EFFECT_MAX_CHILDREN
+              value: {{ .Values.nextcloud.protectedEffect.maxChildren | quote }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/www/html
+            - name: setup-hook
+              mountPath: /opt/srw-protected-effect
+              readOnly: true
+            - name: protected-effect-run
+              mountPath: /run/srw-nextcloud
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - test -S /run/srw-nextcloud/protected-effect.sock
+            failureThreshold: 60
+            periodSeconds: 2
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - test -S /run/srw-nextcloud/protected-effect.sock
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.nextcloud.protectedEffect.resources.fpm | nindent 12 }}
+        - name: nextcloud-protected-effect-nginx
+          image: {{ .Values.nextcloud.protectedEffect.nginxImage | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - nginx
+            - -g
+            - daemon off;
+            - -c
+            - /opt/srw-protected-effect/nginx.conf
+          ports:
+            - name: protected-effect
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: setup-hook
+              mountPath: /opt/srw-protected-effect
+              readOnly: true
+            - name: protected-effect-run
+              mountPath: /run/srw-nextcloud
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - >-
+                  wget -q -O /dev/null
+                  --header='X-SRW-Backend-Instance: 99999999-9999-4999-8999-999999999999'
+                  http://127.0.0.1:8080/index.php/apps/srw_protected_effect/api/v1/capability
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - >-
+                  wget -q -O /dev/null
+                  --header='X-SRW-Backend-Instance: 99999999-9999-4999-8999-999999999999'
+                  http://127.0.0.1:8080/index.php/apps/srw_protected_effect/api/v1/capability
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.nextcloud.protectedEffect.resources.nginx | nindent 12 }}
+        {{- end }}
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -289,6 +403,12 @@ spec:
           configMap:
             name: {{ include "srw.fullname" . }}-nextcloud-hooks
             defaultMode: 0755
+        {{- if .Values.nextcloud.protectedEffect.enabled }}
+        - name: protected-effect-run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -303,4 +423,48 @@ spec:
       targetPort: 80
   selector:
     {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
+{{- if .Values.nextcloud.protectedEffect.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.nextcloudProtectedEffectName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud-protected-effect") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: protected-effect
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.nextcloudProtectedEffectName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud-protected-effect") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Preserve the ordinary Nextcloud data/read/cleanup lane for its existing
+    # callers. Only the bounded authority lane is orchestrator-exclusive.
+    - ports:
+        - protocol: TCP
+          port: 80
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- end }}
 {{- end }}

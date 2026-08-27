@@ -27,6 +27,8 @@ export interface SessionEvent {
  */
 export interface LifecycleEvent {
     thread_id: string;
+    /** Exact session life that emitted this phase. */
+    session_runtime_generation?: string;
     state: 'provisioning' | 'booting' | 'ready' | 'failed' | (string & {});
     reason?: string;
     /**
@@ -36,6 +38,16 @@ export interface LifecycleEvent {
      * readiness budget for a cold KubeVirt boot. Absent for sandbox/lite.
      */
     backend?: string;
+}
+
+/** A protected cloud stage that passed the server's exact publication CAS. */
+export interface CloudDiffStagedEvent {
+    thread_id: string;
+    session_runtime_generation: string;
+    staged_epoch: number;
+    file_count: number;
+    counts: { added: number; modified: number; deleted: number };
+    mount_id: string;
 }
 
 /**
@@ -78,6 +90,9 @@ export class NotificationService {
      * matching the thread they care about. Cleared on disconnectSSE.
      */
     readonly lifecycleEvent = signal<LifecycleEvent | null>(null);
+
+    /** Latest exact-runtime protected stage publication. */
+    readonly cloudDiffStagedEvent = signal<CloudDiffStagedEvent | null>(null);
 
     /**
      * Latest `user_registered` frame (admins only receive these). The admin
@@ -213,9 +228,21 @@ export class NotificationService {
         // filters on the active thread id.
         this.lifecycleEvent.set({
             thread_id: data.thread_id,
+            session_runtime_generation: data.session_runtime_generation,
             state: data.state,
             reason: data.reason,
             backend: data.backend,
+        });
+    } else if (data.type === 'cloud.diff_staged') {
+        // The persistent-chat service generation-fences this wake-up edge and
+        // re-reads the staged summary; these counts are never painted directly.
+        this.cloudDiffStagedEvent.set({
+            thread_id: data.thread_id,
+            session_runtime_generation: data.session_runtime_generation,
+            staged_epoch: data.staged_epoch,
+            file_count: data.file_count,
+            counts: data.counts,
+            mount_id: data.mount_id,
         });
     } else if (data.type === 'user_registered') {
         // Admin-only fan-out (app-side admission): a new user
@@ -275,6 +302,7 @@ export class NotificationService {
       this.eventSource = null;
       this.isConnected.set(false);
       this.lifecycleEvent.set(null);
+      this.cloudDiffStagedEvent.set(null);
     }
   }
 }

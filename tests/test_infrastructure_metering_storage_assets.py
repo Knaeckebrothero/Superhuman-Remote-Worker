@@ -700,10 +700,14 @@ async def test_0105_backfills_active_primary_sources_without_moving_earlier_scop
         await admin.close()
 
     pre_0105 = tmp_path / "pre-0105"
+    through_0105 = tmp_path / "through-0105"
     pre_0105.mkdir()
+    through_0105.mkdir()
     for migration in APP_MIGRATIONS.iterdir():
         if migration.is_file() and migration.name < SOURCE_ACTIVATION_MIGRATION.name:
             (pre_0105 / migration.name).symlink_to(migration.resolve())
+        if migration.is_file() and migration.name <= SOURCE_ACTIVATION_MIGRATION.name:
+            (through_0105 / migration.name).symlink_to(migration.resolve())
 
     pool = await asyncpg.create_pool(
         _swap_db(storage_pg_dsn, dbname),
@@ -759,8 +763,8 @@ async def test_0105_backfills_active_primary_sources_without_moving_earlier_scop
                     ],
                 )
 
-        await run_migrations(pool, APP_MIGRATIONS)
-        await run_migrations(pool, APP_MIGRATIONS)
+        await run_migrations(pool, through_0105)
+        await run_migrations(pool, through_0105)
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT measurement_basis,state,activated_at "

@@ -133,6 +133,7 @@ async def db(pg_dsn):
                 id uuid PRIMARY KEY,
                 thread_id uuid NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
                 accepted_agent_id uuid,
+                runtime_generation uuid,
                 outcome text
             )
             """

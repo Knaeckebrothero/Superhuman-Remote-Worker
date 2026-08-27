@@ -1,3 +1,7 @@
+{{- $runtimeAuthorityCutover := .Values.orchestrator.runtimeAuthorityMigrationMaintenanceAck | default false -}}
+{{- if and $runtimeAuthorityCutover (ne (lower (toString (.Values.agent.requirePinnedStatusIdentity | default "true"))) "true") -}}
+{{- fail "orchestrator.runtimeAuthorityMigrationMaintenanceAck requires agent.requirePinnedStatusIdentity=true" -}}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,6 +14,8 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.orchestrator.replicas }}
+  strategy:
+    type: {{ ternary "Recreate" "RollingUpdate" $runtimeAuthorityCutover }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 6 }}
@@ -59,6 +65,13 @@ spec:
           ports:
             - containerPort: 8085
           env:
+            # Migration 0185 is intentionally not rolling-compatible.  An
+            # existing database accepts it only after the operator drains old
+            # pinned/agent writers and acknowledges the named maintenance
+            # gate; the same value switches this Deployment to Recreate so no
+            # old orchestrator overlaps the migration transaction.
+            - name: MIGRATION_MAINTENANCE_GATES
+              value: {{ ternary "pinned-runtime-authority-v1" "" $runtimeAuthorityCutover | quote }}
             - name: PORT
               value: "8085"
             # License acceptance — orchestrator refuses to start if not "true"
@@ -162,6 +175,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: PROTECTED_CLOUD_MODE_ENABLED
+            - name: REQUIRE_PINNED_STATUS_IDENTITY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: REQUIRE_PINNED_STATUS_IDENTITY
             - name: CANVAS_LIVE_PREVIEW_ENABLED
               valueFrom:
                 configMapKeyRef:
@@ -835,6 +853,26 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_AGENT_PASSWORD
                   optional: true
+            {{- if and .Values.nextcloud.enabled .Values.nextcloud.protectedEffect.enabled }}
+            - name: NEXTCLOUD_PROTECTED_EFFECT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEXTCLOUD_PROTECTED_EFFECT_URL
+                  optional: false
+            - name: NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256
+                  optional: false
+            - name: NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.nextcloudProtectedEffectSecretName" . }}
+                  key: NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY
+                  optional: false
+            {{- end }}
             - name: NEXTCLOUD_RCLONE_USER_HOME_USERNAME
               valueFrom:
                 configMapKeyRef:

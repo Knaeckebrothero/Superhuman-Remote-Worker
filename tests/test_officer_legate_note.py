@@ -20,10 +20,14 @@ from uuid import UUID
 import pytest
 
 from services import session_wake
+from src.shared.pinned_session_identity import PinnedSessionBinding
 
 THREAD_ID = "6ce5bc4c-0000-4000-8000-000000000001"
 AGENT_ID = "f898a7dd-0000-4000-8000-000000000002"
 PROJECT_ID = "a572e4a0-0000-4000-8000-000000000003"
+RUNTIME_GENERATION = "b683f5b1-0000-4000-8000-000000000004"
+ATTACH_TOKEN = "c79406c2-0000-4000-8000-000000000005"
+POD_UID = "d8a517d3-0000-4000-8000-000000000006"
 
 NOTE = "[Legate note — Legate via MCP, 2026-08-17 09:00 UTC]\n\nStop the theme work."
 
@@ -71,6 +75,10 @@ def _thread(*, hold: dict | None = None, agent_id: str | None = AGENT_ID) -> dic
         "user_id": "u",
         "status": "active",
         "agent_id": agent_id,
+        "execution_lane": "pinned",
+        "runtime_generation": RUNTIME_GENERATION,
+        "runtime_attach_token": ATTACH_TOKEN if agent_id is not None else None,
+        "runtime_retirement_token": None,
         "project_id": PROJECT_ID,
         "title": "Centurion — Better Resavio",
         "metadata": {"config_override": {"officer": officer}},
@@ -78,14 +86,39 @@ def _thread(*, hold: dict | None = None, agent_id: str | None = AGENT_ID) -> dic
 
 
 def _agent(**over) -> dict:
-    a = {"id": AGENT_ID, "status": "session", "pod_ip": "10.1.2.3", "pod_port": 8001}
+    a = {
+        "id": AGENT_ID,
+        "thread_id": THREAD_ID,
+        "status": "session",
+        "pod_ip": "10.1.2.3",
+        "pod_port": 8001,
+        "hostname": "srw-officer-agent",
+        "pod_uid": POD_UID,
+    }
     a.update(over)
     return a
+
+
+def _binding(agent: dict | None) -> PinnedSessionBinding | None:
+    if agent is None:
+        return None
+    return PinnedSessionBinding(
+        thread_id=THREAD_ID,
+        runtime_generation=RUNTIME_GENERATION,
+        agent_id=AGENT_ID,
+        runtime_attach_token=ATTACH_TOKEN,
+        agent_hostname=str(agent["hostname"]),
+        pod_uid=str(agent["pod_uid"]),
+        pod_ip=str(agent["pod_ip"]),
+        pod_port=int(agent["pod_port"]),
+        agent_status=str(agent["status"]),
+    )
 
 
 def _db(*, agent=None) -> SimpleNamespace:
     return SimpleNamespace(
         get_agent=AsyncMock(return_value=agent),
+        get_pinned_session_binding=AsyncMock(return_value=_binding(agent)),
         enqueue_session_wake_event=AsyncMock(return_value=True),
         save_thread_message=AsyncMock(),
     )

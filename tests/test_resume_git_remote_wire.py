@@ -11,6 +11,7 @@ pattern from tests/test_dual_app_stop_reset.py).
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -88,6 +89,51 @@ async def test_worker_ready_endpoints_advertise_resolved_resume(monkeypatch):
 
     assert primary_response.capabilities["resolved_config_resume"] is True
     assert dual_response.capabilities["resolved_config_resume"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("protected_required", "joined_ready", "expected_protected_ready"),
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+async def test_dual_session_ready_serializes_exact_protected_contract(
+    monkeypatch, protected_required, joined_ready, expected_protected_ready
+):
+    """A protected warm attach on a dual agent advertises the same exact
+    readiness contract as persistent mode; ordinary sessions remain ready
+    without claiming an active protected mount."""
+
+    import src.api.persistent_app as persistent_app
+
+    agent = MagicMock()
+    agent.get_status.return_value = {
+        "initialized": True,
+        "connections": {"postgres": True},
+    }
+    session = MagicMock()
+    session.protected_cloud_required = protected_required
+    session.protected_cloud_ready.return_value = joined_ready
+    monkeypatch.setattr(dual_app, "_agent", agent)
+    monkeypatch.setattr(dual_app, "_shutdown_requested", False)
+    monkeypatch.setattr(dual_app, "_pod_state", dual_app.PodState.SESSION)
+    monkeypatch.setattr(persistent_app, "_session", session)
+    monkeypatch.setattr(persistent_app, "_session_ready", lambda: joined_ready)
+
+    ready = next(
+        route.endpoint
+        for route in dual_app.create_dual_app().routes
+        if getattr(route, "path", "") == "/ready"
+    )
+    response = await ready()
+    serialized = json.loads(response.model_dump_json())
+
+    assert serialized["ready"] is joined_ready
+    assert serialized["capabilities"]["durable_input_delivery"] is True
+    assert type(serialized["capabilities"]["protected_cloud_contract"]) is int
+    assert serialized["capabilities"]["protected_cloud_contract"] == 1
+    assert (
+        serialized["capabilities"]["protected_cloud_ready"] is expected_protected_ready
+    )
 
 
 def _sandbox_runtime() -> dict[str, str]:

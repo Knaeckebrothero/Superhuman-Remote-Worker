@@ -10,6 +10,7 @@ actually delete pods rather than flicker a status field nothing reads.
 from contextlib import asynccontextmanager
 import json
 from unittest.mock import AsyncMock, patch
+from uuid import UUID
 
 import pytest
 
@@ -39,6 +40,119 @@ def _make_db_with_mocked_acquire(
 
     db.acquire = fake_acquire
     return db, conn
+
+
+class TestHeartbeatPreservesWarmAttachReservation:
+    """A mixed-version pool heartbeat cannot erase status=session."""
+
+    @pytest.mark.asyncio
+    async def test_bound_session_rejects_ready_heartbeat(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        conn.fetchrow.return_value["thread_id"] = "22222222-2222-2222-2222-222222222222"
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+
+        assert result["effective_status"] == "session"
+        sql = conn.execute.await_args.args[0]
+        assert "status = 'session' AND thread_id IS NOT NULL" in sql
+        assert "= 'ready' THEN 'session'" in sql
+
+    @pytest.mark.asyncio
+    async def test_unbound_session_status_can_return_ready(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        conn.fetchrow.return_value["thread_id"] = None
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+
+        assert result["effective_status"] == "ready"
+
+
+class TestHeartbeatPinnedRuntimeAuthority:
+    """A delayed G1 beat cannot mutate a same-agent G2 binding."""
+
+    @staticmethod
+    def _bind_row(conn, *, generation: str, attach_token: str | None) -> None:
+        conn.fetchrow.return_value.update(
+            {
+                "thread_id": "22222222-2222-2222-2222-222222222222",
+                "execution_lane": "pinned",
+                "thread_runtime_generation": UUID(generation),
+                "thread_runtime_attach_token": (
+                    UUID(attach_token) if attach_token is not None else None
+                ),
+                "runtime_retirement_token": None,
+                "thread_status": "active",
+                "thread_metadata": {"protected_cloud": True},
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_never_updates_liveness_or_metrics(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        self._bind_row(
+            conn,
+            generation="33333333-3333-3333-3333-333333333333",
+            attach_token="44444444-4444-4444-4444-444444444444",
+        )
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="session",
+            metrics={"graph_progress": 9},
+            session_runtime_generation="55555555-5555-5555-5555-555555555555",
+            session_runtime_attach_token="44444444-4444-4444-4444-444444444444",
+        )
+
+        assert result == {
+            "authority_refused": True,
+            "thread_id": "22222222-2222-2222-2222-222222222222",
+        }
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exact_identity_is_rechecked_inside_final_update(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        generation = "33333333-3333-3333-3333-333333333333"
+        token = "44444444-4444-4444-4444-444444444444"
+        self._bind_row(conn, generation=generation, attach_token=token)
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="session",
+            session_runtime_generation=generation,
+            session_runtime_attach_token=token,
+        )
+
+        assert result is not None and not result.get("authority_refused")
+        sql, *params = conn.execute.await_args.args
+        assert "thread.runtime_retirement_token IS NULL" in sql
+        assert "thread.runtime_generation =" in sql
+        assert "thread.runtime_attach_token" in sql
+        assert UUID(generation) in params
+        assert UUID(token) in params
+
+    @pytest.mark.asyncio
+    async def test_protected_runtime_missing_identity_fails_closed(self):
+        db, conn = _make_db_with_mocked_acquire(prev_status="session")
+        self._bind_row(
+            conn,
+            generation="33333333-3333-3333-3333-333333333333",
+            attach_token=None,
+        )
+
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="session",
+        )
+
+        assert result and result.get("authority_refused") is True
+        conn.execute.assert_not_awaited()
 
 
 class TestHeartbeatPreservesDraining:

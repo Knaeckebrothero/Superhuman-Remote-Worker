@@ -31,7 +31,12 @@ import main
 # catch must use the identical import path.
 from services.cloud_staging.apply import StagedApplyError
 
-THREAD_ID = "thread-apply-ep-1"
+THREAD_ID = "11111111-1111-4111-8111-111111111111"
+AGENT_ID = "22222222-2222-4222-8222-222222222222"
+RUNTIME_GENERATION = "33333333-3333-4333-8333-333333333333"
+ATTACH_TOKEN = "44444444-4444-4444-8444-444444444444"
+WORKSPACE_GENERATION = "55555555-5555-4555-8555-555555555555"
+WORKSPACE_RUNTIME = "66666666-6666-4666-8666-666666666666"
 
 
 # --------------------------------------------------------------------------- #
@@ -43,13 +48,40 @@ def _make_user() -> dict:
     return {"id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "email": "user@example.test"}
 
 
-def _make_thread(*, protected: bool = True, agent_id: str | None = "agent-1") -> dict:
-    metadata = {"protected_cloud": protected}
+def _make_thread(*, protected: bool = True, agent_id: str | None = AGENT_ID) -> dict:
+    metadata = {
+        "protected_cloud": protected,
+        "workspace_container": {
+            "status": "ready",
+            "_canvas_workspace_generation": WORKSPACE_GENERATION,
+            "_runtime_incarnation": WORKSPACE_RUNTIME,
+        },
+        "_workspace_binding": {
+            "kind": "remote",
+            "generation": WORKSPACE_GENERATION,
+        },
+    }
     return {
         "id": THREAD_ID,
         "user_id": _make_user()["id"],
         "metadata": metadata,
         "agent_id": agent_id,
+        "execution_lane": "pinned",
+        "runtime_generation": RUNTIME_GENERATION,
+        "runtime_attach_token": ATTACH_TOKEN,
+        "runtime_retirement_token": None,
+    }
+
+
+def _staged_summary(*, runtime_generation: str = RUNTIME_GENERATION) -> dict:
+    return {
+        "producer": {
+            "agent_id": AGENT_ID,
+            "runtime_generation": runtime_generation,
+            "runtime_attach_token": ATTACH_TOKEN,
+            "workspace_generation": WORKSPACE_GENERATION,
+            "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
+        }
     }
 
 
@@ -71,6 +103,9 @@ def _patch_endpoint(
             patch("main.require_thread_owner", AsyncMock(return_value=(user, thread)))
         )
     db = MagicMock()
+    db.get_ro_mount_by_thread = AsyncMock(
+        return_value={"staged_epoch": 5, "staged_summary": _staged_summary()}
+    )
     stack.enter_context(patch("main.postgres_db", db))
     stack.enter_context(patch("main.snapshot_service", MagicMock()))
     stack.enter_context(patch("main.main_cloud_router", MagicMock()))
@@ -133,7 +168,10 @@ class TestApplyEndpoint:
             # not just "a callable".
             out = await kwargs["reset_agent_overlay"]()
             assert out is True
-            main._reset_thread_overlay.assert_awaited_once_with(THREAD_ID, thread)
+            main._reset_thread_overlay.assert_awaited_once_with(
+                THREAD_ID,
+                main._capture_thread_overlay_reset_authority(thread, _staged_summary()),
+            )
 
     @pytest.mark.asyncio
     async def test_apply_missing_epoch_defaults_to_sentinel(self, fake_request):
@@ -385,33 +423,68 @@ class _FakeAsyncClient:
     async def __aexit__(self, *_a):
         return False
 
-    async def post(self, _url):
+    async def post(self, url, *, headers=None, json=None):
         if self._exc is not None:
             raise self._exc
+        self.url = url
+        self.headers = headers
+        self.json = json
         return self._response
 
 
 class TestResetThreadOverlay:
+    @staticmethod
+    def _authority() -> dict[str, str]:
+        authority = main._capture_thread_overlay_reset_authority(
+            _make_thread(), _staged_summary()
+        )
+        assert authority is not None
+        return authority
+
+    @staticmethod
+    def _db(*, thread=None, agent=None, reciprocal=True):
+        db = MagicMock()
+        db.get_thread = AsyncMock(
+            side_effect=[thread or _make_thread(), thread or _make_thread()]
+        )
+        db.get_agent = AsyncMock(
+            return_value=agent
+            or {
+                "id": AGENT_ID,
+                "thread_id": THREAD_ID,
+                "pod_ip": "10.0.0.9",
+                "pod_port": 8001,
+            }
+        )
+        db.pinned_thread_agent_is_reciprocal = AsyncMock(return_value=reciprocal)
+        return db
+
     @pytest.mark.asyncio
     async def test_reset_overlay_true_on_200(self):
-        db = MagicMock()
-        db.get_agent = AsyncMock(return_value={"pod_ip": "10.0.0.9", "pod_port": 8001})
+        db = self._db()
+        client = _FakeAsyncClient(response=_FakeResponse(200))
         with (
             patch("main.postgres_db", db),
-            patch(
-                "main.httpx.AsyncClient",
-                return_value=_FakeAsyncClient(response=_FakeResponse(200)),
-            ),
+            patch("main.httpx.AsyncClient", return_value=client),
         ):
-            out = await main._reset_thread_overlay(THREAD_ID, {"agent_id": "agent-1"})
+            out = await main._reset_thread_overlay(THREAD_ID, self._authority())
         assert out is True
+        assert client.headers == {
+            "X-Agent-ID": AGENT_ID,
+            "X-Session-Runtime-Generation": RUNTIME_GENERATION,
+            "X-Session-Runtime-Attach-Token": ATTACH_TOKEN,
+        }
+        assert client.json == {
+            "thread_id": THREAD_ID,
+            "workspace_generation": WORKSPACE_GENERATION,
+            "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
+        }
 
     @pytest.mark.asyncio
     async def test_reset_overlay_false_on_404(self):
         """404 (pod alive, overlay unavailable — Task 9's contract) is not
         fatal; it's still just a normal False."""
-        db = MagicMock()
-        db.get_agent = AsyncMock(return_value={"pod_ip": "10.0.0.9", "pod_port": 8001})
+        db = self._db()
         with (
             patch("main.postgres_db", db),
             patch(
@@ -419,14 +492,13 @@ class TestResetThreadOverlay:
                 return_value=_FakeAsyncClient(response=_FakeResponse(404)),
             ),
         ):
-            out = await main._reset_thread_overlay(THREAD_ID, {"agent_id": "agent-1"})
+            out = await main._reset_thread_overlay(THREAD_ID, self._authority())
         assert out is False
 
     @pytest.mark.asyncio
     async def test_reset_overlay_false_on_exception(self):
         """Dead/unreachable pod -> exception -> False, never raises."""
-        db = MagicMock()
-        db.get_agent = AsyncMock(return_value={"pod_ip": "10.0.0.9", "pod_port": 8001})
+        db = self._db()
         with (
             patch("main.postgres_db", db),
             patch(
@@ -434,18 +506,64 @@ class TestResetThreadOverlay:
                 return_value=_FakeAsyncClient(exc=ConnectionError("dead pod")),
             ),
         ):
-            out = await main._reset_thread_overlay(THREAD_ID, {"agent_id": "agent-1"})
+            out = await main._reset_thread_overlay(THREAD_ID, self._authority())
         assert out is False
 
     @pytest.mark.asyncio
     async def test_reset_overlay_false_when_no_agent_bound(self):
-        out = await main._reset_thread_overlay(THREAD_ID, {})
+        out = await main._reset_thread_overlay(THREAD_ID, None)
         assert out is False
 
     @pytest.mark.asyncio
     async def test_reset_overlay_false_when_agent_has_no_pod_ip(self):
-        db = MagicMock()
-        db.get_agent = AsyncMock(return_value={"pod_ip": None})
+        db = self._db(agent={"id": AGENT_ID, "thread_id": THREAD_ID, "pod_ip": None})
         with patch("main.postgres_db", db):
-            out = await main._reset_thread_overlay(THREAD_ID, {"agent_id": "agent-1"})
+            out = await main._reset_thread_overlay(THREAD_ID, self._authority())
         assert out is False
+
+    @pytest.mark.asyncio
+    async def test_reset_overlay_refuses_successor_before_http(self):
+        successor = _make_thread()
+        successor["runtime_generation"] = "77777777-7777-4777-8777-777777777777"
+        db = self._db(thread=successor)
+        client = _FakeAsyncClient(response=_FakeResponse(200))
+        with (
+            patch("main.postgres_db", db),
+            patch("main.httpx.AsyncClient", return_value=client) as http_client,
+        ):
+            out = await main._reset_thread_overlay(THREAD_ID, self._authority())
+        assert out is False
+        http_client.assert_not_called()
+
+    def test_capture_refuses_review_from_predecessor_generation(self):
+        assert (
+            main._capture_thread_overlay_reset_authority(
+                _make_thread(),
+                _staged_summary(
+                    runtime_generation="77777777-7777-4777-8777-777777777777"
+                ),
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_reset_overlay_drops_workspace_replacement_at_final_read(self):
+        successor = _make_thread()
+        successor["metadata"] = dict(successor["metadata"])
+        successor["metadata"]["workspace_container"] = dict(
+            successor["metadata"]["workspace_container"]
+        )
+        successor["metadata"]["workspace_container"]["_runtime_incarnation"] = (
+            "77777777-7777-4777-8777-777777777777"
+        )
+        db = self._db()
+        db.get_thread = AsyncMock(side_effect=[_make_thread(), successor])
+        client = _FakeAsyncClient(response=_FakeResponse(200))
+        with (
+            patch("main.postgres_db", db),
+            patch("main.httpx.AsyncClient", return_value=client) as http_client,
+        ):
+            out = await main._reset_thread_overlay(THREAD_ID, self._authority())
+        assert out is False
+        http_client.assert_not_called()
+        db.pinned_thread_agent_is_reciprocal.assert_not_awaited()

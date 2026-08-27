@@ -1635,7 +1635,13 @@ export interface PromoteRequest {
  * live-resumable: sending a message wakes the session on a fresh agent.
  * Only 'ended' renders the resume card.
  */
-export type ThreadStatus = 'created' | 'active' | 'awaiting_user' | 'suspended' | 'ended';
+export type ThreadStatus =
+  | 'created'
+  | 'active'
+  | 'awaiting_user'
+  | 'suspended'
+  | 'ending'
+  | 'ended';
 
 /**
  * One remote folder attached to a thread, as projected by
@@ -1681,6 +1687,10 @@ export interface Thread {
   created_at: string;
   last_activity: string;
   ended_at?: string | null;
+  /** Safe, derived public projection of an in-progress pinned retirement.
+   *  Raw retirement tokens/context never belong in an owner payload. */
+  runtime_retirement_pending?: boolean;
+  retirement_disposition?: 'ended' | 'suspended' | null;
   total_turns: number;
   total_tokens: number;
   nc_session_folder?: string | null;

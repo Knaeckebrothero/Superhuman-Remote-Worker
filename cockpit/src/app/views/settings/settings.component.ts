@@ -1,29 +1,37 @@
-import {ChangeDetectionStrategy, Component, computed, effect, inject, OnInit, signal} from '@angular/core';
-import {Router} from '@angular/router';
-import {environment} from '../../core/environment';
-import {McpTokenService} from '../../core/services/mcp-token.service';
-import {UserService} from '../../core/services/user.service';
-import {ViewModeService} from '../../core/services/view-mode.service';
-import {ApiService} from '../../core/services/api.service';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  effect,
+  inject,
+  OnInit,
+  signal,
+} from '@angular/core';
+import { Router } from '@angular/router';
+import { environment } from '../../core/environment';
+import { McpTokenService } from '../../core/services/mcp-token.service';
+import { UserService } from '../../core/services/user.service';
+import { ViewModeService } from '../../core/services/view-mode.service';
+import { ApiService } from '../../core/services/api.service';
 import {
   SettingsService,
   MainCloudSettingsResponse,
   MainCloudFormState,
 } from '../../core/services/settings.service';
-import {ModelService} from '../../core/services/model.service';
-import {CapabilitiesService} from '../../core/services/capabilities.service';
-import {I18nService, SupportedLang} from '../../core/services/i18n.service';
-import type {ExpertEditorNavigationState} from '../experts/expert-editor.component';
+import { ModelService } from '../../core/services/model.service';
+import { CapabilitiesService } from '../../core/services/capabilities.service';
+import { I18nService, SupportedLang } from '../../core/services/i18n.service';
+import type { ExpertEditorNavigationState } from '../experts/expert-editor.component';
 import {
-    ApiKeyProvider,
-    CodexStatus,
-    CodexUsage,
-    CommunicationSettings,
-    Expert,
-    ExpertDefaultsResponse,
-    McpTokenCreateResponse,
-    Project,
-    ReadAloudReasoningLevel
+  ApiKeyProvider,
+  CodexStatus,
+  CodexUsage,
+  CommunicationSettings,
+  Expert,
+  ExpertDefaultsResponse,
+  McpTokenCreateResponse,
+  Project,
+  ReadAloudReasoningLevel,
 } from '../../core/models/api.model';
 import {
   voicesForModelId,
@@ -32,18 +40,18 @@ import {
   TtsAccountVoice,
   TtsLibraryVoice,
 } from '../../core/models/tts-voices';
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
-import {AppThemeToggleComponent} from '../../ui/theme-toggle';
-import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {AppButtonComponent} from '../../ui/button';
-import {AppInputComponent} from '../../ui/input';
-import {AppTextareaComponent} from '../../ui/textarea';
-import {AppSelectComponent} from '../../ui/select';
-import {AppSwitchComponent} from '../../ui/switch';
-import {AppCheckboxComponent} from '../../ui/checkbox';
-import {AppFormFieldComponent} from '../../ui/form-field';
-import {AppBadgeComponent} from '../../ui/badge';
-import {AppIconComponent} from '../../ui/icon';
+import { SidebarToggleComponent } from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import { AppThemeToggleComponent } from '../../ui/theme-toggle';
+import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
+import { AppButtonComponent } from '../../ui/button';
+import { AppInputComponent } from '../../ui/input';
+import { AppTextareaComponent } from '../../ui/textarea';
+import { AppSelectComponent } from '../../ui/select';
+import { AppSwitchComponent } from '../../ui/switch';
+import { AppCheckboxComponent } from '../../ui/checkbox';
+import { AppFormFieldComponent } from '../../ui/form-field';
+import { AppBadgeComponent } from '../../ui/badge';
+import { AppIconComponent } from '../../ui/icon';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
@@ -95,7 +103,10 @@ const EXPIRY_OPTIONS = [
           <p class="section-desc">{{ 'settings.appearance.desc' | transloco }}</p>
           <div class="form-block">
             <app-form-field [label]="'settings.appearance.themeLabel' | transloco">
-              <app-theme-toggle [showLabels]="true" [ariaLabel]="'settings.appearance.themeLabel' | transloco" />
+              <app-theme-toggle
+                [showLabels]="true"
+                [ariaLabel]="'settings.appearance.themeLabel' | transloco"
+              />
             </app-form-field>
           </div>
         </section>
@@ -106,10 +117,7 @@ const EXPIRY_OPTIONS = [
           <p class="section-desc">{{ 'settings.language.desc' | transloco }}</p>
           <div class="form-block">
             <app-form-field [label]="'settings.language.label' | transloco">
-              <app-select
-                [value]="i18n.activeLang()"
-                (changed)="onLanguageChange($any($event))"
-              >
+              <app-select [value]="i18n.activeLang()" (changed)="onLanguageChange($any($event))">
                 <option value="en">English</option>
                 <option value="de-DE">Deutsch</option>
               </app-select>
@@ -129,7 +137,14 @@ const EXPIRY_OPTIONS = [
               >
                 <app-select [value]="ttsModel()" (changed)="setTtsModel($any($event))">
                   @for (m of modelService.ttsModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !ttsModelOverridden() && m.id === resolved().default_tts_model ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                    <option [value]="m.id">
+                      {{ m.label
+                      }}{{
+                        !ttsModelOverridden() && m.id === resolved().default_tts_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}
+                    </option>
                   }
                 </app-select>
               </app-form-field>
@@ -182,7 +197,9 @@ const EXPIRY_OPTIONS = [
                   size="sm"
                   [placeholder]="'settings.voice.samplePlaceholder' | transloco"
                 />
-                <p class="voice-sample-hint">{{ 'settings.voice.sampleHint' | transloco: {left: previewCharsLeft()} }}</p>
+                <p class="voice-sample-hint">
+                  {{ 'settings.voice.sampleHint' | transloco: { left: previewCharsLeft() } }}
+                </p>
               </app-form-field>
               <div class="voice-preview-row">
                 <app-button
@@ -196,11 +213,7 @@ const EXPIRY_OPTIONS = [
                   {{ 'settings.voice.preview' | transloco }}
                 </app-button>
                 @if (ttsBackend() === 'elevenlabs' && selectedElevenVoice()?.preview_url) {
-                  <app-button
-                    variant="ghost"
-                    size="sm"
-                    (clicked)="playHostedPreview()"
-                  >
+                  <app-button variant="ghost" size="sm" (clicked)="playHostedPreview()">
                     <app-icon size="sm">graphic_eq</app-icon>
                     {{ 'settings.voice.hostedPreview' | transloco }}
                   </app-button>
@@ -230,7 +243,9 @@ const EXPIRY_OPTIONS = [
                   >
                     <option value="off">{{ 'settings.voice.reasoningOff' | transloco }}</option>
                     <option value="low">{{ 'settings.voice.reasoningLow' | transloco }}</option>
-                    <option value="medium">{{ 'settings.voice.reasoningMedium' | transloco }}</option>
+                    <option value="medium">
+                      {{ 'settings.voice.reasoningMedium' | transloco }}
+                    </option>
                     <option value="high">{{ 'settings.voice.reasoningHigh' | transloco }}</option>
                   </app-select>
                 </app-form-field>
@@ -245,7 +260,12 @@ const EXPIRY_OPTIONS = [
                     size="sm"
                     [placeholder]="'settings.voice.rewritePromptPlaceholder' | transloco"
                   />
-                  <p class="voice-sample-hint">{{ 'settings.voice.rewritePromptCounter' | transloco: {left: readAloudPromptCharsLeft()} }}</p>
+                  <p class="voice-sample-hint">
+                    {{
+                      'settings.voice.rewritePromptCounter'
+                        | transloco: { left: readAloudPromptCharsLeft() }
+                    }}
+                  </p>
                 </app-form-field>
                 <div class="actions-row">
                   <app-button
@@ -255,7 +275,11 @@ const EXPIRY_OPTIONS = [
                     [disabled]="savingReadAloud()"
                     (clicked)="saveReadAloud()"
                   >
-                    {{ savingReadAloud() ? ('common.saving' | transloco) : ('settings.voice.rewriteSave' | transloco) }}
+                    {{
+                      savingReadAloud()
+                        ? ('common.saving' | transloco)
+                        : ('settings.voice.rewriteSave' | transloco)
+                    }}
                   </app-button>
                   @if (readAloudSaved()) {
                     <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
@@ -270,7 +294,9 @@ const EXPIRY_OPTIONS = [
                 <div class="voice-library">
                   <div class="voice-library-head">
                     <app-button variant="ghost" size="sm" (clicked)="toggleLibrary()">
-                      <app-icon size="sm">{{ libraryOpen() ? 'expand_less' : 'travel_explore' }}</app-icon>
+                      <app-icon size="sm">{{
+                        libraryOpen() ? 'expand_less' : 'travel_explore'
+                      }}</app-icon>
                       {{ 'settings.voice.libraryToggle' | transloco }}
                     </app-button>
                     @if (userService.currentUser()?.is_admin) {
@@ -293,8 +319,13 @@ const EXPIRY_OPTIONS = [
                         [placeholder]="'settings.voice.librarySearchPlaceholder' | transloco"
                         (changed)="librarySearch.set($event)"
                       />
-                      <app-select [value]="libraryGender()" (changed)="libraryGender.set($any($event))">
-                        <option value="">{{ 'settings.voice.libraryAnyGender' | transloco }}</option>
+                      <app-select
+                        [value]="libraryGender()"
+                        (changed)="libraryGender.set($any($event))"
+                      >
+                        <option value="">
+                          {{ 'settings.voice.libraryAnyGender' | transloco }}
+                        </option>
                         <option value="female">{{ 'settings.voice.female' | transloco }}</option>
                         <option value="male">{{ 'settings.voice.male' | transloco }}</option>
                       </app-select>
@@ -314,7 +345,9 @@ const EXPIRY_OPTIONS = [
                       <p class="voice-preview-error">{{ libraryError() }}</p>
                     }
                     @if (libraryVoices().length > 0) {
-                      <p class="voice-lang-note">{{ 'settings.voice.libraryPreviewCaveat' | transloco }}</p>
+                      <p class="voice-lang-note">
+                        {{ 'settings.voice.libraryPreviewCaveat' | transloco }}
+                      </p>
                     }
 
                     <div class="voice-library-results">
@@ -323,7 +356,9 @@ const EXPIRY_OPTIONS = [
                           <div class="voice-library-card__info">
                             <span class="voice-library-card__name">{{ v.name }}</span>
                             @if (libraryVoiceLabel(v)) {
-                              <span class="voice-library-card__tags">{{ libraryVoiceLabel(v) }}</span>
+                              <span class="voice-library-card__tags">{{
+                                libraryVoiceLabel(v)
+                              }}</span>
                             }
                           </div>
                           <div class="voice-library-card__actions">
@@ -359,7 +394,9 @@ const EXPIRY_OPTIONS = [
                         </div>
                       }
                       @if (!libraryLoading() && libraryVoices().length === 0 && !libraryError()) {
-                        <p class="voice-lang-note">{{ 'settings.voice.libraryEmpty' | transloco }}</p>
+                        <p class="voice-lang-note">
+                          {{ 'settings.voice.libraryEmpty' | transloco }}
+                        </p>
                       }
                     </div>
                   }
@@ -457,7 +494,11 @@ const EXPIRY_OPTIONS = [
               [disabled]="settingKey() || !keyValue().trim()"
               (clicked)="saveApiKey()"
             >
-              {{ settingKey() ? ('common.saving' | transloco) : ('settings.apiKeys.saveButton' | transloco) }}
+              {{
+                settingKey()
+                  ? ('common.saving' | transloco)
+                  : ('settings.apiKeys.saveButton' | transloco)
+              }}
             </app-button>
           </div>
         </section>
@@ -475,9 +516,22 @@ const EXPIRY_OPTIONS = [
                   (changed)="onPrefChange(prefModel, resolved().default_model, $event)"
                 >
                   @for (group of modelService.models(); track group.group) {
-                    <optgroup [label]="group.configured ? group.group : group.group + ' ' + ('settings.preferences.noApiKey' | transloco)">
+                    <optgroup
+                      [label]="
+                        group.configured
+                          ? group.group
+                          : group.group + ' ' + ('settings.preferences.noApiKey' | transloco)
+                      "
+                    >
                       @for (model of group.models; track model) {
-                        <option [value]="model">{{ model }}{{ !prefModel() && model === resolved().default_model ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                        <option [value]="model">
+                          {{ model
+                          }}{{
+                            !prefModel() && model === resolved().default_model
+                              ? ' (' + ('common.default' | transloco) + ')'
+                              : ''
+                          }}
+                        </option>
                       }
                     </optgroup>
                   }
@@ -489,7 +543,14 @@ const EXPIRY_OPTIONS = [
                   (changed)="onPrefChange(prefAuxModel, resolved().default_auxiliary_model, $event)"
                 >
                   @for (m of modelService.auxiliaryModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !prefAuxModel() && m.id === resolved().default_auxiliary_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
+                    <option [value]="m.id">
+                      {{ m.label
+                      }}{{
+                        !prefAuxModel() && m.id === resolved().default_auxiliary_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                    </option>
                   }
                 </app-select>
               </app-form-field>
@@ -500,66 +561,177 @@ const EXPIRY_OPTIONS = [
                   [value]="prefAutonomy() ?? resolved().default_autonomy ?? ''"
                   (changed)="onPrefChange(prefAutonomy, resolved().default_autonomy, $event)"
                 >
-                  <option value="full">{{ 'settings.preferences.autonomyFull' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'full' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="review">{{ 'settings.preferences.autonomyReview' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'review' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="partial">{{ 'settings.preferences.autonomyPartial' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'partial' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="guided">{{ 'settings.preferences.autonomyGuided' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'guided' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="dependent">{{ 'settings.preferences.autonomyDependent' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'dependent' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="full">
+                    {{ 'settings.preferences.autonomyFull' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'full'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="review">
+                    {{ 'settings.preferences.autonomyReview' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'review'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="partial">
+                    {{ 'settings.preferences.autonomyPartial' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'partial'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="guided">
+                    {{ 'settings.preferences.autonomyGuided' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'guided'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="dependent">
+                    {{ 'settings.preferences.autonomyDependent' | transloco
+                    }}{{
+                      !prefAutonomy() && resolved().default_autonomy === 'dependent'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
                 </app-select>
               </app-form-field>
               <app-form-field [label]="'settings.preferences.reasoning' | transloco">
                 <app-select
                   [value]="prefReasoning() ?? resolved().default_reasoning_level ?? ''"
-                  (changed)="onPrefChange(prefReasoning, resolved().default_reasoning_level, $event)"
+                  (changed)="
+                    onPrefChange(prefReasoning, resolved().default_reasoning_level, $event)
+                  "
                 >
-                  <option value="low">{{ 'settings.preferences.reasoningLow' | transloco }}{{ !prefReasoning() && resolved().default_reasoning_level === 'low' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="medium">{{ 'settings.preferences.reasoningMedium' | transloco }}{{ !prefReasoning() && resolved().default_reasoning_level === 'medium' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="high">{{ 'settings.preferences.reasoningHigh' | transloco }}{{ !prefReasoning() && resolved().default_reasoning_level === 'high' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="low">
+                    {{ 'settings.preferences.reasoningLow' | transloco
+                    }}{{
+                      !prefReasoning() && resolved().default_reasoning_level === 'low'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="medium">
+                    {{ 'settings.preferences.reasoningMedium' | transloco
+                    }}{{
+                      !prefReasoning() && resolved().default_reasoning_level === 'medium'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="high">
+                    {{ 'settings.preferences.reasoningHigh' | transloco
+                    }}{{
+                      !prefReasoning() && resolved().default_reasoning_level === 'high'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
                 </app-select>
               </app-form-field>
             </div>
 
             <h3 class="subsection-title">{{ 'settings.preferences.helperModels' | transloco }}</h3>
             <div class="form-row two-col">
-              <app-form-field [label]="'settings.preferences.visionModel' | transloco" [hint]="'settings.preferences.visionHint' | transloco">
+              <app-form-field
+                [label]="'settings.preferences.visionModel' | transloco"
+                [hint]="'settings.preferences.visionHint' | transloco"
+              >
                 <app-select
                   [value]="prefVisionModel() ?? resolved().default_vision_model ?? ''"
                   (changed)="onPrefChange(prefVisionModel, resolved().default_vision_model, $event)"
                 >
                   @for (m of modelService.visionModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !prefVisionModel() && m.id === resolved().default_vision_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
+                    <option [value]="m.id">
+                      {{ m.label
+                      }}{{
+                        !prefVisionModel() && m.id === resolved().default_vision_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                    </option>
                   }
                 </app-select>
               </app-form-field>
-              <app-form-field [label]="'settings.preferences.whisperModel' | transloco" [hint]="'settings.preferences.whisperHint' | transloco">
+              <app-form-field
+                [label]="'settings.preferences.whisperModel' | transloco"
+                [hint]="'settings.preferences.whisperHint' | transloco"
+              >
                 <app-select
                   [value]="prefWhisperModel() ?? resolved().default_whisper_model ?? ''"
-                  (changed)="onPrefChange(prefWhisperModel, resolved().default_whisper_model, $event)"
+                  (changed)="
+                    onPrefChange(prefWhisperModel, resolved().default_whisper_model, $event)
+                  "
                 >
                   @for (m of modelService.whisperModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !prefWhisperModel() && m.id === resolved().default_whisper_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
+                    <option [value]="m.id">
+                      {{ m.label
+                      }}{{
+                        !prefWhisperModel() && m.id === resolved().default_whisper_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                    </option>
                   }
                 </app-select>
               </app-form-field>
             </div>
             <div class="form-row two-col">
-              <app-form-field [label]="'settings.preferences.embeddingModel' | transloco" [hint]="'settings.preferences.embeddingHint' | transloco">
+              <app-form-field
+                [label]="'settings.preferences.embeddingModel' | transloco"
+                [hint]="'settings.preferences.embeddingHint' | transloco"
+              >
                 <app-select
                   [value]="prefEmbeddingModel() ?? resolved().default_embedding_model ?? ''"
-                  (changed)="onPrefChange(prefEmbeddingModel, resolved().default_embedding_model, $event)"
+                  (changed)="
+                    onPrefChange(prefEmbeddingModel, resolved().default_embedding_model, $event)
+                  "
                 >
                   @for (m of modelService.embeddingModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : '' }}{{ !prefEmbeddingModel() && m.id === resolved().default_embedding_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
+                    <option [value]="m.id">
+                      {{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : ''
+                      }}{{
+                        !prefEmbeddingModel() && m.id === resolved().default_embedding_model
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                    </option>
                   }
                 </app-select>
               </app-form-field>
-              <app-form-field [label]="'settings.preferences.embeddingProvider' | transloco" [hint]="'settings.preferences.embeddingProviderHint' | transloco">
+              <app-form-field
+                [label]="'settings.preferences.embeddingProvider' | transloco"
+                [hint]="'settings.preferences.embeddingProviderHint' | transloco"
+              >
                 <app-select
                   [value]="prefEmbeddingProvider() ?? resolved().embedding_provider ?? ''"
-                  (changed)="onPrefChange(prefEmbeddingProvider, resolved().embedding_provider, $event)"
+                  (changed)="
+                    onPrefChange(prefEmbeddingProvider, resolved().embedding_provider, $event)
+                  "
                 >
-                  <option value="local">{{ 'settings.preferences.providerLocal' | transloco }}{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'local' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="openrouter">{{ 'settings.preferences.providerOpenrouter' | transloco }}{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'openrouter' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="local">
+                    {{ 'settings.preferences.providerLocal' | transloco
+                    }}{{
+                      !prefEmbeddingProvider() && resolved().embedding_provider === 'local'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
+                  <option value="openrouter">
+                    {{ 'settings.preferences.providerOpenrouter' | transloco
+                    }}{{
+                      !prefEmbeddingProvider() && resolved().embedding_provider === 'openrouter'
+                        ? ' (' + ('common.default' | transloco) + ')'
+                        : ''
+                    }}
+                  </option>
                 </app-select>
               </app-form-field>
             </div>
@@ -572,7 +744,11 @@ const EXPIRY_OPTIONS = [
                 [disabled]="savingPrefs()"
                 (clicked)="savePreferences()"
               >
-                {{ savingPrefs() ? ('common.saving' | transloco) : ('settings.preferences.save' | transloco) }}
+                {{
+                  savingPrefs()
+                    ? ('common.saving' | transloco)
+                    : ('settings.preferences.save' | transloco)
+                }}
               </app-button>
               @if (prefsSaved()) {
                 <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
@@ -594,7 +770,7 @@ const EXPIRY_OPTIONS = [
               @for (type of expertDefaultTypes; track type) {
                 <div class="form-row two-col">
                   <app-form-field
-                    [label]="('settings.expertDefaults.' + type) | transloco"
+                    [label]="'settings.expertDefaults.' + type | transloco"
                     [hint]="defaultExpertHint(type)"
                   >
                     <app-select
@@ -602,7 +778,9 @@ const EXPIRY_OPTIONS = [
                       [disabled]="!defaults.personal_defaults_allowed || !!defaultExpertBusy()"
                       (changed)="setDefaultExpert(type, $event ?? '')"
                     >
-                      <option value="">{{ 'settings.expertDefaults.useApplication' | transloco }}</option>
+                      <option value="">
+                        {{ 'settings.expertDefaults.useApplication' | transloco }}
+                      </option>
                       @for (expert of ownedExperts(type); track expert.id) {
                         <option [value]="expert.id">{{ expert.display_name }}</option>
                       }
@@ -648,25 +826,76 @@ const EXPIRY_OPTIONS = [
           <div class="form-block">
             <app-form-field
               [label]="'settings.persistent.model' | transloco"
-              [hint]="paModel() ? '' : (resolved().persistent_agent?.model ? ('settings.persistent.defaultPrefix' | transloco) + ' ' + (resolved().persistent_agent?.model || '') : '')"
+              [hint]="
+                paModel()
+                  ? ''
+                  : resolved().persistent_agent?.model
+                    ? ('settings.persistent.defaultPrefix' | transloco) +
+                      ' ' +
+                      (resolved().persistent_agent?.model || '')
+                    : ''
+              "
             >
               <app-input
                 [value]="paModel() ?? ''"
-                [placeholder]="resolved().persistent_agent?.model ?? ('settings.persistent.modelPlaceholder' | transloco)"
+                [placeholder]="
+                  resolved().persistent_agent?.model ??
+                  ('settings.persistent.modelPlaceholder' | transloco)
+                "
                 (changed)="onPaModelChange($event)"
               />
             </app-form-field>
             <app-form-field
               [label]="'settings.persistent.permissionMode' | transloco"
-              [hint]="capabilities.permissionRestricted() ? ('grants.locked.permission_mode' | transloco) : ''"
+              [hint]="
+                capabilities.permissionRestricted()
+                  ? ('grants.locked.permission_mode' | transloco)
+                  : ''
+              "
             >
               <app-select
                 [value]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
-                (changed)="onPrefChange(paPermissionMode, resolved().persistent_agent?.permission_mode, $event)"
+                (changed)="
+                  onPrefChange(
+                    paPermissionMode,
+                    resolved().persistent_agent?.permission_mode,
+                    $event
+                  )
+                "
               >
-                <option value="supervised">{{ 'settings.persistent.permissionSupervised' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'supervised' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                <option value="auto_accept" [disabled]="!capabilities.allowsPermissionMode('auto_accept')">{{ 'settings.persistent.permissionAutoAccept' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'auto_accept' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                <option value="autonomous" [disabled]="!capabilities.allowsPermissionMode('autonomous')">{{ 'settings.persistent.permissionAutonomous' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'autonomous' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                <option value="supervised">
+                  {{ 'settings.persistent.permissionSupervised' | transloco
+                  }}{{
+                    !paPermissionMode() &&
+                    resolved().persistent_agent?.permission_mode === 'supervised'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+                <option
+                  value="auto_accept"
+                  [disabled]="!capabilities.allowsPermissionMode('auto_accept')"
+                >
+                  {{ 'settings.persistent.permissionAutoAccept' | transloco
+                  }}{{
+                    !paPermissionMode() &&
+                    resolved().persistent_agent?.permission_mode === 'auto_accept'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+                <option
+                  value="autonomous"
+                  [disabled]="!capabilities.allowsPermissionMode('autonomous')"
+                >
+                  {{ 'settings.persistent.permissionAutonomous' | transloco
+                  }}{{
+                    !paPermissionMode() &&
+                    resolved().persistent_agent?.permission_mode === 'autonomous'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
               </app-select>
             </app-form-field>
             <app-form-field
@@ -674,12 +903,44 @@ const EXPIRY_OPTIONS = [
               [hint]="'settings.persistent.workspaceBackendHint' | transloco"
             >
               <app-select
-                [value]="paWorkspaceBackend() ?? resolved().persistent_agent?.workspace_backend ?? ''"
-                (changed)="onPrefChange(paWorkspaceBackend, resolved().persistent_agent?.workspace_backend, $event)"
+                [value]="
+                  paWorkspaceBackend() ?? resolved().persistent_agent?.workspace_backend ?? ''
+                "
+                (changed)="
+                  onPrefChange(
+                    paWorkspaceBackend,
+                    resolved().persistent_agent?.workspace_backend,
+                    $event
+                  )
+                "
               >
-                <option value="virtual">{{ 'settings.persistent.workspaceVirtual' | transloco }}{{ !paWorkspaceBackend() && resolved().persistent_agent?.workspace_backend === 'virtual' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                <option value="sandbox">{{ 'settings.persistent.workspaceSandbox' | transloco }}{{ !paWorkspaceBackend() && resolved().persistent_agent?.workspace_backend === 'sandbox' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                <option value="none">{{ 'settings.persistent.workspaceNone' | transloco }}{{ !paWorkspaceBackend() && resolved().persistent_agent?.workspace_backend === 'none' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                <option value="virtual">
+                  {{ 'settings.persistent.workspaceVirtual' | transloco
+                  }}{{
+                    !paWorkspaceBackend() &&
+                    resolved().persistent_agent?.workspace_backend === 'virtual'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+                <option value="sandbox">
+                  {{ 'settings.persistent.workspaceSandbox' | transloco
+                  }}{{
+                    !paWorkspaceBackend() &&
+                    resolved().persistent_agent?.workspace_backend === 'sandbox'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
+                <option value="none">
+                  {{ 'settings.persistent.workspaceNone' | transloco
+                  }}{{
+                    !paWorkspaceBackend() &&
+                    resolved().persistent_agent?.workspace_backend === 'none'
+                      ? ' (' + ('common.default' | transloco) + ')'
+                      : ''
+                  }}
+                </option>
               </app-select>
             </app-form-field>
             <app-form-field [label]="'settings.persistent.greeting' | transloco">
@@ -712,9 +973,15 @@ const EXPIRY_OPTIONS = [
                   [value]="paHeadlessMode() ?? ''"
                   (changed)="paHeadlessMode.set($any($event || null))"
                 >
-                  <option value="">{{ 'settings.persistent.headlessModeDefault' | transloco }}</option>
-                  <option value="eager">{{ 'settings.persistent.headlessModeEager' | transloco }}</option>
-                  <option value="polite">{{ 'settings.persistent.headlessModePolite' | transloco }}</option>
+                  <option value="">
+                    {{ 'settings.persistent.headlessModeDefault' | transloco }}
+                  </option>
+                  <option value="eager">
+                    {{ 'settings.persistent.headlessModeEager' | transloco }}
+                  </option>
+                  <option value="polite">
+                    {{ 'settings.persistent.headlessModePolite' | transloco }}
+                  </option>
                 </app-select>
               </app-form-field>
               <app-form-field
@@ -731,7 +998,11 @@ const EXPIRY_OPTIONS = [
             </div>
             <app-form-field [label]="'settings.persistent.notificationChannels' | transloco">
               <div class="channel-list">
-                <app-checkbox size="sm" [checked]="paNotifEmail()" (changed)="paNotifEmail.set($event)">
+                <app-checkbox
+                  size="sm"
+                  [checked]="paNotifEmail()"
+                  (changed)="paNotifEmail.set($event)"
+                >
                   {{ 'settings.persistent.notificationChannelEmail' | transloco }}
                 </app-checkbox>
               </div>
@@ -744,7 +1015,11 @@ const EXPIRY_OPTIONS = [
                 [disabled]="savingPA()"
                 (clicked)="savePersistentAgent()"
               >
-                {{ savingPA() ? ('common.saving' | transloco) : ('settings.persistent.save' | transloco) }}
+                {{
+                  savingPA()
+                    ? ('common.saving' | transloco)
+                    : ('settings.persistent.save' | transloco)
+                }}
               </app-button>
               @if (paSaved()) {
                 <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
@@ -764,18 +1039,44 @@ const EXPIRY_OPTIONS = [
                 [value]="commDelivery()"
                 (changed)="commDelivery.set($event ?? 'next_strategic_phase')"
               >
-                <option value="next_strategic_phase">{{ 'settings.communication.deliveryNextStrategic' | transloco }}</option>
-                <option value="immediate_interrupt">{{ 'settings.communication.deliveryImmediate' | transloco }}</option>
-                <option value="llm_triage">{{ 'settings.communication.deliveryLlmTriage' | transloco }}</option>
+                <option value="next_strategic_phase">
+                  {{ 'settings.communication.deliveryNextStrategic' | transloco }}
+                </option>
+                <option value="immediate_interrupt">
+                  {{ 'settings.communication.deliveryImmediate' | transloco }}
+                </option>
+                <option value="llm_triage">
+                  {{ 'settings.communication.deliveryLlmTriage' | transloco }}
+                </option>
               </app-select>
             </app-form-field>
 
             <app-form-field [label]="'settings.communication.channels' | transloco">
               <div class="channel-list">
-                <app-checkbox size="sm" [checked]="commChannelEmail()" (changed)="commChannelEmail.set($event)">Email</app-checkbox>
-                <app-checkbox size="sm" [checked]="commChannelNtfy()" (changed)="commChannelNtfy.set($event)">Ntfy</app-checkbox>
-                <app-checkbox size="sm" [checked]="commChannelSlack()" (changed)="commChannelSlack.set($event)">Slack</app-checkbox>
-                <app-checkbox size="sm" [checked]="commChannelDiscord()" (changed)="commChannelDiscord.set($event)">Discord</app-checkbox>
+                <app-checkbox
+                  size="sm"
+                  [checked]="commChannelEmail()"
+                  (changed)="commChannelEmail.set($event)"
+                  >Email</app-checkbox
+                >
+                <app-checkbox
+                  size="sm"
+                  [checked]="commChannelNtfy()"
+                  (changed)="commChannelNtfy.set($event)"
+                  >Ntfy</app-checkbox
+                >
+                <app-checkbox
+                  size="sm"
+                  [checked]="commChannelSlack()"
+                  (changed)="commChannelSlack.set($event)"
+                  >Slack</app-checkbox
+                >
+                <app-checkbox
+                  size="sm"
+                  [checked]="commChannelDiscord()"
+                  (changed)="commChannelDiscord.set($event)"
+                  >Discord</app-checkbox
+                >
               </div>
             </app-form-field>
 
@@ -819,7 +1120,11 @@ const EXPIRY_OPTIONS = [
                 [disabled]="savingComm()"
                 (clicked)="saveCommunication()"
               >
-                {{ savingComm() ? ('common.saving' | transloco) : ('settings.communication.save' | transloco) }}
+                {{
+                  savingComm()
+                    ? ('common.saving' | transloco)
+                    : ('settings.communication.save' | transloco)
+                }}
               </app-button>
               @if (commSaved()) {
                 <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
@@ -851,8 +1156,14 @@ const EXPIRY_OPTIONS = [
                   <span class="col-prefix mono">{{ token.token_prefix }}...</span>
                   <span class="col-scope">{{ formatScope(token.scope) }}</span>
                   <span class="col-origin">{{ formatOrigin(token.origin) }}</span>
-                  <span class="col-used">{{ token.last_used_at ? formatDate(token.last_used_at) : ('common.never' | transloco) }}</span>
-                  <span class="col-expires">{{ token.expires_at ? formatDate(token.expires_at) : ('common.never' | transloco) }}</span>
+                  <span class="col-used">{{
+                    token.last_used_at
+                      ? formatDate(token.last_used_at)
+                      : ('common.never' | transloco)
+                  }}</span>
+                  <span class="col-expires">{{
+                    token.expires_at ? formatDate(token.expires_at) : ('common.never' | transloco)
+                  }}</span>
                   <span class="col-action">
                     <app-button variant="danger" size="sm" (clicked)="revokeToken(token.id)">
                       {{ 'settings.mcp.revoke' | transloco }}
@@ -903,7 +1214,9 @@ const EXPIRY_OPTIONS = [
               >
                 <option value="user">{{ 'settings.mcp.scopeUser' | transloco }}</option>
                 @for (p of projects(); track p.id) {
-                  <option [value]="'project:' + p.id">{{ 'settings.mcp.scopeProjectPrefix' | transloco }} {{ p.name }}</option>
+                  <option [value]="'project:' + p.id">
+                    {{ 'settings.mcp.scopeProjectPrefix' | transloco }} {{ p.name }}
+                  </option>
                 }
                 @if (userService.currentUser()?.is_admin) {
                   <option value="all">{{ 'settings.mcp.scopeAll' | transloco }}</option>
@@ -930,7 +1243,11 @@ const EXPIRY_OPTIONS = [
               [disabled]="creating() || !newName().trim()"
               (clicked)="createToken()"
             >
-              {{ creating() ? ('settings.mcp.creating' | transloco) : ('settings.mcp.create' | transloco) }}
+              {{
+                creating()
+                  ? ('settings.mcp.creating' | transloco)
+                  : ('settings.mcp.create' | transloco)
+              }}
             </app-button>
           </div>
 
@@ -940,9 +1257,16 @@ const EXPIRY_OPTIONS = [
               <h3 class="form-title">{{ 'settings.mcp.claudeCodeTitle' | transloco }}</h3>
               <p class="section-desc" [innerHTML]="'settings.mcp.claudeCodeDesc' | transloco"></p>
               <div class="code-block-wrapper">
-                <pre class="code-block">{{mcpJsonSnippet()}}</pre>
-                <app-button class="code-copy-btn" variant="primary" size="sm" (clicked)="copyText(mcpJsonSnippet())">
-                  {{ snippetCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco) }}
+                <pre class="code-block">{{ mcpJsonSnippet() }}</pre>
+                <app-button
+                  class="code-copy-btn"
+                  variant="primary"
+                  size="sm"
+                  (clicked)="copyText(mcpJsonSnippet())"
+                >
+                  {{
+                    snippetCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco)
+                  }}
                 </app-button>
               </div>
             </div>
@@ -960,8 +1284,14 @@ const EXPIRY_OPTIONS = [
                 readonly
                 #mcpUrlInput
               />
-              <app-button variant="primary" size="md" (clicked)="copyText(mcpUrlInput.value, 'connector')">
-                {{ connectorCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco) }}
+              <app-button
+                variant="primary"
+                size="md"
+                (clicked)="copyText(mcpUrlInput.value, 'connector')"
+              >
+                {{
+                  connectorCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco)
+                }}
               </app-button>
             </div>
             <p class="section-hint">{{ 'settings.mcp.webConnectorHint' | transloco }}</p>
@@ -996,7 +1326,12 @@ const EXPIRY_OPTIONS = [
                   @if (!codexStatus().reachable) {
                     {{ 'settings.codex.notEnabled' | transloco }}
                   } @else {
-                    {{ (codexStatus().connected ? 'settings.codex.connected' : 'settings.codex.notConnected') | transloco }}
+                    {{
+                      (codexStatus().connected
+                        ? 'settings.codex.connected'
+                        : 'settings.codex.notConnected'
+                      ) | transloco
+                    }}
                     @if (codexStatus().model_count > 0) {
                       &mdash; {{ codexStatus().model_count }} model(s) available
                     }
@@ -1020,7 +1355,11 @@ const EXPIRY_OPTIONS = [
                   <div class="codex-account-row">
                     <span class="mono">{{ acct.name }}</span>
                     <span class="codex-account-status">{{ acct.status }}</span>
-                    <app-button variant="danger" size="sm" (clicked)="disconnectCodexAccount(acct.name)">
+                    <app-button
+                      variant="danger"
+                      size="sm"
+                      (clicked)="disconnectCodexAccount(acct.name)"
+                    >
                       {{ 'settings.codex.disconnect' | transloco }}
                     </app-button>
                   </div>
@@ -1037,19 +1376,30 @@ const EXPIRY_OPTIONS = [
                     <span class="codex-usage-plan">{{ codexUsage().plan_type }}</span>
                   }
                   @if (codexUsage().limit_reached) {
-                    <span class="codex-usage-limit">{{ 'settings.codex.usage.limitReached' | transloco }}</span>
+                    <span class="codex-usage-limit">{{
+                      'settings.codex.usage.limitReached' | transloco
+                    }}</span>
                   }
                 </h3>
                 @if (codexUsage().primary; as w) {
                   <div class="codex-usage-row">
                     <div class="codex-usage-meta">
-                      <span class="codex-usage-name">{{ 'settings.codex.usage.session' | transloco }}</span>
+                      <span class="codex-usage-name">{{
+                        'settings.codex.usage.session' | transloco
+                      }}</span>
                       @if (w.reset_after_seconds) {
-                        <span class="codex-usage-reset">{{ 'settings.codex.usage.resetsIn' | transloco: { time: formatReset(w.reset_after_seconds) } }}</span>
+                        <span class="codex-usage-reset">{{
+                          'settings.codex.usage.resetsIn'
+                            | transloco: { time: formatReset(w.reset_after_seconds) }
+                        }}</span>
                       }
                     </div>
                     <div class="codex-usage-track">
-                      <div class="codex-usage-fill" [class]="usageLevel(w.used_percent)" [style.width.%]="clampPct(w.used_percent)"></div>
+                      <div
+                        class="codex-usage-fill"
+                        [class]="usageLevel(w.used_percent)"
+                        [style.width.%]="clampPct(w.used_percent)"
+                      ></div>
                     </div>
                     <span class="codex-usage-pct">{{ w.used_percent ?? 0 }}%</span>
                   </div>
@@ -1057,13 +1407,22 @@ const EXPIRY_OPTIONS = [
                 @if (codexUsage().secondary; as w) {
                   <div class="codex-usage-row">
                     <div class="codex-usage-meta">
-                      <span class="codex-usage-name">{{ 'settings.codex.usage.weekly' | transloco }}</span>
+                      <span class="codex-usage-name">{{
+                        'settings.codex.usage.weekly' | transloco
+                      }}</span>
                       @if (w.reset_after_seconds) {
-                        <span class="codex-usage-reset">{{ 'settings.codex.usage.resetsIn' | transloco: { time: formatReset(w.reset_after_seconds) } }}</span>
+                        <span class="codex-usage-reset">{{
+                          'settings.codex.usage.resetsIn'
+                            | transloco: { time: formatReset(w.reset_after_seconds) }
+                        }}</span>
                       }
                     </div>
                     <div class="codex-usage-track">
-                      <div class="codex-usage-fill" [class]="usageLevel(w.used_percent)" [style.width.%]="clampPct(w.used_percent)"></div>
+                      <div
+                        class="codex-usage-fill"
+                        [class]="usageLevel(w.used_percent)"
+                        [style.width.%]="clampPct(w.used_percent)"
+                      ></div>
                     </div>
                     <span class="codex-usage-pct">{{ w.used_percent ?? 0 }}%</span>
                   </div>
@@ -1086,50 +1445,60 @@ const EXPIRY_OPTIONS = [
 
             <!-- Connect (only when the proxy is actually reachable) -->
             @if (codexStatus().reachable) {
-            <div class="create-form">
-              <app-button
-                variant="primary"
-                size="md"
-                [loading]="codexConnecting()"
-                [disabled]="codexConnecting()"
-                (clicked)="connectCodexAccount()"
-              >
-                {{ (codexConnecting() ? 'settings.codex.waiting' : 'settings.codex.connectAccount') | transloco }}
-              </app-button>
-              @if (codexConnecting()) {
-                <div class="codex-callback-help">
-                  <p class="codex-callback-title">{{ 'settings.codex.completeSignIn' | transloco }}</p>
-                  <ol class="codex-callback-steps">
-                    <li>{{ 'settings.codex.step1' | transloco }}</li>
-                    <li>{{ 'settings.codex.step2' | transloco }}</li>
-                    <li>{{ 'settings.codex.step3' | transloco }}</li>
-                    <li>{{ 'settings.codex.step4' | transloco }}</li>
-                  </ol>
-                  <div class="codex-callback-input-row">
-                    <app-input
-                      [value]="codexCallbackUrl()"
-                      [placeholder]="'settings.codex.callbackPlaceholder' | transloco"
-                      (changed)="codexCallbackUrl.set($event)"
-                    />
-                    <app-button
-                      variant="primary"
-                      size="md"
-                      [loading]="codexCallbackSubmitting()"
-                      [disabled]="codexCallbackSubmitting()"
-                      (clicked)="submitCodexCallback()"
-                    >
-                      {{ (codexCallbackSubmitting() ? 'settings.codex.submitting' : 'settings.codex.completeLogin') | transloco }}
-                    </app-button>
+              <div class="create-form">
+                <app-button
+                  variant="primary"
+                  size="md"
+                  [loading]="codexConnecting()"
+                  [disabled]="codexConnecting()"
+                  (clicked)="connectCodexAccount()"
+                >
+                  {{
+                    (codexConnecting() ? 'settings.codex.waiting' : 'settings.codex.connectAccount')
+                      | transloco
+                  }}
+                </app-button>
+                @if (codexConnecting()) {
+                  <div class="codex-callback-help">
+                    <p class="codex-callback-title">
+                      {{ 'settings.codex.completeSignIn' | transloco }}
+                    </p>
+                    <ol class="codex-callback-steps">
+                      <li>{{ 'settings.codex.step1' | transloco }}</li>
+                      <li>{{ 'settings.codex.step2' | transloco }}</li>
+                      <li>{{ 'settings.codex.step3' | transloco }}</li>
+                      <li>{{ 'settings.codex.step4' | transloco }}</li>
+                    </ol>
+                    <div class="codex-callback-input-row">
+                      <app-input
+                        [value]="codexCallbackUrl()"
+                        [placeholder]="'settings.codex.callbackPlaceholder' | transloco"
+                        (changed)="codexCallbackUrl.set($event)"
+                      />
+                      <app-button
+                        variant="primary"
+                        size="md"
+                        [loading]="codexCallbackSubmitting()"
+                        [disabled]="codexCallbackSubmitting()"
+                        (clicked)="submitCodexCallback()"
+                      >
+                        {{
+                          (codexCallbackSubmitting()
+                            ? 'settings.codex.submitting'
+                            : 'settings.codex.completeLogin'
+                          ) | transloco
+                        }}
+                      </app-button>
+                    </div>
+                    @if (codexCallbackError()) {
+                      <p class="codex-callback-error">{{ codexCallbackError() }}</p>
+                    }
+                    <p class="codex-callback-hint">
+                      {{ 'settings.codex.portForwardHint' | transloco }}
+                    </p>
                   </div>
-                  @if (codexCallbackError()) {
-                    <p class="codex-callback-error">{{ codexCallbackError() }}</p>
-                  }
-                  <p class="codex-callback-hint">
-                    {{ 'settings.codex.portForwardHint' | transloco }}
-                  </p>
-                </div>
-              }
-            </div>
+                }
+              </div>
             } @else if (!codexLoading()) {
               <!-- Proxy disabled/down: explain how to turn it on instead of
                    offering a Connect button that 502s on /api/codex/login. -->
@@ -1158,9 +1527,13 @@ const EXPIRY_OPTIONS = [
                   [class.connected]="s.effective.is_initialized"
                 ></span>
                 <span class="codex-status-text">
-                  {{ 'settings.cloud.active' | transloco }} <strong>{{ s.effective.backend_id }}</strong>
-                  @if (s.effective.is_initialized) { &mdash; {{ 'settings.cloud.initialized' | transloco }} }
-                  @else { &mdash; {{ 'settings.cloud.notInitialized' | transloco }} }
+                  {{ 'settings.cloud.active' | transloco }}
+                  <strong>{{ s.effective.backend_id }}</strong>
+                  @if (s.effective.is_initialized) {
+                    &mdash; {{ 'settings.cloud.initialized' | transloco }}
+                  } @else {
+                    &mdash; {{ 'settings.cloud.notInitialized' | transloco }}
+                  }
                 </span>
                 <app-button
                   variant="ghost"
@@ -1258,11 +1631,12 @@ const EXPIRY_OPTIONS = [
                     <div class="codex-account-row">
                       <span class="mono">{{ entry.field }}</span>
                       <span class="mono">{{ entry.env_var }}</span>
-                      <span
-                        class="codex-account-status"
-                        [class.connected]="entry.set"
-                      >
-                        {{ entry.set ? ('settings.cloud.secretSet' | transloco: {chars: entry.length}) : ('settings.cloud.secretUnset' | transloco) }}
+                      <span class="codex-account-status" [class.connected]="entry.set">
+                        {{
+                          entry.set
+                            ? ('settings.cloud.secretSet' | transloco)
+                            : ('settings.cloud.secretUnset' | transloco)
+                        }}
                       </span>
                     </div>
                   }
@@ -1278,7 +1652,9 @@ const EXPIRY_OPTIONS = [
                   [disabled]="cloudBusy()"
                   (clicked)="testCloudSettings()"
                 >
-                  {{ (cloudTesting() ? 'settings.cloud.testing' : 'settings.cloud.test') | transloco }}
+                  {{
+                    (cloudTesting() ? 'settings.cloud.testing' : 'settings.cloud.test') | transloco
+                  }}
                 </app-button>
                 <app-button
                   variant="primary"
@@ -1287,7 +1663,10 @@ const EXPIRY_OPTIONS = [
                   [disabled]="cloudBusy()"
                   (clicked)="saveCloudSettings()"
                 >
-                  {{ (cloudSaving() ? 'settings.cloud.saving' : 'settings.cloud.saveReload') | transloco }}
+                  {{
+                    (cloudSaving() ? 'settings.cloud.saving' : 'settings.cloud.saveReload')
+                      | transloco
+                  }}
                 </app-button>
                 @if (s.overlay.present) {
                   <app-button
@@ -1313,8 +1692,12 @@ const EXPIRY_OPTIONS = [
               @if (s.overlay.present) {
                 <p class="section-desc cloud-overlay-info">
                   {{ 'settings.cloud.persistedOverlayLastSaved' | transloco }}
-                  @if (s.overlay.updated_at) { {{ formatDate(s.overlay.updated_at) }} }
-                  @if (s.overlay.updated_by) { by {{ s.overlay.updated_by }} }
+                  @if (s.overlay.updated_at) {
+                    {{ formatDate(s.overlay.updated_at) }}
+                  }
+                  @if (s.overlay.updated_by) {
+                    by {{ s.overlay.updated_by }}
+                  }
                 </p>
               }
             }
@@ -1323,672 +1706,777 @@ const EXPIRY_OPTIONS = [
       </div>
     </div>
   `,
-  styles: [`
-    :host { display: block; height: 100%; overflow: auto; }
-
-    .settings-page {
-      padding: 32px;
-      max-width: var(--content-max-width);
-      margin: 0 auto;
-      color: var(--text-primary);
-    }
-
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 32px;
-    }
-
-    .page-title {
-      font-size: 24px;
-      font-weight: 700;
-      margin: 0;
-      color: var(--text-primary);
-    }
-
-    .settings-section {
-      background: var(--panel-bg);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-lg);
-      padding: 24px;
-    }
-
-    .section-spacer { margin-top: 24px; }
-
-    .section-title {
-      font-size: 18px;
-      font-weight: 600;
-      margin-bottom: 4px;
-      color: var(--text-primary);
-    }
-
-    .section-desc {
-      font-size: 13px;
-      color: var(--text-muted);
-      margin-bottom: 20px;
-    }
-
-    .section-desc code {
-      background: var(--surface-0);
-      padding: 2px 6px;
-      border-radius: var(--radius-tag);
-      font-size: 12px;
-    }
-
-    /* Key + Token tables */
-    .key-table, .token-table {
-      margin-bottom: 20px;
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-surface);
-      overflow: hidden;
-    }
-
-    .key-header, .key-row {
-      display: grid;
-      grid-template-columns: 1.5fr 1.2fr 1.2fr 1fr 90px;
-      padding: 10px 14px;
-      gap: 8px;
-      align-items: center;
-      font-size: 13px;
-    }
-
-    .token-header, .token-row {
-      display: grid;
-      grid-template-columns: 2fr 1.2fr 1fr 0.8fr 1fr 1fr 90px;
-      padding: 10px 14px;
-      gap: 8px;
-      align-items: center;
-      font-size: 13px;
-    }
-
-    .key-header, .token-header {
-      background: var(--surface-0);
-      font-weight: 600;
-      font-size: 12px;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-
-    .key-row, .token-row {
-      border-top: 1px solid var(--border-color);
-    }
-
-    .mono {
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-
-    .empty-state {
-      font-size: 13px;
-      color: var(--text-muted);
-      text-align: center;
-      padding: 24px;
-      margin-bottom: 20px;
-    }
-
-    /* New token banner */
-    .new-token-banner {
-      background: var(--success-tint);
-      border: 1px solid var(--success);
-      border-radius: var(--radius-surface);
-      padding: 14px;
-      margin-bottom: 20px;
-    }
-
-    .new-token-warning {
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--success);
-      margin-bottom: 10px;
-    }
-
-    .new-token-row {
-      display: flex;
-      gap: 8px;
-    }
-
-    .new-token-input,
-    .readonly-input {
-      flex: 1;
-      padding: 8px 12px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-control);
-      color: var(--text-primary);
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      outline: none;
-    }
-
-    /* Form layout */
-    .form-block {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-
-    .create-form {
-      border-top: 1px solid var(--border-color);
-      padding-top: 20px;
-      margin-bottom: 20px;
-    }
-
-    .form-title {
-      font-size: 14px;
-      font-weight: 600;
-      margin-bottom: 12px;
-      color: var(--text-primary);
-    }
-
-    .form-row {
-      margin-bottom: 10px;
-    }
-
-    .two-col {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-
-    .actions-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-top: 12px;
-    }
-
-    .channel-list {
-      display: flex;
-      gap: 16px;
-      flex-wrap: wrap;
-      margin-top: 4px;
-    }
-
-    .quiet-hours-row { margin-top: 12px; }
-
-    .time-input {
-      width: 100%;
-      padding: 8px 12px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-control);
-      color: var(--text-primary);
-      font-family: inherit;
-      font-size: 13px;
-      outline: none;
-    }
-    .time-input:focus { border-color: var(--accent-color); }
-
-    .form-error {
-      color: var(--danger);
-      font-size: 12px;
-      margin: 0 0 10px;
-    }
-
-    .subsection-title {
-      font-size: 12px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--text-muted);
-      margin: 16px 0 8px;
-      padding-top: 12px;
-      border-top: 1px solid var(--border-color);
-    }
-
-    /* Instructions */
-    .instructions {
-      border-top: 1px solid var(--border-color);
-      padding-top: 20px;
-    }
-
-    .code-block-wrapper {
-      position: relative;
-    }
-
-    .code-block {
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-tag);
-      padding: 14px;
-      padding-right: 80px;
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      line-height: 1.5;
-      color: var(--text-primary);
-      overflow-x: auto;
-      white-space: pre;
-    }
-
-    .code-copy-btn {
-      position: absolute;
-      top: 8px;
-      right: 8px;
-    }
-
-    .connector-url-row {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 8px;
-    }
-
-    .section-hint {
-      font-size: 12px;
-      color: var(--text-secondary);
-      line-height: 1.5;
-    }
-
-    /* Codex Proxy */
-    .codex-status-card {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 12px 16px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-surface);
-      margin-bottom: 16px;
-    }
-
-    .codex-status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--danger);
-      flex-shrink: 0;
-    }
-
-    .codex-status-dot.connected {
-      background: var(--success);
-    }
-
-    .codex-status-text {
-      font-size: 13px;
-      color: var(--text-secondary);
-      flex: 1;
-    }
-
-    .codex-disabled-notice {
-      padding: 14px 16px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-surface);
-    }
-
-    .codex-disabled-title {
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--text-primary);
-      margin: 0 0 6px 0;
-    }
-
-    .codex-disabled-desc {
-      font-size: 13px;
-      color: var(--text-secondary);
-      line-height: 1.6;
-      margin: 0 0 10px 0;
-    }
-
-    .codex-disabled-code {
-      display: inline-block;
-      padding: 4px 10px;
-      background: var(--surface-1);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-control);
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      color: var(--text-secondary);
-    }
-
-    .codex-accounts {
-      margin-bottom: 16px;
-    }
-
-    .secret-provenance { margin-top: 16px; }
-
-    .codex-account-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 8px 14px;
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-surface);
-      margin-bottom: 6px;
-    }
-
-    .codex-account-row .mono { flex: 1; }
-
-    .codex-account-status {
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    .codex-account-status.connected { color: var(--success); }
-
-    .codex-models {
-      margin-bottom: 16px;
-    }
-
-    .codex-model-chips {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-
-    .codex-model-chip {
-      padding: 4px 10px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-control);
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
-      font-size: 12px;
-      color: var(--text-secondary);
-    }
-
-    .codex-usage {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-
-    .codex-usage-plan {
-      margin-left: 8px;
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--text-secondary);
-      text-transform: none;
-    }
-
-    .codex-usage-limit {
-      margin-left: 8px;
-      font-size: 12px;
-      color: var(--danger);
-    }
-
-    .codex-usage-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .codex-usage-meta {
-      display: flex;
-      flex-direction: column;
-      min-width: 132px;
-    }
-
-    .codex-usage-name { font-size: 13px; color: var(--text-primary); }
-    .codex-usage-reset { font-size: 11px; color: var(--text-secondary); }
-
-    .codex-usage-track {
-      flex: 1;
-      height: 8px;
-      border-radius: 4px;
-      background: var(--surface-0);
-      border: 1px solid var(--border-color);
-      overflow: hidden;
-    }
-
-    .codex-usage-fill {
-      height: 100%;
-      border-radius: 4px;
-      transition: width 0.3s ease;
-    }
-
-    .codex-usage-fill.ok { background: var(--accent-color); }
-    .codex-usage-fill.warn { background: #e6a23c; }
-    .codex-usage-fill.crit { background: var(--danger); }
-
-    .codex-usage-pct {
-      min-width: 42px;
-      text-align: right;
-      font-size: 12px;
-      font-variant-numeric: tabular-nums;
-      color: var(--text-secondary);
-    }
-
-    .codex-usage-note {
-      margin: 4px 0 0;
-      font-size: 11px;
-      line-height: 1.45;
-      font-style: italic;
-      color: var(--text-secondary);
-    }
-
-    /* Codex callback paste flow */
-    .codex-callback-help {
-      margin-top: 16px;
-      padding: 16px;
-      background: var(--surface-0);
-      border: 1px solid var(--accent-color);
-      border-radius: var(--radius-surface);
-    }
-
-    .codex-callback-title {
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--accent-color);
-      margin-bottom: 10px;
-    }
-
-    .codex-callback-steps {
-      font-size: 13px;
-      color: var(--text-secondary);
-      line-height: 1.6;
-      margin: 0 0 14px 0;
-      padding-left: 20px;
-    }
-
-    .codex-callback-steps code {
-      background: var(--surface-0);
-      padding: 2px 6px;
-      border-radius: var(--radius-tag);
-      font-size: 12px;
-    }
-
-    .codex-callback-input-row {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 8px;
-      align-items: stretch;
-    }
-    .codex-callback-input-row > app-input { flex: 1; }
-
-    .codex-callback-error {
-      font-size: 13px;
-      color: var(--danger);
-      margin: 6px 0 0 0;
-    }
-
-    .codex-callback-hint {
-      font-size: 12px;
-      color: var(--text-muted);
-      margin: 10px 0 0 0;
-    }
-
-    .codex-callback-hint code {
-      background: var(--surface-0);
-      padding: 2px 6px;
-      border-radius: var(--radius-tag);
-      font-size: 11px;
-    }
-
-    /* Cloud Storage */
-    .cloud-button-row {
-      display: flex;
-      gap: 12px;
-      margin-top: 20px;
-      flex-wrap: wrap;
-    }
-    .cloud-message { margin-top: 12px; }
-    .cloud-overlay-info { margin-top: 8px; }
-
-    /* ---- Mobile (<=560px): this page's first responsive block ---- */
-    @media (max-width: 560px) {
-      /* Reclaim width — the 32px/24px desktop padding is wasteful on a phone. */
-      .settings-page { padding: 16px; }
-      .settings-section { padding: 16px; }
-
-      /* Paired fields stack to one full-width column (bigger tap targets; the
+  styles: [
+    `
+      :host {
+        display: block;
+        height: 100%;
+        overflow: auto;
+      }
+
+      .settings-page {
+        padding: 32px;
+        max-width: var(--content-max-width);
+        margin: 0 auto;
+        color: var(--text-primary);
+      }
+
+      .page-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 32px;
+      }
+
+      .page-title {
+        font-size: 24px;
+        font-weight: 700;
+        margin: 0;
+        color: var(--text-primary);
+      }
+
+      .settings-section {
+        background: var(--panel-bg);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-lg);
+        padding: 24px;
+      }
+
+      .section-spacer {
+        margin-top: 24px;
+      }
+
+      .section-title {
+        font-size: 18px;
+        font-weight: 600;
+        margin-bottom: 4px;
+        color: var(--text-primary);
+      }
+
+      .section-desc {
+        font-size: 13px;
+        color: var(--text-muted);
+        margin-bottom: 20px;
+      }
+
+      .section-desc code {
+        background: var(--surface-0);
+        padding: 2px 6px;
+        border-radius: var(--radius-tag);
+        font-size: 12px;
+      }
+
+      /* Key + Token tables */
+      .key-table,
+      .token-table {
+        margin-bottom: 20px;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        overflow: hidden;
+      }
+
+      .key-header,
+      .key-row {
+        display: grid;
+        grid-template-columns: 1.5fr 1.2fr 1.2fr 1fr 90px;
+        padding: 10px 14px;
+        gap: 8px;
+        align-items: center;
+        font-size: 13px;
+      }
+
+      .token-header,
+      .token-row {
+        display: grid;
+        grid-template-columns: 2fr 1.2fr 1fr 0.8fr 1fr 1fr 90px;
+        padding: 10px 14px;
+        gap: 8px;
+        align-items: center;
+        font-size: 13px;
+      }
+
+      .key-header,
+      .token-header {
+        background: var(--surface-0);
+        font-weight: 600;
+        font-size: 12px;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .key-row,
+      .token-row {
+        border-top: 1px solid var(--border-color);
+      }
+
+      .mono {
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .empty-state {
+        font-size: 13px;
+        color: var(--text-muted);
+        text-align: center;
+        padding: 24px;
+        margin-bottom: 20px;
+      }
+
+      /* New token banner */
+      .new-token-banner {
+        background: var(--success-tint);
+        border: 1px solid var(--success);
+        border-radius: var(--radius-surface);
+        padding: 14px;
+        margin-bottom: 20px;
+      }
+
+      .new-token-warning {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--success);
+        margin-bottom: 10px;
+      }
+
+      .new-token-row {
+        display: flex;
+        gap: 8px;
+      }
+
+      .new-token-input,
+      .readonly-input {
+        flex: 1;
+        padding: 8px 12px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        color: var(--text-primary);
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        outline: none;
+      }
+
+      /* Form layout */
+      .form-block {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .create-form {
+        border-top: 1px solid var(--border-color);
+        padding-top: 20px;
+        margin-bottom: 20px;
+      }
+
+      .form-title {
+        font-size: 14px;
+        font-weight: 600;
+        margin-bottom: 12px;
+        color: var(--text-primary);
+      }
+
+      .form-row {
+        margin-bottom: 10px;
+      }
+
+      .two-col {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+
+      .actions-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-top: 12px;
+      }
+
+      .channel-list {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-top: 4px;
+      }
+
+      .quiet-hours-row {
+        margin-top: 12px;
+      }
+
+      .time-input {
+        width: 100%;
+        padding: 8px 12px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        color: var(--text-primary);
+        font-family: inherit;
+        font-size: 13px;
+        outline: none;
+      }
+      .time-input:focus {
+        border-color: var(--accent-color);
+      }
+
+      .form-error {
+        color: var(--danger);
+        font-size: 12px;
+        margin: 0 0 10px;
+      }
+
+      .subsection-title {
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--text-muted);
+        margin: 16px 0 8px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-color);
+      }
+
+      /* Instructions */
+      .instructions {
+        border-top: 1px solid var(--border-color);
+        padding-top: 20px;
+      }
+
+      .code-block-wrapper {
+        position: relative;
+      }
+
+      .code-block {
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-tag);
+        padding: 14px;
+        padding-right: 80px;
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--text-primary);
+        overflow-x: auto;
+        white-space: pre;
+      }
+
+      .code-copy-btn {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+      }
+
+      .connector-url-row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      .section-hint {
+        font-size: 12px;
+        color: var(--text-secondary);
+        line-height: 1.5;
+      }
+
+      /* Codex Proxy */
+      .codex-status-card {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 16px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        margin-bottom: 16px;
+      }
+
+      .codex-status-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--danger);
+        flex-shrink: 0;
+      }
+
+      .codex-status-dot.connected {
+        background: var(--success);
+      }
+
+      .codex-status-text {
+        font-size: 13px;
+        color: var(--text-secondary);
+        flex: 1;
+      }
+
+      .codex-disabled-notice {
+        padding: 14px 16px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+      }
+
+      .codex-disabled-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--text-primary);
+        margin: 0 0 6px 0;
+      }
+
+      .codex-disabled-desc {
+        font-size: 13px;
+        color: var(--text-secondary);
+        line-height: 1.6;
+        margin: 0 0 10px 0;
+      }
+
+      .codex-disabled-code {
+        display: inline-block;
+        padding: 4px 10px;
+        background: var(--surface-1);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      .codex-accounts {
+        margin-bottom: 16px;
+      }
+
+      .secret-provenance {
+        margin-top: 16px;
+      }
+
+      .codex-account-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 14px;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        margin-bottom: 6px;
+      }
+
+      .codex-account-row .mono {
+        flex: 1;
+      }
+
+      .codex-account-status {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .codex-account-status.connected {
+        color: var(--success);
+      }
+
+      .codex-models {
+        margin-bottom: 16px;
+      }
+
+      .codex-model-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .codex-model-chip {
+        padding: 4px 10px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-control);
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      .codex-usage {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+
+      .codex-usage-plan {
+        margin-left: 8px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--text-secondary);
+        text-transform: none;
+      }
+
+      .codex-usage-limit {
+        margin-left: 8px;
+        font-size: 12px;
+        color: var(--danger);
+      }
+
+      .codex-usage-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .codex-usage-meta {
+        display: flex;
+        flex-direction: column;
+        min-width: 132px;
+      }
+
+      .codex-usage-name {
+        font-size: 13px;
+        color: var(--text-primary);
+      }
+      .codex-usage-reset {
+        font-size: 11px;
+        color: var(--text-secondary);
+      }
+
+      .codex-usage-track {
+        flex: 1;
+        height: 8px;
+        border-radius: 4px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        overflow: hidden;
+      }
+
+      .codex-usage-fill {
+        height: 100%;
+        border-radius: 4px;
+        transition: width 0.3s ease;
+      }
+
+      .codex-usage-fill.ok {
+        background: var(--accent-color);
+      }
+      .codex-usage-fill.warn {
+        background: #e6a23c;
+      }
+      .codex-usage-fill.crit {
+        background: var(--danger);
+      }
+
+      .codex-usage-pct {
+        min-width: 42px;
+        text-align: right;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        color: var(--text-secondary);
+      }
+
+      .codex-usage-note {
+        margin: 4px 0 0;
+        font-size: 11px;
+        line-height: 1.45;
+        font-style: italic;
+        color: var(--text-secondary);
+      }
+
+      /* Codex callback paste flow */
+      .codex-callback-help {
+        margin-top: 16px;
+        padding: 16px;
+        background: var(--surface-0);
+        border: 1px solid var(--accent-color);
+        border-radius: var(--radius-surface);
+      }
+
+      .codex-callback-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--accent-color);
+        margin-bottom: 10px;
+      }
+
+      .codex-callback-steps {
+        font-size: 13px;
+        color: var(--text-secondary);
+        line-height: 1.6;
+        margin: 0 0 14px 0;
+        padding-left: 20px;
+      }
+
+      .codex-callback-steps code {
+        background: var(--surface-0);
+        padding: 2px 6px;
+        border-radius: var(--radius-tag);
+        font-size: 12px;
+      }
+
+      .codex-callback-input-row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 8px;
+        align-items: stretch;
+      }
+      .codex-callback-input-row > app-input {
+        flex: 1;
+      }
+
+      .codex-callback-error {
+        font-size: 13px;
+        color: var(--danger);
+        margin: 6px 0 0 0;
+      }
+
+      .codex-callback-hint {
+        font-size: 12px;
+        color: var(--text-muted);
+        margin: 10px 0 0 0;
+      }
+
+      .codex-callback-hint code {
+        background: var(--surface-0);
+        padding: 2px 6px;
+        border-radius: var(--radius-tag);
+        font-size: 11px;
+      }
+
+      /* Cloud Storage */
+      .cloud-button-row {
+        display: flex;
+        gap: 12px;
+        margin-top: 20px;
+        flex-wrap: wrap;
+      }
+      .cloud-message {
+        margin-top: 12px;
+      }
+      .cloud-overlay-info {
+        margin-top: 8px;
+      }
+
+      /* ---- Mobile (<=560px): this page's first responsive block ---- */
+      @media (max-width: 560px) {
+        /* Reclaim width — the 32px/24px desktop padding is wasteful on a phone. */
+        .settings-page {
+          padding: 16px;
+        }
+        .settings-section {
+          padding: 16px;
+        }
+
+        /* Paired fields stack to one full-width column (bigger tap targets; the
          preference/persistent/cloud selects were cramped, not broken). */
-      .two-col { grid-template-columns: 1fr; }
+        .two-col {
+          grid-template-columns: 1fr;
+        }
 
-      /* API-key & MCP-token grids -> one card per row. A fixed 5-/7-column grid
+        /* API-key & MCP-token grids -> one card per row. A fixed 5-/7-column grid
          can't fit a phone, and the table wrapper is overflow:hidden, so the
          right-most column (the Delete / Revoke button) was clipped and
          UNREACHABLE. Cards restore every field + a full-width action button. */
-      .key-table, .token-table { border: none; border-radius: 0; overflow: visible; }
-      .key-header, .token-header { display: none; }
-      .key-row, .token-row {
-        display: block;
-        border: 1px solid var(--border-color);
-        border-radius: var(--radius-surface);
-        padding: 12px 14px;
-        margin-bottom: 10px;
-      }
-      .key-row > span, .token-row > span { display: block; padding: 1px 0; }
-      /* First cell = card title. */
-      .key-row .col-provider, .token-row .col-name {
-        font-weight: 600; font-size: 14px; color: var(--text-primary); margin-bottom: 4px;
-      }
-      /* Re-label the now-headerless value cells. CSS content: is not scanned by
+        .key-table,
+        .token-table {
+          border: none;
+          border-radius: 0;
+          overflow: visible;
+        }
+        .key-header,
+        .token-header {
+          display: none;
+        }
+        .key-row,
+        .token-row {
+          display: block;
+          border: 1px solid var(--border-color);
+          border-radius: var(--radius-surface);
+          padding: 12px 14px;
+          margin-bottom: 10px;
+        }
+        .key-row > span,
+        .token-row > span {
+          display: block;
+          padding: 1px 0;
+        }
+        /* First cell = card title. */
+        .key-row .col-provider,
+        .token-row .col-name {
+          font-weight: 600;
+          font-size: 14px;
+          color: var(--text-primary);
+          margin-bottom: 4px;
+        }
+        /* Re-label the now-headerless value cells. CSS content: is not scanned by
          the i18n hardcoded-string check and matches the admin-users card
          precedent; it also sidesteps the missing settings.apiKeys.* keys. */
-      .key-row .col-prefix::before { content: 'Key: '; }
-      .key-row .col-label::before { content: 'Label: '; }
-      .key-row .col-updated::before { content: 'Updated: '; }
-      .token-row .col-prefix::before { content: 'Token: '; }
-      .token-row .col-scope::before { content: 'Scope: '; }
-      .token-row .col-origin::before { content: 'Origin: '; }
-      .token-row .col-used::before { content: 'Last used: '; }
-      .token-row .col-expires::before { content: 'Expires: '; }
-      .key-row span::before, .token-row span::before { color: var(--text-muted); font-weight: 600; }
-      /* Action cell -> full-width button at the foot of the card. */
-      .key-row .col-action, .token-row .col-action { margin-top: 12px; }
-      .key-row .col-action app-button, .token-row .col-action app-button { display: block; width: 100%; }
-      .key-row .col-action ::ng-deep .app-button__btn,
-      .token-row .col-action ::ng-deep .app-button__btn { width: 100%; }
+        .key-row .col-prefix::before {
+          content: 'Key: ';
+        }
+        .key-row .col-label::before {
+          content: 'Label: ';
+        }
+        .key-row .col-updated::before {
+          content: 'Updated: ';
+        }
+        .token-row .col-prefix::before {
+          content: 'Token: ';
+        }
+        .token-row .col-scope::before {
+          content: 'Scope: ';
+        }
+        .token-row .col-origin::before {
+          content: 'Origin: ';
+        }
+        .token-row .col-used::before {
+          content: 'Last used: ';
+        }
+        .token-row .col-expires::before {
+          content: 'Expires: ';
+        }
+        .key-row span::before,
+        .token-row span::before {
+          color: var(--text-muted);
+          font-weight: 600;
+        }
+        /* Action cell -> full-width button at the foot of the card. */
+        .key-row .col-action,
+        .token-row .col-action {
+          margin-top: 12px;
+        }
+        .key-row .col-action app-button,
+        .token-row .col-action app-button {
+          display: block;
+          width: 100%;
+        }
+        .key-row .col-action ::ng-deep .app-button__btn,
+        .token-row .col-action ::ng-deep .app-button__btn {
+          width: 100%;
+        }
 
-      /* Codex accounts & Cloud secret-provenance rows: let the long, unbreakable
+        /* Codex accounts & Cloud secret-provenance rows: let the long, unbreakable
          mono strings (e.g. OPENCLOUD_KEYCLOAK_CLIENT_SECRET) wrap instead of
          forcing the row -- and the whole page -- to scroll sideways. */
-      .codex-account-row { flex-wrap: wrap; }
-      .codex-account-row > * { min-width: 0; }
-      .codex-account-row .mono { overflow-wrap: anywhere; }
-    }
-    .voice-lang-note {
-      margin: 8px 0 0;
-      font-size: 12px;
-      line-height: 1.45;
-      color: var(--text-muted);
-    }
-    .voice-sample-hint {
-      margin: 4px 0 0;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    .voice-preview-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-top: 10px;
-    }
-    .voice-preview-row app-icon { margin-right: 4px; }
-    .voice-preview-error {
-      font-size: 13px;
-      color: var(--danger);
-    }
-    .voice-rewrite {
-      margin-top: 14px;
-      padding-top: 12px;
-      border-top: 1px solid var(--border-color);
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .voice-subhead {
-      margin: 0;
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--text);
-    }
-    .voice-library {
-      margin-top: 14px;
-      padding-top: 12px;
-      border-top: 1px solid var(--border-color);
-    }
-    .voice-library-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .voice-library-flag {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    .voice-library-search {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-top: 12px;
-      flex-wrap: wrap;
-    }
-    .voice-library-search app-input { flex: 1 1 180px; }
-    .voice-library-results {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      margin-top: 12px;
-    }
-    .voice-library-card {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 8px 10px;
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      background: var(--surface-1);
-    }
-    .voice-library-card.is-added { border-color: var(--accent-color); }
-    .voice-library-card__info {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-      min-width: 0;
-    }
-    .voice-library-card__name {
-      font-size: 13px;
-      font-weight: 500;
-      color: var(--text);
-    }
-    .voice-library-card__tags {
-      font-size: 12px;
-      color: var(--text-muted);
-      text-transform: capitalize;
-    }
-    .voice-library-card__actions {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      flex-shrink: 0;
-    }
-    .voice-library-card__done {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      font-size: 12px;
-      color: var(--accent-color);
-    }
-  `],
+        .codex-account-row {
+          flex-wrap: wrap;
+        }
+        .codex-account-row > * {
+          min-width: 0;
+        }
+        .codex-account-row .mono {
+          overflow-wrap: anywhere;
+        }
+      }
+      .voice-lang-note {
+        margin: 8px 0 0;
+        font-size: 12px;
+        line-height: 1.45;
+        color: var(--text-muted);
+      }
+      .voice-sample-hint {
+        margin: 4px 0 0;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .voice-preview-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 10px;
+      }
+      .voice-preview-row app-icon {
+        margin-right: 4px;
+      }
+      .voice-preview-error {
+        font-size: 13px;
+        color: var(--danger);
+      }
+      .voice-rewrite {
+        margin-top: 14px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-color);
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .voice-subhead {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text);
+      }
+      .voice-library {
+        margin-top: 14px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-color);
+      }
+      .voice-library-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .voice-library-flag {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .voice-library-search {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 12px;
+        flex-wrap: wrap;
+      }
+      .voice-library-search app-input {
+        flex: 1 1 180px;
+      }
+      .voice-library-results {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 12px;
+      }
+      .voice-library-card {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 8px 10px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--surface-1);
+      }
+      .voice-library-card.is-added {
+        border-color: var(--accent-color);
+      }
+      .voice-library-card__info {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+      .voice-library-card__name {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--text);
+      }
+      .voice-library-card__tags {
+        font-size: 12px;
+        color: var(--text-muted);
+        text-transform: capitalize;
+      }
+      .voice-library-card__actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      .voice-library-card__done {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12px;
+        color: var(--accent-color);
+      }
+    `,
+  ],
 })
 export class SettingsComponent implements OnInit {
   readonly tokenService = inject(McpTokenService);
@@ -2012,11 +2500,7 @@ export class SettingsComponent implements OnInit {
    * `preferences()._resolved` (which is always undefined). */
   readonly ttsModel = computed(() => {
     const p = this.settingsService.preferences();
-    return (
-      p.default_tts_model ||
-      this.settingsService.resolvedDefaults().default_tts_model ||
-      ''
-    );
+    return p.default_tts_model || this.settingsService.resolvedDefaults().default_tts_model || '';
   });
   readonly ttsConfigured = computed(() => !!this.ttsModel());
   /** True when the user has pinned a TTS model (vs following the system
@@ -2029,9 +2513,7 @@ export class SettingsComponent implements OnInit {
   /** The configured TTS backend — drives the backend-specific note. */
   readonly ttsBackend = computed(() => ttsBackendForModelId(this.ttsModel()));
   /** The user's chosen voice ('' = follow the admin/per-language default). */
-  readonly ttsVoice = computed(
-    () => this.settingsService.preferences().default_tts_voice ?? '',
-  );
+  readonly ttsVoice = computed(() => this.settingsService.preferences().default_tts_voice ?? '');
 
   /** Option label for a voice: the raw id plus a language tag when known
    * (e.g. `af_bella [EN-US]`). The `<option>` value stays the raw id. */
@@ -2061,9 +2543,7 @@ export class SettingsComponent implements OnInit {
    * (e.g. `Sarah — american · female`) — strictly better than prefix-decoding.
    * The `<option>` value is the opaque account `voice_id`. */
   elevenVoiceLabel(v: TtsAccountVoice): string {
-    const tags = [v.labels?.['accent'], v.labels?.['gender']]
-      .filter(Boolean)
-      .join(' · ');
+    const tags = [v.labels?.['accent'], v.labels?.['gender']].filter(Boolean).join(' · ');
     return tags ? `${v.name} — ${tags}` : v.name;
   }
 
@@ -2208,8 +2688,8 @@ export class SettingsComponent implements OnInit {
             id: newId,
             name: v.name,
             labels: {
-              ...(v.accent ? {accent: v.accent} : {}),
-              ...(v.gender ? {gender: v.gender} : {}),
+              ...(v.accent ? { accent: v.accent } : {}),
+              ...(v.gender ? { gender: v.gender } : {}),
             },
             preview_url: v.preview_url,
           };
@@ -2223,17 +2703,13 @@ export class SettingsComponent implements OnInit {
           this.apiService.listTtsVoices().subscribe((r) => {
             if (r.backend !== 'elevenlabs' || r.voices.length === 0) return;
             this.elevenVoices.set(
-              r.voices.some((x) => x.id === newId)
-                ? r.voices
-                : [optimistic, ...r.voices],
+              r.voices.some((x) => x.id === newId) ? r.voices : [optimistic, ...r.voices],
             );
           });
         },
         error: (err) => {
           this.libraryAddingId.set(null);
-          this.libraryError.set(
-            (err?.error?.detail as string) || 'Could not add this voice.',
-          );
+          this.libraryError.set((err?.error?.detail as string) || 'Could not add this voice.');
         },
       });
   }
@@ -2262,18 +2738,17 @@ export class SettingsComponent implements OnInit {
    * would make the new backend reject the voice. */
   setTtsModel(modelId: string): void {
     if (modelId === this.ttsModel()) return;
-    const resolvedDefault =
-      this.settingsService.resolvedDefaults().default_tts_model ?? '';
+    const resolvedDefault = this.settingsService.resolvedDefaults().default_tts_model ?? '';
     const override = !modelId || modelId === resolvedDefault ? null : modelId;
     this.settingsService
-      .updatePreferences({default_tts_model: override, default_tts_voice: null})
+      .updatePreferences({ default_tts_model: override, default_tts_voice: null })
       .subscribe();
     this.previewErrorKey.set(null);
   }
 
   /** Persist the read-aloud voice choice (empty ⇒ clear the override). */
   setTtsVoice(voice: string): void {
-    this.settingsService.updatePreferences({default_tts_voice: voice || null}).subscribe();
+    this.settingsService.updatePreferences({ default_tts_voice: voice || null }).subscribe();
     // A fresh selection invalidates any earlier preview error.
     this.previewErrorKey.set(null);
   }
@@ -2290,10 +2765,14 @@ export class SettingsComponent implements OnInit {
    * the read-aloud box). */
   private ttsErrorKey(code: string): string {
     switch (code) {
-      case 'payment_required': return 'chat.tts.err.paymentRequired';
-      case 'auth': return 'chat.tts.err.auth';
-      case 'rate_limit': return 'chat.tts.err.rateLimit';
-      default: return 'settings.voice.previewFailed';
+      case 'payment_required':
+        return 'chat.tts.err.paymentRequired';
+      case 'auth':
+        return 'chat.tts.err.auth';
+      case 'rate_limit':
+        return 'chat.tts.err.rateLimit';
+      default:
+        return 'settings.voice.previewFailed';
     }
   }
 
@@ -2301,9 +2780,7 @@ export class SettingsComponent implements OnInit {
    * phrase). Mirrors the server's `_PREVIEW_TEXT_MAX`. */
   readonly previewTextMax = 500;
   readonly previewText = signal('');
-  readonly previewCharsLeft = computed(
-    () => this.previewTextMax - this.previewText().length,
-  );
+  readonly previewCharsLeft = computed(() => this.previewTextMax - this.previewText().length);
 
   /** Clamp typed/pasted preview text to the cap so the UI can't submit
    * something the server would 422. */
@@ -2418,7 +2895,9 @@ export class SettingsComponent implements OnInit {
   readonly paSaved = signal(false);
 
   // Communication form state
-  readonly commDelivery = signal<'next_strategic_phase' | 'immediate_interrupt' | 'llm_triage'>('next_strategic_phase');
+  readonly commDelivery = signal<'next_strategic_phase' | 'immediate_interrupt' | 'llm_triage'>(
+    'next_strategic_phase',
+  );
   readonly commChannelEmail = signal(true);
   readonly commChannelNtfy = signal(false);
   readonly commChannelSlack = signal(false);
@@ -2431,7 +2910,12 @@ export class SettingsComponent implements OnInit {
   readonly commSaved = signal(false);
 
   // Codex proxy state (admin-only)
-  readonly codexStatus = signal<CodexStatus>({ connected: false, reachable: false, accounts: [], model_count: 0 });
+  readonly codexStatus = signal<CodexStatus>({
+    connected: false,
+    reachable: false,
+    accounts: [],
+    model_count: 0,
+  });
   readonly codexModels = signal<string[]>([]);
   readonly codexUsage = signal<CodexUsage>({ available: false });
   readonly codexLoading = signal(false);
@@ -2473,7 +2957,6 @@ export class SettingsComponent implements OnInit {
       field,
       env_var: prov.env_var,
       set: prov.set,
-      length: prov.length,
     }));
   });
 
@@ -2495,9 +2978,7 @@ export class SettingsComponent implements OnInit {
         // Seed the read-aloud rewrite draft (prefs only change on load/save, so
         // this never clobbers a mid-edit draft — same as the sub-objects below).
         const ra = prefs.read_aloud;
-        this.readAloudReasoning.set(
-          (ra?.reasoning_level as ReadAloudReasoningLevel) ?? 'off',
-        );
+        this.readAloudReasoning.set((ra?.reasoning_level as ReadAloudReasoningLevel) ?? 'off');
         this.readAloudPromptDraft.set(ra?.custom_prompt ?? '');
 
         // Sync persistent agent preferences
@@ -2537,14 +3018,12 @@ export class SettingsComponent implements OnInit {
     effect(() => {
       const userId = this.userService.currentUserId();
       if (userId) {
-        this.apiService
-            .getProjects(userId)
-            .subscribe({
-              next: (p) => this.projects.set(p),
-              // Settings has many independent panels; the project-scoped ones
-              // degrade to empty rather than failing the whole page.
-              error: () => this.projects.set([]),
-            });
+        this.apiService.getProjects(userId).subscribe({
+          next: (p) => this.projects.set(p),
+          // Settings has many independent panels; the project-scoped ones
+          // degrade to empty rather than failing the whole page.
+          error: () => this.projects.set([]),
+        });
       }
     });
 
@@ -2578,9 +3057,7 @@ export class SettingsComponent implements OnInit {
       this.elevenVoicesLoading.set(true);
       this.apiService.listTtsVoices().subscribe((resp) => {
         this.elevenVoicesLoading.set(false);
-        this.elevenVoices.set(
-          resp.backend === 'elevenlabs' ? resp.voices : [],
-        );
+        this.elevenVoices.set(resp.backend === 'elevenlabs' ? resp.voices : []);
       });
     });
   }
@@ -2588,8 +3065,7 @@ export class SettingsComponent implements OnInit {
   private _adminLoadersFired = false;
 
   /** Only show active (non-revoked) tokens. */
-  activeTokens = () =>
-    this.tokenService.tokens().filter((t) => !t.revoked_at);
+  activeTokens = () => this.tokenService.tokens().filter((t) => !t.revoked_at);
 
   ngOnInit(): void {
     this.modelService.load();
@@ -2631,8 +3107,14 @@ export class SettingsComponent implements OnInit {
     const now = new Date();
     const diffMs = now.getTime() - d.getTime();
     if (diffMs < 60_000) return this.transloco.translate('settings.helpers.timeJustNow');
-    if (diffMs < 3600_000) return this.transloco.translate('settings.helpers.timeMinutesAgo', {n: Math.floor(diffMs / 60_000)});
-    if (diffMs < 86400_000) return this.transloco.translate('settings.helpers.timeHoursAgo', {n: Math.floor(diffMs / 3600_000)});
+    if (diffMs < 3600_000)
+      return this.transloco.translate('settings.helpers.timeMinutesAgo', {
+        n: Math.floor(diffMs / 60_000),
+      });
+    if (diffMs < 86400_000)
+      return this.transloco.translate('settings.helpers.timeHoursAgo', {
+        n: Math.floor(diffMs / 3600_000),
+      });
     return d.toLocaleDateString(this.transloco.getActiveLang(), { month: 'short', day: 'numeric' });
   }
 
@@ -2820,8 +3302,8 @@ export class SettingsComponent implements OnInit {
         // The editor the user lands on surfaces it once instead — see
         // `forkNoticeTranslationArgs` there.
         if (id) {
-          const state: ExpertEditorNavigationState = {dropped: result.dropped};
-          this.router.navigate(['/experts', id, 'edit'], {state});
+          const state: ExpertEditorNavigationState = { dropped: result.dropped };
+          this.router.navigate(['/experts', id, 'edit'], { state });
         }
       },
       error: () => this.defaultExpertBusy.set(null),
@@ -2860,8 +3342,11 @@ export class SettingsComponent implements OnInit {
 
     const allowlistText = this.paCommandAllowlist().trim();
     const allowlist = allowlistText
-        ? allowlistText.split(',').map(s => s.trim()).filter(Boolean)
-        : null;
+      ? allowlistText
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : null;
 
     // notification_channels: v1 only ships email. We always send an explicit
     // list (never null) so the user's choice round-trips cleanly even when
@@ -2961,8 +3446,7 @@ export class SettingsComponent implements OnInit {
         },
         error: (err) => {
           this.creating.set(false);
-          const detail =
-            (err?.error?.detail as string | undefined) ?? 'Create failed';
+          const detail = (err?.error?.detail as string | undefined) ?? 'Create failed';
           this.createError.set(detail);
         },
       });
@@ -3044,7 +3528,9 @@ export class SettingsComponent implements OnInit {
     try {
       const parsed = new URL(url);
       if (!parsed.searchParams.get('code') || !parsed.searchParams.get('state')) {
-        this.codexCallbackError.set(this.transloco.translate('settings.codex.errors.urlMissingParams'));
+        this.codexCallbackError.set(
+          this.transloco.translate('settings.codex.errors.urlMissingParams'),
+        );
         return;
       }
     } catch {
@@ -3065,7 +3551,8 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.codexCallbackSubmitting.set(false);
-        const detail = err?.error?.detail || this.transloco.translate('settings.codex.errors.completeFailed');
+        const detail =
+          err?.error?.detail || this.transloco.translate('settings.codex.errors.completeFailed');
         this.codexCallbackError.set(detail);
       },
     });
@@ -3125,16 +3612,15 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.cloudLoading.set(false);
-        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.loadFailed'));
+        this.cloudMessage.set(
+          err?.error?.detail || this.transloco.translate('settings.cloud.messages.loadFailed'),
+        );
         this.cloudMessageIsError.set(true);
       },
     });
   }
 
-  updateCloudForm<K extends keyof MainCloudFormState>(
-    key: K,
-    value: MainCloudFormState[K],
-  ): void {
+  updateCloudForm<K extends keyof MainCloudFormState>(key: K, value: MainCloudFormState[K]): void {
     this.cloudForm.update((form) => ({ ...form, [key]: value }));
   }
 
@@ -3153,6 +3639,7 @@ export class SettingsComponent implements OnInit {
     return {
       value: { ...form },
       credentials_ref: credRef,
+      expected_activation_revision: this.cloudSettings()?.activation_revision ?? 0,
     };
   }
 
@@ -3165,14 +3652,19 @@ export class SettingsComponent implements OnInit {
         this.cloudTesting.set(false);
         this.cloudMessage.set(
           res.ok
-            ? this.transloco.translate('settings.cloud.messages.testOk', {ms: res.latency_ms?.toFixed(0) ?? '?'})
-            : this.transloco.translate('settings.cloud.messages.testFailed', {error: res.detail}),
+            ? this.transloco.translate('settings.cloud.messages.testOk', {
+                ms: res.latency_ms?.toFixed(0) ?? '?',
+              })
+            : this.transloco.translate('settings.cloud.messages.testFailed', { error: res.detail }),
         );
         this.cloudMessageIsError.set(!res.ok);
       },
       error: (err) => {
         this.cloudTesting.set(false);
-        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.testRequestFailed'));
+        this.cloudMessage.set(
+          err?.error?.detail ||
+            this.transloco.translate('settings.cloud.messages.testRequestFailed'),
+        );
         this.cloudMessageIsError.set(true);
       },
     });
@@ -3187,8 +3679,10 @@ export class SettingsComponent implements OnInit {
         this.cloudSaving.set(false);
         this.cloudMessage.set(
           this.transloco.translate(
-            res.reloaded ? 'settings.cloud.messages.savedReloaded' : 'settings.cloud.messages.saved',
-            {backend: res.backend_id},
+            res.reloaded
+              ? 'settings.cloud.messages.savedReloaded'
+              : 'settings.cloud.messages.saved',
+            { backend: res.backend_id },
           ),
         );
         this.cloudMessageIsError.set(false);
@@ -3196,7 +3690,9 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.cloudSaving.set(false);
-        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.saveFailed'));
+        this.cloudMessage.set(
+          err?.error?.detail || this.transloco.translate('settings.cloud.messages.saveFailed'),
+        );
         this.cloudMessageIsError.set(true);
       },
     });
@@ -3215,7 +3711,9 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.cloudSaving.set(false);
-        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.resetFailed'));
+        this.cloudMessage.set(
+          err?.error?.detail || this.transloco.translate('settings.cloud.messages.resetFailed'),
+        );
         this.cloudMessageIsError.set(true);
       },
     });

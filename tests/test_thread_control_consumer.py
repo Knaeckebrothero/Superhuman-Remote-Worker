@@ -23,6 +23,8 @@ THREAD_ID = UUID("11111111-1111-4111-8111-111111111111")
 REQUEST_1 = UUID("22222222-2222-4222-8222-222222222222")
 REQUEST_2 = UUID("33333333-3333-4333-8333-333333333333")
 PINNED_AGENT_ID = UUID("44444444-4444-4444-8444-444444444444")
+RUNTIME_GENERATION = UUID("55555555-5555-4555-8555-555555555555")
+RUNTIME_ATTACH_TOKEN = UUID("66666666-6666-4666-8666-666666666666")
 
 
 class _Acquire:
@@ -65,6 +67,7 @@ def _request(
         verb=verb,
         payload={"mode": mode},
         accepted_agent_id=accepted_agent_id,
+        runtime_generation=RUNTIME_GENERATION,
     )
 
 
@@ -97,6 +100,7 @@ def _undo_request(request_id: UUID = REQUEST_1, seq: int = 1) -> ControlRequest:
         verb="workspace.undo",
         payload={},
         accepted_agent_id=None,
+        runtime_generation=RUNTIME_GENERATION,
     )
 
 
@@ -572,6 +576,8 @@ async def test_pinned_drain_adopts_then_passes_immutable_agent_owner(
     apply_request = MagicMock(return_value=("narration.changed", "applied", None))
 
     with (
+        patch.object(pa, "_session_runtime_generation", str(RUNTIME_GENERATION)),
+        patch.object(pa, "_session_runtime_attach_token", str(RUNTIME_ATTACH_TOKEN)),
         patch("src.shared.thread_controls.owner_fence_current", owner_fence),
         patch("src.shared.thread_controls.adopt_next_pinned_control_request", adopt),
         patch("src.shared.thread_controls.fetch_next_control_request", fetch_next),
@@ -589,6 +595,8 @@ async def test_pinned_drain_adopts_then_passes_immutable_agent_owner(
     assert adopt.await_args_list[0].kwargs == {
         "thread_id": str(THREAD_ID),
         "agent_id": str(PINNED_AGENT_ID),
+        "runtime_generation": str(RUNTIME_GENERATION),
+        "runtime_attach_token": str(RUNTIME_ATTACH_TOKEN),
     }
     journal.assert_awaited_once_with(
         "narration.changed",
@@ -665,6 +673,8 @@ async def test_writer_fences_pinned_control_on_event_immutable_agent_id():
         epoch=2,
         on_terminal_failure=lambda _events, _reason: None,
         pinned_agent_id=agent_id,
+        pinned_runtime_generation=str(RUNTIME_GENERATION),
+        pinned_runtime_attach_token=str(RUNTIME_ATTACH_TOKEN),
     )
     event = pa._QueuedPersistentEvent(
         epoch=2,
@@ -681,11 +691,17 @@ async def test_writer_fences_pinned_control_on_event_immutable_agent_id():
     request_lock_sql, request_lock_args = conn.calls[2]
     assert "execution_lane = 'pinned'" in thread_fence_sql
     assert "FOR NO KEY UPDATE" in thread_fence_sql
-    assert thread_fence_args == (str(THREAD_ID), agent_id)
+    assert thread_fence_args == (
+        str(THREAD_ID),
+        agent_id,
+        str(RUNTIME_GENERATION),
+        str(RUNTIME_ATTACH_TOKEN),
+    )
     assert "thread_id = $2::uuid" in agent_fence_sql
     assert agent_fence_args == (agent_id, str(THREAD_ID))
     assert "accepted_agent_id IS NOT DISTINCT FROM $3::uuid" in request_lock_sql
     assert request_lock_args[2] == agent_id
+    assert request_lock_args[3] == str(RUNTIME_GENERATION)
 
 
 @pytest.mark.asyncio
@@ -936,8 +952,18 @@ async def test_final_pinned_drain_failure_stays_fatal_for_current_owner(monkeypa
 
 
 class _PinnedStatusConn:
-    def __init__(self, *, agent_id=PINNED_AGENT_ID, reciprocal=1, updated=THREAD_ID):
+    def __init__(
+        self,
+        *,
+        agent_id=PINNED_AGENT_ID,
+        runtime_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        runtime_attach_token=None,
+        reciprocal=1,
+        updated=THREAD_ID,
+    ):
         self.agent_id = agent_id
+        self.runtime_generation = runtime_generation
+        self.runtime_attach_token = runtime_attach_token
         self.reciprocal = reciprocal
         self.updated = updated
         self.calls: list[tuple[str, tuple]] = []
@@ -947,7 +973,12 @@ class _PinnedStatusConn:
 
     async def fetchrow(self, sql, *args):
         self.calls.append((sql, args))
-        return {"execution_lane": "pinned", "agent_id": self.agent_id}
+        return {
+            "execution_lane": "pinned",
+            "agent_id": self.agent_id,
+            "runtime_generation": self.runtime_generation,
+            "runtime_attach_token": self.runtime_attach_token,
+        }
 
     async def fetchval(self, sql, *args):
         self.calls.append((sql, args))
@@ -959,7 +990,7 @@ class _PinnedStatusConn:
 
 
 @pytest.mark.asyncio
-async def test_exact_pinned_status_rest_false_falls_back_to_fenced_database(
+async def test_exact_pinned_ended_status_rest_false_never_bypasses_retirement(
     monkeypatch,
 ):
     conn = _PinnedStatusConn()
@@ -972,13 +1003,15 @@ async def test_exact_pinned_status_rest_false_falls_back_to_fenced_database(
         SimpleNamespace(postgres_conn=SimpleNamespace(acquire=lambda: _Acquire(conn))),
     )
 
-    assert await pa._update_thread_status("ended", pinned_agent_id=str(PINNED_AGENT_ID))
+    assert not await pa._update_thread_status(
+        "ended", pinned_agent_id=str(PINNED_AGENT_ID)
+    )
     client.update_thread_status.assert_awaited_once_with(
         str(THREAD_ID),
         "ended",
         pinned_agent_id=str(PINNED_AGENT_ID),
     )
-    assert any("agent_id = $2::uuid" in sql for sql, _args in conn.calls)
+    assert not any("UPDATE threads" in sql for sql, _args in conn.calls)
 
 
 @pytest.mark.asyncio
@@ -1000,4 +1033,123 @@ async def test_exact_pinned_status_refuses_moved_binding_without_update(monkeypa
     assert not await pa._update_thread_status(
         "ended", pinned_agent_id=str(PINNED_AGENT_ID)
     )
+    assert not any("UPDATE threads" in sql for sql, _args in conn.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["active", "awaiting_user"])
+async def test_advertised_pinned_identity_fences_every_status_write(
+    monkeypatch, status
+):
+    conn = _PinnedStatusConn()
+    client = SimpleNamespace(
+        agent_id=str(PINNED_AGENT_ID),
+        update_thread_status=AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(pa, "_pinned_status_identity_enabled", True)
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(
+        pa,
+        "_session",
+        SimpleNamespace(postgres_conn=SimpleNamespace(acquire=lambda: _Acquire(conn))),
+    )
+
+    assert await pa._update_thread_status(status)
+    client.update_thread_status.assert_awaited_once_with(
+        str(THREAD_ID),
+        status,
+        pinned_agent_id=str(PINNED_AGENT_ID),
+    )
+    assert any(
+        "agent_id = $2::uuid" in sql and "UPDATE threads" in sql
+        for sql, _args in conn.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_old_server_compatibility_omits_identity_until_advertised(monkeypatch):
+    client = SimpleNamespace(
+        agent_id=str(PINNED_AGENT_ID),
+        update_thread_status=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(pa, "_pinned_status_identity_enabled", False)
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa, "_session", None)
+
+    assert await pa._update_thread_status("active")
+    client.update_thread_status.assert_awaited_once_with(str(THREAD_ID), "active")
+
+
+@pytest.mark.asyncio
+async def test_runtime_generation_fences_rest_and_direct_database_status_write(
+    monkeypatch,
+):
+    generation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    attach_token = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    conn = _PinnedStatusConn(
+        runtime_generation=generation,
+        runtime_attach_token=attach_token,
+    )
+    client = SimpleNamespace(
+        agent_id=str(PINNED_AGENT_ID),
+        update_thread_status=AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(pa, "_pinned_status_identity_enabled", True)
+    monkeypatch.setattr(pa, "_pinned_runtime_generation_enabled", True)
+    monkeypatch.setattr(pa, "_session_runtime_generation", generation)
+    monkeypatch.setattr(pa, "_session_runtime_attach_token", attach_token)
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(
+        pa,
+        "_session",
+        SimpleNamespace(postgres_conn=SimpleNamespace(acquire=lambda: _Acquire(conn))),
+    )
+
+    assert await pa._update_thread_status("active")
+    client.update_thread_status.assert_awaited_once_with(
+        str(THREAD_ID),
+        "active",
+        pinned_agent_id=str(PINNED_AGENT_ID),
+        session_runtime_generation=generation,
+        session_runtime_attach_token=attach_token,
+    )
+    update_sql, update_args = next(
+        (sql, args) for sql, args in conn.calls if "UPDATE threads" in sql
+    )
+    assert "runtime_generation = $3::uuid" in update_sql
+    assert "runtime_attach_token IS NOT DISTINCT FROM $4::uuid" in update_sql
+    assert update_args == (
+        str(THREAD_ID),
+        str(PINNED_AGENT_ID),
+        generation,
+        attach_token,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_runtime_generation_cannot_use_direct_database_fallback(
+    monkeypatch,
+):
+    generation_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    generation_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    conn = _PinnedStatusConn(runtime_generation=generation_b)
+    client = SimpleNamespace(
+        agent_id=str(PINNED_AGENT_ID),
+        update_thread_status=AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(pa, "_pinned_status_identity_enabled", True)
+    monkeypatch.setattr(pa, "_pinned_runtime_generation_enabled", True)
+    monkeypatch.setattr(pa, "_session_runtime_generation", generation_a)
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(
+        pa,
+        "_session",
+        SimpleNamespace(postgres_conn=SimpleNamespace(acquire=lambda: _Acquire(conn))),
+    )
+
+    assert not await pa._update_thread_status("active")
     assert not any("UPDATE threads" in sql for sql, _args in conn.calls)

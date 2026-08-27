@@ -15,6 +15,7 @@ Follows the house patterns: ``tests/test_export_to_cloud_endpoint.py``
 ``access_module._INTERNAL_KEY`` for the 401 case).
 """
 
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +29,18 @@ from services.workspace_suspension import WorkspaceSuspensionService
 # =============================================================================
 # POST /api/agents/threads/{thread_id}/cloud-stage
 # =============================================================================
+
+_STAGE_AUTHORITY = {
+    "runtime_generation": "11111111-1111-4111-8111-111111111111",
+    "workspace_generation": "22222222-2222-4222-8222-222222222222",
+    "expected_staged_epoch": 3,
+    "runtime_retirement_token": None,
+}
+
+
+@asynccontextmanager
+async def _owned_lock(*_args, **_kwargs):
+    yield True
 
 
 class TestCloudStageEndpoint:
@@ -64,22 +77,47 @@ class TestCloudStageEndpoint:
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch("main._is_protected_cloud_mode_enabled", return_value=True),
             patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock),
+            patch.object(
+                main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value={"id": "thread-1"}),
+            ),
+            patch.object(
+                main.postgres_db,
+                "get_ro_mount_by_thread",
+                AsyncMock(return_value={"id": "mount-1"}),
+            ),
+            patch.object(
+                main.postgres_db,
+                "thread_advisory_lock",
+                side_effect=_owned_lock,
+            ),
+            patch.object(
+                main, "_require_pinned_workspace_credential_owner", AsyncMock()
+            ),
+            patch.object(
+                main,
+                "_capture_cloud_stage_authority",
+                return_value=dict(_STAGE_AUTHORITY),
+            ),
         ):
             result = await main.agent_trigger_cloud_stage(fake_request, "thread-1")
             assert result == {"scheduled": True}
             # Task is registered synchronously (create_task schedules but does
             # not run until the event loop gets control back).
-            assert "thread-1" in main._cloud_stage_tasks
-            task = main._cloud_stage_tasks["thread-1"]
+            task_key = main._cloud_stage_task_key("thread-1", _STAGE_AUTHORITY)
+            assert task_key in main._cloud_stage_tasks
+            task = main._cloud_stage_tasks[task_key]
             await task
 
         stage_mock.assert_awaited_once_with(
             thread_id="thread-1",
             postgres_db=main.postgres_db,
             snapshot_service=main.snapshot_service,
+            authority=_STAGE_AUTHORITY,
         )
         # Self-evicts once the task completes.
-        assert "thread-1" not in main._cloud_stage_tasks
+        assert task_key not in main._cloud_stage_tasks
 
     @pytest.mark.asyncio
     async def test_cloud_stage_dedupes_inflight_thread(self, fake_request):
@@ -88,15 +126,34 @@ class TestCloudStageEndpoint:
         fake_request.headers = {"X-Internal-Key": "secret"}
         main._cloud_stage_tasks.clear()
         sentinel_task = MagicMock()
-        main._cloud_stage_tasks["thread-1"] = sentinel_task
+        task_key = main._cloud_stage_task_key("thread-1", _STAGE_AUTHORITY)
+        main._cloud_stage_tasks[task_key] = sentinel_task
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch("main._is_protected_cloud_mode_enabled", return_value=True),
+            patch.object(
+                main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value={"id": "thread-1"}),
+            ),
+            patch.object(
+                main.postgres_db,
+                "get_ro_mount_by_thread",
+                AsyncMock(return_value={"id": "mount-1"}),
+            ),
+            patch.object(
+                main, "_require_pinned_workspace_credential_owner", AsyncMock()
+            ),
+            patch.object(
+                main,
+                "_capture_cloud_stage_authority",
+                return_value=dict(_STAGE_AUTHORITY),
+            ),
         ):
             result = await main.agent_trigger_cloud_stage(fake_request, "thread-1")
         assert result == {"scheduled": True}
         # Registry slot untouched — still the sentinel, no new task created.
-        assert main._cloud_stage_tasks["thread-1"] is sentinel_task
+        assert main._cloud_stage_tasks[task_key] is sentinel_task
         main._cloud_stage_tasks.clear()
 
 

@@ -164,8 +164,9 @@ async def _lock_current_plan_scope(
     if _text_id(post.get("thread_id")) != _text_id(plan.get("thread_id")):
         return False
     thread = await conn.fetchrow(
-        "SELECT id, project_id, user_id, status, metadata, agent_id "
-        "FROM threads WHERE id = $1::uuid FOR UPDATE",
+        "SELECT id, project_id, user_id, status, metadata, execution_lane, "
+        "runtime_generation, runtime_attach_token, runtime_retirement_token, "
+        "agent_id FROM threads WHERE id = $1::uuid FOR UPDATE",
         str(plan.get("thread_id")),
     )
     if thread is None or thread.get("agent_id") is None:
@@ -408,8 +409,10 @@ async def create_plan(
                 )
 
             thread = await conn.fetchrow(
-                "SELECT id, project_id, user_id, status, metadata, agent_id "
-                "FROM threads WHERE id = $1 FOR UPDATE",
+                "SELECT id, project_id, user_id, status, metadata, execution_lane, "
+                "runtime_generation, runtime_attach_token, "
+                "runtime_retirement_token, agent_id FROM threads "
+                "WHERE id = $1 FOR UPDATE",
                 post["thread_id"],
             )
             agent = (

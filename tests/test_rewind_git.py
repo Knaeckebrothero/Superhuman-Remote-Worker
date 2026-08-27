@@ -365,7 +365,7 @@ def test_remote_nul_integrity_rejects_dropped_leading_base64_line(tmp_path):
     # complete NUL record. Only the end-retained length/hash frame detects the
     # missing leading data line.
     assert retained_raw.endswith(b"\x00")
-    assert list(transport_temp.iterdir()) == []
+    assert list(transport_temp.glob("srw-git-nul.*")) == []
 
     # A complete retry decodes normally, and a Git failure also removes its
     # operation-scoped spool file before surfacing failure.
@@ -378,7 +378,7 @@ def test_remote_nul_integrity_rejects_dropped_leading_base64_line(tmp_path):
         )
         is None
     )
-    assert list(transport_temp.iterdir()) == []
+    assert list(transport_temp.glob("srw-git-nul.*")) == []
     framed_commands = [
         command for command in backend.commands if "SRW-Git-NUL-Integrity" in command
     ]

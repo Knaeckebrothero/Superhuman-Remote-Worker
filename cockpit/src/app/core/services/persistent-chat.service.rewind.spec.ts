@@ -55,6 +55,7 @@ function createService() {
     };
     const mockNotifications: any = {
         lifecycleEvent: signal<{thread_id: string; state: string; reason?: string} | null>(null),
+        cloudDiffStagedEvent: signal(null),
     };
 
     TestBed.resetTestingModule();

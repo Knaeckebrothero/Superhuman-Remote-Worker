@@ -1881,6 +1881,17 @@ export function clearDraft(threadId: string | null): void {
           </div>
         }
 
+        @if (chat.threadStatus() === 'ending') {
+          <div class="resume-card ending-card" role="status" aria-live="polite">
+            <div class="resume-body">
+              <div class="resume-eyebrow">{{ 'chat.ending.eyebrow' | transloco }}</div>
+              <h3 class="resume-title">{{ 'chat.ending.title' | transloco }}</h3>
+              <p class="resume-text">{{ 'chat.ending.body' | transloco }}</p>
+            </div>
+            <span class="ide-spinner" aria-hidden="true"></span>
+          </div>
+        }
+
         <!-- Ended-session end-marker + resume card. Sits at the tail of the
              transcript, directly above the (still-live) composer — the card is
              the resume-without-typing path; sending resumes too. -->
@@ -2646,7 +2657,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.chat.isConnected(),
             this.chat.isStartingSession(),
             this.chat.isDraftSession(),
-            this.chat.threadStatus() === 'ended',
+            this.chat.threadStatus() === 'ended' || this.chat.threadStatus() === 'suspended',
             this.chat.isResuming(),
         ),
     );
@@ -3003,8 +3014,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // Sending has a side effect here (it brings the agent back), so say so
         // rather than letting the default "Enter to send" imply it's free.
         if (this.chat.isResuming()) return this.transloco.translate('chat.input.resuming');
+        if (this.chat.threadStatus() === 'ending') {
+            return this.transloco.translate('chat.input.ending');
+        }
         if (this.chat.threadStatus() === 'ended') {
             return this.transloco.translate('chat.input.endedSendResumes');
+        }
+        if (this.chat.threadStatus() === 'suspended') {
+            return this.transloco.translate('chat.input.suspendedSendResumes');
         }
         if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');

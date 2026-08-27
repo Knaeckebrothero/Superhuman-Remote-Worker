@@ -85,6 +85,7 @@ from ..shared.run_queue import (
     complete_unit,
     heartbeat_unit,
     open_interrupt_admission,
+    park_unit,
     release_unit,
 )
 from ..shared.session_retirement import acknowledge_session_claim_quiesced
@@ -127,6 +128,15 @@ TURN_ABORT_GRACE_SECONDS = 15.0  # polite-unwind budget after an interrupt
 COMPLETE_RETRY_ATTEMPTS = 3
 PENDING_ROWS_LIMIT = 50
 WORKER_FINALIZATION_POLL_SECONDS = 1.0
+
+
+class _ClaimQuiescenceError(RuntimeError):
+    """A claimant could not retire every local consumer before disposition."""
+
+
+class _PostEffectParkError(_ClaimQuiescenceError):
+    """Exact post-effect claim could not reach its fail-closed queue state."""
+
 
 _AUDIT_WRITER_UNSET = object()
 
@@ -413,6 +423,10 @@ class StatelessTurnExecutor:
         # finally block. Cleanup must never downgrade an atomic
         # close+checkpoint retry into a gate-only close.
         self._pending_settled_close: tuple[str, int, int, int] | None = None
+        # Monotonic executor-owned copy of the exact external-effect seam.
+        # PersistentApp session globals are intentionally cleared by a
+        # physical detach, which can precede the queue completion CAS.
+        self._tool_effect_identity: tuple[str, int, int] | None = None
 
     # ------------------------------------------------------------------
     # Plumbing
@@ -454,8 +468,9 @@ class StatelessTurnExecutor:
 
         The turn keeps heartbeating while it finishes, so the lease covers the
         whole grace window. On timeout, escalate: politely interrupt the turn,
-        then cancel the loop task as the last resort (the abandoned lease
-        expires and the reaper requeues the unit — bounded, logged).
+        then cancel the loop task as the last resort. A fully quiesced claim
+        that crossed a tool-effect boundary is parked for manual
+        reconciliation; a pre-effect claim remains retryable.
         """
         if timeout is None:
             timeout = float(os.getenv("STATELESS_SHUTDOWN_TIMEOUT_S", "120"))
@@ -471,14 +486,28 @@ class StatelessTurnExecutor:
                 "interrupting the in-flight turn",
                 timeout,
             )
-            self._abort_turn_politely(_pa())
+            pa = _pa()
+            target_turn_id = self._owned_abort_target(pa)
+            tool_execution_started = self._claim_crossed_tool_effect(pa)
+            if not tool_execution_started:
+                # This turn has crossed no external-effect boundary. Abandon
+                # the exact local claim before signaling so a cooperative turn
+                # close cannot race through complete_unit and consume an
+                # unanswered input. The DB lease is left for the normal
+                # expiry/reaper retry path after physical quiescence.
+                self._lease.mark_lost()
+            self._abort_turn_politely(
+                pa,
+                target_turn_id=target_turn_id,
+                force_graceful=tool_execution_started,
+            )
             try:
                 await asyncio.wait_for(asyncio.shield(task), self._abort_grace_seconds)
             except asyncio.TimeoutError:
                 logger.error(
                     "stateless executor still running after interrupt — "
-                    "cancelling; the lease will expire and the reaper "
-                    "requeues the unit"
+                    "cancelling; a quiesced post-effect claim will be parked "
+                    "instead of retried"
                 )
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -709,6 +738,14 @@ class StatelessTurnExecutor:
                         stop_started_at,
                     ) = self._new_worker_claim_timing(worker_claim)
                 try:
+                    if worker_claim is None:
+                        # The pod may still hold an idle warm session from its
+                        # previous claim. Retire it before publishing this
+                        # newly leased session unit back to the queue.
+                        await self._quiesce_claim_before_transition(
+                            _pa(),
+                            reason="release_shutting_down",
+                        )
                     finish_started_at = time.perf_counter()
                     try:
                         state = await release_unit(
@@ -728,6 +765,14 @@ class StatelessTurnExecutor:
                         stop_claim.unit_id,
                         stop_claim.lease_token,
                         state,
+                    )
+                except _ClaimQuiescenceError:
+                    logger.critical(
+                        "shutdown-boundary claim could not be quiesced; "
+                        "leaving exact lease unreleased (unit=%s token=%d)",
+                        stop_claim.unit_id,
+                        stop_claim.lease_token,
+                        exc_info=True,
                     )
                 except Exception:
                     pass
@@ -769,15 +814,67 @@ class StatelessTurnExecutor:
                 await self._serve_claim(claim)
             except asyncio.CancelledError:
                 raise
+            except _PostEffectParkError:
+                # Never route this through the generic release belt: the
+                # claim may already have produced an unledgered external tool
+                # effect. Stop claiming and leave the exact lease visibly
+                # unresolved rather than making the input runnable.
+                logger.critical(
+                    "post-effect claim could not be parked; stopping executor "
+                    "without release (unit=%s token=%d)",
+                    claim.unit_id,
+                    claim.lease_token,
+                    exc_info=True,
+                )
+                self.request_stop()
+            except _ClaimQuiescenceError:
+                # A retryable claim is not safe to publish while its old warm
+                # loop/session may still be alive. Stop and leave the exact
+                # lease for operator/reaper reconciliation.
+                logger.critical(
+                    "claim could not be fully quiesced; stopping executor "
+                    "without release (unit=%s token=%d)",
+                    claim.unit_id,
+                    claim.lease_token,
+                    exc_info=True,
+                )
+                self.request_stop()
             except Exception:
-                # Never crash the loop. _serve_claim handles its own error
-                # paths; this outermost belt also hands the lease back so an
-                # unexpected crash cannot strand the unit until lease expiry.
-                # Safe: release_unit fires only on (token match AND state
-                # 'leased'), so after a successful complete or a lost lease
-                # it is a recorded no-op.
+                # This outermost belt must classify the exact claim before it
+                # hands anything back. An unexpected exception can happen
+                # after a tool has crossed its effect boundary; releasing that
+                # input would replay the tool on a successor.
+                if self._claim_crossed_tool_effect(_pa(), claim=claim):
+                    logger.exception(
+                        "unhandled post-effect error serving unit %s — "
+                        "quiescing and parking",
+                        claim.unit_id,
+                    )
+                    try:
+                        state = await self._quiesce_and_park_post_effect_claim(
+                            _pa(),
+                            claim,
+                            reason="serve_crash_after_tool_effect",
+                        )
+                    except _PostEffectParkError:
+                        logger.critical(
+                            "post-effect serve crash could not be parked; "
+                            "stopping executor without release "
+                            "(unit=%s token=%d)",
+                            claim.unit_id,
+                            claim.lease_token,
+                            exc_info=True,
+                        )
+                        self.request_stop()
+                    else:
+                        if state is None:
+                            self.request_stop()
+                    continue
+                # No external-effect boundary was crossed: the original
+                # retryable serve-crash disposition remains correct.
                 logger.exception(
-                    "unhandled error serving unit %s — releasing and continuing",
+                    "unhandled pre-effect error serving unit %s — "
+                    "releasing and continuing",
                     claim.unit_id,
                 )
                 await self._release(claim, reason="serve_crash")
@@ -830,7 +927,7 @@ class StatelessTurnExecutor:
             if pa._session is not None:
                 await self._detach_cached_session("worker_claim_switch")
             self._scrub_process_residue()
-            self._lease.update(unit_id, token)
+            self._activate_lease(unit_id, token)
 
             timing["outcome"] = await self._serve_worker_claim_inner(
                 claim,
@@ -889,7 +986,7 @@ class StatelessTurnExecutor:
                 # nevertheless authoritative; publish this generation before
                 # its retry/give-up disposition rather than inheriting the old
                 # handle's lost bit.
-                self._lease.update(unit_id, token)
+                self._activate_lease(unit_id, token)
             if (
                 unit.attempts_since_completion > claim.max_attempts
                 and not self._lease.lost.is_set()
@@ -2054,6 +2151,10 @@ class StatelessTurnExecutor:
         pa = _pa()
         unit_id = str(claim.unit_id)
         token = claim.lease_token
+        # A newly claimed generation cannot inherit an effect marker from a
+        # durably disposed predecessor. The PA copy remains exact-token
+        # scoped until attach/turn start resets its session-local diagnostics.
+        self._tool_effect_identity = None
         logger.info(
             "run_queue claim: unit=%s kind=%s token=%d attempts=%d "
             "input_seq=%s consumed_seq=%s control_input_seq=%s "
@@ -2147,13 +2248,15 @@ class StatelessTurnExecutor:
                 await heartbeat_task
             pa._turn_start_external_hook = None
             pa._turn_complete_external_hook = None
+            pa._turn_tool_execution_external_hook = None
             if cancelled:
                 # SIGTERM's hard-cancel is still an ownership transition. Do
                 # not leave a live exact claim to expire after this Pod object
                 # disappears: first drain every local/SFTP/background writer,
-                # then release the exact token while this process is alive. A
-                # concurrent End/reaper steal turns release into a no-op and
-                # is acknowledged against its exact loss ledger below.
+                # then disposition the exact token while this process is
+                # alive. Pre-effect work is released for retry; a claim that
+                # crossed a tool-effect boundary is parked so no successor can
+                # automatically replay an ambiguous external side effect.
                 await self._shutdown_dispose_cancelled_claim(claim)
             if claim_lost.is_set() or self._exact_claim_handle_lost(claim):
                 if not await self._ack_terminal_claim_loss(claim):
@@ -2166,18 +2269,24 @@ class StatelessTurnExecutor:
     async def _shutdown_dispose_cancelled_claim(self, claim: ClaimedUnit) -> None:
         """Quiesce and durably dispose one SIGTERM-cancelled session claim."""
 
-        try:
-            await self._detach_physical_before_transition("shutdown_cancelled_claim")
-        except BaseException:
-            logger.critical(
-                "shutdown could not quiesce exact stateless claimant; keeping "
-                "the executor task alive for the Pod grace window "
-                "(unit=%s token=%d)",
-                claim.unit_id,
-                claim.lease_token,
-                exc_info=True,
+        pa = _pa()
+        # Capture only an exact claim identity before physical detach may
+        # clear process-local session state. This classification is monotonic
+        # for the remainder of this claim's cancellation cleanup.
+        tool_execution_started = self._claim_crossed_tool_effect(pa, claim=claim)
+
+        if tool_execution_started:
+            await self._quiesce_and_park_post_effect_claim(
+                pa,
+                claim,
+                reason="uncooperative_shutdown",
             )
-            raise
+            return
+
+        await self._quiesce_claim_before_transition(
+            pa,
+            reason="shutdown_cancelled_claim",
+        )
 
         last_error: BaseException | None = None
         for attempt in range(1, COMPLETE_RETRY_ATTEMPTS + 1):
@@ -2189,6 +2298,7 @@ class StatelessTurnExecutor:
                     error=True,
                 )
                 if state is not None:
+                    self._clear_claim_tool_effect(pa, claim)
                     logger.info(
                         "run_queue release: unit=%s token=%d "
                         "reason=shutdown_cancelled state=%s",
@@ -2201,6 +2311,7 @@ class StatelessTurnExecutor:
                 # credential-bearing claimant debt before this SELECT can see
                 # the advanced token; exact post-detach ACK is therefore safe.
                 await self._ack_terminal_claim_loss(claim)
+                self._clear_claim_tool_effect(pa, claim)
                 return
             except asyncio.CancelledError:
                 # The outer task is already cancelled; cleanup itself must be
@@ -2286,7 +2397,7 @@ class StatelessTurnExecutor:
             # persists, journal flushes) at THIS claim's token in place.
             # Physical sessions deliberately miss this path: detach retires
             # their old backend before a fresh object receives the new token.
-            self._lease.update(unit_id, token)
+            self._activate_lease(unit_id, token)
             if claim_lost.is_set():
                 self._lease.mark_lost()
                 return
@@ -2313,7 +2424,7 @@ class StatelessTurnExecutor:
                 await self._detach_cached_session("claim_switch")
             timing["detach"] = time.perf_counter() - t0
             self._scrub_process_residue()
-            self._lease.update(unit_id, token)
+            self._activate_lease(unit_id, token)
             if claim_lost.is_set():
                 self._lease.mark_lost()
                 return
@@ -2543,6 +2654,9 @@ class StatelessTurnExecutor:
             target_turn_id=turn_id,
         )
         pa._turn_complete_external_hook = lambda _turn_id: turn_done.set()
+        pa._turn_tool_execution_external_hook = (
+            lambda identity: self._record_claim_tool_effect(claim, identity)
+        )
         if not pa._ensure_persistent_loop_started("stateless_claim"):
             await self._detach_cached_session("loop_not_ready")
             await self._release(claim, reason="loop_not_ready")
@@ -2572,6 +2686,10 @@ class StatelessTurnExecutor:
                 )
                 await self._detach_cached_session("interrupt_identity_missing")
                 return
+            tool_execution_started = self._claim_crossed_tool_effect(
+                pa,
+                claim=claim,
+            )
             # The transcript, memory, Git mapping, and workspace effects have
             # settled, but a protected-cloud generation may still be flushing.
             # Keep the exact interrupt gate open until that PUT reaches a
@@ -2594,6 +2712,15 @@ class StatelessTurnExecutor:
                     completed_input_seq=int(target["seq"]),
                 )
             except Exception:
+                if tool_execution_started:
+                    await self._quiesce_and_park_post_effect_claim(
+                        pa,
+                        claim,
+                        reason=(
+                            "turn_complete_interrupt_close_failed_after_tool_effect"
+                        ),
+                    )
+                    return
                 self._lease.mark_lost()
                 logger.error(
                     "atomic input checkpoint/final interrupt drain failed after "
@@ -2612,13 +2739,24 @@ class StatelessTurnExecutor:
                     unit_id,
                     token,
                 )
-                await self._detach_cached_session("interrupt_close_lost_lease")
-                await self._ack_terminal_claim_loss(claim)
+                if tool_execution_started:
+                    await self._quiesce_and_park_post_effect_claim(
+                        pa,
+                        claim,
+                        reason="turn_complete_after_tool_effect_lost_authority",
+                    )
+                else:
+                    await self._detach_cached_session("interrupt_close_lost_lease")
+                    await self._ack_terminal_claim_loss(claim)
                 return
             # Close the owner-consumption window before completion. A control
             # committed after this point advances control_input_seq; the
             # completion statement observes it and requeues atomically.
             await pa._stop_thread_control_watcher()
+            # Snapshot the exact effect identity before a non-warm physical
+            # detach may clear process-local session state. If the completion
+            # CAS itself later exhausts retries, this determines whether the
+            # input can safely auto-retry or must be parked.
             t0 = time.perf_counter()
             await self._detach_physical_before_transition("turn_complete")
             timing["detach_final"] = time.perf_counter() - t0
@@ -2639,6 +2777,32 @@ class StatelessTurnExecutor:
                 )
                 await self._detach_cached_session("lease_lost_completion")
                 await self._ack_terminal_claim_loss(claim)
+                self._clear_claim_tool_effect(pa, claim)
+                return
+            if state == "error":
+                if tool_execution_started:
+                    await self._quiesce_and_park_post_effect_claim(
+                        pa,
+                        claim,
+                        reason="completion_cas_failed",
+                    )
+                else:
+                    # The atomic interrupt close already checkpointed the
+                    # answered input's consumed_seq; only the queue state CAS
+                    # failed. Never publish a retry or keep a warm consumer
+                    # alive on that ambiguous leased/done tail.
+                    await self._quiesce_claim_before_transition(
+                        pa,
+                        reason="completion_cas_failed_pre_effect",
+                    )
+                    logger.critical(
+                        "pre-effect run_queue completion remained unresolved; "
+                        "stopping executor without release/park "
+                        "(unit=%s token=%d)",
+                        claim.unit_id,
+                        claim.lease_token,
+                    )
+                    self.request_stop()
                 return
             logger.info(
                 "run_queue complete: unit=%s consumed_seq=%d state=%s",
@@ -2664,6 +2828,7 @@ class StatelessTurnExecutor:
                 sum(timing.values()),
             )
             if state != "error":
+                self._clear_claim_tool_effect(pa, claim)
                 self._mark_warm(claim)  # lite-only affinity + warm-TTL clock
         elif outcome == "lease_lost":
             # Polite fast path (§5.2): stop the turn the way the graceful
@@ -2675,11 +2840,10 @@ class StatelessTurnExecutor:
                 unit_id,
                 token,
             )
-            turn_id = (
-                pa._interrupt_owner_turn_id
-                if pa._interrupt_owner_lease_token == token
-                else None
-            )
+            turn_id = self._owned_abort_target(pa)
+            # Signal before interrupt-watcher close/drain: those are remote/DB
+            # joins and must not delay the process-local abort edge.
+            self._abort_turn_politely(pa, target_turn_id=turn_id)
             if turn_id is not None:
                 await self._close_interrupt_window(
                     pa,
@@ -2689,7 +2853,6 @@ class StatelessTurnExecutor:
             else:
                 await pa._stop_thread_interrupt_watcher()
             await pa._stop_thread_control_watcher()
-            self._abort_turn_politely(pa)
             await self._wait_turn_unwind(turn_done, loop_task)
             # The aborted turn's in-memory tail may hold messages the fence
             # rejected — a later affinity reuse would diverge from the DB.
@@ -2702,10 +2865,16 @@ class StatelessTurnExecutor:
             # this a no-op for ordinary reaper loss.
             await self._ack_terminal_claim_loss(claim)
         else:  # loop_died
+            tool_execution_started = self._claim_crossed_tool_effect(
+                pa,
+                claim=claim,
+            )
+            disposition = "parking" if tool_execution_started else "releasing"
             logger.warning(
-                "persistent loop ended mid-turn for unit %s (%s) — releasing",
+                "persistent loop ended mid-turn for unit %s (%s) — %s",
                 unit_id,
                 outcome,
+                disposition,
             )
             turn_id = (
                 pa._interrupt_owner_turn_id
@@ -2720,6 +2889,13 @@ class StatelessTurnExecutor:
                         target_turn_id=int(turn_id),
                     )
                 except Exception:
+                    if tool_execution_started:
+                        await self._quiesce_and_park_post_effect_claim(
+                            pa,
+                            claim,
+                            reason="loop_died_after_tool_effect_interrupt_close_failed",
+                        )
+                        return
                     self._lease.mark_lost()
                     logger.error(
                         "interrupt final drain failed after loop death; "
@@ -2733,10 +2909,23 @@ class StatelessTurnExecutor:
                     )
                     return
                 if not interrupt_closed:
-                    await self._detach_cached_session("loop_died_lost_lease")
+                    if tool_execution_started:
+                        await self._quiesce_and_park_post_effect_claim(
+                            pa,
+                            claim,
+                            reason="loop_died_after_tool_effect_lost_authority",
+                        )
+                    else:
+                        await self._detach_cached_session("loop_died_lost_lease")
                     return
+            if tool_execution_started:
+                await self._quiesce_and_park_post_effect_claim(
+                    pa,
+                    claim,
+                    reason="loop_died_after_tool_effect",
+                )
+                return
             await self._release(claim, reason="loop_died")
-            await self._detach_cached_session("loop_died")
 
     # ------------------------------------------------------------------
     # Pieces
@@ -2975,27 +3164,287 @@ class StatelessTurnExecutor:
                     waiter.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await waiter
-        # Preference order: a completed turn wins even if the lease was lost
-        # in the same instant — complete_unit is token-guarded, so a truly
-        # lost lease turns the completion into the fenced-out path anyway.
-        if turn_done.is_set():
-            return "turn_done"
+        # Lease loss wins a simultaneous turn close. Besides a rejected DB
+        # renewal this event represents shutdown's intentional abandonment of
+        # a pre-effect turn; letting turn_done win there would complete the
+        # still-unanswered input under a DB lease that remains valid until TTL.
         if lost_event.is_set():
             return "lease_lost"
+        if turn_done.is_set():
+            return "turn_done"
         return "loop_died"
 
-    def _abort_turn_politely(self, pa: Any) -> None:
+    def _activate_lease(self, unit_id: Any, lease_token: int) -> None:
+        """Install a new exact claimant and retire prior effect evidence."""
+
+        self._tool_effect_identity = None
+        self._lease.update(unit_id, lease_token)
+
+    def _record_claim_tool_effect(
+        self,
+        claim: ClaimedUnit,
+        identity: tuple[str, int, int],
+    ) -> None:
+        """Synchronously copy PA's exact pre-invoke identity into the owner."""
+
+        expected = (str(claim.unit_id), int(claim.lease_token))
+        if (
+            not isinstance(identity, tuple)
+            or len(identity) != 3
+            or identity[:2] != expected
+            or isinstance(identity[2], bool)
+            or not isinstance(identity[2], int)
+            or identity[2] <= 0
+            or self._lease.unit_id != expected[0]
+            or self._lease.lease_token != expected[1]
+            or self._lease.lost.is_set()
+        ):
+            self._lease.mark_lost()
+            raise RuntimeError(
+                "tool execution boundary does not match the active queue claim"
+            )
+        current = self._tool_effect_identity
+        if current is not None and current != identity:
+            # One queue claim is one durable input turn. Keep the first effect
+            # monotonic and fail rather than silently relabeling it.
+            self._lease.mark_lost()
+            raise RuntimeError("queue claim crossed multiple tool-turn identities")
+        self._tool_effect_identity = identity
+
+    def _owned_abort_target(self, pa: Any) -> Optional[int]:
+        """Return the exact active turn owned by this executor claim."""
+
+        unit_id = self._lease.unit_id
+        lease_token = self._lease.lease_token
+        target_turn_id = getattr(pa, "_interrupt_owner_turn_id", None)
+        if (
+            not unit_id
+            or str(getattr(pa, "_thread_id", "") or "") != str(unit_id)
+            or getattr(pa, "_interrupt_owner_lease_token", None) != lease_token
+            or isinstance(target_turn_id, bool)
+            or not isinstance(target_turn_id, int)
+            or target_turn_id <= 0
+        ):
+            return None
+        return target_turn_id
+
+    def _claim_crossed_tool_effect(
+        self,
+        pa: Any,
+        *,
+        claim: Optional[ClaimedUnit] = None,
+    ) -> bool:
+        """Read the exact claim-scoped external-effect identity.
+
+        This deliberately does not depend on interrupt-watcher globals: those
+        close at the turn-settled hook, before the run_queue completion CAS.
+        """
+
+        unit_id = str(claim.unit_id) if claim is not None else self._lease.unit_id
+        lease_token = (
+            int(claim.lease_token)
+            if claim is not None
+            else int(self._lease.lease_token)
+        )
+        if not unit_id or lease_token <= 0:
+            return False
+        local_identity = self._tool_effect_identity
+        if local_identity is not None and local_identity[:2] == (
+            str(unit_id),
+            lease_token,
+        ):
+            return True
+        try:
+            identity = pa._turn_tool_execution_identity_for_claim(
+                thread_id=str(unit_id),
+                lease_token=lease_token,
+            )
+            if identity is None:
+                return False
+            # Copy before any caller can physically detach PersistentApp and
+            # erase its diagnostic global.
+            self._tool_effect_identity = identity
+            return True
+        except Exception:
+            # Classification is a safety boundary. Never downgrade a broken
+            # exact-identity reader to the pre-effect auto-retry path.
+            logger.exception(
+                "tool-effect identity lookup failed closed (unit=%s token=%d)",
+                unit_id,
+                lease_token,
+            )
+            return True
+
+    def _clear_claim_tool_effect(self, pa: Any, claim: ClaimedUnit) -> None:
+        """Forget only the identity whose queue disposition is now durable."""
+
+        expected = (str(claim.unit_id), int(claim.lease_token))
+        if (
+            self._tool_effect_identity is not None
+            and self._tool_effect_identity[:2] == expected
+        ):
+            self._tool_effect_identity = None
+
+        try:
+            pa._clear_turn_tool_execution_identity(
+                thread_id=str(claim.unit_id),
+                lease_token=int(claim.lease_token),
+            )
+        except Exception:
+            # A stale marker can only make a later shutdown more conservative
+            # because all lookups are exact-token scoped. Do not turn a durable
+            # queue disposition into an executor failure for local cleanup.
+            logger.warning(
+                "failed to clear local tool-effect identity (unit=%s token=%d)",
+                claim.unit_id,
+                claim.lease_token,
+                exc_info=True,
+            )
+
+    async def _quiesce_and_park_post_effect_claim(
+        self,
+        pa: Any,
+        claim: ClaimedUnit,
+        *,
+        reason: str,
+    ) -> Optional[str]:
+        """Retire every physical writer, then park an ambiguous effect claim."""
+
+        try:
+            await self._quiesce_claim_before_transition(
+                pa,
+                reason=f"park_{reason}",
+            )
+        except _ClaimQuiescenceError as exc:
+            raise _PostEffectParkError(
+                "post-effect claimant could not be fully quiesced before park"
+            ) from exc
+        return await self._park_post_effect_claim(
+            pa,
+            claim,
+            reason=reason,
+        )
+
+    async def _quiesce_claim_before_transition(
+        self,
+        pa: Any,
+        *,
+        reason: str,
+    ) -> None:
+        """Retire all warm/physical consumers before a queue state change."""
+
+        try:
+            # No queued successor may observe the claim while a turn-end cloud
+            # writer or cached persistent loop can still mutate state.
+            await self._await_cloud_push(pa)
+            if (
+                pa._pending_cloud_push_task is not None
+                and pa._pending_cloud_push_task.done()
+            ):
+                pa._pending_cloud_push_task = None
+            await self._detach_cached_session(reason)
+        except BaseException as exc:
+            raise _ClaimQuiescenceError(
+                "claimant could not be fully quiesced before queue transition"
+            ) from exc
+
+    async def _park_post_effect_claim(
+        self,
+        pa: Any,
+        claim: ClaimedUnit,
+        *,
+        reason: str,
+    ) -> Optional[str]:
+        """CAS an already-quiesced post-effect claim to manual recovery."""
+
+        last_error: BaseException | None = None
+        for attempt in range(1, COMPLETE_RETRY_ATTEMPTS + 1):
+            try:
+                state = await park_unit(
+                    self._db,
+                    unit_id=claim.unit_id,
+                    lease_token=claim.lease_token,
+                )
+                if state is None:
+                    logger.critical(
+                        "post-effect park lost exact queue authority: "
+                        "unit=%s token=%d reason=%s; successor disposition "
+                        "requires reconciliation",
+                        claim.unit_id,
+                        claim.lease_token,
+                        reason,
+                    )
+                    await self._ack_terminal_claim_loss(claim)
+                    self._clear_claim_tool_effect(pa, claim)
+                    return None
+                self._clear_claim_tool_effect(pa, claim)
+                logger.critical(
+                    "run_queue parked after post-effect claim could not "
+                    "complete: unit=%s token=%d reason=%s state=%s; manual "
+                    "reconciliation and explicit unpark required",
+                    claim.unit_id,
+                    claim.lease_token,
+                    reason,
+                    state,
+                )
+                return state
+            except asyncio.CancelledError:
+                # Cancellation cleanup must reach a durable queue disposition;
+                # retry it just like the release path below.
+                continue
+            except BaseException as exc:
+                last_error = exc
+                if attempt < COMPLETE_RETRY_ATTEMPTS:
+                    await asyncio.sleep(0.5 * attempt)
+        raise _PostEffectParkError(
+            "post-effect claim could not be parked without enabling replay"
+        ) from last_error
+
+    def _abort_turn_politely(
+        self,
+        pa: Any,
+        *,
+        target_turn_id: Optional[int],
+        force_graceful: bool = False,
+    ) -> bool:
         """Interrupt the loop the way the interrupt verb does: graceful while
         a tool call is mid-invoke, hard otherwise (cancels a blocked LLM
-        stream immediately)."""
+        stream immediately).
+
+        Stateless lease loss may race the end of a turn. Never synthesize an
+        unscoped flag: the persistent-loop helper atomically verifies that the
+        exact durable turn is still active before mutating interrupt state.
+        """
+        if (
+            isinstance(target_turn_id, bool)
+            or not isinstance(target_turn_id, int)
+            or target_turn_id <= 0
+        ):
+            logger.warning(
+                "refusing unscoped stateless turn abort: no exact active turn"
+            )
+            return False
         try:
-            mode = "graceful" if pa._tool_inflight else "hard"
-            pa._loop_interrupt_flag = mode
-            if mode == "hard" and pa._hard_interrupt_event is not None:
-                pa._hard_interrupt_event.set()
-            logger.info("turn abort requested (mode=%s)", mode)
+            mode = pa._signal_interrupt_for_turn(
+                target_turn_id,
+                force_graceful=force_graceful,
+            )
         except Exception:
             logger.warning("failed to signal turn abort", exc_info=True)
+            return False
+        if mode is None:
+            logger.warning(
+                "refusing stale stateless turn abort: target_turn=%d is no "
+                "longer active",
+                target_turn_id,
+            )
+            return False
+        logger.info(
+            "turn abort requested (mode=%s target_turn=%d)",
+            mode,
+            target_turn_id,
+        )
+        return True
 
     async def _wait_turn_unwind(
         self, turn_done: asyncio.Event, loop_task: Optional[asyncio.Task]
@@ -3051,11 +3500,12 @@ class StatelessTurnExecutor:
         """complete_unit with bounded retries. Returns the resulting state,
         None when fenced out, or the sentinel 'error' after exhausted retries.
 
-        NEVER falls back to release_unit here: the answer is already
-        persisted, and a release (which does not advance ``consumed_seq``)
-        would hand the unit to another pod for a full re-answer. Leaving the
-        lease to expire is the lesser evil — loud in the log, bounded by the
-        reaper (§5.2 torn-turn: completion IS the watermark write)."""
+        NEVER falls back to release_unit here: the answer is already persisted
+        and the preceding atomic interrupt close already checkpointed
+        ``consumed_seq``. A release would publish that already-settled
+        answer/effect for another pod despite the watermark. Leaving the queue
+        state leased is the lesser evil — loud in the log and bounded by the
+        reaper (§5.2 torn-turn invariant)."""
         last_exc: Optional[BaseException] = None
         for attempt in range(1, COMPLETE_RETRY_ATTEMPTS + 1):
             try:
@@ -3083,15 +3533,13 @@ class StatelessTurnExecutor:
         """Voluntary error release (§5.1): default linear backoff, token-
         guarded (a genuinely lost lease makes this a recorded no-op)."""
         pa = _pa()
-        # Warm/lite sessions skip physical detach, so teardown cannot be the
-        # only push drain. No leased->queued transition may expose a successor
-        # while this owner's external PUT is still live.
-        await self._await_cloud_push(pa)
-        if (
-            pa._pending_cloud_push_task is not None
-            and pa._pending_cloud_push_task.done()
-        ):
-            pa._pending_cloud_push_task = None
+        # Warm affinity is valid only after successful completion. Every
+        # leased->queued error transition retires the cached loop/session so a
+        # successor can never overlap this claimant's consumer or writers.
+        await self._quiesce_claim_before_transition(
+            pa,
+            reason=f"release_{reason}",
+        )
         if self._lease.lost.is_set():
             logger.info(
                 "run_queue release: unit=%s token=%d reason=%s "
@@ -3103,11 +3551,6 @@ class StatelessTurnExecutor:
             if self._exact_claim_handle_lost(claim):
                 await self._ack_terminal_claim_loss(claim)
             return
-        # Exact lifecycle boundary: no consumer may survive the state change
-        # from leased back to queued, even on an error path.
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await pa._stop_thread_control_watcher()
-        await self._detach_physical_before_transition(f"release_{reason}")
         try:
             state = await release_unit(
                 self._db,
@@ -3133,6 +3576,7 @@ class StatelessTurnExecutor:
                 reason,
             )
             await self._ack_terminal_claim_loss(claim)
+            self._clear_claim_tool_effect(pa, claim)
         else:
             logger.info(
                 "run_queue release: unit=%s token=%d reason=%s state=%s",
@@ -3141,6 +3585,7 @@ class StatelessTurnExecutor:
                 reason,
                 state,
             )
+            self._clear_claim_tool_effect(pa, claim)
 
     async def _detach_physical_before_transition(self, reason: str) -> None:
         """Retire physical owner state while this claim is still exclusive."""
@@ -3215,6 +3660,7 @@ class StatelessTurnExecutor:
         self._warm_since = None
         pa._turn_complete_external_hook = None
         pa._turn_start_external_hook = None
+        pa._turn_tool_execution_external_hook = None
         if pa._session is None:
             # A failed attach can leave _thread_id set with no session
             # (dual_app precedent) — clear it so the next claim starts clean.

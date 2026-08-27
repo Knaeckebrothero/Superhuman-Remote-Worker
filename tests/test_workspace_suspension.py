@@ -10,6 +10,7 @@ Tests cover:
 import sys
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -1174,6 +1175,10 @@ def make_vm_thread(thread_id="tid-vm", ssh_host="100.64.0.235"):
     return {
         "id": thread_id,
         "status": "active",
+        "execution_lane": "pinned",
+        "runtime_generation": "00000000-0000-4000-8000-000000000001",
+        "agent_id": None,
+        "runtime_attach_token": None,
         "metadata": {
             "config_override": {"workspace": {"backend": "vm"}},
             "workspace_container": {
@@ -1449,7 +1454,9 @@ class TestVmSuspendRidesThePersistentRootdisk:
         svc._db.get_thread = AsyncMock(return_value=thread)
         svc._extract_snapshot = AsyncMock()
 
-        ok = await svc.restore_thread_workspace("tid-vm")
+        ok = await svc.restore_thread_workspace(
+            "tid-vm", _pinned_runtime_lock_held=True
+        )
 
         assert ok is True
         svc._extract_snapshot.assert_not_awaited()
@@ -1465,7 +1472,7 @@ class TestVmSuspendRidesThePersistentRootdisk:
         svc._db.get_thread = AsyncMock(return_value=thread)
         svc._extract_snapshot = AsyncMock()
 
-        await svc.restore_thread_workspace("tid-vm")
+        await svc.restore_thread_workspace("tid-vm", _pinned_runtime_lock_held=True)
 
         svc._extract_snapshot.assert_awaited_once()
 
@@ -1646,6 +1653,38 @@ class TestVmRestoreEndsAtTheCreate:
         return thread
 
     @pytest.mark.asyncio
+    async def test_pinned_restore_refuses_when_runtime_lock_is_unavailable(self):
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=self._kept_thread())
+
+        ok = await svc.restore_thread_workspace("tid-vm")
+
+        assert ok is False
+        vm_prov.create_thread_vm.assert_not_awaited()
+        svc._container_provisioner.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pinned_restore_refuses_when_runtime_lock_is_not_acquired(
+        self, monkeypatch
+    ):
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=self._kept_thread())
+
+        @asynccontextmanager
+        async def denied_lock(_db, _thread_id):
+            yield False
+
+        monkeypatch.setattr(
+            type(svc._db), "thread_advisory_lock", denied_lock, raising=False
+        )
+
+        ok = await svc.restore_thread_workspace("tid-vm")
+
+        assert ok is False
+        vm_prov.create_thread_vm.assert_not_awaited()
+        svc._container_provisioner.create_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_kept_disk_restore_succeeds_without_ssh_host(self, monkeypatch):
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
         svc, vm_prov = make_vm_service()
@@ -1657,10 +1696,18 @@ class TestVmRestoreEndsAtTheCreate:
         svc._db.get_thread = AsyncMock(side_effect=[before, after])
         svc._extract_snapshot = AsyncMock()
 
-        ok = await svc.restore_thread_workspace("tid-vm")
+        ok = await svc.restore_thread_workspace(
+            "tid-vm", _pinned_runtime_lock_held=True
+        )
 
         assert ok is True
-        vm_prov.create_thread_vm.assert_awaited_once_with("tid-vm")
+        vm_prov.create_thread_vm.assert_awaited_once_with(
+            "tid-vm",
+            expected_runtime_generation="00000000-0000-4000-8000-000000000001",
+            expected_agent_id=None,
+            expected_attach_token=None,
+            expected_vm_context=before["metadata"]["vm"],
+        )
         svc._extract_snapshot.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1672,7 +1719,7 @@ class TestVmRestoreEndsAtTheCreate:
         after["metadata"]["vm"] = {"status": "provisioning", "rootdisk": "kept"}
         svc._db.get_thread = AsyncMock(side_effect=[before, after])
 
-        await svc.restore_thread_workspace("tid-vm")
+        await svc.restore_thread_workspace("tid-vm", _pinned_runtime_lock_held=True)
 
         for call in svc._db.merge_thread_vm_context.await_args_list:
             assert call.args[1].get("status") != "failed", (
@@ -1692,7 +1739,7 @@ class TestVmRestoreEndsAtTheCreate:
         after["metadata"]["vm"] = {"status": "provisioning", "rootdisk": "kept"}
         svc._db.get_thread = AsyncMock(side_effect=[before, after])
 
-        await svc.restore_thread_workspace("tid-vm")
+        await svc.restore_thread_workspace("tid-vm", _pinned_runtime_lock_held=True)
 
         for call in svc._db.merge_thread_vm_context.await_args_list:
             assert call.args[1].get("status") != "ready"
@@ -1708,7 +1755,9 @@ class TestVmRestoreEndsAtTheCreate:
         svc._db.get_thread = AsyncMock(return_value=thread)
         svc._extract_snapshot = AsyncMock()
 
-        ok = await svc.restore_thread_workspace("tid-vm")
+        ok = await svc.restore_thread_workspace(
+            "tid-vm", _pinned_runtime_lock_held=True
+        )
 
         assert ok is True
         svc._extract_snapshot.assert_awaited_once()

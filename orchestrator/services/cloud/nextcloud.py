@@ -27,14 +27,14 @@ Uses two Nextcloud APIs:
 from __future__ import annotations
 
 import itertools
-import json
+import hashlib
 import logging
 import os
 import re
-import secrets
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any, Optional
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import httpx
 
@@ -47,6 +47,7 @@ from .base import (
     RoReaderGrant,
     UserHome,
 )
+from .backend_instance_authority import main_cloud_installation_proof_sha256
 from .config import NextcloudSettings
 from .etag_baseline import PropfindError, capture_etag_baseline
 from .errors import CloudBackendError, CloudBackendErrorKind
@@ -60,6 +61,8 @@ from .handles import (
 )
 from .retry import LeakyBucket
 from .telemetry import instrument_backend_op
+from .protected_reader_authority import ProtectedNextcloudReaderGrantPlan
+from .protected_effect_contract import NextcloudEffectFenceIntent
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +77,13 @@ _READ_PERMISSION = 1  # read only — the protected-mode RO reader grant
 # at 15/10min to leave headroom for clock skew and concurrent processes.
 _SHARE_RATE_LIMIT_EVENTS = 15
 _SHARE_RATE_LIMIT_WINDOW_SECONDS = 600.0
+
+_PROTECTED_EFFECT_CAPABILITY_PATH = (
+    "/index.php/apps/srw_protected_effect/api/v1/capability"
+)
+_PROTECTED_EFFECT_AUTHORITY_HEADER = "X-SRW-Protected-Effect-Authority"
+_PROTECTED_EFFECT_SIGNATURE_HEADER = "X-SRW-Protected-Effect-Signature"
+_PROTECTED_EFFECT_INSTANCE_HEADER = "X-SRW-Backend-Instance"
 
 
 class NextcloudBackend:
@@ -104,8 +114,22 @@ class NextcloudBackend:
         self._admin_password = settings.admin_password.get_secret_value()
         self._agent_user = settings.agent_user
         self._agent_password = settings.agent_password.get_secret_value()
+        self._protected_effect_url = (
+            str(settings.protected_effect_url).rstrip("/")
+            if settings.protected_effect_url is not None
+            else None
+        )
+        self._protected_effect_config_sha256 = settings.protected_effect_config_sha256
+        self._protected_effect_hmac_key = (
+            settings.protected_effect_hmac_key.get_secret_value().encode("utf-8")
+            if settings.protected_effect_hmac_key is not None
+            else None
+        )
         self._initialized = False
         self._client: Optional[httpx.AsyncClient] = None
+        self._protected_effect_client: Optional[httpx.AsyncClient] = None
+        self._backend_instance_id: Optional[str] = None
+        self._installation_proof_sha256: Optional[str] = None
         self._share_bucket = LeakyBucket(
             max_events=_SHARE_RATE_LIMIT_EVENTS,
             window_seconds=_SHARE_RATE_LIMIT_WINDOW_SECONDS,
@@ -120,6 +144,136 @@ class NextcloudBackend:
     @property
     def is_initialized(self) -> bool:
         return self._initialized
+
+    @property
+    def backend_instance_id(self) -> Optional[str]:
+        return self._backend_instance_id
+
+    @property
+    def installation_proof_sha256(self) -> Optional[str]:
+        return self._installation_proof_sha256
+
+    @property
+    def protected_effect_config_sha256(self) -> Optional[str]:
+        return self._protected_effect_config_sha256
+
+    @property
+    def protected_effect_hmac_key(self) -> Optional[bytes]:
+        # Bytes are returned only to the in-process signer. They are never
+        # included in plans, persisted authorities, responses, or logs.
+        return self._protected_effect_hmac_key
+
+    def bind_backend_instance(self, backend_instance_id: str) -> None:
+        """Bind the DB-adopted installation UUID exactly once."""
+
+        if self._backend_instance_id not in {None, backend_instance_id}:
+            raise RuntimeError("Nextcloud backend instance authority changed")
+        self._backend_instance_id = backend_instance_id
+
+    def _protected_effect_origin_path(self, path: str) -> str:
+        """Prefix a signed target with the installation path exactly once."""
+
+        if not isinstance(path, str) or not path.startswith("/") or "?" in path:
+            raise ValueError("protected Nextcloud effect path is malformed")
+        base_path = urlsplit(self._base_url).path.rstrip("/")
+        if base_path and (path == base_path or path.startswith(f"{base_path}/")):
+            return path
+        return f"{base_path}{path}"
+
+    async def fetch_protected_effect_capability(
+        self,
+    ) -> tuple[dict[str, Any], str]:
+        """Fetch the remote app's signed, installation-bound timing contract."""
+
+        self._ensure_ready()
+        if (
+            self._backend_instance_id is None
+            or self._protected_effect_client is None
+            or self._protected_effect_config_sha256 is None
+            or self._protected_effect_hmac_key is None
+        ):
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_SUPPORTED,
+                "protected Nextcloud effect lane is not configured",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        try:
+            response = await self._protected_effect_client.get(
+                self._protected_effect_origin_path(_PROTECTED_EFFECT_CAPABILITY_PATH),
+                headers={
+                    _PROTECTED_EFFECT_INSTANCE_HEADER: self._backend_instance_id,
+                },
+            )
+            response.raise_for_status()
+            self._assert_not_html(response)
+            payload = response.json()
+        except httpx.HTTPError as exc:
+            raise self._map_http_error(exc) from exc
+        except (TypeError, ValueError) as exc:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                "protected Nextcloud effect capability response is malformed",
+                backend=self.backend_id,
+            ) from exc
+        if not isinstance(payload, dict) or set(payload) != {
+            "capability",
+            "signature",
+        }:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                "protected Nextcloud effect capability response is malformed",
+                backend=self.backend_id,
+            )
+        capability = payload.get("capability")
+        signature = payload.get("signature")
+        if not isinstance(capability, dict) or not isinstance(signature, str):
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                "protected Nextcloud effect capability response is malformed",
+                backend=self.backend_id,
+            )
+        return capability, signature
+
+    async def dispatch_protected_effect(
+        self,
+        intent: NextcloudEffectFenceIntent,
+        *,
+        body: bytes,
+    ) -> httpx.Response:
+        """Send one already-durable request to its exact signed target path."""
+
+        self._ensure_ready()
+        if (
+            not isinstance(intent, NextcloudEffectFenceIntent)
+            or self._protected_effect_client is None
+            or intent.request.backend_instance_id != self._backend_instance_id
+            or intent.request.config_sha256 != self._protected_effect_config_sha256
+            or type(body) is not bytes
+            or hashlib.sha256(body).hexdigest() != intent.request.body_sha256
+        ):
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "protected Nextcloud effect dispatch authority is malformed",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        try:
+            return await self._protected_effect_client.request(
+                intent.request.method,
+                intent.request.path,
+                content=body,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    _PROTECTED_EFFECT_INSTANCE_HEADER: (
+                        intent.request.backend_instance_id
+                    ),
+                    _PROTECTED_EFFECT_AUTHORITY_HEADER: intent.request.canonical_json,
+                    _PROTECTED_EFFECT_SIGNATURE_HEADER: intent.request_signature,
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise self._map_http_error(exc) from exc
 
     @property
     def webdav_credentials(self) -> dict[str, str]:
@@ -265,9 +419,51 @@ class NextcloudBackend:
                 timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=10.0),
                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             )
+            if self._protected_effect_url is not None:
+                self._protected_effect_client = httpx.AsyncClient(
+                    base_url=self._protected_effect_url,
+                    auth=(self._admin_user, self._admin_password),
+                    headers={
+                        "OCS-APIRequest": "true",
+                        "Accept": "application/json",
+                        "User-Agent": (
+                            "SuperhumanRemoteWorker/0.1 protected-effect-lane"
+                        ),
+                    },
+                    timeout=httpx.Timeout(
+                        connect=5.0,
+                        read=65.0,
+                        write=10.0,
+                        pool=10.0,
+                    ),
+                    limits=httpx.Limits(
+                        max_connections=4,
+                        max_keepalive_connections=2,
+                    ),
+                )
 
             resp = await self._client.get("/status.php")
             resp.raise_for_status()
+            try:
+                status_payload = resp.json()
+            except (TypeError, ValueError):
+                status_payload = None
+            remote_instance_id = (
+                status_payload.get("instanceid")
+                if isinstance(status_payload, dict)
+                else None
+            )
+            if isinstance(remote_instance_id, str) and remote_instance_id.strip():
+                self._installation_proof_sha256 = main_cloud_installation_proof_sha256(
+                    backend_id=self.backend_id,
+                    remote_identity=remote_instance_id,
+                )
+            else:
+                self._installation_proof_sha256 = None
+                logger.warning(
+                    "Nextcloud status response has no installation identity; "
+                    "protected cloud effects remain unavailable"
+                )
 
             resp = await self._client.get(
                 "/index.php/apps/groupfolders/folders",
@@ -280,6 +476,9 @@ class NextcloudBackend:
                 )
                 await self._client.aclose()
                 self._client = None
+                if self._protected_effect_client is not None:
+                    await self._protected_effect_client.aclose()
+                    self._protected_effect_client = None
                 return False
             resp.raise_for_status()
 
@@ -300,6 +499,9 @@ class NextcloudBackend:
                 )
                 await self._client.aclose()
                 self._client = None
+                if self._protected_effect_client is not None:
+                    await self._protected_effect_client.aclose()
+                    self._protected_effect_client = None
                 return False
 
             self._initialized = True
@@ -310,6 +512,9 @@ class NextcloudBackend:
             if self._client:
                 await self._client.aclose()
                 self._client = None
+            if self._protected_effect_client is not None:
+                await self._protected_effect_client.aclose()
+                self._protected_effect_client = None
             return False
 
     async def close(self) -> None:
@@ -318,6 +523,11 @@ class NextcloudBackend:
                 await self._client.aclose()
             finally:
                 self._client = None
+        if self._protected_effect_client is not None:
+            try:
+                await self._protected_effect_client.aclose()
+            finally:
+                self._protected_effect_client = None
         self._initialized = False
 
     async def health_check(self) -> HealthStatus:
@@ -1266,19 +1476,27 @@ class NextcloudBackend:
     @staticmethod
     def _ocs_statuscode(resp: httpx.Response) -> Optional[int]:
         try:
-            return resp.json().get("ocs", {}).get("meta", {}).get("statuscode")
-        except ValueError:
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                return None
+            ocs = payload.get("ocs")
+            if not isinstance(ocs, dict):
+                return None
+            meta = ocs.get("meta")
+            if not isinstance(meta, dict):
+                return None
+            code = meta.get("statuscode")
+            return code if type(code) is int else None
+        except (AttributeError, TypeError, ValueError):
             return None
 
     def _require_ocs_status(
         self, resp: httpx.Response, *, ok: set[int], op: str
     ) -> None:
         """Assert an OCS response is one of ``ok`` (by envelope statuscode), else
-        raise. A 200 with an unparseable envelope is treated as success."""
+        raise. HTTP success without an exact OCS status is not effect proof."""
         code = self._ocs_statuscode(resp)
         if code in ok:
-            return
-        if code is None and resp.status_code == 200:
             return
         raise CloudBackendError(
             CloudBackendErrorKind.UNKNOWN,
@@ -1292,96 +1510,198 @@ class NextcloudBackend:
             f"/ocs/v2.php/cloud/groups/{group_id}", params={"format": "json"}
         )
         # 100/200 = deleted; 998/404 = already gone — revoke is idempotent.
-        code = self._ocs_statuscode(resp)
-        if resp.status_code in (200,) or code in (100, 200, 998):
-            return
         if resp.status_code == 404:
             return
-        resp.raise_for_status()
+        self._require_ocs_status(
+            resp,
+            ok={100, 200, 998},
+            op=f"delete RO grant group {group_id}",
+        )
 
-    async def ensure_ro_reader(self, *, user_key: str) -> str:
-        """Idempotently ensure a dedicated low-privilege reader account.
+    async def _dispatch_protected_effect(
+        self,
+        dispatch: Callable[[str, str, bytes], Awaitable[httpx.Response]],
+        *,
+        method: str,
+        path: str,
+        form: dict[str, str],
+        ok: set[int],
+        op: str,
+    ) -> None:
+        """Dispatch one authority-creating request through the signed lane.
 
-        Creates no group memberships, so the account has zero folder access
-        until a grant is minted. Tolerates OCS 102 (user already exists).
+        The callback is responsible for persisting the exact pre-effect intent,
+        sending the canonical path with no query, and durably closing its causal
+        horizon.  Keeping the raw ``httpx`` client out of this helper makes it
+        impossible for protected-reader creation to silently fall back to an
+        ordinary admin request.
         """
-        self._ensure_ready()
-        reader_id = f"srw-reader-{user_key}"
-        try:
-            resp = await self._client.post(
-                "/ocs/v2.php/cloud/users",
-                params={"format": "json"},
-                data={"userid": reader_id, "password": secrets.token_urlsafe(24)},
-            )
-        except httpx.HTTPError as e:
-            raise self._map_http_error(e) from e
-        # 100/200 = created, 102 = already exists — both fine.
-        self._require_ocs_status(resp, ok={100, 200, 102}, op="create RO reader")
-        return reader_id
 
-    async def mint_ro_grant(
-        self, handle: ProjectFolderHandle, *, user_key: str, grant_key: str
+        body = urlencode(form).encode("ascii")
+        try:
+            response = await dispatch(method, path, body)
+        except httpx.HTTPError as exc:
+            raise self._map_http_error(exc) from exc
+        if not isinstance(response, httpx.Response):
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                f"{op} returned no authenticated response",
+                backend=self.backend_id,
+            )
+        self._require_ocs_status(response, ok=ok, op=op)
+
+    async def grant_protected_reader_attempt(
+        self,
+        plan: ProtectedNextcloudReaderGrantPlan,
+        *,
+        credentials: str,
+        dispatch_effect: Callable[[str, str, bytes], Awaitable[httpx.Response]],
     ) -> RoReaderGrant:
-        """Mint a per-mount READ-ONLY grant: a dedicated group with permission=1
-        on the target Group Folder, the reader added to it, and a freshly
-        rotated app-password as the mount credential (design §8.1.4)."""
+        """Create one attempt-unique reader and its read-only folder grant.
+
+        ``credentials`` is generated and encrypted in the durable engage row
+        before this method is called.  The same value is used on every retry;
+        there is no post-grant password rotation and therefore no window in
+        which a delayed attempt can invalidate another thread's credential.
+        Every POST is forced through ``dispatch_effect`` so no authority can be
+        created without append-once request evidence and an attested deadline.
+        """
+
         self._ensure_ready()
-        reader_id = f"srw-reader-{user_key}"
-        folder_id = handle.native_id
-        mountpoint = handle.vendor_meta.get("mountpoint")
-        if not mountpoint:
+        grant = self.build_protected_reader_grant(
+            plan,
+            credentials=credentials,
+        )
+        if not callable(dispatch_effect):
             raise CloudBackendError(
                 CloudBackendErrorKind.INVALID_REQUEST,
-                f"project folder handle has no mountpoint (native_id={folder_id!r})",
+                "protected reader attempt authority is incomplete",
                 backend=self.backend_id,
                 retryable=False,
             )
-        group_id = f"srw-rog-{grant_key[:16]}"
-        await self.ensure_group(group_id)
-        # READ ONLY — never _ALL_PERMISSIONS. This is the whole security point.
-        await self._grant_group_access(int(folder_id), group_id, _READ_PERMISSION)
-        await self.add_user_to_group(reader_id, group_id)
-        # Rotate the reader credential per provision (a leaked old password stops
-        # working after the next mount).
-        app_password = secrets.token_urlsafe(24)
-        try:
-            pw_resp = await self._client.put(
-                f"/ocs/v2.php/cloud/users/{reader_id}",
-                params={"format": "json"},
-                data={"key": "password", "value": app_password},
+
+        await self._dispatch_protected_effect(
+            dispatch_effect,
+            method="POST",
+            path=self._protected_effect_origin_path("/ocs/v2.php/cloud/users"),
+            form={"userid": plan.reader_id, "password": credentials},
+            ok={100, 200, 102},
+            op="create protected reader attempt",
+        )
+        await self._dispatch_protected_effect(
+            dispatch_effect,
+            method="POST",
+            path=self._protected_effect_origin_path("/ocs/v2.php/cloud/groups"),
+            form={"groupid": plan.group_id},
+            ok={100, 200, 102},
+            op="create protected reader grant group",
+        )
+        await self._dispatch_protected_effect(
+            dispatch_effect,
+            method="POST",
+            path=self._protected_effect_origin_path(
+                f"/index.php/apps/groupfolders/folders/{plan.folder_id}/groups"
+            ),
+            form={"group": plan.group_id},
+            ok={100, 200},
+            op="attach protected grant group to folder",
+        )
+        # Groupfolders initially creates a broad ACL.  Membership is added only
+        # after this exact downgrade has succeeded, so the reader never observes
+        # write authority even if the process dies between the two requests.
+        await self._dispatch_protected_effect(
+            dispatch_effect,
+            method="POST",
+            path=self._protected_effect_origin_path(
+                f"/index.php/apps/groupfolders/folders/{plan.folder_id}/groups/"
+                f"{plan.group_id}"
+            ),
+            form={"permissions": str(_READ_PERMISSION)},
+            ok={100, 200},
+            op="set protected reader grant read-only",
+        )
+        await self._dispatch_protected_effect(
+            dispatch_effect,
+            method="POST",
+            path=self._protected_effect_origin_path(
+                f"/ocs/v2.php/cloud/users/{plan.reader_id}/groups"
+            ),
+            form={"groupid": plan.group_id},
+            ok={100, 200, 102},
+            op="attach protected reader to grant group",
+        )
+
+        return grant
+
+    def build_protected_reader_grant(
+        self,
+        plan: ProtectedNextcloudReaderGrantPlan,
+        *,
+        credentials: str,
+    ) -> RoReaderGrant:
+        """Build the exact credential projection without causing an effect."""
+
+        if (
+            not isinstance(plan, ProtectedNextcloudReaderGrantPlan)
+            or plan.backend_instance_id != self._backend_instance_id
+            or not isinstance(credentials, str)
+            or not credentials
+        ):
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "protected reader attempt authority is incomplete",
+                backend=self.backend_id,
+                retryable=False,
             )
-        except httpx.HTTPError as e:
-            raise self._map_http_error(e) from e
-        self._require_ocs_status(pw_resp, ok={100, 200}, op="rotate RO reader password")
-        webdav_url = (
-            f"{self._base_url}/remote.php/dav/files/{reader_id}/"
-            f"{quote(mountpoint, safe='')}/"
-        )
-        grant_handle = json.dumps(
-            {"group_id": group_id, "folder_id": str(folder_id), "reader_id": reader_id}
-        )
         return RoReaderGrant(
-            reader_id=reader_id,
-            grant_handle=grant_handle,
-            webdav_url=webdav_url,
-            credentials=app_password,
+            reader_id=plan.reader_id,
+            grant_handle=plan.grant_handle,
+            webdav_url=(
+                f"{self._base_url}/remote.php/dav/files/{plan.reader_id}/"
+                f"{quote(plan.mountpoint, safe='')}/"
+            ),
+            credentials=credentials,
             auth_kind="basic",
         )
 
-    async def revoke_ro_grant(self, grant_handle: str, *, user_key: str) -> None:
-        """Undo a grant minted by ``mint_ro_grant`` by deleting the per-mount
-        group, which drops both the group and its Group Folder ACL in one step
-        (the reader is left with no group → no folder access). The reader
-        account itself is left intact for reuse. Idempotent.
+    async def _delete_user(self, reader_id: str) -> None:
+        response = await self._client.delete(
+            f"/ocs/v2.php/cloud/users/{reader_id}",
+            params={"format": "json"},
+        )
+        if response.status_code == 404:
+            return
+        self._require_ocs_status(
+            response,
+            ok={100, 200, 998},
+            op=f"delete protected reader {reader_id}",
+        )
 
-        Deleting the group is the whole revoke — calling
-        ``remove_user_from_group`` first would be a redundant no-op once the
-        group is gone.
+    async def revoke_protected_reader_attempt(
+        self,
+        plan: ProtectedNextcloudReaderGrantPlan,
+    ) -> None:
+        """Idempotently remove exactly one attempt's group and principal.
+
+        Access is removed before the credential principal.  Both identities are
+        full-attempt-derived and the canonical plan has already been checked
+        against durable backend/source authority, so a delayed A cleanup cannot
+        address B even when both attempts belong to the same user or thread.
         """
+
         self._ensure_ready()
-        data = json.loads(grant_handle)
-        group_id = data["group_id"]
-        await self._delete_group(group_id)
+        if (
+            not isinstance(plan, ProtectedNextcloudReaderGrantPlan)
+            or plan.backend_instance_id != self._backend_instance_id
+        ):
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "protected reader revoke authority is incomplete",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        await self._delete_group(plan.group_id)
+        await self._delete_user(plan.reader_id)
 
     async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
         """Write a real canary file with the WRITE identity and discover REAL

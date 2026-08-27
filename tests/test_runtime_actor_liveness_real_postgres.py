@@ -102,6 +102,7 @@ async def _seed_officer(db: PostgresDB) -> dict[str, str]:
         "thread_id": str(uuid4()),
         "agent_id": str(uuid4()),
         "user_id": str(uuid4()),
+        "attach_token": str(uuid4()),
     }
     async with db.acquire() as conn:
         await conn.execute(
@@ -137,19 +138,27 @@ async def _seed_officer(db: PostgresDB) -> dict[str, str]:
             """
             INSERT INTO agents (
                 id, config_name, hostname, pod_ip, status, agent_mode,
-                thread_id, last_heartbeat
+                last_heartbeat
             )
             VALUES ($1, 'persistent_defaults', 'officer-proof', '127.0.0.1',
-                    'session', 'persistent', $2, now())
+                    'session', 'persistent', now())
             """,
             UUID(ids["agent_id"]),
-            UUID(ids["thread_id"]),
         )
-        await conn.execute(
-            "UPDATE threads SET agent_id = $2 WHERE id = $1",
-            UUID(ids["thread_id"]),
-            UUID(ids["agent_id"]),
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE threads SET agent_id = $2, "
+                "control_admission_agent_id = $2, runtime_attach_token = $3 "
+                "WHERE id = $1",
+                UUID(ids["thread_id"]),
+                UUID(ids["agent_id"]),
+                UUID(ids["attach_token"]),
+            )
+            await conn.execute(
+                "UPDATE agents SET thread_id = $2 WHERE id = $1",
+                UUID(ids["agent_id"]),
+                UUID(ids["thread_id"]),
+            )
         await conn.execute(
             "INSERT INTO project_officers (project_id, thread_id) VALUES ($1, $2)",
             UUID(ids["project_id"]),
@@ -175,31 +184,47 @@ async def _grant(db: PostgresDB, token: str):
         )
 
 
-async def _replace_officer_agent(
-    db: PostgresDB, ids: dict[str, str]
-) -> tuple[str, service.RuntimeActorContext]:
+async def _replace_officer_binding(db: PostgresDB, ids: dict[str, str]) -> str:
+    """Install one exact reciprocal successor without minting its actor."""
+
     successor = str(uuid4())
+    successor_attach = str(uuid4())
     async with db.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO agents (
                 id, config_name, hostname, pod_ip, status, agent_mode,
-                thread_id, last_heartbeat
+                last_heartbeat
             ) VALUES ($1, 'persistent_defaults', 'replacement', '127.0.0.2',
-                      'session', 'persistent', $2, now())
+                      'session', 'persistent', now())
             """,
             UUID(successor),
-            UUID(ids["thread_id"]),
         )
-        await conn.execute(
-            "UPDATE agents SET status = 'offline' WHERE id = $1",
-            UUID(ids["agent_id"]),
-        )
-        await conn.execute(
-            "UPDATE threads SET agent_id = $2 WHERE id = $1",
-            UUID(ids["thread_id"]),
-            UUID(successor),
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE threads SET agent_id = $2, "
+                "control_admission_agent_id = $2, runtime_attach_token = $3 "
+                "WHERE id = $1",
+                UUID(ids["thread_id"]),
+                UUID(successor),
+                UUID(successor_attach),
+            )
+            await conn.execute(
+                "UPDATE agents SET thread_id = $2 WHERE id = $1",
+                UUID(successor),
+                UUID(ids["thread_id"]),
+            )
+            await conn.execute(
+                "UPDATE agents SET status = 'offline', thread_id = NULL WHERE id = $1",
+                UUID(ids["agent_id"]),
+            )
+    return successor
+
+
+async def _replace_officer_agent(
+    db: PostgresDB, ids: dict[str, str]
+) -> tuple[str, service.RuntimeActorContext]:
+    successor = await _replace_officer_binding(db, ids)
     actor = await service.mint_thread_runtime_actor(
         db,
         thread_id=ids["thread_id"],
@@ -620,10 +645,29 @@ async def test_retiring_current_agent_immediately_fences_access_and_refresh(db):
 
 
 @pytest.mark.asyncio
-async def test_deleting_current_agent_revokes_authority_and_retains_uuid_snapshot(db):
+async def test_retirement_begin_immediately_fences_access_and_refresh(db):
     ids = await _seed_officer(db)
 
-    assert await db.delete_agent(ids["agent_id"])
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread_id"], permanent=False
+    )
+    assert retirement["state"] == "pending"
+
+    with pytest.raises(service.RuntimeActorCredentialError) as access_denied:
+        await service._actor_for_access(db, ids["access_token"])
+    assert access_denied.value.code == "runtime_not_current"
+    with pytest.raises(HTTPException) as refresh_denied:
+        await service.refresh_runtime_actor_request(
+            db, _refresh_request(ids["refresh_token"])
+        )
+    assert refresh_denied.value.detail["code"] == "runtime_not_current"
+
+
+@pytest.mark.asyncio
+async def test_deleting_current_agent_is_refused_without_exact_retirement(db):
+    ids = await _seed_officer(db)
+
+    assert not await db.delete_agent(ids["agent_id"])
 
     async with db.acquire() as conn:
         grant = await conn.fetchrow(
@@ -633,20 +677,14 @@ async def test_deleting_current_agent_revokes_authority_and_retains_uuid_snapsho
             "SELECT agent_id FROM threads WHERE id = $1", UUID(ids["thread_id"])
         )
     assert str(grant["agent_id"]) == ids["agent_id"]
-    assert grant["revoked_at"] is not None
-    assert thread_agent is None
-    with pytest.raises(service.RuntimeActorCredentialError) as access_denied:
-        await service._actor_for_access(db, ids["access_token"])
-    assert access_denied.value.code == "revoked_credential"
-    with pytest.raises(HTTPException) as refresh_denied:
-        await service.refresh_runtime_actor_request(
-            db, _refresh_request(ids["refresh_token"])
-        )
-    assert refresh_denied.value.detail["code"] == "revoked_credential"
+    assert grant["revoked_at"] is None
+    assert str(thread_agent) == ids["agent_id"]
+    current = await service._actor_for_access(db, ids["access_token"])
+    assert current.project_id == ids["project_id"]
 
 
 @pytest.mark.asyncio
-async def test_agent_deletion_racing_refresh_has_no_post_delete_authority(db):
+async def test_bound_agent_deletion_racing_refresh_preserves_current_authority(db):
     ids = await _seed_officer(db)
 
     refreshed, deleted = await asyncio.gather(
@@ -657,18 +695,16 @@ async def test_agent_deletion_racing_refresh_has_no_post_delete_authority(db):
         return_exceptions=True,
     )
 
-    assert deleted is True
-    if not isinstance(refreshed, Exception):
-        with pytest.raises(service.RuntimeActorCredentialError):
-            await service._actor_for_access(db, refreshed.access_credential)
-    else:
-        assert isinstance(refreshed, HTTPException)
+    assert deleted is False
+    assert not isinstance(refreshed, Exception)
+    current = await service._actor_for_access(db, refreshed.access_credential)
+    assert current.project_id == ids["project_id"]
     async with db.acquire() as conn:
         grant = await conn.fetchrow(
             "SELECT agent_id, revoked_at FROM runtime_actor_grants"
         )
     assert str(grant["agent_id"]) == ids["agent_id"]
-    assert grant["revoked_at"] is not None
+    assert grant["revoked_at"] is None
 
 
 @pytest.mark.asyncio
@@ -748,7 +784,7 @@ async def test_offline_gc_batch_with_officer_predecessor_deletes_unrelated_agent
     [
         "stale-agent",
         "decommissioned",
-        "ended",
+        "retiring",
         "foreign-project",
         "orphan",
         "old-incarnation",
@@ -757,6 +793,8 @@ async def test_offline_gc_batch_with_officer_predecessor_deletes_unrelated_agent
 )
 async def test_expired_recovery_fails_for_noncurrent_authority(db, fence):
     ids = await _seed_officer(db)
+    replace_binding = False
+    begin_retirement = False
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE runtime_actor_grants SET refresh_expires_at = now() - interval '1 hour'"
@@ -767,8 +805,8 @@ async def test_expired_recovery_fails_for_noncurrent_authority(db, fence):
             )
         elif fence == "decommissioned":
             await conn.execute("UPDATE project_officers SET thread_id = NULL")
-        elif fence == "ended":
-            await conn.execute("UPDATE threads SET status = 'ended'")
+        elif fence == "retiring":
+            begin_retirement = True
         elif fence == "foreign-project":
             foreign_project = uuid4()
             await conn.execute(
@@ -780,30 +818,32 @@ async def test_expired_recovery_fails_for_noncurrent_authority(db, fence):
                 foreign_project,
             )
         elif fence == "orphan":
-            await conn.execute("UPDATE threads SET agent_id = NULL")
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE threads SET agent_id = NULL, "
+                    "control_admission_agent_id = NULL, "
+                    "runtime_attach_token = NULL WHERE id = $1",
+                    UUID(ids["thread_id"]),
+                )
+                await conn.execute(
+                    "UPDATE agents SET thread_id = NULL WHERE id = $1",
+                    UUID(ids["agent_id"]),
+                )
         elif fence == "old-incarnation":
             await conn.execute(
                 "UPDATE project_officers SET incarnations = "
                 "jsonb_build_array(jsonb_build_object('thread_id', thread_id))"
             )
         elif fence == "pod-churn":
-            successor = uuid4()
-            await conn.execute(
-                """
-                INSERT INTO agents (
-                    id, config_name, hostname, pod_ip, status, agent_mode,
-                    thread_id, last_heartbeat
-                ) VALUES ($1, 'persistent_defaults', 'successor', '127.0.0.2',
-                          'session', 'persistent', $2, now())
-                """,
-                successor,
-                UUID(ids["thread_id"]),
-            )
-            await conn.execute(
-                "UPDATE threads SET agent_id = $2 WHERE id = $1",
-                UUID(ids["thread_id"]),
-                successor,
-            )
+            replace_binding = True
+
+    if begin_retirement:
+        retirement = await db.begin_pinned_thread_retirement(
+            ids["thread_id"], permanent=False
+        )
+        assert retirement["state"] == "pending"
+    if replace_binding:
+        await _replace_officer_binding(db, ids)
 
     watchdog = await service.maintain_current_officer_runtime(
         db,
@@ -860,28 +900,7 @@ async def test_concurrent_watchdog_recovery_is_one_idempotent_authority(db):
 @pytest.mark.asyncio
 async def test_pod_replacement_revokes_the_predecessor_grant_for_old_replicas(db):
     ids = await _seed_officer(db)
-    successor = uuid4()
-    async with db.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO agents (
-                id, config_name, hostname, pod_ip, status, agent_mode,
-                thread_id, last_heartbeat
-            ) VALUES ($1, 'persistent_defaults', 'replacement', '127.0.0.2',
-                      'session', 'persistent', $2, now())
-            """,
-            successor,
-            UUID(ids["thread_id"]),
-        )
-        await conn.execute(
-            "UPDATE agents SET status = 'offline' WHERE id = $1",
-            UUID(ids["agent_id"]),
-        )
-        await conn.execute(
-            "UPDATE threads SET agent_id = $2 WHERE id = $1",
-            UUID(ids["thread_id"]),
-            successor,
-        )
+    successor = await _replace_officer_binding(db, ids)
 
     replacement = await service.mint_thread_runtime_actor(
         db,
@@ -1707,7 +1726,6 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
     assert len(assigned) == 1
     delivery_id = assigned[0]["delivery_id"]
     pod_uid = "verification-runtime-pod"
-    runtime_generation = uuid4()
     async with db.acquire() as conn:
         async with conn.transaction():
             await conn.execute(
@@ -1715,6 +1733,13 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
                 UUID(ids["agent_id"]),
                 pod_uid,
             )
+            runtime_identity = await conn.fetchrow(
+                "SELECT runtime_generation, runtime_attach_token FROM threads "
+                "WHERE id = $1 FOR UPDATE",
+                UUID(ids["thread_id"]),
+            )
+            runtime_generation = runtime_identity["runtime_generation"]
+            runtime_attach_token = runtime_identity["runtime_attach_token"]
             owned = await input_delivery.persist_input_delivery(
                 conn,
                 thread_id=ids["thread_id"],
@@ -1726,6 +1751,7 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
                 agent_id=ids["agent_id"],
                 pod_uid=pod_uid,
                 runtime_generation=runtime_generation,
+                runtime_attach_token=runtime_attach_token,
             )
             assert await input_delivery.mark_input_delivery_queued(
                 conn,
@@ -1733,6 +1759,7 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
                 agent_id=ids["agent_id"],
                 pod_uid=pod_uid,
                 runtime_generation=runtime_generation,
+                runtime_attach_token=runtime_attach_token,
                 claim_generation=int(owned["claim_generation"]),
             )
             assert await input_delivery.transition_input_delivery(
@@ -1741,6 +1768,7 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
                 agent_id=ids["agent_id"],
                 pod_uid=pod_uid,
                 runtime_generation=runtime_generation,
+                runtime_attach_token=runtime_attach_token,
                 claim_generation=int(owned["claim_generation"]),
                 transition="admitted",
                 turn_number=1,
@@ -1754,6 +1782,7 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
                 agent_id=ids["agent_id"],
                 pod_uid=pod_uid,
                 runtime_generation=runtime_generation,
+                runtime_attach_token=runtime_attach_token,
                 claim_generation=int(owned["claim_generation"]),
                 transition="settled",
             )

@@ -258,21 +258,29 @@ async def test_legacy_thread_can_detach_but_cannot_reattach_before_adoption(db):
     legacy_url = f"http://admin:shared-secret@gitea:3000/srw/{repo_name}.git"
     old_agent_id = uuid4()
     replacement_agent_id = uuid4()
+    old_attach_token = uuid4()
+    replacement_attach_token = uuid4()
 
     async with db.acquire() as conn:
         await conn.execute(
             "INSERT INTO agents "
-            "(id, config_name, hostname, status, agent_mode, thread_id) "
+            "(id, config_name, hostname, status, agent_mode) "
             "VALUES ($1, 'session_base', 'legacy-thread-pod', 'session', "
-            "'persistent', $2)",
-            old_agent_id,
-            UUID(thread_id),
-        )
-        await conn.execute(
-            "UPDATE threads SET agent_id=$2 WHERE id=$1",
-            UUID(thread_id),
+            "'persistent')",
             old_agent_id,
         )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE threads SET agent_id=$2, runtime_attach_token=$3 WHERE id=$1",
+                UUID(thread_id),
+                old_agent_id,
+                old_attach_token,
+            )
+            await conn.execute(
+                "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                old_agent_id,
+                UUID(thread_id),
+            )
         # Exact pre-0176 durable shape: an already-attached persistent thread
         # held the administrator-bearing clone URL in workspace_container.
         await conn.execute(
@@ -297,14 +305,24 @@ async def test_legacy_thread_can_detach_but_cannot_reattach_before_adoption(db):
 
         # Detach is a reduction of authority and must stay available even
         # before Gitea/key adoption can run.
-        assert (
-            await conn.execute(
-                "UPDATE threads SET agent_id=NULL WHERE id=$1 AND agent_id=$2",
-                UUID(thread_id),
-                old_agent_id,
+        async with conn.transaction():
+            assert (
+                await conn.execute(
+                    "UPDATE threads SET agent_id=NULL, runtime_attach_token=NULL "
+                    "WHERE id=$1 AND agent_id=$2",
+                    UUID(thread_id),
+                    old_agent_id,
+                )
+                == "UPDATE 1"
             )
-            == "UPDATE 1"
-        )
+            assert (
+                await conn.execute(
+                    "UPDATE agents SET thread_id=NULL WHERE id=$1 AND thread_id=$2",
+                    old_agent_id,
+                    UUID(thread_id),
+                )
+                == "UPDATE 1"
+            )
         stored = await conn.fetchrow(
             "SELECT agent_id, metadata FROM threads WHERE id=$1", UUID(thread_id)
         )
@@ -316,17 +334,17 @@ async def test_legacy_thread_can_detach_but_cannot_reattach_before_adoption(db):
 
         await conn.execute(
             "INSERT INTO agents "
-            "(id, config_name, hostname, status, agent_mode, thread_id) "
+            "(id, config_name, hostname, status, agent_mode) "
             "VALUES ($1, 'session_base', 'replacement-thread-pod', 'session', "
-            "'persistent', $2)",
+            "'persistent')",
             replacement_agent_id,
-            UUID(thread_id),
         )
         with pytest.raises(asyncpg.exceptions.CheckViolationError) as attach:
             await conn.execute(
-                "UPDATE threads SET agent_id=$2 WHERE id=$1",
+                "UPDATE threads SET agent_id=$2, runtime_attach_token=$3 WHERE id=$1",
                 UUID(thread_id),
                 replacement_agent_id,
+                replacement_attach_token,
             )
         assert (
             attach.value.constraint_name
@@ -337,14 +355,25 @@ async def test_legacy_thread_can_detach_but_cannot_reattach_before_adoption(db):
         db, _gitea(probe=True), await db.get_thread(thread_id)
     )
     async with db.acquire() as conn:
-        assert (
-            await conn.execute(
-                "UPDATE threads SET agent_id=$2 WHERE id=$1",
-                UUID(thread_id),
-                replacement_agent_id,
+        async with conn.transaction():
+            assert (
+                await conn.execute(
+                    "UPDATE threads SET agent_id=$2, runtime_attach_token=$3 "
+                    "WHERE id=$1",
+                    UUID(thread_id),
+                    replacement_agent_id,
+                    replacement_attach_token,
+                )
+                == "UPDATE 1"
             )
-            == "UPDATE 1"
-        )
+            assert (
+                await conn.execute(
+                    "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                    replacement_agent_id,
+                    UUID(thread_id),
+                )
+                == "UPDATE 1"
+            )
         clean_url = await conn.fetchval(
             "SELECT metadata->'workspace_container'->>'git_remote_url' "
             "FROM threads WHERE id=$1",
@@ -1333,14 +1362,23 @@ async def test_previous_release_thread_write_is_stripped_and_attach_fenced(db):
     assert adopted_workspace["git_remote_url"] == clean_url
     assert "_managed_repository_authority_pending" not in adopted_workspace
     async with db.acquire() as conn:
-        assert (
-            await conn.execute(
-                "UPDATE threads SET agent_id=$2 WHERE id=$1",
-                UUID(thread_id),
-                agent_id,
+        async with conn.transaction():
+            assert (
+                await conn.execute(
+                    "UPDATE threads SET agent_id=$2 WHERE id=$1",
+                    UUID(thread_id),
+                    agent_id,
+                )
+                == "UPDATE 1"
             )
-            == "UPDATE 1"
-        )
+            assert (
+                await conn.execute(
+                    "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                    agent_id,
+                    UUID(thread_id),
+                )
+                == "UPDATE 1"
+            )
 
 
 @pytest.mark.asyncio

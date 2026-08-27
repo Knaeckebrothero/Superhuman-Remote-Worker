@@ -21,8 +21,17 @@ describe('classifyResumeError', () => {
         });
     });
 
-    it('treats 409 as benign so a double-click still falls through', () => {
-        expect(classifyResumeError({status: 409})).toEqual({kind: 'benign'});
+    it('classifies only typed session_not_ended 409 as an unproven successor', () => {
+        expect(classifyResumeError({
+            status: 409,
+            error: {detail: {code: 'session_not_ended'}},
+        })).toEqual({kind: 'not_ended'});
+        expect(classifyResumeError({status: 409}))
+            .toEqual({kind: 'error', status: 409});
+        expect(classifyResumeError({
+            status: 409,
+            error: {detail: {code: 'protected_cloud_unsupported_session_class'}},
+        })).toEqual({kind: 'error', status: 409});
     });
 
     it('surfaces 403 as a real error instead of swallowing it', () => {

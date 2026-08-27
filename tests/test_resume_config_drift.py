@@ -38,6 +38,14 @@ from orchestrator.services.config_drift import DriftItem
 
 DS_GONE = "d7555d5d-ce46-49e2-b1fa-8235d720badc"
 DS_CORRUPT = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1"
+ENDED_RUNTIME_GENERATION = "77777777-7777-4777-8777-777777777777"
+RESUMED_RUNTIME_GENERATION = "88888888-8888-4888-8888-888888888888"
+
+
+def _discard_background_task(coroutine):
+    """Close fire-and-forget work outside this file's drift contract."""
+    coroutine.close()
+    return SimpleNamespace()
 
 
 def _patch_caller_and_db(user: dict, db):
@@ -64,7 +72,29 @@ def _patch_caller_and_db(user: dict, db):
         patch("main.persistent_provisioner", SimpleNamespace(is_available=False))
     )
     stack.enter_context(patch("main.ensure_session_workspace", AsyncMock()))
+    stack.enter_context(
+        patch("main.asyncio.create_task", side_effect=_discard_background_task)
+    )
     db.list_thread_mounts = AsyncMock(return_value=[])
+
+    async def resume_row(thread_id: str) -> bool:
+        thread = await db.get_thread(thread_id)
+        if (
+            not thread
+            or thread.get("status") != "ended"
+            or thread.get("runtime_retirement_token") is not None
+        ):
+            return False
+        thread["status"] = "created"
+        thread["runtime_generation"] = RESUMED_RUNTIME_GENERATION
+        thread["agent_id"] = None
+        thread["control_admission_agent_id"] = None
+        thread["runtime_attach_token"] = None
+        thread["runtime_authority_exposed"] = False
+        thread["ended_at"] = None
+        return True
+
+    db.resume_thread = AsyncMock(side_effect=resume_row)
     return stack
 
 
@@ -73,6 +103,8 @@ def _ended_thread(thread: dict) -> dict:
     requires, with the cloud-folder handles already present so the
     (irrelevant, fire-and-forget) late-provision task never gets scheduled."""
     thread["status"] = "ended"
+    thread["runtime_generation"] = ENDED_RUNTIME_GENERATION
+    thread["runtime_retirement_token"] = None
     thread["metadata"] = {}
     thread["main_cloud_session_handle"] = "existing-handle"
     thread["main_cloud_share_handle"] = "existing-share"

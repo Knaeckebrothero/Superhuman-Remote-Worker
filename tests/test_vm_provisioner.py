@@ -43,6 +43,7 @@ def mock_db():
     db = MagicMock()
     db.merge_vm_context = AsyncMock()
     db.merge_thread_vm_context = AsyncMock()
+    db.begin_pinned_thread_vm_provisioning = AsyncMock(return_value=True)
     db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
     db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
     db.get_job = AsyncMock(
@@ -369,14 +370,46 @@ class TestFreshProvisionReset:
 
             prov = VMProvisioner()
             prov._db = mock_db
-            await prov.create_thread_vm(thread_id="reset-thread")
-        first = mock_db.merge_thread_vm_context.await_args_list[0]
-        assert first[0][0] == "reset-thread"
-        assert first[0][1]["snapshot_attempts"] == 0
-        assert first[0][1]["ssh_host"] is None
+            await prov.create_thread_vm(
+                thread_id="reset-thread",
+                expected_runtime_generation=PROVISION_GENERATION,
+                expected_vm_context=None,
+            )
+        first = mock_db.begin_pinned_thread_vm_provisioning.await_args
+        assert first.args[0] == "reset-thread"
+        ctx = first.kwargs["provision_context"]
+        assert ctx["snapshot_attempts"] == 0
+        assert ctx["ssh_host"] is None
+        assert ctx["_runtime_incarnation"] is None
+        assert ctx["status"] == "provisioning"
         assert mock_nats_bridge.request_vm_create.await_args.kwargs["entity_type"] == (
             "thread"
         )
+        assert (
+            mock_nats_bridge.request_vm_create.await_args.kwargs["set_provisioning"]
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_thread_vm_refuses_dispatch_when_authority_cas_loses(
+        self, mock_nats_bridge, mock_db
+    ):
+        mock_db.begin_pinned_thread_vm_provisioning = AsyncMock(return_value=False)
+        with (
+            patch.dict(os.environ, {"VM_MODE": "external"}),
+            patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge),
+        ):
+            mock_nats_bridge.is_available = True
+            from orchestrator.services.vm_provisioner import VMProvisioner
+
+            prov = VMProvisioner()
+            prov._db = mock_db
+            assert not await prov.create_thread_vm(
+                thread_id="stale-thread",
+                expected_runtime_generation=PROVISION_GENERATION,
+                expected_vm_context=None,
+            )
+        mock_nats_bridge.request_vm_create.assert_not_awaited()
 
 
 # =============================================================================

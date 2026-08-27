@@ -743,3 +743,147 @@ async def test_stateless_config_cannot_mutate_workspace_tier():
     assert exc.value.status_code == 409
     db.merge_thread_config_override.assert_not_awaited()
     audit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_tier", ["sandbox", "vm"])
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            "protected_cloud": True,
+            "config_override": {"workspace": {"backend": "sandbox"}},
+        },
+        {"protected_cloud": "true"},
+        "not-json",
+        ["not", "an", "object"],
+    ],
+    ids=["protected", "malformed-marker", "invalid-json", "list-metadata"],
+)
+async def test_protected_workspace_upgrade_refuses_before_every_effect(
+    target_tier, metadata
+):
+    """Neither upgrade endpoint may move a protected/corrupt row off its
+    pinned Container contract, including the VM delegation path."""
+
+    from orchestrator import main as orch_main
+
+    thread = {
+        "id": THREAD_ID,
+        "execution_lane": "pinned",
+        "metadata": metadata,
+    }
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    db.merge_thread_workspace_context = AsyncMock()
+    vm = MagicMock(is_available=True)
+    vm.create_thread_vm = AsyncMock()
+    container = MagicMock(is_available=True, in_cluster=True)
+    container.create_workspace = AsyncMock()
+    grants = AsyncMock()
+
+    with (
+        patch.object(orch_main, "require_internal", AsyncMock()),
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "vm_provisioner", vm),
+        patch.object(orch_main, "container_provisioner", container),
+        patch.object(orch_main, "_enforce_workspace_upgrade_grants", grants),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await orch_main.agent_upgrade_thread_to_workspace(
+                MagicMock(),
+                THREAD_ID,
+                orch_main.ThreadWorkspaceUpgradeRequest(target_tier=target_tier),
+            )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"].startswith("protected_cloud_")
+    grants.assert_not_awaited()
+    db.merge_thread_workspace_context.assert_not_awaited()
+    vm.create_thread_vm.assert_not_awaited()
+    container.create_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        {"workspace": {"backend": "vm"}},
+        {"workspace": {"backend": "sandbox"}},
+        {"officer": {"enabled": True}},
+        {"officer": {"enabled": False}},
+    ],
+)
+async def test_protected_config_cannot_mutate_runtime_class(fragment):
+    from orchestrator import main as orch_main
+
+    db = MagicMock()
+    db.merge_thread_config_override = AsyncMock()
+    audit = AsyncMock()
+    grants = AsyncMock()
+    thread = {
+        "id": THREAD_ID,
+        "user_id": None,
+        "project_id": None,
+        "execution_lane": "pinned",
+        "metadata": {
+            "protected_cloud": True,
+            "config_override": {"workspace": {"backend": "sandbox"}},
+        },
+    }
+
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "log_security_event", audit),
+        patch.object(orch_main, "_enforce_session_create_grants", grants),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await orch_main._apply_thread_config_update(
+                THREAD_ID,
+                thread,
+                fragment,
+                None,
+                request=MagicMock(),
+                actor=None,
+            )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "protected_cloud_runtime_class_fixed"
+    grants.assert_not_awaited()
+    db.merge_thread_config_override.assert_not_awaited()
+    audit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", ["bad-json", [], {"protected_cloud": 1}])
+async def test_malformed_protected_authority_blocks_config_before_persist(metadata):
+    from orchestrator import main as orch_main
+
+    db = MagicMock()
+    db.merge_thread_config_override = AsyncMock()
+    audit = AsyncMock()
+    thread = {
+        "id": THREAD_ID,
+        "user_id": None,
+        "execution_lane": "pinned",
+        "metadata": metadata,
+    }
+
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "log_security_event", audit),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await orch_main._apply_thread_config_update(
+                THREAD_ID,
+                thread,
+                {"llm": {"temperature": 0.1}},
+                None,
+                request=MagicMock(),
+                actor=None,
+            )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "protected_cloud_malformed"
+    db.merge_thread_config_override.assert_not_awaited()
+    audit.assert_not_awaited()

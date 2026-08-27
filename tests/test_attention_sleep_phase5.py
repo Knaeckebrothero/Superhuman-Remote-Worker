@@ -4,8 +4,8 @@ thread, and the /magic/extend endpoint.
 
 Live DB round-trips (UPDATE → trigger → NOTIFY → wake) are covered by the
 smoke runbook at knowledge-base/knowledge/tests/headless_sessions_smoke.md. Here we mock the
-postgres pool and the workspace_suspension_service to exercise the
-contract surface of each new code path.
+postgres pool and exact retirement owner to exercise the contract surface of
+each new code path.
 """
 
 import asyncio
@@ -297,9 +297,20 @@ class TestPermissionCheckWakePathGuard:
 # Section 3 — Attention-sleep watchdog
 # ===========================================================================
 #
-# attention_sleep_sweeper runs every 60s, selects stale awaiting_user
-# threads, calls workspace_suspension_service.suspend_thread_workspace,
-# and CAS-UPDATEs status to 'suspended'.
+# attention_sleep_sweeper runs every 60s, selects stale awaiting_user threads,
+# and hands their exact live runtime identity to the durable retirement flow,
+# which settles the lifecycle to suspended after cleanup.
+
+
+def _stale_pinned_runtime_row() -> dict:
+    return {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "status": "awaiting_user",
+        "execution_lane": "pinned",
+        "runtime_generation": "22222222-2222-4222-8222-222222222222",
+        "agent_id": "33333333-3333-4333-8333-333333333333",
+        "runtime_attach_token": "44444444-4444-4444-8444-444444444444",
+    }
 
 
 class TestAttentionSleepSweeper:
@@ -310,6 +321,7 @@ class TestAttentionSleepSweeper:
         self._orig_db = om.postgres_db
         self._orig_svc = om.workspace_suspension_service
         self._orig_promote = om.promote_expired_stateless_pauses
+        self._orig_end_thread_flow = om._end_thread_flow
         om.promote_expired_stateless_pauses = AsyncMock(return_value=[])
 
     def teardown_method(self):
@@ -318,22 +330,21 @@ class TestAttentionSleepSweeper:
         om.postgres_db = self._orig_db
         om.workspace_suspension_service = self._orig_svc
         om.promote_expired_stateless_pauses = self._orig_promote
+        om._end_thread_flow = self._orig_end_thread_flow
 
     @pytest.mark.asyncio
     async def test_suspends_stale_awaiting_user(self):
         import orchestrator.main as om
 
-        # Stub the DB: SELECT returns one stale row; UPDATE returns its id.
-        db = _make_db(
-            fetch=[{"id": "thread-abc"}],
-            fetchval="thread-abc",
-        )
+        row = _stale_pinned_runtime_row()
+        db = _make_db(fetch=[row])
         svc = MagicMock()
         svc.is_enabled = True
-        svc.suspend_thread_workspace = AsyncMock(return_value=True)
+        end_thread_flow = AsyncMock(return_value={"status": "suspended"})
 
         om.postgres_db = db
         om.workspace_suspension_service = svc
+        om._end_thread_flow = end_thread_flow
 
         shutdown = asyncio.Event()
         # Run one tick: schedule the sweeper, give it a moment, signal shutdown.
@@ -342,15 +353,16 @@ class TestAttentionSleepSweeper:
         shutdown.set()
         await task
 
-        svc.suspend_thread_workspace.assert_awaited_with("thread-abc")
-        # The CAS UPDATE → fetchval should also have fired.
-        update_calls = [
-            c
-            for c in db._fake_conn.fetchval.await_args_list
-            if "UPDATE threads" in c.args[0]
-        ]
-        assert len(update_calls) >= 1
-        assert "control_admission_agent_id = NULL" in update_calls[0].args[0]
+        end_thread_flow.assert_awaited_once_with(
+            str(row["id"]),
+            row,
+            permanent=False,
+            force=False,
+            expected_runtime_generation=str(row["runtime_generation"]),
+            expected_agent_id=str(row["agent_id"]),
+            expected_attach_token=str(row["runtime_attach_token"]),
+            settle_status="suspended",
+        )
 
     @pytest.mark.asyncio
     async def test_skips_when_service_disabled(self):
@@ -359,10 +371,11 @@ class TestAttentionSleepSweeper:
         db = _make_db(fetch=[{"id": "thread-abc"}])
         svc = MagicMock()
         svc.is_enabled = False
-        svc.suspend_thread_workspace = AsyncMock(return_value=True)
+        end_thread_flow = AsyncMock(return_value={"status": "suspended"})
 
         om.postgres_db = db
         om.workspace_suspension_service = svc
+        om._end_thread_flow = end_thread_flow
 
         shutdown = asyncio.Event()
         task = asyncio.create_task(om.attention_sleep_sweeper(shutdown))
@@ -370,19 +383,21 @@ class TestAttentionSleepSweeper:
         shutdown.set()
         await task
 
-        svc.suspend_thread_workspace.assert_not_called()
+        end_thread_flow.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_handles_suspend_failure_without_crashing(self):
         import orchestrator.main as om
 
-        db = _make_db(fetch=[{"id": "thread-abc"}])
+        row = _stale_pinned_runtime_row()
+        db = _make_db(fetch=[row])
         svc = MagicMock()
         svc.is_enabled = True
-        svc.suspend_thread_workspace = AsyncMock(return_value=False)
+        end_thread_flow = AsyncMock(side_effect=RuntimeError("retirement unavailable"))
 
         om.postgres_db = db
         om.workspace_suspension_service = svc
+        om._end_thread_flow = end_thread_flow
 
         shutdown = asyncio.Event()
         task = asyncio.create_task(om.attention_sleep_sweeper(shutdown))
@@ -390,19 +405,20 @@ class TestAttentionSleepSweeper:
         shutdown.set()
         await task
 
-        # suspend was tried but did not produce an UPDATE.
-        svc.suspend_thread_workspace.assert_awaited_once()
+        end_thread_flow.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_presence_failure_does_not_skip_legacy_suspension(self):
         import orchestrator.main as om
 
-        db = _make_db(fetch=[{"id": "thread-abc"}], fetchval="thread-abc")
+        row = _stale_pinned_runtime_row()
+        db = _make_db(fetch=[row])
         svc = MagicMock()
         svc.is_enabled = True
-        svc.suspend_thread_workspace = AsyncMock(return_value=True)
+        end_thread_flow = AsyncMock(return_value={"status": "suspended"})
         om.postgres_db = db
         om.workspace_suspension_service = svc
+        om._end_thread_flow = end_thread_flow
         om.promote_expired_stateless_pauses = AsyncMock(
             side_effect=RuntimeError("presence table unavailable")
         )
@@ -413,7 +429,7 @@ class TestAttentionSleepSweeper:
         shutdown.set()
         await task
 
-        svc.suspend_thread_workspace.assert_awaited_with("thread-abc")
+        end_thread_flow.assert_awaited_once()
 
 
 # ===========================================================================
@@ -842,53 +858,69 @@ class TestPhase5WakeIfSuspended:
     async def test_restores_when_workspace_suspended(self):
         import orchestrator.main as om
 
-        # get_thread returns metadata with suspended workspace.
-        thread = {
-            "id": "thread-abc",
-            "execution_lane": "pinned",
-            "agent_id": None,
-            "config_name": "persistent_defaults",
-            "metadata": {"workspace_container": {"status": "suspended"}},
-        }
+        thread = _stale_pinned_runtime_row()
+        thread.update(
+            {
+                "status": "suspended",
+                "agent_id": None,
+                "runtime_attach_token": None,
+                "config_name": "persistent_defaults",
+                "metadata": {"workspace_container": {"status": "suspended"}},
+            }
+        )
+        thread_id = str(thread["id"])
         db = MagicMock()
         db.get_thread = AsyncMock(return_value=thread)
-        db.acquire = lambda: _make_db()._Acquire if False else _make_db().acquire()
-        # Easier: build a proper db helper
-        db_inner = _make_db()
+        db_inner = _make_db(fetchval=thread_id)
         db.acquire = db_inner.acquire
         om.postgres_db = db
 
         svc = MagicMock()
         svc.is_enabled = True
-        svc.restore_thread_workspace = AsyncMock(return_value=True)
         om.workspace_suspension_service = svc
+        ensure_workspace = AsyncMock(
+            return_value=MagicMock(outcome=om.EnsureOutcome.READY)
+        )
+        om.ensure_session_workspace = ensure_workspace
 
         prov = MagicMock()
-        prov.create_agent_pod = AsyncMock(return_value=True)
+        prov.create_agent_pod = AsyncMock(return_value=MagicMock(usable=True))
         om.persistent_provisioner = prov
 
-        await om._phase5_wake_if_suspended("thread-abc")
+        await om._phase5_wake_if_suspended(thread_id)
         # Give the inner create_task room.
         await asyncio.sleep(0)
 
-        svc.restore_thread_workspace.assert_awaited_with("thread-abc")
-        prov.create_agent_pod.assert_called_with(
-            "thread-abc", config_name="session_base"
+        ensure_workspace.assert_awaited_once_with(
+            thread_id,
+            db=db,
+            provisioner=om.container_provisioner,
+            suspension=svc,
+            expected_runtime_generation=str(thread["runtime_generation"]),
         )
-        wake_sql = " ".join(db_inner._fake_conn.execute.await_args.args[0].split())
+        prov.create_agent_pod.assert_awaited_once_with(
+            thread_id,
+            config_name="session_base",
+            expected_runtime_generation=str(thread["runtime_generation"]),
+        )
+        wake_sql = " ".join(db_inner._fake_conn.fetchval.await_args.args[0].split())
         assert "status = 'active'" in wake_sql
+        assert "runtime_generation=$2::uuid" in wake_sql
+        assert "runtime_retirement_token IS NULL" in wake_sql
         assert "control_admission_agent_id = NULL" in wake_sql
 
     @pytest.mark.asyncio
     async def test_skips_when_workspace_not_suspended(self):
         import orchestrator.main as om
 
-        thread = {
-            "id": "thread-abc",
-            "execution_lane": "pinned",
-            "agent_id": "agent-1",
-            "metadata": {"workspace_container": {"status": "ready"}},
-        }
+        thread = _stale_pinned_runtime_row()
+        thread.update(
+            {
+                "status": "active",
+                "metadata": {"workspace_container": {"status": "ready"}},
+            }
+        )
+        thread_id = str(thread["id"])
         db = MagicMock()
         db.get_thread = AsyncMock(return_value=thread)
         db_inner = _make_db()
@@ -897,17 +929,18 @@ class TestPhase5WakeIfSuspended:
 
         svc = MagicMock()
         svc.is_enabled = True
-        svc.restore_thread_workspace = AsyncMock()
         om.workspace_suspension_service = svc
+        ensure_workspace = AsyncMock()
+        om.ensure_session_workspace = ensure_workspace
 
         prov = MagicMock()
         prov.create_agent_pod = AsyncMock()
         om.persistent_provisioner = prov
 
-        await om._phase5_wake_if_suspended("thread-abc")
+        await om._phase5_wake_if_suspended(thread_id)
         await asyncio.sleep(0)
 
-        svc.restore_thread_workspace.assert_not_called()
+        ensure_workspace.assert_not_awaited()
         # agent_id is already bound; no need to re-create.
         prov.create_agent_pod.assert_not_called()
 

@@ -122,6 +122,20 @@ class MainCloudBackend(Protocol):
 
     backend_id: str
 
+    @property
+    def backend_instance_id(self) -> Optional[str]:
+        """Durable installation authority, or ``None`` until DB adoption."""
+        ...
+
+    @property
+    def installation_proof_sha256(self) -> Optional[str]:
+        """Digest of the provider-owned installation proof after init."""
+        ...
+
+    def bind_backend_instance(self, backend_instance_id: str) -> None:
+        """Bind the exact DB installation UUID after remote attestation."""
+        ...
+
     # ------------------------------------------------------------------ Lifecycle
     @property
     def is_configured(self) -> bool: ...

@@ -396,6 +396,27 @@ WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
 RETURNING state
 """
 
+# Fail-closed disposition for a leased unit whose executor crossed an
+# external-effect boundary but could not reach normal completion. Unlike an
+# error release, this MUST NOT make the unit runnable: retrying an input after
+# an unledgered tool effect can duplicate that effect. The exact-token/state
+# guard is the same ownership CAS as complete/release; watermarks and attempts
+# are deliberately untouched so an operator can inspect and explicitly
+# unpark the original debt.
+_PARK_SQL = """
+UPDATE run_queue SET
+    state = 'parked',
+    leased_by = NULL,
+    last_leased_by = NULL,
+    leased_until = NULL,
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL,
+    queued_at = now(),
+    run_after = now()
+WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
+RETURNING state
+"""
+
 _RECORD_INPUT_SQL = """
 WITH cur AS (
     SELECT unit_id, state AS old_state
@@ -963,6 +984,27 @@ async def release_unit(
         bool(error),
         _RELEASE_BACKOFF_BASE_SECONDS,
     )
+
+
+async def park_unit(
+    conn: Executor,
+    *,
+    unit_id: UUID | str,
+    lease_token: int,
+) -> str | None:
+    """Fail closed: exact leased claim -> ``'parked'`` without consumption.
+
+    This is the non-retry disposition for a fully quiesced claimant that may
+    already have produced an external side effect but cannot truthfully call
+    :func:`complete_unit`. It preserves input/consumed watermarks, attempt
+    counters, and the fencing token; clears the old physical/admission owner;
+    and remains non-claimable until an operator calls :func:`unpark_unit`.
+
+    Returns ``'parked'`` on success or ``None`` when the exact token no longer
+    owns a leased row. Callers must quiesce every local writer before calling
+    this function, just as they must before release/complete.
+    """
+    return await conn.fetchval(_PARK_SQL, _uuid(unit_id), lease_token)
 
 
 async def fence_lease(

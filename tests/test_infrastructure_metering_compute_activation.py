@@ -1320,21 +1320,24 @@ async def test_compute_foundation_database_lifecycle(compute_pg_dsn: str) -> Non
                 "UPDATE agents SET current_job_id=NULL WHERE id=$1", agent_id
             )
 
-            thread_id = uuid4()
-            await conn.execute(
-                "INSERT INTO threads ("
-                "id,title,user_id,project_id,agent_id,status) VALUES ("
-                "$1,'Compute thread',$2,$3,$4,'active')",
-                thread_id,
-                user_id,
-                project_id,
-                agent_id,
-            )
-            await conn.execute(
-                "UPDATE agents SET thread_id=$2 WHERE id=$1",
-                agent_id,
-                thread_id,
-            )
+            thread_id, thread_attach_token = uuid4(), uuid4()
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO threads ("
+                    "id,title,user_id,project_id,agent_id,runtime_attach_token,"
+                    "runtime_authority_exposed,status) "
+                    "VALUES ($1,'Compute thread',$2,$3,$4,$5,true,'active')",
+                    thread_id,
+                    user_id,
+                    project_id,
+                    agent_id,
+                    thread_attach_token,
+                )
+                await conn.execute(
+                    "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                    agent_id,
+                    thread_id,
+                )
             state = await _binding_state(conn, agent_id)
             assert (
                 state["attribution_scope"],
@@ -1347,7 +1350,15 @@ async def test_compute_foundation_database_lifecycle(compute_pg_dsn: str) -> Non
             state = await _binding_state(conn, agent_id)
             assert state["attribution_scope"] == "unknown"
             assert state["reason_code"] == "thread-binding-conflict"
-            await conn.execute("UPDATE agents SET thread_id=NULL WHERE id=$1", agent_id)
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE threads SET agent_id=NULL, runtime_attach_token=NULL "
+                    "WHERE id=$1",
+                    thread_id,
+                )
+                await conn.execute(
+                    "UPDATE agents SET thread_id=NULL WHERE id=$1", agent_id
+                )
 
             journal_count = await conn.fetchval(
                 "SELECT count(*) FROM agent_metering_binding_events WHERE agent_id=$1",
@@ -1500,6 +1511,7 @@ async def test_compute_foundation_database_lifecycle(compute_pg_dsn: str) -> Non
                 first_uid = f"z-{owner_kind}-uid"
                 second_uid = f"a-{owner_kind}-uid"
                 owner_id = uuid4()
+                thread_handoff_token = uuid4()
                 await conn.execute(
                     "INSERT INTO agents (id,config_name,hostname,status,pod_uid) "
                     "VALUES ($1,'worker',$4,'ready',$5),"
@@ -1549,20 +1561,31 @@ async def test_compute_foundation_database_lifecycle(compute_pg_dsn: str) -> Non
                          WHERE id=$1
                     """
                 else:
-                    await conn.execute(
-                        "INSERT INTO threads (id,title,user_id,agent_id,status) "
-                        "VALUES ($1,'lock-order thread',$2,$3,'suspended')",
-                        owner_id,
-                        user_id,
-                        first_agent_id,
+                    async with conn.transaction():
+                        await conn.execute(
+                            "INSERT INTO threads ("
+                            "id,title,user_id,agent_id,runtime_attach_token,"
+                            "runtime_authority_exposed,status) "
+                            "VALUES ($1,'lock-order thread',$2,$3,$4,true,"
+                            "'suspended')",
+                            owner_id,
+                            user_id,
+                            first_agent_id,
+                            uuid4(),
+                        )
+                        await conn.execute(
+                            "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                            first_agent_id,
+                            owner_id,
+                        )
+                    # A pinned thread may have only one reciprocal agent. The
+                    # owner mutation therefore performs a real first->second
+                    # handoff; the thread trigger still sees both Pod UIDs and
+                    # exercises their canonical prelock order.
+                    owner_mutation = (
+                        "UPDATE threads SET status='active',agent_id=$2,"
+                        "runtime_attach_token=$3 WHERE id=$1"
                     )
-                    await conn.execute(
-                        "UPDATE agents SET thread_id=$3 WHERE id IN ($1,$2)",
-                        first_agent_id,
-                        second_agent_id,
-                        owner_id,
-                    )
-                    owner_mutation = "UPDATE threads SET status='active' WHERE id=$1"
 
                 blocker_name = f"srw-agent-metering-agent:{first_agent_id}"
                 owner_application = f"metering-{owner_kind}-lock-order"
@@ -1577,6 +1600,24 @@ async def test_compute_foundation_database_lifecycle(compute_pg_dsn: str) -> Non
                             owner_application,
                         )
                         await owner_conn.execute("SET deadlock_timeout='100ms'")
+                        if owner_kind == "thread":
+                            async with owner_conn.transaction():
+                                result = await owner_conn.execute(
+                                    owner_mutation,
+                                    owner_id,
+                                    second_agent_id,
+                                    thread_handoff_token,
+                                )
+                                await owner_conn.execute(
+                                    "UPDATE agents SET thread_id=NULL WHERE id=$1",
+                                    first_agent_id,
+                                )
+                                await owner_conn.execute(
+                                    "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                                    second_agent_id,
+                                    owner_id,
+                                )
+                            return result
                         return await owner_conn.execute(owner_mutation, owner_id)
 
                 async def move_agent() -> str:

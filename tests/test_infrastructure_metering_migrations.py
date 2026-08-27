@@ -238,7 +238,22 @@ APP_DELIVERABLE_CONTRACT_AUTHORITY = (
     ROOT
     / "orchestrator/database/migrations/app/0182_deliverable_contract_authority.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_DELIVERABLE_CONTRACT_AUTHORITY
+APP_PERSISTENT_INPUT_DELIVERY_CANCELLATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0183_persistent_input_delivery_cancellation.sql"
+)
+APP_THREAD_ENDED_TRANSITION_FENCE = (
+    ROOT / "orchestrator/database/migrations/app/0184_thread_ended_transition_fence.sql"
+)
+APP_THREAD_RUNTIME_GENERATION_RETIREMENT = (
+    ROOT
+    / "orchestrator/database/migrations/app/0185_thread_runtime_generation_retirement.sql"
+)
+APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY = (
+    ROOT
+    / "orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -792,7 +807,164 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
     )
     assert "schema_current" not in APP_DATASOURCE_TOMBSTONES_MIGRATION.read_text()
     assert "schema_current" not in APP_THREAD_SESSION_DURABLE_STATE.read_text()
+    assert (
+        "schema_current" not in APP_PERSISTENT_INPUT_DELIVERY_CANCELLATION.read_text()
+    )
+    assert "schema_current" not in APP_THREAD_ENDED_TRANSITION_FENCE.read_text()
+    assert "schema_current" not in APP_THREAD_RUNTIME_GENERATION_RETIREMENT.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
+
+
+def test_0183_persistent_input_cancellation_is_terminal_and_source_scoped() -> None:
+    raw = APP_PERSISTENT_INPUT_DELIVERY_CANCELLATION.read_text()
+    sql = _compact(raw)
+
+    assert "-- migration:     0183_persistent_input_delivery_cancellation.sql" in raw
+    assert "-- depends-on:    0182_deliverable_contract_authority.sql" in raw
+    assert "PERSISTENT_INPUT_CANCELLATION_ENABLED" in raw
+    assert "ADD COLUMN cancelled_at TIMESTAMPTZ" in sql
+    assert "ADD COLUMN cancelled_turn_number BIGINT" in sql
+    assert "ADD COLUMN cancelled_reason TEXT" in sql
+    assert "'cancelled'" in sql
+    assert "state = 'cancelled' AND source = 'direct_human'" in sql
+    assert "cancelled_at IS NOT NULL" in sql
+    assert "cancelled_turn_number > 0" in sql
+    assert "btrim(cancelled_reason) <> ''" in sql
+    assert "length(cancelled_reason) <= 120" in sql
+    assert "UPDATE public.thread_messages" not in sql
+
+
+def test_0184_ended_transition_fence_is_mixed_version_compatible() -> None:
+    raw = APP_THREAD_ENDED_TRANSITION_FENCE.read_text()
+    sql = _compact(raw)
+
+    assert "-- migration:     0184_thread_ended_transition_fence.sql" in raw
+    assert "-- depends-on:    0183_persistent_input_delivery_cancellation.sql" in raw
+    assert "OLD.status = 'ended'" in sql
+    assert "NEW.status NOT IN ('ended', 'created')" in sql
+    assert "ERRCODE = '23514'" in sql
+    assert "CONSTRAINT = 'threads_ended_transition_fence'" in sql
+    assert "BEFORE UPDATE OF status ON public.threads" in sql
+    assert "srw.explicit_thread_resume" not in raw
+
+    snapshot = (ROOT / "orchestrator/database/schema_current.sql").read_text()
+    assert "CREATE FUNCTION public.enforce_thread_ended_transition()" in snapshot
+    assert "CREATE TRIGGER threads_ended_transition_fence BEFORE UPDATE OF" in snapshot
+
+
+def test_0185_runtime_generation_and_retirement_authority_contract() -> None:
+    raw = APP_THREAD_RUNTIME_GENERATION_RETIREMENT.read_text()
+    sql = _compact(raw)
+
+    assert "-- migration:     0185_thread_runtime_generation_retirement.sql" in raw
+    assert "-- depends-on:    0184_thread_ended_transition_fence.sql" in raw
+    assert "-- maintenance-gate: pinned-runtime-authority-v1" in raw
+    assert "runtime_generation uuid" in sql
+    assert "ALTER COLUMN runtime_generation SET NOT NULL" in sql
+    assert "runtime_retirement_token uuid" in sql
+    assert "runtime_retirement_authorized_at timestamptz" in sql
+    assert "runtime_retirement_context jsonb" in sql
+    assert "runtime_retirement_stage_receipt jsonb" in sql
+    assert "runtime_retirement_local_quiescence jsonb" in sql
+    assert "runtime_retirement_external_cleanup jsonb" in sql
+    assert "runtime_authority_exposed boolean NOT NULL DEFAULT false" in sql
+    assert "runtime_attach_token uuid" in sql
+    assert "runtime_attach_abort_receipt jsonb" in sql
+    assert "ALTER TABLE public.cloud_ro_mounts" in sql
+    assert "ADD COLUMN IF NOT EXISTS runtime_generation uuid" in sql
+    assert "ADD COLUMN IF NOT EXISTS engage_attempt uuid" in sql
+    assert "ALTER TABLE public.thread_control_requests" in sql
+    assert "CREATE TABLE IF NOT EXISTS public.thread_runtime_retirement_outcomes" in sql
+    assert "PRIMARY KEY (thread_id, runtime_generation, retirement_token)" in sql
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_thread_runtime_retirement_outcomes_process"
+        in sql
+    )
+    assert (
+        "CREATE TABLE IF NOT EXISTS public.thread_runtime_attach_abort_outcomes" in sql
+    )
+    assert "CREATE TABLE IF NOT EXISTS public.thread_workspace_provision_intents" in sql
+    assert (
+        "CREATE OR REPLACE FUNCTION public.enforce_thread_workspace_provision_intent()"
+        in sql
+    )
+    assert "thread_workspace_provision_intent_authority" in sql
+    assert "status IN ('planned', 'published', 'revoking', 'fenced', 'retired')" in sql
+    assert "gc_after >= fenced_at + interval '10 minutes'" in sql
+    assert "pinned_retirement_workspace_provision_intent_retired" in sql
+    assert "workspace_provision_fence_v1" in sql
+    assert "threads_runtime_retirement_external_cleanup_shape" in sql
+    assert "threads_runtime_retirement_external_cleanup_immutable" in sql
+    assert "PRIMARY KEY (thread_id, runtime_generation, runtime_attach_token)" in sql
+    for append_only_table in (
+        "thread_runtime_retirement_outcomes",
+        "thread_runtime_attach_abort_outcomes",
+    ):
+        table_definition = re.search(
+            rf"CREATE TABLE IF NOT EXISTS public\.{append_only_table}\s*"
+            r"\((.*?)\n\);",
+            raw,
+            re.DOTALL,
+        )
+        assert table_definition is not None
+        assert "REFERENCES public.threads" not in table_definition.group(1)
+    assert "threads_runtime_retirement_shape" in sql
+    assert "threads_runtime_retirement_stage_receipt_shape" in sql
+    assert "threads_runtime_retirement_local_quiescence_shape" in sql
+    assert "NEW.runtime_generation := public.uuid_generate_v4()" in sql
+    assert "threads_runtime_generation_immutable" in sql
+    assert "threads_runtime_authority_exposed_immutable" in sql
+    assert "threads_runtime_attach_abort_receipt" in sql
+    assert "threads_runtime_retirement_authorized_immutable" in sql
+    assert "threads_runtime_retirement_local_quiescence_identity" in sql
+    assert "threads_runtime_retirement_stage_receipt_pending" in sql
+    assert "threads_runtime_retirement_stage_receipt_source" in sql
+    assert "threads_runtime_retirement_pending" in sql
+    assert "workspace_process_zero_v1" in sql
+    assert "agent_runtime_zero_v1" in sql
+    assert "workspace_actuator_zero_v1" in sql
+
+    snapshot = (ROOT / "orchestrator/database/schema_current.sql").read_text()
+    assert "runtime_generation uuid" in snapshot
+    assert "runtime_retirement_token uuid" in snapshot
+    assert "runtime_retirement_authorized_at timestamp with time zone" in snapshot
+    assert "runtime_retirement_stage_receipt jsonb" in snapshot
+    assert "runtime_retirement_local_quiescence jsonb" in snapshot
+    assert "runtime_authority_exposed boolean DEFAULT false NOT NULL" in snapshot
+    assert "runtime_attach_abort_receipt jsonb" in snapshot
+    assert "CREATE TABLE public.thread_runtime_retirement_outcomes" in snapshot
+    assert "CREATE TABLE public.thread_runtime_attach_abort_outcomes" in snapshot
+    assert "idx_thread_runtime_retirement_outcomes_process" in snapshot
+    assert "threads_runtime_retirement_shape" in snapshot
+    assert "threads_runtime_retirement_authorized_immutable" in snapshot
+    assert "threads_runtime_authority_exposed_immutable" in snapshot
+
+
+def test_0186_protected_cloud_instance_and_attempt_authority_contract() -> None:
+    raw = APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY.read_text()
+    sql = _compact(raw)
+
+    assert "-- migration:     0186_protected_cloud_instance_authority.sql" in raw
+    assert "-- depends-on:    0185_thread_runtime_generation_retirement.sql" in raw
+    assert "-- maintenance-gate: pinned-runtime-authority-v1" in raw
+    assert "CREATE TABLE IF NOT EXISTS public.main_cloud_backend_instances" in sql
+    assert "CREATE TABLE IF NOT EXISTS public.main_cloud_active_backend" in sql
+    assert "CREATE TABLE IF NOT EXISTS public.cloud_ro_effect_intents" in sql
+    assert "ADD COLUMN IF NOT EXISTS backend_instance_id uuid" in sql
+    assert "ADD COLUMN IF NOT EXISTS source_binding jsonb" in sql
+    assert "ADD COLUMN IF NOT EXISTS source_binding_sha256 text" in sql
+    assert "status IN ('engaging', 'active', 'revoking', 'revoked')" in sql
+    assert "cloud_ro_mounts_instance_migration_authority" in sql
+    assert "enforce_cloud_ro_mount_authority_shape" in sql
+    assert "cloud_ro_mounts_selected_source" in sql
+    assert "'srw-reader-a-' || replace(NEW.engage_attempt::text, '-', '')" in sql
+    assert "'srw-rog-a-' || replace(NEW.engage_attempt::text, '-', '')" in sql
+    assert "pg_catalog.sha256" in sql
+    assert "cloud_ro_mounts_attempt_retained" in sql
+    assert "enforce_cloud_ro_effect_intent_insert_authority" in sql
+    assert "cloud_ro_effect_intents_insert_authority" in sql
+    assert "cloud_ro_effect_intents_horizon_authority" in sql
+    assert "effect.safe_after > clock_timestamp()" in sql
 
 
 def test_0177_is_bounded_thread_only_and_keeps_0176_immutable() -> None:
@@ -839,14 +1011,18 @@ async def test_0177_repairs_deployed_legacy_thread_detach_without_opening_attach
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
     through_0175 = tmp_path / "through-0175"
     through_0176 = tmp_path / "through-0176"
+    through_0177 = tmp_path / "through-0177"
     through_0175.mkdir()
     through_0176.mkdir()
+    through_0177.mkdir()
     try:
         for path in discover(ROOT / "orchestrator/database/migrations/app"):
             if path.name < APP_MANAGED_REPOSITORY_AUTHORITIES.name:
                 (through_0175 / path.name).write_bytes(path.read_bytes())
             if path.name <= APP_MANAGED_REPOSITORY_AUTHORITIES.name:
                 (through_0176 / path.name).write_bytes(path.read_bytes())
+            if path.name <= APP_MANAGED_REPOSITORY_THREAD_DETACH.name:
+                (through_0177 / path.name).write_bytes(path.read_bytes())
 
         await run_migrations(pool, through_0175)
         thread_id = uuid4()
@@ -894,7 +1070,7 @@ async def test_0177_repairs_deployed_legacy_thread_detach_without_opening_attach
                 == "managed_repository_url_must_be_credential_free"
             )
 
-        await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        await run_migrations(pool, through_0177)
         async with pool.acquire() as conn:
             assert (
                 await conn.execute(
@@ -1210,12 +1386,15 @@ async def test_compute_shape_repair_upgrades_deployed_0112_and_0113_checksums(
     dsn = _swap_db(app_pg_dsn, dbname)
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
     staged_dir = tmp_path / "through-0113"
+    repaired_dir = tmp_path / "through-0114"
     staged_dir.mkdir()
+    repaired_dir.mkdir()
     try:
         for path in discover(ROOT / "orchestrator/database/migrations/app"):
-            if path.name > APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.name:
-                break
-            (staged_dir / path.name).write_bytes(path.read_bytes())
+            if path.name <= APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.name:
+                (staged_dir / path.name).write_bytes(path.read_bytes())
+            if path.name <= APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.name:
+                (repaired_dir / path.name).write_bytes(path.read_bytes())
 
         await run_migrations(pool, staged_dir)
         async with pool.acquire() as conn:
@@ -1238,8 +1417,8 @@ async def test_compute_shape_repair_upgrades_deployed_0112_and_0113_checksums(
                 APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.name,
             )
 
-        await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
-        await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        await run_migrations(pool, repaired_dir)
+        await run_migrations(pool, repaired_dir)
         async with pool.acquire() as conn:
             assert (
                 await conn.fetchval(

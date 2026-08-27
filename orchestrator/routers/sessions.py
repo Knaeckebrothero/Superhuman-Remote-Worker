@@ -35,6 +35,19 @@ from security.auth import require_approved_user
 from services.session_lifecycle import emit as lifecycle_emit
 from services.session_lifecycle import probe_ready, wait_for_binding, wait_for_ready
 from services.session_provisioning_state import agent_pod_provisioning_in_progress
+from services.session_runtime_admission import (
+    ThreadRuntimeAuthority,
+    pinned_binding_invalid_detail,
+    protected_cloud_marker_state,
+    same_thread_runtime_authority,
+    thread_runtime_authority,
+    thread_requests_protected_cloud,
+    thread_runtime_is_preparable,
+    thread_runtime_refusal_detail,
+)
+from src.shared.pinned_session_identity import (
+    PinnedSessionBinding,
+)
 from src.shared.run_queue import LANE_PINNED, LANE_STATELESS
 
 logger = logging.getLogger(__name__)
@@ -89,6 +102,112 @@ _PINNED_PROVISIONING_ONLY_DETAIL = (
 )
 
 
+def _require_preparable_thread(thread: dict[str, Any] | None) -> dict[str, Any]:
+    """Public/runtime-boundary lifecycle gate, separate from lane selection."""
+
+    if not thread_runtime_is_preparable(thread):
+        raise HTTPException(
+            status_code=409,
+            detail=thread_runtime_refusal_detail(thread),
+        )
+    return thread
+
+
+def _require_supported_protected_prepare_override(
+    thread: dict[str, Any], override: dict[str, Any] | None
+) -> None:
+    """Reject protected topology changes before a detached task can exist.
+
+    The body override reaches provisioning as a replacement configuration, so
+    validating only the persisted thread leaves an API caller able to smuggle
+    a VM/lite workspace or Officer class into the background task.  This is a
+    synchronous admission check: every refusal happens before task scheduling,
+    lifecycle emission, reservation, or infrastructure work.
+    """
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            import json
+
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = None
+    marker = protected_cloud_marker_state(metadata)
+    if marker == "off":
+        return
+    if marker != "on":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "protected_cloud_malformed",
+                "message": "Protected cloud session state is invalid.",
+            },
+        )
+
+    def _check_fragment(fragment: Any) -> None:
+        if fragment is None:
+            return
+        if not isinstance(fragment, dict):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "protected_cloud_config_malformed"},
+            )
+        workspace = fragment.get("workspace")
+        if workspace is not None:
+            if not isinstance(workspace, dict):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "protected_cloud_config_malformed"},
+                )
+            for key in ("backend", "tier"):
+                if key not in workspace:
+                    continue
+                value = workspace.get(key)
+                if not isinstance(value, str) or value.strip().lower() not in {
+                    "sandbox",
+                    "container",
+                }:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "code": "protected_cloud_unsupported_workspace",
+                            "message": (
+                                "Protected cloud sessions require the Container "
+                                "workspace tier."
+                            ),
+                        },
+                    )
+        officer = fragment.get("officer")
+        if officer is not None:
+            if not isinstance(officer, dict) or (
+                "enabled" in officer and type(officer.get("enabled")) is not bool
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "protected_cloud_config_malformed"},
+                )
+            if officer.get("enabled") is True:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "protected_cloud_unsupported_session_class",
+                        "message": (
+                            "Protected cloud sessions are not supported for the "
+                            "background Officer runtime."
+                        ),
+                    },
+                )
+
+    persisted_override = (
+        metadata.get("config_override") if isinstance(metadata, dict) else None
+    )
+    _check_fragment(persisted_override)
+    _check_fragment(override)
+    if isinstance(override, dict):
+        _check_fragment(override.get("agent"))
+
+
 def _schedule_prepare_task(coro: Any) -> asyncio.Task[Any]:
     return asyncio.create_task(coro)
 
@@ -122,6 +241,10 @@ async def prepare_session(
         raise HTTPException(status_code=404, detail="thread not found")
     if str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="thread access denied")
+    _require_preparable_thread(thread)
+    runtime_authority = thread_runtime_authority(thread)
+    if runtime_authority is None:
+        raise HTTPException(status_code=409, detail="Session runtime is unavailable")
     if thread.get("execution_lane") != LANE_PINNED:
         # Fail closed: only the explicitly pinned lane may enter the pod
         # provisioner.  A stateless thread is served by run_queue claims, and
@@ -130,6 +253,8 @@ async def prepare_session(
             status_code=409,
             detail=_PINNED_PROVISIONING_ONLY_DETAIL,
         )
+
+    _require_supported_protected_prepare_override(thread, body.config_override)
 
     # The agent boots `--config <config_name>` and must load a real base YAML.
     # The cockpit's expert picker sends the expert UUID in config_name (here and
@@ -166,6 +291,7 @@ async def prepare_session(
             user_id=str(user["id"]),
             config_name=boot_config_name,
             config_override=validated_override,
+            runtime_authority=runtime_authority,
         )
     )
 
@@ -177,6 +303,7 @@ async def _do_prepare(
     user_id: str,
     config_name: str | None,
     config_override: dict[str, Any] | None,
+    runtime_authority: ThreadRuntimeAuthority,
 ) -> None:
     """Run the actual provisioning + readiness work asynchronously.
 
@@ -194,7 +321,19 @@ async def _do_prepare(
     db = _get_db()
 
     def _emit(state: str, **extra: Any) -> None:
-        lifecycle_emit(user_id, thread_id, state, **extra)
+        lifecycle_emit(
+            user_id,
+            thread_id,
+            state,
+            session_runtime_generation=runtime_authority.generation,
+            **extra,
+        )
+
+    # The public handler can race End before this detached task starts.  Never
+    # emit a fresh provisioning phase for a terminal generation.
+    thread = await db.get_thread(thread_id)
+    if not same_thread_runtime_authority(thread, runtime_authority):
+        return
 
     # Emit "provisioning" up-front so the cockpit's progress card surfaces
     # the phase even when a sibling path (POST /resume) wins the race and
@@ -214,6 +353,23 @@ async def _do_prepare(
     from main import _await_late_cloud_setup  # late import: avoid circular
 
     await _await_late_cloud_setup(thread_id)
+    thread = await db.get_thread(thread_id)
+    if not same_thread_runtime_authority(thread, runtime_authority):
+        return
+
+    # A protected thread may not reserve or provision an agent until reader
+    # engagement has produced the active mount payload.  The helper is a no-op
+    # for ordinary sessions and rechecks terminal lifecycle while waiting.
+    from main import _await_protected_cloud_runtime_ready
+
+    if not await _await_protected_cloud_runtime_ready(thread_id):
+        current = await db.get_thread(thread_id)
+        if same_thread_runtime_authority(current, runtime_authority):
+            _emit(
+                "failed",
+                reason="Protected cloud reader or staging overlay is unavailable",
+            )
+        return
 
     needs_binding_wait = False
     try:
@@ -221,6 +377,8 @@ async def _do_prepare(
             thread = await db.get_thread(thread_id)
             if not thread:
                 _emit("failed", reason="thread vanished")
+                return
+            if not same_thread_runtime_authority(thread, runtime_authority):
                 return
             if thread.get("execution_lane") != LANE_PINNED:
                 # Defense in depth for direct/internal callers and for a lane
@@ -254,6 +412,9 @@ async def _do_prepare(
                 )
 
                 _violations = await _session_grant_violations(thread)
+                thread = await db.get_thread(thread_id)
+                if not same_thread_runtime_authority(thread, runtime_authority):
+                    return
                 if _violations:
                     logger.warning(
                         "Thread %s: prepare denied by capability grants: %s",
@@ -268,6 +429,9 @@ async def _do_prepare(
                 # before reconciling a workspace + booting a doomed pod.
                 # knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
                 _ep_violations = await _session_endpoint_violations(thread)
+                thread = await db.get_thread(thread_id)
+                if not same_thread_runtime_authority(thread, runtime_authority):
+                    return
                 if _ep_violations:
                     logger.warning(
                         "Thread %s: prepare denied by unusable transport: %s",
@@ -301,6 +465,7 @@ async def _do_prepare(
                         db=postgres_db,
                         provisioner=container_provisioner,
                         suspension=workspace_suspension_service,
+                        expected_runtime_generation=runtime_authority.generation,
                     )
                 )
 
@@ -316,6 +481,9 @@ async def _do_prepare(
                         config_name=config_name or "session_base",
                         config_override=config_override,
                     )
+                    thread = await db.get_thread(thread_id)
+                    if not same_thread_runtime_authority(thread, runtime_authority):
+                        return
                 needs_binding_wait = True
 
         # Lock released. For fresh-pod paths, wait for the agent's
@@ -326,8 +494,14 @@ async def _do_prepare(
         if needs_binding_wait:
             bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
             if not await wait_for_binding(thread_id, bind_timeout_s):
-                _emit("failed", reason="agent failed to register")
+                current = await db.get_thread(thread_id)
+                if same_thread_runtime_authority(current, runtime_authority):
+                    _emit("failed", reason="agent failed to register")
                 return
+
+        thread = await db.get_thread(thread_id)
+        if not same_thread_runtime_authority(thread, runtime_authority):
+            return
 
         # Readiness probe. A VM-backed thread pays a cold KubeVirt boot far
         # beyond the sandbox default; size the budget from the thread's stored
@@ -339,37 +513,94 @@ async def _do_prepare(
         )
 
         thread = await db.get_thread(thread_id)
+        if not same_thread_runtime_authority(thread, runtime_authority):
+            return
         _backend = _thread_workspace_backend(thread)
         _vm_tag = {"backend": "vm"} if _backend == "vm" else {}
         _emit("booting", **_vm_tag)
-        agent_id = thread["agent_id"]
-        agent = await db.get_agent(str(agent_id))
-        if not agent or not agent.get("pod_ip"):
-            _emit("failed", reason="agent has no pod_ip")
+        binding: PinnedSessionBinding | None = await db.get_pinned_session_binding(
+            thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+        )
+        startup_statuses = {"booting", "ready", "working", "session"}
+        if binding is None or binding.agent_status not in startup_statuses:
+            current = await db.get_thread(thread_id)
+            if same_thread_runtime_authority(current, runtime_authority):
+                _emit("failed", reason="session binding is not authoritative")
             return
 
         ready_timeout_s = _session_ready_timeout_s(_backend)
         if not await wait_for_ready(
-            pod_ip=agent["pod_ip"],
-            pod_port=int(agent.get("pod_port", 8001)),
+            pod_ip=binding.pod_ip,
+            pod_port=binding.pod_port,
             timeout_s=ready_timeout_s,
+            require_protected_cloud=thread_requests_protected_cloud(thread),
+            expected_session_identity_fingerprint=(
+                binding.session_identity_fingerprint
+            ),
         ):
-            _emit("failed", reason="agent /ready timeout")
+            current = await db.get_thread(thread_id)
+            if same_thread_runtime_authority(current, runtime_authority):
+                _emit("failed", reason="agent /ready timeout")
+            return
+
+        current_binding: (
+            PinnedSessionBinding | None
+        ) = await db.get_pinned_session_binding(
+            thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+        )
+        if (
+            current_binding is None
+            or current_binding.target_key != binding.target_key
+            or current_binding.agent_status not in startup_statuses
+        ):
             return
 
         # Create the route resource.
         from main import session_router  # type: ignore
 
-        await session_router.ensure_route(
-            thread_id=thread_id,
-            pod_name=agent["hostname"],
-            pod_uid=agent.get("pod_uid", ""),
-        )
+        route_published = False
+        try:
+            await session_router.ensure_route(
+                thread_id=thread_id,
+                pod_name=binding.agent_hostname,
+                pod_uid=binding.pod_uid,
+                runtime_generation=runtime_authority.generation,
+            )
 
-        _emit("ready")
+            current_binding = await db.get_pinned_session_binding(
+                thread_id,
+                expected_runtime_generation=runtime_authority.generation,
+            )
+            if (
+                current_binding is None
+                or current_binding.target_key != binding.target_key
+                or current_binding.agent_status not in startup_statuses
+            ):
+                return
+
+            _emit("ready")
+            route_published = True
+        finally:
+            # ``ensure_route`` may create the deterministic Service before an
+            # Ingress failure. Any path that does not publish ready therefore
+            # owes exact G/Pod cleanup, including exceptions from the final DB
+            # reread. A false result means cleanup authority was not proven;
+            # surface that failure instead of silently wedging the successor.
+            if not route_published:
+                route_removed = await session_router.teardown_route(
+                    thread_id,
+                    expected_runtime_generation=runtime_authority.generation,
+                    expected_owner_uid=binding.pod_uid,
+                )
+                if not route_removed:
+                    raise RuntimeError("incomplete session route could not be removed")
     except Exception as e:
         logger.exception("prepare failed for thread %s: %s", thread_id, e)
-        _emit("failed", reason=str(e))
+        current = await db.get_thread(thread_id)
+        if same_thread_runtime_authority(current, runtime_authority):
+            _emit("failed", reason=str(e))
 
 
 async def _provision_agent_for_thread(
@@ -386,9 +617,20 @@ async def _provision_agent_for_thread(
     # reuse point.  Re-read the authoritative row and whitelist the one lane
     # that is allowed to bind a registered agent; a blacklist of today's
     # stateless name would make the next lane unsafe by default.
-    thread = await _get_db().get_thread(thread_id)
-    if not thread or thread.get("execution_lane") != LANE_PINNED:
+    db = _get_db()
+    thread = await db.get_thread(thread_id)
+    runtime_authority = thread_runtime_authority(thread)
+    if runtime_authority is None or thread.get("execution_lane") != LANE_PINNED:
         raise RuntimeError(_PINNED_PROVISIONING_ONLY_DETAIL)
+
+    from main import _await_protected_cloud_runtime_ready
+
+    if not await _await_protected_cloud_runtime_ready(thread_id):
+        raise RuntimeError("Protected cloud engagement is not ready")
+    if not same_thread_runtime_authority(
+        await db.get_thread(thread_id), runtime_authority
+    ):
+        raise RuntimeError("Session lifecycle changed during preparation")
 
     from main import (
         _find_idle_persistent_agent,
@@ -397,6 +639,9 @@ async def _provision_agent_for_thread(
     )
 
     idle_agent = await _find_idle_persistent_agent()
+    thread = await db.get_thread(thread_id)
+    if not same_thread_runtime_authority(thread, runtime_authority):
+        raise RuntimeError("Session lifecycle changed during preparation")
     if idle_agent:
         ok = await _send_session_attach(
             idle_agent, thread_id, config_override or {}, [], datasources=None
@@ -407,15 +652,25 @@ async def _provision_agent_for_thread(
         # Reservation refusal can race a lane transition or a sibling bind.
         # Re-read before the fresh-pod fallback; the entry snapshot is no
         # longer authority after an awaited HTTP/DB path.
-        current = await _get_db().get_thread(thread_id)
-        if not current or current.get("execution_lane") != LANE_PINNED:
+        current = await db.get_thread(thread_id)
+        if (
+            not same_thread_runtime_authority(current, runtime_authority)
+            or current.get("execution_lane") != LANE_PINNED
+        ):
             raise RuntimeError(_PINNED_PROVISIONING_ONLY_DETAIL)
         if current.get("agent_id") or agent_pod_provisioning_in_progress(current):
             return
 
+    current = await db.get_thread(thread_id)
+    if not same_thread_runtime_authority(current, runtime_authority):
+        raise RuntimeError("Session lifecycle changed during preparation")
     await agent_provisioner.provision_agent(
         purpose="session", thread_id=thread_id, config_name=config_name
     )
+    if not same_thread_runtime_authority(
+        await db.get_thread(thread_id), runtime_authority
+    ):
+        raise RuntimeError("Session lifecycle changed during agent provisioning")
 
 
 # --------------------------------------------------------------------------- #
@@ -431,6 +686,8 @@ class PinnedConnectionResponse(BaseModel):
     ws_url: str
     token: str
     expires_at: int
+    pinned_runtime_generation_contract: Literal[1] = 1
+    session_runtime_generation: str
 
 
 class StatelessConnectionResponse(BaseModel):
@@ -441,6 +698,8 @@ class StatelessConnectionResponse(BaseModel):
     ws_url: None
     token: None
     expires_at: None
+    pinned_runtime_generation_contract: Literal[1] = 1
+    session_runtime_generation: str
 
 
 ConnectionResponse = Annotated[
@@ -473,6 +732,28 @@ async def get_connection(
         raise HTTPException(status_code=404, detail="thread not found")
     if str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="thread access denied")
+    _require_preparable_thread(thread)
+    runtime_authority = thread_runtime_authority(thread)
+    if runtime_authority is None:
+        raise HTTPException(status_code=409, detail="Session runtime is unavailable")
+
+    from main import _await_protected_cloud_runtime_ready
+
+    if not await _await_protected_cloud_runtime_ready(thread_id, timeout_s=0):
+        _require_preparable_thread(await db.get_thread(thread_id))
+        raise HTTPException(
+            status_code=425,
+            detail={"code": "protected_cloud_not_ready"},
+        )
+
+    # The readiness join above crosses database/cloud awaits.  Its entry row
+    # is no longer authoritative for either lifecycle or lane: End or a
+    # detached lane transition may have committed while the reader probe was
+    # running.  Re-read before the stateless fast return (and before using any
+    # pinned binding) so a stale snapshot can never mint a ready connection.
+    thread = await db.get_thread(thread_id)
+    if not same_thread_runtime_authority(thread, runtime_authority):
+        raise HTTPException(status_code=409, detail="Session runtime changed")
 
     execution_lane = thread.get("execution_lane")
     if execution_lane == LANE_STATELESS:
@@ -493,6 +774,7 @@ async def get_connection(
             ws_url=None,
             token=None,
             expires_at=None,
+            session_runtime_generation=runtime_authority.generation,
         )
     if execution_lane != LANE_PINNED:
         raise HTTPException(
@@ -500,27 +782,42 @@ async def get_connection(
             detail="Unsupported session execution lane",
         )
 
-    agent_id = thread.get("agent_id")
-    if not agent_id:
+    if not thread.get("agent_id"):
         # Not bound yet — caller should POST /prepare.
         raise HTTPException(status_code=425, detail="session not ready")
 
-    agent = await db.get_agent(str(agent_id))
+    async def _raise_exact_binding_refusal() -> None:
+        current = await db.get_thread(runtime_authority.thread_id)
+        if not same_thread_runtime_authority(current, runtime_authority):
+            _require_preparable_thread(current)
+            raise HTTPException(status_code=425, detail="session not ready")
+        raise HTTPException(
+            status_code=409,
+            detail=pinned_binding_invalid_detail(runtime_authority),
+        )
 
-    # Self-heal a stale binding. A bound agent that is gone (row GC'd) or
-    # 'offline' (dead pod — the heartbeat reaper flips it) is terminal: clear
-    # agent_id and return 425 so the cockpit's _resolveConnection POSTs
-    # /prepare and re-provisions, instead of polling a 409 forever. A 'booting'
-    # agent is NOT dead — it falls through to the 409s below and the cockpit
-    # keeps polling (normal cold start).
-    if agent is None or agent.get("status") == "offline":
-        await db.update_thread_agent(thread_id, None)
-        raise HTTPException(status_code=425, detail="session not ready")
+    async def _read_binding() -> PinnedSessionBinding | None:
+        return await db.get_pinned_session_binding(
+            runtime_authority.thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+        )
 
-    if not agent.get("pod_ip"):
-        raise HTTPException(status_code=409, detail="agent unavailable")
-    if agent.get("status") not in ("ready", "working", "session"):
-        raise HTTPException(status_code=409, detail="agent not ready")
+    def _require_live_agent(binding: PinnedSessionBinding) -> None:
+        # Offline is a liveness hint with a durable stale-agent detector as
+        # recovery owner. Other non-live states are bound cold-start states;
+        # the cockpit's generic 409 readiness poll remains their owner.
+        if binding.agent_status == "offline":
+            raise HTTPException(status_code=425, detail="session not ready")
+        if binding.agent_status not in ("ready", "working", "session"):
+            raise HTTPException(status_code=409, detail="agent not ready")
+
+    binding = await _read_binding()
+    if binding is None:
+        await _raise_exact_binding_refusal()
+        raise AssertionError("unreachable")
+    _require_live_agent(binding)
+    captured_target = binding.target_key
+    identity_fingerprint = binding.session_identity_fingerprint
 
     # Verify the agent is actually session-ready before minting a token.
     # ``agent.status`` is set by the heartbeat (~60s lag), and an idle
@@ -533,9 +830,19 @@ async def get_connection(
     # the cockpit's ``_pollConnectionUntilReady`` wait (180s window)
     # instead of opening WS into the void and burning through its
     # 8-attempt reconnect budget before K8s converges.
-    pod_port_int = int(agent.get("pod_port", 8001))
-    if not await probe_ready(str(agent["pod_ip"]), pod_port_int):
+    if not await probe_ready(
+        binding.pod_ip,
+        binding.pod_port,
+        require_protected_cloud=thread_requests_protected_cloud(thread),
+        expected_session_identity_fingerprint=identity_fingerprint,
+    ):
         raise HTTPException(status_code=425, detail="session not ready")
+
+    current_binding = await _read_binding()
+    if current_binding is None or current_binding.target_key != captured_target:
+        await _raise_exact_binding_refusal()
+        raise AssertionError("unreachable")
+    _require_live_agent(current_binding)
 
     # Make /connection self-healing: any code path that binds an agent to a
     # thread (POST /prepare, the legacy resume in main.py, orchestrator restart
@@ -545,24 +852,52 @@ async def get_connection(
     # which path bound the agent.
     from main import session_router, session_tokens  # type: ignore
 
-    await session_router.ensure_route(
-        thread_id=thread_id,
-        pod_name=str(agent.get("hostname") or ""),
-        pod_uid=str(agent.get("pod_uid") or ""),
-    )
+    route_committed = False
+    try:
+        await session_router.ensure_route(
+            thread_id=runtime_authority.thread_id,
+            pod_name=binding.agent_hostname,
+            pod_uid=binding.pod_uid,
+            runtime_generation=runtime_authority.generation,
+        )
 
-    token, expires_at = session_tokens.mint(
-        user_id=str(user["id"]),
-        thread_id=thread_id,
-    )
+        # This is the final await before token mint.  The joined DB predicate is
+        # the linearization boundary for the route/token response; a stale route
+        # is removed with the exact generation + Pod UID and can never target a
+        # successor.
+        current_binding = await _read_binding()
+        if current_binding is None or current_binding.target_key != captured_target:
+            await _raise_exact_binding_refusal()
+            raise AssertionError("unreachable")
+        _require_live_agent(current_binding)
 
-    host = os.environ.get("SESSION_INGRESS_HOST", "api.example.com")
-    ws_url = f"wss://{host}/p/{thread_id}/ws?t={token}"
+        token, expires_at = session_tokens.mint(
+            user_id=str(user["id"]),
+            thread_id=runtime_authority.thread_id,
+            session_identity_fingerprint=identity_fingerprint,
+        )
 
-    return PinnedConnectionResponse(
-        state="ready",
-        control_socket="websocket",
-        ws_url=ws_url,
-        token=token,
-        expires_at=expires_at,
-    )
+        host = os.environ.get("SESSION_INGRESS_HOST", "api.example.com")
+        ws_url = f"wss://{host}/p/{runtime_authority.thread_id}/ws?t={token}"
+        response = PinnedConnectionResponse(
+            state="ready",
+            control_socket="websocket",
+            ws_url=ws_url,
+            token=token,
+            expires_at=expires_at,
+            session_runtime_generation=runtime_authority.generation,
+        )
+        route_committed = True
+        return response
+    finally:
+        # Exact cleanup covers partial Service/Ingress creation, a failed final
+        # DB read, a status/identity race, and token construction failure.  It
+        # is deliberately armed only when route mutation begins.
+        if not route_committed:
+            route_removed = await session_router.teardown_route(
+                runtime_authority.thread_id,
+                expected_runtime_generation=runtime_authority.generation,
+                expected_owner_uid=binding.pod_uid,
+            )
+            if not route_removed:
+                raise RuntimeError("incomplete session route could not be removed")

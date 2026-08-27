@@ -184,6 +184,22 @@ describe('SessionsPageComponent', () => {
 
             expect(component.threads()).toEqual([]);
         });
+
+        it('maps the safe retirement-pending projection to the non-resumable ending state', async () => {
+            mockHttp.get.mockReturnValue(of({
+                threads: [
+                    makeThread({
+                        runtime_retirement_pending: true,
+                        retirement_disposition: 'ended',
+                    }),
+                ],
+            }));
+
+            await component.loadThreads();
+
+            expect(component.threads()[0].status).toBe('ending');
+            expect(component.threads()[0].runtime_retirement_pending).toBe(true);
+        });
     });
 
     // =========================================================================
@@ -202,16 +218,24 @@ describe('SessionsPageComponent', () => {
             expect(component.filteredThreads().length).toBe(2);
         });
 
-        it('should filter by active status', () => {
+        it('keeps the Active bucket consistent with its non-ended count', () => {
             component.threads.set([
                 makeThread({status: 'active'}),
-                makeThread({id: 't2', status: 'ended'}),
+                makeThread({id: 't2', status: 'ending'}),
+                makeThread({id: 't3', status: 'suspended'}),
+                makeThread({id: 't4', status: 'awaiting_user'}),
+                makeThread({id: 't5', status: 'ended'}),
             ]);
             component.statusFilter.set('active');
 
             const filtered = component.filteredThreads();
-            expect(filtered.length).toBe(1);
-            expect(filtered[0].status).toBe('active');
+            expect(filtered.map(thread => thread.status)).toEqual([
+                'active',
+                'ending',
+                'suspended',
+                'awaiting_user',
+            ]);
+            expect(component.activeCount()).toBe(filtered.length);
         });
 
         it('should filter by ended status', () => {
@@ -399,6 +423,39 @@ describe('SessionsPageComponent', () => {
             expect(mockToast.danger).toHaveBeenCalled();
             expect(mockToast.info).not.toHaveBeenCalled();
             expect(mockRouter.navigate).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('confirmDelete()', () => {
+        it('offers force only for the exact turn_in_flight conflict', async () => {
+            component.deleteSession(makeThread());
+            mockHttp.delete.mockReturnValueOnce(throwError(() => new HttpErrorResponse({
+                status: 409,
+                error: {detail: {code: 'turn_in_flight'}},
+            })));
+
+            await component.confirmDelete();
+
+            expect(component.confirmForceOpen()).toBe(true);
+            expect(mockToast.danger).not.toHaveBeenCalled();
+        });
+
+        it('does not convert a generic or retirement 409 into force delete', async () => {
+            component.deleteSession(makeThread({status: 'ending'}));
+            mockHttp.delete.mockReturnValueOnce(throwError(() => new HttpErrorResponse({
+                status: 409,
+                error: {detail: {code: 'session_ending'}},
+            })));
+
+            await component.confirmDelete();
+
+            expect(component.confirmForceOpen()).toBe(false);
+            expect(mockToast.danger).toHaveBeenCalledOnce();
+            expect(
+                mockHttp.delete.mock.calls.some((call: any[]) =>
+                    String(call[0]).includes('force=true'),
+                ),
+            ).toBe(false);
         });
     });
 

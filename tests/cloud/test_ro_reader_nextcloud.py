@@ -10,7 +10,6 @@ rotated credential, and clean revoke — not live NC status-code semantics
 
 from __future__ import annotations
 
-import json
 import re
 from urllib.parse import parse_qs, quote, unquote
 
@@ -19,11 +18,20 @@ import pytest
 
 from orchestrator.services.cloud import NextcloudBackend, ProjectFolderHandle
 from orchestrator.services.cloud.config import NextcloudSettings
+from orchestrator.services.cloud.errors import CloudBackendError
+from orchestrator.services.cloud.protected_reader_authority import (
+    ProtectedNextcloudReaderGrantPlan,
+)
+from orchestrator.services.cloud_staging.source_identity import (
+    ProtectedMountSourceIdentity,
+)
 
 NC_BASE = "https://nc.example.com"
 AGENT_USER = "agent-service"
 MOUNTPOINT = "Test Project"
 FOLDER_ID = "7"
+BACKEND_INSTANCE_ID = "99999999-9999-4999-8999-999999999999"
+PROJECT_ID = "88888888-8888-4888-8888-888888888888"
 
 
 def _settings() -> NextcloudSettings:
@@ -45,8 +53,23 @@ def _handle() -> ProjectFolderHandle:
     )
 
 
-def _json(s: str) -> dict:
-    return json.loads(s)
+def _plan(
+    *,
+    attempt: str = "77777777-7777-4777-8777-777777777777",
+    folder_id: str = FOLDER_ID,
+    mountpoint: str = MOUNTPOINT,
+) -> ProtectedNextcloudReaderGrantPlan:
+    return ProtectedNextcloudReaderGrantPlan(
+        engage_attempt=attempt,
+        backend_instance_id=BACKEND_INSTANCE_ID,
+        source=ProtectedMountSourceIdentity(
+            backend_instance_id=BACKEND_INSTANCE_ID,
+            source_ref=PROJECT_ID,
+            target_path="cloud",
+            native_id=folder_id,
+            mountpoint=mountpoint,
+        ),
+    )
 
 
 class FakeNcOcs:
@@ -59,6 +82,7 @@ class FakeNcOcs:
         self.folder_group_perms: dict[str, dict[str, int]] = {}
         self.files: dict[str, bytes] = {}
         self.requests: list[httpx.Request] = []
+        self.delete_group_response: httpx.Response | None = None
 
     def _ocs(self, statuscode: int, extra: dict | None = None) -> httpx.Response:
         body = {"ocs": {"meta": {"status": "ok", "statuscode": statuscode}}}
@@ -87,6 +111,9 @@ class FakeNcOcs:
             return self._ocs(100)
 
         m = re.fullmatch(r"/ocs/v2\.php/cloud/users/([^/]+)", path)
+        if m and method == "DELETE":
+            self.users.pop(m.group(1), None)
+            return self._ocs(100)
         if m and method == "PUT":
             uid = m.group(1)
             form = self._form(request)
@@ -116,6 +143,8 @@ class FakeNcOcs:
 
         m = re.fullmatch(r"/ocs/v2\.php/cloud/groups/([^/]+)", path)
         if m and method == "DELETE":
+            if self.delete_group_response is not None:
+                return self.delete_group_response
             self.groups.discard(m.group(1))
             self.folder_group_perms and [
                 perms.pop(m.group(1), None)
@@ -171,48 +200,165 @@ def _backend_with_ocs_fake():
     backend._initialized = True
     backend._agent_user = AGENT_USER
     backend._agent_password = "pw"
+    backend.bind_backend_instance(BACKEND_INSTANCE_ID)
     return backend, fake
 
 
-@pytest.mark.asyncio
-async def test_ensure_ro_reader_creates_low_priv_account():
-    backend, fake = _backend_with_ocs_fake()
-    reader_id = await backend.ensure_ro_reader(user_key="abc")
-    assert reader_id == "srw-reader-abc"
-    assert fake.users["srw-reader-abc"]["groups"] == []  # no folder access yet
+def _effect_dispatcher(backend: NextcloudBackend):
+    async def _dispatch(method: str, path: str, body: bytes) -> httpx.Response:
+        assert "?" not in path
+        return await backend._client.request(
+            method,
+            path,
+            content=body,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+
+    return _dispatch
 
 
 @pytest.mark.asyncio
-async def test_ensure_ro_reader_is_idempotent():
+async def test_grant_creates_attempt_scoped_reader_with_final_password():
     backend, fake = _backend_with_ocs_fake()
-    await backend.ensure_ro_reader(user_key="abc")
-    reader_id = await backend.ensure_ro_reader(user_key="abc")  # tolerates OCS 102
-    assert reader_id == "srw-reader-abc"
+    plan = _plan()
+    grant = await backend.grant_protected_reader_attempt(
+        plan,
+        credentials="final-password-A",
+        dispatch_effect=_effect_dispatcher(backend),
+    )
 
-
-@pytest.mark.asyncio
-async def test_mint_grant_gives_reader_read_only_on_folder():
-    backend, fake = _backend_with_ocs_fake()
-    await backend.ensure_ro_reader(user_key="abc")
-    grant = await backend.mint_ro_grant(_handle(), user_key="abc", grant_key="thread-1")
-    group = _json(grant.grant_handle)["group_id"]
-    assert fake.folder_group_perms[FOLDER_ID][group] == 1  # read-only, not 31
-    assert group in fake.users["srw-reader-abc"]["groups"]
-    assert grant.credentials  # a rotated app-password was issued
-    assert grant.auth_kind == "basic"
-    assert grant.reader_id == "srw-reader-abc"
+    assert grant.reader_id == plan.reader_id
+    assert grant.grant_handle == plan.grant_handle
+    assert grant.credentials == "final-password-A"
+    assert fake.users[plan.reader_id]["password"] == "final-password-A"
+    assert fake.users[plan.reader_id]["groups"] == [plan.group_id]
+    assert fake.folder_group_perms[FOLDER_ID][plan.group_id] == 1
     assert quote(MOUNTPOINT, safe="") in grant.webdav_url
+    assert all(request.method != "PUT" for request in fake.requests)
 
 
 @pytest.mark.asyncio
-async def test_revoke_grant_removes_folder_access_but_keeps_account():
+async def test_same_attempt_retry_is_idempotent_without_password_rotation():
     backend, fake = _backend_with_ocs_fake()
-    await backend.ensure_ro_reader(user_key="abc")
-    grant = await backend.mint_ro_grant(_handle(), user_key="abc", grant_key="thread-1")
-    await backend.revoke_ro_grant(grant.grant_handle, user_key="abc")
-    group = _json(grant.grant_handle)["group_id"]
-    assert group not in fake.folder_group_perms.get(FOLDER_ID, {})
-    assert "srw-reader-abc" in fake.users  # account survives
+    plan = _plan()
+    for _ in range(2):
+        grant = await backend.grant_protected_reader_attempt(
+            plan,
+            credentials="final-password-A",
+            dispatch_effect=_effect_dispatcher(backend),
+        )
+
+    assert grant.reader_id == plan.reader_id
+    assert fake.users[plan.reader_id]["password"] == "final-password-A"
+    assert fake.users[plan.reader_id]["groups"].count(plan.group_id) >= 1
+    assert all(request.method != "PUT" for request in fake.requests)
+
+
+@pytest.mark.asyncio
+async def test_two_same_user_threads_have_disjoint_reader_and_group_authority():
+    backend, fake = _backend_with_ocs_fake()
+    plan_a = _plan(attempt="11111111-1111-4111-8111-111111111111")
+    plan_b = _plan(
+        attempt="22222222-2222-4222-8222-222222222222",
+        folder_id="8",
+        mountpoint="Other Project",
+    )
+    await backend.grant_protected_reader_attempt(
+        plan_a,
+        credentials="password-A",
+        dispatch_effect=_effect_dispatcher(backend),
+    )
+    await backend.grant_protected_reader_attempt(
+        plan_b,
+        credentials="password-B",
+        dispatch_effect=_effect_dispatcher(backend),
+    )
+
+    assert plan_a.reader_id != plan_b.reader_id
+    assert plan_a.group_id != plan_b.group_id
+    assert fake.users[plan_a.reader_id] == {
+        "groups": [plan_a.group_id],
+        "password": "password-A",
+    }
+    assert fake.users[plan_b.reader_id] == {
+        "groups": [plan_b.group_id],
+        "password": "password-B",
+    }
+    assert fake.folder_group_perms[plan_a.folder_id] == {plan_a.group_id: 1}
+    assert fake.folder_group_perms[plan_b.folder_id] == {plan_b.group_id: 1}
+
+
+@pytest.mark.asyncio
+async def test_revoke_attempt_deletes_group_and_reader_without_touching_peer():
+    backend, fake = _backend_with_ocs_fake()
+    plan_a = _plan(attempt="11111111-1111-4111-8111-111111111111")
+    plan_b = _plan(
+        attempt="22222222-2222-4222-8222-222222222222",
+        folder_id="8",
+        mountpoint="Other Project",
+    )
+    for plan, password in ((plan_a, "password-A"), (plan_b, "password-B")):
+        await backend.grant_protected_reader_attempt(
+            plan,
+            credentials=password,
+            dispatch_effect=_effect_dispatcher(backend),
+        )
+
+    await backend.revoke_protected_reader_attempt(plan_a)
+
+    assert plan_a.group_id not in fake.groups
+    assert plan_a.reader_id not in fake.users
+    assert plan_b.group_id in fake.groups
+    assert fake.users[plan_b.reader_id]["password"] == "password-B"
+    assert fake.folder_group_perms[plan_b.folder_id] == {plan_b.group_id: 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(
+            200,
+            json={
+                "ocs": {
+                    "meta": {
+                        "status": "failure",
+                        "statuscode": 997,
+                        "message": "logical delete failure",
+                    }
+                }
+            },
+        ),
+        httpx.Response(200, json={"unexpected": "shape"}),
+        httpx.Response(200, json=[]),
+        httpx.Response(
+            200,
+            json={"ocs": {"meta": {"status": "ok", "statuscode": "100"}}},
+        ),
+        httpx.Response(
+            200,
+            json={"ocs": {"meta": {"status": "ok", "statuscode": True}}},
+        ),
+    ],
+)
+async def test_revoke_does_not_treat_http_200_ocs_failure_as_deleted(
+    response: httpx.Response,
+) -> None:
+    backend, fake = _backend_with_ocs_fake()
+    plan = _plan()
+    await backend.grant_protected_reader_attempt(
+        plan,
+        credentials="final-password-A",
+        dispatch_effect=_effect_dispatcher(backend),
+    )
+    fake.delete_group_response = response
+
+    with pytest.raises(CloudBackendError, match="delete RO grant group"):
+        await backend.revoke_protected_reader_attempt(plan)
+
+    assert plan.group_id in fake.groups
+    assert plan.group_id in fake.folder_group_perms[FOLDER_ID]
+    assert plan.reader_id in fake.users
 
 
 @pytest.mark.asyncio

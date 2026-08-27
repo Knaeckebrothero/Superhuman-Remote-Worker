@@ -73,6 +73,14 @@ DELIVERABLE_MIGRATION_FILE = (
     / "app"
     / "0182_deliverable_contract_authority.sql"
 )
+RUNTIME_AUTHORITY_MIGRATION_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "orchestrator"
+    / "database"
+    / "migrations"
+    / "app"
+    / "0185_thread_runtime_generation_retirement.sql"
+)
 
 DECOMMISSION_STEPS = (
     "post_locked",
@@ -111,6 +119,7 @@ async def _schema_applied(pg_dsn):
     conn = await asyncpg.connect(pg_dsn)
     try:
         await conn.execute(SCHEMA_FILE.read_text())
+        await conn.execute(RUNTIME_AUTHORITY_MIGRATION_FILE.read_text())
     finally:
         await conn.close()
 
@@ -1538,23 +1547,33 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
     assert len(assigned) == 1
 
     agent_id = uuid4()
-    runtime_generation = uuid4()
+    attach_token = uuid4()
     async with db.acquire() as conn:
         await conn.execute(
             "INSERT INTO agents "
-            "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,thread_id) "
+            "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode) "
             "VALUES ($1,'centurion',$2,'127.0.0.1','bp10-pod','session',"
-            "'persistent',$3)",
+            "'persistent')",
             agent_id,
             f"persistent-{seed['thread_id'][:12]}",
-            UUID(seed["thread_id"]),
-        )
-        await conn.execute(
-            "UPDATE threads SET agent_id=$2 WHERE id=$1",
-            UUID(seed["thread_id"]),
-            agent_id,
         )
         async with conn.transaction():
+            runtime_generation = await conn.fetchval(
+                "SELECT runtime_generation FROM threads WHERE id=$1 FOR UPDATE",
+                UUID(seed["thread_id"]),
+            )
+            await conn.execute(
+                "UPDATE threads SET agent_id=$2, control_admission_agent_id=$2, "
+                "runtime_attach_token=$3 WHERE id=$1",
+                UUID(seed["thread_id"]),
+                agent_id,
+                attach_token,
+            )
+            await conn.execute(
+                "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                agent_id,
+                UUID(seed["thread_id"]),
+            )
             delivery = await persist_input_delivery(
                 conn,
                 thread_id=seed["thread_id"],
@@ -1566,6 +1585,7 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 agent_id=agent_id,
                 pod_uid="bp10-pod",
                 runtime_generation=runtime_generation,
+                runtime_attach_token=attach_token,
             )
             assert await mark_input_delivery_queued(
                 conn,
@@ -1573,6 +1593,7 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 agent_id=agent_id,
                 pod_uid="bp10-pod",
                 runtime_generation=runtime_generation,
+                runtime_attach_token=attach_token,
                 claim_generation=int(delivery["claim_generation"]),
             )
             assert await transition_input_delivery(
@@ -1581,6 +1602,7 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 agent_id=agent_id,
                 pod_uid="bp10-pod",
                 runtime_generation=runtime_generation,
+                runtime_attach_token=attach_token,
                 claim_generation=int(delivery["claim_generation"]),
                 transition="admitted",
                 turn_number=1,
@@ -3751,6 +3773,99 @@ async def test_decommission_fault_after_each_substep_rolls_back(db, fault_step):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fault_step", DECOMMISSION_STEPS)
+async def test_retirement_authorization_and_officer_mutations_rollback_together(
+    db, fault_step
+):
+    """No crash point leaves a mutated Post behind a hidden preflight."""
+    seed = await _seed_post(
+        db,
+        post_state={"standing": "before"},
+        officer_state={"digest": [{"subject": "harvest me"}]},
+    )
+    await _seed_decommission_debris(db, seed)
+    retirement = await db.begin_pinned_thread_retirement(
+        seed["thread_id"], permanent=False, settle_status="ended"
+    )
+
+    def inject(step):
+        if step == fault_step:
+            raise RuntimeError(f"retirement fault after {step}")
+
+    with pytest.raises(RuntimeError, match=f"retirement fault after {fault_step}"):
+        await db.decommission_project_officer(
+            seed["project_id"],
+            seed["thread_id"],
+            reason="retirement rollback proof",
+            retirement_token=retirement["token"],
+            retirement_generation=retirement["generation"],
+            retirement_settle_status="ended",
+            fault_injector=inject,
+        )
+
+    async with db.acquire() as conn:
+        post = await conn.fetchrow(
+            "SELECT thread_id,state,incarnations FROM project_officers "
+            "WHERE project_id=$1",
+            UUID(seed["project_id"]),
+        )
+        thread = await conn.fetchrow(
+            "SELECT metadata,runtime_retirement_token,"
+            "runtime_retirement_authorized_at FROM threads WHERE id=$1",
+            UUID(seed["thread_id"]),
+        )
+    assert str(post["thread_id"]) == seed["thread_id"]
+    assert _json(post["state"]) == {"standing": "before"}
+    assert _json(post["incarnations"]) == []
+    assert _json(thread["metadata"])["config_override"]["officer"]["enabled"]
+    assert str(thread["runtime_retirement_token"]) == retirement["token"]
+    assert thread["runtime_retirement_authorized_at"] is None
+    assert await db.abort_pinned_thread_retirement(
+        seed["thread_id"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_force_officer_refusal_keeps_preflight_hidden_and_abortable(db):
+    seed = await _seed_post(db)
+    await _seed_officer_job(
+        db,
+        seed,
+        thread_id=seed["thread_id"],
+        status="processing",
+        label="in-flight refusal proof",
+    )
+    retirement = await db.begin_pinned_thread_retirement(
+        seed["thread_id"], permanent=False, settle_status="ended"
+    )
+
+    result = await db.decommission_project_officer(
+        seed["project_id"],
+        seed["thread_id"],
+        reason="no-force refusal",
+        force=False,
+        retirement_token=retirement["token"],
+        retirement_generation=retirement["generation"],
+        retirement_settle_status="ended",
+    )
+    assert result["blocked_by_in_flight"] is True
+    current = await db.get_thread(seed["thread_id"])
+    assert current["runtime_retirement_authorized_at"] is None
+    assert _json(current["metadata"])["config_override"]["officer"]["enabled"]
+    assert (
+        str((await db.get_project_officer(seed["project_id"]))["thread_id"])
+        == seed["thread_id"]
+    )
+    assert await db.abort_pinned_thread_retirement(
+        seed["thread_id"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+    )
+
+
+@pytest.mark.asyncio
 async def test_repeated_decommission_is_idempotent_and_stages_one_fallback(db):
     seed = await _seed_post(
         db,
@@ -3805,7 +3920,9 @@ async def test_repeated_decommission_is_idempotent_and_stages_one_fallback(db):
     # The lifecycle transaction created durable outbox intent only. No
     # notification provider ran inside it, so acceptance remains unstamped.
     assert route["user_delivery_at"] is None
-    assert thread["status"] == "ended"
+    # The post handoff disables Officer mode; exact retirement settlement is
+    # the sole owner of the later terminal lifecycle edge.
+    assert thread["status"] == "active"
     assert not _json(thread["metadata"])["config_override"]["officer"]["enabled"]
 
 
@@ -3862,7 +3979,7 @@ async def test_direct_end_of_orphan_does_not_touch_occupied_post_debris(db):
     assert _json(post["incarnations"]) == []
     assert current["status"] == "active"
     assert _json(current["metadata"])["config_override"]["officer"]["enabled"]
-    assert ended_orphan["status"] == "ended"
+    assert ended_orphan["status"] == "active"
     assert not _json(ended_orphan["metadata"])["config_override"]["officer"]["enabled"]
     assert wake_count == 3
     assert route["state"] == "pending_officer"
@@ -3922,7 +4039,7 @@ async def test_orphan_end_wins_vacant_post_race_and_registration_loses(db):
     assert post["thread_id"] is None
     assert len(post["incarnations"]) == 1
     assert post["incarnations"][0]["thread_id"] == seed["thread_id"]
-    assert thread["status"] == "ended"
+    assert thread["status"] == "active"
     assert wake_count == 1
 
 
@@ -3986,7 +4103,7 @@ async def test_commission_continuity_racing_decommission_is_preserved_and_truthf
     assert post["thread_id"] is None
     assert post["state"]["while_vacant"] == [continuity_entry]
     assert post["state"]["sitrep_fingerprints"] == {"old-job": "fp"}
-    assert thread["status"] == "ended"
+    assert thread["status"] == "active"
     assert wake_count == 0
 
 

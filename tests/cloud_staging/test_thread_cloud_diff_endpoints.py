@@ -32,9 +32,30 @@ import pytest
 from fastapi import HTTPException
 
 import main
+from services.cloud.protected_reader_authority import (
+    ProtectedNextcloudReaderGrantPlan,
+)
+from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
 from tests.cloud.fake import FakeMainCloudBackend
 
 THREAD_ID = "thread-cd-1"
+_RUNTIME_GENERATION = "44444444-4444-4444-8444-444444444444"
+_AGENT_ID = "55555555-5555-4555-8555-555555555555"
+_ATTACH_TOKEN = "66666666-6666-4666-8666-666666666666"
+_WORKSPACE_GENERATION = "77777777-7777-4777-8777-777777777777"
+_WORKSPACE_RUNTIME = "88888888-8888-4888-8888-888888888888"
+_SOURCE = ProtectedMountSourceIdentity(
+    backend_instance_id="11111111-1111-4111-8111-111111111111",
+    source_ref="22222222-2222-4222-8222-222222222222",
+    target_path="MyProject",
+    native_id="1",
+    mountpoint="MyProject",
+)
+_PLAN = ProtectedNextcloudReaderGrantPlan(
+    engage_attempt="33333333-3333-4333-8333-333333333333",
+    backend_instance_id=_SOURCE.backend_instance_id,
+    source=_SOURCE,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -54,9 +75,32 @@ def _make_thread(
 ) -> dict:
     metadata = {"protected_cloud": protected}
     if workspace:
-        metadata["workspace_container"] = {"pod_ip": "10.0.0.5", "port": 30022}
+        metadata["workspace_container"] = {
+            "status": "ready",
+            "pod_ip": "10.0.0.5",
+            "port": 30022,
+            "_canvas_workspace_generation": _WORKSPACE_GENERATION,
+            "_runtime_incarnation": _WORKSPACE_RUNTIME,
+        }
+        metadata["_workspace_binding"] = {
+            "generation": _WORKSPACE_GENERATION,
+            "kind": "remote",
+            "ssh_host_key_fingerprint": "SHA256:trusted",
+        }
     metadata.update(meta_over)
-    return {"id": THREAD_ID, "user_id": _make_user()["id"], "metadata": metadata}
+    return {
+        "id": THREAD_ID,
+        "user_id": _make_user()["id"],
+        "status": "active",
+        "execution_lane": "pinned",
+        "runtime_generation": _RUNTIME_GENERATION,
+        "runtime_retirement_token": None,
+        "runtime_retirement_authorized_at": None,
+        "runtime_authority_exposed": True,
+        "agent_id": _AGENT_ID,
+        "runtime_attach_token": _ATTACH_TOKEN,
+        "metadata": metadata,
+    }
 
 
 def _build_tar(members: list[tuple[str, bytes]]) -> bytes:
@@ -83,14 +127,32 @@ def _manifest(
         "entries": entries,
         "skipped": [],
         "tar_sha256": hashlib.sha256(tar_bytes).hexdigest(),
+        "source_binding": _SOURCE.binding,
+        "source_binding_sha256": _SOURCE.sha256,
     }
 
 
-def _mount_row(*, staged_summary=None, status="active", backend="fake") -> dict:
+def _mount_row(*, staged_summary=None, status="active", backend="nextcloud") -> dict:
+    if isinstance(staged_summary, dict):
+        staged_summary = dict(staged_summary)
+        staged_summary.setdefault("source_binding", _SOURCE.binding)
+        staged_summary.setdefault("source_binding_sha256", _SOURCE.sha256)
     return {
         "id": "mount-1",
+        "thread_id": THREAD_ID,
+        "user_id": _make_user()["id"],
         "status": status,
         "backend": backend,
+        "backend_instance_id": _SOURCE.backend_instance_id,
+        "reader_id": _PLAN.reader_id,
+        "grant_group_id": _PLAN.group_id,
+        "grant_handle": _PLAN.grant_handle,
+        "grant_handle_sha256": _PLAN.grant_handle_sha256,
+        "runtime_generation": _RUNTIME_GENERATION,
+        "engage_attempt": _PLAN.engage_attempt,
+        "selected_mount_id": "55555555-5555-4555-8555-555555555555",
+        "source_binding": _SOURCE.binding,
+        "source_binding_sha256": _SOURCE.sha256,
         "staged_summary": staged_summary,
     }
 
@@ -120,7 +182,7 @@ def _snapshot_service(blobs: dict[str, bytes] | None = None):
 
 def _cloud_router(backend):
     router = MagicMock()
-    router.for_backend = MagicMock(return_value=backend)
+    router.for_backend_instance = MagicMock(return_value=backend)
     return router
 
 
@@ -194,7 +256,11 @@ class TestCloudDiffSummary:
             user=user,
             thread=thread,
             ro_mount_row=row,
-            thread_mounts=[_thread_mounts_row()],
+            # The mutable current selection is B. Review must retain A's
+            # immutable source label from the staged authority.
+            thread_mounts=[
+                _thread_mounts_row(mountpoint="ReplacementB", cloud_handle="99")
+            ],
             snapshot_service=svc,
         )
         with stack:
@@ -313,7 +379,7 @@ class TestCloudDiffFile:
             }
         )
         backend = FakeMainCloudBackend()
-        backend.seed_project_file("proj-1", "mod.txt", b"oldv")
+        backend.seed_project_file(_SOURCE.native_id, "mod.txt", b"oldv")
         stack, _db = _patch_endpoint(
             user=user,
             thread=thread,
@@ -425,7 +491,12 @@ class TestCloudDiffRestage:
     async def test_restage_schedules_stage(self, fake_request):
         user = _make_user()
         thread = _make_thread(workspace=True)
-        stack, _db = _patch_endpoint(user=user, thread=thread)
+        row = _mount_row(staged_summary=None)
+        stack, _db = _patch_endpoint(
+            user=user,
+            thread=thread,
+            ro_mount_row=row,
+        )
         stage_mock = AsyncMock(return_value={"epoch": 1, "counts": {}})
         main._cloud_stage_tasks.clear()
         with (
@@ -434,18 +505,18 @@ class TestCloudDiffRestage:
         ):
             result = await main.restage_thread_cloud_diff(THREAD_ID, fake_request)
             assert result == {"scheduled": True}
-            assert THREAD_ID in main._cloud_stage_tasks
-            task = main._cloud_stage_tasks[THREAD_ID]
+            assert len(main._cloud_stage_tasks) == 1
+            task = next(iter(main._cloud_stage_tasks.values()))
             await task
 
             # Assert inside the patch context: main.postgres_db/snapshot_service
             # are only the patched fakes while ``stack`` is still active.
-            stage_mock.assert_awaited_once_with(
-                thread_id=THREAD_ID,
-                postgres_db=main.postgres_db,
-                snapshot_service=main.snapshot_service,
-            )
-        assert THREAD_ID not in main._cloud_stage_tasks
+            call = stage_mock.await_args
+            assert call.kwargs["thread_id"] == THREAD_ID
+            assert call.kwargs["postgres_db"] is main.postgres_db
+            assert call.kwargs["snapshot_service"] is main.snapshot_service
+            assert call.kwargs["authority"]["source_binding_sha256"] == _SOURCE.sha256
+        assert not main._cloud_stage_tasks
 
     @pytest.mark.asyncio
     async def test_restage_409_without_workspace(self, fake_request):

@@ -32,6 +32,7 @@ class ControlRequest:
     verb: str
     payload: dict[str, Any]
     accepted_agent_id: UUID | None
+    runtime_generation: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +45,7 @@ class ControlReceipt:
 
 _NEXT_STATELESS_SQL = """
 SELECT r.id, r.thread_id, r.request_seq, r.client_request_id, r.verb,
-       r.payload, r.accepted_agent_id
+       r.payload, r.accepted_agent_id, r.runtime_generation
 FROM thread_control_requests r
 JOIN threads t ON t.id = r.thread_id
 JOIN run_queue q ON q.unit_id = r.thread_id
@@ -69,7 +70,7 @@ WITH oldest AS MATERIALIZED (
     LIMIT 1
 )
 SELECT r.id, r.thread_id, r.request_seq, r.client_request_id, r.verb,
-       r.payload, r.accepted_agent_id
+       r.payload, r.accepted_agent_id, r.runtime_generation
 FROM oldest r
 JOIN threads t ON t.id = r.thread_id
 JOIN agents a ON a.id = t.agent_id AND a.thread_id = t.id
@@ -83,6 +84,10 @@ WHERE (
       )
   AND t.execution_lane = 'pinned'
   AND t.agent_id = $2::uuid
+  AND t.runtime_generation = $3::uuid
+  AND t.runtime_attach_token IS NOT DISTINCT FROM $4::uuid
+  AND t.runtime_retirement_token IS NULL
+  AND r.runtime_generation = $3::uuid
 """
 
 _ADOPT_PINNED_SQL = """
@@ -91,6 +96,7 @@ WITH oldest AS MATERIALIZED (
     FROM thread_control_requests request
     WHERE request.thread_id = $1::uuid
       AND request.outcome IS NULL
+      AND request.runtime_generation = $3::uuid
     ORDER BY request.request_seq
     LIMIT 1
     FOR UPDATE
@@ -110,6 +116,9 @@ WHERE request.id = oldest.id
   AND thread.id = request.thread_id
   AND thread.execution_lane = 'pinned'
   AND thread.agent_id = $2::uuid
+  AND thread.runtime_generation = $3::uuid
+  AND thread.runtime_attach_token IS NOT DISTINCT FROM $4::uuid
+  AND thread.runtime_retirement_token IS NULL
   AND agent.id = thread.agent_id
   AND agent.thread_id = thread.id
 RETURNING request.id
@@ -134,6 +143,9 @@ JOIN agents a ON a.id = t.agent_id AND a.thread_id = t.id
 WHERE t.id = $1::uuid
   AND t.execution_lane = 'pinned'
   AND t.agent_id = $2::uuid
+  AND t.runtime_generation = $3::uuid
+  AND t.runtime_attach_token IS NOT DISTINCT FROM $4::uuid
+  AND t.runtime_retirement_token IS NULL
 FOR SHARE OF t, a
 """
 
@@ -171,6 +183,7 @@ def _request(row: Any) -> ControlRequest | None:
         verb=str(row["verb"]),
         payload=_json_object(row["payload"]),
         accepted_agent_id=row["accepted_agent_id"],
+        runtime_generation=row["runtime_generation"],
     )
 
 
@@ -307,6 +320,8 @@ async def fetch_next_control_request(
     thread_id: UUID | str,
     lease_token: int | None = None,
     agent_id: UUID | str | None = None,
+    runtime_generation: UUID | str | None = None,
+    runtime_attach_token: UUID | str | None = None,
 ) -> ControlRequest | None:
     """Return the oldest pending request iff ``conn`` observes exact ownership.
 
@@ -322,12 +337,25 @@ async def fetch_next_control_request(
             _NEXT_STATELESS_SQL, _uuid(thread_id), int(lease_token)
         )
     else:
-        row = await conn.fetchrow(_NEXT_PINNED_SQL, _uuid(thread_id), _uuid(agent_id))
+        if runtime_generation is None:
+            return None
+        row = await conn.fetchrow(
+            _NEXT_PINNED_SQL,
+            _uuid(thread_id),
+            _uuid(agent_id),
+            _uuid(runtime_generation),
+            _uuid(runtime_attach_token) if runtime_attach_token is not None else None,
+        )
     return _request(row)
 
 
 async def adopt_next_pinned_control_request(
-    conn: Any, *, thread_id: UUID | str, agent_id: UUID | str
+    conn: Any,
+    *,
+    thread_id: UUID | str,
+    agent_id: UUID | str,
+    runtime_generation: UUID | str,
+    runtime_attach_token: UUID | str | None = None,
 ) -> bool:
     """Transfer the oldest unreceipted request to the exact current owner.
 
@@ -339,7 +367,13 @@ async def adopt_next_pinned_control_request(
     recovered by the successor instead.
     """
 
-    adopted = await conn.fetchval(_ADOPT_PINNED_SQL, _uuid(thread_id), _uuid(agent_id))
+    adopted = await conn.fetchval(
+        _ADOPT_PINNED_SQL,
+        _uuid(thread_id),
+        _uuid(agent_id),
+        _uuid(runtime_generation),
+        _uuid(runtime_attach_token) if runtime_attach_token is not None else None,
+    )
     return adopted is not None
 
 
@@ -349,6 +383,8 @@ async def owner_fence_current(
     thread_id: UUID | str,
     lease_token: int | None = None,
     agent_id: UUID | str | None = None,
+    runtime_generation: UUID | str | None = None,
+    runtime_attach_token: UUID | str | None = None,
 ) -> bool:
     """Check the exact current owner, taking a transaction-scoped share lock."""
     if (lease_token is None) == (agent_id is None):
@@ -358,7 +394,15 @@ async def owner_fence_current(
             _STATELESS_FENCE_SQL, _uuid(thread_id), int(lease_token)
         )
     else:
-        row = await conn.fetchrow(_PINNED_FENCE_SQL, _uuid(thread_id), _uuid(agent_id))
+        if runtime_generation is None:
+            return False
+        row = await conn.fetchrow(
+            _PINNED_FENCE_SQL,
+            _uuid(thread_id),
+            _uuid(agent_id),
+            _uuid(runtime_generation),
+            _uuid(runtime_attach_token) if runtime_attach_token is not None else None,
+        )
     return row is not None
 
 
@@ -383,6 +427,8 @@ async def finalize_control_request(
     request_id: UUID | str,
     lease_token: int | None = None,
     agent_id: UUID | str | None = None,
+    runtime_generation: UUID | str | None = None,
+    runtime_attach_token: UUID | str | None = None,
     outcome: str = "applied",
     error_code: str | None = None,
 ) -> str:
@@ -421,8 +467,16 @@ async def finalize_control_request(
         else:
             if row["accepted_agent_id"] is None:
                 return "lost_owner"
+            if runtime_generation is None or str(
+                row["runtime_generation"] or ""
+            ) != str(_uuid(runtime_generation)):
+                return "lost_owner"
             fenced = await owner_fence_current(
-                conn, thread_id=thread_id, agent_id=_uuid(agent_id)
+                conn,
+                thread_id=thread_id,
+                agent_id=_uuid(agent_id),
+                runtime_generation=runtime_generation,
+                runtime_attach_token=runtime_attach_token,
             )
         return "already_terminal" if fenced else "lost_owner"
 
@@ -470,9 +524,19 @@ async def finalize_control_request(
     else:
         aid = _uuid(agent_id)
         accepted_agent_id = row["accepted_agent_id"]
-        if accepted_agent_id is None:
+        if (
+            accepted_agent_id is None
+            or runtime_generation is None
+            or str(row["runtime_generation"] or "") != str(_uuid(runtime_generation))
+        ):
             return "lost_owner"
-        fenced = await owner_fence_current(conn, thread_id=thread_id, agent_id=aid)
+        fenced = await owner_fence_current(
+            conn,
+            thread_id=thread_id,
+            agent_id=aid,
+            runtime_generation=runtime_generation,
+            runtime_attach_token=runtime_attach_token,
+        )
         if not fenced:
             return "lost_owner"
         older_pending = await conn.fetchval(

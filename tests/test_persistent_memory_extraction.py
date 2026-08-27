@@ -517,6 +517,11 @@ class TestTeardownExtraction:
         with (
             patch("src.api.persistent_app._session", session),
             patch("src.api.persistent_app._thread_id", "tid"),
+            patch(
+                "src.api.persistent_app._update_thread_status",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("src.api.persistent_app._terminate_session", AsyncMock()),
             patch("src.services.auxiliary.extract_and_store_memories", extraction),
         ):
             await _handle_archive(ws)
@@ -534,7 +539,11 @@ class TestTeardownExtraction:
             patch("src.api.persistent_app._session", session),
             patch("src.api.persistent_app._thread_id", "tid"),
             patch("src.api.persistent_app._broadcast"),
-            patch("src.api.persistent_app._update_thread_status", AsyncMock()),
+            patch(
+                "src.api.persistent_app._update_thread_status",
+                AsyncMock(return_value=True),
+            ),
+            patch("src.api.persistent_app._terminate_session", AsyncMock()),
             patch("src.services.auxiliary.extract_and_store_memories", extraction),
         ):
             await _handle_idle_archive()

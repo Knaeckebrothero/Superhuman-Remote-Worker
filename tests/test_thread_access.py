@@ -26,6 +26,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from src.shared.pinned_session_identity import PinnedSessionBinding
+
 
 FORWARD_THREAD_ID = "11111111-1111-4111-8111-111111111111"
 FORWARD_RUNTIME_ID = "22222222-2222-4222-8222-222222222222"
@@ -66,6 +68,9 @@ def _forwarding_stateless_thread(*, ready: bool) -> dict:
         "user_id": "user-1",
         "agent_id": "agent-1",
         "execution_lane": "stateless",
+        "status": "active",
+        "runtime_generation": "55555555-5555-4555-8555-555555555555",
+        "runtime_retirement_token": None,
         "metadata": metadata,
     }
 
@@ -126,7 +131,51 @@ class TestRequireThreadOwner:
 
 class TestForwardingWorkspaceAuthority:
     @pytest.mark.asyncio
-    async def test_direct_stateless_forwarding_finishes_nonce_lifecycle(self):
+    async def test_pinned_forwarding_uses_one_joined_binding_snapshot(self):
+        import orchestrator.main as main
+
+        thread = _forwarding_stateless_thread(ready=True)
+        thread["execution_lane"] = "pinned"
+        binding = PinnedSessionBinding(
+            thread_id=FORWARD_THREAD_ID,
+            runtime_generation=thread["runtime_generation"],
+            agent_id="66666666-6666-4666-8666-666666666666",
+            runtime_attach_token="77777777-7777-4777-8777-777777777777",
+            agent_hostname="persistent-111111111111",
+            pod_uid="pod-uid-1",
+            pod_ip="10.42.0.8",
+            pod_port=8001,
+            agent_status="session",
+        )
+        joined = AsyncMock(return_value=binding)
+        db = SimpleNamespace(
+            get_thread=AsyncMock(return_value=thread),
+            get_pinned_session_binding=joined,
+        )
+        suspension = SimpleNamespace(
+            is_enabled=True,
+            restore_thread_workspace=AsyncMock(),
+        )
+
+        with (
+            patch.object(main, "postgres_db", db),
+            patch.object(main, "workspace_suspension_service", suspension),
+        ):
+            resolved, selected = await main._resolve_thread_for_forwarding(
+                FORWARD_THREAD_ID,
+                {"id": "user-1", "is_admin": False},
+            )
+
+        assert resolved is thread
+        assert selected is binding
+        joined.assert_awaited_once_with(
+            FORWARD_THREAD_ID,
+            expected_runtime_generation=thread["runtime_generation"],
+        )
+        suspension.restore_thread_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_direct_stateless_forwarding_is_refused_before_reconciliation(self):
         import orchestrator.main as main
 
         in_progress = _forwarding_stateless_thread(ready=False)
@@ -148,18 +197,13 @@ class TestForwardingWorkspaceAuthority:
             patch.object(main, "container_provisioner", provisioner),
             patch.object(main, "workspace_suspension_service", suspension),
         ):
-            resolved, agent = await main._resolve_thread_for_forwarding(
-                FORWARD_THREAD_ID, {"id": "user-1", "is_admin": False}
-            )
+            with pytest.raises(HTTPException) as exc:
+                await main._resolve_thread_for_forwarding(
+                    FORWARD_THREAD_ID, {"id": "user-1", "is_admin": False}
+                )
 
-        assert resolved is ready
-        assert agent["id"] == "agent-1"
-        ensure.assert_awaited_once_with(
-            FORWARD_THREAD_ID,
-            db=db,
-            provisioner=provisioner,
-            suspension=suspension,
-        )
+        assert exc.value.status_code == 409
+        ensure.assert_not_awaited()
         suspension.restore_thread_workspace.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -196,7 +240,7 @@ class TestForwardingWorkspaceAuthority:
         suspension.restore_thread_workspace.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_stateless_suspended_forwarding_never_uses_legacy_restore(self):
+    async def test_stateless_suspended_forwarding_refuses_legacy_restore(self):
         import orchestrator.main as main
 
         suspended = _forwarding_stateless_thread(ready=False)
@@ -220,11 +264,13 @@ class TestForwardingWorkspaceAuthority:
             patch.object(main, "container_provisioner", SimpleNamespace()),
             patch.object(main, "workspace_suspension_service", suspension),
         ):
-            await main._resolve_thread_for_forwarding(
-                FORWARD_THREAD_ID,
-                {"id": "user-1", "is_admin": False},
-            )
+            with pytest.raises(HTTPException) as exc:
+                await main._resolve_thread_for_forwarding(
+                    FORWARD_THREAD_ID,
+                    {"id": "user-1", "is_admin": False},
+                )
 
+        assert exc.value.status_code == 409
         suspension.restore_thread_workspace.assert_not_awaited()
 
     @pytest.mark.asyncio

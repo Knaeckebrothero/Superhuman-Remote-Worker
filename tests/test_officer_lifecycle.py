@@ -50,6 +50,8 @@ SCHEMA_FILE = REPO_ROOT / "orchestrator" / "database" / "schema_current.sql"
 
 PROJECT_ID = str(uuid4())
 THREAD_ID = str(uuid4())
+RETIREMENT_GENERATION = str(uuid4())
+RETIREMENT_TOKEN = str(uuid4())
 
 
 # =========================================================================
@@ -378,6 +380,8 @@ def _officer_thread(**over):
         "status": "active",
         "project_id": PROJECT_ID,
         "agent_id": None,
+        "runtime_generation": RETIREMENT_GENERATION,
+        "runtime_retirement_token": None,
         "metadata": {"config_override": {"officer": {"enabled": True}}},
     }
     t.update(over)
@@ -1313,6 +1317,41 @@ class TestDecommissionHygieneHelper:
 
 
 class TestEndThreadReroute:
+    @pytest.fixture(autouse=True)
+    def exact_retirement(self, db, monkeypatch):
+        async def begin_retirement(*_args, permanent, settle_status, **_kwargs):
+            return {
+                "state": "pending",
+                "token": RETIREMENT_TOKEN,
+                "generation": RETIREMENT_GENERATION,
+                "permanent": permanent,
+                "authorized_at": None,
+                "context": {
+                    "thread_id": THREAD_ID,
+                    "settle_status": settle_status,
+                    "runtime_authority_exposed": False,
+                },
+            }
+
+        lock = AsyncMock()
+        lock.__aenter__.return_value = True
+        lock.__aexit__.return_value = False
+        db.begin_pinned_thread_retirement = AsyncMock(side_effect=begin_retirement)
+        db.abort_pinned_thread_retirement = AsyncMock(return_value=True)
+        db.authorize_pinned_thread_retirement = AsyncMock(return_value=True)
+        db.settle_pinned_thread_retirement = AsyncMock(return_value=True)
+        db.try_thread_advisory_lock = MagicMock(return_value=lock)
+        monkeypatch.setattr(
+            orch_main,
+            "_pinned_retirement_is_current",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            orch_main,
+            "_cleanup_pinned_thread_retirement",
+            AsyncMock(),
+        )
+
     @pytest.mark.asyncio
     async def test_direct_delete_on_an_officer_routes_through_decommission(
         self, db, monkeypatch
@@ -1341,6 +1380,7 @@ class TestEndThreadReroute:
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
         thread["metadata"]["officer_state"] = {"pages": {"count": 1}}
+        db.get_thread = AsyncMock(return_value=thread)
 
         out = await orch_main._end_thread_flow(
             THREAD_ID, thread, permanent=False, force=False
@@ -1355,13 +1395,23 @@ class TestEndThreadReroute:
             reason="retired",
             force=False,
             allow_orphan_retirement=True,
+            retirement_token=RETIREMENT_TOKEN,
+            retirement_generation=RETIREMENT_GENERATION,
+            retirement_settle_status="ended",
         )
         db.merge_thread_config_override.assert_not_awaited()
         db.merge_project_officer_state.assert_not_awaited()
         db.fold_project_officer_wake_queue.assert_not_awaited()
         db.clear_project_officer_thread.assert_not_awaited()
         db.append_project_officer_incarnation.assert_not_awaited()
-        db.end_thread.assert_awaited_once_with(THREAD_ID)
+        db.end_thread.assert_not_awaited()
+        db.settle_pinned_thread_retirement.assert_awaited_once_with(
+            THREAD_ID,
+            token=RETIREMENT_TOKEN,
+            generation=RETIREMENT_GENERATION,
+            final_status="ended",
+            staged_event=None,
+        )
 
     @pytest.mark.asyncio
     async def test_authoritative_handoff_failure_blocks_the_end(self, db, monkeypatch):
@@ -1377,11 +1427,13 @@ class TestEndThreadReroute:
         )
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
+        db.get_thread = AsyncMock(return_value=thread)
         with pytest.raises(RuntimeError, match="post table on fire"):
             await orch_main._end_thread_flow(
                 THREAD_ID, thread, permanent=False, force=False
             )
         db.end_thread.assert_not_awaited()
+        db.settle_pinned_thread_retirement.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_direct_end_returns_post_locked_in_flight_warning_without_cleanup(
@@ -1412,10 +1464,12 @@ class TestEndThreadReroute:
         monkeypatch.setattr(orch_main, "_release_thread_resources", release)
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", conclude)
         db.end_thread = AsyncMock()
+        thread = _officer_thread(execution_lane="pinned")
+        db.get_thread = AsyncMock(return_value=thread)
 
         out = await orch_main._end_thread_flow(
             THREAD_ID,
-            _officer_thread(execution_lane="pinned"),
+            thread,
             permanent=False,
             force=False,
         )
@@ -1428,6 +1482,9 @@ class TestEndThreadReroute:
             reason="retired",
             force=False,
             allow_orphan_retirement=True,
+            retirement_token=RETIREMENT_TOKEN,
+            retirement_generation=RETIREMENT_GENERATION,
+            retirement_settle_status="ended",
         )
         release.assert_not_awaited()
         conclude.assert_not_awaited()
@@ -1450,17 +1507,20 @@ class TestEndThreadReroute:
         monkeypatch.setattr(orch_main, "_release_thread_resources", AsyncMock())
         monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         db.end_thread = AsyncMock()
+        thread = _officer_thread(execution_lane="pinned")
+        db.get_thread = AsyncMock(return_value=thread)
 
         out = await orch_main._end_thread_flow(
             THREAD_ID,
-            _officer_thread(execution_lane="pinned"),
+            thread,
             permanent=False,
             force=False,
         )
 
         assert out == {"status": "ended"}
         db.merge_thread_config_override.assert_not_awaited()
-        db.end_thread.assert_awaited_once_with(THREAD_ID)
+        db.end_thread.assert_not_awaited()
+        db.settle_pinned_thread_retirement.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_direct_end_and_explicit_decommission_share_one_transition(
@@ -1515,11 +1575,17 @@ class TestEndThreadReroute:
             "reason": "retired",
             "force": False,
             "allow_orphan_retirement": True,
+            "retirement_token": RETIREMENT_TOKEN,
+            "retirement_generation": RETIREMENT_GENERATION,
+            "retirement_settle_status": "ended",
         }
         assert endpoint_call.kwargs == {
             "reason": "retired",
             "force": False,
             "allow_orphan_retirement": False,
+            "retirement_token": RETIREMENT_TOKEN,
+            "retirement_generation": RETIREMENT_GENERATION,
+            "retirement_settle_status": "ended",
         }
 
     @pytest.mark.asyncio
@@ -1616,8 +1682,11 @@ class TestEndThreadReroute:
             "project_id": PROJECT_ID,
             "status": "active",
             "execution_lane": "pinned",
+            "runtime_generation": RETIREMENT_GENERATION,
+            "runtime_retirement_token": None,
             "metadata": {},
         }
+        db.get_thread = AsyncMock(return_value=plain)
         await orch_main._end_thread_flow(THREAD_ID, plain, permanent=False, force=False)
         hygiene.assert_not_awaited()
         db.merge_thread_config_override.assert_not_awaited()

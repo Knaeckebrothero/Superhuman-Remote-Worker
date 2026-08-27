@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
-
 import pytest
 
 from src.services.cloud_sync.nextcloud_sync import NextcloudWorkspaceSync
@@ -42,10 +40,7 @@ class _FakeWebDavClient:
 @pytest.fixture
 def fake_client_factory(monkeypatch):
     fake = _FakeWebDavClient()
-    monkeypatch.setattr(
-        "webdav3.client.Client",
-        MagicMock(return_value=fake),
-    )
+    monkeypatch.setattr(NextcloudWorkspaceSync, "_get_client", lambda _self: fake)
     return fake
 
 

@@ -408,6 +408,12 @@ nextcloud:
   storageClass: "longhorn"
   objectStore:
     enabled: true
+  # Required by agent.protectedCloudModeEnabled below. The HMAC root lives at
+  # this dedicated Vault path (never the application Secret fanned to agents)
+  # and must not be rotated while effect intents remain.
+  protectedEffect:
+    enabled: true
+    hmacVaultPath: "homelab/superhuman-remote-worker/nextcloud-protected-effect"
 # -----------------------------------------------------------------------------
 # S3 / MinIO — workspace snapshots + IDE session blobs. Credentials
 # (S3_ACCESS_KEY / S3_SECRET_KEY) come from Vault via the srw-secrets path
