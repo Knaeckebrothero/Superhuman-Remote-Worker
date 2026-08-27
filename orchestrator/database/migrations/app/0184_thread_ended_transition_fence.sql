@@ -40,4 +40,11 @@ EXECUTE FUNCTION public.enforce_thread_ended_transition();
 COMMENT ON FUNCTION public.enforce_thread_ended_transition() IS
     'Mixed-version fence: ended stays ended or takes the resume-shaped created edge.';
 
+-- The replacement checks were installed NOT VALID by 0183 so its
+-- ACCESS EXCLUSIVE lock did not also scan the delivery ledger. Validate them
+-- now in a separate transaction before any cancellation writer is enabled.
+ALTER TABLE public.thread_input_deliveries
+    VALIDATE CONSTRAINT thread_input_deliveries_state_check,
+    VALIDATE CONSTRAINT thread_input_deliveries_cancellation_shape;
+
 COMMIT;

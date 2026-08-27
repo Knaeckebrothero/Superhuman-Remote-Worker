@@ -3,16 +3,12 @@ name: db-migrations
 # Gate for changes under orchestrator/database/migrations/** (plus the schema
 # artifacts, the runner and its import surface, and the squawk config).
 #
-# The trigger list carries database/__init__.py and database/postgres.py even
-# though neither is a migration: `python -m database.migrate` loads the package
-# __init__, which eagerly imports postgres.py, so a module-scope import there of
-# anything outside the runner's install set (asyncpg + cryptography) breaks the
-# dry-run and artifact jobs before a single statement reaches Postgres. A
-# module-scope `security.access` import — which pulls in FastAPI — did exactly
-# that on 2026-08-20. Listing the two files makes that breakage surface on the
-# commit that causes it instead of reddening the next, unrelated migration PR.
-# postgres.py is large and changes often, so this deliberately trades CI minutes
-# for the runner staying importable.
+# The trigger list carries database/__init__.py even though it is not a
+# migration: `python -m database.migrate` loads the package initializer first.
+# That initializer deliberately keeps application exports lazy so the runner
+# needs only asyncpg; changing the import boundary must exercise this workflow.
+# postgres.py remains listed because it owns the application-side schema
+# capabilities and migration invocation used during normal startup.
 #
 # Runs four jobs in parallel:
 #   1. squawk      — static lint of the migrations ADDED/MODIFIED by this push
@@ -167,9 +163,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # asyncpg drives the runner; cryptography is pulled in transitively
-      # via security.crypto (AESGCM) when database/__init__.py loads postgres.py.
-      - run: pip install --quiet asyncpg cryptography 'pydantic>=2.10' pytest pytest-asyncio
+      # asyncpg drives the standalone runner. The remaining packages support
+      # the focused Canvas lifecycle checks, which import the application DB
+      # layer and its encryption/main-cloud value objects later in this job.
+      - run: >-
+          pip install --quiet asyncpg cryptography httpx tenacity
+          'pydantic>=2.10' pytest pytest-asyncio
       - name: Create the vector database
         env:
           PGPASSWORD: ci
@@ -185,12 +184,8 @@ jobs:
       #
       # That same /app also holds the repository-root `src/` tree (the
       # Dockerfile copies it to /app/src/), so in production ONE sys.path entry
-      # resolves both roots. Here they are two directories, and
-      # database/__init__.py -> postgres.py imports `src.shared.*` at module
-      # scope, so orchestrator/ alone raises ModuleNotFoundError: No module
-      # named 'src'. Carrying the workspace in PYTHONPATH reunites the two
-      # halves of production's single root — the same reason
-      # scripts/schema-snapshot.sh passes REPO_ROOT to its own invocation.
+      # resolves both roots. Here they are two directories, so carry the
+      # workspace in PYTHONPATH to match production's import root.
       - name: Dry-run app migrations
         working-directory: orchestrator
         env:
@@ -240,10 +235,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # The migration runner (driven from the host by schema-snapshot.sh) needs
-      # asyncpg; cryptography comes in transitively via security.crypto (AESGCM)
-      # when database/__init__.py loads postgres.py.
-      - run: pip install --quiet asyncpg cryptography
+      # The migration runner is intentionally independent of the application
+      # database layer and needs only asyncpg.
+      - run: pip install --quiet asyncpg
       # Docker is preinstalled on ubuntu-latest; the script auto-detects it and
       # spins up one throwaway container per family (pgvector:pg15 x2,
       # postgres:16), migrates from zero, and dumps inside the container.

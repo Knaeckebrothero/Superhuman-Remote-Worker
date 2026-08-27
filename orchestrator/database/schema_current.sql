@@ -14363,7 +14363,7 @@ CREATE TABLE public.thread_workspace_provision_intents (
     seed_configmap_name character varying(253),
     service_name character varying(253),
     network_tier character varying(32) NOT NULL,
-    manifest_fingerprint character(64) NOT NULL,
+    manifest_fingerprint character varying(64) NOT NULL,
     previous_binding jsonb DEFAULT '{}'::jsonb NOT NULL,
     retained_binding_generation uuid,
     retained_pvc_uid text,
@@ -14391,7 +14391,7 @@ CREATE TABLE public.thread_workspace_provision_intents (
     CONSTRAINT thread_workspace_provision_intents_check7 CHECK (((retained_pvc_uid IS NULL) OR ((pvc_name IS NOT NULL) AND (retained_binding_generation IS NOT NULL)))),
     CONSTRAINT thread_workspace_provision_intents_check8 CHECK (((retained_service_uid IS NULL) OR (service_name IS NOT NULL))),
     CONSTRAINT thread_workspace_provision_intents_check9 CHECK (((((status)::text = ANY ((ARRAY['planned'::character varying, 'revoking'::character varying])::text[])) AND (fence_pod_uid IS NULL) AND (fence_pvc_uid IS NULL) AND (fence_configmap_uid IS NULL) AND (fence_service_uid IS NULL) AND (fenced_at IS NULL) AND (gc_after IS NULL) AND (resolved_at IS NULL)) OR (((status)::text = 'published'::text) AND (NULLIF(pod_uid, ''::text) IS NOT NULL) AND ((pvc_name IS NULL) OR (NULLIF(pvc_uid, ''::text) IS NOT NULL)) AND ((seed_configmap_name IS NULL) OR (NULLIF(seed_configmap_uid, ''::text) IS NOT NULL)) AND ((service_name IS NULL) OR (NULLIF(service_uid, ''::text) IS NOT NULL)) AND (fence_pod_uid IS NULL) AND (fence_pvc_uid IS NULL) AND (fence_configmap_uid IS NULL) AND (fence_service_uid IS NULL) AND (fenced_at IS NULL) AND (gc_after IS NULL) AND (resolved_at IS NOT NULL)) OR (((status)::text = 'fenced'::text) AND (NULLIF(fence_pod_uid, ''::text) IS NOT NULL) AND ((pvc_name IS NULL) OR (retained_pvc_uid IS NOT NULL) OR (NULLIF(fence_pvc_uid, ''::text) IS NOT NULL)) AND ((seed_configmap_name IS NULL) OR (NULLIF(fence_configmap_uid, ''::text) IS NOT NULL)) AND ((service_name IS NULL) OR (retained_service_uid IS NOT NULL) OR (NULLIF(fence_service_uid, ''::text) IS NOT NULL)) AND (fenced_at IS NOT NULL) AND (gc_after >= (fenced_at + '00:10:00'::interval)) AND (resolved_at IS NULL)) OR (((status)::text = 'retired'::text) AND (fenced_at IS NOT NULL) AND (gc_after IS NOT NULL) AND (resolved_at IS NOT NULL)))),
-    CONSTRAINT thread_workspace_provision_intents_manifest_fingerprint_check CHECK ((manifest_fingerprint ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT thread_workspace_provision_intents_manifest_fingerprint_check CHECK (((manifest_fingerprint)::text ~ '^[0-9a-f]{64}$'::text)),
     CONSTRAINT thread_workspace_provision_intents_previous_binding_check CHECK ((jsonb_typeof(previous_binding) = 'object'::text)),
     CONSTRAINT thread_workspace_provision_intents_status_check CHECK (((status)::text = ANY ((ARRAY['planned'::character varying, 'published'::character varying, 'revoking'::character varying, 'fenced'::character varying, 'retired'::character varying])::text[])))
 );

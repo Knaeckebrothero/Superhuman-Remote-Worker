@@ -462,22 +462,34 @@ BEGIN
 END;
 $$;
 
+-- 0186 follows the drained 0185 authority cutover in the same startup. These
+-- bounded validations must complete before the protected-cloud writer opens.
 ALTER TABLE public.projects
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT projects_main_cloud_backend_instance_fk;
 ALTER TABLE public.threads
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT threads_main_cloud_backend_instance_fk;
 ALTER TABLE public.thread_mounts
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT thread_mounts_backend_instance_fk;
 ALTER TABLE public.cloud_ro_mounts
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT cloud_ro_mounts_backend_instance_fk,
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT cloud_ro_mounts_status_shape,
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT cloud_ro_mounts_live_authority_shape;
 
 -- One unresolved grant authority per remote principal. Attempt-scoped names
--- make these global uniqueness belts, not merely per-thread conventions.
+-- make these global uniqueness belts, not merely per-thread conventions. The
+-- table is empty after the required drain, so a transactional build cannot
+-- block a live reader writer and keeps the invariant atomic with the schema.
+-- squawk-ignore require-concurrent-index-creation
 CREATE UNIQUE INDEX IF NOT EXISTS cloud_ro_mounts_live_reader_authority_idx
     ON public.cloud_ro_mounts (reader_id)
     WHERE status IN ('engaging', 'active', 'revoking');
+-- squawk-ignore require-concurrent-index-creation
 CREATE UNIQUE INDEX IF NOT EXISTS cloud_ro_mounts_live_group_authority_idx
     ON public.cloud_ro_mounts (grant_group_id)
     WHERE status IN ('engaging', 'active', 'revoking');

@@ -587,12 +587,16 @@ describe('JobDiffReviewComponent surface', () => {
     it('shows the protected folder, staged time and epoch', async () => {
       await render();
       expect(root().querySelector('.review__title')?.textContent?.trim()).toBe('cloud');
+      const stagedAt = new Intl.DateTimeFormat('en', {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      }).format(new Date('2026-08-24T09:18:00Z'));
       const meta = Array.from(root().querySelectorAll('.review__meta li')).map((li) => [
         li.querySelector('.review__meta-key')?.textContent?.trim(),
         li.lastElementChild?.textContent?.trim(),
       ]);
       expect(meta).toEqual([
-        ['Staged', 'Aug 24, 2026, 11:18 AM'],
+        ['Staged', stagedAt],
         ['Mount', 'cloud'],
         ['Epoch', '5'],
       ]);

@@ -778,7 +778,7 @@ COMMENT ON TABLE public.project_loop_ttl_effects IS 'Immutable project-loop turn
 CREATE TABLE public.schema_migrations (
     filename text NOT NULL,
     checksum text NOT NULL,
-    applied_at timestamp with time zone DEFAULT now() NOT NULL,
+    applied_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     applied_by text DEFAULT CURRENT_USER NOT NULL,
     execution_ms integer NOT NULL,
     success boolean DEFAULT true NOT NULL,

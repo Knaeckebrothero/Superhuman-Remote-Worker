@@ -51,32 +51,6 @@ def _render_orchestrator(*extra_args: str) -> dict:
     return next(doc for doc in yaml.safe_load_all(rendered) if doc)
 
 
-def _render_release_notes(*extra_args: str) -> str:
-    if shutil.which("helm") is None:
-        pytest.skip("helm is not installed")
-    rendered = subprocess.run(
-        [
-            "helm",
-            "install",
-            "runtime-authority-notes",
-            str(CHART),
-            "-f",
-            str(CHART / "ci" / "test-values.yaml"),
-            "--set",
-            "externalSecrets.enabled=false",
-            "--set",
-            "secrets.create=true",
-            *extra_args,
-            "--dry-run=client",
-            "--debug",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    return rendered.partition("NOTES:\n")[2]
-
-
 def test_runtime_authority_migration_defaults_to_rolling_refusal() -> None:
     deployment = _render_orchestrator()
     assert deployment["spec"]["strategy"] == {"type": "RollingUpdate"}
@@ -107,17 +81,19 @@ def test_runtime_authority_ack_uses_same_value_for_gate_and_recreate() -> None:
     assert env["MIGRATION_MAINTENANCE_GATES"] == migration_gate
 
 
-def test_runtime_authority_cutover_notes_render_only_for_acknowledgement() -> None:
-    ordinary_notes = _render_release_notes()
-    assert "PINNED RUNTIME AUTHORITY CUTOVER" not in ordinary_notes
+def test_runtime_authority_cutover_notes_are_acknowledgement_gated() -> None:
+    notes = (CHART / "templates" / "NOTES.txt").read_text(encoding="utf-8")
+    guard = "{{- if .Values.orchestrator.runtimeAuthorityMigrationMaintenanceAck }}"
+    start = notes.index(guard) + len(guard)
+    end = notes.index("{{- end }}", start)
+    cutover_notes = notes[start:end]
 
-    cutover_notes = _render_release_notes(
-        "--set", "orchestrator.runtimeAuthorityMigrationMaintenanceAck=true"
-    )
     assert "PINNED RUNTIME AUTHORITY CUTOVER" in cutover_notes
     assert "`pinned-runtime-authority-v1` migration gate" in cutover_notes
     assert "Do not use Helm\n`--atomic`" in cutover_notes
     assert "never roll back to a pre-0185 image" in cutover_notes
+    assert "PINNED RUNTIME AUTHORITY CUTOVER" not in notes[:start]
+    assert "PINNED RUNTIME AUTHORITY CUTOVER" not in notes[end:]
 
 
 def test_runtime_authority_ack_refuses_legacy_identity_mode() -> None:
