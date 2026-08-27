@@ -6213,6 +6213,250 @@ class PostgresDB:
                     "retirement_stage_receipt": stage_receipt,
                 }
 
+    async def publish_quiesced_retirement_existing_stage_receipt(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+    ) -> dict[str, Any] | None:
+        """Adopt an exact pre-Begin review after the old runtime quiesced.
+
+        A protected agent can acknowledge process zero and revoke its reader
+        before the orchestrator retries soft End.  At that point the workspace
+        is quiesced and no active reader remains from which to re-stage, but a
+        review that was already durable at Begin must remain resumable.  The
+        caller first proves its immutable manifest blob still exists.  Publish
+        only the captured/current byte-identical staged summary, after exact
+        local and remote cleanup, as an ``unchanged`` retirement receipt.
+        """
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            parsed_generation = UUID(str(expected_runtime_generation))
+            parsed_token = UUID(str(expected_retirement_token))
+        except (TypeError, ValueError):
+            return None
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    """
+                    SELECT runtime_retirement_context,
+                           runtime_retirement_stage_receipt,
+                           runtime_retirement_local_quiescence
+                      FROM threads
+                     WHERE id=$1::uuid
+                       AND execution_lane='pinned'
+                       AND runtime_generation=$2::uuid
+                       AND runtime_retirement_token=$3::uuid
+                       AND runtime_retirement_authorized_at IS NOT NULL
+                       AND runtime_retirement_permanent=false
+                     FOR UPDATE
+                    """,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_token,
+                )
+                if thread is None:
+                    return None
+                existing = thread["runtime_retirement_stage_receipt"]
+                if existing is not None:
+                    return dict(existing) if isinstance(existing, Mapping) else None
+                context = thread["runtime_retirement_context"] or {}
+                local_quiescence = thread["runtime_retirement_local_quiescence"]
+                for value_name, value in (
+                    ("context", context),
+                    ("local_quiescence", local_quiescence),
+                ):
+                    if isinstance(value, str):
+                        try:
+                            parsed = json.loads(value)
+                        except (TypeError, ValueError):
+                            return None
+                        if value_name == "context":
+                            context = parsed
+                        else:
+                            local_quiescence = parsed
+                if (
+                    not isinstance(context, dict)
+                    or context.get("protected_cloud") is not True
+                ):
+                    return None
+                settle_status = str(context.get("settle_status") or "")
+                if not _pinned_retirement_local_quiescence_matches(
+                    context,
+                    local_quiescence,
+                    runtime_generation=parsed_generation,
+                    retirement_token=parsed_token,
+                    final_status=settle_status,
+                ):
+                    return None
+
+                captured = context.get("protected_ro")
+                workspace = context.get("workspace_container") or {}
+                binding = context.get("workspace_binding") or {}
+                if not all(
+                    isinstance(value, dict) for value in (captured, workspace, binding)
+                ):
+                    return None
+                assert isinstance(captured, dict)
+                captured_summary = captured.get("staged_summary")
+                captured_source = captured.get("source_binding")
+                captured_baseline = captured.get("etag_baseline")
+                for value_name, value in (
+                    ("summary", captured_summary),
+                    ("source", captured_source),
+                    ("baseline", captured_baseline),
+                ):
+                    if isinstance(value, str):
+                        try:
+                            parsed = json.loads(value)
+                        except (TypeError, ValueError):
+                            return None
+                        if value_name == "summary":
+                            captured_summary = parsed
+                        elif value_name == "source":
+                            captured_source = parsed
+                        else:
+                            captured_baseline = parsed
+                try:
+                    captured_epoch = int(captured["staged_epoch"])
+                    workspace_generation = str(
+                        UUID(str(binding.get("generation") or ""))
+                    )
+                    workspace_runtime = str(
+                        UUID(str(workspace.get("_runtime_incarnation") or ""))
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return None
+                captured_plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(
+                    {**captured, "source_binding": captured_source}
+                )
+                counts = (
+                    captured_summary.get("counts")
+                    if isinstance(captured_summary, dict)
+                    else None
+                )
+                counts_valid = bool(
+                    isinstance(counts, dict)
+                    and set(counts) == {"added", "modified", "deleted"}
+                    and all(
+                        type(value) is int and value >= 0 for value in counts.values()
+                    )
+                )
+                if not (
+                    str(captured.get("status") or "") == "active"
+                    and captured_epoch > 0
+                    and isinstance(captured_summary, dict)
+                    and counts_valid
+                    and captured_plan is not None
+                    and captured_summary.get("source_binding")
+                    == captured_plan.source.binding
+                    and str(captured_summary.get("source_binding_sha256") or "")
+                    == captured_plan.source_sha256
+                ):
+                    return None
+
+                current_row = await conn.fetchrow(
+                    """
+                    SELECT id, thread_id, user_id, backend, backend_instance_id,
+                           reader_id, grant_group_id, grant_handle,
+                           grant_handle_sha256, status, selected_mount_id,
+                           source_binding, source_binding_sha256, staged_epoch,
+                           staged_summary, staged_at, etag_baseline,
+                           runtime_generation, engage_attempt,
+                           credentials IS NULL AS credentials_cleared,
+                           remote_absence_verified_at IS NOT NULL
+                               AS absence_verified
+                      FROM cloud_ro_mounts
+                     WHERE thread_id=$1::uuid
+                     FOR SHARE
+                    """,
+                    parsed_thread,
+                )
+                if current_row is None:
+                    return None
+                current = dict(current_row)
+                for field in ("source_binding", "staged_summary", "etag_baseline"):
+                    if isinstance(current.get(field), str):
+                        try:
+                            current[field] = json.loads(current[field])
+                        except (TypeError, ValueError):
+                            return None
+                current_plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(
+                    current
+                )
+                identity_fields = (
+                    "id",
+                    "thread_id",
+                    "user_id",
+                    "backend_instance_id",
+                    "selected_mount_id",
+                    "runtime_generation",
+                    "engage_attempt",
+                )
+                scalar_fields = (
+                    "backend",
+                    "reader_id",
+                    "grant_group_id",
+                    "grant_handle",
+                    "grant_handle_sha256",
+                    "source_binding_sha256",
+                )
+                if not (
+                    all(
+                        str(current.get(field) or "") == str(captured.get(field) or "")
+                        for field in identity_fields
+                    )
+                    and all(
+                        current.get(field) == captured.get(field)
+                        for field in scalar_fields
+                    )
+                    and current.get("source_binding") == captured_source
+                    and current.get("etag_baseline") == captured_baseline
+                    and current_plan == captured_plan
+                    and str(current.get("status") or "") == "revoked"
+                    and current.get("credentials_cleared") is True
+                    and current.get("absence_verified") is True
+                    and current.get("staged_at") is not None
+                    and int(current.get("staged_epoch") or -1) == captured_epoch
+                    and current.get("staged_summary") == captured_summary
+                ):
+                    return None
+
+                receipt = {
+                    "version": 1,
+                    "kind": "unchanged",
+                    "runtime_generation": str(parsed_generation),
+                    "retirement_token": str(parsed_token),
+                    "mount_id": str(captured["id"]),
+                    "engage_attempt": str(captured["engage_attempt"]),
+                    "source_binding_sha256": captured_plan.source_sha256,
+                    "workspace_generation": workspace_generation,
+                    "workspace_runtime_incarnation": workspace_runtime,
+                    "expected_staged_epoch": captured_epoch,
+                    "staged_epoch": captured_epoch,
+                    "staged_summary": captured_summary,
+                }
+                written = await conn.execute(
+                    """
+                    UPDATE threads
+                       SET runtime_retirement_stage_receipt=$4::jsonb
+                     WHERE id=$1::uuid
+                       AND runtime_generation=$2::uuid
+                       AND runtime_retirement_token=$3::uuid
+                       AND runtime_retirement_authorized_at IS NOT NULL
+                       AND runtime_retirement_permanent=false
+                       AND runtime_retirement_stage_receipt IS NULL
+                    """,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_token,
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                )
+                return receipt if written == "UPDATE 1" else None
+
     async def publish_never_engaged_retirement_stage_receipt(
         self,
         thread_id: str,
