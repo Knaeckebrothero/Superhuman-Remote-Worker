@@ -115,6 +115,7 @@ let state = freshState();
 function freshState(scenario = 'pending') {
   return {
     scenario,
+    probeBlocked: scenario === 'probeFail',
     epoch: 5,
     resolved: null,
     applyCalls: 0,
@@ -197,6 +198,10 @@ const server = createServer(async (req, res) => {
     }
     if (pathname === '/__e2e/release' && req.method === 'POST') {
       releaseApply();
+      return json(res, 200, { ok: true });
+    }
+    if (pathname === '/__e2e/release-probe' && req.method === 'POST') {
+      state.probeBlocked = false;
       return json(res, 200, { ok: true });
     }
     if (pathname === '/__e2e/state') return json(res, 200, state);
@@ -370,10 +375,11 @@ const server = createServer(async (req, res) => {
         res.destroy();
         return;
       }
-      // The hidden pending-count probe fails once, then recovers: a protected
-      // ended session must not be stranded by one transient failure, and
-      // "Check again" has to actually work.
-      if (state.scenario === 'probeFail' && state.summaryCalls === 1) {
+      // Keep the hidden pending-count probe failed until the test explicitly
+      // releases it. Ended sessions run a bounded post-terminal probe series,
+      // so "fail the first call" races that legitimate recovery loop and can
+      // turn green or red before the user-facing state is asserted.
+      if (state.scenario === 'probeFail' && state.probeBlocked) {
         return json(res, 503, { detail: 'Staging service unavailable' });
       }
       return json(res, 200, summaryBody());

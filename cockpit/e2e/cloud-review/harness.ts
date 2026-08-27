@@ -54,13 +54,18 @@ export async function resetFixture(page: Page, scenario: Scenario = 'pending'): 
   await page.request.post('/__e2e/reset', { data: { scenario } });
 }
 
-export function fixtureState(page: Page): Promise<Record<string, number | string | null>> {
+export function fixtureState(page: Page): Promise<Record<string, boolean | number | string | null>> {
   return page.request.get('/__e2e/state').then((r) => r.json());
 }
 
 /** Let a held apply finish. See the `holdApply` scenario. */
 export async function releaseApply(page: Page): Promise<void> {
   await page.request.post('/__e2e/release');
+}
+
+/** Let a failed pending-count probe recover. See the `probeFail` scenario. */
+export async function releaseProbe(page: Page): Promise<void> {
+  await page.request.post('/__e2e/release-probe');
 }
 
 /** Load the session with an explicit theme, before Angular's first paint. */
