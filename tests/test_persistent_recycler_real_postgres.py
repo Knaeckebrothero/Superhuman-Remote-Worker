@@ -2054,15 +2054,32 @@ async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
     import main as orch_main
 
     ids = await _seed(db, bind_agent=False)
+    row_id, plan, ro_generation, _mount_id = await _seed_protected_ro_attempt(
+        db,
+        ids,
+        status="active",
+    )
     workspace_generation = str(uuid4())
     workspace_runtime = str(uuid4())
     async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE cloud_ro_mounts SET staged_epoch=1, staged_at=now(), "
+            "staged_summary='{\"file_count\":1}'::jsonb WHERE id=$1::uuid",
+            UUID(row_id),
+        )
         thread = await conn.fetchrow(
             "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
             UUID(ids["thread"]),
         )
         metadata = _json(thread["metadata"])
-        metadata["config_override"]["officer"]["enabled"] = False
+        metadata.setdefault("config_override", {}).setdefault("officer", {})[
+            "enabled"
+        ] = False
+        metadata["agent_pod"] = {
+            "pod_name": f"persistent-{ids['thread'][:12]}",
+            "pod_uid": "old-pod",
+            "observed_build_sha": "old-build",
+        }
         metadata["workspace_container"] = {
             "status": "ready",
             "provisioner": "k8s",
@@ -2133,6 +2150,18 @@ async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
     assert receipt["workspace_generation"] == workspace_generation
     assert receipt["workspace_runtime_incarnation"] == workspace_runtime
     assert receipt["agent_pod_uid"] == "old-pod"
+    assert await db.begin_ro_mount_revocation_if_matches(
+        row_id,
+        expected_thread_id=ids["thread"],
+        expected_runtime_generation=ro_generation,
+        plan=plan,
+    )
+    assert await db.finish_ro_mount_revocation_if_matches(
+        row_id,
+        expected_thread_id=ids["thread"],
+        expected_runtime_generation=ro_generation,
+        plan=plan,
+    )
     assert await db.clear_pinned_retirement_physical_runtime_endpoint(
         ids["thread"],
         runtime_generation=retirement["generation"],
@@ -2156,6 +2185,11 @@ async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
         expected_runtime_generation=retirement["generation"],
     )
     assert await db.get_thread(ids["thread"]) is None
+    retired_ro = await db.get_ro_mount_by_thread(ids["thread"])
+    assert retired_ro is not None
+    assert retired_ro["status"] == "revoked"
+    assert retired_ro["staged_epoch"] == 1
+    assert retired_ro["staged_summary"] is None
 
 
 @pytest.mark.asyncio
