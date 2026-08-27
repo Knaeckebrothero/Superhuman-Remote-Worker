@@ -30,6 +30,20 @@ PROCESS_ZERO_MIGRATION = (
 )
 
 
+async def _execute_pre_0195(conn, query: str, *args):
+    """Seed a previous-release row without teaching production a bypass.
+
+    0195/0196 fence a raw owner INSERT/UPDATE that already carries a
+    Kubernetes runtime projection. These fixtures deliberately install such a
+    row to prove the *process-zero* boundary above it, so they seed the way
+    the migration encounters existing data.
+    """
+
+    async with conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role = replica")
+        return await conn.execute(query, *args)
+
+
 @pytest.fixture(scope="module")
 def pg_dsn():
     try:
@@ -86,7 +100,8 @@ async def test_terminal_receipt_is_durable_idempotent_and_uid_fenced(db):
         }
     }
     async with db.acquire() as conn:
-        await conn.execute(
+        await _execute_pre_0195(
+            conn,
             "INSERT INTO threads (id, status, execution_lane, metadata) "
             "VALUES ($1, 'active', 'stateless', $2::jsonb)",
             thread_id,
@@ -124,7 +139,8 @@ async def test_terminal_receipt_is_durable_idempotent_and_uid_fenced(db):
             )
             == observed_at
         )
-        await conn.execute(
+        await _execute_pre_0195(
+            conn,
             "UPDATE threads SET metadata = jsonb_set(metadata, "
             "'{workspace_container,_runtime_incarnation}', to_jsonb($2::text)) "
             "WHERE id = $1",
@@ -170,14 +186,16 @@ async def test_managed_repository_process_zero_uses_server_owned_exact_ledger(
     column = "context" if owner_kind == "job" else "metadata"
     async with db.acquire() as conn:
         if owner_kind == "job":
-            await conn.execute(
+            await _execute_pre_0195(
+                conn,
                 "INSERT INTO jobs (id, description, status, context) "
                 "VALUES ($1, 'process-zero ledger', 'processing', $2::jsonb)",
                 owner_id,
                 json.dumps(state),
             )
         else:
-            await conn.execute(
+            await _execute_pre_0195(
+                conn,
                 "INSERT INTO threads (id, status, execution_lane, metadata) "
                 "VALUES ($1, 'active', 'pinned', $2::jsonb)",
                 owner_id,
@@ -253,14 +271,16 @@ async def test_vm_retirement_claim_and_receipt_gate_terminal_transition(
     }
     async with db.acquire() as conn:
         if owner_kind == "job":
-            await conn.execute(
+            await _execute_pre_0195(
+                conn,
                 "INSERT INTO jobs (id, description, status, context) "
                 "VALUES ($1, 'VM process-zero gate', 'completed', $2::jsonb)",
                 owner_id,
                 json.dumps(state),
             )
         else:
-            await conn.execute(
+            await _execute_pre_0195(
+                conn,
                 "INSERT INTO threads (id, status, execution_lane, metadata) "
                 "VALUES ($1, 'ended', 'pinned', $2::jsonb)",
                 owner_id,
@@ -362,7 +382,8 @@ async def test_legacy_stateless_json_receipt_is_ignored_and_can_remain_unchanged
             "trg_threads_reject_managed_repository_process_zero_json"
         )
         try:
-            await conn.execute(
+            await _execute_pre_0195(
+                conn,
                 "INSERT INTO threads (id, status, execution_lane, metadata) "
                 "VALUES ($1, 'active', 'stateless', $2::jsonb)",
                 thread_id,
@@ -373,7 +394,8 @@ async def test_legacy_stateless_json_receipt_is_ignored_and_can_remain_unchanged
                 "ALTER TABLE threads ENABLE TRIGGER "
                 "trg_threads_reject_managed_repository_process_zero_json"
             )
-        await conn.execute(
+        await _execute_pre_0195(
+            conn,
             "UPDATE threads SET metadata = jsonb_set(metadata, '{note}', '1') "
             "WHERE id = $1",
             thread_id,
@@ -412,14 +434,16 @@ async def test_docker_process_zero_requires_exact_claim_before_reuse(
     }
     async with db.acquire() as conn:
         if owner_kind == "job":
-            await conn.execute(
+            await _execute_pre_0195(
+                conn,
                 "INSERT INTO jobs (id, description, status, context) "
                 "VALUES ($1, 'docker receipt', 'processing', $2::jsonb)",
                 owner_id,
                 json.dumps({"workspace_container": workspace}),
             )
         else:
-            await conn.execute(
+            await _execute_pre_0195(
+                conn,
                 "INSERT INTO threads (id, status, execution_lane, metadata) "
                 "VALUES ($1, 'active', 'pinned', $2::jsonb)",
                 owner_id,
@@ -581,13 +605,15 @@ async def test_pre_0175_inherited_child_is_exempt_only_for_exact_parent_runtime(
         "port": 30022,
     }
     async with db.acquire() as conn:
-        await conn.execute(
+        await _execute_pre_0195(
+            conn,
             "INSERT INTO jobs (id, description, status, context) "
             "VALUES ($1, 'legacy parent', 'processing', $2::jsonb)",
             parent_id,
             json.dumps({"workspace_container": legacy_workspace}),
         )
-        await conn.execute(
+        await _execute_pre_0195(
+            conn,
             "INSERT INTO jobs (id, parent_job_id, description, status, context) "
             "VALUES ($1, $2, 'exact inherited child', 'completed', $3::jsonb)",
             child_id,
@@ -602,7 +628,8 @@ async def test_pre_0175_inherited_child_is_exempt_only_for_exact_parent_runtime(
         await conn.execute("DELETE FROM jobs WHERE id = $1", child_id)
 
         forged = {**legacy_workspace, "host": "workspace-foreign.internal"}
-        await conn.execute(
+        await _execute_pre_0195(
+            conn,
             "INSERT INTO jobs (id, parent_job_id, description, status, context) "
             "VALUES ($1, $2, 'forged inherited child', 'completed', $3::jsonb)",
             forged_child_id,
@@ -651,7 +678,8 @@ async def test_retirement_claim_and_receipt_are_absorbing_for_exact_runtime(db):
         }
     }
     async with db.acquire() as conn:
-        await conn.execute(
+        await _execute_pre_0195(
+            conn,
             "INSERT INTO jobs (id, description, status, context) "
             "VALUES ($1, 'absorbing retirement', 'processing', $2::jsonb)",
             job_id,

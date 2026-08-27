@@ -1562,6 +1562,9 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 "SELECT runtime_generation FROM threads WHERE id=$1 FOR UPDATE",
                 UUID(seed["thread_id"]),
             )
+            # A pinned binding already live when 0198 landed; the subject here
+            # is Officer Post transaction behaviour, not the bind authority.
+            await conn.execute("SET LOCAL session_replication_role = 'replica'")
             await conn.execute(
                 "UPDATE threads SET agent_id=$2, control_admission_agent_id=$2, "
                 "runtime_attach_token=$3 WHERE id=$1",

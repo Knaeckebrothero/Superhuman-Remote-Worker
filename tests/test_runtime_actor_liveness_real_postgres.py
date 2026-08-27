@@ -146,6 +146,10 @@ async def _seed_officer(db: PostgresDB) -> dict[str, str]:
             UUID(ids["agent_id"]),
         )
         async with conn.transaction():
+            # These fixtures model a pinned binding already live when 0198
+            # lands; their subject is runtime-actor liveness, not the bind
+            # authority, which has its own suites.
+            await conn.execute("SET LOCAL session_replication_role = 'replica'")
             await conn.execute(
                 "UPDATE threads SET agent_id = $2, "
                 "control_admission_agent_id = $2, runtime_attach_token = $3 "
@@ -201,6 +205,10 @@ async def _replace_officer_binding(db: PostgresDB, ids: dict[str, str]) -> str:
             UUID(successor),
         )
         async with conn.transaction():
+            # These fixtures model a pinned binding already live when 0198
+            # lands; their subject is runtime-actor liveness, not the bind
+            # authority, which has its own suites.
+            await conn.execute("SET LOCAL session_replication_role = 'replica'")
             await conn.execute(
                 "UPDATE threads SET agent_id = $2, "
                 "control_admission_agent_id = $2, runtime_attach_token = $3 "
