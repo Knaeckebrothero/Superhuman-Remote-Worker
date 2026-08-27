@@ -32,6 +32,7 @@ AGENT_ID = UUID("44444444-dddd-4444-8888-444444444444")
 REQUEST_ID = UUID("55555555-eeee-4444-8888-555555555555")
 CLIENT_REQUEST_ID = UUID("66666666-ffff-4444-8888-666666666666")
 RUNTIME_GENERATION = UUID("77777777-aaaa-4444-8888-777777777777")
+ATTACH_TOKEN = UUID("99999999-aaaa-4444-8888-999999999999")
 
 
 class _AsyncContext:
@@ -657,6 +658,58 @@ async def test_exact_pinned_live_status_refuses_stale_pre_resume_agent(status):
 
     assert exc.value.status_code == 409
     conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["active", "awaiting_user"])
+async def test_exact_pinned_live_status_preserves_runtime_resources(status):
+    import main as orchestrator_main
+
+    thread = {
+        "id": THREAD_ID,
+        "agent_id": AGENT_ID,
+        "execution_lane": "pinned",
+        "status": "created",
+        "metadata": {},
+        "project_id": PROJECT_ID,
+        "title": "protected session",
+        "runtime_generation": RUNTIME_GENERATION,
+        "runtime_attach_token": ATTACH_TOKEN,
+        "runtime_retirement_token": None,
+    }
+    conn = MagicMock()
+    conn.transaction = lambda: _AsyncContext()
+    conn.fetchrow = AsyncMock(return_value=thread)
+    conn.fetchval = AsyncMock(side_effect=[1, THREAD_ID])
+    db = MagicMock()
+    db.acquire = lambda: _AsyncContext(conn)
+    db.get_thread = AsyncMock(return_value=thread)
+    suspend_resources = AsyncMock()
+    conclude_conference = AsyncMock()
+
+    with (
+        patch.object(orchestrator_main, "require_internal", AsyncMock()),
+        patch.object(orchestrator_main, "postgres_db", db),
+        patch.object(orchestrator_main, "_suspend_thread_resources", suspend_resources),
+        patch.object(
+            orchestrator_main, "_conclude_conference_if_any", conclude_conference
+        ),
+    ):
+        result = await orchestrator_main.agent_update_thread_status(
+            MagicMock(),
+            str(THREAD_ID),
+            orchestrator_main.AgentThreadStatusRequest(
+                status=status,
+                agent_id=AGENT_ID,
+                session_runtime_generation=RUNTIME_GENERATION,
+                session_runtime_attach_token=ATTACH_TOKEN,
+            ),
+        )
+
+    assert result == {"status": status}
+    assert status in conn.fetchval.await_args_list[1].args[0]
+    suspend_resources.assert_not_awaited()
+    conclude_conference.assert_not_awaited()
 
 
 @pytest.mark.asyncio
