@@ -2133,6 +2133,23 @@ async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
     assert receipt["workspace_generation"] == workspace_generation
     assert receipt["workspace_runtime_incarnation"] == workspace_runtime
     assert receipt["agent_pod_uid"] == "old-pod"
+    assert await db.clear_pinned_retirement_physical_runtime_endpoint(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+        completed_quiescence_protocol="sandbox_actuator_zero_v1",
+        completed_external_cleanup_protocol="sandbox_actuator_zero_v1",
+    )
+    current = await db.get_thread(ids["thread"])
+    assert current is not None
+    metadata = _json(current["metadata"])
+    assert metadata["workspace_container"]["status"] == "deleted"
+    assert "_workspace_binding" not in metadata
+    assert await db.pinned_retirement_external_cleanup_complete(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+    )
 
 
 @pytest.mark.asyncio
