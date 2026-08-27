@@ -181,6 +181,10 @@ metadata:
 spec:
   replicas: {{ .Values.nextcloud.replicas | default 0 }}
   progressDeadlineSeconds: 900
+  # Bundled Nextcloud has one shared data PVC. A rolling update deadlocks on
+  # ReadWriteOnce volumes when the replacement lands on another node.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 6 }}
