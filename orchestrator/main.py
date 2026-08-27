@@ -11014,6 +11014,7 @@ async def _recover_captured_sandbox_process_zero(
         return True
 
     thread_id = str(context.get("thread_id") or "")
+    permanent = bool(retirement.get("permanent"))
     current = await postgres_db.get_thread(thread_id)
     if current and _agent_pod_provision_intent_zero_candidate(retirement, current):
         async with postgres_db.try_thread_advisory_lock(thread_id) as lock_owner:
@@ -11138,6 +11139,35 @@ async def _recover_captured_sandbox_process_zero(
             != workspace_generation
         ):
             return False
+
+        # A permanent retirement token prevents a same-name successor from
+        # being admitted.  After the exact captured agent Pod is stopped, a
+        # Kubernetes 404 (or an exact UID whose containers are all terminal)
+        # is therefore a stronger process-zero proof than SSH: there is no
+        # workspace process namespace left to contact.  Receipt that actuator
+        # proof before the ordinary retirement cleanup removes the residual
+        # PVC/Service.  Replacement and ambiguous observations stay refused.
+        if permanent:
+            workspace_authority = await container_provisioner.workspace_pod_authority(
+                WorkspaceOwner.session(thread_id),
+                expected_runtime_incarnation=runtime_incarnation,
+            )
+            if workspace_authority in {"exact_absent", "exact_terminal"}:
+                receipt = await postgres_db.acknowledge_pinned_thread_local_quiescence(
+                    thread_id,
+                    expected_runtime_generation=generation,
+                    expected_retirement_token=token,
+                    expected_agent_id=str(context.get("agent_id") or ""),
+                    expected_attach_token=str(
+                        context.get("runtime_attach_token") or ""
+                    ),
+                    expected_settle_status=str(context.get("settle_status") or ""),
+                    expected_quiescence_protocol="sandbox_actuator_zero_v1",
+                    expected_workspace_generation=workspace_generation,
+                    expected_workspace_runtime_incarnation=runtime_incarnation,
+                    quiescence_actor="orchestrator",
+                )
+                return receipt is not None
 
         from services import resolve_ssh_key_path
         from src.core.backends.remote import RemoteBackend
