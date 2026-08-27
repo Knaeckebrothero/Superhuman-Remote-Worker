@@ -45,7 +45,19 @@ def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
 
 
 @pytest.mark.asyncio
-async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod():
+@pytest.mark.parametrize(
+    ("workspace_status", "workspace_authority", "expected_recovery"),
+    [
+        ("ready", "exact_absent", True),
+        ("suspending", "exact_absent", True),
+        ("suspending", "exact_live", False),
+    ],
+)
+async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod(
+    workspace_status,
+    workspace_authority,
+    expected_recovery,
+):
     """A deleted U1 is process-zero; recovery must not require SSH to U1."""
 
     thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
@@ -65,7 +77,7 @@ async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod():
         "agent": {"hostname": "agent-retired", "pod_uid": "agent-pod-uid"},
         "workspace_backend": "sandbox",
         "workspace_container": {
-            "status": "ready",
+            "status": workspace_status,
             "pod_ip": "10.42.0.8",
             "port": 30022,
             "_canvas_workspace_generation": workspace_generation,
@@ -104,7 +116,7 @@ async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod():
     agent_provisioner.agent_pod_authority = AsyncMock(return_value="exact_absent")
     container_provisioner = MagicMock(is_available=True)
     container_provisioner.workspace_pod_authority = AsyncMock(
-        return_value="exact_absent"
+        return_value=workspace_authority
     )
 
     with (
@@ -112,20 +124,26 @@ async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod():
         patch.object(main, "agent_provisioner", agent_provisioner),
         patch.object(main, "container_provisioner", container_provisioner),
     ):
-        assert await main._recover_captured_sandbox_process_zero(retirement) is True
+        assert (
+            await main._recover_captured_sandbox_process_zero(retirement)
+            is expected_recovery
+        )
 
-    db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
-        thread_id,
-        expected_runtime_generation=generation,
-        expected_retirement_token=token,
-        expected_agent_id=agent_id,
-        expected_attach_token=attach_token,
-        expected_settle_status="ended",
-        expected_quiescence_protocol="sandbox_actuator_zero_v1",
-        expected_workspace_generation=workspace_generation,
-        expected_workspace_runtime_incarnation=workspace_runtime,
-        quiescence_actor="orchestrator",
-    )
+    if expected_recovery:
+        db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
+            thread_id,
+            expected_runtime_generation=generation,
+            expected_retirement_token=token,
+            expected_agent_id=agent_id,
+            expected_attach_token=attach_token,
+            expected_settle_status="ended",
+            expected_quiescence_protocol="sandbox_actuator_zero_v1",
+            expected_workspace_generation=workspace_generation,
+            expected_workspace_runtime_incarnation=workspace_runtime,
+            quiescence_actor="orchestrator",
+        )
+    else:
+        db.acknowledge_pinned_thread_local_quiescence.assert_not_awaited()
 
 
 @pytest.mark.asyncio
