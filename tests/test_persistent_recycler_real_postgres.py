@@ -1987,6 +1987,68 @@ async def test_pre_registration_pod_recovery_refuses_a_late_agent_owner(db):
 
 
 @pytest.mark.asyncio
+async def test_pre_registration_pod_recovery_reaps_exact_offline_orphan(db):
+    """A failed registration row cannot wedge exact permanent retirement."""
+    import main as orch_main
+
+    ids = await _seed(db, bind_agent=False)
+    async with db.acquire() as conn:
+        thread = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(thread["metadata"])
+        metadata["config_override"]["officer"]["enabled"] = False
+        await conn.execute(
+            "UPDATE threads SET status='created', metadata=$2::jsonb WHERE id=$1",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retirement is not None
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO agents (id,config_name,hostname,pod_uid,status,"
+            "agent_mode,last_heartbeat) VALUES "
+            "($1::uuid,'centurion',$2,$3,'offline','persistent',now())",
+            UUID(ids["agent"]),
+            f"persistent-{ids['thread'][:12]}",
+            "old-pod",
+        )
+
+    provisioner = MagicMock()
+    provisioner.is_available = True
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.agent_pod_authority = AsyncMock(return_value="exact_absent")
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "agent_provisioner", provisioner),
+    ):
+        current = await db.get_thread(ids["thread"])
+        assert current is not None
+        assert await orch_main._recover_pre_registration_agent_pod_zero(
+            retirement, current
+        )
+
+    provisioner.delete_agent_pod_exact.assert_awaited_once_with(
+        f"persistent-{ids['thread'][:12]}", expected_pod_uid="old-pod"
+    )
+    assert await db.get_agent(ids["agent"]) is None
+    current = await db.get_thread(ids["thread"])
+    assert current is not None
+    assert "agent_pod" not in _json(current["metadata"])
+    receipt = _json(current["runtime_retirement_local_quiescence"])
+    assert receipt["quiescence_protocol"] == "agent_runtime_zero_v1"
+    assert receipt["agent_pod_uid"] == "old-pod"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("permanent", [False, True])
 async def test_response_lost_agent_create_uses_retained_pod_and_pvc_fences(
     db, permanent

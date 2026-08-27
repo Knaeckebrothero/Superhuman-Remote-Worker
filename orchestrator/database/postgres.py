@@ -13612,6 +13612,75 @@ class PostgresDB:
 
         return result == "DELETE 1"
 
+    async def delete_exact_offline_unbound_agent(
+        self,
+        agent_id: str,
+        *,
+        expected_hostname: str,
+        expected_pod_uid: str,
+    ) -> bool:
+        """Delete one exact terminal pre-registration agent identity.
+
+        Pinned retirement uses this only after Kubernetes has proved the
+        captured Pod UID absent/terminal.  The atomic predicate prevents an
+        offline orphan from being confused with a rebound, replacement, job,
+        or control-admission owner between that observation and deletion.
+        """
+
+        try:
+            uuid_val = UUID(agent_id)
+        except ValueError:
+            return False
+        if not expected_hostname or not expected_pod_uid:
+            return False
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT id
+                    FROM agents
+                    WHERE id = $1
+                      AND hostname = $2
+                      AND pod_uid = $3
+                      AND status IN ('offline', 'failed')
+                      AND thread_id IS NULL
+                      AND current_job_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM threads
+                          WHERE agent_id = agents.id
+                             OR control_admission_agent_id = agents.id
+                      )
+                    FOR UPDATE
+                    """,
+                    uuid_val,
+                    expected_hostname,
+                    expected_pod_uid,
+                )
+                if row is None:
+                    return False
+                result = await conn.execute(
+                    """
+                    DELETE FROM agents
+                    WHERE id = $1
+                      AND hostname = $2
+                      AND pod_uid = $3
+                      AND status IN ('offline', 'failed')
+                      AND thread_id IS NULL
+                      AND current_job_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM threads
+                          WHERE agent_id = agents.id
+                             OR control_admission_agent_id = agents.id
+                      )
+                    """,
+                    uuid_val,
+                    expected_hostname,
+                    expected_pod_uid,
+                )
+
+        return result == "DELETE 1"
+
     async def mark_stale_agents_offline(
         self, timeout_minutes: int = 3
     ) -> List[Dict[str, Any]]:
