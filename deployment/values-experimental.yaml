@@ -132,7 +132,7 @@ orchestrator:
   #    would restore it (observed twice on 2026-08-23). Fixed in the chart: the
   #    seed Job no longer renders at replicas 0, and its wait is bounded. A
   #    quiesce is now an ordinary apply. See the migration runbook §B2a.
-  replicas: 0
+  replicas: 2
   # Gate 3 completion-command substrate ON for dev (chart default stays false).
   # Reports become durable command rows with effects-as-rows and a
   # leader-elected finalizer; `lifespan` additionally starts the finalizer and
@@ -709,11 +709,6 @@ headscale:
 # VMs. Disable to skip the sidecar entirely (e.g. when VM workspaces aren't
 # in use or headscale is offline).
 agent:
-  # One-shot runtime-authority cutover drain. Keep the dynamic warm pool at
-  # zero until every orchestrator and agent writer is on the post-0185 image.
-  pool:
-    minAgents: "0"
-    buffer: "0"
   # Stateless session lane ON for dev (chart default stays false): the
   # executor pool serves lite+sandbox session tiers via the run_queue —
   # the first live-traffic deployment of the lane, for the unmeasured
