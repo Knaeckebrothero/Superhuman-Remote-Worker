@@ -1199,6 +1199,176 @@ async def test_permanent_delete_reclaims_same_generation_retained_k8s_pvc(db):
 
 
 @pytest.mark.asyncio
+async def test_permanent_agent_ack_hands_off_mounted_claim_to_owner_cleanup(db):
+    """The caller exits before an owner retry exact-deletes its Pod and PVC."""
+
+    import main as orch_main
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    attempt_id = str(uuid4())
+    pod_name = f"srw-agent-s-{attempt_id[:8]}"
+    pod_uid = str(uuid4())
+    pvc_name = f"pvc-agent-s-{ids['thread'][:12]}"
+    pvc_uid = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created' WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+    intent = await db.reserve_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt_id,
+        pod_name=pod_name,
+        provisioner="agent",
+        pvc_name=pvc_name,
+    )
+    assert intent is not None
+    claim_id = str(intent["workspace_claim"]["claim_id"])
+    assert await db.publish_pinned_agent_workspace_claim(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        claim_id=claim_id,
+        pvc_name=pvc_name,
+        pvc_uid=pvc_uid,
+    )
+    assert await db.publish_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt_id,
+        pod_name=pod_name,
+        pod_uid=pod_uid,
+        namespace="test",
+    )
+    async with db.acquire() as conn:
+        metadata = _json(
+            await conn.fetchval(
+                "SELECT metadata FROM threads WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+        )
+        metadata["config_override"]["officer"]["enabled"] = False
+        await conn.execute(
+            "INSERT INTO agents "
+            "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,last_heartbeat) "
+            "VALUES ($1,'centurion',$2,'127.0.0.1',$3,'session','persistent',now())",
+            UUID(ids["agent"]),
+            pod_name,
+            pod_uid,
+        )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE threads SET status='active',agent_id=$2::uuid,"
+                "control_admission_agent_id=$2::uuid,runtime_attach_token=$3::uuid,"
+                "metadata=$4::jsonb WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+                UUID(ids["agent"]),
+                UUID(ids["attach_token"]),
+                json.dumps(metadata),
+            )
+            await conn.execute(
+                "UPDATE agents SET thread_id=$2::uuid WHERE id=$1::uuid",
+                UUID(ids["agent"]),
+                UUID(ids["thread"]),
+            )
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"],
+        permanent=True,
+        initiator="agent",
+        expected_runtime_generation=generation,
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+    )
+    assert retirement["state"] == "pending"
+    await _authorize_and_ack(db, ids, retirement)
+
+    effects: list[str] = []
+
+    async def _delete_pod(*_args, **_kwargs):
+        effects.append("delete_pod")
+        return True
+
+    async def _fence_claim(*_args, **_kwargs):
+        effects.append("fence_claim")
+        if effects.count("fence_claim") == 1:
+            return {"state": "exact_original", "pvc_uid": pvc_uid}
+        return {"state": "exact_fence", "pvc_uid": "pvc-fence-uid"}
+
+    async def _delete_claim(*_args, **_kwargs):
+        effects.append("delete_claim")
+        return True
+
+    provisioner = MagicMock(is_available=True)
+    provisioner.delete_agent_pod_exact = AsyncMock(side_effect=_delete_pod)
+    provisioner.agent_pod_authority = AsyncMock(return_value="exact_absent")
+    provisioner.fence_agent_workspace_claim = AsyncMock(side_effect=_fence_claim)
+    provisioner.delete_agent_workspace_claim_exact = AsyncMock(
+        side_effect=_delete_claim
+    )
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "agent_provisioner", provisioner),
+        patch.object(
+            orch_main.session_router,
+            "teardown_route",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(
+            orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
+        ),
+        patch.object(
+            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+        ),
+    ):
+        current = await db.get_thread(ids["thread"])
+        self_ack = await orch_main._end_thread_flow(
+            ids["thread"],
+            current,
+            permanent=True,
+            force=True,
+            expected_runtime_generation=generation,
+            expected_agent_id=ids["agent"],
+            expected_attach_token=ids["attach_token"],
+            local_runtime_quiesced=True,
+            retiring_agent_response_pending=True,
+        )
+        assert self_ack == {
+            "status": "ending",
+            "retirement_disposition": "ended",
+            "retirement_permanent": True,
+            "retiring_agent_exit_authorized": True,
+            "session_runtime_retirement_token": retirement["token"],
+        }
+        assert effects == []
+        claim = await db.fetchrow(
+            "SELECT status,pvc_uid FROM thread_agent_workspace_claims "
+            "WHERE claim_id=$1::uuid",
+            claim_id,
+        )
+        assert dict(claim) == {"status": "ready", "pvc_uid": pvc_uid}
+
+        pending = await db.get_thread(ids["thread"])
+        assert pending is not None
+        owner_result = await orch_main._end_thread_flow(
+            ids["thread"], pending, permanent=True, force=True
+        )
+
+    assert owner_result == {"status": "deleted"}
+    assert effects == ["delete_pod", "fence_claim", "delete_claim", "fence_claim"]
+    assert await db.get_thread(ids["thread"]) is None
+    async with db.acquire() as conn:
+        claim = await conn.fetchrow(
+            "SELECT status,pvc_uid,gc_after FROM thread_agent_workspace_claims "
+            "WHERE claim_id=$1::uuid",
+            UUID(claim_id),
+        )
+    assert claim["status"] == "fenced"
+    assert claim["pvc_uid"] == "pvc-fence-uid"
+    assert claim["gc_after"] is not None
+
+
+@pytest.mark.asyncio
 async def test_permanent_sandbox_absence_accepts_orchestrator_zero_receipt(db):
     """Exact Pod absence may receipt a permanent bound sandbox retirement."""
 

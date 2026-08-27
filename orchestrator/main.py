@@ -11405,6 +11405,7 @@ async def _cleanup_pinned_thread_retirement(
     retirement: Mapping[str, Any],
     *,
     cleanup_agent_pod: bool = True,
+    defer_agent_workspace_claim_until_caller_exit: bool = False,
 ) -> None:
     """Actuate only identities captured by ``begin_pinned_thread_retirement``.
 
@@ -11777,6 +11778,21 @@ async def _cleanup_pinned_thread_retirement(
             )
             if completed_quiescence_protocol is None:
                 completed_quiescence_protocol = "agent_runtime_zero_v1"
+
+    if defer_agent_workspace_claim_until_caller_exit:
+        # A permanent final ACK is sent by the same agent process whose Pod
+        # mounts this claim. Its append-only local-quiescence receipt proves
+        # the runtime stopped all writers, but Kubernetes cannot remove the
+        # PVC until this HTTP response lets that caller exit. Leave the claim
+        # completely untouched; an owner/reconciler retry exact-stops the
+        # captured Pod first and then resumes the ordinary fenced cleanup.
+        if (
+            not permanent
+            or cleanup_agent_pod
+            or _captured_agent_workspace_claim(retirement) is None
+        ):
+            raise RuntimeError("agent workspace cleanup handoff is malformed")
+        return
 
     # A bootstrap Pod can have a distinct persistent PVC whose create was
     # already sent before registration. Soft settlement retains/re-attests the
@@ -44522,6 +44538,7 @@ async def agent_update_thread_status(
                 ),
                 settle_status=settle_disposition,
                 local_runtime_quiesced=True,
+                retiring_agent_response_pending=bool(body.retirement_permanent),
             )
             return retired
         # Terminal exact-owner writes return through the retirement funnel
@@ -50679,6 +50696,7 @@ async def _end_thread_flow(
     require_expected_agent_offline: bool = False,
     settle_status: Literal["ended", "suspended"] = "ended",
     local_runtime_quiesced: bool = False,
+    retiring_agent_response_pending: bool = False,
 ) -> dict[str, Any]:
     """The End funnel body — everything ``end_thread`` does after auth.
 
@@ -50695,6 +50713,8 @@ async def _end_thread_flow(
     """
     if permanent and settle_status != "ended":
         raise ValueError("permanent retirement cannot settle suspended")
+    if retiring_agent_response_pending and not local_runtime_quiesced:
+        raise ValueError("retiring agent response requires local quiescence")
     stateless = thread.get("execution_lane") == "stateless"
     initial_status = thread.get("status")
     initial_stateless_authority: dict[str, Any] | None = None
@@ -50929,7 +50949,11 @@ async def _end_thread_flow(
                 return "authorized"
             return "preflight"
 
-        def _ending_response(*, retry_after_ms: int | None = None) -> dict[str, Any]:
+        def _ending_response(
+            *,
+            retry_after_ms: int | None = None,
+            retiring_agent_exit_authorized: bool = False,
+        ) -> dict[str, Any]:
             response: dict[str, Any] = {
                 "status": "ending",
                 "retirement_disposition": settle_status,
@@ -50937,6 +50961,9 @@ async def _end_thread_flow(
             }
             if retry_after_ms is not None:
                 response["retry_after_ms"] = retry_after_ms
+            if retiring_agent_exit_authorized:
+                response["retiring_agent_exit_authorized"] = True
+                response["session_runtime_retirement_token"] = str(retirement["token"])
             return response
 
         if expected_runtime_generation is not None:
@@ -51149,6 +51176,19 @@ async def _end_thread_flow(
                         retirement_token=str(retirement["token"]),
                     )
                 )
+            raw_local_quiescence = authoritative_thread.get(
+                "runtime_retirement_local_quiescence"
+            )
+            if isinstance(raw_local_quiescence, str):
+                try:
+                    raw_local_quiescence = json.loads(raw_local_quiescence)
+                except (TypeError, ValueError):
+                    raw_local_quiescence = None
+            agent_local_quiescence = bool(
+                local_quiescence
+                and isinstance(raw_local_quiescence, Mapping)
+                and raw_local_quiescence.get("quiescence_actor") == "agent"
+            )
             context = retirement.get("context")
             context = {} if context is None else context
             captured_agent = (
@@ -51355,13 +51395,38 @@ async def _end_thread_flow(
                                 )
                             if isinstance(stage_result.get("event"), dict):
                                 staged_event = dict(stage_result["event"])
+                raw_agent_workspace_claim = (
+                    context.get("agent_workspace_claim")
+                    if isinstance(context, Mapping)
+                    else None
+                )
+                agent_workspace_exit_handoff = bool(
+                    permanent
+                    and retiring_agent_response_pending
+                    and runtime_exposed
+                    and local_quiescence
+                    and raw_agent_workspace_claim not in (None, {})
+                )
                 await _cleanup_pinned_thread_retirement(
                     retirement,
                     cleanup_agent_pod=(
                         not runtime_exposed
-                        or (orchestrator_destructive_zero and not prior_soft_settlement)
+                        or (
+                            permanent
+                            and not retiring_agent_response_pending
+                            and (
+                                agent_local_quiescence
+                                or prior_soft_settlement
+                                or orchestrator_destructive_zero
+                            )
+                        )
+                    ),
+                    defer_agent_workspace_claim_until_caller_exit=(
+                        agent_workspace_exit_handoff
                     ),
                 )
+                if agent_workspace_exit_handoff:
+                    return _ending_response(retiring_agent_exit_authorized=True)
                 if permanent:
                     await _delete_auxiliary_state(authoritative_thread)
                     await postgres_db.delete_thread(

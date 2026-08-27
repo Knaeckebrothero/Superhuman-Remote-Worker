@@ -1348,21 +1348,37 @@ class OrchestratorClient:
                 return False
             if not local_runtime_quiesced:
                 return True
-            # A generic 200 is not a local-quiescence receipt.  Only a typed
-            # terminal settlement response may let the old runtime clear its
-            # exact fence and exit; ``ending`` is reconciled through the
-            # append-only outcome endpoint below.
+            # A generic 200 is not a local-quiescence receipt. A typed terminal
+            # settlement normally lets the old runtime clear its exact fence.
+            # Permanent dedicated-agent teardown has one additional exact
+            # handoff: after the server durably accepts local quiescence it may
+            # authorize this caller to exit so an owner retry can delete the
+            # now-unmounted agent PVC. The token echo prevents a generic or
+            # stale ``ending`` response from being mistaken for that handoff.
             try:
                 payload = r.json()
             except Exception:
                 return False
-            return bool(
+            terminal_settlement = bool(
                 isinstance(payload, dict)
                 and payload.get("status")
                 in {"ended", "suspended", "deleted", "settled_or_superseded"}
                 and payload.get("retirement_disposition") == retirement_disposition
                 and payload.get("retirement_permanent") is retirement_permanent
             )
+            exact_exit_handoff = bool(
+                isinstance(payload, dict)
+                and retirement_permanent is True
+                and payload.get("status") == "ending"
+                and payload.get("retiring_agent_exit_authorized") is True
+                and payload.get("retirement_disposition") == retirement_disposition
+                and payload.get("retirement_permanent") is True
+                and _canonical_runtime_uuid(
+                    payload.get("session_runtime_retirement_token")
+                )
+                == retirement_token
+            )
+            return terminal_settlement or exact_exit_handoff
         except Exception as e:
             logger.warning(f"Thread status update failed (non-fatal): {e}")
             return False
