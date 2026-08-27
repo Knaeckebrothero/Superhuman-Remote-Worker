@@ -193,6 +193,11 @@ def test_enabled_lane_binds_one_config_to_server_client_and_bundle() -> None:
             "http://127.0.0.1:8080/index.php/apps/"
             "srw_protected_effect/api/v1/capability" in command
         )
+    nginx_config = hooks["data"]["nginx.conf"]
+    assert "server_name localhost;" in nginx_config
+    # Both allowlisted Nextcloud front-controller locations receive one
+    # trusted canonical Host; the capability script does not need it.
+    assert nginx_config.count("fastcgi_param HTTP_HOST localhost;") == 2
 
     service = next(
         document

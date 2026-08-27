@@ -1606,12 +1606,14 @@ class NextcloudBackend:
         resp = await self._client.delete(
             f"/ocs/v2.php/cloud/groups/{group_id}", params={"format": "json"}
         )
-        # 100/200 = deleted; 998/404 = already gone — revoke is idempotent.
+        # Nextcloud 31 returns HTTP 400 + OCS 101 for an absent group. Older
+        # releases used 998/404. Both are exact "already gone" evidence on
+        # this DELETE-only path, so revoke remains idempotent across versions.
         if resp.status_code == 404:
             return
         self._require_ocs_status(
             resp,
-            ok={100, 200, 998},
+            ok={100, 101, 200, 998},
             op=f"delete RO grant group {group_id}",
         )
 
@@ -1770,7 +1772,9 @@ class NextcloudBackend:
             return
         self._require_ocs_status(
             response,
-            ok={100, 200, 998},
+            # Nextcloud 31: HTTP 400 + OCS 101 means this exact user is
+            # absent. See the matching group cleanup above.
+            ok={100, 101, 200, 998},
             op=f"delete protected reader {reader_id}",
         )
 

@@ -11496,6 +11496,13 @@ class PostgresDB:
                 workspace = metadata.get("workspace_container")
                 current_binding = metadata.get("_workspace_binding")
                 current_binding = {} if current_binding is None else current_binding
+                try:
+                    previous_binding = _strict_json_object(
+                        intent["previous_binding"],
+                        label="workspace provision intent previous binding",
+                    )
+                except RuntimeError:
+                    return None
                 if not (
                     str(intent["status"]) == "planned"
                     and str(intent["runtime_generation"]) == str(parsed_generation)
@@ -11533,7 +11540,7 @@ class PostgresDB:
                     and str(workspace.get("_workspace_provision_generation") or "")
                     == str(parsed_generation)
                     and isinstance(current_binding, dict)
-                    and current_binding == dict(intent["previous_binding"] or {})
+                    and current_binding == previous_binding
                 ):
                     return None
                 pod_uid = str(intent["pod_uid"])
@@ -11543,7 +11550,7 @@ class PostgresDB:
                     if pvc_uid is not None
                     else f"k8s-pod:{intent['namespace']}:{pod_uid}"
                 )
-                previous = dict(intent["previous_binding"] or {})
+                previous = previous_binding
                 if (
                     intent["retained_binding_generation"] is not None
                     and str(intent["retained_pvc_uid"] or "") == str(pvc_uid or "")
