@@ -324,6 +324,45 @@ async def ensure_legacy_k8s_job_runtime_authority(
 
     workspace = _object(_object(current.get("context")).get("workspace_container"))
     marker = workspace.get(LEGACY_K8S_RUNTIME_ADOPTION_KEY)
+    # An adopted row that ordinary provisioning has since replaced is no longer
+    # adopted: the successor Pod was created by this server under a durable
+    # reservation and needs no adoption marker. Leaving the predecessor's
+    # marker there would make every later pre-network check re-attest a Pod
+    # that is gone and refuse delivery for good, so retire it -- the marker is
+    # not part of the 0196 authority envelope, and nothing else moves.
+    current_runtime = workspace.get("_runtime_incarnation")
+    if (
+        isinstance(marker, Mapping)
+        and current_runtime
+        and marker.get("runtime_incarnation") != current_runtime
+    ):
+        replaced = dict(workspace)
+        replaced.pop(LEGACY_K8S_RUNTIME_ADOPTION_KEY, None)
+        await db.adopt_legacy_k8s_job_workspace_runtime(
+            owner.id,
+            expected_status=str(current.get("status") or ""),
+            expected_execution_lane=current.get("execution_lane"),
+            expected_parent_job_id=(
+                str(current["parent_job_id"]) if current.get("parent_job_id") else None
+            ),
+            expected_contract=_object(current.get("context")).get(
+                WORKSPACE_CONTRACT_CONTEXT_KEY
+            ),
+            expected_legacy_backend=_object(current.get("context")).get(
+                "workspace_backend"
+            ),
+            expected_workspace_config=_object(current.get("config_override")).get(
+                "workspace"
+            ),
+            expected_workspace=workspace,
+            adopted_workspace=replaced,
+        )
+        return LegacyK8sAdoptionResult(
+            LegacyK8sAdoptionOutcome.NOT_NEEDED,
+            owner,
+            await db.get_job(owner.id),
+            "runtime_replaced_by_creation",
+        )
     try:
         first = await provisioner.attest_workspace_runtime(owner)
         if isinstance(marker, Mapping) and _attestation_matches_workspace(

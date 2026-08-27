@@ -23,6 +23,7 @@ from orchestrator.services.job_completion_commands import (
     accept_completion_command,
 )
 from src.shared.worker_queue import claim_worker_batch
+from tests._previous_release_seed import seed_previous_release_row
 
 
 SCHEMA_FILE = (
@@ -465,10 +466,19 @@ async def test_expired_marker_releases_dispatch_but_malformed_stays_closed(pg):
 async def test_stateless_active_marker_blocks_bypassed_queue_claim(pg):
     async with pg.acquire() as conn:
         job_id = await conn.fetchval(
-            "INSERT INTO jobs "
-            "(description, status, execution_lane, context) "
-            "VALUES ('stateless control ordering', 'paused', 'stateless', "
-            "$1::jsonb) RETURNING id",
+            "INSERT INTO jobs (description, status, execution_lane) "
+            "VALUES ('stateless control ordering', 'paused', 'stateless') "
+            "RETURNING id"
+        )
+        # A ready Kubernetes projection with no Pod UID is previous-release
+        # data; 0196 fences a writer that publishes one today. The subject here
+        # is control-plane claim ordering above such a row, so seed it the way
+        # the migration met it.
+        await seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            job_id,
             json.dumps(
                 {
                     "workspace_container": {
