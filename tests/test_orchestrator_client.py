@@ -592,6 +592,76 @@ class TestOrchestratorClient:
         )
 
     @pytest.mark.asyncio
+    async def test_exact_permanent_exit_handoff_releases_retiring_agent(self, client):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "status": "ending",
+            "retirement_disposition": "ended",
+            "retirement_permanent": True,
+            "retiring_agent_exit_authorized": True,
+            "session_runtime_retirement_token": RUNTIME_RETIREMENT_TOKEN,
+        }
+        client._client = MagicMock()
+        client._client.put = AsyncMock(return_value=response)
+        client.pinned_runtime_generation_contract = True
+
+        assert await client.update_thread_status(
+            "thread-a",
+            "ended",
+            pinned_agent_id="agent-123",
+            session_runtime_generation=RUNTIME_GENERATION,
+            session_runtime_attach_token=RUNTIME_ATTACH_TOKEN,
+            retirement_disposition="ended",
+            retirement_permanent=True,
+            session_runtime_retirement_token=RUNTIME_RETIREMENT_TOKEN,
+            local_runtime_quiesced=True,
+            local_quiescence_protocol="workspace_process_zero_v1",
+            workspace_generation=RUNTIME_GENERATION,
+            workspace_runtime_incarnation=RUNTIME_ATTACH_TOKEN,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("retiring_agent_exit_authorized", False),
+            ("session_runtime_retirement_token", RUNTIME_ATTACH_TOKEN),
+            ("retirement_permanent", False),
+        ],
+    )
+    async def test_permanent_exit_handoff_requires_exact_typed_echo(
+        self, client, field, value
+    ):
+        payload = {
+            "status": "ending",
+            "retirement_disposition": "ended",
+            "retirement_permanent": True,
+            "retiring_agent_exit_authorized": True,
+            "session_runtime_retirement_token": RUNTIME_RETIREMENT_TOKEN,
+        }
+        payload[field] = value
+        response = MagicMock(status_code=200)
+        response.json.return_value = payload
+        client._client = MagicMock()
+        client._client.put = AsyncMock(return_value=response)
+        client.pinned_runtime_generation_contract = True
+
+        assert not await client.update_thread_status(
+            "thread-a",
+            "ended",
+            pinned_agent_id="agent-123",
+            session_runtime_generation=RUNTIME_GENERATION,
+            session_runtime_attach_token=RUNTIME_ATTACH_TOKEN,
+            retirement_disposition="ended",
+            retirement_permanent=True,
+            session_runtime_retirement_token=RUNTIME_RETIREMENT_TOKEN,
+            local_runtime_quiesced=True,
+            local_quiescence_protocol="workspace_process_zero_v1",
+            workspace_generation=RUNTIME_GENERATION,
+            workspace_runtime_incarnation=RUNTIME_ATTACH_TOKEN,
+        )
+
+    @pytest.mark.asyncio
     async def test_suspend_echoes_exact_runtime_identity_headers(self, client):
         response = MagicMock(status_code=200)
         response.json.return_value = {"suspended": True}
