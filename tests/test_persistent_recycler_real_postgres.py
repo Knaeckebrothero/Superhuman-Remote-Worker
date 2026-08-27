@@ -3968,6 +3968,173 @@ async def test_soft_end_revokes_never_delivered_reader_before_zero_stage(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("manifest_blob", [b"{}", None], ids=["present", "missing"])
+async def test_soft_end_adopts_exact_review_after_reader_quiescence(db, manifest_blob):
+    """An End retry preserves review bytes after the live reader is gone."""
+
+    import main as orch_main
+
+    ids = await _seed(db)
+    row_id, plan, generation, _mount_id = await _seed_protected_ro_attempt(
+        db,
+        ids,
+        status="active",
+    )
+    workspace_generation = str(uuid4())
+    workspace_runtime = str(uuid4())
+    staged_summary = {
+        "signature": "pre-begin-staged-review",
+        "source_binding": plan.source.binding,
+        "source_binding_sha256": plan.source_sha256,
+        "counts": {"added": 0, "modified": 1, "deleted": 0},
+    }
+    async with db.acquire() as conn:
+        thread = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(thread["metadata"])
+        metadata["workspace_container"] = {
+            "status": "ready",
+            "provisioner": "k8s",
+            "namespace": "default",
+            "pod_name": f"ws-thread-{ids['thread'][:12]}",
+            "_runtime_incarnation": workspace_runtime,
+            "_canvas_workspace_generation": workspace_generation,
+        }
+        metadata["_workspace_binding"] = {
+            "kind": "remote",
+            "generation": workspace_generation,
+            "backing_id": f"k8s-pod:default:{workspace_runtime}",
+            "ssh_host_key_fingerprint": "SHA256:pre-staged-proof",
+        }
+        await conn.execute(
+            "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+        await conn.execute(
+            "UPDATE cloud_ro_mounts SET staged_epoch=8, staged_at=now(), "
+            "staged_summary=$2::jsonb WHERE id=$1::uuid",
+            UUID(row_id),
+            json.dumps(staged_summary),
+        )
+
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert retirement["context"]["protected_ro"]["staged_epoch"] == 8
+    assert retirement["context"]["protected_ro"]["staged_summary"] == staged_summary
+    await _authorize_and_ack(db, ids, retirement)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE agents SET status='offline' WHERE id=$1::uuid",
+            UUID(ids["agent"]),
+        )
+    assert await db.begin_ro_mount_revocation_if_matches(
+        row_id,
+        expected_thread_id=ids["thread"],
+        expected_runtime_generation=generation,
+        plan=plan,
+    )
+    assert await db.finish_ro_mount_revocation_if_matches(
+        row_id,
+        expected_thread_id=ids["thread"],
+        expected_runtime_generation=generation,
+        plan=plan,
+    )
+
+    published: list[dict | None] = []
+    publish_existing = db.publish_quiesced_retirement_existing_stage_receipt
+
+    async def _publish_existing(*args, **kwargs):
+        receipt = await publish_existing(*args, **kwargs)
+        published.append(receipt)
+        return receipt
+
+    current = await db.get_thread(ids["thread"])
+    assert current is not None
+    assert str(current["runtime_generation"]) == retirement["generation"]
+    assert str(current["runtime_retirement_token"]) == retirement["token"]
+    assert current["runtime_retirement_authorized_at"] is not None
+    assert current["runtime_retirement_permanent"] is False
+    assert current["runtime_authority_exposed"] is True
+    cleanup = AsyncMock(return_value=None)
+    snapshots = MagicMock()
+    snapshots.get_blob = AsyncMock(return_value=manifest_blob)
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "snapshot_service", snapshots),
+        patch.object(
+            db,
+            "publish_quiesced_retirement_existing_stage_receipt",
+            AsyncMock(side_effect=_publish_existing),
+        ) as publish_spy,
+        patch.object(orch_main, "_cleanup_pinned_thread_retirement", cleanup),
+        patch.object(
+            orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
+        ),
+        patch.object(
+            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+        ),
+        patch(
+            "services.cloud_staging.stage.stage_thread_cloud_diff",
+            AsyncMock(side_effect=AssertionError("quiesced retry must not re-stage")),
+        ),
+    ):
+        if manifest_blob is None:
+            with pytest.raises(orch_main.HTTPException) as retry_pending:
+                await orch_main._end_thread_flow(
+                    ids["thread"], current, permanent=False, force=True
+                )
+        else:
+            result = await orch_main._end_thread_flow(
+                ids["thread"], current, permanent=False, force=True
+            )
+
+    snapshots.get_blob.assert_awaited_once()
+    if manifest_blob is None:
+        assert retry_pending.value.status_code == 503
+        publish_spy.assert_not_awaited()
+        cleanup.assert_not_awaited()
+        pending = await db.get_thread(ids["thread"])
+        assert pending is not None
+        assert pending["runtime_retirement_stage_receipt"] is None
+        return
+
+    assert result == {"status": "ended"}
+    publish_spy.assert_awaited_once()
+    cleanup.assert_awaited_once()
+    assert len(published) == 1
+    receipt = published[0]
+    assert receipt is not None
+    assert receipt["kind"] == "unchanged"
+    assert receipt["expected_staged_epoch"] == 8
+    assert receipt["staged_epoch"] == 8
+    assert receipt["staged_summary"] == staged_summary
+
+    settled = await db.get_thread(ids["thread"])
+    assert settled is not None
+    assert settled["status"] == "ended"
+    assert settled["runtime_retirement_stage_receipt"] is None
+    ro_row = await db.get_ro_mount_by_thread(ids["thread"])
+    assert ro_row is not None
+    assert ro_row["status"] == "revoked"
+    assert ro_row["staged_epoch"] == 8
+    assert ro_row["staged_summary"] == staged_summary
+    async with db.acquire() as conn:
+        events = await conn.fetch(
+            "SELECT kind, payload FROM thread_events WHERE thread_id=$1::uuid "
+            "ORDER BY seq",
+            UUID(ids["thread"]),
+        )
+    assert [event["kind"] for event in events] == [
+        "cloud.diff_staged",
+        "session.ended",
+    ]
+    assert _json(events[0]["payload"])["staged_epoch"] == 8
+    assert _json(events[0]["payload"])["counts"] == staged_summary["counts"]
+
+
+@pytest.mark.asyncio
 async def test_malformed_protected_marker_cannot_soft_retire_as_unprotected(db):
     ids = await _seed(db)
     async with db.acquire() as conn:

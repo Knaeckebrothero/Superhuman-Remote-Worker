@@ -51177,7 +51177,10 @@ async def _end_thread_flow(
                 # permanent deletion.  Soft End/Suspend must finish and
                 # durably announce staging before settlement reopens Resume.
                 if not permanent and authoritative_metadata.get("protected_cloud"):
-                    from services.cloud_staging.stage import stage_thread_cloud_diff
+                    from services.cloud_staging.stage import (
+                        stage_thread_cloud_diff,
+                        staging_manifest_key,
+                    )
 
                     ro_row = await postgres_db.get_ro_mount_by_thread(thread_id)
                     receipt_present = (
@@ -51201,29 +51204,54 @@ async def _end_thread_flow(
                             authoritative_thread, ro_row or {}
                         )
                         if stage_authority is None:
-                            # A protected create may be ended before workspace
-                            # attach or credential delivery.  An engaging (or
-                            # fully probed active) reader grant is an external
-                            # resource, not process exposure: exact-revoke its
-                            # captured attempt before publishing the distinct
-                            # zero-stage receipt.  This deliberately does not
-                            # run the rest of cleanup before mandatory staging.
-                            await _revoke_never_delivered_protected_reader(
-                                retirement,
-                                authoritative_thread,
-                                ro_row,
+                            captured_ro = (retirement.get("context") or {}).get(
+                                "protected_ro"
                             )
-                            never_engaged = await postgres_db.publish_never_engaged_retirement_stage_receipt(
-                                thread_id,
-                                expected_runtime_generation=str(
-                                    retirement["generation"]
-                                ),
-                                expected_retirement_token=str(retirement["token"]),
+                            captured_summary = (
+                                captured_ro.get("staged_summary")
+                                if isinstance(captured_ro, Mapping)
+                                else None
                             )
-                            if never_engaged is None:
-                                raise RuntimeError(
-                                    "protected retirement lacks exact staging authority"
+                            manifest_present = bool(
+                                isinstance(captured_summary, dict)
+                                and await snapshot_service.get_blob(
+                                    staging_manifest_key(thread_id, captured_summary)
                                 )
+                                is not None
+                            )
+                            pre_staged = None
+                            if manifest_present:
+                                pre_staged = await postgres_db.publish_quiesced_retirement_existing_stage_receipt(
+                                    thread_id,
+                                    expected_runtime_generation=str(
+                                        retirement["generation"]
+                                    ),
+                                    expected_retirement_token=str(retirement["token"]),
+                                )
+                            if pre_staged is None:
+                                # A protected create may be ended before workspace
+                                # attach or credential delivery.  An engaging (or
+                                # fully probed active) reader grant is an external
+                                # resource, not process exposure: exact-revoke its
+                                # captured attempt before publishing the distinct
+                                # zero-stage receipt.  This deliberately does not
+                                # run the rest of cleanup before mandatory staging.
+                                await _revoke_never_delivered_protected_reader(
+                                    retirement,
+                                    authoritative_thread,
+                                    ro_row,
+                                )
+                                never_engaged = await postgres_db.publish_never_engaged_retirement_stage_receipt(
+                                    thread_id,
+                                    expected_runtime_generation=str(
+                                        retirement["generation"]
+                                    ),
+                                    expected_retirement_token=str(retirement["token"]),
+                                )
+                                if never_engaged is None:
+                                    raise RuntimeError(
+                                        "protected retirement lacks exact staging authority"
+                                    )
                             authoritative_thread = (
                                 await postgres_db.get_thread(thread_id)
                                 or authoritative_thread
@@ -51237,7 +51265,11 @@ async def _end_thread_flow(
                             )
                             if not receipt_valid:
                                 raise RuntimeError(
-                                    "never-engaged retirement receipt is inconsistent"
+                                    (
+                                        "pre-staged retirement receipt is inconsistent"
+                                        if pre_staged is not None
+                                        else "never-engaged retirement receipt is inconsistent"
+                                    )
                                 )
                             staged_event = receipt_event
                         else:
