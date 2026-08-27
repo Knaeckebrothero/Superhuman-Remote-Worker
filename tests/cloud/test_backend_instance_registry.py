@@ -11,6 +11,7 @@ from orchestrator.services.cloud.backend_instance_authority import (
 )
 from orchestrator.services.cloud.instance_registry import (
     activate_main_cloud_config,
+    build_attested_main_cloud_candidate,
     initialize_main_cloud_instance_authority,
     reload_active_main_cloud_instance,
 )
@@ -72,6 +73,60 @@ def _active(
     revision: int,
 ) -> dict[str, object]:
     return {"authority": authority, "activation_revision": revision}
+
+
+@pytest.mark.asyncio
+async def test_candidate_prepares_provisional_instance_before_remote_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str | None]] = []
+
+    class _TrackingBackend(FakeMainCloudBackend):
+        backend_id = "nextcloud"
+
+        def prepare_backend_instance_attestation(
+            self,
+            backend_instance_id: str,
+        ) -> None:
+            events.append(("prepare", backend_instance_id))
+            super().prepare_backend_instance_attestation(backend_instance_id)
+
+        async def ensure_initialized(self) -> bool:
+            events.append(("initialize", self.backend_instance_id))
+            self._installation_proof_sha256 = _PROOF_A
+            return await super().ensure_initialized()
+
+    backend = _TrackingBackend(start_initialized=False)
+    authority = _authority()
+    import orchestrator.services.cloud.instance_registry as registry
+
+    settings = type("Settings", (), {"backend_id": "nextcloud"})()
+    monkeypatch.setattr(registry, "load_main_cloud_config", lambda **_kwargs: settings)
+    monkeypatch.setattr(
+        registry,
+        "main_cloud_secret_references",
+        lambda *_args: authority.secret_refs,
+    )
+    monkeypatch.setattr(
+        registry,
+        "main_cloud_routing_snapshot",
+        lambda _settings: authority.routing,
+    )
+    monkeypatch.setattr(
+        registry,
+        "build_backend_from_config",
+        lambda _settings: backend,
+    )
+
+    candidate_backend, candidate = await build_attested_main_cloud_candidate(
+        db_overlay=None,
+        backend_instance_id=_A,
+    )
+
+    assert candidate_backend is backend
+    assert candidate.backend_instance_id == _A
+    assert backend.backend_instance_id is None
+    assert events == [("prepare", _A), ("initialize", None)]
 
 
 @pytest.mark.asyncio

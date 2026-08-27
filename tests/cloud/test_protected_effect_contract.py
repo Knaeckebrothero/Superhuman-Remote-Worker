@@ -15,11 +15,14 @@ from orchestrator.services.cloud.protected_effect_contract import (
     NextcloudEffectFenceIntent,
     NextcloudEffectHorizon,
     NextcloudEffectRequestAuthority,
+    NextcloudInstallationAttestation,
     ValidatedNextcloudEffectCapability,
     adopt_protected_effect_capability,
+    adopt_protected_effect_installation_attestation,
     calculate_protected_effect_safe_after,
     normalize_protected_effect_path,
     sign_protected_effect_capability,
+    sign_protected_effect_installation_attestation,
     sign_protected_effect_request,
     verify_protected_effect_capability_signature,
     verify_protected_effect_request_signature,
@@ -31,6 +34,7 @@ OTHER_BACKEND_INSTANCE_ID = "88888888-8888-4888-8888-bbbbbbbbbbbb"
 ENGAGE_ATTEMPT = "11111111-1111-4111-8111-aaaaaaaaaaaa"
 OTHER_ENGAGE_ATTEMPT = "22222222-2222-4222-8222-bbbbbbbbbbbb"
 CONFIG_SHA256 = "a" * 64
+INSTALLATION_PROOF_SHA256 = "d" * 64
 BODY_SHA256 = "b" * 64
 HMAC_KEY = bytes(range(32))
 SERVER_TIME = datetime(2026, 8, 26, 12, 34, 56, 123456, tzinfo=timezone.utc)
@@ -49,6 +53,22 @@ def _capability(**overrides: Any) -> NextcloudEffectCapability:
     }
     values.update(overrides)
     return NextcloudEffectCapability(**values)
+
+
+def _installation_attestation(
+    capability: NextcloudEffectCapability | None = None,
+    **overrides: Any,
+) -> NextcloudInstallationAttestation:
+    wire_capability = capability or _capability()
+    values: dict[str, Any] = {
+        "backend_instance_id": wire_capability.backend_instance_id,
+        "config_sha256": wire_capability.config_sha256,
+        "installation_proof_sha256": INSTALLATION_PROOF_SHA256,
+        "capability_sha256": wire_capability.capability_sha256,
+        "server_time": wire_capability.server_time,
+    }
+    values.update(overrides)
+    return NextcloudInstallationAttestation(**values)
 
 
 def _request(**overrides: Any) -> NextcloudEffectRequestAuthority:
@@ -254,6 +274,126 @@ def test_capability_validates_a_fresh_postgres_clock_window() -> None:
     assert validated.capability == capability
     assert validated.db_after == SERVER_TIME + timedelta(seconds=1)
     assert validated.fresh_until == SERVER_TIME + timedelta(seconds=3)
+
+
+def test_startup_attestation_returns_only_a_fresh_signed_installation_proof() -> None:
+    capability = _capability()
+    capability_signature = sign_protected_effect_capability(
+        capability,
+        key=HMAC_KEY,
+    )
+    attestation = _installation_attestation(capability)
+    attestation_signature = sign_protected_effect_installation_attestation(
+        attestation,
+        key=HMAC_KEY,
+    )
+
+    assert (
+        adopt_protected_effect_installation_attestation(
+            capability.binding,
+            capability_signature=capability_signature,
+            attestation_binding=attestation.binding,
+            attestation_signature=attestation_signature,
+            key=HMAC_KEY,
+            client_before=SERVER_TIME - timedelta(seconds=1),
+            client_after=SERVER_TIME + timedelta(seconds=1),
+            expected_backend_instance_id=BACKEND_INSTANCE_ID,
+            expected_config_sha256=CONFIG_SHA256,
+        )
+        == INSTALLATION_PROOF_SHA256
+    )
+    assert (
+        adopt_protected_effect_installation_attestation(
+            capability.binding,
+            capability_signature=capability_signature,
+            attestation_binding=attestation.binding,
+            attestation_signature="0" * 64,
+            key=HMAC_KEY,
+            client_before=SERVER_TIME - timedelta(seconds=1),
+            client_after=SERVER_TIME + timedelta(seconds=1),
+            expected_backend_instance_id=BACKEND_INSTANCE_ID,
+            expected_config_sha256=CONFIG_SHA256,
+        )
+        is None
+    )
+    assert (
+        adopt_protected_effect_installation_attestation(
+            capability.binding,
+            capability_signature=capability_signature,
+            attestation_binding=attestation.binding,
+            attestation_signature=attestation_signature,
+            key=HMAC_KEY,
+            client_before=SERVER_TIME + timedelta(seconds=10),
+            client_after=SERVER_TIME + timedelta(seconds=11),
+            expected_backend_instance_id=BACKEND_INSTANCE_ID,
+            expected_config_sha256=CONFIG_SHA256,
+        )
+        is None
+    )
+
+
+def test_installation_attestation_has_an_exact_separate_wire_shape() -> None:
+    attestation = _installation_attestation()
+
+    assert set(attestation.binding) == {
+        "version",
+        "backend_instance_id",
+        "config_sha256",
+        "installation_proof_sha256",
+        "capability_sha256",
+        "server_time",
+    }
+    assert (
+        NextcloudInstallationAttestation.from_binding(attestation.binding)
+        == attestation
+    )
+    assert (
+        NextcloudInstallationAttestation.from_binding(
+            {**attestation.binding, "remote_identity": "must-not-cross-boundary"}
+        )
+        is None
+    )
+    malformed = dict(attestation.binding)
+    malformed["installation_proof_sha256"] = "D" * 64
+    assert NextcloudInstallationAttestation.from_binding(malformed) is None
+
+
+@pytest.mark.parametrize(
+    "attestation",
+    [
+        _installation_attestation(capability_sha256="e" * 64),
+        _installation_attestation(config_sha256="e" * 64),
+        _installation_attestation(backend_instance_id=OTHER_BACKEND_INSTANCE_ID),
+        _installation_attestation(server_time=SERVER_TIME + timedelta(microseconds=1)),
+    ],
+)
+def test_startup_attestation_refuses_cross_capability_substitution(
+    attestation: NextcloudInstallationAttestation,
+) -> None:
+    capability = _capability()
+
+    assert (
+        adopt_protected_effect_installation_attestation(
+            capability.binding,
+            capability_signature=sign_protected_effect_capability(
+                capability,
+                key=HMAC_KEY,
+            ),
+            attestation_binding=attestation.binding,
+            attestation_signature=(
+                sign_protected_effect_installation_attestation(
+                    attestation,
+                    key=HMAC_KEY,
+                )
+            ),
+            key=HMAC_KEY,
+            client_before=SERVER_TIME - timedelta(seconds=1),
+            client_after=SERVER_TIME + timedelta(seconds=1),
+            expected_backend_instance_id=BACKEND_INSTANCE_ID,
+            expected_config_sha256=CONFIG_SHA256,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

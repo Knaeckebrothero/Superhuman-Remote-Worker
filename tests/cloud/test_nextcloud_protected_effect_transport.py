@@ -15,8 +15,10 @@ from orchestrator.services.cloud.protected_effect_contract import (
     NextcloudEffectCapability,
     NextcloudEffectFenceIntent,
     NextcloudEffectRequestAuthority,
+    NextcloudInstallationAttestation,
     adopt_protected_effect_capability,
     sign_protected_effect_capability,
+    sign_protected_effect_installation_attestation,
     sign_protected_effect_request,
 )
 
@@ -24,6 +26,7 @@ from orchestrator.services.cloud.protected_effect_contract import (
 INSTANCE = "99999999-9999-4999-8999-999999999999"
 ATTEMPT = "33333333-3333-4333-8333-333333333333"
 CONFIG_SHA = "a" * 64
+INSTALLATION_PROOF_SHA = "d" * 64
 KEY = b"k" * 32
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
 
@@ -53,6 +56,27 @@ def _capability() -> NextcloudEffectCapability:
         capability_max_age_seconds=5,
         server_time=NOW,
     )
+
+
+def _capability_payload(capability: NextcloudEffectCapability) -> dict:
+    attestation = NextcloudInstallationAttestation(
+        backend_instance_id=INSTANCE,
+        config_sha256=CONFIG_SHA,
+        installation_proof_sha256=INSTALLATION_PROOF_SHA,
+        capability_sha256=capability.capability_sha256,
+        server_time=capability.server_time,
+    )
+    return {
+        "capability": capability.binding,
+        "signature": sign_protected_effect_capability(capability, key=KEY),
+        "installation_attestation": attestation.binding,
+        "installation_signature": (
+            sign_protected_effect_installation_attestation(
+                attestation,
+                key=KEY,
+            )
+        ),
+    }
 
 
 def _intent(*, body: bytes, path: str) -> NextcloudEffectFenceIntent:
@@ -98,11 +122,23 @@ async def test_initialization_builds_a_distinct_json_effect_client(
             clients.append(self)
 
         async def get(self, path: str, **_kwargs) -> httpx.Response:
-            payload = (
-                {"installed": True, "instanceid": "installation-1"}
-                if path == "/status.php"
-                else {"ocs": {"meta": {"statuscode": 100}, "data": {}}}
-            )
+            if path == "/status.php":
+                # Nextcloud 31 deliberately no longer publishes instanceid.
+                payload = {"installed": True, "version": "31.0.0"}
+            elif path.endswith("/api/v1/capability"):
+                capability = NextcloudEffectCapability(
+                    backend_instance_id=INSTANCE,
+                    config_sha256=CONFIG_SHA,
+                    queue_bound_seconds=30,
+                    handler_bound_seconds=10,
+                    clock_skew_bound_seconds=2,
+                    safety_margin_seconds=5,
+                    capability_max_age_seconds=5,
+                    server_time=datetime.now(timezone.utc),
+                )
+                payload = _capability_payload(capability)
+            else:
+                payload = {"ocs": {"meta": {"statuscode": 100}, "data": {}}}
             return httpx.Response(
                 200,
                 request=httpx.Request("GET", f"https://cloud.invalid{path}"),
@@ -117,8 +153,13 @@ async def test_initialization_builds_a_distinct_json_effect_client(
         _Client,
     )
     backend = NextcloudBackend(_settings())
+    backend.prepare_backend_instance_attestation(INSTANCE)
 
     assert await backend.ensure_initialized() is True
+    assert backend.backend_instance_id is None
+    assert backend.installation_proof_sha256 == INSTALLATION_PROOF_SHA
+    backend.bind_backend_instance(INSTANCE)
+    assert backend.backend_instance_id == INSTANCE
     assert len(clients) == 2
     ordinary, effect = clients
     assert ordinary.kwargs["base_url"] == "https://cloud.internal.example/nextcloud"
@@ -142,13 +183,7 @@ async def test_capability_and_effect_use_only_the_isolated_effect_origin() -> No
         if request.url.path.endswith("/api/v1/capability"):
             return httpx.Response(
                 200,
-                json={
-                    "capability": capability.binding,
-                    "signature": sign_protected_effect_capability(
-                        capability,
-                        key=KEY,
-                    ),
-                },
+                json=_capability_payload(capability),
             )
         return httpx.Response(
             200,

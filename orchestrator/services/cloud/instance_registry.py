@@ -52,7 +52,9 @@ async def build_attested_main_cloud_candidate(
     settings = load_main_cloud_config(db_overlay=db_overlay)
     secret_refs = main_cloud_secret_references(settings.backend_id, db_overlay)
     backend = build_backend_from_config(settings)
+    proposed_instance_id = backend_instance_id or str(uuid4())
     try:
+        backend.prepare_backend_instance_attestation(proposed_instance_id)
         initialized = await backend.ensure_initialized()
         proof = backend.installation_proof_sha256
         if not initialized or proof is None:
@@ -60,7 +62,7 @@ async def build_attested_main_cloud_candidate(
                 "main-cloud backend did not attest a stable installation identity"
             )
         authority = MainCloudBackendInstanceAuthority.capture(
-            backend_instance_id=backend_instance_id or str(uuid4()),
+            backend_instance_id=proposed_instance_id,
             backend_id=settings.backend_id,
             routing=main_cloud_routing_snapshot(settings),
             installation_proof_sha256=proof,

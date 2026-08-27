@@ -122,6 +122,10 @@ class FakeMainCloudBackend:
             raise RuntimeError("fake backend instance authority changed")
         self._backend_instance_id = backend_instance_id
 
+    def prepare_backend_instance_attestation(self, backend_instance_id: str) -> None:
+        if not isinstance(backend_instance_id, str) or not backend_instance_id:
+            raise ValueError("fake attestation instance is missing")
+
     @property
     def webdav_credentials(self) -> dict[str, str]:
         return {"username": "fake-agent", "password": "fake-password"}

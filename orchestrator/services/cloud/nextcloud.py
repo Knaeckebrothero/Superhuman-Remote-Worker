@@ -33,6 +33,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
@@ -62,7 +63,10 @@ from .handles import (
 from .retry import LeakyBucket
 from .telemetry import instrument_backend_op
 from .protected_reader_authority import ProtectedNextcloudReaderGrantPlan
-from .protected_effect_contract import NextcloudEffectFenceIntent
+from .protected_effect_contract import (
+    NextcloudEffectFenceIntent,
+    adopt_protected_effect_installation_attestation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +133,7 @@ class NextcloudBackend:
         self._client: Optional[httpx.AsyncClient] = None
         self._protected_effect_client: Optional[httpx.AsyncClient] = None
         self._backend_instance_id: Optional[str] = None
+        self._attestation_backend_instance_id: Optional[str] = None
         self._installation_proof_sha256: Optional[str] = None
         self._share_bucket = LeakyBucket(
             max_events=_SHARE_RATE_LIMIT_EVENTS,
@@ -169,6 +174,23 @@ class NextcloudBackend:
         if self._backend_instance_id not in {None, backend_instance_id}:
             raise RuntimeError("Nextcloud backend instance authority changed")
         self._backend_instance_id = backend_instance_id
+        self._attestation_backend_instance_id = None
+
+    def prepare_backend_instance_attestation(self, backend_instance_id: str) -> None:
+        """Supply a proposed UUID without treating it as routing authority."""
+
+        if not isinstance(backend_instance_id, str) or not backend_instance_id:
+            raise ValueError("Nextcloud attestation instance is missing")
+        if self._backend_instance_id is not None:
+            if self._backend_instance_id != backend_instance_id:
+                raise RuntimeError("Nextcloud backend instance authority changed")
+            return
+        if self._attestation_backend_instance_id not in {
+            None,
+            backend_instance_id,
+        }:
+            raise RuntimeError("Nextcloud attestation instance changed")
+        self._attestation_backend_instance_id = backend_instance_id
 
     def _protected_effect_origin_path(self, path: str) -> str:
         """Prefix a signed target with the installation path exactly once."""
@@ -186,9 +208,29 @@ class NextcloudBackend:
         """Fetch the remote app's signed, installation-bound timing contract."""
 
         self._ensure_ready()
+        if self._backend_instance_id is None:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_SUPPORTED,
+                "protected Nextcloud effect lane has no instance authority",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        (
+            capability,
+            signature,
+            _attestation,
+            _attestation_signature,
+        ) = await self._request_protected_effect_capability(self._backend_instance_id)
+        return capability, signature
+
+    async def _request_protected_effect_capability(
+        self,
+        backend_instance_id: str,
+    ) -> tuple[dict[str, Any], str, dict[str, Any], str]:
+        """Fetch capability bytes during startup or normal effect dispatch."""
+
         if (
-            self._backend_instance_id is None
-            or self._protected_effect_client is None
+            self._protected_effect_client is None
             or self._protected_effect_config_sha256 is None
             or self._protected_effect_hmac_key is None
         ):
@@ -202,7 +244,7 @@ class NextcloudBackend:
             response = await self._protected_effect_client.get(
                 self._protected_effect_origin_path(_PROTECTED_EFFECT_CAPABILITY_PATH),
                 headers={
-                    _PROTECTED_EFFECT_INSTANCE_HEADER: self._backend_instance_id,
+                    _PROTECTED_EFFECT_INSTANCE_HEADER: backend_instance_id,
                 },
             )
             response.raise_for_status()
@@ -219,6 +261,8 @@ class NextcloudBackend:
         if not isinstance(payload, dict) or set(payload) != {
             "capability",
             "signature",
+            "installation_attestation",
+            "installation_signature",
         }:
             raise CloudBackendError(
                 CloudBackendErrorKind.UNKNOWN,
@@ -227,13 +271,20 @@ class NextcloudBackend:
             )
         capability = payload.get("capability")
         signature = payload.get("signature")
-        if not isinstance(capability, dict) or not isinstance(signature, str):
+        attestation = payload.get("installation_attestation")
+        attestation_signature = payload.get("installation_signature")
+        if (
+            not isinstance(capability, dict)
+            or not isinstance(signature, str)
+            or not isinstance(attestation, dict)
+            or not isinstance(attestation_signature, str)
+        ):
             raise CloudBackendError(
                 CloudBackendErrorKind.UNKNOWN,
                 "protected Nextcloud effect capability response is malformed",
                 backend=self.backend_id,
             )
-        return capability, signature
+        return capability, signature, attestation, attestation_signature
 
     async def dispatch_protected_effect(
         self,
@@ -453,16 +504,11 @@ class NextcloudBackend:
                 if isinstance(status_payload, dict)
                 else None
             )
+            legacy_installation_proof = None
             if isinstance(remote_instance_id, str) and remote_instance_id.strip():
-                self._installation_proof_sha256 = main_cloud_installation_proof_sha256(
+                legacy_installation_proof = main_cloud_installation_proof_sha256(
                     backend_id=self.backend_id,
                     remote_identity=remote_instance_id,
-                )
-            else:
-                self._installation_proof_sha256 = None
-                logger.warning(
-                    "Nextcloud status response has no installation identity; "
-                    "protected cloud effects remain unavailable"
                 )
 
             resp = await self._client.get(
@@ -503,6 +549,57 @@ class NextcloudBackend:
                     await self._protected_effect_client.aclose()
                     self._protected_effect_client = None
                 return False
+
+            installation_proof = legacy_installation_proof
+            if self._protected_effect_url is not None:
+                attestation_instance_id = (
+                    self._backend_instance_id or self._attestation_backend_instance_id
+                )
+                if attestation_instance_id is None:
+                    raise RuntimeError(
+                        "protected Nextcloud installation attestation has no "
+                        "proposed backend instance"
+                    )
+                client_before = datetime.now(timezone.utc)
+                (
+                    capability,
+                    capability_signature,
+                    installation_attestation,
+                    installation_signature,
+                ) = await self._request_protected_effect_capability(
+                    attestation_instance_id
+                )
+                client_after = datetime.now(timezone.utc)
+                signed_proof = adopt_protected_effect_installation_attestation(
+                    capability,
+                    capability_signature=capability_signature,
+                    attestation_binding=installation_attestation,
+                    attestation_signature=installation_signature,
+                    key=self._protected_effect_hmac_key,
+                    client_before=client_before,
+                    client_after=client_after,
+                    expected_backend_instance_id=attestation_instance_id,
+                    expected_config_sha256=self._protected_effect_config_sha256,
+                )
+                if signed_proof is None:
+                    raise RuntimeError(
+                        "protected Nextcloud installation attestation is invalid"
+                    )
+                if (
+                    legacy_installation_proof is not None
+                    and signed_proof != legacy_installation_proof
+                ):
+                    raise RuntimeError(
+                        "protected Nextcloud installation proofs disagree"
+                    )
+                installation_proof = signed_proof
+
+            self._installation_proof_sha256 = installation_proof
+            if installation_proof is None:
+                logger.warning(
+                    "Nextcloud exposes no stable installation identity; "
+                    "main-cloud authority remains unavailable"
+                )
 
             self._initialized = True
             logger.info("Nextcloud backend initialized (groupfolders available)")

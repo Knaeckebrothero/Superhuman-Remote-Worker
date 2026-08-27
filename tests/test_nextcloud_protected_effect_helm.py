@@ -368,6 +368,7 @@ def test_lane_refuses_external_or_unbounded_server_configuration(
 
 def test_server_bundle_verifies_before_nextcloud_and_exposes_only_five_posts() -> None:
     common = (EFFECT_FILES / "common.php").read_text()
+    capability = (EFFECT_FILES / "capability.php").read_text()
     prepend = (EFFECT_FILES / "prepend.php").read_text()
     launcher = (EFFECT_FILES / "start-fpm.sh").read_text()
     nginx = (EFFECT_FILES / "nginx.conf").read_text()
@@ -380,6 +381,21 @@ def test_server_bundle_verifies_before_nextcloud_and_exposes_only_five_posts() -
         'const SRW_EFFECT_REQUEST_DOMAIN = "srw-nextcloud-effect-request-v1\\0";'
         in common
     )
+    assert (
+        "const SRW_MAIN_CLOUD_INSTALLATION_DOMAIN = "
+        '"srw-main-cloud-installation-v1\\0";' in capability
+    )
+    assert (
+        "const SRW_INSTALLATION_ATTESTATION_DOMAIN = "
+        '"srw-nextcloud-installation-attestation-v1\\0";' in capability
+    )
+    assert "'/var/www/html/config/config.php'" in capability
+    assert (
+        "'installation_proof_sha256' => "
+        "srw_effect_installation_proof_sha256()" in capability
+    )
+    assert "echo $remoteIdentity" not in capability
+    assert "json_encode($remoteIdentity" not in capability
     assert "srw_effect_verify_request(" in prepend
     assert "($_SERVER['SRW_PROTECTED_EFFECT_CAPABILITY'] ?? '') === '1'" in prepend
     assert "/var/www/html/index.php" not in prepend
