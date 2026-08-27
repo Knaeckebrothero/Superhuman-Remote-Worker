@@ -19,7 +19,11 @@ from orchestrator.services.lifecycle import (
     WorkspaceInstanceManager,
     expected_workspace_shas,
 )
-from orchestrator.services.container_provisioner import WorkspaceTeardownIdentity
+from services.container_provisioner import (
+    WorkspaceCleanupOutcome,
+    WorkspaceRuntimeAttestation,
+    WorkspaceTeardownIdentity,
+)
 from services.workspace_lifecycle import WorkspaceOwner
 
 
@@ -61,7 +65,20 @@ def _make_manager(
     pod_list = MagicMock()
     pod_list.items = pods or []
     container._core_api.list_namespaced_pod.return_value = pod_list
-    container.delete_workspace = AsyncMock(return_value=True)
+    container.delete_workspace = AsyncMock(return_value=False)
+    container.delete_workspace_with_outcome = AsyncMock()
+
+    async def prepare_cleanup(_owner, **kwargs):
+        return {
+            "intent_generation": 7,
+            "resources_captured_at": "2026-08-27T00:00:00+00:00",
+            "reclaim_shared_resources": kwargs["reclaim_shared_resources"],
+        }
+
+    container.prepare_workspace_cleanup_intent = AsyncMock(side_effect=prepare_cleanup)
+    container.reconcile_workspace_cleanup_intent = AsyncMock(
+        return_value=WorkspaceCleanupOutcome("settled", 7)
+    )
     container.delete_workspace_pvc = AsyncMock(return_value=True)
     container._delete_service = AsyncMock(return_value=True)
     container.capture_workspace_teardown_identity = AsyncMock(
@@ -80,6 +97,16 @@ def _make_manager(
             ssh_host_key_fingerprint="SHA256:lifecycle-test",
         )
     )
+    container.attest_workspace_runtime = AsyncMock(
+        return_value=WorkspaceRuntimeAttestation(
+            backing_id="k8s-pod:test-ns:11111111-1111-4111-8111-111111111111",
+            workspace_generation="44444444-4444-4444-8444-444444444444",
+            runtime_incarnation="11111111-1111-4111-8111-111111111111",
+            ssh_host_key_fingerprint="SHA256:lifecycle-test",
+            host="agent-workspace-j1.test-ns.svc",
+            pod_ip="10.0.0.7",
+        )
+    )
 
     suspension = MagicMock()
     suspension.is_enabled = suspension_enabled
@@ -92,6 +119,8 @@ def _make_manager(
 
     db = AsyncMock()
     db.get_job = AsyncMock(side_effect=lambda jid: (job_rows or {}).get(jid))
+    db.merge_workspace_container_context_if_runtime = AsyncMock(return_value=True)
+    db.merge_thread_workspace_context_if_runtime = AsyncMock(return_value=True)
     db.acquire = MagicMock()
     conn = AsyncMock()
 
@@ -108,7 +137,7 @@ def _make_manager(
                 if completion_command_exists
                 else None
             )
-        if "FROM jobs" in sql and "FOR UPDATE" in sql:
+        if "FROM jobs" in sql:
             row = (job_rows or {}).get(identity)
             if row is None:
                 return None
@@ -151,6 +180,28 @@ def _make_manager(
     )
     mgr._test_completion_router = router
     return mgr, container, suspension, snapshot, db
+
+
+def _assert_exact_workspace_delete(
+    container: MagicMock,
+    owner: WorkspaceOwner,
+    runtime_uid: str = "11111111-1111-4111-8111-111111111111",
+) -> None:
+    container.prepare_workspace_cleanup_intent.assert_awaited_once()
+    prepare = container.prepare_workspace_cleanup_intent.await_args
+    assert prepare.args == (owner,)
+    assert prepare.kwargs["expected_runtime_incarnation"] == runtime_uid
+    assert prepare.kwargs["target_disposition"] in {"deleted", "suspended"}
+    assert type(prepare.kwargs["reclaim_shared_resources"]) is bool
+    assert "identity" not in prepare.kwargs
+    container.reconcile_workspace_cleanup_intent.assert_awaited_once_with(
+        owner,
+        expected_runtime_incarnation=runtime_uid,
+        intent_generation=7,
+    )
+    container.delete_workspace.assert_not_awaited()
+    container.delete_workspace_with_outcome.assert_not_awaited()
+    container.capture_workspace_teardown_identity.assert_not_awaited()
 
 
 async def _fake_to_thread(fn, *args, **kwargs):
@@ -338,7 +389,7 @@ class TestStatelessThreadLifecycleRefusal:
     @staticmethod
     def _assert_no_effects(container, snapshot, db):
         snapshot.capture_vm_snapshot.assert_not_called()
-        container.delete_workspace.assert_not_called()
+        container.delete_workspace_with_outcome.assert_not_called()
         container.create_workspace.assert_not_called()
         container.delete_workspace_pvc.assert_not_called()
         container._delete_service.assert_not_called()
@@ -426,7 +477,7 @@ class TestStatelessThreadLifecycleRefusal:
         self._assert_no_effects(container, snapshot, db)
 
     @pytest.mark.asyncio
-    async def test_pinned_ended_dirty_thread_keeps_legacy_reap_behavior(
+    async def test_pinned_ended_dirty_thread_is_contained_without_capture_or_reap(
         self, monkeypatch
     ):
         monkeypatch.delenv("WORKSPACE_IMAGE", raising=False)
@@ -443,11 +494,10 @@ class TestStatelessThreadLifecycleRefusal:
         ):
             report = await InstanceLifecycleReconciler([mgr]).tick()
 
-        assert report["workspace"]["reaped"] == 1
-        snapshot.capture_vm_snapshot.assert_awaited_once()
-        container.delete_workspace.assert_awaited_once_with(
-            WorkspaceOwner.session("thread-stateless")
-        )
+        assert report["workspace"]["reaped"] == 0
+        snapshot.capture_vm_snapshot.assert_not_awaited()
+        container.prepare_workspace_cleanup_intent.assert_not_awaited()
+        container.delete_workspace_with_outcome.assert_not_awaited()
 
 
 # =============================================================================
@@ -685,7 +735,7 @@ class TestCompletionFinalizerTeardownOwnership:
         assert "completion_control_owned" not in inst.metadata
         assert "completion_lifecycle_disposition" not in inst.metadata
         assert "execution_lane" not in inst.metadata
-        assert "pod_uid" not in inst.metadata
+        assert inst.metadata["pod_uid"] == "11111111-1111-4111-8111-111111111111"
         assert await mgr.is_healthy(inst) is False
         assert await mgr.is_reapable(inst) is True
         conn = db.acquire.return_value.__aenter__.return_value
@@ -826,7 +876,7 @@ class TestCompletionFinalizerTeardownOwnership:
         await mgr.give_up(give_up_inst, grace_s=0)
 
         snapshot.capture_vm_snapshot.assert_not_awaited()
-        container.delete_workspace.assert_not_awaited()
+        container.delete_workspace_with_outcome.assert_not_awaited()
         container.create_workspace.assert_not_awaited()
         route_queries = [
             str(call.args[0])
@@ -906,7 +956,7 @@ class TestCompletionControlLifecycleOwnership:
         await mgr.give_up(inst, grace_s=0)
 
         snapshot.capture_vm_snapshot.assert_not_awaited()
-        container.delete_workspace.assert_not_awaited()
+        container.delete_workspace_with_outcome.assert_not_awaited()
         container.create_workspace.assert_not_awaited()
         conn = db.acquire.return_value.__aenter__.return_value
         marker_queries = [
@@ -966,7 +1016,7 @@ class TestCompletionControlLifecycleOwnership:
 
         assert report["workspace"]["reaped"] == 0
         snapshot.capture_vm_snapshot.assert_not_awaited()
-        container.delete_workspace.assert_not_awaited()
+        container.delete_workspace_with_outcome.assert_not_awaited()
         db.merge_workspace_container_context.assert_not_awaited()
         container.capture_terminal_workspace_identity.assert_not_awaited()
 
@@ -982,7 +1032,9 @@ class TestCompletionControlLifecycleOwnership:
             },
             completion_commands_enabled=True,
         )
-        container.delete_workspace.return_value = False
+        container.reconcile_workspace_cleanup_intent.return_value = (
+            WorkspaceCleanupOutcome("retryable", 7)
+        )
         inst = Instance(
             kind="workspace",
             id="workspace-j1",
@@ -998,13 +1050,7 @@ class TestCompletionControlLifecycleOwnership:
 
         await mgr.delete(inst, grace_s=0)
 
-        container.delete_workspace.assert_awaited_once_with(
-            WorkspaceOwner.job("j1"),
-            expected_runtime_incarnation="11111111-1111-4111-8111-111111111111",
-            captured_teardown_uid="11111111-1111-4111-8111-111111111111",
-            wait_for_exact_absence=True,
-            exact_absence_timeout_seconds=45.0,
-        )
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
         container.delete_workspace_pvc.assert_not_awaited()
         container._delete_service.assert_not_awaited()
 
@@ -1046,7 +1092,8 @@ class TestCompletionControlLifecycleOwnership:
 
         await mgr.delete(inst, grace_s=0)
 
-        container.delete_workspace.assert_awaited_once()
+        container.prepare_workspace_cleanup_intent.assert_awaited_once()
+        container.reconcile_workspace_cleanup_intent.assert_not_awaited()
         container.delete_workspace_pvc.assert_not_awaited()
         container._delete_service.assert_not_awaited()
         conn = db.acquire.return_value.__aenter__.return_value
@@ -1070,8 +1117,9 @@ class TestCompletionControlLifecycleOwnership:
             },
             completion_commands_enabled=True,
         )
-        container.delete_workspace_pvc.return_value = failed_resource != "pvc"
-        container._delete_service.return_value = failed_resource != "service"
+        container.reconcile_workspace_cleanup_intent.return_value = (
+            WorkspaceCleanupOutcome("retryable", 7)
+        )
         inst = Instance(
             kind="workspace",
             id="workspace-j1",
@@ -1087,20 +1135,15 @@ class TestCompletionControlLifecycleOwnership:
 
         await mgr.delete(inst, grace_s=0)
 
-        container.delete_workspace.assert_awaited_once()
-        container.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.job("j1"),
-            require_exact_owner=True,
-            expected_uid="22222222-2222-4222-8222-222222222222",
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
+        assert (
+            container.prepare_workspace_cleanup_intent.await_args.kwargs[
+                "reclaim_shared_resources"
+            ]
+            is True
         )
-        if failed_resource == "pvc":
-            container._delete_service.assert_not_awaited()
-        else:
-            container._delete_service.assert_awaited_once_with(
-                WorkspaceOwner.job("j1"),
-                require_exact_owner=True,
-                expected_uid="33333333-3333-4333-8333-333333333333",
-            )
+        container.delete_workspace_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
         conn = db.acquire.return_value.__aenter__.return_value
         assert not any(
             "- '_completion_control_claim'" in str(call.args[0])
@@ -1141,7 +1184,7 @@ class TestCompletionControlLifecycleOwnership:
 
         await mgr.delete(inst, grace_s=0)
 
-        container.delete_workspace.assert_awaited_once()
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
         container.delete_workspace_pvc.assert_not_awaited()
         container._delete_service.assert_not_awaited()
         conn = db.acquire.return_value.__aenter__.return_value
@@ -1389,16 +1432,20 @@ class TestMissingRowOrphan:
             metadata={
                 "labels": {"srw/job-id": "jgone"},
                 "bound_row_missing": True,
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": False,
             },
         )
         await mgr.delete(inst, grace_s=0)
-        container.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.job("jgone"), require_exact_owner=True
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("jgone"))
+        assert (
+            container.prepare_workspace_cleanup_intent.await_args.kwargs[
+                "reclaim_shared_resources"
+            ]
+            is True
         )
-        container._delete_service.assert_awaited_once_with(
-            WorkspaceOwner.job("jgone"), require_exact_owner=True
-        )
+        container.delete_workspace_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
 
     @staticmethod
     def _wire_empty_pvcs(container):
@@ -1425,7 +1472,7 @@ class TestMissingRowOrphan:
         ):
             report = await reconciler.tick()
         assert report["workspace"]["reaped"] == 1
-        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("jgone"))
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("jgone"))
         snapshot.capture_vm_snapshot.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1441,7 +1488,7 @@ class TestMissingRowOrphan:
         ):
             report = await reconciler.tick()
         assert report["workspace"]["reaped"] == 0
-        container.delete_workspace.assert_not_called()
+        container.delete_workspace_with_outcome.assert_not_called()
 
 
 # =============================================================================
@@ -1663,10 +1710,14 @@ class TestGiveUp:
             kind="workspace",
             id="workspace-a",
             bound_to="j1",
-            metadata={"labels": {"srw/job-id": "j1"}, "volume_ephemeral": True},
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+                "volume_ephemeral": True,
+            },
         )
         await mgr.give_up(inst, grace_s=0)
-        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
 
     @pytest.mark.asyncio
     async def test_pvc_give_up_recreates_keeps_pvc(self):
@@ -1677,15 +1728,19 @@ class TestGiveUp:
             kind="workspace",
             id="workspace-a",
             bound_to="j1",
-            metadata={"labels": {"srw/job-id": "j1"}, "volume_ephemeral": False},
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+                "volume_ephemeral": False,
+            },
         )
         await mgr.give_up(inst, grace_s=0)
-        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
         container.create_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
         container.delete_workspace_pvc.assert_not_called()  # PVC must survive
 
     @pytest.mark.asyncio
-    async def test_snapshot_success_resets_attempt_counter(self):
+    async def test_kubernetes_snapshot_refusal_does_not_reset_attempt_counter(self):
         mgr, _, _, snapshot, db = _make_manager()
         db.merge_workspace_container_context = AsyncMock(return_value=True)
         snapshot.capture_vm_snapshot = AsyncMock(return_value=True)
@@ -1696,10 +1751,9 @@ class TestGiveUp:
             metadata={"labels": {"srw/job-id": "j1"}, "pod_ip": "10.0.0.5"},
         )
         ref = await mgr.snapshot(inst)
-        assert ref == "j1"
-        db.merge_workspace_container_context.assert_awaited_with(
-            "j1", {"snapshot_attempts": 0}
-        )
+        assert ref is None
+        snapshot.capture_vm_snapshot.assert_not_awaited()
+        db.merge_workspace_container_context.assert_not_awaited()
 
 
 def _make_pvc(name: str, job_id: str | None = None, thread_id: str | None = None):
@@ -1720,6 +1774,20 @@ def _make_pvc(name: str, job_id: str | None = None, thread_id: str | None = None
     return pvc
 
 
+def _terminal_job_row(status: str = "completed") -> dict:
+    return {
+        "status": status,
+        "execution_lane": "pinned",
+        "context": {
+            "workspace_container": {
+                "status": "deleted",
+                "provisioner": "k8s",
+                "_runtime_incarnation": ("11111111-1111-4111-8111-111111111111"),
+            }
+        },
+    }
+
+
 # =============================================================================
 # delete() — terminal PVC reclaim (Branch a leak guard)
 # =============================================================================
@@ -1737,18 +1805,22 @@ class TestDeleteTerminalPvc:
             metadata={
                 "labels": {"srw/job-id": "j1"},
                 "job_status": "completed",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": False,
             },
         )
         await mgr.delete(inst, grace_s=0)
-        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
-        container.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.job("j1"), require_exact_owner=True
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
+        assert (
+            container.prepare_workspace_cleanup_intent.await_args.kwargs[
+                "reclaim_shared_resources"
+            ]
+            is True
         )
-        # The stable-DNS Service shares the PVC lifecycle — reclaimed on terminal.
-        container._delete_service.assert_awaited_once_with(
-            WorkspaceOwner.job("j1"), require_exact_owner=True
-        )
+        # Reconciliation owns exact captured PVC/Service cleanup and the final
+        # owner projection in one durable protocol.
+        container.delete_workspace_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reaped_emptydir_with_snapshot_marked_suspended(self):
@@ -1763,15 +1835,18 @@ class TestDeleteTerminalPvc:
             metadata={
                 "labels": {"srw/job-id": "j1"},
                 "job_status": "paused",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": True,
                 "snapshot_status": "available",
             },
         )
         await mgr.delete(inst, grace_s=0)
-        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
-        db.merge_workspace_container_context.assert_awaited_once_with(
-            "j1", {"status": "suspended"}
-        )
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
+        prepare = container.prepare_workspace_cleanup_intent.await_args.kwargs
+        assert prepare["target_disposition"] == "suspended"
+        assert prepare["snapshot_restore_required"] is True
+        assert prepare["reclaim_shared_resources"] is False
+        db.merge_workspace_container_context_if_runtime.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reaped_emptydir_without_snapshot_not_marked_suspended(self):
@@ -1783,10 +1858,18 @@ class TestDeleteTerminalPvc:
             metadata={
                 "labels": {"srw/job-id": "j1"},
                 "job_status": "paused",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": True,
             },
         )
         await mgr.delete(inst, grace_s=0)
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
+        assert (
+            container.prepare_workspace_cleanup_intent.await_args.kwargs[
+                "target_disposition"
+            ]
+            == "deleted"
+        )
         db.merge_workspace_container_context.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1801,11 +1884,19 @@ class TestDeleteTerminalPvc:
             metadata={
                 "labels": {"srw/job-id": "j1"},
                 "job_status": "paused",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": False,
                 "snapshot_status": "available",
             },
         )
         await mgr.delete(inst, grace_s=0)
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
+        assert (
+            container.prepare_workspace_cleanup_intent.await_args.kwargs[
+                "target_disposition"
+            ]
+            == "deleted"
+        )
         db.merge_workspace_container_context.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1819,18 +1910,18 @@ class TestDeleteTerminalPvc:
             metadata={
                 "labels": {"srw/job-id": "j1"},
                 "job_status": "completed",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": True,
                 "snapshot_status": "available",
             },
         )
         await mgr.delete(inst, grace_s=0)
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
         db.merge_workspace_container_context.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_snapshot_success_stamps_instance_metadata(self):
-        # The reconciler calls delete() right after snapshot(); delete() reads
-        # the in-memory snapshot_status to decide the suspended handoff.
-        mgr, *_ = _make_manager()
+    async def test_kubernetes_snapshot_refusal_does_not_stamp_instance_metadata(self):
+        mgr, _, _, snapshot, db = _make_manager()
         inst = Instance(
             kind="workspace",
             id="workspace-a",
@@ -1838,8 +1929,10 @@ class TestDeleteTerminalPvc:
             metadata={"labels": {"srw/job-id": "j1"}, "pod_ip": "10.0.0.7"},
         )
         ref = await mgr.snapshot(inst)
-        assert ref == "j1"
-        assert inst.metadata["snapshot_status"] == "available"
+        assert ref is None
+        assert "snapshot_status" not in inst.metadata
+        snapshot.capture_vm_snapshot.assert_not_awaited()
+        db.merge_workspace_container_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_idle_job_pvc_backed_keeps_pvc(self):
@@ -1852,11 +1945,12 @@ class TestDeleteTerminalPvc:
             metadata={
                 "labels": {"srw/job-id": "j1"},
                 "job_status": "paused",  # idle, NOT terminal → reattach next dispatch
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": False,
             },
         )
         await mgr.delete(inst, grace_s=0)
-        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
         container.delete_workspace_pvc.assert_not_called()
         # Idle keeps the Service too (stable DNS persists for the resume).
         container._delete_service.assert_not_called()
@@ -1898,13 +1992,12 @@ class TestDeleteTerminalPvc:
             metadata={
                 "labels": {"srw/thread-id": "t1"},
                 "thread_status": "ended",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": False,
             },
         )
         await mgr.delete(inst, grace_s=0)
-        container.delete_workspace.assert_awaited_once_with(
-            WorkspaceOwner.session("t1")
-        )
+        _assert_exact_workspace_delete(container, WorkspaceOwner.session("t1"))
         container.delete_workspace_pvc.assert_not_called()
         # The Service follows the volume here, not the pod: a resume reattaches
         # the claim and the stable DNS should still point at it.
@@ -1928,11 +2021,13 @@ class TestDeleteTerminalPvc:
                 metadata={
                     "labels": {"srw/thread-id": "t1"},
                     "thread_status": status,
+                    "pod_uid": "11111111-1111-4111-8111-111111111111",
                     "volume_ephemeral": False,
                 },
             )
             assert mgr._is_volume_reclaimable(inst) is False, status
             await mgr.delete(inst, grace_s=0)
+            _assert_exact_workspace_delete(container, WorkspaceOwner.session("t1"))
             container.delete_workspace_pvc.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1952,20 +2047,21 @@ class TestDeleteTerminalPvc:
             metadata={
                 "labels": {"srw/thread-id": "t1"},
                 "bound_row_missing": True,
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": False,
             },
         )
         assert mgr._is_volume_reclaimable(inst) is True
         await mgr.delete(inst, grace_s=0)
-        container.delete_workspace.assert_awaited_once_with(
-            WorkspaceOwner.session("t1")
+        _assert_exact_workspace_delete(container, WorkspaceOwner.session("t1"))
+        assert (
+            container.prepare_workspace_cleanup_intent.await_args.kwargs[
+                "reclaim_shared_resources"
+            ]
+            is True
         )
-        container.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.session("t1"), require_exact_owner=True
-        )
-        container._delete_service.assert_awaited_once_with(
-            WorkspaceOwner.session("t1"), require_exact_owner=True
-        )
+        container.delete_workspace_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unknown_binding_never_reclaims(self):
@@ -2011,7 +2107,9 @@ class TestDeleteTerminalPvc:
     @pytest.mark.asyncio
     async def test_pod_delete_failure_skips_pvc_delete(self):
         mgr, container, *_ = _make_manager()
-        container.delete_workspace = AsyncMock(side_effect=RuntimeError("boom"))
+        container.reconcile_workspace_cleanup_intent = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
         container.delete_workspace_pvc = AsyncMock(return_value=True)
         inst = Instance(
             kind="workspace",
@@ -2041,14 +2139,20 @@ class TestGiveUpTerminal:
             metadata={
                 "labels": {"srw/job-id": "j1"},
                 "job_status": "failed",  # terminal
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
                 "volume_ephemeral": False,
             },
         )
         await mgr.give_up(inst, grace_s=0)
-        # delete() reclaimed the PVC (terminal); give_up must NOT recreate a pod.
-        container.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.job("j1"), require_exact_owner=True
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
+        assert (
+            container.prepare_workspace_cleanup_intent.await_args.kwargs[
+                "reclaim_shared_resources"
+            ]
+            is True
         )
+        # Cleanup is owned by the durable reconciler; give_up must not recreate.
+        container.delete_workspace_pvc.assert_not_awaited()
         container.create_workspace.assert_not_called()
 
 
@@ -2070,7 +2174,7 @@ class TestReapOrphans:
     @pytest.mark.asyncio
     async def test_reaps_terminal_job_pvc_with_no_live_pod(self):
         mgr, container, _, _, _ = _make_manager(
-            pods=[], thread_rows={"jdone": {"status": "completed"}}
+            pods=[], job_rows={"jdone": _terminal_job_row()}
         )
         self._wire_pvcs(container, [_make_pvc("pvc-workspace-jdone", "jdone")])
         with patch(
@@ -2079,20 +2183,26 @@ class TestReapOrphans:
         ):
             n = await mgr.reap_orphans()
         assert n == 1
-        container._delete_pvc.assert_awaited_once_with(
-            "pvc-workspace-jdone", expected_owner=WorkspaceOwner.job("jdone")
+        container.prepare_workspace_cleanup_intent.assert_awaited_once_with(
+            WorkspaceOwner.job("jdone"),
+            expected_runtime_incarnation=("11111111-1111-4111-8111-111111111111"),
+            target_disposition="deleted",
+            reclaim_shared_resources=True,
+            admission_source="automatic",
         )
-        # The orphan's stable-DNS Service is reclaimed alongside its PVC.
-        container._delete_service.assert_awaited_once_with(
-            WorkspaceOwner.job("jdone"), require_exact_owner=True
+        container.reconcile_workspace_cleanup_intent.assert_awaited_once_with(
+            WorkspaceOwner.job("jdone"),
+            expected_runtime_incarnation=("11111111-1111-4111-8111-111111111111"),
+            intent_generation=7,
         )
+        container._delete_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_completion_owner_blocks_orphan_pvc_then_done_allows_reap(self):
         mgr, container, _, _, db = _make_manager(
             pods=[],
-            job_rows={"jdone": {"status": "completed", "context": {}}},
-            thread_rows={"jdone": {"status": "completed"}},
+            job_rows={"jdone": _terminal_job_row()},
             completion_commands_enabled=True,
         )
         self._wire_pvcs(container, [_make_pvc("pvc-workspace-jdone", "jdone")])
@@ -2134,23 +2244,21 @@ class TestReapOrphans:
             side_effect=_fake_to_thread,
         ):
             assert await mgr.reap_orphans() == 1
-        container._delete_pvc.assert_awaited_once_with(
-            "pvc-workspace-jdone",
-            expected_owner=WorkspaceOwner.job("jdone"),
-            expected_uid="22222222-2222-4222-8222-222222222222",
-        )
-        container._delete_service.assert_awaited_once_with(
+        container.prepare_workspace_cleanup_intent.assert_awaited_once_with(
             WorkspaceOwner.job("jdone"),
-            require_exact_owner=True,
-            expected_uid="33333333-3333-4333-8333-333333333333",
+            expected_runtime_incarnation=("11111111-1111-4111-8111-111111111111"),
+            target_disposition="deleted",
+            reclaim_shared_resources=True,
+            admission_source="automatic",
         )
+        container._delete_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_control_marker_blocks_orphan_pvc_destructive_recheck(self):
         mgr, container, _, _, db = _make_manager(
             pods=[],
-            job_rows={"jdone": {"status": "completed", "context": {}}},
-            thread_rows={"jdone": {"status": "completed"}},
+            job_rows={"jdone": _terminal_job_row()},
             completion_commands_enabled=True,
             completion_control_active=True,
         )
@@ -2171,8 +2279,8 @@ class TestReapOrphans:
         )
 
     @pytest.mark.asyncio
-    async def test_reaps_pvc_whose_job_row_is_gone(self):
-        # fetchrow returns None (no row) → genuinely gone → reap.
+    async def test_retains_pvc_whose_job_row_is_gone_without_exact_authority(self):
+        # A name and missing row do not prove the retired runtime/process zero.
         mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
         self._wire_pvcs(container, [_make_pvc("pvc-workspace-jgone", "jgone")])
         with patch(
@@ -2180,15 +2288,15 @@ class TestReapOrphans:
             side_effect=_fake_to_thread,
         ):
             n = await mgr.reap_orphans()
-        assert n == 1
-        container._delete_pvc.assert_awaited_once_with(
-            "pvc-workspace-jgone", expected_owner=WorkspaceOwner.job("jgone")
-        )
+        assert n == 0
+        container.prepare_workspace_cleanup_intent.assert_not_awaited()
+        container._delete_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skips_active_job_pvc(self):
         mgr, container, _, _, _ = _make_manager(
-            pods=[], thread_rows={"jrun": {"status": "processing"}}
+            pods=[], job_rows={"jrun": {"status": "processing", "context": {}}}
         )
         self._wire_pvcs(container, [_make_pvc("pvc-workspace-jrun", "jrun")])
         with patch(
@@ -2204,7 +2312,7 @@ class TestReapOrphans:
         # Terminal job but a pod still exists → instance path owns teardown.
         pod = _make_pod("workspace-jlive", labels={"srw/job-id": "jlive"})
         mgr, container, _, _, _ = _make_manager(
-            pods=[pod], thread_rows={"jlive": {"status": "completed"}}
+            pods=[pod], job_rows={"jlive": _terminal_job_row()}
         )
         self._wire_pvcs(container, [_make_pvc("pvc-workspace-jlive", "jlive")])
         with patch(
@@ -2253,15 +2361,85 @@ class TestReapOrphans:
         n = await mgr.reap_orphans()
         assert n == 0
 
+    @pytest.mark.asyncio
+    async def test_reconciles_pending_cleanup_intents_without_a_live_pod_or_pvc(self):
+        mgr, container, _, _, _ = _make_manager(pods=[])
+        self._wire_pvcs(container, [])
+        reconcile_pending = AsyncMock(
+            return_value={"settled": 1, "superseded": 1, "retryable": 2}
+        )
+
+        with patch.object(
+            type(container),
+            "reconcile_pending_workspace_cleanup_intents",
+            reconcile_pending,
+            create=True,
+        ):
+            n = await mgr.reap_orphans()
+
+        assert n == 2
+        reconcile_pending.assert_awaited_once_with(container, limit=25)
+        container._delete_pvc.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_cleanup_lost_response_replays_same_intent(self):
+        mgr, container, _, _, _ = _make_manager(
+            pods=[], job_rows={"jdone": _terminal_job_row()}
+        )
+        self._wire_pvcs(container, [_make_pvc("pvc-workspace-jdone", "jdone")])
+        container.reconcile_workspace_cleanup_intent.side_effect = [
+            RuntimeError("response lost after settlement"),
+            WorkspaceCleanupOutcome("settled", 7),
+        ]
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await mgr.reap_orphans() == 0
+            assert await mgr.reap_orphans() == 1
+
+        assert container.prepare_workspace_cleanup_intent.await_count == 2
+        for call in container.prepare_workspace_cleanup_intent.await_args_list:
+            assert call.kwargs["expected_runtime_incarnation"] == (
+                "11111111-1111-4111-8111-111111111111"
+            )
+            assert call.kwargs["target_disposition"] == "deleted"
+            assert call.kwargs["reclaim_shared_resources"] is True
+        assert [
+            call.kwargs["intent_generation"]
+            for call in container.reconcile_workspace_cleanup_intent.await_args_list
+        ] == [7, 7]
+        container._delete_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_row_without_runtime_receipt_is_retained(self):
+        mgr, container, _, _, _ = _make_manager(
+            pods=[],
+            job_rows={
+                "jlegacy": {
+                    "status": "completed",
+                    "execution_lane": "pinned",
+                    "context": {"workspace_container": {"provisioner": "k8s"}},
+                }
+            },
+        )
+        self._wire_pvcs(container, [_make_pvc("pvc-workspace-jlegacy", "jlegacy")])
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await mgr.reap_orphans() == 0
+
+        container.prepare_workspace_cleanup_intent.assert_not_awaited()
+        container._delete_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
+
 
 class TestReapOrphanSessionPvcs:
-    """The session half of the backstop sweep, and the primary reclaim route for
-    sessions: a thread is normally deleted while its pod is already idle-reaped,
-    so the inline delete() path never sees it.
-
-    The rule is deliberately asymmetric with jobs — status is NEVER consulted
-    for a session, only the existence of the ``threads`` row.
-    """
+    """Missing session owners are retained until exact teardown proof exists."""
 
     @staticmethod
     def _wire_pvcs(container, pvcs):
@@ -2273,8 +2451,7 @@ class TestReapOrphanSessionPvcs:
         container._delete_pvc = AsyncMock(return_value=True)
 
     @pytest.mark.asyncio
-    async def test_reaps_workspace_pvc_whose_thread_row_is_gone(self):
-        # fetchrow returns None (no row) → the thread was permanently deleted.
+    async def test_retains_workspace_pvc_whose_thread_row_is_gone(self):
         mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
         self._wire_pvcs(
             container, [_make_pvc("pvc-ws-thread-tgone", thread_id="tgone")]
@@ -2284,21 +2461,13 @@ class TestReapOrphanSessionPvcs:
             side_effect=_fake_to_thread,
         ):
             n = await mgr.reap_orphans()
-        assert n == 1
-        container._delete_pvc.assert_awaited_once_with(
-            "pvc-ws-thread-tgone",
-            expected_owner=WorkspaceOwner.session("tgone"),
-        )
-        container._delete_service.assert_awaited_once_with(
-            WorkspaceOwner.session("tgone"), require_exact_owner=True
-        )
+        assert n == 0
+        container.prepare_workspace_cleanup_intent.assert_not_awaited()
+        container._delete_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_reaps_session_agent_pvc_whose_thread_row_is_gone(self):
-        """The session agent pod's own claim (agent_provisioner) is in scope —
-        it carries the same ``srw.io/component: agent-workspace`` label, so
-        without this branch it would be listed by the sweep and then leak
-        forever."""
+    async def test_retains_session_agent_pvc_whose_thread_row_is_gone(self):
         mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
         self._wire_pvcs(container, [_make_pvc("pvc-agent-s-tgone", thread_id="tgone")])
         with patch(
@@ -2306,14 +2475,11 @@ class TestReapOrphanSessionPvcs:
             side_effect=_fake_to_thread,
         ):
             n = await mgr.reap_orphans()
-        assert n == 1
-        container._delete_pvc.assert_awaited_once_with(
-            "pvc-agent-s-tgone",
-            expected_owner=WorkspaceOwner.session("tgone"),
-        )
+        assert n == 0
+        container._delete_pvc.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_both_claims_of_one_thread_share_a_single_service_delete(self):
+    async def test_both_claims_of_one_missing_thread_remain_fail_closed(self):
         mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
         self._wire_pvcs(
             container,
@@ -2327,10 +2493,9 @@ class TestReapOrphanSessionPvcs:
             side_effect=_fake_to_thread,
         ):
             n = await mgr.reap_orphans()
-        assert n == 2
-        container._delete_service.assert_awaited_once_with(
-            WorkspaceOwner.session("tgone"), require_exact_owner=True
-        )
+        assert n == 0
+        container._delete_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skips_pvc_whose_thread_still_exists(self):
@@ -2420,9 +2585,7 @@ class TestReapOrphanSessionPvcs:
         assert await mgr._thread_row_exists("tlive") is None
 
     @pytest.mark.asyncio
-    async def test_unlabeled_session_claim_is_still_collectable_by_name(self):
-        """A claim that predates the label falls back to the 12-char id in its
-        own name, so it is collectable instead of leaking forever."""
+    async def test_unlabeled_session_claim_is_not_authority_to_delete(self):
         mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
         self._wire_pvcs(container, [_make_pvc("pvc-ws-thread-tgone")])
         with patch(
@@ -2430,11 +2593,9 @@ class TestReapOrphanSessionPvcs:
             side_effect=_fake_to_thread,
         ):
             n = await mgr.reap_orphans()
-        assert n == 1
-        container._delete_pvc.assert_awaited_once_with(
-            "pvc-ws-thread-tgone",
-            expected_owner=WorkspaceOwner.session("tgone"),
-        )
+        assert n == 0
+        container.prepare_workspace_cleanup_intent.assert_not_awaited()
+        container._delete_pvc.assert_not_awaited()
 
 
 def test_pod_volume_is_ephemeral_helper():
@@ -2465,8 +2626,8 @@ def test_pod_volume_is_ephemeral_helper():
 
 class TestSnapshot:
     @pytest.mark.asyncio
-    async def test_captures_via_snapshot_service(self):
-        mgr, _, _, snapshot, _ = _make_manager()
+    async def test_kubernetes_capture_refused_before_snapshot_service(self):
+        mgr, _, _, snapshot, db = _make_manager()
         inst = Instance(
             kind="workspace",
             id="workspace-abc",
@@ -2474,8 +2635,9 @@ class TestSnapshot:
             metadata={"pod_ip": "10.0.0.5"},
         )
         ref = await mgr.snapshot(inst)
-        assert ref == "job-uuid-1"
-        snapshot.capture_vm_snapshot.assert_awaited_once()
+        assert ref is None
+        snapshot.capture_vm_snapshot.assert_not_awaited()
+        db.merge_workspace_container_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_none_without_pod_ip(self):
@@ -2503,7 +2665,10 @@ class TestRestore:
         inst = Instance(
             kind="workspace",
             id="workspace-abc",
-            metadata={"labels": {"srw/job-id": "job1"}},
+            metadata={
+                "labels": {"srw/job-id": "job1"},
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+            },
         )
         await mgr.restore(inst, "job1")
         suspension.restore_workspace.assert_awaited_once_with("job1")
@@ -2515,7 +2680,10 @@ class TestRestore:
         inst = Instance(
             kind="workspace",
             id="ws-thread-xyz",
-            metadata={"labels": {"srw/thread-id": "t1"}},
+            metadata={
+                "labels": {"srw/thread-id": "t1"},
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+            },
         )
         await mgr.restore(inst, "t1")
         suspension.restore_thread_workspace.assert_awaited_once_with("t1")
@@ -2535,7 +2703,7 @@ class TestSignalDrainPending:
         mgr, container, suspension, snapshot, db = _make_manager()
         inst = Instance(kind="workspace", id="x", bound_to="job1", metadata={})
         await mgr.signal_drain_pending(inst)
-        container.delete_workspace.assert_not_called()
+        container.delete_workspace_with_outcome.assert_not_called()
         suspension.restore_workspace.assert_not_called()
         snapshot.capture_vm_snapshot.assert_not_called()
         db.acquire.assert_not_called()
@@ -2549,10 +2717,13 @@ class TestDrain:
             kind="workspace",
             id="workspace-abc",
             bound_to="job1",
-            metadata={"labels": {"srw/job-id": "job1"}},
+            metadata={
+                "labels": {"srw/job-id": "job1"},
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+            },
         )
         await mgr.drain(inst, grace_s=10)
-        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("job1"))
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("job1"))
 
     @pytest.mark.asyncio
     async def test_thread_drain_calls_delete_workspace_with_session_owner(self):
@@ -2561,19 +2732,73 @@ class TestDrain:
             kind="workspace",
             id="ws-thread-xyz",
             bound_to="t1",
-            metadata={"labels": {"srw/thread-id": "t1"}},
+            metadata={
+                "labels": {"srw/thread-id": "t1"},
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+            },
         )
         await mgr.drain(inst, grace_s=10)
-        container.delete_workspace.assert_awaited_once_with(
-            WorkspaceOwner.session("t1")
-        )
+        _assert_exact_workspace_delete(container, WorkspaceOwner.session("t1"))
 
     @pytest.mark.asyncio
     async def test_drain_skipped_without_bound(self):
         mgr, container, *_ = _make_manager()
         inst = Instance(kind="workspace", id="x", bound_to=None, metadata={})
         await mgr.drain(inst, grace_s=10)
-        container.delete_workspace.assert_not_called()
+        container.delete_workspace_with_outcome.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("state", "expected_settled"),
+        [("superseded", True), ("retryable", False)],
+    )
+    async def test_typed_delete_preserves_successor_runtime(
+        self, state: str, expected_settled: bool
+    ):
+        mgr, container, _, _, db = _make_manager()
+        container.reconcile_workspace_cleanup_intent.return_value = (
+            WorkspaceCleanupOutcome(state, 7)
+        )
+        inst = Instance(
+            kind="workspace",
+            id="workspace-abc",
+            bound_to="job1",
+            metadata={
+                "labels": {"srw/job-id": "job1"},
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+                "job_status": "paused",
+                "volume_ephemeral": True,
+            },
+        )
+
+        assert await mgr._delete_owned(inst, grace_s=0) is expected_settled
+
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("job1"))
+        container.delete_workspace_pvc.assert_not_awaited()
+        container._delete_service.assert_not_awaited()
+        db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+        db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_settled_cleanup_projects_only_inside_atomic_intent_settlement(self):
+        mgr, container, _, _, db = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="workspace-abc",
+            bound_to="job1",
+            metadata={
+                "labels": {"srw/job-id": "job1"},
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+                "job_status": "paused",
+                "volume_ephemeral": True,
+            },
+        )
+
+        assert await mgr._delete_owned(inst, grace_s=0) is True
+
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("job1"))
+        db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+        db.merge_workspace_container_context.assert_not_awaited()
 
 
 class TestDeleteNoopWhenK8sUnavailable:
@@ -2587,4 +2812,4 @@ class TestDeleteNoopWhenK8sUnavailable:
             metadata={"labels": {"srw/job-id": "job1"}},
         )
         await mgr.delete(inst, grace_s=10)
-        container.delete_workspace.assert_not_called()
+        container.delete_workspace_with_outcome.assert_not_called()

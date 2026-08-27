@@ -108,6 +108,23 @@ _REAL_RESERVE_SESSION_ATTACH_BINDING = orch_main._reserve_session_attach_binding
 @pytest.fixture(autouse=True)
 def _patch_session_attach_reservation():
     """Payload-focused tests do not need a live DB reservation."""
+    target = orch_main._PinnedSessionMutationTarget(
+        agent={
+            "id": _ATTACH_AGENT_ID,
+            "pod_ip": "10.0.0.1",
+            "pod_port": 8001,
+        },
+        binding=None,
+        recipient={
+            "expected_thread_id": _ATTACH_THREAD_ID,
+            "expected_agent_id": _ATTACH_AGENT_ID,
+            "expected_pod_uid": None,
+            "expected_process_generation": "test-process-generation",
+        },
+        process_generation="test-process-generation",
+        runtime_generation=_ATTACH_RUNTIME_GENERATION,
+        attach_token=_ATTACH_TOKEN,
+    )
     with (
         patch.object(
             orch_main,
@@ -118,6 +135,16 @@ def _patch_session_attach_reservation():
             orch_main,
             "_release_session_attach_binding",
             AsyncMock(return_value="released"),
+        ),
+        patch.object(
+            orch_main,
+            "_prepare_pinned_session_mutation_target",
+            AsyncMock(return_value=target),
+        ),
+        patch.object(
+            orch_main,
+            "_pinned_session_mutation_target_is_current",
+            AsyncMock(return_value=True),
         ),
     ):
         yield
@@ -693,22 +720,13 @@ class TestSendSessionAttachPayload:
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
-    async def test_thread_reservation_cas_miss_rolls_back_before_agent_or_http(self):
-        conn = AsyncMock()
-        conn.execute = AsyncMock(return_value="UPDATE 0")
-        tx = AsyncMock()
-        tx.__aenter__.return_value = None
-        tx.__aexit__.return_value = False
-        conn.transaction = MagicMock(return_value=tx)
-        acquire = AsyncMock()
-        acquire.__aenter__.return_value = conn
-        acquire.__aexit__.return_value = False
-
+    async def test_thread_reservation_refusal_never_claims_delivery(self):
+        result = SimpleNamespace(bound=False, state="refused", attach_token=None)
         with patch.object(
-            orch_main.postgres_db,
-            "acquire",
-            MagicMock(return_value=acquire),
-        ):
+            orch_main,
+            "reserve_pinned_warm_agent_binding",
+            AsyncMock(return_value=result),
+        ) as reserve:
             reserved = await _REAL_RESERVE_SESSION_ATTACH_BINDING(
                 self.agent_id,
                 self.thread_id,
@@ -716,26 +734,34 @@ class TestSendSessionAttachPayload:
             )
 
         assert reserved is None
-        assert conn.execute.await_count == 1
-        assert "execution_lane = $3" in conn.execute.await_args.args[0]
-        assert "control_admission_agent_id = NULL" in conn.execute.await_args.args[0]
+        reserve.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_agent_cas_follows_thread_lock_in_same_reservation_transaction(self):
-        conn = AsyncMock()
-        conn.execute = AsyncMock(side_effect=["UPDATE 1", "UPDATE 0"])
-        tx = AsyncMock()
-        tx.__aenter__.return_value = None
-        tx.__aexit__.return_value = False
-        conn.transaction = MagicMock(return_value=tx)
-        acquire = AsyncMock()
-        acquire.__aenter__.return_value = conn
-        acquire.__aexit__.return_value = False
-
+    async def test_pending_warm_protection_fences_fallback_delivery(self):
+        result = SimpleNamespace(bound=False, state="pending", attach_token=None)
         with patch.object(
-            orch_main.postgres_db,
-            "acquire",
-            MagicMock(return_value=acquire),
+            orch_main,
+            "reserve_pinned_warm_agent_binding",
+            AsyncMock(return_value=result),
+        ):
+            with pytest.raises(orch_main._WarmBindingReservationPending):
+                await _REAL_RESERVE_SESSION_ATTACH_BINDING(
+                    self.agent_id,
+                    self.thread_id,
+                    expected_runtime_generation=self.generation,
+                )
+
+    @pytest.mark.asyncio
+    async def test_bound_warm_protection_returns_exact_attach_token(self):
+        result = SimpleNamespace(
+            bound=True,
+            state="bound",
+            attach_token=self.attach_token,
+        )
+        with patch.object(
+            orch_main,
+            "reserve_pinned_warm_agent_binding",
+            AsyncMock(return_value=result),
         ):
             reserved = await _REAL_RESERVE_SESSION_ATTACH_BINDING(
                 self.agent_id,
@@ -743,13 +769,7 @@ class TestSendSessionAttachPayload:
                 expected_runtime_generation=self.generation,
             )
 
-        assert reserved is None
-        assert conn.execute.await_count == 2
-        assert "execution_lane = $3" in conn.execute.await_args_list[0].args[0]
-        assert "current_job_id IS NULL" in conn.execute.await_args_list[1].args[0]
-        assert "status = 'ready'" in conn.execute.await_args_list[1].args[0]
-        tx.__aexit__.assert_awaited_once()
-        assert tx.__aexit__.await_args.args[0] is RuntimeError
+        assert reserved == self.attach_token
 
     @pytest.mark.asyncio
     async def test_successful_reservation_precedes_http_delivery(self):
@@ -1540,11 +1560,24 @@ class TestColdSessionDatasourceDelivery:
         }
         workspace = {
             "status": "ready",
+            # A ready pinned sandbox workspace declares its provisioner; the
+            # attach path refuses an undeclared one (503) before it reaches
+            # this credential boundary.
+            "provisioner": "k8s",
             "pod_ip": "10.42.0.10",
             "pod_port": 30022,
             "_canvas_workspace_generation": ("00000000-0000-4000-8000-000000000091"),
             "_runtime_incarnation": "00000000-0000-4000-8000-000000000092",
         }
+        attestation = orch_main.WorkspaceRuntimeAttestation(
+            backing_id="k8s-pvc:agent-workspaces:pvc-uid-a1",
+            workspace_generation=workspace["_canvas_workspace_generation"],
+            runtime_incarnation=workspace["_runtime_incarnation"],
+            ssh_host_key_fingerprint="SHA256:trusted-a1",
+            host="workspace-session.agent-workspaces.svc.cluster.local",
+            pod_ip=workspace["pod_ip"],
+            port=workspace["pod_port"],
+        )
         thread = {
             "id": thread_id,
             "execution_lane": "pinned",
@@ -1587,6 +1620,11 @@ class TestColdSessionDatasourceDelivery:
                 orch_main.postgres_db,
                 "get_thread",
                 AsyncMock(side_effect=get_thread),
+            ),
+            patch.object(
+                orch_main.container_provisioner,
+                "attest_workspace_runtime",
+                AsyncMock(return_value=attestation),
             ),
             patch.object(
                 orch_main.postgres_db,
@@ -1917,15 +1955,33 @@ class TestDetachAgentSession:
 
     @pytest.mark.asyncio
     async def test_live_session_agent_detaches(self):
+        thread = {
+            "id": _ATTACH_THREAD_ID,
+            "agent_id": _ATTACH_AGENT_ID,
+            "execution_lane": "pinned",
+            "status": "active",
+            "runtime_generation": _ATTACH_RUNTIME_GENERATION,
+            "runtime_attach_token": _ATTACH_TOKEN,
+            "runtime_retirement_token": None,
+        }
         db = self._db(
-            {"id": "t1", "agent_id": "a1"},
+            thread,
             {"pod_ip": "10.0.0.2", "pod_port": 8001, "status": "session"},
+        )
+        db.get_pinned_session_binding = AsyncMock(
+            return_value=SimpleNamespace(
+                agent_status="session",
+                pod_namespace="srw",
+                pod_ip="10.0.0.2",
+                pod_port=8001,
+                session_identity_fingerprint="sha256:" + "a" * 64,
+            )
         )
         with (
             patch.object(orch_main, "postgres_db", db),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
-            assert await orch_main._detach_agent_session("t1") is True
+            assert await orch_main._detach_agent_session(_ATTACH_THREAD_ID) is True
         assert _FakeAsyncClient.calls[0]["url"] == "http://10.0.0.2:8001/session/detach"
 
     @pytest.mark.asyncio

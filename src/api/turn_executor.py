@@ -1697,6 +1697,7 @@ class StatelessTurnExecutor:
             ("project_id", "project_id"),
             ("runtime_actor", "runtime_actor"),
             ("workspace_runtime", "workspace_runtime"),
+            ("workspace_provisioner", "workspace_provisioner"),
             ("workspace_generation", "workspace_generation"),
             (
                 "workspace_runtime_incarnation",

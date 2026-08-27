@@ -170,25 +170,19 @@ async def persist_input_delivery(
     if any(value is not None for value in identity) and not has_identity:
         raise InputDeliveryAuthorityLost("incomplete runtime identity")
 
-    if has_identity:
-        thread = await lock_runtime_authority(
-            conn,
-            thread_id=thread_uuid,
-            agent_id=str(agent_id),
-            pod_uid=str(pod_uid),
-            runtime_generation=str(runtime_generation),
-            runtime_attach_token=str(runtime_attach_token),
-        )
-    else:
-        # Transcript FK + activity updates follow the same parent-first order.
-        thread_row = await conn.fetchrow(
-            "SELECT id, agent_id, status, execution_lane, user_id, total_turns "
-            "FROM threads WHERE id = $1 FOR UPDATE",
-            thread_uuid,
-        )
-        if thread_row is None:
-            raise InputDeliveryAuthorityLost("thread no longer exists")
-        thread = _dict(thread_row)
+    # Lock the parent before the delivery row in every path.  Do not require
+    # live runtime ownership yet: an admitted/settled delivery is an immutable
+    # historical receipt whose response may have been lost immediately before
+    # End cleared the live binding.
+    thread_row = await conn.fetchrow(
+        "SELECT id, agent_id, status, execution_lane, runtime_generation, "
+        "runtime_attach_token, runtime_retirement_token, user_id, total_turns "
+        "FROM threads WHERE id = $1 FOR UPDATE",
+        thread_uuid,
+    )
+    if thread_row is None:
+        raise InputDeliveryAuthorityLost("thread no longer exists")
+    thread = _dict(thread_row)
 
     execution_lane = str(thread.get("execution_lane") or "pinned")
     if execution_lane not in {"pinned", "stateless"}:
@@ -228,6 +222,16 @@ async def persist_input_delivery(
             raise InputDeliveryConflict(
                 "stable input identity conflicts with transcript"
             )
+        if has_identity and (
+            str(terminal_replay["execution_lane"] or "") != "pinned"
+            or str(terminal_replay["owner_agent_id"] or "") != str(agent_id)
+            or str(terminal_replay["owner_pod_uid"] or "") != str(pod_uid)
+            or str(terminal_replay["owner_runtime_generation"] or "")
+            != str(runtime_generation)
+        ):
+            raise InputDeliveryAuthorityLost(
+                "terminal delivery belongs to another runtime"
+            )
         result = _dict(terminal_replay)
         result.update(
             {
@@ -244,6 +248,28 @@ async def persist_input_delivery(
             }
         )
         return result
+
+    if has_identity:
+        # New work still needs the current reciprocal binding, attach token,
+        # open generation, and live agent row.  This second read reuses the
+        # parent lock already held above and keeps the standalone helper strict.
+        thread = await lock_runtime_authority(
+            conn,
+            thread_id=thread_uuid,
+            agent_id=str(agent_id),
+            pod_uid=str(pod_uid),
+            runtime_generation=str(runtime_generation),
+            runtime_attach_token=str(runtime_attach_token),
+        )
+
+    if execution_lane == "pinned" and (
+        thread.get("runtime_retirement_token") is not None
+        or str(thread.get("status") or "") in {"ending", "ended", "suspended"}
+    ):
+        # A terminal replay above remains observable after End. New input does
+        # not: End and persistence serialize on the same thread row, so the
+        # winner is the only truthful durable outcome.
+        raise InputDeliveryAuthorityLost("pinned thread retirement owns input")
 
     if has_identity and execution_lane != "pinned":
         raise InputDeliveryAuthorityLost("pinned runtime cannot claim stateless input")

@@ -8,7 +8,7 @@ from src.database.postgres_db import PostgresDB
 
 @pytest.mark.asyncio
 async def test_agent_db_end_thread_closes_control_admission():
-    """The direct-DB fallback must close the same capability as REST end."""
+    """The direct-DB fallback is unavailable to pinned runtimes."""
     db = PostgresDB.__new__(PostgresDB)
     conn = AsyncMock()
 
@@ -22,6 +22,7 @@ async def test_agent_db_end_thread_closes_control_admission():
     sql = " ".join(conn.execute.await_args.args[0].split())
     assert "status = 'ended'" in sql
     assert "control_admission_agent_id = NULL" in sql
+    assert "execution_lane <> 'pinned'" in sql
 
 
 @pytest.mark.asyncio
@@ -38,6 +39,8 @@ async def test_agent_db_terminal_status_closes_control_admission():
 
     sql = " ".join(conn.execute.await_args.args[0].split())
     assert "WHEN $2 IN ('ended', 'suspended') THEN NULL" in sql
+    assert "execution_lane = 'pinned'" in sql
+    assert "$2 IN ('ending', 'ended', 'suspended')" in sql
 
 
 @pytest.mark.asyncio

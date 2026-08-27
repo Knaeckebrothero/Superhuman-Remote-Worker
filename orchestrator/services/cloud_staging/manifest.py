@@ -24,13 +24,28 @@ _OPAQUE_XATTR_KEYS = (
     "SCHILY.xattr.user.fuseoverlayfs.opaque",
 )
 _BINARY_SNIFF_BYTES = 8192
+MAX_MANIFEST_ENTRIES = 100_000
+MAX_TAR_MEMBERS = 200_000
+MAX_PATH_BYTES = 4096
+MAX_STAGED_FILE_BYTES = 100 * 1024 * 1024
+MAX_MANIFEST_JSON_BYTES = 16 * 1024 * 1024
 
 
 def _rel(name: str) -> str | None:
     name = name.removeprefix("./")
     if not name.startswith(_UPPER_PREFIX):
         return None
-    return name[len(_UPPER_PREFIX) :].rstrip("/") or None
+    relative = name[len(_UPPER_PREFIX) :].rstrip("/") or None
+    if relative is None:
+        return None
+    if (
+        relative.startswith("/")
+        or "\x00" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+        or len(relative.encode("utf-8", "surrogatepass")) > MAX_PATH_BYTES
+    ):
+        raise ValueError("unsafe or oversized path in upperdir tar")
+    return relative
 
 
 def _is_opaque(member: tarfile.TarInfo) -> bool:
@@ -44,13 +59,21 @@ def _is_opaque(member: tarfile.TarInfo) -> bool:
 def derive_manifest(
     tar_path: str, *, baseline: dict[str, str], epoch: int, staged_at: str
 ) -> dict:
+    if len(baseline) > MAX_MANIFEST_ENTRIES or any(
+        not isinstance(path, str)
+        or len(path.encode("utf-8", "surrogatepass")) > MAX_PATH_BYTES
+        for path in baseline
+    ):
+        raise ValueError("staging baseline exceeds manifest limits")
     staged: dict[str, dict] = {}  # rel -> {size, binary}
     whiteout_targets: set[str] = set()  # file-or-dir paths whited out
     opaque_dirs: set[str] = set()
     skipped: list[dict] = []
 
     with tarfile.open(tar_path, "r") as tf:
-        for member in tf:
+        for member_count, member in enumerate(tf, start=1):
+            if member_count > MAX_TAR_MEMBERS:
+                raise ValueError("upperdir tar has too many members")
             rel = _rel(member.name)
             if rel is None:
                 continue
@@ -78,6 +101,8 @@ def derive_manifest(
                 )
                 skipped.append({"path": rel, "kind": kind})
                 continue
+            if member.size < 0 or member.size > MAX_STAGED_FILE_BYTES:
+                raise ValueError("upperdir member exceeds staged file limit")
             if base == _OPAQUE_SENTINEL:
                 parent = posixpath.dirname(rel)
                 if parent:
@@ -95,6 +120,8 @@ def derive_manifest(
             f = tf.extractfile(member)
             head = f.read(_BINARY_SNIFF_BYTES) if f else b""
             staged[rel] = {"size": member.size, "binary": b"\0" in head}
+            if len(staged) > MAX_MANIFEST_ENTRIES:
+                raise ValueError("staging manifest has too many entries")
 
     deleted: set[str] = set()
     for target in whiteout_targets | opaque_dirs:

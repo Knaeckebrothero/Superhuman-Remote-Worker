@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from orchestrator.database.postgres import PostgresDB
+from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 from orchestrator.services.vm_readiness import VMReadinessService
 from orchestrator.services.ssh_helpers import orchestrator_can_reach
 
@@ -32,12 +33,22 @@ def candidate(entity_id="11111111-1111-4111-8111-111111111112", **vm):
 
 
 class FakeDB:
-    def __init__(self, jobs=(), threads=(), ready_jobs=(), ready_threads=()):
+    def __init__(
+        self,
+        jobs=(),
+        threads=(),
+        ready_jobs=(),
+        ready_threads=(),
+        *,
+        promote_result=True,
+    ):
         self.jobs = list(jobs)
         self.threads = list(threads)
         self.ready_jobs = list(ready_jobs)
         self.ready_threads = list(ready_threads)
         self.calls = []
+        self.promotions = []
+        self.promote_result = promote_result
 
     async def list_job_vm_readiness_candidates(self, *, ready=False):
         self.calls.append(("job", ready))
@@ -46,6 +57,16 @@ class FakeDB:
     async def list_thread_vm_readiness_candidates(self, *, ready=False):
         self.calls.append(("thread", ready))
         return list(self.ready_threads if ready else self.threads)
+
+    async def merge_vm_context_if_current(self, entity_id, registration_id, updates):
+        self.promotions.append(("job", entity_id, registration_id, updates))
+        return self.promote_result
+
+    async def merge_thread_vm_context_if_current(
+        self, entity_id, registration_id, updates
+    ):
+        self.promotions.append(("thread", entity_id, registration_id, updates))
+        return self.promote_result
 
 
 class FakeProvisioner:
@@ -80,6 +101,33 @@ class FakeProvisioner:
         )
         return self.write_result
 
+    async def attest_workspace_runtime(self, entity_id, *, entity_type="job"):
+        del entity_id, entity_type
+        if not self.writes:
+            raise RuntimeError("runtime identity is not prepared")
+        updates = self.writes[-1][3]
+        uid = updates.get("active_pod_uid")
+        host = updates.get("ssh_host")
+        if not uid or not host:
+            # Final/transient writes may omit coordinates; use the most recent
+            # exact prepared tuple, mirroring the durable JSONB merge.
+            prepared = next(
+                write[3]
+                for write in reversed(self.writes)
+                if write[3].get("active_pod_uid") and write[3].get("ssh_host")
+            )
+            uid = prepared["active_pod_uid"]
+            host = prepared["ssh_host"]
+        return WorkspaceRuntimeAttestation(
+            backing_id=f"k8s-vmi:{uid}",
+            workspace_generation=GENERATION,
+            runtime_incarnation=uid,
+            ssh_host_key_fingerprint=HOST_KEY_FINGERPRINT,
+            host=host,
+            pod_ip=host,
+            port=22,
+        )
+
 
 @pytest.fixture
 def successful_ssh(monkeypatch):
@@ -112,14 +160,17 @@ async def test_first_probe_success_promotes_once_with_cas(successful_ssh):
 
     await service.run_cycle()
 
-    entity_type, _, generation, updates, cas = provisioner.writes[-1]
+    entity_type, _, generation, prepared, cas = provisioner.writes[-1]
     assert (entity_type, generation, cas) == ("job", GENERATION, True)
+    assert prepared["status"] == "ssh_pending"
+    promoted_type, _, registration_id, updates = db.promotions[-1]
+    assert promoted_type == "job"
     assert updates["status"] == "ready"
     assert updates["ssh_host"] == updates["pod_ip"] == "10.42.0.10"
     assert updates["ssh_port"] == 22
     assert updates["active_pod_uid"] == "pod-1"
     assert updates["ssh_ready_source"] == "provisioner_probe"
-    assert updates["ssh_registration_id"]
+    assert updates["ssh_registration_id"] == registration_id
     assert updates["ssh_probe_error"] is None
     assert updates["recovering"] is False
     successful_ssh[0].assert_awaited_once_with(
@@ -132,8 +183,80 @@ async def test_first_probe_success_promotes_once_with_cas(successful_ssh):
         expected_host_key_fingerprint=HOST_KEY_FINGERPRINT,
     )
     successful_ssh[1].assert_awaited_once()
+    assert (
+        successful_ssh[1].await_args.kwargs["expected_host_key_fingerprint"]
+        == HOST_KEY_FINGERPRINT
+    )
+    assert callable(successful_ssh[1].await_args.kwargs["mutation_authority"])
     trigger.assert_called_once()
     assert len(provisioner.writes) == 1
+
+
+@pytest.mark.asyncio
+async def test_replaced_launcher_at_same_ip_receives_zero_seed_bytes(monkeypatch):
+    ssh = AsyncMock(return_value=(True, 1, ""))
+    effects = []
+
+    async def seed(*_args, **kwargs):
+        target = await kwargs["mutation_authority"]()
+        if target is not None:
+            effects.append(target)
+        return target is not None
+
+    monkeypatch.setattr("orchestrator.services.vm_readiness.wait_for_agent_ssh", ssh)
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.seed_ide_config_for_user", seed
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.resolve_ssh_key_path", lambda: "/key"
+    )
+
+    class ReplacedProvisioner(FakeProvisioner):
+        def __init__(self):
+            super().__init__(
+                {
+                    "ready": True,
+                    "pod_ip": "10.42.0.55",
+                    "phase": "Running",
+                    "active_pod_uid": "00000000-0000-4000-8000-000000000055",
+                }
+            )
+            self.attestations = 0
+
+        async def attest_workspace_runtime(self, entity_id, *, entity_type="job"):
+            del entity_id, entity_type
+            self.attestations += 1
+            uid = (
+                "00000000-0000-4000-8000-000000000055"
+                if self.attestations == 1
+                else "00000000-0000-4000-8000-000000000099"
+            )
+            fingerprint = (
+                HOST_KEY_FINGERPRINT
+                if self.attestations == 1
+                else "SHA256:" + ("B" * 43)
+            )
+            return WorkspaceRuntimeAttestation(
+                backing_id=f"k8s-vmi:{uid}",
+                workspace_generation=GENERATION,
+                runtime_incarnation=uid,
+                ssh_host_key_fingerprint=fingerprint,
+                host="10.42.0.55",
+                pod_ip="10.42.0.55",
+                port=22,
+            )
+
+    provisioner = ReplacedProvisioner()
+    trigger = MagicMock()
+    await VMReadinessService(
+        FakeDB(jobs=[candidate()]),
+        provisioner,
+        trigger_dispatch=trigger,
+    ).run_cycle()
+
+    assert effects == []
+    assert all(write[3].get("status") != "ready" for write in provisioner.writes)
+    trigger.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -309,6 +432,7 @@ async def test_stopped_guest_becomes_unreachable(monkeypatch):
 @pytest.mark.asyncio
 async def test_ip_change_reprobes_ready_vm(successful_ssh):
     row = candidate(status="ready", pod_ip="10.42.0.20", active_pod_uid="pod-old")
+    db = FakeDB(ready_jobs=[row])
     provisioner = FakeProvisioner(
         {
             "ready": True,
@@ -317,12 +441,11 @@ async def test_ip_change_reprobes_ready_vm(successful_ssh):
             "active_pod_uid": "pod-new",
         }
     )
-    service = VMReadinessService(
-        FakeDB(ready_jobs=[row]), provisioner, trigger_dispatch=lambda: None
-    )
+    service = VMReadinessService(db, provisioner, trigger_dispatch=lambda: None)
     await service.run_cycle()
     assert provisioner.writes[-1][3]["ssh_host"] == "10.42.0.21"
-    assert provisioner.writes[-1][4] is False
+    assert provisioner.writes[0][4] is False
+    assert db.promotions[-1][3]["active_pod_uid"] == "pod-new"
 
 
 @pytest.mark.asyncio
@@ -385,6 +508,26 @@ async def test_rejected_promotion_suppresses_seed_and_dispatch(successful_ssh):
 
     assert len(provisioner.writes) == 1
     successful_ssh[1].assert_not_awaited()
+    trigger.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_registration_cas_loss_cannot_publish_stale_ready(successful_ssh):
+    db = FakeDB(jobs=[candidate()], promote_result=False)
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.23",
+            "phase": "Running",
+            "active_pod_uid": "pod-b",
+        }
+    )
+    trigger = MagicMock()
+
+    await VMReadinessService(db, provisioner, trigger_dispatch=trigger).run_cycle()
+
+    assert db.promotions[-1][3]["status"] == "ready"
+    assert provisioner.writes[-1][3]["status"] == "ssh_pending"
     trigger.assert_not_called()
 
 
@@ -618,11 +761,12 @@ async def test_reprobe_ssh_process_verification_failure_demotes_ready_row(monkey
 
 class _FakeKeyscanProc:
     def __init__(self, stdout: bytes):
-        self._stdout = stdout
+        self.stdout = MagicMock()
+        self.stdout.read = AsyncMock(side_effect=[stdout, b""])
+        self.stderr = MagicMock()
+        self.stderr.read = AsyncMock(side_effect=[b""])
+        self.wait = AsyncMock(return_value=0)
         self.returncode = 0
-
-    async def communicate(self):
-        return self._stdout, b""
 
 
 @pytest.mark.asyncio

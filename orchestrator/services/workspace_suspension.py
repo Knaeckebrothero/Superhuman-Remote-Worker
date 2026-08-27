@@ -14,17 +14,33 @@ import os
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
-from uuid import UUID
+from typing import Any, Awaitable, Callable, Optional
+from uuid import UUID, uuid4
 
 from services import resolve_ssh_key_path
-from services.container_provisioner import WORKSPACE_RUNTIME_INCARNATION_KEY
+from services.container_provisioner import (
+    WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY,
+    WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY,
+    WORKSPACE_RUNTIME_INCARNATION_KEY,
+    WorkspaceCleanupOutcome,
+    WorkspaceRuntimeAttestation,
+    WorkspaceRuntimeAuthorityError,
+    WorkspaceTeardownIdentity,
+)
 from services.ssh_helpers import (
     EXTRACT_HOME_REMOTE_CMD,
     EXTRACT_REMOTE_CMD,
     stream_extract_snapshot,
 )
-from services.vm_provisioner import vm_persistent_rootdisk_enabled
+from services.restore_work_lease import (
+    RestoreWorkLeaseHeartbeat,
+    RestoreWorkLeaseLost,
+)
+from services.vm_provisioner import (
+    VMTeardownIdentity,
+    VMTeardownResult,
+    vm_persistent_rootdisk_enabled,
+)
 from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from services.workspace_lifecycle import WorkspaceOwner
 
@@ -73,6 +89,79 @@ def _canonical_uuid(value: Any, *, label: str) -> str:
     if value != canonical:
         raise RuntimeError(f"strict restore {label} is not canonical")
     return canonical
+
+
+def _captured_workspace_runtime(workspace: Any) -> str | None:
+    """Return one exact Kubernetes runtime UID, or refuse legacy ambiguity."""
+
+    if not isinstance(workspace, dict):
+        return None
+    value = workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+    if not isinstance(value, str):
+        return None
+    try:
+        canonical = str(UUID(value))
+    except (TypeError, ValueError):
+        return None
+    return canonical if value == canonical else None
+
+
+def _settled_restore_runtime(
+    workspace: Any,
+    creation: Any,
+    *,
+    retired_runtime: str | None = None,
+) -> str | None:
+    """Validate the current B projection against its exact settled receipt."""
+
+    if not isinstance(workspace, dict) or not isinstance(creation, dict):
+        return None
+    if (
+        str(creation.get("operation_kind") or "") != "restore"
+        or str(creation.get("result_kind") or "") != "settled"
+        or creation.get("settled_at") is None
+        or workspace.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY) is not True
+        or workspace.get(WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY)
+        != str(creation.get("id") or "")
+        or workspace.get(WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY)
+        != str(creation.get("claim_token") or "")
+    ):
+        return None
+    runtime = _captured_workspace_runtime(workspace)
+    try:
+        receipt_runtime = _canonical_uuid(
+            creation.get("runtime_incarnation"), label="restore runtime"
+        )
+    except RuntimeError:
+        return None
+    if runtime != receipt_runtime or runtime == retired_runtime:
+        return None
+    return runtime
+
+
+def _claimed_restore_work(
+    restore_work: Any,
+    *,
+    runtime_incarnation: str,
+    claimant: str,
+) -> bool:
+    """Validate the exact-B work lease returned by the server-owned ledger."""
+
+    if not isinstance(restore_work, dict):
+        return False
+    try:
+        reservation_id = str(UUID(str(restore_work.get("id"))))
+        work_runtime = str(UUID(str(restore_work.get("runtime_incarnation"))))
+        work_token = int(restore_work.get("restore_work_claim_token"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        reservation_id
+        and work_runtime == runtime_incarnation
+        and work_token > 0
+        and restore_work.get("restore_work_claimed_by") == claimant
+        and restore_work.get("restore_work_completed_at") is None
+    )
 
 
 def _strict_session_restore_authority(
@@ -346,19 +435,298 @@ class WorkspaceSuspensionService:
     def idle_timeout_minutes(self) -> int:
         return int(os.environ.get("WORKSPACE_IDLE_TIMEOUT", "30"))
 
+    async def _claim_workspace_restore_work(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        runtime_incarnation: str,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Claim B's post-create effects, replaying one lost claim response."""
+
+        claimant = f"workspace-restore:{uuid4()}"
+        for _attempt in range(2):
+            try:
+                restore_work = (
+                    await self._container_provisioner.claim_workspace_restore_work(
+                        owner,
+                        claimant=claimant,
+                        lease_seconds=300,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "Workspace restore-work claim response was ambiguous for %s %s",
+                    owner.kind,
+                    owner.id,
+                )
+                continue
+            if _claimed_restore_work(
+                restore_work,
+                runtime_incarnation=runtime_incarnation,
+                claimant=claimant,
+            ):
+                return claimant, restore_work
+            return None
+        return None
+
+    async def _release_workspace_restore_work(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        restore_work: dict[str, Any],
+        claimant: str,
+    ) -> None:
+        try:
+            await self._container_provisioner.release_workspace_restore_work(
+                owner,
+                restore_work=restore_work,
+                claimant=claimant,
+                retry_seconds=30,
+            )
+        except Exception:
+            # The bounded lease remains the crash-recovery authority.
+            logger.warning(
+                "Workspace restore-work release response was ambiguous for %s %s",
+                owner.kind,
+                owner.id,
+            )
+
+    async def _complete_workspace_restore_work(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        restore_work: dict[str, Any],
+        claimant: str,
+    ) -> bool:
+        """Complete exact-B Ready publication, replaying a lost response."""
+
+        for _attempt in range(2):
+            try:
+                if await self._container_provisioner.complete_workspace_restore_work(
+                    owner,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                    success=True,
+                ):
+                    return True
+            except Exception:
+                logger.warning(
+                    "Workspace restore-work completion response was ambiguous for "
+                    "%s %s",
+                    owner.kind,
+                    owner.id,
+                )
+        return False
+
+    def _workspace_restore_heartbeat(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        restore_work: dict[str, Any],
+        claimant: str,
+    ) -> RestoreWorkLeaseHeartbeat:
+        async def renew() -> object:
+            return await self._container_provisioner.renew_workspace_restore_work(
+                owner,
+                restore_work=restore_work,
+                claimant=claimant,
+                lease_seconds=300,
+            )
+
+        return RestoreWorkLeaseHeartbeat(renew, interval_seconds=60)
+
+    @staticmethod
+    def _vm_capture_tuple_matches(
+        identity: VMTeardownIdentity,
+        attestation: WorkspaceRuntimeAttestation,
+    ) -> bool:
+        """Bind destructive VM identity to the exact attested SSH target."""
+
+        return bool(
+            identity.provision_generation == attestation.workspace_generation
+            and identity.ssh_host == attestation.host
+            and identity.ssh_port == attestation.port
+            and identity.ssh_host_key_fingerprint
+            == attestation.ssh_host_key_fingerprint
+            and identity.vm_uid
+            and identity.rootdisk_pvc_uid
+        )
+
+    async def _capture_vm_capture_authority(
+        self,
+        owner_id: str,
+        *,
+        entity_type: str,
+    ) -> tuple[VMTeardownIdentity, WorkspaceRuntimeAttestation] | None:
+        """Capture one immutable VM generation and its fresh live endpoint."""
+
+        if not self._vm_provisioner or not self._vm_provisioner.is_available:
+            return None
+        try:
+            identity = await self._vm_provisioner.capture_vm_teardown_identity(
+                owner_id,
+                entity_type=entity_type,
+            )
+            attestation = await self._vm_provisioner.attest_workspace_runtime(
+                owner_id,
+                entity_type=entity_type,
+            )
+            if not self._vm_capture_tuple_matches(identity, attestation):
+                return None
+            if (
+                await self._vm_provisioner.revalidate_vm_teardown_identity(
+                    owner_id,
+                    identity,
+                    entity_type=entity_type,
+                )
+                != "matched"
+            ):
+                return None
+            return identity, attestation
+        except Exception:
+            logger.warning(
+                "VM capture authority unavailable for %s %s",
+                entity_type,
+                owner_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _revalidate_vm_capture_target(
+        self,
+        owner_id: str,
+        *,
+        entity_type: str,
+        identity: VMTeardownIdentity,
+        attestation: WorkspaceRuntimeAttestation,
+    ) -> tuple[str, int, str] | None:
+        """Freshly re-prove the same VM immediately before one external read."""
+
+        try:
+            current = await self._vm_provisioner.attest_workspace_runtime(
+                owner_id,
+                entity_type=entity_type,
+            )
+            if current != attestation:
+                return None
+            if (
+                await self._vm_provisioner.revalidate_vm_teardown_identity(
+                    owner_id,
+                    identity,
+                    entity_type=entity_type,
+                )
+                != "matched"
+            ):
+                return None
+            return (
+                attestation.host,
+                attestation.port,
+                attestation.ssh_host_key_fingerprint,
+            )
+        except Exception:
+            return None
+
+    async def _attest_claimed_workspace_restore_target(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        runtime_incarnation: str,
+        restore_work: dict[str, Any],
+        claimant: str,
+    ) -> WorkspaceRuntimeAttestation:
+        """Attest exact B and immediately re-lock its durable work token."""
+
+        attestation = await self._container_provisioner.attest_workspace_runtime(owner)
+        if attestation.runtime_incarnation != runtime_incarnation:
+            raise WorkspaceRuntimeAuthorityError("workspace restore Pod UID changed")
+        renewed = await self._container_provisioner.renew_workspace_restore_work(
+            owner,
+            restore_work=restore_work,
+            claimant=claimant,
+            lease_seconds=300,
+        )
+        if not _claimed_restore_work(
+            renewed,
+            runtime_incarnation=runtime_incarnation,
+            claimant=claimant,
+        ) or any(
+            str(renewed.get(key) or "") != str(restore_work.get(key) or "")
+            for key in ("id", "restore_work_claim_token")
+        ):
+            raise RestoreWorkLeaseLost(
+                "workspace restore authority changed after runtime attestation"
+            )
+        return attestation
+
     # =========================================================================
     # Suspend: snapshot → delete pod
     # =========================================================================
 
+    async def _settle_container_suspension(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        runtime_incarnation: str,
+        suspended_at: str,
+        snapshot_restore_required: bool,
+    ) -> bool:
+        """Retire one exact Pod through the durable preserve-only protocol.
+
+        Snapshot capture intentionally happens before this helper: it is a
+        read-only operation and must succeed before cleanup gains authority.
+        The post-snapshot identity probe prevents a late A→B replacement from
+        turning A's snapshot into deletion authority over B.  Projection to
+        ``suspended`` is owned by cleanup settlement; callers never hand-merge
+        lifecycle state around the intent.
+        """
+
+        identity = (
+            await self._container_provisioner.capture_workspace_teardown_identity(
+                owner,
+                expected_runtime_incarnation=runtime_incarnation,
+            )
+        )
+        if (
+            not isinstance(identity, WorkspaceTeardownIdentity)
+            or identity.pod_uid != runtime_incarnation
+        ):
+            return False
+        intent = await self._container_provisioner.prepare_workspace_cleanup_intent(
+            owner,
+            expected_runtime_incarnation=runtime_incarnation,
+            target_disposition="suspended",
+            reclaim_shared_resources=False,
+            suspended_at=suspended_at,
+            identity=identity,
+            snapshot_restore_required=snapshot_restore_required,
+        )
+        if not isinstance(intent, dict):
+            return False
+        outcome = await self._container_provisioner.reconcile_workspace_cleanup_intent(
+            owner,
+            expected_runtime_incarnation=runtime_incarnation,
+            intent_generation=int(intent["intent_generation"]),
+        )
+        if not isinstance(outcome, WorkspaceCleanupOutcome):
+            raise RuntimeError("workspace suspension returned an untyped outcome")
+        if outcome.superseded:
+            logger.info(
+                "Workspace suspension target %s became stale; preserving its successor",
+                runtime_incarnation,
+            )
+            return False
+        return outcome.settled
+
     async def suspend_workspace(self, job_id: str) -> bool:
         """Capture snapshot to S3, then tear down the workspace.
 
-        Dispatches to the correct provisioner based on workspace metadata:
-        - K8s container: snapshot → delete pod
-        - VM: snapshot → delete VM
+        VM workspaces retain the existing snapshot → delete flow. Kubernetes
+        capture is temporarily refused before I/O because no durable
+        pre-delete capture authority exists yet.
 
-        Returns True if snapshot + teardown succeeded.
-        On failure, reverts status to 'ready' and keeps the workspace alive.
+        Returns True if snapshot + teardown succeeded. Failures before deletion
+        restore ``ready`` only while the captured runtime is still current;
+        stale or already-deleted runtimes never project over a successor.
         """
         if not self.is_enabled or not self._db:
             return False
@@ -385,83 +753,204 @@ class WorkspaceSuspensionService:
             )
             return False
 
-        # Determine SSH host for snapshot
-        ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
-        ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
+        from services.ide_settings import is_kubernetes_capture_context
 
-        if not ssh_host:
+        if is_kubernetes_capture_context(ctx) or not vm_ctx:
+            # Temporary containment: a stale Kubernetes endpoint (including a
+            # stable Service whose selector now names successor B) is not
+            # capture authority for predecessor A.  Migration 0195 cleanup
+            # intents start at process-zero teardown and therefore cannot make
+            # the preceding snapshot/profile reads crash-safe.  Refuse before
+            # resolving/dialing any endpoint or mutating owner state; a future
+            # durable pre-delete capture authority must replace this guard.
+            logger.warning(
+                "Kubernetes workspace suspension capture is disabled pending "
+                "durable exact-runtime capture authority (job %s)",
+                job_id,
+            )
             return False
 
-        ws_status = ws_ctx.get("status") if ws_ctx else vm_ctx.get("status")
+        # The containment guard above leaves only the explicit VM path.  A VM
+        # owner may still carry a git-only ``workspace_container`` object, so
+        # its mere presence must not redirect status/capture to the Pod path.
+        ws_status = vm_ctx.get("status")
         if ws_status != "ready":
             return False
 
-        # Opportunistic final code-server config pull while the workspace is
-        # still alive — shrinks the worst-case IDE-settings loss window below the
-        # sweeper interval on a clean suspend/teardown. Best-effort.
-        try:
-            user_id = job.get("user_id")
-            if user_id:
-                from services.ide_settings import IdeSettingsStore, pull_ide_config
+        authority = await self._capture_vm_capture_authority(
+            job_id,
+            entity_type="job",
+        )
+        if authority is None:
+            # A raw/stale VM endpoint is not capture authority.  Preserve the
+            # live workspace before reading even one settings/snapshot byte.
+            return False
+        vm_identity, vm_attestation = authority
+        # Reserve suspension before the first IDE/settings byte. The exact VM
+        # operation is then claimed from the reserved state; default-dark or
+        # contended rollouts restore Ready without touching the guest.
+        if not await self._db.merge_vm_context_if_provision_generation(
+            job_id,
+            vm_identity.provision_generation,
+            {"status": "suspending", "_suspend_remote_io_closed": None},
+        ):
+            return False
 
-                store = IdeSettingsStore(self._db)
-                pulled = await pull_ide_config(ssh_host, int(ssh_port))
-                if pulled:
-                    await store.apply_pulled_files(str(user_id), pulled)
-                # Capture license/globalStorage + bytes extensions to S3 (Phase B),
-                # signature-gated. Shrinks the state loss window on clean suspend.
-                if self._snapshot_service and self._snapshot_service.is_available:
-                    from services.ide_profile_store import IdeProfileStore
-                    from services.ide_settings import capture_ide_profile
-
-                    profile = IdeProfileStore(
-                        self._snapshot_service._s3, self._snapshot_service._bucket
-                    )
-                    await capture_ide_profile(
-                        store, str(user_id), ssh_host, int(ssh_port), profile
-                    )
-        except Exception:
-            logger.debug(
-                "ide settings teardown pull failed for job %s", job_id, exc_info=True
-            )
-
-        # Mark as suspending (prevents re-entry from sweeper)
-        if ws_ctx:
-            await self._db.merge_workspace_container_context(
-                job_id, {"status": "suspending"}
-            )
-        elif vm_ctx:
-            await self._db.merge_vm_context(job_id, {"status": "suspending"})
+        from services.vm_remote_operation import (
+            VMRemoteOperationLeaseLost,
+            VMRemoteOperationUnavailable,
+            claim_vm_remote_operation,
+        )
 
         try:
-            # Capture environment to S3
-            source_type = "vm" if vm_ctx and not ws_ctx else "pod"
-            ok = await self._snapshot_service.capture_vm_snapshot(
-                job_id=job_id,
-                ssh_host=ssh_host,
-                ssh_port=int(ssh_port),
-                source_type=source_type,
+            lease = await claim_vm_remote_operation(
+                db=self._db,
+                provisioner=self._vm_provisioner,
+                owner_id=job_id,
+                owner_kind="job",
+                operation_kind="ide_profile",
+                lease_seconds=300,
             )
+        except VMRemoteOperationUnavailable:
+            try:
+                await self._db.merge_vm_context_if_provision_generation(
+                    job_id,
+                    vm_identity.provision_generation,
+                    {"status": "ready", "_suspend_remote_io_closed": None},
+                )
+            except Exception:
+                logger.warning(
+                    "VM suspension reservation could not be rolled back for %s",
+                    job_id,
+                    exc_info=True,
+                )
+            return False
+
+        ssh_host = lease.identity.ssh_host
+        ssh_port = lease.identity.ssh_port
+        fingerprint = lease.identity.ssh_host_key_fingerprint
+        disk_survives_teardown = vm_persistent_rootdisk_enabled()
+        remote_io_closed = False
+        try:
+            async with lease:
+                if not (
+                    vm_identity.provision_generation
+                    == lease.identity.workspace_generation
+                    and vm_identity.vm_uid == lease.identity.vm_uid
+                    and vm_identity.ssh_host == ssh_host
+                    and vm_identity.ssh_port == ssh_port
+                    and vm_identity.ssh_host_key_fingerprint == fingerprint
+                    and vm_attestation.runtime_incarnation
+                    == lease.identity.launcher_pod_uid
+                ):
+                    raise VMRemoteOperationLeaseLost(
+                        "VM suspension target changed before remote capture"
+                    )
+
+                async def capture_target() -> tuple[str, int, str] | None:
+                    return await lease.revalidate()
+
+                async def snapshot_authority() -> bool:
+                    return await capture_target() is not None
+
+                # Opportunistic final code-server config/profile pull while the
+                # exact renewable operation still owns the guest filesystem.
+                try:
+                    user_id = job.get("user_id")
+                    if user_id:
+                        from services.ide_settings import (
+                            IdeSettingsStore,
+                            pull_ide_config,
+                        )
+
+                        store = IdeSettingsStore(self._db)
+                        pulled = await pull_ide_config(
+                            ssh_host,
+                            int(ssh_port),
+                            expected_host_key_fingerprint=fingerprint,
+                            capture_authority=capture_target,
+                        )
+                        if await capture_target() is None:
+                            raise VMRemoteOperationLeaseLost(
+                                "VM authority changed during IDE settings capture"
+                            )
+                        if pulled:
+                            await store.apply_pulled_files(str(user_id), pulled)
+                        if (
+                            self._snapshot_service
+                            and self._snapshot_service.is_available
+                        ):
+                            from services.ide_profile_store import IdeProfileStore
+                            from services.ide_settings import capture_ide_profile
+
+                            profile = IdeProfileStore(
+                                self._snapshot_service._s3,
+                                self._snapshot_service._bucket,
+                            )
+                            await capture_ide_profile(
+                                store,
+                                str(user_id),
+                                ssh_host,
+                                int(ssh_port),
+                                profile,
+                                expected_host_key_fingerprint=fingerprint,
+                                capture_authority=capture_target,
+                                vm_lease=lease,
+                            )
+                except VMRemoteOperationLeaseLost:
+                    raise
+                except Exception:
+                    logger.debug(
+                        "ide settings teardown pull failed for job %s",
+                        job_id,
+                        exc_info=True,
+                    )
+
+                ok = await self._snapshot_service.capture_vm_snapshot(
+                    job_id=job_id,
+                    ssh_host=ssh_host,
+                    ssh_port=int(ssh_port),
+                    source_type="vm",
+                    expected_host_key_fingerprint=fingerprint,
+                    capture_authority=snapshot_authority,
+                )
+                if await capture_target() is None:
+                    raise VMRemoteOperationLeaseLost(
+                        "VM authority changed during suspension snapshot"
+                    )
+
+                # Close admission for any successor remote operation before
+                # this lease settles. Renewal/success settlement deliberately
+                # ignore this auxiliary marker; fresh claims do not.
+                remote_io_closed = bool(
+                    await self._db.merge_vm_context_if_provision_generation(
+                        job_id,
+                        vm_identity.provision_generation,
+                        {
+                            "_suspend_remote_io_closed": str(lease.receipt["id"]),
+                        },
+                    )
+                )
+                if not remote_io_closed:
+                    raise VMRemoteOperationLeaseLost(
+                        "VM suspension could not close subsequent remote I/O"
+                    )
+
             # Same reasoning as the thread path below: with a persistent
             # rootdisk the disk carries the workspace across the teardown, so a
             # capture that can never succeed for a VM stops being a
             # precondition. A pod has no disk to keep and stays fail-closed.
-            disk_survives_teardown = (
-                source_type == "vm" and vm_persistent_rootdisk_enabled()
-            )
-
             if not ok:
                 if not disk_survives_teardown:
                     logger.warning(
                         "Snapshot capture failed for job %s — keeping workspace alive",
                         job_id,
                     )
-                    if ws_ctx:
-                        await self._db.merge_workspace_container_context(
-                            job_id, {"status": "ready"}
-                        )
-                    elif vm_ctx:
-                        await self._db.merge_vm_context(job_id, {"status": "ready"})
+                    await self._db.merge_vm_context_if_provision_generation(
+                        job_id,
+                        vm_identity.provision_generation,
+                        {"status": "ready", "_suspend_remote_io_closed": None},
+                    )
                     return False
                 logger.info(
                     "Snapshot capture unavailable for job %s — suspending anyway; "
@@ -473,30 +962,34 @@ class WorkspaceSuspensionService:
             suspended_ctx: dict[str, Any] = {
                 "status": "suspended",
                 "suspended_at": datetime.now(timezone.utc).isoformat(),
+                "_suspend_remote_io_closed": str(lease.receipt["id"]),
             }
 
-            if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
-                deleted = await self._vm_provisioner.delete_vm(
-                    job_id, purge_disk=not disk_survives_teardown
+            if self._vm_provisioner and self._vm_provisioner.is_available:
+                outcome = await self._vm_provisioner.release_vm_captured(
+                    job_id,
+                    vm_identity,
+                    purge_disk=not disk_survives_teardown,
+                    capture_snapshot=False,
+                    entity_type="job",
                 )
-                if not deleted:
+                if (
+                    not isinstance(outcome, VMTeardownResult)
+                    or outcome.disposition != "completed"
+                ):
                     raise RuntimeError(
                         "VM suspension process-zero retirement is incomplete"
                     )
                 if disk_survives_teardown:
                     suspended_ctx["rootdisk"] = "kept"
-                await self._db.merge_vm_context(job_id, suspended_ctx)
+                if not await self._db.merge_vm_context_if_provision_generation(
+                    job_id,
+                    vm_identity.provision_generation,
+                    suspended_ctx,
+                ):
+                    raise RuntimeError("VM suspension successor replaced the target")
             else:
-                # K8s container (default)
-                deleted = await self._container_provisioner.delete_workspace(
-                    WorkspaceOwner.job(job_id)
-                )
-                if not deleted:
-                    raise RuntimeError(
-                        "workspace suspension process-zero retirement is incomplete"
-                    )
-                suspended_ctx.update({"pod_ip": None, "pod_name": None})
-                await self._db.merge_workspace_container_context(job_id, suspended_ctx)
+                raise RuntimeError("VM suspension provisioner is unavailable")
 
             logger.info("Workspace suspended to S3 for job %s", job_id)
             return True
@@ -504,12 +997,20 @@ class WorkspaceSuspensionService:
         except Exception:
             logger.exception("Failed to suspend workspace for job %s", job_id)
             try:
-                if ws_ctx:
-                    await self._db.merge_workspace_container_context(
-                        job_id, {"status": "ready"}
+                if vm_ctx and (
+                    await self._revalidate_vm_capture_target(
+                        job_id,
+                        entity_type="job",
+                        identity=vm_identity,
+                        attestation=vm_attestation,
                     )
-                elif vm_ctx:
-                    await self._db.merge_vm_context(job_id, {"status": "ready"})
+                    is not None
+                ):
+                    await self._db.merge_vm_context_if_provision_generation(
+                        job_id,
+                        vm_identity.provision_generation,
+                        {"status": "ready", "_suspend_remote_io_closed": None},
+                    )
             except Exception:
                 pass
             return False
@@ -552,13 +1053,14 @@ class WorkspaceSuspensionService:
             )
             return False
 
-        if ws_ctx:
-            await self._db.merge_workspace_container_context(
-                job_id, {"status": "restoring"}
-            )
-        elif vm_ctx:
+        if not ws_ctx and vm_ctx:
             await self._db.merge_vm_context(job_id, {"status": "restoring"})
 
+        restored_runtime: str | None = None
+        restore_work: dict[str, Any] | None = None
+        restore_claimant: str | None = None
+        restore_work_finished = False
+        restore_owner: WorkspaceOwner | None = None
         try:
             ssh_host = None
             # Pod vs VM decides the extract scope below: a pod extract runs as
@@ -597,54 +1099,180 @@ class WorkspaceSuspensionService:
                 return False
 
             else:
-                # K8s container (default): create a fresh pod
-                ok = await self._container_provisioner.create_workspace(
-                    WorkspaceOwner.job(job_id)
-                )
-                if not ok:
-                    logger.error("Failed to create pod for restore of job %s", job_id)
-                    await self._db.merge_workspace_container_context(
-                        job_id,
-                        {
-                            "status": "failed",
-                            "error": "pod creation failed on restore",
-                        },
+                # K8s restore starts from one exact, settled suspension of A.
+                # No ``restoring`` write is made over A: creation reserves and
+                # publishes a distinct B, and only B may receive extraction
+                # status below.
+                owner = WorkspaceOwner.job(job_id)
+                retired_runtime: str | None = None
+                creation: dict[str, Any] | None = None
+                if ws_ctx.get("status") == "suspended":
+                    retired_runtime = _captured_workspace_runtime(ws_ctx)
+                    if (
+                        retired_runtime is None
+                        or ws_ctx.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY)
+                        is not True
+                    ):
+                        return False
+                    suspension = await self._container_provisioner.get_settled_workspace_suspension(
+                        owner,
+                        expected_runtime_incarnation=retired_runtime,
                     )
-                    return False
-
+                    if not isinstance(suspension, dict):
+                        return False
+                    try:
+                        operation_id = str(UUID(str(suspension["id"])))
+                    except (KeyError, TypeError, ValueError):
+                        return False
+                    try:
+                        await self._container_provisioner.create_workspace(
+                            owner,
+                            operation_kind="restore",
+                            operation_id=operation_id,
+                        )
+                    except Exception:
+                        # The response may be lost after the reservation
+                        # settled. Read the durable exact result before deciding
+                        # failure.
+                        logger.warning(
+                            "Workspace restore create response was ambiguous for "
+                            "job %s",
+                            job_id,
+                        )
+                    creation = (
+                        await self._container_provisioner.get_workspace_creation_result(
+                            owner,
+                            operation_kind="restore",
+                            operation_id=operation_id,
+                        )
+                    )
+                else:
+                    # A retry after process restart sees B, not retired A.  It
+                    # may continue only when B's current projection names the
+                    # exact settled restore reservation.
+                    creation = await self._container_provisioner.get_current_workspace_creation_result(
+                        owner,
+                        operation_kind="restore",
+                    )
                 job = await self._db.get_job(job_id)
-                ws_ctx = (job.get("context") or {}).get("workspace_container", {})
+                if not job:
+                    return False
+                current_ctx = job.get("context") or {}
+                if isinstance(current_ctx, str):
+                    try:
+                        current_ctx = json.loads(current_ctx)
+                    except (json.JSONDecodeError, TypeError):
+                        return False
+                ws_ctx = current_ctx.get("workspace_container", {})
+                restored_runtime = _settled_restore_runtime(
+                    ws_ctx,
+                    creation,
+                    retired_runtime=retired_runtime,
+                )
+                if restored_runtime is None:
+                    logger.error("Failed to create pod for restore of job %s", job_id)
+                    return False
                 ssh_host = ws_ctx.get("pod_ip")
 
-            if not ssh_host:
-                error_msg = "no SSH host after provisioning for restore"
-                logger.error("%s (job %s)", error_msg, job_id)
-                await self._db.merge_workspace_container_context(
-                    job_id, {"status": "failed", "error": error_msg}
+            if not restoring_vm:
+                restore_owner = WorkspaceOwner.job(job_id)
+                claimed = await self._claim_workspace_restore_work(
+                    restore_owner,
+                    runtime_incarnation=str(restored_runtime),
+                )
+                if claimed is None:
+                    return False
+                restore_claimant, restore_work = claimed
+
+            try:
+                heartbeat = (
+                    self._workspace_restore_heartbeat(
+                        restore_owner,
+                        restore_work=restore_work,
+                        claimant=restore_claimant,
+                    )
+                    if restore_owner is not None
+                    and restore_work is not None
+                    and restore_claimant is not None
+                    else None
+                )
+                if heartbeat is None:
+                    # VM restore paths retain their existing non-Kubernetes
+                    # authority and never reach exact-B work leasing.
+                    return False
+                async with heartbeat:
+                    attestation = await self._attest_claimed_workspace_restore_target(
+                        restore_owner,
+                        runtime_incarnation=str(restored_runtime),
+                        restore_work=restore_work,
+                        claimant=restore_claimant,
+                    )
+
+                    async def mutation_authority() -> WorkspaceRuntimeAttestation:
+                        return await self._attest_claimed_workspace_restore_target(
+                            restore_owner,
+                            runtime_incarnation=str(restored_runtime),
+                            restore_work=restore_work,
+                            claimant=restore_claimant,
+                        )
+
+                    ssh_host = attestation.pod_ip
+                    if not ssh_host:
+                        error_msg = "no SSH host after provisioning for restore"
+                        logger.error("%s (job %s)", error_msg, job_id)
+                        await self._db.merge_workspace_container_context_if_runtime(
+                            job_id,
+                            {"status": "failed", "error": error_msg},
+                            expected_runtime_incarnation=restored_runtime,
+                        )
+                        return False
+
+                    # Extract snapshot into the workspace. A failed extract is a
+                    # failed restore: the workspace is empty or half-populated.
+                    ssh_port = attestation.port
+                    if not await self._extract_snapshot(
+                        job_id,
+                        ssh_host,
+                        ssh_port=ssh_port,
+                        scoped_home=True,
+                        expected_host_key_fingerprint=(
+                            attestation.ssh_host_key_fingerprint
+                        ),
+                        mutation_authority=mutation_authority,
+                    ):
+                        error_msg = "snapshot extraction failed on restore"
+                        logger.error("%s (job %s)", error_msg, job_id)
+                        await self._db.merge_workspace_container_context_if_runtime(
+                            job_id,
+                            {"status": "failed", "error": error_msg},
+                            expected_runtime_incarnation=restored_runtime,
+                        )
+                        return False
+
+                    # Re-attest the complete endpoint/key identity and re-lock
+                    # the work token after the last byte, then retain the
+                    # cheap UID liveness probe immediately before settlement.
+                    if await mutation_authority() != attestation:
+                        return False
+                    exact_live = await self._container_provisioner.workspace_pod_live(
+                        restore_owner,
+                        expected_runtime_incarnation=restored_runtime,
+                    )
+                    if exact_live is not True:
+                        return False
+            except (RestoreWorkLeaseLost, WorkspaceRuntimeAuthorityError):
+                logger.warning(
+                    "Workspace restore-work authority changed for job %s", job_id
                 )
                 return False
 
-            # Extract snapshot into the workspace. A failed extract is a failed
-            # restore: the workspace is empty or half-populated, and stamping
-            # 'ready' over it hands the dispatcher a blank tree that looks
-            # healthy. Fail visibly instead and let the caller decide.
-            ssh_port = _resolve_ssh_port(ws_ctx, {})
-            if not await self._extract_snapshot(
-                job_id, ssh_host, ssh_port=ssh_port, scoped_home=True
+            if not await self._complete_workspace_restore_work(
+                restore_owner,
+                restore_work=restore_work,
+                claimant=restore_claimant,
             ):
-                error_msg = "snapshot extraction failed on restore"
-                logger.error("%s (job %s)", error_msg, job_id)
-                await self._db.merge_workspace_container_context(
-                    job_id, {"status": "failed", "error": error_msg}
-                )
                 return False
-
-            # Mark as ready
-            restored_ctx = {
-                "status": "ready",
-                "restored_at": datetime.now(timezone.utc).isoformat(),
-            }
-            await self._db.merge_workspace_container_context(job_id, restored_ctx)
+            restore_work_finished = True
 
             logger.info(
                 "Workspace restored from S3 for job %s (ssh_host=%s)",
@@ -655,15 +1283,240 @@ class WorkspaceSuspensionService:
 
         except Exception:
             logger.exception("Failed to restore workspace for job %s", job_id)
-            if ws_ctx:
-                await self._db.merge_workspace_container_context(
-                    job_id, {"status": "failed", "error": "restore exception"}
-                )
-            elif vm_ctx:
+            if not ws_ctx and vm_ctx:
                 await self._db.merge_vm_context(
                     job_id, {"status": "failed", "error": "restore exception"}
                 )
+            elif restored_runtime is not None:
+                await self._db.merge_workspace_container_context_if_runtime(
+                    job_id,
+                    {"status": "failed", "error": "restore exception"},
+                    expected_runtime_incarnation=restored_runtime,
+                )
             return False
+        finally:
+            if (
+                not restore_work_finished
+                and restore_owner is not None
+                and restore_work is not None
+                and restore_claimant is not None
+            ):
+                await self._release_workspace_restore_work(
+                    restore_owner,
+                    restore_work=restore_work,
+                    claimant=restore_claimant,
+                )
+
+    async def _finish_container_thread_restore(
+        self,
+        thread_id: str,
+        *,
+        owner: WorkspaceOwner,
+        restored_runtime: str,
+        ws_ctx: dict[str, Any],
+        strict_authority: _StrictSessionRestoreAuthority | None,
+        strict_terminal_snapshot: bool,
+        volume_reattached: bool,
+        reattach_reason: str,
+    ) -> bool:
+        """Run and atomically settle exact-B thread restore effects.
+
+        Creation settlement proves which Pod is B; this second durable lease
+        serializes snapshot extraction across orchestrator replicas. Its
+        heartbeat spans every unbounded remote effect, and final Ready
+        publication consumes the same claim token. Strict stateless restores
+        additionally retain the full binding/endpoint/fingerprint tuple.
+        """
+
+        claimed = await self._claim_workspace_restore_work(
+            owner,
+            runtime_incarnation=restored_runtime,
+        )
+        if claimed is None:
+            return False
+        claimant, restore_work = claimed
+        restore_work_finished = False
+        try:
+            ssh_host = (
+                strict_authority.ssh_host
+                if strict_authority is not None
+                else ws_ctx.get("pod_ip")
+            )
+            if not isinstance(ssh_host, str) or not ssh_host:
+                if not strict_terminal_snapshot:
+                    await self._db.merge_thread_workspace_context_if_runtime(
+                        thread_id,
+                        {
+                            "status": "failed",
+                            "error": "no SSH host after provisioning for restore",
+                        },
+                        expected_runtime_incarnation=restored_runtime,
+                    )
+                return False
+            ssh_port = (
+                strict_authority.ssh_port
+                if strict_authority is not None
+                else _resolve_ssh_port(ws_ctx, {})
+            )
+
+            try:
+                async with self._workspace_restore_heartbeat(
+                    owner,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                ):
+                    attestation = await self._attest_claimed_workspace_restore_target(
+                        owner,
+                        runtime_incarnation=restored_runtime,
+                        restore_work=restore_work,
+                        claimant=claimant,
+                    )
+
+                    async def mutation_authority() -> WorkspaceRuntimeAttestation:
+                        return await self._attest_claimed_workspace_restore_target(
+                            owner,
+                            runtime_incarnation=restored_runtime,
+                            restore_work=restore_work,
+                            claimant=claimant,
+                        )
+
+                    if strict_authority is not None and not (
+                        attestation.runtime_incarnation
+                        == strict_authority.runtime_incarnation
+                        and attestation.backing_id == strict_authority.backing_id
+                        and attestation.pod_ip == strict_authority.ssh_host
+                        and attestation.port == strict_authority.ssh_port
+                        and attestation.ssh_host_key_fingerprint
+                        == strict_authority.host_key_fingerprint
+                    ):
+                        raise WorkspaceRuntimeAuthorityError(
+                            "strict workspace restore attestation changed"
+                        )
+                    ssh_host = attestation.pod_ip
+                    ssh_port = attestation.port
+                    if volume_reattached:
+                        logger.info(
+                            "Workspace restore for thread %s rides the reattached "
+                            "volume (%s) — no snapshot extract",
+                            thread_id,
+                            reattach_reason,
+                        )
+                    else:
+                        extract_kwargs: dict[str, Any] = {
+                            "scoped_home": True,
+                            "expected_host_key_fingerprint": (
+                                attestation.ssh_host_key_fingerprint
+                            ),
+                            "mutation_authority": mutation_authority,
+                        }
+                        if strict_authority is not None:
+                            extract_kwargs = {
+                                "expected_host_key_fingerprint": (
+                                    strict_authority.host_key_fingerprint
+                                ),
+                                "mutation_authority": mutation_authority,
+                                "remote_cmd": EXTRACT_HOME_REMOTE_CMD,
+                                "require_pipefail": True,
+                            }
+                        extracted = await self._extract_snapshot(
+                            thread_id,
+                            ssh_host,
+                            ssh_port=ssh_port,
+                            entity_type="threads",
+                            **extract_kwargs,
+                        )
+                        if not extracted:
+                            logger.error(
+                                "snapshot extraction failed on restore (thread %s)",
+                                thread_id,
+                            )
+                            if not strict_terminal_snapshot:
+                                await (
+                                    self._db.merge_thread_workspace_context_if_runtime(
+                                        thread_id,
+                                        {
+                                            "status": "failed",
+                                            "error": (
+                                                "snapshot extraction failed on restore"
+                                            ),
+                                        },
+                                        expected_runtime_incarnation=restored_runtime,
+                                    )
+                                )
+                            return False
+
+                    if await mutation_authority() != attestation:
+                        return False
+                    exact_live = await self._container_provisioner.workspace_pod_live(
+                        owner,
+                        expected_runtime_incarnation=restored_runtime,
+                    )
+                    if exact_live is not True:
+                        return False
+            except (RestoreWorkLeaseLost, WorkspaceRuntimeAuthorityError):
+                logger.warning(
+                    "Workspace restore-work authority changed for thread %s",
+                    thread_id,
+                )
+                return False
+
+            if strict_authority is not None:
+                for _attempt in range(2):
+                    try:
+                        completed = await self._container_provisioner.complete_strict_thread_restore_work(
+                            owner,
+                            restore_work=restore_work,
+                            claimant=claimant,
+                            workspace_generation=(
+                                strict_authority.workspace_generation
+                            ),
+                            endpoint_generation=(strict_authority.endpoint_generation),
+                            backing_id=strict_authority.backing_id,
+                            host_key_fingerprint=(
+                                strict_authority.host_key_fingerprint
+                            ),
+                            pod_ip=strict_authority.ssh_host,
+                            port=strict_authority.ssh_port,
+                            expected_workspace_status=(
+                                strict_authority.workspace_status
+                            ),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Strict thread restore completion response was "
+                            "ambiguous for %s",
+                            thread_id,
+                        )
+                        continue
+                    if completed:
+                        restore_work_finished = True
+                        break
+                if not restore_work_finished:
+                    return False
+            else:
+                if not await self._complete_workspace_restore_work(
+                    owner,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                ):
+                    return False
+                restore_work_finished = True
+
+            logger.info(
+                "%s workspace restored for thread %s from %s (runtime=%s)",
+                "Strict terminal" if strict_authority is not None else "Pinned",
+                thread_id,
+                "its own volume" if volume_reattached else "S3",
+                restored_runtime,
+            )
+            return True
+        finally:
+            if not restore_work_finished:
+                await self._release_workspace_restore_work(
+                    owner,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                )
 
     async def _commit_strict_thread_restore_ready(
         self,
@@ -762,6 +1615,8 @@ class WorkspaceSuspensionService:
         *,
         scoped_home: Optional[bool] = None,
         expected_host_key_fingerprint: Optional[str] = None,
+        mutation_authority: Callable[[], Awaitable[WorkspaceRuntimeAttestation]]
+        | None = None,
         remote_cmd: Optional[str] = None,
         require_pipefail: bool = False,
     ) -> bool:
@@ -806,6 +1661,14 @@ class WorkspaceSuspensionService:
                     entity_id,
                 )
                 return False
+
+            # The download is local. Freshly attest and re-lock exact B at
+            # the boundary where archive bytes can leave for a reusable IP.
+            if mutation_authority is not None:
+                attestation = await mutation_authority()
+                ssh_host = attestation.pod_ip
+                ssh_port = attestation.port
+                expected_host_key_fingerprint = attestation.ssh_host_key_fingerprint
 
             key_path = resolve_ssh_key_path()
             if not key_path:
@@ -880,7 +1743,9 @@ class WorkspaceSuspensionService:
                 owner.id, _pinned_runtime_lock_held=True
             )
         if stateless_creation_generation is None and not allow_stateless_create:
-            kwargs = {"expected_runtime_incarnation": expected_runtime_incarnation}
+            kwargs: dict[str, Any] = {
+                "expected_runtime_incarnation": expected_runtime_incarnation
+            }
             if _pinned_runtime_lock_held:
                 kwargs["_pinned_runtime_lock_held"] = True
             return await self.restore_thread_workspace(owner.id, **kwargs)
@@ -899,10 +1764,13 @@ class WorkspaceSuspensionService:
     async def suspend_thread_workspace(self, thread_id: str) -> bool:
         """Capture thread workspace snapshot to S3, then tear down.
 
-        Dispatches to the correct provisioner based on workspace metadata.
+        VM workspaces retain the existing snapshot → delete flow. Kubernetes
+        capture is temporarily refused before I/O because no durable
+        pre-delete capture authority exists yet.
 
-        Returns True if snapshot + teardown succeeded.
-        On failure, reverts status to 'ready' and keeps the workspace alive.
+        Returns True if snapshot + teardown succeeded. Failures before deletion
+        restore ``ready`` only while the captured runtime is still current;
+        stale or already-deleted runtimes never project over a successor.
         """
         if not self.is_enabled or not self._db:
             return False
@@ -944,13 +1812,21 @@ class WorkspaceSuspensionService:
         # instead of asking whether workspace_container happens to exist.
         is_vm = _thread_is_vm_tier(metadata, ws_ctx, vm_ctx)
 
-        ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
-        ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx, is_vm=is_vm)
-
-        if not ssh_host:
+        if not is_vm:
+            # Temporary containment: neither a raw Pod IP nor stable Service
+            # DNS proves that reads still target this thread's exact runtime A.
+            # The existing cleanup intent begins after capture, so it cannot
+            # fence a crash/replacement during snapshot/profile reads.  Keep
+            # the Kubernetes workspace live and untouched until a durable,
+            # renewable pre-delete capture authority exists.
+            logger.warning(
+                "Kubernetes thread suspension capture is disabled pending "
+                "durable exact-runtime capture authority (thread %s)",
+                thread_id,
+            )
             return False
 
-        ws_status = vm_ctx.get("status") if is_vm else ws_ctx.get("status")
+        ws_status = vm_ctx.get("status")
         if ws_status in ("suspended", "suspending"):
             # A concurrent/earlier suspend already handled (or is handling)
             # this thread. Returning False here made the caller's fallback
@@ -966,16 +1842,72 @@ class WorkspaceSuspensionService:
         if ws_status != "ready":
             return False
 
-        if is_vm:
-            await self._db.merge_thread_vm_context(thread_id, {"status": "suspending"})
-        else:
-            await self._db.merge_thread_workspace_context(
-                thread_id, {"status": "suspending"}
+        authority = await self._capture_vm_capture_authority(
+            thread_id,
+            entity_type="thread",
+        )
+        if authority is None:
+            return False
+        vm_identity, vm_attestation = authority
+
+        # Resolve from the fresh attestation only. A VM-assigned thread can
+        # retain stale Ready container residue; no raw metadata endpoint is an
+        # external-read authority.
+        ssh_host = vm_attestation.host
+        ssh_port = vm_attestation.port
+        fingerprint = vm_attestation.ssh_host_key_fingerprint
+
+        if not await self._db.merge_thread_vm_context_if_provision_generation(
+            thread_id,
+            vm_identity.provision_generation,
+            {"status": "suspending", "_suspend_remote_io_closed": None},
+        ):
+            return False
+        from services.vm_remote_operation import (
+            VMRemoteOperationLeaseLost,
+            VMRemoteOperationUnavailable,
+            claim_vm_remote_operation,
+        )
+
+        try:
+            vm_lease = await claim_vm_remote_operation(
+                db=self._db,
+                provisioner=self._vm_provisioner,
+                owner_id=thread_id,
+                owner_kind="thread",
+                operation_kind="snapshot_capture",
+                lease_seconds=300,
+            )
+        except VMRemoteOperationUnavailable:
+            await self._db.merge_thread_vm_context_if_provision_generation(
+                thread_id,
+                vm_identity.provision_generation,
+                {"status": "ready", "_suspend_remote_io_closed": None},
+            )
+            return False
+
+        ssh_host = vm_lease.identity.ssh_host
+        ssh_port = vm_lease.identity.ssh_port
+        fingerprint = vm_lease.identity.ssh_host_key_fingerprint
+
+        async def capture_target() -> tuple[str, int, str] | None:
+            return await vm_lease.revalidate()
+
+        async def snapshot_authority() -> bool:
+            return await capture_target() is not None
+
+        async def capture_snapshot() -> bool:
+            return await self._snapshot_service.capture_vm_snapshot(
+                job_id=thread_id,
+                ssh_host=ssh_host,
+                ssh_port=int(ssh_port),
+                source_type="vm",
+                entity_type="threads",
+                expected_host_key_fingerprint=fingerprint,
+                capture_authority=snapshot_authority,
             )
 
         try:
-            source_type = "vm" if is_vm else "pod"
-
             # Slice C (design §5): stage the protected session's upperdir
             # diff to S3 BEFORE the teardown snapshot — this is the last
             # chance to capture it while the overlay is still mounted.
@@ -985,28 +1917,44 @@ class WorkspaceSuspensionService:
             # must never block or fail the teardown — the VM snapshot below
             # is the durable, load-bearing path and always still runs.
             if metadata.get("protected_cloud"):
-                try:
-                    from services.cloud_staging.stage import stage_thread_cloud_diff
+                # Protected-cloud staging has its own multi-step signature,
+                # tar, S3 and DB settlement protocol.  It cannot borrow this
+                # one-shot suspension attestation safely, so leave it live for
+                # the dedicated durable capture-authority follow-up rather
+                # than dialing a raw/reused VM endpoint here.
+                logger.warning(
+                    "teardown cloud-stage skipped for %s: durable VM capture "
+                    "authority is unavailable",
+                    thread_id,
+                )
 
-                    await stage_thread_cloud_diff(
-                        thread_id=thread_id,
-                        postgres_db=self._db,
-                        snapshot_service=self._snapshot_service,
+            async with vm_lease:
+                if not (
+                    vm_identity.provision_generation
+                    == vm_lease.identity.workspace_generation
+                    and vm_identity.vm_uid == vm_lease.identity.vm_uid
+                    and vm_identity.ssh_host == ssh_host
+                    and vm_identity.ssh_port == ssh_port
+                    and vm_identity.ssh_host_key_fingerprint == fingerprint
+                    and vm_attestation.runtime_incarnation
+                    == vm_lease.identity.launcher_pod_uid
+                ):
+                    raise VMRemoteOperationLeaseLost(
+                        "thread VM suspension target changed before snapshot"
                     )
-                except Exception as e:
-                    logger.warning(
-                        "teardown cloud-stage failed (non-fatal) for %s: %s",
-                        thread_id,
-                        e,
+                ok = await capture_snapshot()
+                if await capture_target() is None:
+                    raise VMRemoteOperationLeaseLost(
+                        "VM authority changed during thread suspension snapshot"
                     )
-
-            ok = await self._snapshot_service.capture_vm_snapshot(
-                job_id=thread_id,
-                ssh_host=ssh_host,
-                ssh_port=int(ssh_port),
-                source_type=source_type,
-                entity_type="threads",
-            )
+                if not await self._db.merge_thread_vm_context_if_provision_generation(
+                    thread_id,
+                    vm_identity.provision_generation,
+                    {"_suspend_remote_io_closed": str(vm_lease.receipt["id"])},
+                ):
+                    raise VMRemoteOperationLeaseLost(
+                        "thread VM suspension could not close subsequent remote I/O"
+                    )
             # With a persistent rootdisk the VM's disk outlives the VM, so the
             # snapshot stops being the only copy of the workspace and stops
             # being a precondition for tearing down. That matters because for a
@@ -1015,7 +1963,7 @@ class WorkspaceSuspensionService:
             # tailnet the orchestrator has no route to. Fail-closed on a gate
             # that always fails is why VM sessions never suspended at all.
             # A pod has no disk to keep, so it stays fail-closed.
-            disk_survives_teardown = is_vm and vm_persistent_rootdisk_enabled()
+            disk_survives_teardown = vm_persistent_rootdisk_enabled()
 
             if not ok:
                 if not disk_survives_teardown:
@@ -1023,14 +1971,11 @@ class WorkspaceSuspensionService:
                         "Snapshot capture failed for thread %s — keeping workspace alive",
                         thread_id,
                     )
-                    if is_vm:
-                        await self._db.merge_thread_vm_context(
-                            thread_id, {"status": "ready"}
-                        )
-                    else:
-                        await self._db.merge_thread_workspace_context(
-                            thread_id, {"status": "ready"}
-                        )
+                    await self._db.merge_thread_vm_context_if_provision_generation(
+                        thread_id,
+                        vm_identity.provision_generation,
+                        {"status": "ready", "_suspend_remote_io_closed": None},
+                    )
                     return False
                 logger.info(
                     "Snapshot capture unavailable for thread %s — suspending anyway; "
@@ -1043,94 +1988,47 @@ class WorkspaceSuspensionService:
                 "status": "suspended",
                 "suspended_at": datetime.now(timezone.utc).isoformat(),
             }
-            if not is_vm:
-                suspended_ctx[WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY] = True
+            suspended_ctx["_suspend_remote_io_closed"] = str(vm_lease.receipt["id"])
 
-            if is_vm and self._vm_provisioner and self._vm_provisioner.is_available:
-                deleted = await self._vm_provisioner.delete_thread_vm(
-                    thread_id, purge_disk=not disk_survives_teardown
+            if self._vm_provisioner and self._vm_provisioner.is_available:
+                outcome = await self._vm_provisioner.release_vm_captured(
+                    thread_id,
+                    vm_identity,
+                    entity_type="thread",
+                    # Soft End is resumable. Even when the snapshot succeeded,
+                    # deleting the backing disk here would turn a later restore
+                    # failure into irreversible data loss. Permanent End owns
+                    # the only purge_disk=True path.
+                    purge_disk=False,
+                    capture_snapshot=False,
                 )
-                if not deleted:
+                if (
+                    not isinstance(outcome, VMTeardownResult)
+                    or outcome.disposition != "completed"
+                ):
                     raise RuntimeError(
                         "thread VM suspension process-zero retirement is incomplete"
                     )
-                if disk_survives_teardown:
-                    # Optimistic; the vm.lifecycle.status handler overwrites it
-                    # with what the controller actually did. Restore reads it to
-                    # decide whether to extract a snapshot over the disk.
-                    suspended_ctx["rootdisk"] = "kept"
-                await self._db.merge_thread_vm_context(thread_id, suspended_ctx)
-            else:
-                owner = WorkspaceOwner.session(thread_id)
-                deleted = await self._container_provisioner.delete_workspace(owner)
-                if not deleted:
+                # Optimistic; the vm.lifecycle.status handler overwrites it
+                # with what the controller actually did. Restore reads it to
+                # decide whether to extract a snapshot over the disk.
+                suspended_ctx["rootdisk"] = "kept"
+                if not await self._db.merge_thread_vm_context_if_provision_generation(
+                    thread_id,
+                    vm_identity.provision_generation,
+                    suspended_ctx,
+                ):
                     raise RuntimeError(
-                        "thread workspace suspension process-zero retirement is incomplete"
+                        "thread VM suspension successor replaced the target"
                     )
-                # Reclaim-on-idle (opt-in, fail-safe): drop the hot-cache PVC
-                # once the snapshot is confirmed restorable, so idle sessions
-                # stop pinning volumes (knowledge-base/knowledge/features/
-                # workspace_durability_tiering.md §D3). If the archive can't
-                # be verified, KEEP the PVC — deleting it would risk the only
-                # copy of the live working tree. A delete failure (return
-                # False, or a raised exception from the provisioner) must
-                # not fail the suspend either: the session stays resumable
-                # off the retained volume either way.
-                #
-                # This does NOT reclaim the session's separate AGENT-pod PVC
-                # (`pvc-agent-s-<id>`, created by AgentProvisioner): the type
-                # actually wired into ``self._agent_provisioner`` (see
-                # orchestrator/main.py) exposes no PVC-delete method at all.
-                # Only the different, unwired ``PersistentProvisioner`` class
-                # has ``delete_agent_pvc``, and it manages a differently-named
-                # legacy claim (`pvc-persistent-<id>`). Follow-up, not in
-                # scope here — the workspace PVC is the primary/larger
-                # consumer.
-                if _reclaim_on_idle_enabled() and self._snapshot_service:
-                    v_ok, reason = await self._snapshot_service.verify_snapshot(
-                        thread_id, entity_type="threads"
-                    )
-                    if v_ok:
-                        try:
-                            reclaimed = (
-                                await self._container_provisioner.delete_workspace_pvc(
-                                    owner
-                                )
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Reclaim-on-idle: PVC delete raised for thread "
-                                "%s — keeping session resumable off the "
-                                "retained volume",
-                                thread_id,
-                            )
-                            reclaimed = False
-                        if reclaimed:
-                            suspended_ctx["volume_reclaimed"] = True
-                            logger.info(
-                                "Reclaim-on-idle: snapshot verified, PVC "
-                                "reclaimed for thread %s",
-                                thread_id,
-                            )
-                        else:
-                            logger.warning(
-                                "Reclaim-on-idle: PVC delete did not succeed "
-                                "for thread %s — keeping PVC",
-                                thread_id,
-                            )
-                    else:
-                        logger.warning(
-                            "Reclaim-on-idle: snapshot unverified (%s) — "
-                            "keeping PVC for thread %s",
-                            reason,
-                            thread_id,
-                        )
-                suspended_ctx.update({"pod_ip": None, "pod_name": None})
-                await self._db.merge_thread_workspace_context(thread_id, suspended_ctx)
+            else:
+                raise RuntimeError("thread VM suspension provisioner is unavailable")
 
-            # Also delete the agent pod (it's stateless, state is in the workspace)
-            if self._agent_provisioner and self._agent_provisioner.is_available:
-                await self._agent_provisioner.delete_agent_pod_by_thread(thread_id)
+            # The workspace snapshot/retirement owns no immutable agent-Pod
+            # identity. Pod teardown is performed by the caller's durable
+            # pinned-thread retirement generation. A legacy caller without
+            # that authority leaks the old agent safely instead of deleting a
+            # same-name successor selected by labels.
 
             logger.info("Workspace suspended to S3 for thread %s", thread_id)
             return True
@@ -1138,14 +2036,11 @@ class WorkspaceSuspensionService:
         except Exception:
             logger.exception("Failed to suspend workspace for thread %s", thread_id)
             try:
-                if is_vm:
-                    await self._db.merge_thread_vm_context(
-                        thread_id, {"status": "ready"}
-                    )
-                else:
-                    await self._db.merge_thread_workspace_context(
-                        thread_id, {"status": "ready"}
-                    )
+                await self._db.merge_thread_vm_context_if_provision_generation(
+                    thread_id,
+                    vm_identity.provision_generation,
+                    {"status": "ready", "_suspend_remote_io_closed": None},
+                )
             except Exception:
                 pass
             return False
@@ -1299,18 +2194,40 @@ class WorkspaceSuspensionService:
                 )
                 return False
 
-        if (
-            not is_vm
-            and not reuse_existing_runtime
-            and thread.get("execution_lane") != "pinned"
-        ):
-            await self._db.merge_thread_workspace_context(
-                thread_id,
-                {
-                    "status": "restoring",
-                    WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY: True,
-                },
-            )
+        restore_operation_id: str | None = None
+        restore_creation: dict[str, Any] | None = None
+        retired_runtime: str | None = None
+        restored_runtime: str | None = None
+        owner = WorkspaceOwner.session(thread_id)
+        if not is_vm:
+            if reuse_existing_runtime:
+                restore_creation = await self._container_provisioner.get_current_workspace_creation_result(
+                    owner,
+                    operation_kind="restore",
+                )
+                restored_runtime = _settled_restore_runtime(ws_ctx, restore_creation)
+                if restored_runtime != expected_runtime_incarnation:
+                    return False
+            else:
+                retired_runtime = _captured_workspace_runtime(ws_ctx)
+                if (
+                    retired_runtime is None
+                    or ws_ctx.get("status") != "suspended"
+                    or ws_ctx.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY) is not True
+                ):
+                    return False
+                suspension = (
+                    await self._container_provisioner.get_settled_workspace_suspension(
+                        owner,
+                        expected_runtime_incarnation=retired_runtime,
+                    )
+                )
+                if not isinstance(suspension, dict):
+                    return False
+                try:
+                    restore_operation_id = str(UUID(str(suspension["id"])))
+                except (KeyError, TypeError, ValueError):
+                    return False
 
         try:
             ssh_host = None
@@ -1348,6 +2265,13 @@ class WorkspaceSuspensionService:
                 if not ok:
                     logger.error(
                         "Failed to create VM for restore of thread %s", thread_id
+                    )
+                    await self._db.merge_thread_vm_context(
+                        thread_id,
+                        {
+                            "status": "failed",
+                            "error": "VM creation failed on restore",
+                        },
                     )
                     return False
 
@@ -1387,6 +2311,12 @@ class WorkspaceSuspensionService:
                             thread_id,
                             runtime_lock_held=True,
                         )
+                        if not ok:
+                            logger.error(
+                                "Failed to create pinned workspace for thread %s",
+                                thread_id,
+                            )
+                            return False
                     else:
                         create_kwargs: dict[str, Any] = {}
                         if stateless_creation_generation is not None:
@@ -1396,23 +2326,34 @@ class WorkspaceSuspensionService:
                                 ),
                                 "allow_stateless_create": allow_stateless_create,
                             }
-                        ok = await self._container_provisioner.create_workspace(
-                            WorkspaceOwner.session(thread_id),
-                            **create_kwargs,
-                        )
-                    if not ok:
-                        logger.error(
-                            "Failed to create pod for restore of thread %s", thread_id
-                        )
-                        if thread.get("execution_lane") != "pinned":
-                            await self._db.merge_thread_workspace_context(
-                                thread_id,
-                                {
-                                    "status": "failed",
-                                    "error": "pod creation failed on restore",
-                                },
+                        try:
+                            await self._container_provisioner.create_workspace(
+                                owner,
+                                operation_kind="restore",
+                                operation_id=restore_operation_id,
+                                **create_kwargs,
                             )
-                        return False
+                        except Exception:
+                            logger.warning(
+                                "Workspace restore create response was ambiguous for "
+                                "thread %s",
+                                thread_id,
+                            )
+                        restore_creation = await self._container_provisioner.get_workspace_creation_result(
+                            owner,
+                            operation_kind="restore",
+                            operation_id=str(restore_operation_id),
+                        )
+                        if (
+                            not isinstance(restore_creation, dict)
+                            or str(restore_creation.get("result_kind") or "")
+                            != "settled"
+                        ):
+                            logger.error(
+                                "Failed to create pod for restore of thread %s",
+                                thread_id,
+                            )
+                            return False
 
                 thread = await self._db.get_thread(thread_id)
                 metadata = thread.get("metadata") or {}
@@ -1422,17 +2363,22 @@ class WorkspaceSuspensionService:
                     except (ValueError, TypeError):
                         metadata = {}
                 ws_ctx = metadata.get("workspace_container", {})
-                if (
-                    reuse_existing_runtime
-                    and ws_ctx.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
-                    != expected_runtime_incarnation
-                ):
-                    logger.error(
-                        "Strict restore runtime changed before extraction for "
-                        "thread %s",
-                        thread_id,
+                if thread.get("execution_lane") != "pinned":
+                    restored_runtime = _settled_restore_runtime(
+                        ws_ctx,
+                        restore_creation,
+                        retired_runtime=retired_runtime,
                     )
-                    return False
+                    if restored_runtime is None or (
+                        reuse_existing_runtime
+                        and restored_runtime != expected_runtime_incarnation
+                    ):
+                        logger.error(
+                            "Strict restore runtime changed before extraction for "
+                            "thread %s",
+                            thread_id,
+                        )
+                        return False
                 ssh_host = ws_ctx.get("pod_ip")
                 volume_reattached, reattach_reason = _volume_survived_teardown(
                     prior_backing_id, _workspace_backing_id(metadata)
@@ -1450,6 +2396,22 @@ class WorkspaceSuspensionService:
                         return False
                     ssh_host = strict_authority.ssh_host
 
+                # K8s B now owns a durable post-create work lease. The helper
+                # keeps that lease renewed through extraction and consumes it
+                # in the same transaction that publishes Ready. VM restore
+                # retains its independent lifecycle path below.
+                if thread.get("execution_lane") != "pinned":
+                    return await self._finish_container_thread_restore(
+                        thread_id,
+                        owner=owner,
+                        restored_runtime=restored_runtime,
+                        ws_ctx=ws_ctx,
+                        strict_authority=strict_authority,
+                        strict_terminal_snapshot=strict_terminal_snapshot,
+                        volume_reattached=volume_reattached,
+                        reattach_reason=reattach_reason,
+                    )
+
             if not ssh_host:
                 error_msg = "no SSH host after provisioning for restore"
                 logger.error("%s (thread %s)", error_msg, thread_id)
@@ -1457,9 +2419,11 @@ class WorkspaceSuspensionService:
                     await self._db.merge_thread_vm_context(
                         thread_id, {"status": "failed", "error": error_msg}
                     )
-                else:
-                    await self._db.merge_thread_workspace_context(
-                        thread_id, {"status": "failed", "error": error_msg}
+                elif restored_runtime is not None:
+                    await self._db.merge_thread_workspace_context_if_runtime(
+                        thread_id,
+                        {"status": "failed", "error": error_msg},
+                        expected_runtime_incarnation=restored_runtime,
                     )
                 return False
 
@@ -1519,9 +2483,11 @@ class WorkspaceSuspensionService:
                         await self._db.merge_thread_vm_context(
                             thread_id, {"status": "failed", "error": error_msg}
                         )
-                    else:
-                        await self._db.merge_thread_workspace_context(
-                            thread_id, {"status": "failed", "error": error_msg}
+                    elif restored_runtime is not None:
+                        await self._db.merge_thread_workspace_context_if_runtime(
+                            thread_id,
+                            {"status": "failed", "error": error_msg},
+                            expected_runtime_incarnation=restored_runtime,
                         )
                     return False
 
@@ -1581,6 +2547,15 @@ class WorkspaceSuspensionService:
 
             # Legacy job/VM/pinned-session semantics remain below. Strict
             # terminal restores returned only after the transactional CAS.
+            if not is_vm:
+                if (
+                    restored_runtime is None
+                    or not await self._container_provisioner.workspace_pod_live(
+                        owner,
+                        expected_runtime_incarnation=restored_runtime,
+                    )
+                ):
+                    return False
             restored_ctx = {
                 "status": "ready",
                 "restored_at": datetime.now(timezone.utc).isoformat(),
@@ -1590,7 +2565,15 @@ class WorkspaceSuspensionService:
             if is_vm:
                 await self._db.merge_thread_vm_context(thread_id, restored_ctx)
             else:
-                await self._db.merge_thread_workspace_context(thread_id, restored_ctx)
+                if (
+                    restored_runtime is None
+                    or not await self._db.merge_thread_workspace_context_if_runtime(
+                        thread_id,
+                        restored_ctx,
+                        expected_runtime_incarnation=restored_runtime,
+                    )
+                ):
+                    return False
 
             logger.info(
                 "Workspace restored for thread %s from %s (ssh_host=%s)",
@@ -1610,9 +2593,11 @@ class WorkspaceSuspensionService:
                 await self._db.merge_thread_vm_context(
                     thread_id, {"status": "failed", "error": "restore exception"}
                 )
-            else:
-                await self._db.merge_thread_workspace_context(
-                    thread_id, {"status": "failed", "error": "restore exception"}
+            elif restored_runtime is not None:
+                await self._db.merge_thread_workspace_context_if_runtime(
+                    thread_id,
+                    {"status": "failed", "error": "restore exception"},
+                    expected_runtime_incarnation=restored_runtime,
                 )
             return False
 

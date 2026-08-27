@@ -2544,6 +2544,7 @@ async def test_orchestrator_surfaces_terminating_direct_input_as_retryable(
         agent_id="33333333-3333-4333-8333-333333333333",
         runtime_attach_token="44444444-4444-4444-8444-444444444444",
         agent_hostname="persistent-thread-a",
+        pod_namespace="srw",
         pod_uid="pod-uid-a",
         pod_ip="127.0.0.1",
         pod_port=8001,

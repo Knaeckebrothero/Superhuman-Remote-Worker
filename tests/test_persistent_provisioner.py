@@ -511,6 +511,8 @@ def _make_provisioner_with_k8s():
         "pod_name": "persistent-thread-abc",
         "status": "planned",
         "pod_uid": None,
+        "namespace": "test-ns",
+        "protection_protocol": "finalizer_v1",
         "workspace_claim": {
             "claim_id": claim_id,
             "thread_id": thread_id,
@@ -520,6 +522,8 @@ def _make_provisioner_with_k8s():
             "pvc_name": "pvc-persistent-thread-abc",
             "status": "planned",
             "pvc_uid": None,
+            "namespace": "test-ns",
+            "protection_protocol": "finalizer_v1",
         },
     }
     p._db.publish_pinned_agent_workspace_claim.return_value = True
@@ -714,6 +718,7 @@ class TestCreateAgentPodK8s:
                     expected_runtime_generation=generation,
                     expected_claim_id=claim_id,
                     expected_create_attempt=attempt_id,
+                    namespace="test-ns",
                 )
                 == "persistent-pvc-uid"
             )
@@ -733,6 +738,7 @@ class TestCreateAgentPodK8s:
                 expected_runtime_generation=generation,
                 expected_claim_id=claim_id,
                 expected_create_attempt=attempt_id,
+                namespace="test-ns",
             ) == {"state": "exact_fence", "pvc_uid": "persistent-pvc-uid"}
 
 

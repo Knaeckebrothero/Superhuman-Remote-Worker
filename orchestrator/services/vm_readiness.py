@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 
 from services import resolve_ssh_key_path
 
-from .ide_settings import seed_ide_config_for_user
+from .ide_settings import IdeSettingsStore, seed_ide_config_for_user, seed_ide_profile
 from .ssh_helpers import wait_for_agent_ssh
 
 logger = logging.getLogger(__name__)
@@ -302,34 +302,157 @@ class VMReadinessService:
             return
 
         verified_at = datetime.now(timezone.utc).isoformat()
-        promoted = await self._provisioner._set_context_if_generation(
+        registration_id = uuid4().hex
+        # Persist the exact controller-observed launcher identity before any
+        # remote write. This is deliberately still non-ready: a crash between
+        # this CAS and final promotion is rearmed by the next readiness scan.
+        prepared = await self._provisioner._set_context_if_generation(
             entity_type,
             entity_id,
             generation,
             {
-                "status": "ready",
+                "status": "ssh_pending",
                 "ssh_host": pod_ip,
                 "pod_ip": pod_ip,
                 "ssh_port": 22,
                 "active_pod_uid": active_pod_uid,
                 "ssh_ready_source": "provisioner_probe",
                 "ssh_verified_at": verified_at,
-                "ssh_registration_id": uuid4().hex,
+                "ssh_registration_id": registration_id,
                 "ssh_probe_error": None,
                 "recovering": False,
             },
             require_status_not_ready=not reprobe,
         )
+        if not prepared:
+            return
+
+        try:
+            initial_attestation = await self._provisioner.attest_workspace_runtime(
+                entity_id,
+                entity_type=entity_type,
+            )
+        except Exception as exc:
+            await self._transient_failure(
+                key,
+                entity_type,
+                entity_id,
+                generation,
+                vm,
+                f"VM mutation authority unavailable: {exc}",
+                reprobe=False,
+            )
+            return
+
+        async def mutation_authority() -> tuple[str, int, str] | None:
+            """Re-prove the exact launcher immediately before each SSH write."""
+
+            try:
+                current = await self._provisioner.attest_workspace_runtime(
+                    entity_id,
+                    entity_type=entity_type,
+                )
+            except Exception:
+                return None
+            if (
+                current.workspace_generation != initial_attestation.workspace_generation
+                or current.runtime_incarnation
+                != initial_attestation.runtime_incarnation
+                or current.backing_id != initial_attestation.backing_id
+                or current.host != initial_attestation.host
+                or current.port != initial_attestation.port
+                or current.ssh_host_key_fingerprint
+                != initial_attestation.ssh_host_key_fingerprint
+            ):
+                return None
+            return (
+                current.host,
+                current.port,
+                current.ssh_host_key_fingerprint,
+            )
+
+        seeded = await seed_ide_config_for_user(
+            self._db,
+            row.get("user_id"),
+            initial_attestation.host,
+            initial_attestation.port,
+            expected_host_key_fingerprint=(
+                initial_attestation.ssh_host_key_fingerprint
+            ),
+            mutation_authority=mutation_authority,
+        )
+        try:
+            from .snapshot_service import snapshot_service
+
+            if seeded and row.get("user_id") and snapshot_service.is_available:
+                from .ide_profile_store import IdeProfileStore
+
+                user_id = str(row["user_id"])
+                seeded = await seed_ide_profile(
+                    user_id=user_id,
+                    ssh_host=initial_attestation.host,
+                    ssh_port=initial_attestation.port,
+                    profile_store=IdeProfileStore(
+                        snapshot_service._s3,
+                        snapshot_service._bucket,
+                    ),
+                    ext_items=await IdeSettingsStore(self._db).get_extensions(user_id),
+                    expected_host_key_fingerprint=(
+                        initial_attestation.ssh_host_key_fingerprint
+                    ),
+                    mutation_authority=mutation_authority,
+                )
+        except Exception:
+            logger.exception(
+                "IDE profile seed failed for %s %s", entity_type, entity_id
+            )
+            seeded = False
+
+        try:
+            final_attestation = await self._provisioner.attest_workspace_runtime(
+                entity_id,
+                entity_type=entity_type,
+            )
+        except Exception:
+            final_attestation = None
+        if (
+            not seeded
+            or final_attestation is None
+            or final_attestation != initial_attestation
+        ):
+            await self._transient_failure(
+                key,
+                entity_type,
+                entity_id,
+                generation,
+                vm,
+                "VM IDE seed authority changed or seeding failed",
+                reprobe=False,
+            )
+            return
+
+        ready_updates = {
+            "status": "ready",
+            "ssh_host": final_attestation.host,
+            "pod_ip": final_attestation.pod_ip,
+            "ssh_port": final_attestation.port,
+            "active_pod_uid": final_attestation.runtime_incarnation,
+            "ssh_ready_source": "provisioner_probe",
+            "ssh_verified_at": verified_at,
+            "ssh_registration_id": registration_id,
+            "ssh_probe_error": None,
+            "recovering": False,
+        }
+        promote = (
+            self._db.merge_thread_vm_context_if_current
+            if entity_type == "thread"
+            else self._db.merge_vm_context_if_current
+        )
+        promoted = bool(await promote(entity_id, registration_id, ready_updates))
         if not promoted:
             return
         self._failures.pop(key, None)
         self._retry_after.pop(key, None)
-        try:
-            await seed_ide_config_for_user(self._db, row.get("user_id"), pod_ip, 22)
-        except Exception:
-            logger.exception(
-                "IDE settings seed failed for %s %s", entity_type, entity_id
-            )
         if entity_type == "job":
             self._trigger_dispatch()
 

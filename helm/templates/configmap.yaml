@@ -409,7 +409,11 @@ data:
   # (gives a transient node reboot time to recover before discarding) + the
   # data-destructive discard kill-switch.
   WORKSPACE_REATTACH_READY_TIMEOUT: {{ .Values.workspace.reattachReadyTimeout | default 180 | quote }}
-  WORKSPACE_REATTACH_FRESH_FALLBACK: {{ .Values.workspace.freshFallback | default true | quote }}
+  WORKSPACE_REATTACH_FRESH_FALLBACK: {{ .Values.workspace.freshFallback | quote }}
+  # Default-dark background replay for durable non-pinned cleanup generations.
+  # Explicit operations and generations already admitted by the database can
+  # still converge while this is false.
+  WORKSPACE_CLEANUP_RECONCILIATION_ENABLED: {{ .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false | quote }}
   # Reclaim-on-idle (Task 7, opt-in, fail-safe): drop a session's workspace
   # PVC on idle-suspend once its S3 snapshot verifies restorable. Default off
   # keeps today's retain-on-idle behavior. See workspace_suspension.py and
@@ -458,6 +462,13 @@ data:
   # Exact-owner lifecycle CAS. Migration 0185 uses a drained maintenance
   # cutover, so every post-cutover pinned runtime must carry this identity.
   REQUIRE_PINNED_STATUS_IDENTITY: {{ .Values.agent.requirePinnedStatusIdentity | default "true" | quote }}
+  # 0198 never guesses where a historical NULL-namespace authority lives.
+  # The active Release.Namespace is searched automatically; this is the
+  # bounded, operator-owned set of prior namespaces retained for adoption.
+  PINNED_LEGACY_AGENT_NAMESPACES: {{ .Values.agent.pinnedLegacyNamespaces | default list | uniq | join "," | quote }}
+  # Forward-only v1 VM remote-effect admission. It remains dark until Helm's
+  # Recreate cutover has eliminated every predecessor replica.
+  VM_REMOTE_OPERATION_PROTOCOL_ENABLED: {{ ternary "true" "false" (.Values.orchestrator.vmRemoteOperationProtocol.enabled | default false) | quote }}
   # Dynamic Canvas workspace-port live preview master gate. The orchestrator
   # derives the positive attach capability and rechecks every mutation; agents
   # never infer support from this environment value. Provisioned agents inherit

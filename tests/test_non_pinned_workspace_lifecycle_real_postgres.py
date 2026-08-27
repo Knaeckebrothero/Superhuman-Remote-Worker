@@ -1,0 +1,2268 @@
+"""Real-PostgreSQL proof for exact stateless workspace process-zero receipts."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import asyncpg
+import pytest
+import pytest_asyncio
+from testcontainers.postgres import PostgresContainer
+
+from orchestrator.database.postgres import PostgresDB
+
+
+SCHEMA_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "orchestrator"
+    / "database"
+    / "schema_current.sql"
+)
+NON_PINNED_LIFECYCLE_MIGRATIONS = tuple(
+    Path(__file__).resolve().parents[1]
+    / "orchestrator"
+    / "database"
+    / "migrations"
+    / "app"
+    / filename
+    for filename in (
+        "0195_non_pinned_workspace_process_zero.sql",
+        "0196_non_pinned_workspace_lifecycle_authority.sql",
+    )
+)
+
+
+async def _execute_pre_0195(conn, query: str, *args):
+    """Insert a previous-release row without teaching production a bypass."""
+
+    async with conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role = replica")
+        return await conn.execute(query, *args)
+
+
+@pytest.fixture(scope="module")
+def pg_dsn():
+    try:
+        container = PostgresContainer("postgres:15")
+        container.start()
+    except Exception as exc:
+        pytest.skip(f"local Postgres container unavailable: {exc}")
+    try:
+        yield container.get_connection_url().replace(
+            "postgresql+psycopg2", "postgresql"
+        )
+    finally:
+        container.stop()
+
+
+@pytest_asyncio.fixture(scope="module")
+async def _schema_applied(pg_dsn):
+    conn = await asyncpg.connect(pg_dsn)
+    try:
+        await conn.execute(SCHEMA_FILE.read_text())
+        # schema_current.sql is a replay of the whole migration chain, so it
+        # already carries these files once they are regenerated into it.
+        # Applying them a second time would fail on CREATE TABLE/TRIGGER.
+        present = await conn.fetchval(
+            "SELECT to_regclass("
+            "'public.managed_repository_workspace_creation_reservations'"
+            ") IS NOT NULL"
+        )
+        if not present:
+            for migration in NON_PINNED_LIFECYCLE_MIGRATIONS:
+                await conn.execute(migration.read_text())
+    finally:
+        await conn.close()
+
+
+@pytest_asyncio.fixture
+async def db(pg_dsn, _schema_applied):
+    store = PostgresDB(
+        connection_string=pg_dsn,
+        min_connections=1,
+        max_connections=4,
+    )
+    await store.connect()
+    try:
+        yield store
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ("job", "thread"))
+async def test_0195_raw_runtime_insert_requires_creation_reservation(db, owner_kind):
+    owner_id = uuid4()
+    runtime_uid = uuid4()
+    state = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": "created",
+            "_runtime_incarnation": str(runtime_uid),
+        }
+    }
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+            if owner_kind == "job":
+                await conn.execute(
+                    "INSERT INTO jobs (id, description, status, context) "
+                    "VALUES ($1, 'old writer', 'paused', $2::jsonb)",
+                    owner_id,
+                    json.dumps(state),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO threads (id, status, execution_lane, metadata) "
+                    "VALUES ($1, 'active', 'stateless', $2::jsonb)",
+                    owner_id,
+                    json.dumps(state),
+                )
+    assert exc_info.value.constraint_name == (
+        "managed_repository_workspace_creation_reservation_required"
+    )
+
+
+async def _create_settled_authoritative_runtime(
+    db: PostgresDB, *, owner_kind: str, scope: str, settle: bool = True
+) -> tuple[UUID, str, dict, dict]:
+    owner_id = uuid4()
+    runtime_uid = str(uuid4())
+    if owner_kind == "job":
+        async with db.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO jobs (id, description, status) "
+                "VALUES ($1, 'authoritative runtime', 'paused')",
+                owner_id,
+            )
+    else:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO threads (id, status, execution_lane) "
+                "VALUES ($1, 'active', 'stateless')",
+                owner_id,
+            )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope=scope,
+        claimant="authority-envelope-creator",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    reservation = await db.mark_managed_repository_workspace_creation_started(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope=scope,
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="authority-envelope-creator",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert reservation is not None
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope=scope,
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="authority-envelope-creator",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=runtime_uid,
+    )
+    runtime = {
+        "status": "active" if scope == "ide" else "ready",
+        "_runtime_incarnation": runtime_uid,
+        "_creation_reservation_id": str(reservation["id"]),
+        "_creation_claim_token": str(reservation["claim_token"]),
+        "pod_name": f"runtime-{str(owner_id)[:12]}",
+        "namespace": "agent-workspaces",
+        "pod_ip": "10.42.0.31",
+        "host": "10.42.0.31",
+        "port": 30022,
+        "_canvas_workspace_generation": str(uuid4()),
+        "host_key_fingerprint": "SHA256:authoritative-runtime",
+    }
+    state_key = "ide_session" if scope == "ide" else "workspace_container"
+    if scope == "ide":
+        runtime.update(
+            {
+                "restore_type": "k8s_container",
+                "code_server_url": "http://10.42.0.31:8080",
+            }
+        )
+    else:
+        runtime["provisioner"] = "k8s"
+    state = {state_key: runtime}
+    if owner_kind == "thread":
+        state["_workspace_binding"] = {
+            "generation": str(uuid4()),
+            "kind": "remote",
+            "backing_id": "k8s-pvc:agent-workspaces:authoritative-runtime",
+            "ssh_host_key_fingerprint": "SHA256:authoritative-binding",
+        }
+    table = "jobs" if owner_kind == "job" else "threads"
+    column = "context" if owner_kind == "job" else "metadata"
+    async with db.acquire() as conn:
+        await conn.execute(
+            f"UPDATE {table} SET {column} = $2::jsonb WHERE id = $1",
+            owner_id,
+            json.dumps(state),
+        )
+    if settle:
+        assert await db.settle_managed_repository_workspace_creation_reservation(
+            str(owner_id),
+            owner_kind=owner_kind,
+            scope=scope,
+            reservation_generation=int(reservation["reservation_generation"]),
+            claimant="authority-envelope-creator",
+            claim_token=int(reservation["claim_token"]),
+            runtime_incarnation=runtime_uid,
+        )
+    return owner_id, runtime_uid, reservation, state
+
+
+async def _create_inflight_authoritative_runtime(
+    db: PostgresDB, *, owner_kind: str, scope: str
+) -> tuple[UUID, str, dict, dict]:
+    """Publish an exact runtime while its creation reservation is unsettled.
+
+    This is the real window between ``authorize_..._runtime`` and
+    ``settle_..._reservation``: the owner already carries a live UID-bearing
+    Kubernetes projection, and the creator still holds the only authority that
+    can reconcile it.
+    """
+
+    return await _create_settled_authoritative_runtime(
+        db, owner_kind=owner_kind, scope=scope, settle=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_0195_same_runtime_old_writer_cannot_mutate_workspace_authority(db):
+    (
+        job_id,
+        _runtime_uid,
+        _reservation,
+        state,
+    ) = await _create_settled_authoritative_runtime(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    candidates: list[dict] = []
+    for key, value in (
+        ("_creation_reservation_id", None),
+        ("_creation_reservation_id", str(uuid4())),
+        ("_creation_claim_token", None),
+        ("_creation_claim_token", "999999"),
+        ("status", "failed"),
+        ("pod_name", "workspace-forged"),
+        ("namespace", "foreign-namespace"),
+        ("pod_ip", "10.42.99.99"),
+        ("host", "foreign.internal"),
+        ("port", 2222),
+        ("_canvas_workspace_generation", str(uuid4())),
+        ("host_key_fingerprint", "SHA256:forged"),
+    ):
+        candidate = json.loads(json.dumps(state))
+        if value is None:
+            candidate["workspace_container"].pop(key)
+        else:
+            candidate["workspace_container"][key] = value
+        candidates.append(candidate)
+    rolling_old = json.loads(json.dumps(state))
+    rolling_old["workspace_container"].pop("_creation_reservation_id")
+    rolling_old["workspace_container"].pop("_creation_claim_token")
+    rolling_old["workspace_container"]["pod_ip"] = "10.42.99.98"
+    candidates.append(rolling_old)
+
+    async with db.acquire() as conn:
+        for candidate in candidates:
+            with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+                await conn.execute(
+                    "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+                    job_id,
+                    json.dumps(candidate),
+                )
+            assert exc_info.value.constraint_name == (
+                "managed_repository_workspace_authority_envelope_immutable"
+            )
+
+        heartbeat = json.loads(json.dumps(state))
+        heartbeat["workspace_container"]["last_heartbeat_at"] = (
+            "2026-08-27T06:00:00+00:00"
+        )
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb, status = 'processing' WHERE id = $1",
+            job_id,
+            json.dumps(heartbeat),
+        )
+
+
+@pytest.mark.asyncio
+async def test_0195_same_runtime_old_writer_cannot_substitute_thread_binding(db):
+    (
+        thread_id,
+        _runtime_uid,
+        _reservation,
+        state,
+    ) = await _create_settled_authoritative_runtime(
+        db, owner_kind="thread", scope="workspace_container"
+    )
+    for key, value in (
+        ("generation", str(uuid4())),
+        ("backing_id", "k8s-pvc:foreign:other"),
+        ("ssh_host_key_fingerprint", "SHA256:foreign"),
+    ):
+        candidate = json.loads(json.dumps(state))
+        candidate["_workspace_binding"][key] = value
+        async with db.acquire() as conn:
+            with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+                await conn.execute(
+                    "UPDATE threads SET metadata = $2::jsonb WHERE id = $1",
+                    thread_id,
+                    json.dumps(candidate),
+                )
+        assert exc_info.value.constraint_name == (
+            "managed_repository_workspace_authority_envelope_immutable"
+        )
+
+
+@pytest.mark.asyncio
+async def test_0195_same_runtime_old_writer_cannot_substitute_ide_endpoint(db):
+    (
+        job_id,
+        _runtime_uid,
+        _reservation,
+        state,
+    ) = await _create_settled_authoritative_runtime(db, owner_kind="job", scope="ide")
+    for key, value in (
+        ("code_server_url", "http://foreign.internal:8080"),
+        ("restore_type", "container"),
+        ("pod_ip", "10.42.99.97"),
+    ):
+        candidate = json.loads(json.dumps(state))
+        candidate["ide_session"][key] = value
+        async with db.acquire() as conn:
+            with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+                await conn.execute(
+                    "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+                    job_id,
+                    json.dumps(candidate),
+                )
+        assert exc_info.value.constraint_name == (
+            "managed_repository_ide_authority_envelope_immutable"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_status", ("failed", "deleted", "retiring_process_zero"))
+@pytest.mark.parametrize("with_provisioner", (True, False))
+async def test_0195_uidless_terminal_old_writer_cannot_rearm_then_reserve(
+    db, old_status, with_provisioner
+):
+    job_id = uuid4()
+    runtime = {
+        "status": old_status,
+        "pod_name": f"workspace-{str(job_id)[:12]}",
+        **({"provisioner": "k8s"} if with_provisioner else {}),
+    }
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO jobs (id, description, status, context) "
+            "VALUES ($1, 'uidless old writer', 'paused', $2::jsonb)",
+            job_id,
+            json.dumps({"workspace_container": runtime}),
+        )
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+            await conn.execute(
+                "UPDATE jobs SET context = jsonb_set(context, "
+                "'{workspace_container,status}', '\"pending\"'::jsonb) "
+                "WHERE id = $1",
+                job_id,
+            )
+        assert exc_info.value.constraint_name == (
+            "managed_repository_uidless_workspace_runtime_transition_forbidden"
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE jobs SET context = jsonb_build_object("
+                "'workspace_container', '{\"status\":\"pending\"}'::jsonb) "
+                "WHERE id = $1",
+                job_id,
+            )
+    assert (
+        await db.reserve_managed_repository_workspace_creation(
+            str(job_id),
+            owner_kind="job",
+            scope="workspace_container",
+            claimant="uidless-old-writer",
+            desired_manifest_digest="0" * 64,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_0195_genuine_uidless_precreate_progress_remains_compatible(db):
+    job_id = uuid4()
+    runtime = {
+        "provisioner": "k8s",
+        "status": "pending",
+        "pod_name": f"workspace-{str(job_id)[:12]}",
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, context) "
+            "VALUES ($1, 'initial uidless create', 'paused', $2::jsonb)",
+            job_id,
+            json.dumps({"workspace_container": runtime}),
+        )
+        await conn.execute(
+            "UPDATE jobs SET context = jsonb_set(context, "
+            "'{workspace_container,status}', '\"creating\"'::jsonb) "
+            "WHERE id = $1",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="initial-uidless-create",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    assert await db.abort_managed_repository_workspace_creation_reservation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="initial-uidless-create",
+        claim_token=int(reservation["claim_token"]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_0195_creation_reservation_authorizes_exact_bind_and_settlement(db):
+    job_id = uuid4()
+    runtime_uid = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'reserved creation', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="creator-a",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    reservation = await db.mark_managed_repository_workspace_creation_started(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-a",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert reservation is not None
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-a",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=str(runtime_uid),
+    )
+    state = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": "created",
+            "_runtime_incarnation": str(runtime_uid),
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(reservation["claim_token"]),
+        }
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            job_id,
+            json.dumps(state),
+        )
+    assert await db.settle_managed_repository_workspace_creation_reservation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-a",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=str(runtime_uid),
+    )
+
+
+@pytest.mark.asyncio
+async def test_0195_refuses_reservation_over_unretired_runtime_and_ended_thread(db):
+    job_id = uuid4()
+    thread_id = uuid4()
+    runtime_uid = uuid4()
+    state = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": "retiring_process_zero",
+            "_runtime_incarnation": str(runtime_uid),
+        }
+    }
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO jobs (id, description, status, context) "
+            "VALUES ($1, 'unretired runtime', 'paused', $2::jsonb)",
+            job_id,
+            json.dumps(state),
+        )
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO threads (id, status, execution_lane) "
+            "VALUES ($1, 'ended', 'stateless')",
+            thread_id,
+        )
+    assert (
+        await db.reserve_managed_repository_workspace_creation(
+            str(job_id),
+            owner_kind="job",
+            scope="workspace_container",
+            claimant="creator-b",
+            desired_manifest_digest="0" * 64,
+        )
+        is None
+    )
+    assert (
+        await db.reserve_managed_repository_workspace_creation(
+            str(thread_id),
+            owner_kind="thread",
+            scope="workspace_container",
+            claimant="creator-b",
+            desired_manifest_digest="0" * 64,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_status", ("failed", "deleted", "retiring_process_zero")
+)
+@pytest.mark.parametrize("with_provenance", (True, False))
+async def test_0195_refuses_reservation_over_uidless_historical_runtime_state(
+    db,
+    runtime_status,
+    with_provenance,
+):
+    job_id = uuid4()
+    state = {
+        "workspace_container": {
+            **({"provisioner": "k8s"} if with_provenance else {}),
+            "status": runtime_status,
+            "pod_name": f"workspace-{str(job_id)[:12]}",
+        }
+    }
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO jobs (id, description, status, context) "
+            "VALUES ($1, 'uidless historical runtime', 'paused', $2::jsonb)",
+            job_id,
+            json.dumps(state),
+        )
+
+    assert (
+        await db.reserve_managed_repository_workspace_creation(
+            str(job_id),
+            owner_kind="job",
+            scope="workspace_container",
+            claimant="creator-uidless",
+            desired_manifest_digest="0" * 64,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_0195_runtime_bound_expired_claim_rotation_updates_owner_atomically(db):
+    job_id = uuid4()
+    runtime_uid = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'creation handoff', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="creator-before-loss",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    reservation = await db.mark_managed_repository_workspace_creation_started(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-before-loss",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert reservation is not None
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-before-loss",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=str(runtime_uid),
+    )
+    runtime = {
+        "provisioner": "k8s",
+        "status": "created",
+        "_runtime_incarnation": str(runtime_uid),
+        "_creation_reservation_id": str(reservation["id"]),
+        "_creation_claim_token": str(reservation["claim_token"]),
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = jsonb_build_object("
+            "'workspace_container', $2::jsonb) WHERE id = $1",
+            job_id,
+            json.dumps(runtime),
+        )
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at = now() - interval '1 hour', "
+            "expires_at = now() - interval '1 second' WHERE id = $1",
+            reservation["id"],
+        )
+
+    reclaimed = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="creator-after-loss",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reclaimed is not None
+    assert reclaimed["id"] == reservation["id"]
+    assert reclaimed["runtime_incarnation"] == runtime_uid
+    assert int(reclaimed["claim_token"]) != int(reservation["claim_token"])
+
+    async with db.acquire() as conn:
+        projected = await conn.fetchval(
+            "SELECT context->'workspace_container' FROM jobs WHERE id = $1",
+            job_id,
+        )
+    if isinstance(projected, str):
+        projected = json.loads(projected)
+    assert projected["_creation_reservation_id"] == str(reservation["id"])
+    assert projected["_creation_claim_token"] == str(reclaimed["claim_token"])
+    assert projected["_runtime_incarnation"] == str(runtime_uid)
+
+    # A committed-but-lost reclaim response replays the same generation and
+    # token instead of wedging on the predecessor token in owner context.
+    replay = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="creator-after-loss",
+        desired_manifest_digest="0" * 64,
+    )
+    assert replay is not None
+    assert replay["id"] == reclaimed["id"]
+    assert replay["claim_token"] == reclaimed["claim_token"]
+    assert await db.settle_managed_repository_workspace_creation_reservation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(replay["reservation_generation"]),
+        claimant="creator-after-loss",
+        claim_token=int(replay["claim_token"]),
+        runtime_incarnation=str(runtime_uid),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_kind", ("restore", "reattach", "adopt"))
+async def test_0195_expired_creation_cannot_change_operation_kind(db, replacement_kind):
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'creation operation fence', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="original-create",
+        operation_kind="create",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at = now() - interval '1 hour', "
+            "expires_at = now() - interval '1 second' WHERE id = $1",
+            reservation["id"],
+        )
+
+    assert (
+        await db.reserve_managed_repository_workspace_creation(
+            str(job_id),
+            owner_kind="job",
+            scope="workspace_container",
+            claimant=f"replacement-{replacement_kind}",
+            operation_kind=replacement_kind,
+            desired_manifest_digest="0" * 64,
+        )
+        is None
+    )
+    replay = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="replacement-create",
+        operation_kind="create",
+        desired_manifest_digest="0" * 64,
+    )
+    assert replay is not None
+    assert replay["id"] == reservation["id"]
+    assert replay["operation_kind"] == "create"
+
+
+@pytest.mark.asyncio
+async def test_0195_cancelled_pre_pod_creation_settles_without_shared_reclaim(db):
+    job_id = uuid4()
+    seed_uid = uuid4()
+    pvc_uid = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'cancelled partial create', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="creator-c",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    reservation = await db.mark_managed_repository_workspace_creation_started(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-c",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert reservation is not None
+    for kind, uid in (("pvc", pvc_uid), ("seed", seed_uid)):
+        assert await db.record_managed_repository_workspace_creation_resource(
+            str(job_id),
+            owner_kind="job",
+            scope="workspace_container",
+            reservation_generation=int(reservation["reservation_generation"]),
+            claimant="creator-c",
+            claim_token=int(reservation["claim_token"]),
+            resource_kind=kind,
+            resource_uid=str(uid),
+        )
+    cancelled = await db.request_managed_repository_workspace_creation_cancellation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        target_disposition="suspended",
+        reclaim_shared_resources=False,
+        claimant="cleanup-c",
+    )
+    assert cancelled is not None
+    assert cancelled["cancel_resource_policy"] == "preserve"
+    assert cancelled["pvc_uid"] == pvc_uid
+    assert await db.settle_cancelled_partial_workspace_creation_reservation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(cancelled["reservation_generation"]),
+        claimant="cleanup-c",
+        claim_token=int(cancelled["claim_token"]),
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT context->'workspace_container' AS workspace, "
+            "phase, result_kind, cancel_cleanup_completed_at "
+            "FROM jobs CROSS JOIN "
+            "managed_repository_workspace_creation_reservations "
+            "WHERE jobs.id = $1 AND owner_id = $1",
+            job_id,
+        )
+    workspace = row["workspace"]
+    if isinstance(workspace, str):
+        workspace = json.loads(workspace)
+    assert workspace["status"] == "suspended"
+    assert row["phase"] == "aborted"
+    assert row["result_kind"] == "aborted"
+    assert row["cancel_cleanup_completed_at"] is not None
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT cancel_projection_transaction_id IS NOT NULL "
+            "FROM managed_repository_workspace_creation_reservations "
+            "WHERE id = $1",
+            reservation["id"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_0195_active_creation_blocks_raw_owner_delete_until_abort(db):
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'delete fence', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="creator-d",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+            await conn.execute("DELETE FROM jobs WHERE id = $1", job_id)
+    assert exc_info.value.constraint_name == (
+        "managed_repository_workspace_cleanup_required_before_owner_delete"
+    )
+    assert await db.abort_managed_repository_workspace_creation_reservation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-d",
+        claim_token=int(reservation["claim_token"]),
+    )
+    async with db.acquire() as conn:
+        assert (
+            await conn.execute("DELETE FROM jobs WHERE id = $1", job_id) == "DELETE 1"
+        )
+
+
+@pytest.mark.asyncio
+async def test_workspace_settlement_is_idempotent_but_rejects_successor(db):
+    thread_id = uuid4()
+    retired_uid = str(uuid4())
+    successor_uid = str(uuid4())
+    initial = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": "retiring_process_zero",
+            "_runtime_incarnation": retired_uid,
+            "pod_ip": "10.42.0.90",
+        }
+    }
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO threads (id, status, execution_lane, metadata) "
+            "VALUES ($1, 'ended', 'stateless', $2::jsonb)",
+            thread_id,
+            json.dumps(initial),
+        )
+
+    assert await db.record_managed_repository_workspace_process_zero(
+        str(thread_id),
+        owner_kind="thread",
+        scope="workspace_container",
+        provisioner="k8s",
+        runtime_incarnation=retired_uid,
+    )
+    assert await db.prepare_managed_repository_workspace_cleanup_intent(
+        str(thread_id),
+        owner_kind="thread",
+        scope="workspace_container",
+        runtime_incarnation=retired_uid,
+        target_disposition="deleted",
+        reclaim_shared_resources=False,
+        pod_uid=retired_uid,
+        resources_captured=True,
+    )
+    assert await db.settle_managed_repository_workspace_after_process_zero(
+        str(thread_id),
+        owner_kind="thread",
+        runtime_incarnation=retired_uid,
+    )
+    # A response lost after the first commit can replay against the absorbing
+    # cleared state and finish named-resource cleanup.
+    assert await db.settle_managed_repository_workspace_after_process_zero(
+        str(thread_id),
+        owner_kind="thread",
+        runtime_incarnation=retired_uid,
+    )
+
+    successor = {
+        "provisioner": "k8s",
+        "status": "created",
+        "_runtime_incarnation": successor_uid,
+        "pod_ip": "10.42.0.91",
+    }
+    async with db.acquire() as conn:
+        # This models a successor published before 0195 installed its raw
+        # writer fence.  New writers must use a reservation and an ended
+        # thread cannot reserve one, but the old cleanup replay still needs to
+        # reject a genuine historical successor without mutating it.
+        await _execute_pre_0195(
+            conn,
+            "UPDATE threads SET metadata = jsonb_set(metadata, "
+            "'{workspace_container}', $2::jsonb) WHERE id = $1",
+            thread_id,
+            json.dumps(successor),
+        )
+
+    assert not await db.settle_managed_repository_workspace_after_process_zero(
+        str(thread_id),
+        owner_kind="thread",
+        runtime_incarnation=retired_uid,
+    )
+    async with db.acquire() as conn:
+        observed = await conn.fetchval(
+            "SELECT metadata->'workspace_container' FROM threads WHERE id = $1",
+            thread_id,
+        )
+    if isinstance(observed, str):
+        observed = json.loads(observed)
+    assert observed == successor
+
+
+async def _create_settled_restore_generation(
+    db: PostgresDB,
+    *,
+    owner_kind: str,
+    scope: str,
+    runtime_updates: dict | None = None,
+    state_updates: dict | None = None,
+) -> tuple[str, str, dict]:
+    owner_id = uuid4()
+    runtime_uid = uuid4()
+    async with db.acquire() as conn:
+        if owner_kind == "job":
+            await conn.execute(
+                "INSERT INTO jobs (id, description, status) "
+                "VALUES ($1, 'restore work lease', 'paused')",
+                owner_id,
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO threads (id, status, execution_lane) "
+                "VALUES ($1, 'active', 'stateless')",
+                owner_id,
+            )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope=scope,
+        claimant="restore-creator",
+        operation_kind="restore",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    reservation = await db.mark_managed_repository_workspace_creation_started(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope=scope,
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="restore-creator",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert reservation is not None
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope=scope,
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="restore-creator",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=str(runtime_uid),
+    )
+    runtime = {
+        "status": "restoring",
+        "_runtime_incarnation": str(runtime_uid),
+        "_creation_reservation_id": str(reservation["id"]),
+        "_creation_claim_token": str(reservation["claim_token"]),
+    }
+    if scope == "ide":
+        runtime["restore_type"] = "k8s_container"
+        state_key = "ide_session"
+    else:
+        runtime["provisioner"] = "k8s"
+        runtime["_snapshot_restore_required"] = True
+        state_key = "workspace_container"
+    runtime.update(runtime_updates or {})
+    table = "jobs" if owner_kind == "job" else "threads"
+    column = "context" if owner_kind == "job" else "metadata"
+    async with db.acquire() as conn:
+        await conn.execute(
+            f"UPDATE {table} SET {column} = jsonb_build_object($2::text, "
+            "$3::jsonb) || $4::jsonb WHERE id = $1",
+            owner_id,
+            state_key,
+            json.dumps(runtime),
+            json.dumps(state_updates or {}),
+        )
+    assert await db.settle_managed_repository_workspace_creation_reservation(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope=scope,
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="restore-creator",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=str(runtime_uid),
+    )
+    return str(owner_id), str(runtime_uid), reservation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner_kind", "scope", "success_kind"),
+    (
+        ("job", "workspace_container", "ready"),
+        ("thread", "workspace_container", "ready"),
+        ("job", "ide", "active"),
+    ),
+)
+async def test_0195_restore_work_lease_reclaims_and_settles_exact_current_runtime(
+    db, owner_kind, scope, success_kind
+):
+    owner_id, runtime_uid, reservation = await _create_settled_restore_generation(
+        db, owner_kind=owner_kind, scope=scope
+    )
+    first = await db.claim_current_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind=owner_kind,
+        scope=scope,
+        claimant="restore-worker-a",
+    )
+    assert first is not None
+    replay = await db.claim_current_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind=owner_kind,
+        scope=scope,
+        claimant="restore-worker-a",
+    )
+    assert replay is not None
+    assert replay["restore_work_claim_token"] == first["restore_work_claim_token"]
+    assert (
+        await db.claim_current_managed_repository_workspace_restore_work(
+            owner_id,
+            owner_kind=owner_kind,
+            scope=scope,
+            claimant="restore-worker-b",
+        )
+        is None
+    )
+    renewed = await db.renew_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind=owner_kind,
+        scope=scope,
+        reservation_id=str(first["id"]),
+        runtime_incarnation=runtime_uid,
+        claimant="restore-worker-a",
+        work_claim_token=int(first["restore_work_claim_token"]),
+    )
+    assert renewed is not None
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET restore_work_claim_expires_at = now() - interval '1 second' "
+            "WHERE id = $1",
+            reservation["id"],
+        )
+    second = await db.claim_current_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind=owner_kind,
+        scope=scope,
+        claimant="restore-worker-b",
+    )
+    assert second is not None
+    assert int(second["restore_work_claim_token"]) != int(
+        first["restore_work_claim_token"]
+    )
+    complete_kwargs = (
+        {
+            "code_server_url": "http://ide.internal:8080",
+            "last_activity": "2026-08-27T05:00:00+00:00",
+        }
+        if scope == "ide"
+        else {}
+    )
+    assert not await db.complete_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind=owner_kind,
+        scope=scope,
+        reservation_id=str(first["id"]),
+        runtime_incarnation=runtime_uid,
+        claimant="restore-worker-a",
+        work_claim_token=int(first["restore_work_claim_token"]),
+        result_kind=success_kind,
+        **complete_kwargs,
+    )
+    assert await db.complete_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind=owner_kind,
+        scope=scope,
+        reservation_id=str(second["id"]),
+        runtime_incarnation=runtime_uid,
+        claimant="restore-worker-b",
+        work_claim_token=int(second["restore_work_claim_token"]),
+        result_kind=success_kind,
+        **complete_kwargs,
+    )
+    table = "jobs" if owner_kind == "job" else "threads"
+    column = "context" if owner_kind == "job" else "metadata"
+    state_key = "ide_session" if scope == "ide" else "workspace_container"
+    endpoint_key = "code_server_url" if scope == "ide" else "pod_ip"
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT restore_work_projection_transaction_id IS NOT NULL "
+            "FROM managed_repository_workspace_creation_reservations "
+            "WHERE id = $1",
+            reservation["id"],
+        )
+        # A committed projection marker is deliberately transaction-scoped.
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                f"UPDATE {table} SET {column} = jsonb_set({column}, "
+                f"'{{{state_key},{endpoint_key}}}', to_jsonb($2::text)) "
+                "WHERE id = $1",
+                UUID(owner_id),
+                "http://forged.internal" if scope == "ide" else "10.42.99.99",
+            )
+    # Lost successful response is an exact idempotent replay.
+    assert await db.complete_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind=owner_kind,
+        scope=scope,
+        reservation_id=str(second["id"]),
+        runtime_incarnation=runtime_uid,
+        claimant="restore-worker-b",
+        work_claim_token=int(second["restore_work_claim_token"]),
+        result_kind=success_kind,
+        **complete_kwargs,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner_kind", "terminal_status"),
+    (("job", "failed"), ("thread", "ended")),
+)
+async def test_0195_terminal_status_atomically_cancels_effectful_creation(
+    db, owner_kind, terminal_status
+):
+    owner_id = uuid4()
+    async with db.acquire() as conn:
+        if owner_kind == "job":
+            await conn.execute(
+                "INSERT INTO jobs (id, description, status) "
+                "VALUES ($1, 'terminal creation race', 'paused')",
+                owner_id,
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO threads (id, status, execution_lane) "
+                "VALUES ($1, 'active', 'stateless')",
+                owner_id,
+            )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope="workspace_container",
+        claimant="terminal-race-creator",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    started = await db.mark_managed_repository_workspace_creation_started(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="terminal-race-creator",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert started is not None
+    runtime_uid = str(uuid4())
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="terminal-race-creator",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=runtime_uid,
+    )
+    table = "jobs" if owner_kind == "job" else "threads"
+    column = "context" if owner_kind == "job" else "metadata"
+    runtime_state = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": "created",
+            "_runtime_incarnation": runtime_uid,
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(reservation["claim_token"]),
+        }
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            f"UPDATE {table} SET {column} = $2::jsonb WHERE id = $1",
+            owner_id,
+            json.dumps(runtime_state),
+        )
+    if owner_kind == "job":
+        suspended = await db.request_managed_repository_workspace_creation_cancellation(
+            str(owner_id),
+            owner_kind="job",
+            scope="workspace_container",
+            target_disposition="suspended",
+            reclaim_shared_resources=False,
+            claimant="suspension-before-terminal",
+        )
+        assert suspended is not None
+        assert suspended["cancel_target_disposition"] == "suspended"
+    async with db.acquire() as conn:
+        await conn.execute(
+            f"UPDATE {table} SET status = $2 WHERE id = $1",
+            owner_id,
+            terminal_status,
+        )
+        cancelled = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id = $1",
+            reservation["id"],
+        )
+        projected = await conn.fetchval(
+            f"SELECT {column}->'workspace_container' FROM {table} WHERE id = $1",
+            owner_id,
+        )
+        cleanup_intent = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind = $1 AND owner_id = $2 "
+            "AND scope = 'workspace_container' AND settled_at IS NULL",
+            owner_kind,
+            owner_id,
+        )
+    if isinstance(projected, str):
+        projected = json.loads(projected)
+    assert cancelled["cancel_requested_at"] is not None
+    assert cancelled["cancel_claim_projection_transaction_id"] is not None
+    assert cancelled["claimed_by"] == "terminal-owner-transition"
+    assert int(cancelled["claim_token"]) != int(reservation["claim_token"])
+    assert cancelled["cancel_resource_policy"] == (
+        "terminal_reclaim" if owner_kind == "job" else "preserve"
+    )
+    assert cancelled["cancel_target_disposition"] == "deleted"
+    assert cleanup_intent is not None
+    assert cleanup_intent["terminal_admission_transaction_id"] is not None
+    assert projected["_runtime_incarnation"] == runtime_uid
+    assert projected["_creation_reservation_id"] == str(reservation["id"])
+    assert projected["_creation_claim_token"] == str(cancelled["claim_token"])
+    async with db.acquire() as conn:
+        # The terminal trigger's exact token rotation was valid only in its
+        # own transaction; the cancelled creation no longer authorizes an old
+        # writer to mutate that same runtime envelope.
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+            await conn.execute(
+                f"UPDATE {table} SET {column} = jsonb_set({column}, "
+                "'{workspace_container,pod_ip}', to_jsonb($2::text)) "
+                "WHERE id = $1",
+                owner_id,
+                "10.42.99.96",
+            )
+    assert exc_info.value.constraint_name == (
+        "managed_repository_workspace_authority_envelope_immutable"
+    )
+    assert not await db.managed_repository_workspace_creation_claim_is_current(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="terminal-race-creator",
+        claim_token=int(reservation["claim_token"]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_0195_terminal_owner_fences_active_restore_work(db):
+    owner_id, runtime_uid, reservation = await _create_settled_restore_generation(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    claimed = await db.claim_current_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="restore-before-terminal",
+    )
+    assert claimed is not None
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status = 'failed' WHERE id = $1", UUID(owner_id)
+        )
+    assert (
+        await db.renew_managed_repository_workspace_restore_work(
+            owner_id,
+            owner_kind="job",
+            scope="workspace_container",
+            reservation_id=str(reservation["id"]),
+            runtime_incarnation=runtime_uid,
+            claimant="restore-before-terminal",
+            work_claim_token=int(claimed["restore_work_claim_token"]),
+        )
+        is None
+    )
+    assert (
+        await db.claim_current_managed_repository_workspace_restore_work(
+            owner_id,
+            owner_kind="job",
+            scope="workspace_container",
+            claimant="restore-after-terminal",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_0195_cleanup_fences_active_restore_work_lease(db):
+    owner_id, runtime_uid, reservation = await _create_settled_restore_generation(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    claimed = await db.claim_current_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="restore-before-suspend",
+    )
+    assert claimed is not None
+    intent = await db.prepare_managed_repository_workspace_cleanup_intent(
+        owner_id,
+        owner_kind="job",
+        scope="workspace_container",
+        runtime_incarnation=runtime_uid,
+        target_disposition="suspended",
+        reclaim_shared_resources=False,
+        snapshot_restore_required=True,
+    )
+    assert intent is not None
+    assert (
+        await db.renew_managed_repository_workspace_restore_work(
+            owner_id,
+            owner_kind="job",
+            scope="workspace_container",
+            reservation_id=str(reservation["id"]),
+            runtime_incarnation=runtime_uid,
+            claimant="restore-before-suspend",
+            work_claim_token=int(claimed["restore_work_claim_token"]),
+        )
+        is None
+    )
+    assert (
+        await db.claim_current_managed_repository_workspace_restore_work(
+            owner_id,
+            owner_kind="job",
+            scope="workspace_container",
+            claimant="restore-after-suspend",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_0195_strict_thread_restore_work_settles_full_authority_tuple(db):
+    workspace_generation = str(uuid4())
+    endpoint_generation = str(uuid4())
+    backing_id = "k8s-pvc:agent-workspaces:strict-restore"
+    fingerprint = "SHA256:strictrestoreauthority"
+    owner_id, runtime_uid, reservation = await _create_settled_restore_generation(
+        db,
+        owner_kind="thread",
+        scope="workspace_container",
+        runtime_updates={
+            "_canvas_workspace_generation": endpoint_generation,
+            "pod_ip": "10.42.0.19",
+            "port": 30022,
+        },
+        state_updates={
+            "_workspace_binding": {
+                "generation": workspace_generation,
+                "kind": "remote",
+                "backing_id": backing_id,
+                "ssh_host_key_fingerprint": fingerprint,
+            }
+        },
+    )
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "UPDATE threads SET execution_lane = 'stateless' WHERE id = $1",
+            UUID(owner_id),
+        )
+    claimed = await db.claim_current_managed_repository_workspace_restore_work(
+        owner_id,
+        owner_kind="thread",
+        scope="workspace_container",
+        claimant="strict-restore-worker",
+    )
+    assert claimed is not None
+    async with db.acquire() as conn:
+        debug_row = await conn.fetchrow(
+            "SELECT metadata, status::text AS status FROM threads WHERE id = $1",
+            UUID(owner_id),
+        )
+    debug_metadata = debug_row["metadata"]
+    if isinstance(debug_metadata, str):
+        debug_metadata = json.loads(debug_metadata)
+    assert debug_row["status"] == "active"
+    assert debug_metadata["workspace_container"]["status"] == "restoring"
+    assert (
+        debug_metadata["workspace_container"]["_canvas_workspace_generation"]
+        == endpoint_generation
+    )
+    assert debug_metadata["_workspace_binding"]["generation"] == (workspace_generation)
+    debug_workspace = debug_metadata["workspace_container"]
+    assert debug_workspace["_snapshot_restore_required"] is True
+    assert debug_workspace["_runtime_incarnation"] == runtime_uid
+    assert debug_workspace["_creation_reservation_id"] == str(reservation["id"])
+    assert debug_workspace["_creation_claim_token"] == str(reservation["claim_token"])
+    assert debug_metadata["_workspace_binding"]["backing_id"] == backing_id
+    assert (
+        debug_metadata["_workspace_binding"]["ssh_host_key_fingerprint"] == fingerprint
+    )
+    assert claimed["operation_kind"] == "restore"
+    assert claimed["result_kind"] == "settled"
+    assert claimed["restore_work_claimed_by"] == "strict-restore-worker"
+    kwargs = {
+        "reservation_id": str(reservation["id"]),
+        "runtime_incarnation": runtime_uid,
+        "claimant": "strict-restore-worker",
+        "work_claim_token": int(claimed["restore_work_claim_token"]),
+        "workspace_generation": workspace_generation,
+        "endpoint_generation": endpoint_generation,
+        "backing_id": backing_id,
+        "host_key_fingerprint": fingerprint,
+        "pod_ip": "10.42.0.19",
+        "port": 30022,
+        "expected_workspace_status": "restoring",
+    }
+    assert not await db.complete_stateless_thread_workspace_restore_work(
+        owner_id, **{**kwargs, "endpoint_generation": str(uuid4())}
+    )
+    assert await db.complete_stateless_thread_workspace_restore_work(owner_id, **kwargs)
+    assert await db.complete_stateless_thread_workspace_restore_work(owner_id, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_0195_soft_settled_thread_promotes_to_exact_terminal_reclaim(db):
+    thread_id = uuid4()
+    runtime_uid = uuid4()
+    metadata = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": "deleted",
+            "_runtime_incarnation": None,
+            "_snapshot_restore_required": True,
+        },
+        "_stateless_workspace_retirement_settled": {
+            "terminal_token": 8,
+            "cleanup_complete": True,
+            "permanent": True,
+            "backing_id": "k8s-pvc:agent-workspaces:thread-workspace",
+            "runtime_incarnation": str(runtime_uid),
+            "snapshot_restore_required": True,
+            "workspace_absence_proven": True,
+        },
+    }
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO threads (id, status, execution_lane, metadata) "
+            "VALUES ($1, 'ended', 'stateless', $2::jsonb)",
+            thread_id,
+            json.dumps(metadata),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue (unit_id, unit_kind, state, lease_token) "
+            "VALUES ($1, 'session_turn', 'done', 8)",
+            thread_id,
+        )
+        await conn.execute(
+            "INSERT INTO managed_repository_process_zero_receipts "
+            "(owner_kind, owner_id, scope, provisioner, runtime_incarnation) "
+            "VALUES ('thread', $1, 'workspace_container', 'k8s', $2)",
+            thread_id,
+            str(runtime_uid),
+        )
+        thread_generation = await conn.fetchval(
+            "SELECT runtime_generation FROM threads WHERE id = $1", thread_id
+        )
+        prior = await conn.fetchrow(
+            "INSERT INTO managed_repository_workspace_cleanup_intents ("
+            "owner_kind, owner_id, thread_runtime_generation, scope, "
+            "runtime_incarnation, intent_source, "
+            "target_disposition, resource_policy, reclaim_shared_resources, "
+            "lifecycle_fingerprint, pod_uid, capture_complete, "
+            "resources_captured_at, phase, cleanup_completed_at, settled_at, "
+            "result_kind, projection_transaction_id) VALUES ("
+            "'thread', $1, $3, 'workspace_container', $2, "
+            "'current', 'deleted', 'preserve', FALSE, '{}'::jsonb, $2, TRUE, "
+            "now(), 'settled', now(), now(), 'settled', txid_current()) "
+            "RETURNING *",
+            thread_id,
+            runtime_uid,
+            thread_generation,
+        )
+
+    promoted = await db.prepare_managed_repository_workspace_cleanup_intent(
+        str(thread_id),
+        owner_kind="thread",
+        scope="workspace_container",
+        runtime_incarnation=str(runtime_uid),
+        target_disposition="deleted",
+        reclaim_shared_resources=True,
+    )
+    assert promoted is not None
+    assert promoted["id"] != prior["id"]
+    assert promoted["resource_policy"] == "terminal_reclaim"
+    assert promoted["terminal_queue_token"] == 8
+    async with db.acquire() as conn:
+        observed = await conn.fetchval(
+            "SELECT metadata->'workspace_container' FROM threads WHERE id = $1",
+            thread_id,
+        )
+    if isinstance(observed, str):
+        observed = json.loads(observed)
+    assert observed["status"] == "deleted"
+    assert observed["_runtime_incarnation"] is None
+
+
+@pytest.mark.asyncio
+async def test_0195_workspace_mutation_guard_serializes_two_database_sessions(db):
+    owner_id = str(uuid4())
+
+    async with db.workspace_runtime_mutation_lock(
+        owner_id,
+        owner_kind="job",
+        scope="workspace_container",
+    ) as first:
+        assert first is True
+        async with db.workspace_runtime_mutation_lock(
+            owner_id,
+            owner_kind="job",
+            scope="workspace_container",
+            wait=False,
+        ) as second:
+            assert second is False
+
+    async with db.workspace_runtime_mutation_lock(
+        owner_id,
+        owner_kind="job",
+        scope="workspace_container",
+        wait=False,
+    ) as successor:
+        assert successor is True
+
+
+@pytest.mark.asyncio
+async def test_0195_terminal_transition_cannot_rotate_token_during_external_effect(
+    db,
+):
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'guard terminal transition', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="external-effect",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    started = await db.mark_managed_repository_workspace_creation_started(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="external-effect",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert started is not None
+
+    async with db.workspace_runtime_mutation_lock(
+        str(job_id), owner_kind="job", scope="workspace_container"
+    ) as acquired:
+        assert acquired
+        async with db.acquire() as conn:
+            with pytest.raises(asyncpg.SerializationError):
+                await conn.execute(
+                    "UPDATE jobs SET status = 'failed' WHERE id = $1", job_id
+                )
+            unchanged = await conn.fetchrow(
+                "SELECT j.status::text AS status, r.claim_token, "
+                "r.cancel_requested_at FROM jobs j JOIN "
+                "managed_repository_workspace_creation_reservations r "
+                "ON r.owner_id = j.id WHERE j.id = $1",
+                job_id,
+            )
+        assert unchanged["status"] == "paused"
+        assert int(unchanged["claim_token"]) == int(reservation["claim_token"])
+        assert unchanged["cancel_requested_at"] is None
+
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status = 'failed' WHERE id = $1", job_id)
+        cancelled = await conn.fetchrow(
+            "SELECT j.status::text AS status, r.claim_token, "
+            "r.cancel_requested_at FROM jobs j JOIN "
+            "managed_repository_workspace_creation_reservations r "
+            "ON r.owner_id = j.id WHERE j.id = $1",
+            job_id,
+        )
+    assert cancelled["status"] == "failed"
+    assert int(cancelled["claim_token"]) != int(reservation["claim_token"])
+    assert cancelled["cancel_requested_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_0195_external_effect_ambiguity_blocks_absence_until_observed(db):
+    job_id = uuid4()
+    pvc_uid = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'external effect ambiguity', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="effect-owner",
+        desired_manifest_digest="1" * 64,
+    )
+    assert reservation is not None
+    issued = await db.begin_managed_repository_workspace_creation_effect(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="effect-owner",
+        claim_token=int(reservation["claim_token"]),
+        resource_kind="pvc",
+        ambiguity_seconds=90,
+    )
+    assert issued is not None
+    assert not await db.managed_repository_workspace_creation_effects_are_quiescent(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+    )
+    assert await db.record_managed_repository_workspace_creation_resource(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="effect-owner",
+        claim_token=int(reservation["claim_token"]),
+        resource_kind="pvc",
+        resource_uid=str(pvc_uid),
+    )
+    assert await db.managed_repository_workspace_creation_effects_are_quiescent(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+    )
+    async with db.acquire() as conn:
+        effect = await conn.fetchval(
+            "SELECT external_effects->'pvc' FROM "
+            "managed_repository_workspace_creation_reservations WHERE id = $1",
+            reservation["id"],
+        )
+    if isinstance(effect, str):
+        effect = json.loads(effect)
+    assert effect["observed_uid"] == str(pvc_uid)
+    assert effect["observed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_0195_cancel_reconciliation_observes_issued_effect(db):
+    job_id = uuid4()
+    seed_uid = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'cancelled effect observation', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="effect-before-cancel",
+        desired_manifest_digest="6" * 64,
+    )
+    assert reservation is not None
+    assert await db.begin_managed_repository_workspace_creation_effect(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="effect-before-cancel",
+        claim_token=int(reservation["claim_token"]),
+        resource_kind="seed",
+    )
+    cancelled = await db.request_managed_repository_workspace_creation_cancellation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        target_disposition="suspended",
+        reclaim_shared_resources=False,
+        claimant="effect-after-cancel",
+    )
+    assert cancelled is not None
+    assert await db.record_cancelled_workspace_creation_resource_for_reconciliation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(cancelled["reservation_generation"]),
+        claimant="effect-after-cancel",
+        claim_token=int(cancelled["claim_token"]),
+        resource_kind="seed",
+        resource_uid=str(seed_uid),
+    )
+    async with db.acquire() as conn:
+        effect = await conn.fetchval(
+            "SELECT external_effects->'seed' FROM "
+            "managed_repository_workspace_creation_reservations WHERE id = $1",
+            reservation["id"],
+        )
+    if isinstance(effect, str):
+        effect = json.loads(effect)
+    assert effect["observed_uid"] == str(seed_uid)
+
+
+@pytest.mark.asyncio
+async def test_0195_default_dark_db_boundary_is_non_mutating_but_replays(db):
+    job_id = uuid4()
+    runtime_uid = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'dark cleanup admission', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="dark-creator",
+        desired_manifest_digest="2" * 64,
+    )
+    assert reservation is not None
+    reservation = await db.mark_managed_repository_workspace_creation_started(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="dark-creator",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert reservation is not None
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="dark-creator",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=str(runtime_uid),
+    )
+    projected = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": "created",
+            "_runtime_incarnation": str(runtime_uid),
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(reservation["claim_token"]),
+        }
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            job_id,
+            json.dumps(projected),
+        )
+
+    assert (
+        await db.prepare_managed_repository_workspace_cleanup_intent(
+            str(job_id),
+            owner_kind="job",
+            scope="workspace_container",
+            runtime_incarnation=str(runtime_uid),
+            target_disposition="deleted",
+            reclaim_shared_resources=False,
+            admission_source="automatic",
+            automatic_admission_enabled=False,
+        )
+        is None
+    )
+    async with db.acquire() as conn:
+        unchanged = await conn.fetchrow(
+            "SELECT cancel_requested_at, claimed_by, claim_token FROM "
+            "managed_repository_workspace_creation_reservations WHERE id = $1",
+            reservation["id"],
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM "
+            "managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind = 'job' AND owner_id = $1)",
+            job_id,
+        )
+    assert unchanged["cancel_requested_at"] is None
+    assert unchanged["claimed_by"] == "dark-creator"
+    assert int(unchanged["claim_token"]) == int(reservation["claim_token"])
+
+    # An explicit supported operation may commit the generation. Once it is
+    # durable, the dark automatic caller may replay but not replace it.
+    explicit = await db.prepare_managed_repository_workspace_cleanup_intent(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        runtime_incarnation=str(runtime_uid),
+        target_disposition="deleted",
+        reclaim_shared_resources=False,
+        admission_source="explicit",
+    )
+    # Creation cancellation is the required handoff first; it intentionally
+    # does not fabricate a cleanup row while the Pod generation is unsettled.
+    assert explicit is None
+
+
+@pytest.mark.asyncio
+async def test_0195_default_dark_replays_exact_committed_cleanup(db):
+    owner_id, runtime_uid, _reservation = await _create_settled_restore_generation(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    explicit = await db.prepare_managed_repository_workspace_cleanup_intent(
+        owner_id,
+        owner_kind="job",
+        scope="workspace_container",
+        runtime_incarnation=runtime_uid,
+        target_disposition="suspended",
+        reclaim_shared_resources=False,
+        admission_source="explicit",
+    )
+    assert explicit is not None
+    replay = await db.prepare_managed_repository_workspace_cleanup_intent(
+        owner_id,
+        owner_kind="job",
+        scope="workspace_container",
+        runtime_incarnation=runtime_uid,
+        target_disposition="suspended",
+        reclaim_shared_resources=False,
+        admission_source="automatic",
+        automatic_admission_enabled=False,
+    )
+    assert replay is not None
+    assert replay["id"] == explicit["id"]
+    assert replay["admission_source"] == "explicit"
+
+
+@pytest.mark.asyncio
+async def test_0195_cancelled_uidless_generation_loses_projection_authority(db):
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'uidless cancellation fence', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="uidless-cancel-owner",
+        desired_manifest_digest="5" * 64,
+    )
+    assert reservation is not None
+    state = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": "creating",
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(reservation["claim_token"]),
+        }
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            job_id,
+            json.dumps(state),
+        )
+    cancelled = await db.request_managed_repository_workspace_creation_cancellation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        target_disposition="suspended",
+        reclaim_shared_resources=False,
+        claimant="uidless-cancel-reconciler",
+    )
+    assert cancelled is not None
+    async with db.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT managed_repository_workspace_uidless_creation_is_authorized("
+            "'job', $1, 'workspace_container', $2, $3)",
+            job_id,
+            str(reservation["id"]),
+            str(cancelled["claim_token"]),
+        )
+
+
+@pytest.mark.asyncio
+async def test_0195_manifest_digest_is_frozen_for_active_generation(db):
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'manifest freeze', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="manifest-a",
+        desired_manifest_digest="3" * 64,
+    )
+    assert reservation is not None
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at = now() - interval '2 minutes', "
+            "expires_at = now() - interval '1 minute' WHERE id = $1",
+            reservation["id"],
+        )
+    assert (
+        await db.reserve_managed_repository_workspace_creation(
+            str(job_id),
+            owner_kind="job",
+            scope="workspace_container",
+            claimant="manifest-b",
+            desired_manifest_digest="4" * 64,
+        )
+        is None
+    )
+    replay = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="manifest-b",
+        desired_manifest_digest="3" * 64,
+    )
+    assert replay is not None
+    assert replay["id"] == reservation["id"]
+    assert replay["desired_manifest_digest"] == "3" * 64
+
+
+@pytest.mark.asyncio
+async def test_0195_terminal_transition_admits_cleanup_for_settled_runtime(db):
+    owner_id, runtime_uid, reservation = await _create_settled_restore_generation(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status = 'failed' WHERE id = $1", UUID(owner_id)
+        )
+        intent = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind = 'job' AND owner_id = $1 "
+            "AND scope = 'workspace_container' AND settled_at IS NULL",
+            UUID(owner_id),
+        )
+        runtime = await conn.fetchval(
+            "SELECT context->'workspace_container' FROM jobs WHERE id = $1",
+            UUID(owner_id),
+        )
+        creation = await conn.fetchrow(
+            "SELECT result_kind, settled_at FROM "
+            "managed_repository_workspace_creation_reservations WHERE id = $1",
+            reservation["id"],
+        )
+    if isinstance(runtime, str):
+        runtime = json.loads(runtime)
+    assert intent is not None
+    assert str(intent["runtime_incarnation"]) == runtime_uid
+    assert intent["admission_source"] == "explicit"
+    assert intent["resource_policy"] == "terminal_reclaim"
+    assert intent["target_disposition"] == "deleted"
+    assert runtime["status"] == "retiring_process_zero"
+    assert creation["result_kind"] == "settled"
+    assert creation["settled_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_0195_terminal_transition_promotes_pending_preserve_cleanup(db):
+    owner_id, runtime_uid, _reservation = await _create_settled_restore_generation(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    preserve = await db.prepare_managed_repository_workspace_cleanup_intent(
+        owner_id,
+        owner_kind="job",
+        scope="workspace_container",
+        runtime_incarnation=runtime_uid,
+        target_disposition="suspended",
+        reclaim_shared_resources=False,
+        admission_source="explicit",
+    )
+    assert preserve is not None
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status = 'failed' WHERE id = $1", UUID(owner_id)
+        )
+        promoted = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents WHERE id = $1",
+            preserve["id"],
+        )
+    assert promoted["target_disposition"] == "deleted"
+    assert promoted["resource_policy"] == "terminal_reclaim"
+    assert promoted["reclaim_shared_resources"] is True
+    assert promoted["admission_source"] == "explicit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result_kind", ("settled", "superseded"))
+async def test_0195_raw_delete_rejects_preserve_only_runtime_cleanup(db, result_kind):
+    owner_id, runtime_uid, _reservation = await _create_settled_restore_generation(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO managed_repository_workspace_cleanup_intents ("
+            "owner_kind, owner_id, scope, runtime_incarnation, intent_source, "
+            "target_disposition, resource_policy, reclaim_shared_resources, "
+            "lifecycle_fingerprint, pod_uid, capture_complete, "
+            "resources_captured_at, phase, cleanup_completed_at, settled_at, "
+            "result_kind, projection_transaction_id) VALUES ("
+            "'job', $1, 'workspace_container', $2, 'current', 'deleted', "
+            "'preserve', FALSE, '{}'::jsonb, $2, TRUE, now(), $3, now(), "
+            "now(), $4, CASE WHEN $4 = 'settled' THEN 1 ELSE NULL END)",
+            UUID(owner_id),
+            UUID(runtime_uid),
+            result_kind,
+            result_kind,
+        )
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+            await conn.execute("DELETE FROM jobs WHERE id = $1", UUID(owner_id))
+    assert exc_info.value.constraint_name == (
+        "managed_repository_terminal_workspace_cleanup_required_before_owner_delete"
+    )
+
+
+@pytest.mark.asyncio
+async def test_0195_raw_delete_accepts_exact_terminal_reclaim_settlement(db):
+    owner_id, runtime_uid, _reservation = await _create_settled_restore_generation(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "UPDATE jobs SET status = 'failed' WHERE id = $1",
+            UUID(owner_id),
+        )
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO managed_repository_workspace_cleanup_intents ("
+            "owner_kind, owner_id, scope, runtime_incarnation, intent_source, "
+            "target_disposition, resource_policy, reclaim_shared_resources, "
+            "lifecycle_fingerprint, pod_uid, capture_complete, "
+            "resources_captured_at, phase, cleanup_completed_at, settled_at, "
+            "result_kind, projection_transaction_id) VALUES ("
+            "'job', $1, 'workspace_container', $2, 'current', 'deleted', "
+            "'terminal_reclaim', TRUE, '{}'::jsonb, $2, TRUE, now(), "
+            "'settled', now(), now(), 'settled', 1)",
+            UUID(owner_id),
+            UUID(runtime_uid),
+        )
+        await conn.execute(
+            "INSERT INTO managed_repository_process_zero_receipts ("
+            "owner_kind, owner_id, scope, provisioner, runtime_incarnation, "
+            "observed_at) VALUES ("
+            "'job', $1, 'workspace_container', 'k8s', $2, now())",
+            UUID(owner_id),
+            runtime_uid,
+        )
+        projected_runtime = await conn.fetchval(
+            "SELECT context->'workspace_container' FROM jobs WHERE id = $1",
+            UUID(owner_id),
+        )
+        if isinstance(projected_runtime, str):
+            projected_runtime = json.loads(projected_runtime)
+        assert projected_runtime["_runtime_incarnation"] == runtime_uid
+        assert (
+            await conn.execute("DELETE FROM jobs WHERE id = $1", UUID(owner_id))
+            == "DELETE 1"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "projected_status", ("created", "failed", "deleted", "expired")
+)
+async def test_0195_raw_delete_rejects_uidless_legacy_live_projection(
+    db, projected_status
+):
+    job_id = uuid4()
+    state = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": projected_status,
+            "pod_name": f"workspace-{str(job_id)[:12]}",
+        }
+    }
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO jobs (id, description, status, context) "
+            "VALUES ($1, 'legacy live deletion fence', 'paused', $2::jsonb)",
+            job_id,
+            json.dumps(state),
+        )
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+            await conn.execute("DELETE FROM jobs WHERE id = $1", job_id)
+    assert exc_info.value.constraint_name == (
+        "managed_repository_legacy_workspace_cleanup_required_before_owner_delete"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ("job", "thread"))
+async def test_0196_owner_delete_reports_the_active_creation_reservation(
+    db, owner_kind
+):
+    """An in-flight creation must fail closed as an unsettled reservation.
+
+    ``prevent_workspace_owner_delete_before_cleanup`` is a BEFORE DELETE
+    trigger, so ``NEW`` is unassigned and every field reference silently reads
+    NULL instead of raising.  Reading the owner identity from ``NEW`` therefore
+    degraded the per-scope reservation fence into an always-false predicate and
+    mis-attributed a live creation to terminal (or legacy) cleanup authority.
+    """
+
+    (
+        owner_id,
+        runtime_uid,
+        reservation,
+        _state,
+    ) = await _create_inflight_authoritative_runtime(
+        db, owner_kind=owner_kind, scope="workspace_container"
+    )
+    table = "jobs" if owner_kind == "job" else "threads"
+    async with db.acquire() as conn:
+        active = await conn.fetchrow(
+            "SELECT settled_at, runtime_incarnation FROM "
+            "managed_repository_workspace_creation_reservations WHERE id = $1",
+            reservation["id"],
+        )
+        assert active is not None
+        assert active["settled_at"] is None
+        assert str(active["runtime_incarnation"]) == runtime_uid
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+            await conn.execute(f"DELETE FROM {table} WHERE id = $1", owner_id)
+    assert exc_info.value.constraint_name == (
+        "managed_repository_workspace_cleanup_required_before_owner_delete"
+    )
+
+
+@pytest.mark.asyncio
+async def test_0196_settled_creation_still_requires_exact_terminal_cleanup(db):
+    """The reservation fence must not survive its own settlement.
+
+    Once the creation reservation settles, the same owner/scope has to satisfy
+    the exact terminal-reclaim fence again, and the legitimate cleanup path
+    must still admit the delete.
+    """
+
+    (
+        owner_id,
+        runtime_uid,
+        reservation,
+        _state,
+    ) = await _create_inflight_authoritative_runtime(
+        db, owner_kind="job", scope="workspace_container"
+    )
+    assert await db.settle_managed_repository_workspace_creation_reservation(
+        str(owner_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="authority-envelope-creator",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=runtime_uid,
+    )
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+            await conn.execute("DELETE FROM jobs WHERE id = $1", owner_id)
+    assert exc_info.value.constraint_name == (
+        "managed_repository_terminal_workspace_cleanup_required_before_owner_delete"
+    )
+
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "UPDATE jobs SET status = 'failed' WHERE id = $1",
+            owner_id,
+        )
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO managed_repository_workspace_cleanup_intents ("
+            "owner_kind, owner_id, scope, runtime_incarnation, intent_source, "
+            "target_disposition, resource_policy, reclaim_shared_resources, "
+            "lifecycle_fingerprint, pod_uid, capture_complete, "
+            "resources_captured_at, phase, cleanup_completed_at, settled_at, "
+            "result_kind, projection_transaction_id) VALUES ("
+            "'job', $1, 'workspace_container', $2, 'current', 'deleted', "
+            "'terminal_reclaim', TRUE, '{}'::jsonb, $2, TRUE, now(), "
+            "'settled', now(), now(), 'settled', 1)",
+            owner_id,
+            UUID(runtime_uid),
+        )
+        await conn.execute(
+            "INSERT INTO managed_repository_process_zero_receipts ("
+            "owner_kind, owner_id, scope, provisioner, runtime_incarnation, "
+            "observed_at) VALUES ("
+            "'job', $1, 'workspace_container', 'k8s', $2, now())",
+            owner_id,
+            runtime_uid,
+        )
+        assert (
+            await conn.execute("DELETE FROM jobs WHERE id = $1", owner_id) == "DELETE 1"
+        )

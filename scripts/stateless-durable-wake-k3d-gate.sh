@@ -20,6 +20,8 @@ EXPECTED_CONTEXT="k3d-srw"
 NAMESPACE="srw"
 SELECTOR="app.kubernetes.io/component=orchestrator"
 STATELESS_SELECTOR="app.kubernetes.io/component=agent-stateless"
+ORCHESTRATOR_DEPLOYMENT="srw-orchestrator"
+STATELESS_DEPLOYMENT="srw-agent-stateless"
 
 actual_context="$(kubectl config current-context)"
 if [[ "$actual_context" != "$EXPECTED_CONTEXT" ]]; then
@@ -34,6 +36,59 @@ for argument in "$@"; do
     fi
 done
 
+require_dark_flag() {
+    local key="$1"
+    local value
+    value="$(
+        kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" \
+            get configmap srw-config -o "jsonpath={.data.${key}}"
+    )"
+    if [[ "$value" != "false" ]]; then
+        echo "Refusing: $key is not false in srw-config." >&2
+        exit 2
+    fi
+}
+
+require_deployment_converged() {
+    local deployment="$1"
+    local selector="$2"
+    local minimum="$3"
+    local desired generation observed updated ready available unavailable
+    desired="$(kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get deployment "$deployment" -o jsonpath='{.spec.replicas}')"
+    generation="$(kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get deployment "$deployment" -o jsonpath='{.metadata.generation}')"
+    observed="$(kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get deployment "$deployment" -o jsonpath='{.status.observedGeneration}')"
+    updated="$(kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get deployment "$deployment" -o jsonpath='{.status.updatedReplicas}')"
+    ready="$(kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get deployment "$deployment" -o jsonpath='{.status.readyReplicas}')"
+    available="$(kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get deployment "$deployment" -o jsonpath='{.status.availableReplicas}')"
+    unavailable="$(kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get deployment "$deployment" -o jsonpath='{.status.unavailableReplicas}')"
+    unavailable="${unavailable:-0}"
+    if [[ ! "$desired" =~ ^[0-9]+$ || ! "$generation" =~ ^[0-9]+$ || ! "$observed" =~ ^[0-9]+$ || \
+          ! "$updated" =~ ^[0-9]+$ || ! "$ready" =~ ^[0-9]+$ || ! "$available" =~ ^[0-9]+$ || \
+          ! "$unavailable" =~ ^[0-9]+$ || "$desired" -lt "$minimum" || "$observed" -lt "$generation" || \
+          "$updated" -ne "$desired" || "$ready" -ne "$desired" || "$available" -ne "$desired" || \
+          "$unavailable" -ne 0 ]]; then
+        echo "Refusing: deployment $deployment is not fully converged." >&2
+        exit 2
+    fi
+    local all_count
+    all_count="$(
+        kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get pods \
+            -l "$selector" -o name | wc -l
+    )"
+    if [[ "$all_count" -ne "$desired" ]]; then
+        echo "Refusing: deployment $deployment still has an old or missing Pod." >&2
+        exit 2
+    fi
+}
+
+require_dark_flag WORKSPACE_CLEANUP_RECONCILIATION_ENABLED
+require_dark_flag WORKSPACE_REATTACH_FRESH_FALLBACK
+require_dark_flag OFFICER_AUTO_PULL_RELEASE_ENABLED
+require_deployment_converged "$ORCHESTRATOR_DEPLOYMENT" "$SELECTOR" 1
+if [[ "$cleanup_only" != true ]]; then
+    require_deployment_converged "$STATELESS_DEPLOYMENT" "$STATELESS_SELECTOR" 2
+fi
+
 mapfile -t orchestrators < <(
     kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get pods \
         -l "$SELECTOR" --field-selector=status.phase=Running \
@@ -43,6 +98,7 @@ if [[ "${#orchestrators[@]}" -eq 0 ]]; then
     echo "Refusing: no running orchestrator pod was found in $NAMESPACE." >&2
     exit 2
 fi
+orchestrator_image_id=""
 
 # Artifact truth is checked in every running orchestrator before any CLI
 # argument can authorize mutation. A rollout event or image tag is not proof
@@ -61,12 +117,23 @@ for pod_ref in "${orchestrators[@]}"; do
             test -f /app/operator_cli/stateless_wake_acceptance.py
             test -f /app/database/migrations/app/0189_stateless_input_deliveries.sql
             test -f /app/database/migrations/app/0190_stateless_input_delivery_validate.sql
+            test -f /app/database/migrations/app/0195_non_pinned_workspace_process_zero.sql
+            test -f /app/database/migrations/app/0196_non_pinned_workspace_lifecycle_authority.sql
+            test "$WORKSPACE_CLEANUP_RECONCILIATION_ENABLED" = false
+            test "$WORKSPACE_REATTACH_FRESH_FALLBACK" = false
+            test "$OFFICER_AUTO_PULL_RELEASE_ENABLED" = false
             grep -q "terminal_replay = await" /app/src/shared/persistent_input_delivery.py
+            grep -q "K8s Pod IPs are not recipient authority" /app/services/session_wake.py
         '
     image_id="$(
         kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get "$pod_ref" \
             -o jsonpath='{.status.containerStatuses[?(@.name=="orchestrator")].imageID}'
     )"
+    if [[ -n "$orchestrator_image_id" && "$orchestrator_image_id" != "$image_id" ]]; then
+        echo "Refusing: orchestrator Pods do not run one image digest." >&2
+        exit 2
+    fi
+    orchestrator_image_id="$image_id"
     printf 'artifact-pass pod=%s image_id=%s\n' "${pod_ref#pod/}" "$image_id"
 done
 
@@ -80,6 +147,7 @@ if [[ "$cleanup_only" != true ]]; then
         echo "Refusing: fewer than two running stateless executor pods were found." >&2
         exit 2
     fi
+    stateless_image_id=""
     for pod_ref in "${stateless_executors[@]}"; do
         ready="$(
             kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get "$pod_ref" \
@@ -94,11 +162,17 @@ if [[ "$cleanup_only" != true ]]; then
                 grep -q "claim_stateless_input_delivery" /app/src/api/turn_executor.py
                 grep -q "input_delivery_capable_lease_token" /app/src/shared/persistent_input_delivery.py
                 grep -q "terminal_replay = await" /app/src/shared/persistent_input_delivery.py
+                grep -q "workspace_runtime_incarnation" /app/src/api/turn_executor.py
             '
         image_id="$(
             kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" get "$pod_ref" \
                 -o jsonpath='{.status.containerStatuses[?(@.name=="agent")].imageID}'
         )"
+        if [[ -n "$stateless_image_id" && "$stateless_image_id" != "$image_id" ]]; then
+            echo "Refusing: stateless Pods do not run one image digest." >&2
+            exit 2
+        fi
+        stateless_image_id="$image_id"
         printf 'artifact-pass pod=%s image_id=%s\n' "${pod_ref#pod/}" "$image_id"
     done
 fi

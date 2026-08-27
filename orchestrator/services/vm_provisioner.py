@@ -36,6 +36,10 @@ from .vm_lifecycle_auth import (
 logger = logging.getLogger(__name__)
 
 _VALID_VM_MODES = frozenset({"off", "same-cluster", "external"})
+_EXTERNAL_VM_PROVISIONING_UNAVAILABLE = (
+    "external VM provisioning is disabled until an authenticated "
+    "guest-management transport is available"
+)
 _warned_unset_vm_mode = False
 _warned_invalid_vm_mode = False
 
@@ -118,6 +122,18 @@ def _extract_vm_context(job: dict) -> dict:
     return ctx.get("vm", {})
 
 
+def _extract_thread_vm_context(thread: dict) -> dict:
+    """Extract the VM projection from one thread's durable metadata."""
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    return metadata.get("vm", {}) if isinstance(metadata, Mapping) else {}
+
+
 def _http_lifecycle_query(
     payload: Mapping[str, Any], *, operation: str, secret: bytes | None
 ) -> dict[str, str]:
@@ -185,7 +201,41 @@ class VMProvisioner:
         if self.mode == "same-cluster":
             return self._http_available
         if self.mode == "external":
+            # Guest management/sudo over the legacy external NATS path is
+            # intentionally contained.  A connected broker proves transport
+            # reachability, not authenticated authority for the selected VM.
+            # Existing exact-generation lifecycle probes may still use the
+            # bridge during a bounded cleanup, but no new VM may be admitted.
+            return False
+        return False
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        """Return a stable operator-facing reason when provisioning is closed."""
+
+        mode = self.mode
+        if mode == "external":
+            return _EXTERNAL_VM_PROVISIONING_UNAVAILABLE
+        if mode == "same-cluster" and not self._http_available:
+            return "same-cluster VM controller URL is not configured"
+        if mode == "off":
+            return "VM provisioning is disabled by VM_MODE"
+        return None
+
+    @property
+    def lifecycle_available(self) -> bool:
+        """Whether an authenticated controller can manage an existing VM.
+
+        External creation is contained above, but exact-generation status,
+        deletion and orphan reaping remain necessary to retire VMs which
+        predate that containment.  Callers must never use this wider signal
+        to admit creation.
+        """
+
+        if self.mode == "external":
             return self._nats_available
+        if self.mode == "same-cluster":
+            return self._http_available
         return False
 
     @property
@@ -195,8 +245,18 @@ class VMProvisioner:
 
     @property
     def _nats_available(self) -> bool:
-        """True if the external-mode NATS bridge is connected."""
-        return self.mode == "external" and nats_bridge.is_available
+        """True if external lifecycle transport is connected *and* authenticated.
+
+        Broker reachability alone is not controller authority. Keep this check
+        at the shared transport seam so direct list/status/delete callers cannot
+        accidentally emit or trust the legacy unsigned lifecycle protocol.
+        """
+
+        return bool(
+            self.mode == "external"
+            and nats_bridge.is_available
+            and nats_bridge.lifecycle_identity_authenticated is True
+        )
 
     @property
     def _docker_available(self) -> bool:
@@ -302,6 +362,12 @@ class VMProvisioner:
             )
         if (root_uid := _safe_vm_uid(data.get("rootdisk_pvc_uid"))) is not None:
             updates["rootdisk_pvc_uid"] = root_uid
+        if (
+            fingerprint := _safe_ssh_host_key_fingerprint(
+                data.get("ssh_host_key_fingerprint")
+            )
+        ) is not None:
+            updates["ssh_host_key_fingerprint"] = fingerprint
         if type(data.get("credential_runtime_started")) is bool:
             updates["credential_runtime_started"] = data["credential_runtime_started"]
         return await self._set_context_if_generation(
@@ -337,8 +403,8 @@ class VMProvisioner:
 
         mode = self.mode
         logger.info("VM provisioner configured with VM_MODE=%s", mode)
-        if self._nats_available:
-            logger.info("VM provisioner ready: external NATS mode")
+        if mode == "external":
+            logger.warning("VM provisioner unavailable: %s", self.unavailable_reason)
         elif self._http_available:
             logger.info(
                 "VM provisioner ready: same-cluster HTTP mode (controller=%s)",
@@ -392,21 +458,24 @@ class VMProvisioner:
     # =========================================================================
 
     async def attest_workspace_runtime(
-        self, job_id: str
+        self,
+        job_id: str,
+        *,
+        entity_type: str = "job",
     ) -> WorkspaceRuntimeAttestation:
-        """Attest one same-cluster VM endpoint and exact live incarnation.
+        """Attest one VM endpoint and exact live incarnation.
 
-        The co-located controller is the Kubernetes authority here instead of
-        a second direct custom-object client in the orchestrator. Its status
-        operation freshly reads the VM and VMI (including ``activePods`` and
-        the pod IP), while the correlated HMAC response binds that observation
-        to this provision generation. Keeping KubeVirt RBAC and VMI parsing in
-        the controller also avoids two subtly different launcher-pod rules.
+        The lifecycle controller is the Kubernetes authority here instead of a
+        second direct custom-object client in the orchestrator.  Its signed
+        status operation freshly reads the VM and VMI (including
+        ``activePods``), while the durable row supplies the server-owned SSH
+        endpoint and admitted host-key pin.  A second durable reread after the
+        controller observation closes the ordinary stale-read window before a
+        caller uses this attestation for remote mutation.
         """
 
         if (
-            not self._http_available
-            or self._http_client is None
+            not (self._http_available or self._nats_available)
             or self._lifecycle_hmac_secret is None
             or self._db is None
         ):
@@ -414,15 +483,26 @@ class VMProvisioner:
                 "VM Kubernetes authority is unavailable"
             )
 
+        if entity_type not in {"job", "thread"}:
+            raise WorkspaceRuntimeAuthorityError("VM workspace owner type is invalid")
+
         try:
-            row = await self._db.get_job(job_id)
+            row = (
+                await self._db.get_thread(job_id)
+                if entity_type == "thread"
+                else await self._db.get_job(job_id)
+            )
         except Exception as exc:
             raise WorkspaceRuntimeAuthorityError(
                 "VM workspace context probe failed"
             ) from exc
         if not isinstance(row, dict):
-            raise WorkspaceRuntimeAuthorityError("VM workspace job is unavailable")
-        context = _extract_vm_context(row)
+            raise WorkspaceRuntimeAuthorityError("VM workspace owner is unavailable")
+        context = (
+            _extract_thread_vm_context(row)
+            if entity_type == "thread"
+            else _extract_vm_context(row)
+        )
 
         generation = _provision_generation(context.get("provision_generation"))
         if generation is None:
@@ -441,6 +521,16 @@ class VMProvisioner:
         expected_launcher_uid = _provision_generation(context.get("active_pod_uid"))
         if expected_launcher_uid is None:
             raise WorkspaceRuntimeAuthorityError("VM launcher Pod UID is malformed")
+        expected_registration_id = context.get("ssh_registration_id")
+        if (
+            not isinstance(expected_registration_id, str)
+            or not expected_registration_id
+            or expected_registration_id != expected_registration_id.strip()
+            or len(expected_registration_id) > 128
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "VM SSH registration identity is unavailable"
+            )
         fingerprint = _safe_ssh_host_key_fingerprint(
             context.get("ssh_host_key_fingerprint")
         )
@@ -450,12 +540,18 @@ class VMProvisioner:
             )
 
         # Do not use query_status(): it intentionally strips the authenticated
-        # response marker and persists selected telemetry. Claim attestation is
-        # read-only and must see the transport's proof directly.
-        observed = await self._query_http(
-            job_id,
-            provision_generation=generation,
-        )
+        # response marker and persists selected telemetry. Mutation attestation
+        # is read-only and must see the transport's proof directly.
+        if self._http_available:
+            observed = await self._query_http(
+                job_id,
+                provision_generation=generation,
+            )
+        else:
+            observed = await nats_bridge.query_vm_status(
+                job_id,
+                provision_generation=generation,
+            )
         if not isinstance(observed, Mapping) or (
             observed.get("_identity_authenticated") is not True
         ):
@@ -472,24 +568,94 @@ class VMProvisioner:
         launcher_uid = _provision_generation(observed.get("active_pod_uid"))
         if launcher_uid != expected_launcher_uid:
             raise WorkspaceRuntimeAuthorityError("VM launcher Pod UID changed")
-        pod_ip = observed.get("pod_ip")
-        if not isinstance(pod_ip, str) or not pod_ip or pod_ip != pod_ip.strip():
+
+        observed_pod_ip = observed.get("pod_ip")
+        if (
+            not isinstance(observed_pod_ip, str)
+            or not observed_pod_ip
+            or observed_pod_ip != observed_pod_ip.strip()
+        ):
             raise WorkspaceRuntimeAuthorityError("VM pod IP is unavailable")
         try:
-            canonical_pod_ip = str(ipaddress.ip_address(pod_ip))
+            canonical_pod_ip = str(ipaddress.ip_address(observed_pod_ip))
         except ValueError as exc:
             raise WorkspaceRuntimeAuthorityError("VM pod IP is malformed") from exc
-        if canonical_pod_ip != pod_ip:
+        if canonical_pod_ip != observed_pod_ip:
             raise WorkspaceRuntimeAuthorityError("VM pod IP is malformed")
+
+        raw_host = context.get("ssh_host")
+        if self._http_available:
+            host = observed_pod_ip
+            if raw_host != host or context.get("pod_ip") not in {None, host}:
+                raise WorkspaceRuntimeAuthorityError("VM SSH endpoint changed")
+        else:
+            # External mode reaches the guest through its generation-CASed
+            # daemon endpoint, not the launcher Pod IP. The exact admitted host
+            # key still cryptographically binds that endpoint to this VM.
+            host = raw_host
+        if (
+            not isinstance(host, str)
+            or not host
+            or host != host.strip()
+            or len(host) > 512
+            or any(character.isspace() for character in host)
+        ):
+            raise WorkspaceRuntimeAuthorityError("VM SSH endpoint is unavailable")
+        raw_port = context.get("ssh_port")
+        if (
+            isinstance(raw_port, bool)
+            or not isinstance(raw_port, (int, str))
+            or not str(raw_port).isdigit()
+            or not 1 <= int(raw_port) <= 65535
+        ):
+            raise WorkspaceRuntimeAuthorityError("VM SSH port is unavailable")
+        port = int(raw_port)
+
+        # The controller read above is external I/O. Re-read the durable owner
+        # immediately afterwards and require every authority-bearing field to
+        # remain exact before returning a mutation target.
+        try:
+            current_row = (
+                await self._db.get_thread(job_id)
+                if entity_type == "thread"
+                else await self._db.get_job(job_id)
+            )
+        except Exception as exc:
+            raise WorkspaceRuntimeAuthorityError(
+                "VM workspace authority revalidation failed"
+            ) from exc
+        if not isinstance(current_row, dict):
+            raise WorkspaceRuntimeAuthorityError("VM workspace owner changed")
+        current = (
+            _extract_thread_vm_context(current_row)
+            if entity_type == "thread"
+            else _extract_vm_context(current_row)
+        )
+        if (
+            _provision_generation(current.get("provision_generation")) != generation
+            or current.get("identity_authenticated") is not True
+            or _provision_generation(current.get("identity_provision_generation"))
+            != generation
+            or _safe_vm_uid(current.get("vm_uid")) != expected_vm_uid
+            or _provision_generation(current.get("active_pod_uid")) != launcher_uid
+            or current.get("ssh_registration_id") != expected_registration_id
+            or _safe_ssh_host_key_fingerprint(current.get("ssh_host_key_fingerprint"))
+            != fingerprint
+            or current.get("ssh_host") != host
+            or int(current.get("ssh_port") or 0) != port
+        ):
+            raise WorkspaceRuntimeAuthorityError("VM workspace authority changed")
 
         return WorkspaceRuntimeAttestation(
             backing_id=f"k8s-vmi:{launcher_uid}",
             workspace_generation=generation,
             runtime_incarnation=launcher_uid,
             ssh_host_key_fingerprint=fingerprint,
-            host=pod_ip,
-            pod_ip=pod_ip,
-            port=22,
+            host=host,
+            pod_ip=observed_pod_ip,
+            port=port,
+            vm_uid=expected_vm_uid,
+            launcher_pod_uid=launcher_uid,
         )
 
     async def create_vm(
@@ -528,6 +694,12 @@ class VMProvisioner:
             The controller response when HTTP accepted the request, otherwise
             the transport's boolean acknowledgement.
         """
+        if self.mode == "external":
+            # Refuse before generating/storing a provision generation.  A
+            # false availability probe followed by a direct create call must
+            # not leave a durable row pretending an unusable VM is pending.
+            logger.warning("VM create refused: %s", self.unavailable_reason)
+            return False
         # A (re)provisioned VM must start with a CLEAN reap counter and no stale
         # SSH endpoint. context.vm is *merged* (not replaced) across provisions,
         # so a prior incarnation's snapshot_attempts — which reaches the reaper's
@@ -743,13 +915,15 @@ class VMProvisioner:
         self,
         job_id: str,
         identity: VMTeardownIdentity,
+        *,
+        entity_type: str = "job",
     ) -> str:
         """Re-prove an exact VM incarnation immediately before snapshot I/O."""
 
         generation = _provision_generation(identity.provision_generation)
-        if generation is None:
+        if generation is None or entity_type not in {"job", "thread"}:
             return "unknown"
-        if await self._current_provision_generation("job", job_id) != generation:
+        if await self._current_provision_generation(entity_type, job_id) != generation:
             return "superseded"
         probe = await self._probe_vm_teardown_identity(job_id, generation)
         classification = self._classify_captured_probe(probe, identity, purge_disk=True)
@@ -1008,14 +1182,43 @@ class VMProvisioner:
             )
         ):
             try:
+                if (
+                    not identity.ssh_host_key_fingerprint
+                    or await self.revalidate_vm_teardown_identity(
+                        job_id,
+                        identity,
+                        entity_type=entity_type,
+                    )
+                    != "matched"
+                ):
+                    return VMTeardownResult("identity_unknown", False)
+
+                async def capture_authority() -> bool:
+                    return (
+                        await self.revalidate_vm_teardown_identity(
+                            job_id,
+                            identity,
+                            entity_type=entity_type,
+                        )
+                        == "matched"
+                    )
+
                 captured = await self._snapshot_service.capture_vm_snapshot(
                     job_id=job_id,
                     ssh_host=effective_ssh_host,
                     ssh_port=int(effective_ssh_port),
                     source_type="vm",
+                    expected_host_key_fingerprint=(identity.ssh_host_key_fingerprint),
+                    capture_authority=capture_authority,
                     **({"entity_type": "threads"} if entity_type == "thread" else {}),
                 )
-                if not captured:
+                if captured:
+                    logger.info(
+                        "VM snapshot captured for %s %s before exact release",
+                        entity_type,
+                        job_id,
+                    )
+                else:
                     logger.warning(
                         "Captured VM snapshot skipped for job %s; deleting exact "
                         "incarnation under terminal teardown policy",
@@ -1027,6 +1230,15 @@ class VMProvisioner:
                     "incarnation under terminal teardown policy",
                     job_id,
                 )
+            if (
+                await self.revalidate_vm_teardown_identity(
+                    job_id,
+                    identity,
+                    entity_type=entity_type,
+                )
+                != "matched"
+            ):
+                return VMTeardownResult("identity_superseded", False)
 
         if (
             self._db is None
@@ -1258,56 +1470,22 @@ class VMProvisioner:
         Returns:
             True if deletion succeeded (snapshot failure is non-fatal).
         """
-        # Resolve SSH coordinates from DB if not provided
-        if not ssh_host and self._db:
-            try:
-                job = await self._db.get_job(job_id)
-                if job:
-                    vm_ctx = _extract_vm_context(job)
-                    ssh_host = ssh_host or vm_ctx.get("ssh_host")
-                    ssh_port = ssh_port or vm_ctx.get("ssh_port")
-            except Exception:
-                logger.debug("Could not read VM context for job %s", job_id)
-
-        # Snapshot before delete (best-effort)
-        if (
-            self._snapshot_service
-            and self._snapshot_service.is_available
-            and ssh_host
-            and ssh_port
-        ):
-            try:
-                # capture_vm_snapshot RETURNS False (it does not raise) when it
-                # declines — notably for a VM workspace, whose only address is on
-                # the tailnet the orchestrator cannot reach. Ignoring the return
-                # made this log a capture that never happened, on every VM
-                # release. knowledge-base/knowledge/issues/
-                # vm_workspace_snapshot_unreachable_from_orchestrator.md
-                captured = await self._snapshot_service.capture_vm_snapshot(
-                    job_id=job_id,
-                    ssh_host=ssh_host,
-                    ssh_port=int(ssh_port),
-                    source_type="vm",
-                )
-                if captured:
-                    logger.info(
-                        "VM snapshot captured for job %s before release", job_id
-                    )
-                else:
-                    logger.warning(
-                        "VM snapshot SKIPPED for job %s (%s:%s) — deleting anyway; "
-                        "workspace state not yet pushed to git will be lost. See "
-                        "context.snapshot.status for the reason.",
-                        job_id,
-                        ssh_host,
-                        ssh_port,
-                    )
-            except Exception:
-                logger.exception(
-                    "VM snapshot failed for job %s — deleting anyway", job_id
-                )
-
-        return await self.delete_vm(job_id)
+        try:
+            identity = await self.capture_vm_teardown_identity(job_id)
+        except Exception:
+            logger.warning(
+                "VM release refused without exact mutation identity for job %s",
+                job_id,
+                exc_info=True,
+            )
+            return False
+        outcome = await self.release_vm_captured(
+            job_id,
+            identity,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+        )
+        return outcome.disposition == "completed"
 
     async def release_thread_vm(
         self,
@@ -1325,57 +1503,26 @@ class VMProvisioner:
         Returns:
             True if deletion succeeded (snapshot failure is non-fatal).
         """
-        # Resolve SSH coordinates from DB if not provided
-        if not ssh_host and self._db:
-            try:
-                thread = await self._db.get_thread(thread_id)
-                if thread:
-                    metadata = thread.get("metadata") or {}
-                    if isinstance(metadata, str):
-                        import json
-
-                        metadata = json.loads(metadata)
-                    vm_ctx = metadata.get("vm") or {}
-                    ssh_host = ssh_host or vm_ctx.get("ssh_host")
-                    ssh_port = ssh_port or vm_ctx.get("ssh_port")
-            except Exception:
-                logger.debug("Could not read VM context for thread %s", thread_id)
-
-        # Snapshot before delete (best-effort)
-        if (
-            self._snapshot_service
-            and self._snapshot_service.is_available
-            and ssh_host
-            and ssh_port
-        ):
-            try:
-                # See release_vm: a False return means "declined", not "raised".
-                captured = await self._snapshot_service.capture_vm_snapshot(
-                    job_id=thread_id,
-                    ssh_host=ssh_host,
-                    ssh_port=int(ssh_port),
-                    source_type="vm",
-                    entity_type="threads",
-                )
-                if captured:
-                    logger.info(
-                        "VM snapshot captured for thread %s before release", thread_id
-                    )
-                else:
-                    logger.warning(
-                        "VM snapshot SKIPPED for thread %s (%s:%s) — deleting "
-                        "anyway; workspace state not yet pushed to git will be "
-                        "lost. See metadata.snapshot.status for the reason.",
-                        thread_id,
-                        ssh_host,
-                        ssh_port,
-                    )
-            except Exception:
-                logger.exception(
-                    "VM snapshot failed for thread %s — deleting anyway", thread_id
-                )
-
-        return await self.delete_thread_vm(thread_id)
+        try:
+            identity = await self.capture_vm_teardown_identity(
+                thread_id,
+                entity_type="thread",
+            )
+        except Exception:
+            logger.warning(
+                "VM release refused without exact mutation identity for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+            return False
+        outcome = await self.release_vm_captured(
+            thread_id,
+            identity,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            entity_type="thread",
+        )
+        return outcome.disposition == "completed"
 
     async def query_status(
         self,
@@ -2011,6 +2158,9 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
+        if self.mode == "external":
+            logger.warning("Thread VM create refused: %s", self.unavailable_reason)
+            return False
         # Thread VM creation is a lifecycle effect, not a best-effort metadata
         # merge.  Install its authenticated provision generation under the
         # exact open pinned T/G/actor tuple before NATS or HTTP can observe a

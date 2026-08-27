@@ -7,6 +7,7 @@ import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -15,6 +16,38 @@ from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
 _TEST_POD_UID = "11111111-1111-4111-8111-111111111111"
 _TEST_RESOURCE_UID = "22222222-2222-4222-8222-222222222222"
+
+
+@pytest.mark.asyncio
+async def test_bounded_kubernetes_call_joins_worker_after_repeated_cancellation():
+    """No cancellation count may release authority around a live sync call."""
+
+    from orchestrator.services.container_provisioner import ContainerProvisioner
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    observed: dict[str, object] = {}
+
+    def mutate(**kwargs):
+        observed.update(kwargs)
+        started.set()
+        release.wait(timeout=5)
+        finished.set()
+        return "created"
+
+    task = asyncio.create_task(ContainerProvisioner._bounded_kubernetes_call(mutate))
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
+    assert observed["_request_timeout"] == (5, 30)
 
 
 class _PinnedWorkspaceIntentDB:
@@ -165,6 +198,7 @@ def _pvc_from_manifest(body, *, uid=_TEST_RESOURCE_UID):
             namespace=metadata["namespace"],
             uid=uid,
             labels=dict(metadata.get("labels") or {}),
+            annotations=dict(metadata.get("annotations") or {}),
             deletion_timestamp=None,
         ),
         spec=SimpleNamespace(
@@ -187,6 +221,7 @@ def _service_from_manifest(body, *, uid=_TEST_RESOURCE_UID):
             namespace=metadata["namespace"],
             uid=uid,
             labels=dict(metadata.get("labels") or {}),
+            annotations=dict(metadata.get("annotations") or {}),
             deletion_timestamp=None,
         ),
         spec=SimpleNamespace(
@@ -936,6 +971,7 @@ class TestPinnedWorkspaceProvisionIntentFlow:
             "namespace": "captured-old-namespace",
             "body": {"preconditions": {"uid": expected_uid}},
             "grace_period_seconds": 0,
+            "_request_timeout": (5, 30),
         }
         if replacement:
             provisioner._core_api.read_namespaced_pod.assert_not_called()
@@ -943,6 +979,7 @@ class TestPinnedWorkspaceProvisionIntentFlow:
             provisioner._core_api.read_namespaced_pod.assert_called_once_with(
                 name=intent["pod_name"],
                 namespace="captured-old-namespace",
+                _request_timeout=(5, 30),
             )
 
 
@@ -1255,7 +1292,10 @@ class TestReleaseWorkspace:
     only when the caller says the work is truly over — its PVC."""
 
     def _prov(self):
-        from orchestrator.services.container_provisioner import ContainerProvisioner
+        from orchestrator.services.container_provisioner import (
+            ContainerProvisioner,
+            RuntimeDeletionOutcome,
+        )
 
         p = ContainerProvisioner()
         p._k8s_available = True
@@ -1268,9 +1308,10 @@ class TestReleaseWorkspace:
             }
         )
         p.workspace_pod_live = AsyncMock(return_value=True)
-        p.delete_workspace = AsyncMock(return_value=True)
-        p.delete_workspace_pvc = AsyncMock(return_value=True)
-        p._delete_service = AsyncMock(return_value=True)
+        p.delete_workspace_with_outcome = AsyncMock(
+            return_value=RuntimeDeletionOutcome("current_deleted")
+        )
+        p.release_absent_workspace = AsyncMock(return_value=True)
         snap = MagicMock()
         snap.is_available = True
         snap.capture_vm_snapshot = AsyncMock()
@@ -1287,13 +1328,15 @@ class TestReleaseWorkspace:
             p._snapshot_service.capture_vm_snapshot.call_args.kwargs["entity_type"]
             == "threads"
         )
-        p.delete_workspace.assert_awaited_once_with(
+        p.delete_workspace_with_outcome.assert_awaited_once_with(
             owner,
             expected_runtime_incarnation=("11111111-1111-4111-8111-111111111111"),
         )
-        p.delete_workspace_pvc.assert_awaited_once_with(
+        p.release_absent_workspace.assert_awaited_once_with(
             owner,
-            require_exact_owner=True,
+            reclaim_volume=True,
+            expected_runtime_incarnation=("11111111-1111-4111-8111-111111111111"),
+            strict=False,
         )
 
     @pytest.mark.asyncio
@@ -1318,7 +1361,7 @@ class TestReleaseWorkspace:
         owner = WorkspaceOwner.session("t1")
         assert await p.release_workspace(owner) is True
         p._snapshot_service.capture_vm_snapshot.assert_not_awaited()
-        p.delete_workspace.assert_awaited_once_with(
+        p.delete_workspace_with_outcome.assert_awaited_once_with(
             owner,
             expected_runtime_incarnation=("11111111-1111-4111-8111-111111111111"),
         )
@@ -1328,7 +1371,7 @@ class TestReleaseWorkspace:
         p = self._prov()
         p._k8s_available = False
         assert await p.release_workspace(WorkspaceOwner.session("t1")) is False
-        p.delete_workspace.assert_not_awaited()
+        p.delete_workspace_with_outcome.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reclaim_volume_false_keeps_the_pvc(self):
@@ -1345,16 +1388,15 @@ class TestReleaseWorkspace:
         assert await p.release_workspace(owner, reclaim_volume=False) is True
         # Still snapshotted + torn down — only the volume is spared.
         p._snapshot_service.capture_vm_snapshot.assert_awaited_once()
-        p.delete_workspace.assert_awaited_once_with(
+        p.delete_workspace_with_outcome.assert_awaited_once_with(
             owner,
             expected_runtime_incarnation=("11111111-1111-4111-8111-111111111111"),
         )
-        p.delete_workspace_pvc.assert_not_called()
-        # The Service follows the pod, not the volume: recreating it on the next
-        # create_workspace is a 409-idempotent no-op, so it costs nothing to drop.
-        p._delete_service.assert_awaited_once_with(
+        p.release_absent_workspace.assert_awaited_once_with(
             owner,
-            require_exact_owner=True,
+            reclaim_volume=False,
+            expected_runtime_incarnation=("11111111-1111-4111-8111-111111111111"),
+            strict=False,
         )
 
     @pytest.mark.asyncio
@@ -1364,9 +1406,11 @@ class TestReleaseWorkspace:
         p = self._prov()
         owner = WorkspaceOwner.session("t1")
         assert await p.release_workspace(owner) is True
-        p.delete_workspace_pvc.assert_awaited_once_with(
+        p.release_absent_workspace.assert_awaited_once_with(
             owner,
-            require_exact_owner=True,
+            reclaim_volume=True,
+            expected_runtime_incarnation=("11111111-1111-4111-8111-111111111111"),
+            strict=False,
         )
 
     @pytest.mark.asyncio
@@ -1392,11 +1436,17 @@ class TestReleaseWorkspace:
             is True
         )
 
-        p.delete_workspace.assert_awaited_once_with(
+        p.delete_workspace_with_outcome.assert_awaited_once_with(
             owner,
             expected_runtime_incarnation=runtime,
             wait_for_exact_absence=True,
             exact_absence_timeout_seconds=30.0,
+        )
+        p.release_absent_workspace.assert_awaited_once_with(
+            owner,
+            reclaim_volume=False,
+            expected_runtime_incarnation=runtime,
+            strict=True,
         )
 
 
@@ -2296,6 +2346,279 @@ class TestDockerfileHardening:
             assert completed.returncode == 78
 
 
+class _CreationReservationDBDouble:
+    """Minimal real-class creation ledger used by provisioner unit tests."""
+
+    def _init_creation_reservation(self):
+        self._creation_reservation = None
+
+    async def reserve_managed_repository_workspace_creation(self, owner_id, **kwargs):
+        claimant = kwargs["claimant"]
+        if self._creation_reservation is None:
+            self._creation_reservation = {
+                "id": "33333333-3333-4333-8333-333333333333",
+                "owner_id": owner_id,
+                "owner_kind": kwargs["owner_kind"],
+                "scope": kwargs["scope"],
+                "reservation_generation": 1,
+                "claim_token": 1,
+                "claimed_by": claimant,
+                "operation_kind": kwargs.get("operation_kind", "create"),
+                "desired_manifest_digest": kwargs.get(
+                    "desired_manifest_digest", "0" * 64
+                ),
+                "external_effects": {},
+                "phase": "reserved",
+                "runtime_incarnation": None,
+                "external_mutation_started_at": None,
+                "settled_at": None,
+                "cancel_requested_at": None,
+            }
+        if self._creation_reservation["claimed_by"] != claimant:
+            return None
+        return dict(self._creation_reservation)
+
+    @asynccontextmanager
+    async def workspace_runtime_mutation_lock(self, *_args, **_kwargs):
+        yield True
+
+    async def begin_managed_repository_workspace_creation_effect(
+        self, _owner_id, **kwargs
+    ):
+        if not self._creation_claim_matches(kwargs):
+            return None
+        self._creation_reservation["phase"] = "mutating"
+        self._creation_reservation["external_mutation_started_at"] = "now"
+        self._creation_reservation["external_effects"][kwargs["resource_kind"]] = {
+            "issued_at": "now",
+            "observed_uid": None,
+        }
+        return dict(self._creation_reservation)
+
+    async def mark_managed_repository_workspace_creation_started(
+        self, _owner_id, **kwargs
+    ):
+        if not self._creation_claim_matches(kwargs):
+            return None
+        self._creation_reservation["phase"] = "mutating"
+        self._creation_reservation["external_mutation_started_at"] = "now"
+        return dict(self._creation_reservation)
+
+    async def managed_repository_workspace_creation_claim_is_current(
+        self, _owner_id, **kwargs
+    ):
+        return self._creation_claim_matches(kwargs)
+
+    async def authorize_managed_repository_workspace_creation_runtime(
+        self, _owner_id, **kwargs
+    ):
+        if not self._creation_claim_matches(kwargs):
+            return False
+        runtime = kwargs["runtime_incarnation"]
+        current = self._creation_reservation.get("runtime_incarnation")
+        if current not in {None, runtime}:
+            return False
+        self._creation_reservation["runtime_incarnation"] = runtime
+        self._creation_reservation["pod_uid"] = runtime
+        self._creation_reservation["phase"] = "runtime_bound"
+        return True
+
+    async def record_managed_repository_workspace_creation_resource(
+        self, _owner_id, **kwargs
+    ):
+        return self._creation_claim_matches(kwargs)
+
+    async def record_managed_repository_workspace_creation_resources(
+        self, _owner_id, **kwargs
+    ):
+        return self._creation_claim_matches(kwargs)
+
+    async def settle_managed_repository_workspace_creation_reservation(
+        self, _owner_id, **kwargs
+    ):
+        if not self._creation_claim_matches(kwargs):
+            return False
+        self._creation_reservation["phase"] = "settled"
+        self._creation_reservation["settled_at"] = "now"
+        return True
+
+    async def abort_managed_repository_workspace_creation_reservation(
+        self, _owner_id, **kwargs
+    ):
+        if not self._creation_claim_matches(kwargs):
+            return False
+        self._creation_reservation["phase"] = "aborted"
+        self._creation_reservation["settled_at"] = "now"
+        return True
+
+    def _creation_claim_matches(self, kwargs):
+        row = self._creation_reservation
+        return bool(
+            row
+            and row.get("settled_at") is None
+            and int(row["reservation_generation"])
+            == int(kwargs["reservation_generation"])
+            and row["claimed_by"] == kwargs["claimant"]
+            and int(row["claim_token"]) == int(kwargs["claim_token"])
+        )
+
+
+class _PendingCleanupDB:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def list_pending_managed_repository_workspace_cleanup_intents(self, *, limit):
+        return list(self.rows[:limit])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contender", ("cancel", "reconcile"))
+async def test_workspace_mutation_guard_blocks_cancel_and_reconcile(contender):
+    class _GuardDB:
+        def __init__(self):
+            self.lock = asyncio.Lock()
+            self.cancel_called = asyncio.Event()
+
+        @asynccontextmanager
+        async def workspace_runtime_mutation_lock(self, *_args, **_kwargs):
+            async with self.lock:
+                yield True
+
+        async def request_managed_repository_workspace_creation_cancellation(
+            self, *_args, **_kwargs
+        ):
+            self.cancel_called.set()
+            return None
+
+    from orchestrator.services.container_provisioner import (
+        ContainerProvisioner,
+        WorkspaceCleanupOutcome,
+    )
+
+    owner = WorkspaceOwner.job("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    provisioner = ContainerProvisioner()
+    provisioner._db = _GuardDB()
+    provisioner._k8s_available = True
+    provisioner._reconcile_workspace_cleanup_intent_guarded = AsyncMock(
+        return_value=WorkspaceCleanupOutcome("retryable", 0)
+    )
+
+    async with provisioner._workspace_mutation_guard(
+        owner, scope="workspace_container"
+    ) as held:
+        assert held
+        if contender == "cancel":
+            task = asyncio.create_task(
+                provisioner.request_workspace_creation_cancellation(
+                    owner,
+                    target_disposition="deleted",
+                    reclaim_shared_resources=False,
+                )
+            )
+        else:
+            task = asyncio.create_task(
+                provisioner.reconcile_workspace_cleanup_intent(
+                    owner,
+                    expected_runtime_incarnation=(
+                        "11111111-1111-4111-8111-111111111111"
+                    ),
+                )
+            )
+        await asyncio.sleep(0)
+        assert not task.done()
+
+    await task
+    if contender == "cancel":
+        assert provisioner._db.cancel_called.is_set()
+    else:
+        provisioner._reconcile_workspace_cleanup_intent_guarded.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_automatic_cleanup_inventory_failure_precedes_cancellation():
+    class _UnsafeInventoryDB(_StrictCreationDB):
+        async def managed_repository_workspace_cleanup_activation_inventory(self):
+            return {
+                "managed_runtime_count": 1,
+                "unannotated_runtime_count": 1,
+                "ambiguous_effect_count": 0,
+                "safe": False,
+            }
+
+    from orchestrator.services.container_provisioner import ContainerProvisioner
+
+    provisioner = ContainerProvisioner()
+    provisioner._db = _UnsafeInventoryDB()
+    provisioner._k8s_available = True
+    provisioner._workspace_cleanup_reconciliation_enabled = True
+    provisioner.request_workspace_creation_cancellation = AsyncMock()
+
+    assert (
+        await provisioner.prepare_workspace_cleanup_intent(
+            WorkspaceOwner.job("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            expected_runtime_incarnation="11111111-1111-4111-8111-111111111111",
+            target_disposition="deleted",
+            reclaim_shared_resources=False,
+            admission_source="automatic",
+        )
+        is None
+    )
+    provisioner.request_workspace_creation_cancellation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dark_reconciler_finishes_every_committed_generation():
+    """The rollout flag gates discovery, not crash recovery already committed."""
+
+    from orchestrator.services.container_provisioner import (
+        ContainerProvisioner,
+        WorkspaceCleanupOutcome,
+    )
+
+    job_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    runtime = "11111111-1111-4111-8111-111111111111"
+    current = {
+        "owner_id": job_id,
+        "owner_kind": "job",
+        "scope": "workspace_container",
+        "runtime_incarnation": runtime,
+        "intent_generation": 1,
+        "intent_source": "current",
+    }
+    historical = {
+        **current,
+        "intent_generation": 2,
+        "intent_source": "historical",
+    }
+    provisioner = ContainerProvisioner()
+    provisioner._db = _PendingCleanupDB([current, historical])
+    provisioner._k8s_available = True
+    provisioner._workspace_cleanup_reconciliation_enabled = False
+    provisioner.reconcile_pending_workspace_creation_reservations = AsyncMock(
+        return_value={"handed_off": 0, "aborted": 1, "retryable": 0}
+    )
+    provisioner._reconcile_stale_or_orphan_workspace_finalizers = AsyncMock()
+    provisioner.reconcile_workspace_cleanup_intent = AsyncMock(
+        return_value=WorkspaceCleanupOutcome("settled", 1)
+    )
+
+    result = await provisioner.reconcile_pending_workspace_cleanup_intents(limit=10)
+
+    assert result == {"settled": 2, "superseded": 0, "retryable": 0}
+    provisioner.reconcile_pending_workspace_creation_reservations.assert_awaited_once_with(
+        limit=10
+    )
+    provisioner._reconcile_stale_or_orphan_workspace_finalizers.assert_not_awaited()
+    assert provisioner.reconcile_workspace_cleanup_intent.await_count == 2
+    cleanup_call = provisioner.reconcile_workspace_cleanup_intent.await_args_list[0]
+    assert cleanup_call.args[0].kind == "job"
+    assert cleanup_call.args[0].id == job_id
+    assert cleanup_call.kwargs == {
+        "expected_runtime_incarnation": runtime,
+        "intent_generation": 1,
+    }
+
+
 class TestCreateWorkspace:
     """Tests for workspace creation."""
 
@@ -2308,8 +2631,7 @@ class TestCreateWorkspace:
 
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
-        provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        provisioner._db = _PinnedSessionContainerDB()
 
         mock_core_api = MagicMock()
         mock_core_api.create_namespaced_pod = MagicMock(
@@ -2361,8 +2683,7 @@ class TestCreateWorkspace:
 
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
-        provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        provisioner._db = _PinnedSessionContainerDB()
 
         mock_core_api = MagicMock()
         mock_core_api.create_namespaced_pod = MagicMock(
@@ -2392,8 +2713,7 @@ class TestCreateWorkspace:
 
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
-        provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        provisioner._db = _PinnedSessionContainerDB()
 
         captured_body = {}
 
@@ -2431,8 +2751,7 @@ class TestCreateWorkspace:
 
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
-        provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        provisioner._db = _PinnedSessionContainerDB()
 
         mock_core_api = MagicMock()
         mock_core_api.create_namespaced_pod = MagicMock(
@@ -2445,15 +2764,17 @@ class TestCreateWorkspace:
         )
 
         assert result is False
-        # Should have set failed status
-        context_calls = provisioner._db.merge_workspace_container_context.call_args_list
-        last_call_updates = context_calls[-1][0][1]
-        assert last_call_updates["status"] == "failed"
-        assert "API error" in last_call_updates["error"]
+        # Failure remains attached to the durable reservation.  Rewriting the
+        # owner could reactivate a settled predecessor runtime.
+        assert not any(
+            call.args[1].get("status") == "failed"
+            for call in provisioner._db.merge_workspace_container_context.call_args_list
+        )
 
 
-class _StrictCreationDB:
+class _StrictCreationDB(_CreationReservationDBDouble):
     def __init__(self, events=None):
+        self._init_creation_reservation()
         self.events = events if events is not None else []
         self.valid = True
         self.claimed = True
@@ -2462,7 +2783,12 @@ class _StrictCreationDB:
             "workspace_generation": "44444444-4444-4444-8444-444444444444"
         }
         self.process_zero_recorded = True
+        self.stale_process_zero_recorded = False
         self.process_zero_uid = None
+        self.cleanup_intent = None
+
+    async def stateless_thread_workspace_creation_requires_authority(self, _thread_id):
+        return True
 
     async def validate_stateless_thread_workspace_creation_attempt(
         self, thread_id, **kwargs
@@ -2532,10 +2858,162 @@ class _StrictCreationDB:
             self.process_zero_uid = kwargs["runtime_incarnation"]
         return self.process_zero_recorded
 
+    async def record_orphan_managed_repository_workspace_process_zero(
+        self, owner_id, **kwargs
+    ):
+        self.events.append(("record_orphan_process_zero", owner_id, kwargs))
+        recorded = bool(getattr(self, "orphan_process_zero_recorded", False))
+        if recorded:
+            self.process_zero_uid = kwargs["runtime_incarnation"]
+        return recorded
+
+    async def record_stale_managed_repository_workspace_process_zero(
+        self, owner_id, **kwargs
+    ):
+        self.events.append(("record_stale_process_zero", owner_id, kwargs))
+        if self.stale_process_zero_recorded:
+            self.process_zero_uid = kwargs["runtime_incarnation"]
+        return self.stale_process_zero_recorded
+
     async def managed_repository_workspace_process_zero_is_current(
         self, _owner_id, **kwargs
     ):
-        return kwargs.get("runtime_incarnation") == self.process_zero_uid
+        return bool(
+            self.process_zero_recorded
+            and kwargs.get("runtime_incarnation") == self.process_zero_uid
+        )
+
+    async def stale_managed_repository_workspace_process_zero_is_current(
+        self, _owner_id, **kwargs
+    ):
+        return bool(
+            self.stale_process_zero_recorded
+            and kwargs.get("runtime_incarnation") == self.process_zero_uid
+        )
+
+    async def get_managed_repository_workspace_cleanup_intent(
+        self, _owner_id, **kwargs
+    ):
+        if self.cleanup_intent is None:
+            return None
+        if str(self.cleanup_intent["runtime_incarnation"]) != str(
+            kwargs.get("runtime_incarnation")
+        ):
+            return None
+        return dict(self.cleanup_intent)
+
+    async def prepare_managed_repository_workspace_cleanup_intent(
+        self, _owner_id, **kwargs
+    ):
+        if self.cleanup_intent is None:
+            self.cleanup_intent = {
+                "id": uuid4(),
+                "intent_generation": 1,
+                "runtime_incarnation": kwargs["runtime_incarnation"],
+                "target_disposition": kwargs["target_disposition"],
+                "resource_policy": (
+                    "terminal_reclaim"
+                    if kwargs["reclaim_shared_resources"]
+                    else "preserve"
+                ),
+                "reclaim_shared_resources": kwargs["reclaim_shared_resources"],
+                "resources_captured_at": None,
+                "claimed_by": None,
+                "claim_token": 0,
+                "result_kind": None,
+            }
+        return dict(self.cleanup_intent)
+
+    async def claim_managed_repository_workspace_cleanup_intent(
+        self, _intent_id, **kwargs
+    ):
+        if self.cleanup_intent is None:
+            return None
+        self.cleanup_intent["claimed_by"] = kwargs["claimant"]
+        self.cleanup_intent["claim_token"] = 7
+        return dict(self.cleanup_intent)
+
+    async def record_managed_repository_workspace_cleanup_resources(
+        self, _intent_id, **kwargs
+    ):
+        if (
+            self.cleanup_intent is None
+            or self.cleanup_intent.get("claimed_by") != kwargs["claimant"]
+            or int(self.cleanup_intent.get("claim_token") or 0)
+            != int(kwargs["claim_token"])
+        ):
+            return None
+        self.cleanup_intent.update(
+            {
+                "resources_captured_at": "now",
+                "pod_uid": kwargs["pod_uid"],
+                "seed_configmap_uid": kwargs.get("seed_configmap_uid"),
+                "pvc_uid": kwargs.get("pvc_uid"),
+                "service_uid": kwargs.get("service_uid"),
+            }
+        )
+        return dict(self.cleanup_intent)
+
+    async def managed_repository_workspace_cleanup_claim_is_current(
+        self, _intent_id, **kwargs
+    ):
+        return bool(
+            self.cleanup_intent
+            and self.cleanup_intent.get("claimed_by") == kwargs["claimant"]
+            and int(self.cleanup_intent.get("claim_token") or 0)
+            == int(kwargs["claim_token"])
+        )
+
+    async def terminal_workspace_cleanup_claim_is_current(self, intent_id, **kwargs):
+        return await self.managed_repository_workspace_cleanup_claim_is_current(
+            intent_id, **kwargs
+        )
+
+    async def settle_managed_repository_workspace_cleanup_intent(
+        self, _owner_id, **kwargs
+    ):
+        if (
+            self.cleanup_intent is None
+            or int(self.cleanup_intent["intent_generation"])
+            != int(kwargs["intent_generation"])
+            or self.cleanup_intent.get("claimed_by") != kwargs["claimant"]
+            or int(self.cleanup_intent.get("claim_token") or 0)
+            != int(kwargs["claim_token"])
+        ):
+            return False
+        self.cleanup_intent["result_kind"] = "settled"
+        return True
+
+    async def supersede_managed_repository_workspace_cleanup_intent(
+        self, _owner_id, **kwargs
+    ):
+        if (
+            self.cleanup_intent is None
+            or self.cleanup_intent.get("claimed_by") != kwargs["claimant"]
+            or int(self.cleanup_intent.get("claim_token") or 0)
+            != int(kwargs["claim_token"])
+        ):
+            return False
+        self.cleanup_intent["result_kind"] = "superseded"
+        return True
+
+    def install_captured_cleanup_intent(self, runtime_incarnation):
+        self.cleanup_intent = {
+            "id": uuid4(),
+            "intent_generation": 1,
+            "runtime_incarnation": runtime_incarnation,
+            "target_disposition": "deleted",
+            "resource_policy": "preserve",
+            "reclaim_shared_resources": False,
+            "resources_captured_at": "now",
+            "pod_uid": runtime_incarnation,
+            "seed_configmap_uid": None,
+            "pvc_uid": None,
+            "service_uid": None,
+            "claimed_by": "lost-response-cleanup",
+            "claim_token": 7,
+            "result_kind": None,
+        }
 
 
 class _DirectSessionLaneDB:
@@ -2546,7 +3024,7 @@ class _DirectSessionLaneDB:
         return self.requires_authority
 
 
-class _PinnedSessionContainerDB:
+class _PinnedSessionContainerDB(_CreationReservationDBDouble):
     """Exact-authority DB double for pinned session workspace provisioning."""
 
     GENERATION = "11111111-2222-4333-8444-555555555555"
@@ -2554,8 +3032,10 @@ class _PinnedSessionContainerDB:
     BINDING_GENERATION = "33333333-4444-4555-8666-777777777777"
 
     def __init__(self):
+        self._init_creation_reservation()
         self.merge_workspace_container_context = AsyncMock(return_value=True)
         self.merge_thread_workspace_context = AsyncMock(return_value=True)
+        self.merge_ide_session_context = AsyncMock(return_value=True)
         self.execute = AsyncMock(return_value=None)
         self.fetchval = AsyncMock(return_value=False)
         self.get_workspace_network_tier = AsyncMock(return_value=None)
@@ -2721,7 +3201,12 @@ class TestStrictStatelessWorkspaceCreation:
                     "srw.io/network-tier": network_tier,
                 },
                 annotations={
-                    "srw.io/runtime-creation-generation": (generation or cls.GENERATION)
+                    "srw.io/runtime-creation-generation": (
+                        generation or cls.GENERATION
+                    ),
+                    "srw.io/workspace-creation-reservation": (
+                        "33333333-3333-4333-8333-333333333333"
+                    ),
                 },
                 deletion_timestamp=None,
             ),
@@ -2809,7 +3294,12 @@ class TestStrictStatelessWorkspaceCreation:
                     owner.label_key: owner_id or owner.id,
                 },
                 annotations={
-                    "srw.io/runtime-creation-generation": (generation or cls.GENERATION)
+                    "srw.io/runtime-creation-generation": (
+                        generation or cls.GENERATION
+                    ),
+                    "srw.io/workspace-creation-reservation": (
+                        "33333333-3333-4333-8333-333333333333"
+                    ),
                 },
                 deletion_timestamp=None,
                 owner_references=[
@@ -2861,6 +3351,9 @@ class TestStrictStatelessWorkspaceCreation:
     @classmethod
     def _provisioner(cls, db=None):
         from orchestrator.services.container_provisioner import ContainerProvisioner
+        from orchestrator.services.container_provisioner import (
+            WorkspaceTeardownIdentity,
+        )
 
         p = ContainerProvisioner()
         p._k8s_available = True
@@ -2875,7 +3368,37 @@ class TestStrictStatelessWorkspaceCreation:
         p._delete_seed_configmap = AsyncMock(return_value=True)
         p._adopt_configmap = AsyncMock(return_value=True)
         p._seed_workspace_state = AsyncMock(return_value=None)
+        p.capture_workspace_teardown_identity = AsyncMock(
+            return_value=WorkspaceTeardownIdentity(
+                pod_uid=cls.RUNTIME,
+                pvc_uid=None,
+                service_uid=None,
+                seed_configmap_uid=None,
+            )
+        )
         return p
+
+    @classmethod
+    async def _active_reservation(cls, db):
+        reservation = await db.reserve_managed_repository_workspace_creation(
+            cls.THREAD_ID,
+            owner_kind="thread",
+            scope="workspace_container",
+            claimant=f"container-create:{cls.GENERATION}",
+            operation_kind="create",
+        )
+        assert isinstance(reservation, dict)
+        started = await db.mark_managed_repository_workspace_creation_started(
+            cls.THREAD_ID,
+            owner_kind="thread",
+            scope="workspace_container",
+            reservation_generation=int(reservation["reservation_generation"]),
+            claimant=str(reservation["claimed_by"]),
+            claim_token=int(reservation["claim_token"]),
+        )
+        assert isinstance(started, dict)
+        reservation.update(started)
+        return reservation
 
     @pytest.mark.asyncio
     async def test_attest_workspace_runtime_returns_exact_pvc_authority(self):
@@ -3134,7 +3657,10 @@ class TestStrictStatelessWorkspaceCreation:
             },
             {"op": "remove", "path": "/metadata/finalizers/1"},
         ]
-        assert patch_call.kwargs["_content_type"] == ("application/json-patch+json")
+        # The generated CoreV1 client selects JSON Patch from the list body.
+        # `_content_type` is not an accepted kwarg in the deployed client and
+        # would fail after the durable receipt while retaining the finalizer.
+        assert "_content_type" not in patch_call.kwargs
         assert p._db.events[-1] == (
             "record_process_zero",
             self.THREAD_ID,
@@ -3183,6 +3709,98 @@ class TestStrictStatelessWorkspaceCreation:
         p._core_api.patch_namespaced_pod.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_process_zero_finalizer_records_exact_terminal_orphan(self):
+        db = _StrictCreationDB()
+        db.process_zero_recorded = False
+        db.orphan_process_zero_recorded = True
+        p = self._provisioner(db)
+        pod = self._pod()
+        pod.metadata.deletion_timestamp = "now"
+        pod.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        pod.status.phase = "Failed"
+        pod.status.container_statuses[0].state.terminated = SimpleNamespace(exit_code=0)
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        assert await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+        assert db.events[-2:] == [
+            (
+                "record_orphan_process_zero",
+                self.THREAD_ID,
+                {
+                    "owner_kind": "thread",
+                    "scope": "workspace_container",
+                    "provisioner": "k8s",
+                    "runtime_incarnation": self.RUNTIME,
+                },
+            ),
+            (
+                "record_process_zero",
+                self.THREAD_ID,
+                {"runtime_incarnation": self.RUNTIME},
+            ),
+        ]
+        p._core_api.patch_namespaced_pod.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_process_zero_finalizer_records_exact_terminal_stale_runtime(self):
+        db = _StrictCreationDB()
+        db.process_zero_recorded = False
+        db.stale_process_zero_recorded = True
+        p = self._provisioner(db)
+        pod = self._pod()
+        pod.metadata.deletion_timestamp = "now"
+        pod.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        pod.status.phase = "Failed"
+        pod.status.container_statuses[0].state.terminated = SimpleNamespace(exit_code=0)
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        assert await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+        assert db.events[-4:] == [
+            (
+                "record_managed_process_zero",
+                self.THREAD_ID,
+                {
+                    "owner_kind": "thread",
+                    "scope": "workspace_container",
+                    "provisioner": "k8s",
+                    "runtime_incarnation": self.RUNTIME,
+                },
+            ),
+            (
+                "record_orphan_process_zero",
+                self.THREAD_ID,
+                {
+                    "owner_kind": "thread",
+                    "scope": "workspace_container",
+                    "provisioner": "k8s",
+                    "runtime_incarnation": self.RUNTIME,
+                },
+            ),
+            (
+                "record_stale_process_zero",
+                self.THREAD_ID,
+                {
+                    "owner_kind": "thread",
+                    "scope": "workspace_container",
+                    "provisioner": "k8s",
+                    "runtime_incarnation": self.RUNTIME,
+                },
+            ),
+            (
+                "record_process_zero",
+                self.THREAD_ID,
+                {"runtime_incarnation": self.RUNTIME},
+            ),
+        ]
+        p._core_api.patch_namespaced_pod.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_dynamic_mock_method_cannot_forge_process_zero_receipt(self):
         p = self._provisioner(MagicMock())
         pod = self._pod()
@@ -3205,6 +3823,7 @@ class TestStrictStatelessWorkspaceCreation:
 
         db = _StrictCreationDB()
         db.process_zero_uid = self.RUNTIME
+        db.install_captured_cleanup_intent(self.RUNTIME)
         p = self._provisioner(db)
         p._core_api.read_namespaced_pod.side_effect = _NotFound()
         p._set_context = AsyncMock()
@@ -3213,15 +3832,21 @@ class TestStrictStatelessWorkspaceCreation:
             "orchestrator.services.container_provisioner.workspace_metering.close_interval",
             new=AsyncMock(return_value=None),
         ):
-            assert await p.delete_workspace(self._owner())
+            outcome = await p.delete_workspace_with_outcome(
+                self._owner(),
+                expected_runtime_incarnation=self.RUNTIME,
+                _mutation_guard_held=True,
+            )
+            assert outcome.current_deleted
 
         p._core_api.delete_namespaced_pod.assert_not_called()
         p._delete_seed_configmap.assert_awaited_once_with(
             self._owner().pod_name,
             expected_owner=self._owner(),
             expected_pod_uid=self.RUNTIME,
+            expected_configmap_uid=None,
         )
-        p._set_context.assert_awaited_once()
+        p._set_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_process_zero_finalizer_refuses_live_or_replacement_pod(self):
@@ -3267,16 +3892,18 @@ class TestStrictStatelessWorkspaceCreation:
             "orchestrator.services.container_provisioner.workspace_metering.close_interval",
             new=AsyncMock(return_value=None),
         ):
-            assert await p.delete_workspace(
+            outcome = await p.delete_workspace_with_outcome(
                 self._owner(),
                 expected_runtime_incarnation=self.RUNTIME,
                 wait_for_exact_absence=True,
                 exact_absence_timeout_seconds=1,
+                _mutation_guard_held=True,
             )
+            assert outcome.current_deleted
 
         p._core_api.delete_namespaced_pod.assert_called_once()
         p._core_api.patch_namespaced_pod.assert_called_once()
-        p._set_context.assert_awaited_once()
+        p._set_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_conflict_adopts_only_matching_nonce_pod_once(self):
@@ -3468,6 +4095,17 @@ class TestStrictStatelessWorkspaceCreation:
         p._delete_seed_configmap.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_cutover_pre_revoke_create_is_adopted_only_by_exact_reservation(self):
+        """The already-authorized CREATE boundary is the lost-response path.
+
+        A request accepted immediately before the ServiceAccount/RBAC cutover
+        may finish after migration and Recreate. The successor must use the
+        durable reservation/nonce to adopt it, never issue a duplicate create.
+        """
+
+        await self.test_timeout_after_pod_acceptance_retains_seed_for_exact_retry()
+
+    @pytest.mark.asyncio
     async def test_pvc_service_failure_holds_ready_then_continuation_retries(self):
         events = []
         db = _StrictCreationDB(events)
@@ -3481,6 +4119,7 @@ class TestStrictStatelessWorkspaceCreation:
         p._core_api.read_namespaced_persistent_volume_claim.return_value = self._claim(
             p
         )
+        p._core_api.read_namespaced_service.return_value = self._service(p)
         p._wait_for_ready = AsyncMock(return_value="10.42.0.8")
         p._trusted_pod_ssh_identity = AsyncMock(
             return_value=(
@@ -3606,6 +4245,7 @@ class TestStrictStatelessWorkspaceCreation:
         db = _StrictCreationDB(events)
         p = self._provisioner(db)
         p._create_seed_configmap.return_value = "seed-config"
+        p._core_api.read_namespaced_config_map.return_value = self._seed(p)
         entered = threading.Event()
         release = threading.Event()
 
@@ -3683,7 +4323,8 @@ class TestStrictStatelessWorkspaceCreation:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("drift", ["generation", "owner", "runtime"])
     async def test_attempted_replacement_or_annotation_drift_never_adopts(self, drift):
-        p = self._provisioner()
+        db = _StrictCreationDB()
+        p = self._provisioner(db)
         pod_kwargs = {}
         if drift == "generation":
             pod_kwargs["generation"] = "22222222-3333-4444-8555-666666666666"
@@ -3692,6 +4333,7 @@ class TestStrictStatelessWorkspaceCreation:
         elif drift == "runtime":
             pod_kwargs["runtime"] = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
         p._core_api.read_namespaced_pod.return_value = self._pod(**pod_kwargs)
+        reservation = await self._active_reservation(db)
 
         expected_runtime = self.RUNTIME if drift == "runtime" else None
         assert (
@@ -3699,6 +4341,7 @@ class TestStrictStatelessWorkspaceCreation:
                 self._owner(),
                 generation=self.GENERATION,
                 expected_runtime_incarnation=expected_runtime,
+                _creation_reservation=reservation,
             )
             is False
         )
@@ -3725,6 +4368,7 @@ class TestStrictStatelessWorkspaceCreation:
                 self.RUNTIME,
             )
         )
+        reservation = await self._active_reservation(db)
 
         with patch(
             "orchestrator.services.container_provisioner.workspace_metering.open_interval",
@@ -3735,6 +4379,7 @@ class TestStrictStatelessWorkspaceCreation:
                     self._owner(),
                     generation=self.GENERATION,
                     expected_runtime_incarnation=None,
+                    _creation_reservation=reservation,
                 )
                 is True
             )
@@ -3746,29 +4391,15 @@ class TestStrictStatelessWorkspaceCreation:
 
     @pytest.mark.asyncio
     async def test_exact_terminal_delete_reaches_404_before_uid_clear(self):
+        from orchestrator.services.container_provisioner import WorkspaceCleanupOutcome
+
         events = []
         db = _StrictCreationDB(events)
         p = self._provisioner(db)
         p.workspace_pod_authority = AsyncMock(return_value="exact_terminal")
-        terminal = self._pod()
-        terminal.metadata.deletion_timestamp = "now"
-        terminal.status.phase = "Failed"
-        terminal.spec.containers = [SimpleNamespace(name="workspace")]
-        terminal.status.container_statuses[0].state.terminated = SimpleNamespace(
-            exit_code=0
+        p.reconcile_workspace_cleanup_intent = AsyncMock(
+            return_value=WorkspaceCleanupOutcome("settled", 1)
         )
-        p._core_api.read_namespaced_pod.return_value = terminal
-
-        def delete(**kwargs):
-            events.append(("delete", kwargs))
-
-        p._core_api.delete_namespaced_pod = delete
-
-        async def wait(*_args, **kwargs):
-            events.append(("wait_absent", kwargs))
-            return True
-
-        p._wait_for_exact_workspace_pod_absent = AsyncMock(side_effect=wait)
 
         generation = await p.prepare_stateless_workspace_recreation(
             self._owner(),
@@ -3778,16 +4409,12 @@ class TestStrictStatelessWorkspaceCreation:
 
         assert isinstance(generation, str)
         names = [event[0] for event in events]
-        assert names == [
-            "prepare",
-            "validate",
-            "record_managed_process_zero",
-            "delete",
-            "wait_absent",
-            "clear",
-        ]
-        delete_kwargs = next(event[1] for event in events if event[0] == "delete")
-        assert delete_kwargs["body"] == {"preconditions": {"uid": self.RUNTIME}}
+        assert names == ["prepare", "validate", "clear"]
+        p.reconcile_workspace_cleanup_intent.assert_awaited_once_with(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+            intent_generation=1,
+        )
         clear = next(event for event in events if event[0] == "clear")
         assert clear[2] == {
             "generation": generation,
@@ -3797,18 +4424,17 @@ class TestStrictStatelessWorkspaceCreation:
 
     @pytest.mark.asyncio
     async def test_terminal_delete_timeout_retains_uid_until_exact_absent_retry(self):
+        from orchestrator.services.container_provisioner import WorkspaceCleanupOutcome
+
         events = []
         db = _StrictCreationDB(events)
         p = self._provisioner(db)
-        terminal = self._pod()
-        terminal.metadata.deletion_timestamp = "now"
-        terminal.status.phase = "Failed"
-        terminal.status.container_statuses[0].state.terminated = SimpleNamespace(
-            exit_code=0
+        p.reconcile_workspace_cleanup_intent = AsyncMock(
+            side_effect=[
+                WorkspaceCleanupOutcome("retryable", 1),
+                WorkspaceCleanupOutcome("settled", 1),
+            ]
         )
-        p._core_api.read_namespaced_pod.return_value = terminal
-        p._core_api.delete_namespaced_pod.return_value = None
-        p._wait_for_exact_workspace_pod_absent = AsyncMock(return_value=False)
 
         assert (
             await p._delete_prepared_terminal_workspace_runtime(
@@ -3918,96 +4544,6 @@ class TestStrictStatelessWorkspaceCreation:
                     expected_owner=self._owner(),
                     expected_runtime_incarnation=self.RUNTIME,
                     expected_creation_generation=self.GENERATION,
-                )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("replaced_resource", ["pvc", "seed_configmap", "service"])
-    async def test_pinned_ready_attestation_rejects_resource_uid_replacement(
-        self, replaced_resource
-    ):
-        from orchestrator.services.container_provisioner import (
-            WorkspaceRuntimeAuthorityError,
-        )
-
-        attempt = "12345678-1234-4234-8234-123456789abc"
-        pvc_uid = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
-        seed_uid = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
-        service_uid = "aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff"
-        replacement_uid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
-        p = self._provisioner()
-        pvc_name = (
-            f"pvc-ws-thread-{self.THREAD_ID[:12]}"
-            if replaced_resource in {"pvc", "service"}
-            else None
-        )
-        seed_name = (
-            f"code-server-config-{self._owner().pod_name}"
-            if replaced_resource == "seed_configmap"
-            else None
-        )
-
-        def pin(resource):
-            resource.metadata.labels.update(
-                {
-                    "srw.io/workspace-provision-attempt": attempt,
-                    "srw.io/runtime-generation": self.GENERATION,
-                }
-            )
-            return resource
-
-        exact_pod = pin(self._pod(pvc_name=pvc_name, seed_name=seed_name))
-        confirmed_pod = pin(self._pod(pvc_name=pvc_name, seed_name=seed_name))
-        p._core_api.read_namespaced_pod.side_effect = [exact_pod, confirmed_pod]
-        if pvc_name is not None:
-            exact_claim = pin(self._claim(p, uid=pvc_uid))
-            confirmed_claim = pin(
-                self._claim(
-                    p,
-                    uid=(replacement_uid if replaced_resource == "pvc" else pvc_uid),
-                )
-            )
-            exact_service = pin(self._service(p))
-            confirmed_service = pin(self._service(p))
-            if replaced_resource == "service":
-                confirmed_service.metadata.uid = replacement_uid
-            p._core_api.read_namespaced_persistent_volume_claim.side_effect = [
-                exact_claim,
-                confirmed_claim,
-            ]
-            p._core_api.read_namespaced_service.side_effect = [
-                exact_service,
-                confirmed_service,
-            ]
-        if seed_name is not None:
-            exact_seed = pin(self._seed(p))
-            confirmed_seed = pin(self._seed(p))
-            confirmed_seed.metadata.uid = replacement_uid
-            p._core_api.read_namespaced_config_map.side_effect = [
-                exact_seed,
-                confirmed_seed,
-            ]
-
-        with patch(
-            "orchestrator.services.container_provisioner.k8s_stream",
-            return_value="256 SHA256:trusted host (ED25519)",
-        ):
-            with pytest.raises(WorkspaceRuntimeAuthorityError, match="UID changed"):
-                await p._trusted_pod_ssh_identity(
-                    self._owner().pod_name,
-                    pvc_name=pvc_name,
-                    expected_owner=self._owner(),
-                    expected_runtime_incarnation=self.RUNTIME,
-                    expected_network_tier="internet-only",
-                    expected_seed_configmap=seed_name,
-                    expected_pvc_uid=(pvc_uid if pvc_name is not None else None),
-                    expected_provision_attempt=attempt,
-                    expected_runtime_generation=self.GENERATION,
-                    expected_seed_configmap_uid=(
-                        seed_uid if seed_name is not None else None
-                    ),
-                    expected_service_uid=(
-                        service_uid if pvc_name is not None else None
-                    ),
                 )
 
     @pytest.mark.parametrize(
@@ -4122,7 +4658,8 @@ class TestStrictStatelessWorkspaceCreation:
         self, configured_pvc
     ):
         events = []
-        p = self._provisioner(_StrictCreationDB(events))
+        db = _StrictCreationDB(events)
+        p = self._provisioner(db)
         actual_pvc = (
             f"pvc-ws-thread-{self.THREAD_ID[:12]}" if not configured_pvc else None
         )
@@ -4134,6 +4671,7 @@ class TestStrictStatelessWorkspaceCreation:
             claim.spec.storage_class_name = "old-storage-class"
             p._storage_class = "new-storage-class"
             p._core_api.read_namespaced_persistent_volume_claim.return_value = claim
+            p._core_api.read_namespaced_service.return_value = self._service(p)
         p._create_service = AsyncMock(return_value=True)
         p._wait_for_ready = AsyncMock(return_value="10.42.0.8")
         p._trusted_pod_ssh_identity = AsyncMock(
@@ -4147,6 +4685,7 @@ class TestStrictStatelessWorkspaceCreation:
                 self.RUNTIME,
             )
         )
+        reservation = await self._active_reservation(db)
 
         with patch(
             "orchestrator.services.container_provisioner.workspace_metering.open_interval",
@@ -4158,6 +4697,7 @@ class TestStrictStatelessWorkspaceCreation:
                 expected_runtime_incarnation=self.RUNTIME,
                 cpu="9",
                 memory="99Gi",
+                _creation_reservation=reservation,
             )
 
         p._core_api.create_namespaced_pod.assert_not_called()
@@ -4178,6 +4718,96 @@ class TestStrictStatelessWorkspaceCreation:
             )
         else:
             p._create_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("replaced_resource", ["pvc", "seed_configmap", "service"])
+    async def test_pinned_ready_attestation_rejects_resource_uid_replacement(
+        self, replaced_resource
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        attempt = "12345678-1234-4234-8234-123456789abc"
+        pvc_uid = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+        seed_uid = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
+        service_uid = "aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff"
+        replacement_uid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        p = self._provisioner()
+        pvc_name = (
+            f"pvc-ws-thread-{self.THREAD_ID[:12]}"
+            if replaced_resource in {"pvc", "service"}
+            else None
+        )
+        seed_name = (
+            f"code-server-config-{self._owner().pod_name}"
+            if replaced_resource == "seed_configmap"
+            else None
+        )
+
+        def pin(resource):
+            resource.metadata.labels.update(
+                {
+                    "srw.io/workspace-provision-attempt": attempt,
+                    "srw.io/runtime-generation": self.GENERATION,
+                }
+            )
+            return resource
+
+        exact_pod = pin(self._pod(pvc_name=pvc_name, seed_name=seed_name))
+        confirmed_pod = pin(self._pod(pvc_name=pvc_name, seed_name=seed_name))
+        p._core_api.read_namespaced_pod.side_effect = [exact_pod, confirmed_pod]
+        if pvc_name is not None:
+            exact_claim = pin(self._claim(p, uid=pvc_uid))
+            confirmed_claim = pin(
+                self._claim(
+                    p,
+                    uid=(replacement_uid if replaced_resource == "pvc" else pvc_uid),
+                )
+            )
+            exact_service = pin(self._service(p))
+            confirmed_service = pin(self._service(p))
+            if replaced_resource == "service":
+                confirmed_service.metadata.uid = replacement_uid
+            p._core_api.read_namespaced_persistent_volume_claim.side_effect = [
+                exact_claim,
+                confirmed_claim,
+            ]
+            p._core_api.read_namespaced_service.side_effect = [
+                exact_service,
+                confirmed_service,
+            ]
+        if seed_name is not None:
+            exact_seed = pin(self._seed(p))
+            confirmed_seed = pin(self._seed(p))
+            confirmed_seed.metadata.uid = replacement_uid
+            p._core_api.read_namespaced_config_map.side_effect = [
+                exact_seed,
+                confirmed_seed,
+            ]
+
+        with patch(
+            "orchestrator.services.container_provisioner.k8s_stream",
+            return_value="256 SHA256:trusted host (ED25519)",
+        ):
+            with pytest.raises(WorkspaceRuntimeAuthorityError, match="UID changed"):
+                await p._trusted_pod_ssh_identity(
+                    self._owner().pod_name,
+                    pvc_name=pvc_name,
+                    expected_owner=self._owner(),
+                    expected_runtime_incarnation=self.RUNTIME,
+                    expected_network_tier="internet-only",
+                    expected_seed_configmap=seed_name,
+                    expected_pvc_uid=(pvc_uid if pvc_name is not None else None),
+                    expected_provision_attempt=attempt,
+                    expected_runtime_generation=self.GENERATION,
+                    expected_seed_configmap_uid=(
+                        seed_uid if seed_name is not None else None
+                    ),
+                    expected_service_uid=(
+                        service_uid if pvc_name is not None else None
+                    ),
+                )
 
 
 class TestAuthenticatedWorkspaceReadiness:
@@ -4266,8 +4896,7 @@ class TestAuthenticatedWorkspaceReadiness:
 
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
-        provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        provisioner._db = _PinnedSessionContainerDB()
         provisioner._core_api = MagicMock()
         provisioner._core_api.create_namespaced_pod = MagicMock(
             side_effect=lambda **kw: _pod_from_manifest(kw["body"])
@@ -4291,10 +4920,7 @@ class TestAuthenticatedWorkspaceReadiness:
             call.args[1]
             for call in provisioner._db.merge_workspace_container_context.call_args_list
         ]
-        assert updates[-1] == {
-            "status": "failed",
-            "error": "workspace rejected configured public key",
-        }
+        assert not any(update.get("status") == "failed" for update in updates)
         assert not any(update.get("status") == "ready" for update in updates)
 
 
@@ -4318,13 +4944,7 @@ class TestCreateWorkspacePvc:
         p._db = _PinnedSessionContainerDB()
         p._trusted_pod_ssh_identity = AsyncMock(
             return_value=(
-                (
-                    "k8s-pvc:superhuman-remote-worker:"
-                    "22222222-2222-4222-8222-222222222222"
-                    if pvc_enabled
-                    else "k8s-pod:superhuman-remote-worker:"
-                    "11111111-1111-4111-8111-111111111111"
-                ),
+                "k8s-pod:superhuman-remote-worker:11111111-1111-4111-8111-111111111111",
                 "SHA256:trusted",
                 _TEST_POD_UID,
             )
@@ -4357,15 +4977,7 @@ class TestCreateWorkspacePvc:
         core.read_namespaced_persistent_volume_claim = lambda **kw: (
             _pvc_from_manifest(pvc_body)
         )
-
-        def read_service(**_kw):
-            if not service_body:
-                error = Exception("not found")
-                error.status = 404
-                raise error
-            return _service_from_manifest(service_body)
-
-        core.read_namespaced_service = read_service
+        core.read_namespaced_service = lambda **kw: _service_from_manifest(service_body)
         return core
 
     @pytest.mark.asyncio
@@ -4425,7 +5037,9 @@ class TestCreateWorkspacePvc:
 
         with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
             w.return_value = "10.42.0.100"
-            result = await p.create_pinned_thread_workspace("abcdef123456-thread-uuid")
+            result = await p.create_workspace(
+                WorkspaceOwner.session("abcdef123456-thread-uuid")
+            )
 
         assert result is True
         # Session prefix (mirrors the ws-thread-* pod split so `kubectl get
@@ -4468,7 +5082,7 @@ class TestCreateWorkspacePvc:
 
         with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
             w.return_value = "10.42.0.100"
-            await p.create_pinned_thread_workspace("abcdef123456-thread")
+            await p.create_workspace(WorkspaceOwner.session("abcdef123456-thread"))
 
         core.create_namespaced_persistent_volume_claim.assert_not_called()
         vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
@@ -4487,22 +5101,14 @@ class TestCreateWorkspacePvc:
         core.create_namespaced_persistent_volume_claim = MagicMock(
             side_effect=Exception("PVC API down")
         )
-
-        def service_absent(**_kwargs):
-            error = Exception("not found")
-            error.status = 404
-            raise error
-
-        core.read_namespaced_service.side_effect = service_absent
         p._core_api = core
 
-        result = await p.create_pinned_thread_workspace("abcdef123456-thread")
+        result = await p.create_workspace(WorkspaceOwner.session("abcdef123456-thread"))
 
         assert result is False
         core.create_namespaced_pod.assert_not_called()
-        assert p._db.intent is not None
-        assert p._db.intent["status"] == "planned"
-        assert p._db.published == {}
+        # Pre-runtime failures remain on the durable reservation.  Projecting
+        # ``failed`` onto the owner could rewrite a settled predecessor UID.
         p._db.merge_thread_workspace_context.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -4522,9 +5128,7 @@ class TestCreateWorkspacePvc:
         assert result is False
         # No pod (or ConfigMap) provisioned once the prerequisite PVC failed
         core.create_namespaced_pod.assert_not_called()
-        updates = p._db.merge_workspace_container_context.call_args_list[-1][0][1]
-        assert updates["status"] == "failed"
-        assert "PVC" in updates["error"]
+        p._db.merge_workspace_container_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_pvc_quota_403_fails_closed_with_capacity_log(self, caplog):
@@ -4555,8 +5159,7 @@ class TestCreateWorkspacePvc:
 
         assert result is False
         core.create_namespaced_pod.assert_not_called()
-        updates = p._db.merge_workspace_container_context.call_args_list[-1][0][1]
-        assert updates["status"] == "failed"
+        p._db.merge_workspace_container_context.assert_not_awaited()
         # Distinct, greppable capacity signal (not the generic "Failed to create")
         assert "capacity quota exceeded" in caplog.text.lower()
 
@@ -4613,10 +5216,11 @@ class TestCreateWorkspacePvc:
         assert await p._pod_volume_attach_failing("pod-x") is False
 
     @pytest.mark.asyncio
-    async def test_reattach_wedged_on_dead_node_falls_back_to_fresh_pvc(self):
-        # Single-replica node-loss fallback (Phase 3b): a reattach (409) whose
-        # volume can't attach (lone replica on a dead node) is DISCARDED and
-        # recovered onto a fresh empty PVC, so the agent clone+checkpoint-resumes.
+    async def test_reattach_wedged_on_dead_node_defers_without_fresh_authority(self):
+        # Destructive fresh recovery remains dark until a distinct process-zero
+        # and exact-volume rollover protocol exists.
+        from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
+
         p = self._provisioner(pvc_enabled=True)
         pod_body = {}
         pvc_body = {
@@ -4639,22 +5243,23 @@ class TestCreateWorkspacePvc:
         p._core_api = self._capture_core(pod_body, pvc_body)
         p._create_pvc = AsyncMock(side_effect=["reused", "created"])  # reattach→fresh
         p._delete_pvc_and_wait = AsyncMock()
-        p.delete_workspace = AsyncMock(return_value=True)
+        p.delete_workspace_with_outcome = AsyncMock(
+            return_value=RuntimeDeletionOutcome("current_deleted")
+        )
+        p.release_absent_workspace = AsyncMock(return_value=True)
         p._pod_volume_attach_failing = AsyncMock(return_value=True)
 
         with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
             w.side_effect = [None, "10.42.0.5"]  # wedged reattach, then fresh ready
             result = await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
 
+        # The existing attempt remains a retryable creating generation, but
+        # no destructive fresh-PVC fallback is entered.
         assert result is True
-        assert p._create_pvc.await_count == 2  # reattach attempt + fresh recreate
-        p._delete_pvc_and_wait.assert_awaited_once()  # discarded the dead volume
-        p.delete_workspace.assert_awaited_once()  # tore down the wedged pod
-        merges = [
-            c[0][1] for c in p._db.merge_workspace_container_context.call_args_list
-        ]
-        assert any(m.get("workspace_reset") for m in merges)  # observability flag
-        assert any(m.get("status") == "ready" for m in merges)  # fresh pod came up
+        assert p._create_pvc.await_count == 1
+        p._delete_pvc_and_wait.assert_not_awaited()
+        p.delete_workspace_with_outcome.assert_not_awaited()
+        p.release_absent_workspace.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reattach_not_ready_but_volume_ok_does_not_discard(self):
@@ -4671,14 +5276,14 @@ class TestCreateWorkspacePvc:
             w.return_value = None
             result = await p.create_workspace(WorkspaceOwner.job("abcdef123456-rest"))
 
-        assert result is True
+        assert result is False
         p._delete_pvc_and_wait.assert_not_awaited()
         p.delete_workspace.assert_not_awaited()
         assert p._create_pvc.await_count == 1  # no fresh recreate
-        merges = [
-            c[0][1] for c in p._db.merge_workspace_container_context.call_args_list
-        ]
-        assert any(m.get("status") == "creating" for m in merges)
+        assert not any(
+            c[0][1].get("status") == "failed"
+            for c in p._db.merge_workspace_container_context.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_fresh_create_timeout_never_discards(self):
@@ -4731,13 +5336,7 @@ class TestWorkspaceService:
         p._db = _PinnedSessionContainerDB()
         p._trusted_pod_ssh_identity = AsyncMock(
             return_value=(
-                (
-                    "k8s-pvc:superhuman-remote-worker:"
-                    "22222222-2222-4222-8222-222222222222"
-                    if pvc_enabled
-                    else "k8s-pod:superhuman-remote-worker:"
-                    "11111111-1111-4111-8111-111111111111"
-                ),
+                "k8s-pvc:superhuman-remote-worker:22222222-2222-4222-8222-222222222222",
                 "SHA256:trusted",
                 _TEST_POD_UID,
             )
@@ -4781,15 +5380,7 @@ class TestWorkspaceService:
         core.read_namespaced_persistent_volume_claim = lambda **_kw: (
             _pvc_from_manifest(pvc_body)
         )
-
-        def read_service(**_kw):
-            if not svc_body:
-                error = Exception("not found")
-                error.status = 404
-                raise error
-            return _service_from_manifest(svc_body)
-
-        core.read_namespaced_service = read_service
+        core.read_namespaced_service = lambda **_kw: _service_from_manifest(svc_body)
         p._core_api = core
 
         with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
@@ -4831,20 +5422,12 @@ class TestWorkspaceService:
         core.read_namespaced_persistent_volume_claim = lambda **_kw: (
             _pvc_from_manifest(pvc_body)
         )
-
-        def read_service(**_kw):
-            if not svc_body:
-                error = Exception("not found")
-                error.status = 404
-                raise error
-            return _service_from_manifest(svc_body)
-
-        core.read_namespaced_service = read_service
+        core.read_namespaced_service = lambda **_kw: _service_from_manifest(svc_body)
         p._core_api = core
 
         with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
             w.return_value = "10.42.0.100"
-            ok = await p.create_pinned_thread_workspace("abcdef123456-thread")
+            ok = await p.create_workspace(WorkspaceOwner.session("abcdef123456-thread"))
 
         assert ok is True
         assert svc_body["metadata"]["name"] == "ws-thread-abcdef123456"
@@ -4885,10 +5468,10 @@ class TestWorkspaceService:
 
         with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
             w.return_value = "10.42.0.100"
-            await p.create_pinned_thread_workspace("abcdef123456-thread")
+            await p.create_workspace(WorkspaceOwner.session("abcdef123456-thread"))
 
         core.create_namespaced_service.assert_not_called()
-        assert self._ready_thread_ctx(p).get("host") is None
+        assert "host" not in self._ready_thread_ctx(p)
 
     @pytest.mark.asyncio
     async def test_delete_service_idempotent_on_404(self):
@@ -4912,9 +5495,36 @@ class TestWorkspaceService:
 class TestDeleteWorkspace:
     """Tests for workspace deletion."""
 
+    @staticmethod
+    def _intent(runtime):
+        return {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "intent_generation": 1,
+            "runtime_incarnation": runtime,
+            "resource_policy": "preserve",
+            "reclaim_shared_resources": False,
+            "resources_captured_at": "now",
+            "claimed_by": "unit-cleanup",
+            "claim_token": 7,
+            "seed_configmap_uid": None,
+        }
+
+    @pytest.mark.parametrize(
+        "state", ("current_deleted", "stale_target_settled", "refused")
+    )
+    def test_runtime_deletion_outcome_requires_explicit_state(self, state):
+        from orchestrator.services.container_provisioner import (
+            RuntimeDeletionOutcome,
+        )
+
+        outcome = RuntimeDeletionOutcome(state)
+
+        with pytest.raises(TypeError, match="must be inspected explicitly"):
+            bool(outcome)
+
     @pytest.mark.asyncio
     async def test_delete_workspace_success(self):
-        """Successful deletion removes pod and updates context."""
+        """Exact deletion removes only the pod and its seed."""
         from orchestrator.services.container_provisioner import (
             ContainerProvisioner,
         )
@@ -4926,6 +5536,11 @@ class TestDeleteWorkspace:
         provisioner._ensure_managed_repository_process_zero_before_delete = AsyncMock(
             return_value=True
         )
+        provisioner._cleanup_claim_is_current = AsyncMock(return_value=True)
+        provisioner._managed_repository_process_zero_replay_authority = AsyncMock(
+            return_value="current"
+        )
+        provisioner._delete_seed_configmap = AsyncMock(return_value=True)
 
         mock_core_api = MagicMock()
         mock_core_api.delete_namespaced_pod = MagicMock()
@@ -4933,19 +5548,20 @@ class TestDeleteWorkspace:
         mock_core_api.read_namespaced_pod = MagicMock(return_value=_owned_pod(owner))
         provisioner._core_api = mock_core_api
 
-        result = await provisioner.delete_workspace(owner)
+        result = await provisioner.delete_workspace_with_outcome(
+            owner,
+            expected_runtime_incarnation=_TEST_POD_UID,
+            cleanup_intent=self._intent(_TEST_POD_UID),
+            _mutation_guard_held=True,
+        )
 
-        assert result is True
+        assert result.current_deleted
         mock_core_api.delete_namespaced_pod.assert_called_once()
-        # Verify context set to deleted and the stale IP dropped
-        context_call = provisioner._db.merge_workspace_container_context.call_args
-        assert context_call[0][1] == {"status": "deleted", "pod_ip": None}
+        provisioner._db.merge_workspace_container_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delete_workspace_already_gone(self):
-        """Deleting a non-existent pod returns True (idempotent) and still
-        clears the stale container context — a pod that died on its own leaves
-        status='ready' + a dead pod_ip behind otherwise."""
+        """An exact 404 settles only Pod/seed; context remains fenced."""
         from orchestrator.services.container_provisioner import (
             ContainerProvisioner,
         )
@@ -4957,6 +5573,11 @@ class TestDeleteWorkspace:
         provisioner._db.managed_repository_workspace_process_zero_is_current = (
             AsyncMock(return_value=True)
         )
+        provisioner._cleanup_claim_is_current = AsyncMock(return_value=True)
+        provisioner._managed_repository_process_zero_replay_authority = AsyncMock(
+            return_value="current"
+        )
+        provisioner._delete_seed_configmap = AsyncMock(return_value=True)
 
         mock_404 = MagicMock()
         mock_404.status = 404
@@ -4972,29 +5593,32 @@ class TestDeleteWorkspace:
         mock_core_api.read_namespaced_pod = MagicMock(side_effect=error)
 
         runtime = "11111111-1111-4111-8111-111111111111"
-        result = await provisioner.delete_workspace(
+        result = await provisioner.delete_workspace_with_outcome(
             WorkspaceOwner.job("test-job-123456"),
             expected_runtime_incarnation=runtime,
+            cleanup_intent=self._intent(runtime),
+            _mutation_guard_held=True,
         )
-        assert result is True
-        provisioner._db.merge_workspace_container_context.assert_awaited_once_with(
-            "test-job-123456", {"status": "deleted", "pod_ip": None}
-        )
+        assert result.current_deleted
+        provisioner._db.merge_workspace_container_context.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_delete_workspace_not_available(self):
-        """Returns False when K8s is not available."""
+    async def test_legacy_delete_wrapper_refuses_before_kubernetes_mutation(self):
+        """The bool API cannot partially delete and then report failure."""
         from orchestrator.services.container_provisioner import (
             ContainerProvisioner,
         )
 
         provisioner = ContainerProvisioner()
-        provisioner._k8s_available = False
+        provisioner._k8s_available = True
+        provisioner._core_api = MagicMock()
 
         result = await provisioner.delete_workspace(
             WorkspaceOwner.job("test-job-123456")
         )
         assert result is False
+        provisioner._core_api.read_namespaced_pod.assert_not_called()
+        provisioner._core_api.delete_namespaced_pod.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_strict_delete_acceptance_does_not_clear_uid_before_404(self):
@@ -5008,6 +5632,10 @@ class TestDeleteWorkspace:
         provisioner._ensure_managed_repository_process_zero_before_delete = AsyncMock(
             return_value=True
         )
+        provisioner._cleanup_claim_is_current = AsyncMock(return_value=True)
+        provisioner._managed_repository_process_zero_replay_authority = AsyncMock(
+            return_value="current"
+        )
         provisioner._core_api = MagicMock()
         provisioner._wait_for_exact_workspace_pod_absent = AsyncMock(return_value=False)
         owner = WorkspaceOwner.session("test-thread-123456")
@@ -5017,13 +5645,14 @@ class TestDeleteWorkspace:
         )
 
         assert (
-            await provisioner.delete_workspace(
+            await provisioner.delete_workspace_with_outcome(
                 owner,
                 expected_runtime_incarnation=runtime,
                 wait_for_exact_absence=True,
+                cleanup_intent=self._intent(runtime),
+                _mutation_guard_held=True,
             )
-            is False
-        )
+        ).state == "refused"
 
         provisioner._wait_for_exact_workspace_pod_absent.assert_awaited_once_with(
             owner,
@@ -5034,7 +5663,7 @@ class TestDeleteWorkspace:
         provisioner._core_api.delete_namespaced_config_map.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_strict_delete_clears_uid_only_after_exact_404(self):
+    async def test_strict_delete_leaves_uid_fenced_after_exact_404(self):
         from orchestrator.services.container_provisioner import ContainerProvisioner
 
         runtime = "11111111-1111-4111-8111-111111111111"
@@ -5044,6 +5673,10 @@ class TestDeleteWorkspace:
         provisioner._db.merge_thread_workspace_context = AsyncMock(return_value=True)
         provisioner._ensure_managed_repository_process_zero_before_delete = AsyncMock(
             return_value=True
+        )
+        provisioner._cleanup_claim_is_current = AsyncMock(return_value=True)
+        provisioner._managed_repository_process_zero_replay_authority = AsyncMock(
+            return_value="current"
         )
         provisioner._core_api = MagicMock()
         provisioner._wait_for_exact_workspace_pod_absent = AsyncMock(return_value=True)
@@ -5055,26 +5688,20 @@ class TestDeleteWorkspace:
         )
 
         assert (
-            await provisioner.delete_workspace(
+            await provisioner.delete_workspace_with_outcome(
                 owner,
                 expected_runtime_incarnation=runtime,
                 wait_for_exact_absence=True,
+                cleanup_intent=self._intent(runtime),
+                _mutation_guard_held=True,
             )
-            is True
-        )
-
-        provisioner._db.merge_thread_workspace_context.assert_awaited_once_with(
-            owner.id,
-            {
-                "status": "deleted",
-                "pod_ip": None,
-                "_runtime_incarnation": None,
-            },
-        )
+        ).current_deleted
+        provisioner._db.merge_thread_workspace_context.assert_not_awaited()
         provisioner._delete_seed_configmap.assert_awaited_once_with(
             owner.pod_name,
             expected_owner=owner,
             expected_pod_uid=runtime,
+            expected_configmap_uid=None,
         )
 
     @pytest.mark.asyncio
@@ -5089,6 +5716,13 @@ class TestDeleteWorkspace:
         provisioner._core_api = MagicMock()
         provisioner._wait_for_exact_workspace_pod_absent = AsyncMock(return_value=True)
         provisioner._delete_seed_configmap = AsyncMock(return_value=False)
+        provisioner._ensure_managed_repository_process_zero_before_delete = AsyncMock(
+            return_value=True
+        )
+        provisioner._cleanup_claim_is_current = AsyncMock(return_value=True)
+        provisioner._managed_repository_process_zero_replay_authority = AsyncMock(
+            return_value="current"
+        )
         owner = WorkspaceOwner.session("test-thread-123456")
         provisioner._core_api.read_namespaced_pod.return_value = _owned_pod(
             owner,
@@ -5096,13 +5730,14 @@ class TestDeleteWorkspace:
         )
 
         assert (
-            await provisioner.delete_workspace(
+            await provisioner.delete_workspace_with_outcome(
                 owner,
                 expected_runtime_incarnation=runtime,
                 wait_for_exact_absence=True,
+                cleanup_intent=self._intent(runtime),
+                _mutation_guard_held=True,
             )
-            is False
-        )
+        ).state == "refused"
 
         provisioner._db.merge_thread_workspace_context.assert_not_awaited()
 
@@ -5599,15 +6234,13 @@ class TestWorkspaceNamedResourceAuthority:
         p = ContainerProvisioner()
         p._k8s_available = True
         p._core_api = MagicMock()
-        p._db = SimpleNamespace(
-            managed_repository_workspace_process_zero_is_current=AsyncMock(
-                return_value=True
-            ),
-            record_managed_repository_workspace_process_zero=AsyncMock(
-                return_value=True
-            ),
-        )
+        p._db = _StrictCreationDB()
+        p._db.process_zero_uid = cls.POD_UID
         p._retire_managed_repository_agents = AsyncMock(return_value=True)
+        p._workspace_process_zero_cleanup_state = AsyncMock(return_value="current")
+        p._settle_current_workspace_context_after_process_zero = AsyncMock(
+            return_value=True
+        )
         return p
 
     @classmethod
@@ -5692,6 +6325,16 @@ class TestWorkspaceNamedResourceAuthority:
             TestStrictStatelessWorkspaceCreation._claim(p)
         )
         p._core_api.read_namespaced_service.return_value = self._service(p)
+        p._core_api.read_namespaced_config_map.return_value = self._seed(
+            p,
+            owner_references=[
+                SimpleNamespace(
+                    name=self.OWNER.pod_name,
+                    uid=self.POD_UID,
+                    controller=True,
+                )
+            ],
+        )
 
         captured = await p.capture_workspace_teardown_identity(self.OWNER)
 
@@ -5699,6 +6342,7 @@ class TestWorkspaceNamedResourceAuthority:
             pod_uid=self.POD_UID,
             pvc_uid=self.RESOURCE_UID,
             service_uid=self.RESOURCE_UID,
+            seed_configmap_uid=self.RESOURCE_UID,
         )
         assert p._core_api.read_namespaced_pod.call_count == 2
 
@@ -5756,6 +6400,7 @@ class TestWorkspaceNamedResourceAuthority:
             TestStrictStatelessWorkspaceCreation._claim(p)
         )
         p._core_api.read_namespaced_service.return_value = self._service(p)
+        p._core_api.read_namespaced_config_map.side_effect = _NotFound()
 
         captured = await p.capture_workspace_teardown_identity(self.OWNER)
 
@@ -5790,6 +6435,7 @@ class TestWorkspaceNamedResourceAuthority:
             TestStrictStatelessWorkspaceCreation._claim(p)
         )
         p._core_api.read_namespaced_service.return_value = self._service(p)
+        p._core_api.read_namespaced_config_map.side_effect = _NotFound()
 
         with pytest.raises(WorkspaceRuntimeAuthorityError, match="appeared"):
             await p.capture_workspace_teardown_identity(self.OWNER)
@@ -5977,6 +6623,7 @@ class TestWorkspaceNamedResourceAuthority:
         self,
     ):
         from orchestrator.services.container_provisioner import (
+            WorkspaceCleanupOutcome,
             WorkspaceTeardownIdentity,
         )
 
@@ -5992,7 +6639,9 @@ class TestWorkspaceNamedResourceAuthority:
                 "ready": True,
             }
         )
-        p.delete_workspace = AsyncMock(return_value=False)
+        p.reconcile_workspace_cleanup_intent = AsyncMock(
+            return_value=WorkspaceCleanupOutcome("retryable", 1)
+        )
         p.delete_workspace_pvc = AsyncMock()
         p._delete_service = AsyncMock()
 
@@ -6007,7 +6656,7 @@ class TestWorkspaceNamedResourceAuthority:
             strict=True,
         )
 
-        p.delete_workspace.assert_awaited_once()
+        p.reconcile_workspace_cleanup_intent.assert_awaited_once()
         p.delete_workspace_pvc.assert_not_awaited()
         p._delete_service.assert_not_awaited()
 
@@ -6015,13 +6664,11 @@ class TestWorkspaceNamedResourceAuthority:
     async def test_s36_absence_timeout_finishes_after_default_window_first_try(
         self,
     ):
-        """S36 can exceed the old 30-second poll without exceeding HTTP timeout."""
+        """S36 hands the captured generation to the durable reconciler."""
         from orchestrator.services.container_provisioner import (
+            WorkspaceCleanupOutcome,
             WorkspaceTeardownIdentity,
         )
-
-        class _NotFound(Exception):
-            status = 404
 
         p = self._provisioner()
         p.workspace_pod_authority = AsyncMock(
@@ -6034,73 +6681,34 @@ class TestWorkspaceNamedResourceAuthority:
                 "ready": True,
             }
         )
-        p._delete_seed_configmap = AsyncMock(return_value=True)
-        p._set_context = AsyncMock()
-        p.delete_workspace_pvc = AsyncMock(return_value=True)
-        p._delete_service = AsyncMock(return_value=True)
+        p.reconcile_workspace_cleanup_intent = AsyncMock(
+            return_value=WorkspaceCleanupOutcome("settled", 1)
+        )
 
-        # The initial authority read plus 31 one-second absence polls still see
-        # the captured UID. The next poll finally reaches authoritative 404.
-        # A 30-second bound would return False before that last poll.
-        reads = 0
-        captured_pod = _owned_pod(self.OWNER, uid=self.POD_UID)
-
-        def read_pod(**_kwargs):
-            nonlocal reads
-            reads += 1
-            if reads <= 32:
-                return captured_pod
-            raise _NotFound()
-
-        p._core_api.read_namespaced_pod.side_effect = read_pod
-        clock = {"now": 0.0}
-        loop = MagicMock()
-        loop.time.side_effect = lambda: clock["now"]
-
-        async def advance_clock(seconds):
-            clock["now"] += seconds
-
-        with (
-            patch(
-                "orchestrator.services.container_provisioner.asyncio.get_event_loop",
-                return_value=loop,
+        released = await p.release_workspace(
+            self.OWNER,
+            teardown_identity=WorkspaceTeardownIdentity(
+                pod_uid=self.POD_UID,
+                pvc_uid=self.RESOURCE_UID,
+                service_uid=self.RESOURCE_UID,
+                pod_ip="10.0.0.8",
             ),
-            patch(
-                "orchestrator.services.container_provisioner.asyncio.sleep",
-                new=advance_clock,
-            ),
-            patch(
-                "orchestrator.services.container_provisioner.workspace_metering.close_interval",
-                new=AsyncMock(return_value=None),
-            ),
-        ):
-            released = await p.release_workspace(
-                self.OWNER,
-                teardown_identity=WorkspaceTeardownIdentity(
-                    pod_uid=self.POD_UID,
-                    pvc_uid=self.RESOURCE_UID,
-                    service_uid=self.RESOURCE_UID,
-                    pod_ip="10.0.0.8",
-                ),
-                capture_snapshot=False,
-                strict=True,
-                exact_absence_timeout_seconds=45.0,
-            )
+            capture_snapshot=False,
+            strict=True,
+            exact_absence_timeout_seconds=45.0,
+        )
 
         assert released is True
-        assert clock["now"] == 31.0
-        assert reads == 33
-        assert p._core_api.delete_namespaced_pod.call_count == 1
-        assert p._core_api.delete_namespaced_pod.call_args.kwargs["body"] == {
-            "gracePeriodSeconds": 10,
-            "preconditions": {"uid": self.POD_UID},
-        }
-        p.delete_workspace_pvc.assert_awaited_once()
-        p._delete_service.assert_awaited_once()
+        p.reconcile_workspace_cleanup_intent.assert_awaited_once_with(
+            self.OWNER,
+            expected_runtime_incarnation=self.POD_UID,
+            intent_generation=1,
+        )
 
     @pytest.mark.asyncio
     async def test_s36_strict_release_captures_command_keyed_terminal_snapshot(self):
         from orchestrator.services.container_provisioner import (
+            WorkspaceCleanupOutcome,
             WorkspaceTeardownIdentity,
         )
 
@@ -6123,7 +6731,9 @@ class TestWorkspaceNamedResourceAuthority:
                 "ready": True,
             }
         )
-        p.delete_workspace = AsyncMock(return_value=True)
+        p.reconcile_workspace_cleanup_intent = AsyncMock(
+            return_value=WorkspaceCleanupOutcome("settled", 1)
+        )
         p.delete_workspace_pvc = AsyncMock(return_value=True)
         p._delete_service = AsyncMock(return_value=True)
         identity = WorkspaceTeardownIdentity(
@@ -6162,6 +6772,7 @@ class TestWorkspaceNamedResourceAuthority:
     @pytest.mark.asyncio
     async def test_s36_replay_uses_proven_snapshot_after_pod_disappears(self):
         from orchestrator.services.container_provisioner import (
+            WorkspaceCleanupOutcome,
             WorkspaceTeardownIdentity,
         )
 
@@ -6174,9 +6785,9 @@ class TestWorkspaceNamedResourceAuthority:
         )
         p._snapshot_service.capture_vm_snapshot = AsyncMock()
         p.workspace_pod_authority = AsyncMock(return_value="exact_absent")
-        p.delete_workspace = AsyncMock()
-        p.delete_workspace_pvc = AsyncMock(return_value=True)
-        p._delete_service = AsyncMock(return_value=True)
+        p.reconcile_workspace_cleanup_intent = AsyncMock(
+            return_value=WorkspaceCleanupOutcome("settled", 1)
+        )
         identity = WorkspaceTeardownIdentity(
             pod_uid=self.POD_UID,
             pvc_uid=self.RESOURCE_UID,
@@ -6198,9 +6809,7 @@ class TestWorkspaceNamedResourceAuthority:
         )
 
         p._snapshot_service.capture_vm_snapshot.assert_not_awaited()
-        p.delete_workspace.assert_not_awaited()
-        p.delete_workspace_pvc.assert_awaited_once()
-        p._delete_service.assert_awaited_once()
+        p.reconcile_workspace_cleanup_intent.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_s36_pvc_uid_mismatch_proves_old_object_gone_without_delete(self):
@@ -6216,6 +6825,81 @@ class TestWorkspaceNamedResourceAuthority:
             require_exact_owner=True,
             expected_uid=self.RESOURCE_UID,
         )
+        p._core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_terminal_pvc_delete_reports_replacement_not_absence(self):
+        p = self._provisioner()
+        replacement_uid = "88888888-9999-4aaa-8bbb-cccccccccccc"
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = (
+            TestStrictStatelessWorkspaceCreation._claim(p, uid=replacement_uid)
+        )
+
+        outcome = await p._delete_pvc_outcome(
+            f"pvc-ws-thread-{self.OWNER.id[:12]}",
+            expected_owner=self.OWNER,
+            expected_uid=self.RESOURCE_UID,
+        )
+
+        assert outcome.state == "replacement_present"
+        assert outcome.captured_absent is False
+        p._core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_terminal_service_delete_reports_post_delete_replacement(self):
+        p = self._provisioner()
+        replacement = self._service(p)
+        replacement.metadata.uid = "88888888-9999-4aaa-8bbb-cccccccccccc"
+        p._core_api.read_namespaced_service.side_effect = [
+            self._service(p),
+            replacement,
+        ]
+
+        outcome = await p._delete_service_outcome(
+            self.OWNER,
+            require_exact_owner=True,
+            expected_uid=self.RESOURCE_UID,
+        )
+
+        assert outcome.state == "replacement_present"
+        assert outcome.captured_absent is False
+
+    @pytest.mark.asyncio
+    async def test_cutover_pre_revoke_delete_lost_response_preserves_replacement(self):
+        """A DELETE accepted before RBAC revocation is reconciled by exact UID."""
+
+        class _NotFound(Exception):
+            status = 404
+
+        p = self._provisioner()
+        captured = TestStrictStatelessWorkspaceCreation._claim(p)
+
+        def accepted_then_timeout(**_kwargs):
+            raise TimeoutError("response lost after apiserver accepted DELETE")
+
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = captured
+        p._core_api.delete_namespaced_persistent_volume_claim.side_effect = (
+            accepted_then_timeout
+        )
+        first = await p._delete_pvc_outcome(
+            f"pvc-ws-thread-{self.OWNER.id[:12]}",
+            expected_owner=self.OWNER,
+            expected_uid=self.RESOURCE_UID,
+        )
+        assert first.state == "refused"
+
+        replacement_uid = "88888888-9999-4aaa-8bbb-cccccccccccc"
+        replacement = TestStrictStatelessWorkspaceCreation._claim(
+            p, uid=replacement_uid
+        )
+        p._core_api.read_namespaced_persistent_volume_claim.return_value = replacement
+        p._core_api.delete_namespaced_persistent_volume_claim.reset_mock()
+        second = await p._delete_pvc_outcome(
+            f"pvc-ws-thread-{self.OWNER.id[:12]}",
+            expected_owner=self.OWNER,
+            expected_uid=self.RESOURCE_UID,
+        )
+        assert second.state == "replacement_present"
         p._core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
 
     @pytest.mark.asyncio
@@ -6267,16 +6951,21 @@ class TestWorkspaceNamedResourceAuthority:
         )
         p._core_api.delete_namespaced_pod.side_effect = _Conflict()
         p._set_context = AsyncMock()
+        p._db.install_captured_cleanup_intent(self.POD_UID)
 
-        assert not await p.delete_workspace(
+        outcome = await p.delete_workspace_with_outcome(
             self.OWNER,
             expected_runtime_incarnation=self.POD_UID,
             wait_for_exact_absence=True,
             captured_teardown_uid=self.POD_UID,
+            cleanup_intent=p._db.cleanup_intent,
+            _mutation_guard_held=True,
         )
+        assert outcome.state == "refused"
         assert p._core_api.delete_namespaced_pod.call_args.kwargs == {
             "name": self.OWNER.pod_name,
             "namespace": p._namespace,
+            "_request_timeout": (5, 30),
             "grace_period_seconds": 10,
             "body": {
                 "gracePeriodSeconds": 10,
@@ -6296,12 +6985,16 @@ class TestWorkspaceNamedResourceAuthority:
         )
         p._core_api.delete_namespaced_pod.side_effect = _Conflict()
         p._set_context = AsyncMock()
+        p._db.install_captured_cleanup_intent(self.POD_UID)
 
-        assert not await p.delete_workspace(
+        outcome = await p.delete_workspace_with_outcome(
             self.OWNER,
             expected_runtime_incarnation=self.POD_UID,
             wait_for_exact_absence=True,
+            cleanup_intent=p._db.cleanup_intent,
+            _mutation_guard_held=True,
         )
+        assert outcome.state == "refused"
         assert p._core_api.delete_namespaced_pod.call_args.kwargs["body"] == {
             "preconditions": {"uid": self.POD_UID}
         }
@@ -6440,6 +7133,28 @@ class TestWorkspaceNamedResourceAuthority:
         assert p._core_api.delete_namespaced_config_map.call_args.kwargs["body"] == {
             "preconditions": {"uid": self.RESOURCE_UID}
         }
+
+    @pytest.mark.asyncio
+    async def test_labeled_seed_delete_requires_exact_pod_controller_uid(self):
+        p = self._provisioner()
+        successor_seed = self._seed(
+            p,
+            owner_references=[
+                SimpleNamespace(
+                    name=self.OWNER.pod_name,
+                    uid="99999999-9999-4999-8999-999999999999",
+                    controller=True,
+                )
+            ],
+        )
+        p._core_api.read_namespaced_config_map.return_value = successor_seed
+
+        assert not await p._delete_seed_configmap(
+            self.OWNER.pod_name,
+            expected_owner=self.OWNER,
+            expected_pod_uid=self.POD_UID,
+        )
+        p._core_api.delete_namespaced_config_map.assert_not_called()
 
     @classmethod
     def _legacy_seed(cls, p, *, pod_uid=None, labels=None, annotations=None):
@@ -6639,7 +7354,7 @@ class TestIdePodResourceAuthority:
 
         p = ContainerProvisioner()
         p._k8s_available = True
-        p._db = SimpleNamespace(merge_ide_session_context=AsyncMock(return_value=True))
+        p._db = _PinnedSessionContainerDB()
         p._core_api = MagicMock()
         p._resolve_network_tier = AsyncMock(return_value="internet-only")
         p._resolve_ide_seed_files = AsyncMock(return_value={})
@@ -6672,6 +7387,7 @@ class TestIdePodResourceAuthority:
             memory_limit="2Gi",
             network_tier="internet-only",
             seed_configmap=seed_name,
+            creation_reservation_id=("33333333-3333-4333-8333-333333333333"),
         )
         manifest["metadata"]["labels"]["srw/component"] = "ide-session"
         return _pod_from_manifest(manifest, uid=cls.RUNTIME)
@@ -6691,9 +7407,19 @@ class TestIdePodResourceAuthority:
                     "srw.io/component": "agent-workspace",
                     owner.label_key: owner.id,
                 },
-                annotations={},
+                annotations={
+                    "srw.io/workspace-creation-reservation": (
+                        "33333333-3333-4333-8333-333333333333"
+                    )
+                },
                 deletion_timestamp=None,
-                owner_references=[],
+                owner_references=[
+                    SimpleNamespace(
+                        name=f"ide-{cls.JOB_ID[:12]}",
+                        uid=cls.RUNTIME,
+                        controller=True,
+                    )
+                ],
             )
         )
 
@@ -6721,28 +7447,22 @@ class TestIdePodResourceAuthority:
         if incumbent_has_seed:
             p._core_api.read_namespaced_config_map.return_value = self._seed(p)
 
-        created_tasks = []
+        result = await p.create_ide_pod(self.JOB_ID)
 
-        def close_task(coro):
-            coro.close()
-            created_tasks.append(coro)
-            return MagicMock()
-
-        with patch(
-            "orchestrator.services.container_provisioner.asyncio.create_task",
-            side_effect=close_task,
-        ):
-            assert await p.create_ide_pod(self.JOB_ID) == "10.42.0.30"
+        if not incumbent_has_seed and desired_has_seed:
+            # The seed create may have committed before the Pod 409 revealed
+            # an incumbent with a different immutable mount plan.  Keep that
+            # reservation generation retryable; never delete by stable name.
+            assert result is None
+            p._delete_seed_configmap.assert_not_awaited()
+            return
+        assert result == "10.42.0.30"
 
         p._adopt_configmap.assert_not_awaited()
-        if not incumbent_has_seed and desired_has_seed:
-            p._delete_seed_configmap.assert_awaited_once()
-            cleanup = p._delete_seed_configmap.await_args
-            assert cleanup.args == (pod_name,)
-            assert cleanup.kwargs["expected_owner"].id == self.JOB_ID
-        else:
-            p._delete_seed_configmap.assert_not_awaited()
-        assert len(created_tasks) == 1
+        p._delete_seed_configmap.assert_not_awaited()
+        # Phase-B state is never detached from the reservation. This fixture
+        # has no state to stream, so no synchronous seed is created.
+        p._seed_workspace_state.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_live_409_malformed_storage_refuses_without_seed_cleanup(self):
@@ -6798,13 +7518,16 @@ class TestIdePodResourceAuthority:
         )
         p._core_api.read_namespaced_pod.side_effect = [live, terminal]
         p._ide_pod_authority = AsyncMock(side_effect=["exact_terminal", "exact_absent"])
-        p._db = SimpleNamespace(
-            record_managed_repository_workspace_process_zero=AsyncMock(
-                return_value=True
-            )
-        )
+        p._db = _StrictCreationDB()
+        p._db.process_zero_uid = self.RUNTIME
+        p._db.install_captured_cleanup_intent(self.RUNTIME)
 
-        assert await p.delete_ide_pod(self.JOB_ID)
+        outcome = await p.delete_ide_pod_with_outcome(
+            self.JOB_ID,
+            expected_runtime_incarnation=self.RUNTIME,
+            cleanup_intent=p._db.cleanup_intent,
+        )
+        assert outcome.current_deleted
 
         delete_call = p._core_api.delete_namespaced_pod.call_args
         assert delete_call.kwargs["body"] == {"preconditions": {"uid": self.RUNTIME}}
@@ -6818,13 +7541,7 @@ class TestIdePodResourceAuthority:
             },
             {"op": "remove", "path": "/metadata/finalizers/0"},
         ]
-        p._db.record_managed_repository_workspace_process_zero.assert_awaited_once_with(
-            self.JOB_ID,
-            owner_kind="job",
-            scope="ide",
-            provisioner="k8s",
-            runtime_incarnation=self.RUNTIME,
-        )
+        assert p._db.process_zero_uid == self.RUNTIME
 
     @pytest.mark.asyncio
     async def test_delete_ide_pod_refuses_same_name_replacement_before_finalizer(self):
@@ -6847,18 +7564,21 @@ class TestIdePodResourceAuthority:
 
         p = self._provisioner()
         p._core_api.read_namespaced_pod.side_effect = _NotFound()
-        p._db = SimpleNamespace(
-            get_job=AsyncMock(
-                return_value={
-                    "context": {"ide_session": {"_runtime_incarnation": self.RUNTIME}}
-                }
-            ),
-            managed_repository_workspace_process_zero_is_current=AsyncMock(
-                return_value=True
-            ),
+        p._db = _StrictCreationDB()
+        p._db.process_zero_uid = self.RUNTIME
+        p._db.install_captured_cleanup_intent(self.RUNTIME)
+        p._db.get_job = AsyncMock(
+            return_value={
+                "context": {"ide_session": {"_runtime_incarnation": self.RUNTIME}}
+            }
         )
 
-        assert await p.delete_ide_pod(self.JOB_ID)
+        outcome = await p.delete_ide_pod_with_outcome(
+            self.JOB_ID,
+            expected_runtime_incarnation=self.RUNTIME,
+            cleanup_intent=p._db.cleanup_intent,
+        )
+        assert outcome.current_deleted
         p._core_api.delete_namespaced_pod.assert_not_called()
         p._delete_seed_configmap.assert_awaited_once()
         cleanup = p._delete_seed_configmap.await_args
@@ -6873,17 +7593,20 @@ class TestIdePodResourceAuthority:
 
         p = self._provisioner()
         p._core_api.read_namespaced_pod.side_effect = _NotFound()
-        p._db = SimpleNamespace(
-            get_job=AsyncMock(
-                return_value={
-                    "context": {"ide_session": {"_runtime_incarnation": self.RUNTIME}}
-                }
-            ),
-            managed_repository_workspace_process_zero_is_current=AsyncMock(
-                return_value=False
-            ),
+        p._db = _StrictCreationDB()
+        p._db.process_zero_recorded = False
+        p._db.install_captured_cleanup_intent(self.RUNTIME)
+        p._db.get_job = AsyncMock(
+            return_value={
+                "context": {"ide_session": {"_runtime_incarnation": self.RUNTIME}}
+            }
         )
 
-        assert not await p.delete_ide_pod(self.JOB_ID)
+        outcome = await p.delete_ide_pod_with_outcome(
+            self.JOB_ID,
+            expected_runtime_incarnation=self.RUNTIME,
+            cleanup_intent=p._db.cleanup_intent,
+        )
+        assert outcome.state == "refused"
         p._core_api.delete_namespaced_pod.assert_not_called()
         p._delete_seed_configmap.assert_not_awaited()

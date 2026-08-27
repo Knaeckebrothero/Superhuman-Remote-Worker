@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: {{ include "srw.fullname" . }}-orchestrator
+  name: {{ include "srw.orchestratorServiceAccountName" . }}
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
 ---
@@ -40,7 +40,11 @@ rules:
   # PVC lifecycle for workspace persistence
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "delete", "get", "list"]
+    verbs: ["create", "delete", "get", "list", "patch"]
+  # Exact UID/resourceVersion finalizer release for retained agent workspaces.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/finalizers"]
+    verbs: ["update", "patch"]
   # Per-workspace code-server settings seed ConfigMap (IdeSettingsStore →
   # container_provisioner._create_seed_configmap). Created at provision,
   # replaced on conflict (update), adopted via ownerReference (patch), and
@@ -71,5 +75,51 @@ roleRef:
   name: {{ include "srw.fullname" . }}-orchestrator
 subjects:
   - kind: ServiceAccount
-    name: {{ include "srw.fullname" . }}-orchestrator
+    name: {{ include "srw.orchestratorServiceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- range $namespace := (.Values.agent.pinnedLegacyNamespaces | default list | uniq) }}
+{{- if ne $namespace $.Release.Namespace }}
+---
+# Explicit, temporary cross-namespace authority for exact 0185 adoption and
+# convergence. No list/watch/log/exec/Secret access is granted.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "srw.pinnedLegacyAuthorityName" $ }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" $ "component" "orchestrator") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims"]
+    verbs: ["create", "delete", "get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/finalizers", "persistentvolumeclaims/finalizers"]
+    verbs: ["update", "patch"]
+  # A PVC-bound pinned runtime cannot move namespaces during adoption. Publish
+  # and retire only its deterministic exact-owner session route in that same
+  # explicitly allowlisted legacy namespace.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "create", "delete", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "create", "delete", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "srw.pinnedLegacyAuthorityName" $ }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" $ "component" "orchestrator") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "srw.pinnedLegacyAuthorityName" $ }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.orchestratorServiceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}

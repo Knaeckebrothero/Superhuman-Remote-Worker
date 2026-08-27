@@ -823,7 +823,9 @@ def managed_repository_agent_launch_command(
         + presence
         + publish_config
         + 'if test "$_srw_agent_reused" = yes; then cat >/dev/null; else '
-        + f"_srw_agent_output=$(ssh-agent -a {shlex.quote(socket_path)} -s); "
+        # Keep the generation lock in the launching shell but never let the
+        # long-lived ssh-agent inherit descriptor 9 and wedge later rotations.
+        + f"_srw_agent_output=$(ssh-agent -a {shlex.quote(socket_path)} -s 9>&-); "
         + "_srw_agent_spawned=yes; "
         + "_srw_agent_pid=$(printf '%s\\n' \"$_srw_agent_output\" "
         + "| sed -n 's/^SSH_AGENT_PID=\\([0-9][0-9]*\\);.*$/\\1/p'); "

@@ -60,6 +60,7 @@ def _binding(
         agent_id=AGENT_ID,
         runtime_attach_token=ATTACH_TOKEN,
         agent_hostname=hostname,
+        pod_namespace="srw",
         pod_uid=pod_uid,
         pod_ip=pod_ip,
         pod_port=pod_port,

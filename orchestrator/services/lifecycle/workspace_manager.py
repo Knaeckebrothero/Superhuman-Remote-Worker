@@ -26,7 +26,10 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from .types import Instance
-from services.container_provisioner import WorkspaceTeardownIdentity
+from services.container_provisioner import (
+    WorkspaceCleanupOutcome,
+    WorkspaceTeardownIdentity,
+)
 from services.completion_lifecycle import (
     CompletionLifecycleOwnership,
     LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS,
@@ -337,10 +340,13 @@ class WorkspaceInstanceManager:
                 "volume_ephemeral": _pod_volume_is_ephemeral(pod),
                 "pod_age_s": _pod_age_seconds(pod),
             }
-            if self._completion_lifecycle is not None:
-                pod_uid = getattr(pod.metadata, "uid", None)
-                if isinstance(pod_uid, str) and pod_uid:
-                    metadata["pod_uid"] = pod_uid
+            # Exact-runtime cleanup is mandatory in both completion-owned and
+            # legacy lifecycle modes. A deterministic Pod name is never an
+            # acceptable teardown target because a replacement may already
+            # own it by the time deletion runs.
+            pod_uid = getattr(pod.metadata, "uid", None)
+            if isinstance(pod_uid, str) and pod_uid:
+                metadata["pod_uid"] = pod_uid
             if thread_id:
                 row = await self._fetch_thread(thread_id)
                 if row is _FETCH_FAILED:
@@ -505,14 +511,22 @@ class WorkspaceInstanceManager:
             return age is not None and age >= self._orphan_grace_s()
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
+        reapable = False
         if job_status:
             # Warm grace for 'paused' — see is_idle.
             if paused_within_grace(inst.metadata):
                 return False
-            return job_status in _REAPABLE_JOB_STATUSES
-        if thread_status:
-            return thread_status in _REAPABLE_THREAD_STATUSES
-        return False
+            reapable = job_status in _REAPABLE_JOB_STATUSES
+        elif thread_status:
+            reapable = thread_status in _REAPABLE_THREAD_STATUSES
+        if not reapable:
+            return False
+        # A dirty Kubernetes runtime cannot become reapable without a durable,
+        # renewable capture authority. Otherwise repeated refused snapshots
+        # eventually hit give_up() and turn safe containment into delayed loss.
+        if inst.metadata.get("pod_ip") and await self.is_dirty(inst):
+            return False
+        return True
 
     def _is_terminal(self, inst: Instance) -> bool:
         """Bound work is finished (vs merely paused) — nothing to preserve
@@ -691,6 +705,8 @@ class WorkspaceInstanceManager:
         )
         if self._completion_lifecycle is None or not job_bound:
             permit = self._legacy_permit(inst)
+            if await self._kubernetes_snapshot_capture_contained(inst, source=source):
+                permit.skip("k8s_capture_authority_unavailable")
             inst.metadata["_completion_lifecycle_permit"] = permit
             try:
                 yield permit
@@ -714,20 +730,16 @@ class WorkspaceInstanceManager:
             inst.metadata["_completion_lifecycle_permit"] = permit
             try:
                 if permit.local and self._provisioner_ready():
+                    if await self._kubernetes_snapshot_capture_contained(
+                        inst, source=source
+                    ):
+                        permit.skip("k8s_capture_authority_unavailable")
+                        yield permit
+                        return
                     if not await self._permit_external(permit):
                         yield permit
                         return
                     owner = WorkspaceOwner.job(str(inst.bound_to))
-                    # Every destructive route first captures the UID-only
-                    # teardown identity.  Requiring SSH attestation here would
-                    # strand clean or unreachable terminal Pods behind a long
-                    # lifecycle lease even though those routes never snapshot.
-                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                        identity = (
-                            await self._provisioner.capture_workspace_teardown_identity(
-                                owner
-                            )
-                        )
                     needs_snapshot_authority = bool(
                         source in {"reap", "snapshot"}
                         and inst.metadata.get("pod_ip")
@@ -736,45 +748,72 @@ class WorkspaceInstanceManager:
                         and await self.is_dirty(inst)
                         and await self.is_reachable(inst)
                     )
-                    if needs_snapshot_authority:
+                    listed_uid = inst.metadata.get("pod_uid")
+                    listed_pod_ip = inst.metadata.get("pod_ip")
+                    identity: WorkspaceTeardownIdentity | None = None
+                    if source == "orphan_pvc":
+                        # Detached-resource GC has no live runtime from which
+                        # to prepare process zero. Keep exact resource capture
+                        # under the completion claim; runtime teardown itself
+                        # prepares durable cleanup before resource observation.
+                        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                            identity = await self._provisioner.capture_workspace_teardown_identity(
+                                owner
+                            )
+                    elif needs_snapshot_authority:
                         if not await self._permit_external(permit):
                             yield permit
                             return
                         async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                            terminal_identity = await self._provisioner.capture_terminal_workspace_identity(
-                                owner
+                            attestation = (
+                                await self._provisioner.attest_workspace_runtime(owner)
                             )
-                        # The attestation upgrade must describe the same
-                        # immutable objects captured before the reachability
-                        # probe.  A same-name replacement is never adopted.
                         if (
-                            terminal_identity.pod_uid != identity.pod_uid
-                            or terminal_identity.pvc_uid != identity.pvc_uid
-                            or terminal_identity.service_uid != identity.service_uid
+                            listed_uid is None
+                            or attestation.runtime_incarnation != str(listed_uid)
+                            or (
+                                listed_pod_ip is not None
+                                and attestation.pod_ip != str(listed_pod_ip)
+                            )
                         ):
                             permit.skip("workspace_identity_changed", settled=True)
                             yield permit
                             return
-                        identity = terminal_identity
-                    listed_uid = inst.metadata.get("pod_uid")
-                    listed_pod_ip = inst.metadata.get("pod_ip")
-                    if (listed_uid is not None and identity.pod_uid != listed_uid) or (
-                        listed_pod_ip is not None
-                        and identity.pod_ip is not None
-                        and identity.pod_ip != listed_pod_ip
+                        identity = WorkspaceTeardownIdentity(
+                            pod_uid=attestation.runtime_incarnation,
+                            pvc_uid=None,
+                            service_uid=None,
+                            pod_ip=attestation.pod_ip,
+                            ssh_host_key_fingerprint=(
+                                attestation.ssh_host_key_fingerprint
+                            ),
+                            ssh_port=attestation.port,
+                        )
+                    if identity is not None and (
+                        (listed_uid is not None and identity.pod_uid != str(listed_uid))
+                        or (
+                            listed_pod_ip is not None
+                            and identity.pod_ip is not None
+                            and identity.pod_ip != str(listed_pod_ip)
+                        )
                     ):
                         # The object listed by this tick is already gone.  A
                         # same-name replacement is not lifecycle's target.
                         permit.skip("workspace_identity_changed", settled=True)
                     elif (
-                        identity.pod_uid is None
+                        identity is not None
+                        and identity.pod_uid is None
                         and source != "orphan_pvc"
                         and not inst.metadata.get("bound_row_missing")
                     ):
                         permit.skip("workspace_identity_absent", settled=True)
-                    elif source == "orphan_pvc" and identity.pvc_uid is None:
+                    elif (
+                        source == "orphan_pvc"
+                        and identity is not None
+                        and identity.pvc_uid is None
+                    ):
                         permit.skip("workspace_pvc_identity_unknown")
-                    else:
+                    elif identity is not None:
                         inst.metadata["_completion_lifecycle_workspace_identity"] = (
                             identity
                         )
@@ -782,6 +821,19 @@ class WorkspaceInstanceManager:
             finally:
                 inst.metadata.pop("_completion_lifecycle_permit", None)
                 inst.metadata.pop("_completion_lifecycle_workspace_identity", None)
+
+    async def _kubernetes_snapshot_capture_contained(
+        self, inst: Instance, *, source: str
+    ) -> bool:
+        """Whether this lifecycle action would require an unsafe Pod read."""
+
+        return bool(
+            source in {"reap", "snapshot"}
+            and inst.metadata.get("pod_ip")
+            and self._snapshot is not None
+            and getattr(self._snapshot, "is_available", False)
+            and await self.is_dirty(inst)
+        )
 
     @asynccontextmanager
     async def _action_scope(
@@ -929,6 +981,17 @@ class WorkspaceInstanceManager:
             return None
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
+        if inst.metadata.get("pod_ip"):
+            # A one-shot UID/key attestation cannot fence the unbounded
+            # snapshot/S3 tail across crashes. Refuse before reachability, SSH,
+            # S3, or attempt mutation until a durable renewable capture lease
+            # covers this lifecycle path.
+            logger.warning(
+                "Lifecycle Kubernetes snapshot refused without durable "
+                "capture authority for %s",
+                inst.id,
+            )
+            return None
         ssh_host = inst.metadata.get("pod_ip")
         if not ssh_host:
             return None
@@ -1075,162 +1138,79 @@ class WorkspaceInstanceManager:
             if "srw/thread-id" in labels
             else WorkspaceOwner.job(bound)
         )
-        identity = inst.metadata.get("_completion_lifecycle_workspace_identity")
-        delete_kwargs: dict[str, Any] = {}
-        if identity is not None and identity.pod_uid is not None:
-            delete_kwargs = {
-                "expected_runtime_incarnation": identity.pod_uid,
-                "captured_teardown_uid": identity.pod_uid,
-                "wait_for_exact_absence": True,
-                "exact_absence_timeout_seconds": 45.0,
-            }
         permit = inst.metadata.get("_completion_lifecycle_permit")
         if isinstance(
             permit, LifecycleActionPermit
         ) and not await self._permit_external(permit):
             return False
+
+        listed_runtime = inst.metadata.get("pod_uid")
+        if listed_runtime is None:
+            logger.warning(
+                "Workspace lifecycle delete lacks an immutable runtime UID for %s",
+                inst.id,
+            )
+            return False
+
+        runtime_incarnation = str(listed_runtime)
+        target_disposition = (
+            "suspended"
+            if (
+                not self._is_terminal(inst)
+                and inst.metadata.get("volume_ephemeral", True)
+                and inst.metadata.get("snapshot_status") == "available"
+            )
+            else "deleted"
+        )
+        reclaim_shared_resources = self._is_volume_reclaimable(inst)
         try:
+            intent = await self._provisioner.prepare_workspace_cleanup_intent(
+                owner,
+                expected_runtime_incarnation=runtime_incarnation,
+                target_disposition=target_disposition,
+                reclaim_shared_resources=reclaim_shared_resources,
+                suspended_at=(
+                    datetime.now(timezone.utc).isoformat()
+                    if target_disposition == "suspended"
+                    else None
+                ),
+                snapshot_restore_required=(target_disposition == "suspended"),
+                allow_orphan=bool(inst.metadata.get("bound_row_missing")),
+                admission_source="automatic",
+            )
+            if not isinstance(intent, dict):
+                return False
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return False
             async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                deleted = await self._provisioner.delete_workspace(
-                    owner, **delete_kwargs
+                cleanup = await self._provisioner.reconcile_workspace_cleanup_intent(
+                    owner,
+                    expected_runtime_incarnation=runtime_incarnation,
+                    intent_generation=int(intent["intent_generation"]),
                 )
             if isinstance(
                 permit, LifecycleActionPermit
             ) and not await self._permit_external(permit):
                 return False
         except Exception:
-            logger.exception("Failed to delete workspace pod %s", inst.id)
+            logger.exception("Failed to reconcile workspace cleanup for %s", inst.id)
             return False
-        if not deleted and self._completion_lifecycle is not None:
+        if not isinstance(cleanup, WorkspaceCleanupOutcome):
+            logger.error("Workspace lifecycle cleanup returned an untyped outcome")
             return False
-        # Reap-and-restore handoff: a NON-terminal emptyDir workspace whose
-        # state was captured to S3 is 'suspended', not 'deleted' — the next
-        # dispatch then routes through the suspension restore
-        # (ensure_workspace: 'suspended' → restore) instead of re-creating a
-        # blank pod, so a paused job (e.g. waiting on a sudo/VM-upgrade
-        # decision) resumes with its files. PVC-backed pods skip this: their
-        # state survives on the volume and an S3 extract could roll newer
-        # files back. The provisioner wrote 'deleted' above; overwrite it.
-        # Sessions ride the same rule and land on the correct side of it: a
-        # PVC-backed session pod reports volume_ephemeral=False (its
-        # ``workspace-data`` volume is the claim), so it stays 'deleted' and the
-        # next attach recreates a pod that reattaches the live volume, while an
-        # emptyDir session still hands off through S3.
-        # See knowledge-base/knowledge/issues/vm_upgrade_pause_workspace_reaped_before_approval.md.
-        if (
-            not self._is_terminal(inst)
-            and inst.metadata.get("volume_ephemeral", True)
-            and inst.metadata.get("snapshot_status") == "available"
-        ):
-            if isinstance(
-                permit, LifecycleActionPermit
-            ) and not await self._permit_external(permit):
-                return False
-            try:
-                if "srw/thread-id" in labels:
-                    await self._db.merge_thread_workspace_context(
-                        bound, {"status": "suspended"}
-                    )
-                else:
-                    await self._db.merge_workspace_container_context(
-                        bound, {"status": "suspended"}
-                    )
-                logger.info(
-                    "Reaped workspace %s marked 'suspended' (snapshot in S3) — "
-                    "next dispatch restores instead of recreating blank",
-                    inst.id,
-                )
-            except Exception:
-                logger.exception("Failed to mark %s suspended after reap", inst.id)
-            if isinstance(
-                permit, LifecycleActionPermit
-            ) and not await self._permit_external(permit):
-                return False
-        # PVC GC (Branch a leak guard): a PVC-backed workspace keeps its volume
-        # across pod recreates (suspend/restore, drift recovery, give_up
-        # reattach), so we reclaim it ONLY when the volume itself is garbage:
-        # a completed/failed/cancelled JOB, or a THREAD whose row is gone
-        # (deleted). Deliberately NOT ``_is_terminal``: that set counts an
-        # 'ended' thread as terminal, and an ended thread is resumable — every
-        # 30-minute idle timeout would have destroyed the session's working
-        # tree. See ``_is_volume_reclaimable`` for the full rule.
-        # emptyDir instances have no PVC (skip); a missing PVC is an idempotent
-        # 404. The backstop reap_orphans() sweep covers the cases this inline
-        # path can miss (pod already gone, delete failed, restart) — and for
-        # sessions it is the *primary* path, since a thread is usually deleted
-        # while it has no live pod at all.
-        if self._is_volume_reclaimable(inst) and not inst.metadata.get(
-            "volume_ephemeral", True
-        ):
-            if isinstance(
-                permit, LifecycleActionPermit
-            ) and not await self._permit_external(permit):
-                return False
-            try:
-                if self._completion_lifecycle is not None and (
-                    identity is None or identity.pvc_uid is None
-                ):
-                    # A missing UID in the captured tuple is authenticated
-                    # absence. Never turn a later same-name PVC into our target.
-                    pvc_deleted = identity is not None
-                else:
-                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                        pvc_deleted = await self._provisioner.delete_workspace_pvc(
-                            owner,
-                            require_exact_owner=True,
-                            **(
-                                {"expected_uid": identity.pvc_uid}
-                                if identity is not None and identity.pvc_uid is not None
-                                else {}
-                            ),
-                        )
-                if self._completion_lifecycle is not None and not pvc_deleted:
-                    return False
-                logger.info(
-                    "Workspace PVC reclaimed for %s %s (work is gone, not merely idle)",
-                    owner.kind,
-                    owner.id,
-                )
-            except Exception:
-                logger.exception("Failed to delete reclaimable PVC for %s", inst.id)
-                if self._completion_lifecycle is not None:
-                    return False
-            # The stable-DNS Service shares the PVC's lifecycle — reclaim it too.
-            # It follows the volume, not the pod: an idle-reaped session keeps
-            # both (a resume reattaches the claim and the Service already points
-            # at the recreated pod), and recreating a Service is a 409-idempotent
-            # no-op anyway, so keeping one costs nothing.
-            if isinstance(
-                permit, LifecycleActionPermit
-            ) and not await self._permit_external(permit):
-                return False
-            try:
-                if self._completion_lifecycle is not None and (
-                    identity is None or identity.service_uid is None
-                ):
-                    service_deleted = identity is not None
-                else:
-                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                        service_deleted = await self._provisioner._delete_service(
-                            owner,
-                            require_exact_owner=True,
-                            **(
-                                {"expected_uid": identity.service_uid}
-                                if identity is not None
-                                and identity.service_uid is not None
-                                else {}
-                            ),
-                        )
-                if self._completion_lifecycle is not None and not service_deleted:
-                    return False
-                if isinstance(
-                    permit, LifecycleActionPermit
-                ) and not await self._permit_external(permit):
-                    return False
-            except Exception:
-                logger.exception("Failed to delete reclaimable Service for %s", inst.id)
-                if self._completion_lifecycle is not None:
-                    return False
+        if cleanup.superseded:
+            # The exact predecessor reached process-zero. Its successor owns
+            # every current row and deterministic Kubernetes resource.
+            return True
+        if not cleanup.settled:
+            return False
+        if target_disposition == "suspended":
+            logger.info(
+                "Reaped workspace %s settled as suspended from its durable snapshot",
+                inst.id,
+            )
         return True
 
     async def _permit_external(self, permit: LifecycleActionPermit) -> bool:
@@ -1240,41 +1220,125 @@ class WorkspaceInstanceManager:
             return True
         return await self._completion_lifecycle.refresh(permit)
 
+    async def _reconcile_terminal_job_workspace_resources(
+        self,
+        job_id: str,
+        row: Any,
+        *,
+        permit: LifecycleActionPermit | None = None,
+    ) -> bool:
+        """Reclaim a terminal job's exact PVC/Service through S36 only."""
+
+        raw_context = row.get("context") if row is not None else None
+        if isinstance(raw_context, str):
+            try:
+                raw_context = json.loads(raw_context)
+            except (TypeError, ValueError):
+                return False
+        workspace = (
+            raw_context.get("workspace_container")
+            if isinstance(raw_context, dict)
+            else None
+        )
+        runtime = (
+            workspace.get("_runtime_incarnation")
+            if isinstance(workspace, dict) and workspace.get("provisioner") == "k8s"
+            else None
+        )
+        if not isinstance(runtime, str):
+            return False
+        try:
+            from uuid import UUID
+
+            if str(UUID(runtime)) != runtime:
+                return False
+        except (TypeError, ValueError):
+            return False
+
+        owner = WorkspaceOwner.job(job_id)
+        try:
+            intent = await self._provisioner.prepare_workspace_cleanup_intent(
+                owner,
+                expected_runtime_incarnation=runtime,
+                target_disposition="deleted",
+                reclaim_shared_resources=True,
+                admission_source="automatic",
+            )
+            if (
+                not isinstance(intent, dict)
+                or intent.get("resources_captured_at") is None
+                or intent.get("reclaim_shared_resources") is not True
+            ):
+                return False
+            if permit is not None and not await self._permit_external(permit):
+                return False
+            cleanup = await self._provisioner.reconcile_workspace_cleanup_intent(
+                owner,
+                expected_runtime_incarnation=runtime,
+                intent_generation=int(intent["intent_generation"]),
+            )
+            if permit is not None and not await self._permit_external(permit):
+                return False
+        except Exception:
+            # A committed intent or settlement survives this process. The next
+            # sweep must replay it; never fall back to raw Kubernetes deletion.
+            logger.exception(
+                "Terminal workspace cleanup reconciliation failed for job %s",
+                job_id,
+            )
+            return False
+        return isinstance(cleanup, WorkspaceCleanupOutcome) and cleanup.settled
+
     async def reap_orphans(self) -> int:
-        """Backstop GC: delete workspace PVCs whose owning work is gone.
+        """Backstop reconciliation for already-authorized workspace cleanup.
 
         The inline delete (``delete()``) handles the common path, but a
         PVC can outlive its pod — the pod was already gone when teardown ran, the
         inline delete failed, or the orchestrator restarted mid-teardown. Such a
         PVC never surfaces as a live ``Instance`` (it has no pod), so the
         reconciler's per-instance reap can't see it. This once-per-tick sweep
-        lists workspace PVCs directly, and for each one with no live pod applies
-        the SAME asymmetric rule as ``_is_volume_reclaimable``:
+        lists workspace PVCs directly.  Owner absence is inventory evidence,
+        not process-zero authority: a lost create response can leave a real Pod,
+        Service, or PVC after its database owner disappears.  Consequently:
 
-        * **Job** PVCs (``pvc-workspace-*``, ``srw/job-id``) — reaped when the
-          job is terminal (completed/failed/cancelled) **or** its row is gone.
+        * **Job** PVCs (``pvc-workspace-*``, ``srw/job-id``) — reconciled only
+          for a still-present terminal row through its exact durable cleanup
+          intent and process-zero receipt.  Missing owners are retained.
         * **Session** PVCs (``pvc-ws-thread-*`` for the workspace pod,
           ``pvc-agent-s-*`` for the session agent pod, both ``srw/thread-id``) —
-          reaped ONLY when the ``threads`` row is genuinely absent. Status is
-          never consulted: an 'ended' thread is resumable (30-minute idle
-          timeout ends sessions routinely), so status-based reclaim here would
-          be exactly the data-destroying bug this rule exists to prevent.
-          Because sessions are usually deleted while their pod is already gone
-          (idle-reaped), this sweep — not the inline path — is the primary
-          reclaim route for them.
+          never reaped merely because the ``threads`` row is absent.  Status is
+          likewise insufficient: an 'ended' thread is resumable.  Only the
+          supported retirement path can create the exact terminal-reclaim
+          authority; otherwise these claims remain visible for inventory and
+          operator reconciliation.
 
         Everything else is left alone: the shared ``srw-workspace`` agent-scratch
         claim, unlabeled claims, foreign names. emptyDir fleets have no such PVCs
         → no-op. Runs regardless of ``WORKSPACE_PVC_ENABLED`` so a rollback (flag
         flipped off) still drains leftover PVCs as their work finishes.
 
-        Every uncertain branch keeps the volume: DB error, unreadable owner id,
-        live pod, or a row that still exists all ``continue`` without deleting.
+        Every uncertain or authority-free branch keeps the volume: DB error,
+        unreadable owner id, live pod, missing owner, or unadmitted cleanup all
+        ``continue`` without deleting.
 
         Returns the number of PVCs deleted.
         """
         if not self._provisioner_ready() or self._db is None:
             return 0
+        reaped = 0
+        reconcile_pending = getattr(
+            type(self._provisioner),
+            "reconcile_pending_workspace_cleanup_intents",
+            None,
+        )
+        if callable(reconcile_pending):
+            try:
+                pending_counts = await reconcile_pending(self._provisioner, limit=25)
+                if isinstance(pending_counts, dict):
+                    reaped += int(pending_counts.get("settled") or 0)
+                    reaped += int(pending_counts.get("superseded") or 0)
+            except Exception:
+                logger.exception("Pending workspace cleanup reconciliation failed")
         core = self._provisioner._core_api
         ns = self._provisioner._namespace
         try:
@@ -1285,10 +1349,10 @@ class WorkspaceInstanceManager:
             )
         except Exception:
             logger.exception("Orphan PVC sweep: list failed")
-            return 0
+            return reaped
         items = list(getattr(pvcs, "items", []) or [])
         if not items:
-            return 0
+            return reaped
         # One pod list → the owner ids that still have a live workspace pod.
         # Never reap a PVC out from under a running pod; the instance path tears
         # down pod+PVC together for those. Thread ids are also stored truncated
@@ -1312,10 +1376,6 @@ class WorkspaceInstanceManager:
             if pod_thread_id:
                 live_thread_ids.add(pod_thread_id)
                 live_thread_ids.add(pod_thread_id[:_PVC_ID_PREFIX_LEN])
-        reaped = 0
-        # A session can own two claims (workspace pod + agent pod); its Service
-        # is shared, so reclaim it at most once per thread.
-        services_reclaimed: set[str] = set()
         for pvc in items:
             name = pvc.metadata.name
             pvc_labels = pvc.metadata.labels or {}
@@ -1326,8 +1386,9 @@ class WorkspaceInstanceManager:
             if session_prefix:
                 # Owner reference: the full thread uuid from the label (both
                 # provisioners stamp it) with the name's 12-char id suffix as a
-                # fallback, so a label-less legacy claim is still collectable
-                # rather than leaking forever. Strip by prefix length, never by
+                # fallback, so a label-less legacy claim remains inventory-
+                # visible instead of being silently classified as foreign.
+                # Strip by prefix length, never by
                 # splitting on '-' — a truncated uuid contains one.
                 thread_ref = (
                     pvc_labels.get("srw/thread-id") or name[len(session_prefix) :]
@@ -1341,34 +1402,18 @@ class WorkspaceInstanceManager:
                     continue
                 exists = await self._thread_row_exists(thread_ref)
                 # None = lookup failed (unknown) and True = thread still there
-                # (ended sessions live here — resumable, volume stays). Only a
-                # definitive False, i.e. the row is gone, reclaims.
+                # (ended sessions live here — resumable, volume stays). A
+                # definitive False still lacks the exact retired runtime and
+                # process-zero receipt required by S36, so retain the legacy
+                # PVC/Service for explicit inventory rather than guessing.
                 if exists is not False:
                     continue
-                try:
-                    if await self._provisioner._delete_pvc(
-                        name,
-                        expected_owner=WorkspaceOwner.session(thread_ref),
-                    ):
-                        reaped += 1
-                        logger.info(
-                            "Orphan session PVC reaped: %s (thread=%s gone)",
-                            name,
-                            thread_ref,
-                        )
-                except Exception:
-                    logger.exception("Orphan PVC delete failed: %s", name)
-                if thread_ref not in services_reclaimed:
-                    services_reclaimed.add(thread_ref)
-                    try:
-                        await self._provisioner._delete_service(
-                            WorkspaceOwner.session(thread_ref),
-                            require_exact_owner=True,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Orphan Service delete failed for thread %s", thread_ref
-                        )
+                logger.warning(
+                    "Retaining ownerless session workspace resources without "
+                    "exact runtime/process-zero authority (thread_ref=%s pvc=%s)",
+                    thread_ref,
+                    name,
+                )
                 continue
             # Job workspace PVCs (pvc-workspace-*). Anything else — the shared
             # agent-scratch PVC, unlabeled claims, foreign names — is out of
@@ -1380,20 +1425,14 @@ class WorkspaceInstanceManager:
             # Resolve existence/status with a DIRECT query that separates the
             # three cases — a transient DB error must NOT look like "job gone"
             # and trigger a wrong delete. row present → use status; no row →
-            # genuinely gone (reap); query raised → unknown (skip).
+            # ownerless residue (retain); query raised → unknown (retain).
             try:
                 async with self._db.acquire() as conn:
-                    if self._completion_lifecycle is None:
-                        row = await conn.fetchrow(
-                            "SELECT status FROM jobs WHERE id = $1::uuid",
-                            job_id,
-                        )
-                    else:
-                        row = await conn.fetchrow(
-                            "SELECT status, execution_lane FROM jobs "
-                            "WHERE id = $1::uuid",
-                            job_id,
-                        )
+                    row = await conn.fetchrow(
+                        "SELECT status, execution_lane, context FROM jobs "
+                        "WHERE id = $1::uuid",
+                        job_id,
+                    )
             except Exception:
                 logger.exception(
                     "Orphan PVC sweep: job lookup failed for %s — skipping", job_id
@@ -1402,98 +1441,69 @@ class WorkspaceInstanceManager:
             status = row["status"] if row else None
             if row is not None and status not in _TERMINAL_JOB_STATUSES:
                 continue  # job still active → keep its volume
-            if self._completion_lifecycle is None:
-                try:
-                    if await self._provisioner._delete_pvc(
-                        name,
-                        expected_owner=WorkspaceOwner.job(job_id),
-                    ):
-                        reaped += 1
-                        logger.info(
-                            "Orphan workspace PVC reaped: %s (job=%s status=%s)",
-                            name,
-                            job_id,
-                            status or "gone",
-                        )
-                except Exception:
-                    logger.exception("Orphan PVC delete failed: %s", name)
-                try:
-                    await self._provisioner._delete_service(
-                        WorkspaceOwner.job(job_id),
-                        require_exact_owner=True,
-                    )
-                except Exception:
-                    logger.exception("Orphan Service delete failed for job %s", job_id)
-                continue
-            orphan_inst = Instance(
-                kind=self.kind,
-                id=name,
-                bound_to=job_id,
-                metadata={
-                    "labels": {"srw/job-id": job_id},
-                    "bound_row_missing": row is None,
-                    "job_status": str(status) if status is not None else None,
-                    "execution_lane": (
-                        str(row.get("execution_lane") or "pinned")
-                        if row is not None
-                        else "pinned"
-                    ),
-                },
-            )
-            async with self.lifecycle_action(
-                orphan_inst, source="orphan_pvc"
-            ) as permit:
-                if not permit.local:
-                    continue
-                identity = orphan_inst.metadata.get(
-                    "_completion_lifecycle_workspace_identity"
+            if row is None:
+                logger.warning(
+                    "Retaining ownerless job workspace resources without exact "
+                    "runtime/process-zero authority (job=%s pvc=%s)",
+                    job_id,
+                    name,
                 )
-                if not await self._permit_external(permit):
-                    continue
-                try:
-                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                        pvc_deleted = await self._provisioner._delete_pvc(
-                            name,
-                            expected_owner=WorkspaceOwner.job(job_id),
-                            expected_uid=identity.pvc_uid,
-                        )
-                except Exception:
-                    logger.exception("Orphan PVC delete failed: %s", name)
-                    continue
-                if not pvc_deleted or not await self._permit_external(permit):
-                    continue
-                # Reclaim the stable-DNS Service for the same orphan (shares the
-                # PVC lifecycle). Identity is captured under the same claim.
-                try:
-                    if identity.service_uid is None:
-                        service_deleted = True
-                    else:
-                        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                            service_deleted = await self._provisioner._delete_service(
-                                WorkspaceOwner.job(job_id),
-                                require_exact_owner=True,
-                                expected_uid=identity.service_uid,
+                continue
+            reconciled = False
+            if self._completion_lifecycle is None:
+                reconciled = await self._reconcile_terminal_job_workspace_resources(
+                    job_id, row
+                )
+            else:
+                workspace = row.get("context") or {}
+                if isinstance(workspace, str):
+                    try:
+                        workspace = json.loads(workspace)
+                    except (TypeError, ValueError):
+                        workspace = {}
+                workspace = (
+                    workspace.get("workspace_container")
+                    if isinstance(workspace, dict)
+                    else None
+                )
+                orphan_inst = Instance(
+                    kind=self.kind,
+                    id=name,
+                    bound_to=job_id,
+                    metadata={
+                        "labels": {"srw/job-id": job_id},
+                        "job_status": str(status),
+                        "execution_lane": str(row.get("execution_lane") or "pinned"),
+                        "pod_uid": (
+                            workspace.get("_runtime_incarnation")
+                            if isinstance(workspace, dict)
+                            else None
+                        ),
+                    },
+                )
+                async with self.lifecycle_action(
+                    orphan_inst, source="orphan_pvc"
+                ) as permit:
+                    if permit.local and await self._permit_external(permit):
+                        reconciled = (
+                            await self._reconcile_terminal_job_workspace_resources(
+                                job_id, row, permit=permit
                             )
-                        if not await self._permit_external(permit):
-                            continue
-                except Exception:
-                    logger.exception("Orphan Service delete failed for job %s", job_id)
-                    continue
-                if not service_deleted:
-                    continue
-                permit.complete()
+                        )
+                        if reconciled:
+                            permit.complete()
+            if reconciled:
                 reaped += 1
                 logger.info(
-                    "Orphan workspace PVC reaped: %s (job=%s status=%s)",
+                    "Terminal workspace resources reconciled: %s (job=%s status=%s)",
                     name,
                     job_id,
-                    status or "gone",
+                    status,
                 )
         if reaped:
             logger.warning(
-                "Orphan PVC sweep reclaimed %d workspace PVC(s) — inline "
-                "delete missed them (pod gone / delete failed / restart, or a "
-                "deleted session whose pod was already idle-reaped)",
+                "Workspace cleanup reconciler settled %d exact durable "
+                "cleanup intent(s); ownerless resources were retained",
                 reaped,
             )
         return reaped
@@ -1551,11 +1561,11 @@ class WorkspaceInstanceManager:
         """Does a ``threads`` row still exist for a session PVC's owner?
 
         Three-way, like ``_fetch_job``/``_fetch_thread``: ``True`` (row present),
-        ``False`` (lookup succeeded and found nothing — the thread was
-        permanently deleted), ``None`` (the lookup itself failed / no DB). Only a
-        definitive ``False`` may reclaim a volume; ``None`` keeps it.
+        ``False`` (lookup succeeded and found nothing), ``None`` (the lookup
+        itself failed / no DB).  Neither ``False`` nor ``None`` authorizes a
+        volume mutation; both are used only to classify retained inventory.
 
-        This is the deletion signal for sessions, and the only one available:
+        This is an inventory signal for sessions, not deletion authority:
         deleting a thread is a hard ``DELETE FROM threads``
         (``postgres.delete_thread``) — there is no 'deleted' status, and the
         statuses that DO exist ('ended', 'suspended') are all resumable.
@@ -1564,9 +1574,8 @@ class WorkspaceInstanceManager:
         label, but falls back to the 12-char id embedded in the PVC name, so the
         comparison is a left-prefix of the reference's own length rather than an
         equality on ``id``. A prefix could in principle match a *different*
-        thread; the only consequence is "row found" → keep the volume, which is
-        the safe direction. Lower-casing matches ``uuid::text`` output for the
-        same reason: a case mismatch would read as "gone" and delete.
+        thread; the only consequence is "row found" versus "ownerless" in the
+        safe retained inventory. Lower-casing matches ``uuid::text`` output.
         """
         if self._db is None:
             return None

@@ -1,209 +1,445 @@
-"""Tests for the session router service — Service + Ingress per session."""
+"""Exact-recipient tests for session Service + Ingress publication."""
 
-from unittest.mock import MagicMock
+from copy import deepcopy
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from orchestrator.services.session_router import SessionRouterService
+from orchestrator.services.session_router import (
+    SessionRouteAuthorityError,
+    SessionRouterService,
+)
+from src.shared.pinned_session_identity import PinnedSessionBinding
 
+THREAD_ID = "00000000-0000-4000-8000-0000000000a1"
+AGENT_ID = "00000000-0000-4000-8000-0000000000a2"
+ATTACH_TOKEN = "00000000-0000-4000-8000-0000000000a3"
 RUNTIME_GENERATION = "11111111-2222-4333-8444-555555555555"
+POD_NAME = "srw-agent-abc"
+POD_UID = "pod-uid-1"
+POD_IP = "10.0.0.5"
 
 
-def _pod(uid: str = "pod-uid-1") -> MagicMock:
-    pod = MagicMock()
-    pod.metadata.uid = uid
-    return pod
+def _not_found():
+    from kubernetes.client.exceptions import ApiException
+
+    return ApiException(status=404)
 
 
-def _route_resource(
-    *,
-    uid: str,
-    pod_uid: str = "pod-uid-1",
-    runtime_generation: str = RUNTIME_GENERATION,
-) -> MagicMock:
-    resource = MagicMock()
-    resource.metadata.uid = uid
-    resource.metadata.labels = {
-        "srw.io/thread-id": "t1",
-        "srw.io/runtime-generation": runtime_generation,
+def _binding(**changes) -> PinnedSessionBinding:
+    values = {
+        "thread_id": THREAD_ID,
+        "runtime_generation": RUNTIME_GENERATION,
+        "agent_id": AGENT_ID,
+        "runtime_attach_token": ATTACH_TOKEN,
+        "agent_hostname": POD_NAME,
+        "pod_namespace": "srw",
+        "pod_uid": POD_UID,
+        "pod_ip": POD_IP,
+        "pod_port": 8001,
+        "agent_status": "session",
     }
-    owner = MagicMock()
-    owner.uid = pod_uid
-    resource.metadata.owner_references = [owner]
-    return resource
+    values.update(changes)
+    return PinnedSessionBinding(**values)
+
+
+def _pod(*, uid=POD_UID, ip=POD_IP, route_labels=False, resource_version="7"):
+    labels = {
+        "srw/component": "agent",
+        "srw/managed-by": "agent-provisioner",
+        "srw/purpose": "session" if route_labels else "job",
+    }
+    if route_labels:
+        labels.update(
+            {
+                "srw.io/thread-id": THREAD_ID,
+                "srw/thread-id": THREAD_ID[:12],
+                "srw.io/runtime-generation": RUNTIME_GENERATION,
+            }
+        )
+    return {
+        "metadata": {
+            "name": POD_NAME,
+            "namespace": "srw",
+            "uid": uid,
+            "resourceVersion": resource_version,
+            "labels": labels,
+        },
+        "status": {
+            "phase": "Running",
+            "podIP": ip,
+            "containerStatuses": [{"name": "agent", "ready": True}],
+        },
+    }
+
+
+@pytest.fixture
+def db():
+    value = MagicMock()
+    value.get_pinned_session_binding = AsyncMock(return_value=_binding())
+    return value
 
 
 @pytest.fixture
 def k8s_core_api():
-    """Mock CoreV1Api with read returning 404 (resource missing) by default."""
     api = MagicMock()
-    from kubernetes.client.exceptions import ApiException
+    pod = _pod()
+    services = {}
 
-    api.read_namespaced_pod.return_value = _pod()
-    api.read_namespaced_service.side_effect = ApiException(status=404)
+    def read_pod(**_kwargs):
+        return deepcopy(pod)
+
+    def patch_pod(*, body, **_kwargs):
+        for operation in body:
+            if operation["op"] != "add":
+                continue
+            path = operation["path"]
+            if path == "/metadata/labels/srw.io~1thread-id":
+                pod["metadata"]["labels"]["srw.io/thread-id"] = operation["value"]
+            elif path == "/metadata/labels/srw~1thread-id":
+                pod["metadata"]["labels"]["srw/thread-id"] = operation["value"]
+            elif path == "/metadata/labels/srw~1purpose":
+                pod["metadata"]["labels"]["srw/purpose"] = operation["value"]
+            elif path == "/metadata/labels/srw.io~1runtime-generation":
+                pod["metadata"]["labels"]["srw.io/runtime-generation"] = operation[
+                    "value"
+                ]
+        return deepcopy(pod)
+
+    def read_service(*, name, **_kwargs):
+        if name not in services:
+            raise _not_found()
+        return deepcopy(services[name])
+
+    def create_service(*, body, **_kwargs):
+        resource = deepcopy(body)
+        resource["metadata"]["uid"] = "service-uid"
+        services[resource["metadata"]["name"]] = resource
+        return deepcopy(resource)
+
+    def patch_service(*, name, body, **_kwargs):
+        resource = services[name]
+        for operation in body:
+            if operation["path"] == "/metadata/labels/srw.io~1runtime-generation":
+                resource["metadata"]["labels"]["srw.io/runtime-generation"] = operation[
+                    "value"
+                ]
+            elif operation["path"] == "/metadata/ownerReferences":
+                resource["metadata"]["ownerReferences"] = operation["value"]
+            elif operation["path"] == "/spec/selector":
+                resource["spec"]["selector"] = operation["value"]
+        return deepcopy(resource)
+
+    api._pod = pod
+    api._services = services
+    api.read_namespaced_pod.side_effect = read_pod
+    api.patch_namespaced_pod.side_effect = patch_pod
+    api.read_namespaced_service.side_effect = read_service
+    api.create_namespaced_service.side_effect = create_service
+    api.patch_namespaced_service.side_effect = patch_service
     return api
 
 
 @pytest.fixture
 def k8s_networking_api():
-    """Mock NetworkingV1Api with read returning 404 by default."""
     api = MagicMock()
-    from kubernetes.client.exceptions import ApiException
+    ingresses = {}
 
-    api.read_namespaced_ingress.side_effect = ApiException(status=404)
+    def read_ingress(*, name, **_kwargs):
+        if name not in ingresses:
+            raise _not_found()
+        return deepcopy(ingresses[name])
+
+    def create_ingress(*, body, **_kwargs):
+        resource = deepcopy(body)
+        resource["metadata"]["uid"] = "ingress-uid"
+        ingresses[resource["metadata"]["name"]] = resource
+        return deepcopy(resource)
+
+    def patch_ingress(*, name, body, **_kwargs):
+        resource = ingresses[name]
+        for operation in body:
+            if operation["path"] == "/metadata/labels/srw.io~1runtime-generation":
+                resource["metadata"]["labels"]["srw.io/runtime-generation"] = operation[
+                    "value"
+                ]
+            elif operation["path"] == "/metadata/ownerReferences":
+                resource["metadata"]["ownerReferences"] = operation["value"]
+        return deepcopy(resource)
+
+    api._ingresses = ingresses
+    api.read_namespaced_ingress.side_effect = read_ingress
+    api.create_namespaced_ingress.side_effect = create_ingress
+    api.patch_namespaced_ingress.side_effect = patch_ingress
     return api
 
 
 @pytest.fixture
-def svc(k8s_core_api, k8s_networking_api):
+def svc(db, k8s_core_api, k8s_networking_api):
     return SessionRouterService(
         namespace="srw",
         ingress_host="api.example.com",
         ingress_class="traefik",
         annotations={"foo": "bar"},
+        db=db,
         core_api=k8s_core_api,
         networking_api=k8s_networking_api,
     )
 
 
 @pytest.mark.asyncio
-async def test_ensure_route_creates_service_and_ingress(
-    svc, k8s_core_api, k8s_networking_api
+async def test_route_creation_is_pod_uid_resource_version_and_generation_fenced(
+    svc, db, k8s_core_api, k8s_networking_api
 ):
-    """ensure_route creates both Service and Ingress with correct labels and owner refs."""
-    from kubernetes.client.exceptions import ApiException
-
-    k8s_core_api.read_namespaced_service.side_effect = [
-        ApiException(status=404),
-        _route_resource(uid="service-uid"),
-    ]
-    k8s_networking_api.read_namespaced_ingress.side_effect = [
-        ApiException(status=404),
-        _route_resource(uid="ingress-uid"),
-    ]
-    prefix = await svc.ensure_route(
-        thread_id="t1",
-        pod_name="srw-agent-abc",
-        pod_uid="pod-uid-1",
-        runtime_generation=RUNTIME_GENERATION,
+    assert (
+        await svc.ensure_route(THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION)
+        == f"/p/{THREAD_ID}"
     )
 
-    assert prefix == "/p/t1"
-    # Pod label patched so the Service selector matches.
-    k8s_core_api.patch_namespaced_pod.assert_called_once()
-    patch_kwargs = k8s_core_api.patch_namespaced_pod.call_args.kwargs
-    assert patch_kwargs["name"] == "srw-agent-abc"
+    patch = k8s_core_api.patch_namespaced_pod.call_args.kwargs
+    assert patch["body"][:2] == [
+        {"op": "test", "path": "/metadata/uid", "value": POD_UID},
+        {
+            "op": "test",
+            "path": "/metadata/resourceVersion",
+            "value": "7",
+        },
+    ]
     assert {
         "op": "add",
-        "path": "/metadata/labels/srw.io~1thread-id",
-        "value": "t1",
-    } in patch_kwargs["body"]
-    k8s_core_api.create_namespaced_service.assert_called_once()
-    k8s_networking_api.create_namespaced_ingress.assert_called_once()
-
-    svc_body = k8s_core_api.create_namespaced_service.call_args.kwargs["body"]
-    assert svc_body["metadata"]["name"] == "session-t1"
-    assert svc_body["metadata"]["labels"]["srw.io/thread-id"] == "t1"
-    assert (
-        svc_body["metadata"]["labels"]["srw.io/runtime-generation"]
-        == RUNTIME_GENERATION
-    )
-    assert svc_body["metadata"]["ownerReferences"][0]["name"] == "srw-agent-abc"
-    assert svc_body["metadata"]["ownerReferences"][0]["uid"] == "pod-uid-1"
-    assert svc_body["spec"]["selector"] == {
-        "srw.io/thread-id": "t1",
+        "path": "/metadata/labels/srw.io~1runtime-generation",
+        "value": RUNTIME_GENERATION,
+    } in patch["body"]
+    service = k8s_core_api._services[f"session-{THREAD_ID}"]
+    assert service["spec"]["selector"] == {
+        "srw.io/thread-id": THREAD_ID,
         "srw.io/runtime-generation": RUNTIME_GENERATION,
     }
-
-    ing_body = k8s_networking_api.create_namespaced_ingress.call_args.kwargs["body"]
-    assert ing_body["metadata"]["name"] == "session-t1"
-    assert ing_body["spec"]["ingressClassName"] == "traefik"
-    rule = ing_body["spec"]["rules"][0]
-    assert rule["host"] == "api.example.com"
-    path = rule["http"]["paths"][0]
-    assert path["path"] == "/p/t1"
-    assert path["backend"]["service"]["name"] == "session-t1"
+    ingress = k8s_networking_api._ingresses[f"session-{THREAD_ID}"]
+    assert ingress["metadata"]["ownerReferences"][0]["uid"] == POD_UID
+    assert db.get_pinned_session_binding.await_count >= 3
+    assert "_request_timeout" in k8s_core_api.read_namespaced_pod.call_args.kwargs
 
 
 @pytest.mark.asyncio
-async def test_ensure_route_idempotent_when_resources_exist(
-    svc, k8s_core_api, k8s_networking_api
+async def test_legacy_namespace_route_targets_exact_binding_without_shadow(
+    svc, db, k8s_core_api, k8s_networking_api, monkeypatch
 ):
-    """If both resources already exist, ensure_route is a no-op."""
-    # Override the 404: now reads succeed
-    k8s_core_api.read_namespaced_service.side_effect = None
-    k8s_core_api.read_namespaced_service.return_value = _route_resource(
-        uid="service-uid"
-    )
-    k8s_networking_api.read_namespaced_ingress.side_effect = None
-    k8s_networking_api.read_namespaced_ingress.return_value = _route_resource(
-        uid="ingress-uid"
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-old")
+    db.get_pinned_session_binding.return_value = _binding(pod_namespace="agents-old")
+    k8s_core_api._pod["metadata"]["namespace"] = "agents-old"
+
+    assert (
+        await svc.ensure_route(THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION)
+        == f"/p/{THREAD_ID}"
     )
 
-    await svc.ensure_route(
-        thread_id="t1",
-        pod_name="srw-agent-abc",
-        pod_uid="pod-uid-1",
-        runtime_generation=RUNTIME_GENERATION,
+    assert k8s_core_api.patch_namespaced_pod.call_args.kwargs["namespace"] == (
+        "agents-old"
+    )
+    assert k8s_core_api.create_namespaced_service.call_args.kwargs["namespace"] == (
+        "agents-old"
+    )
+    assert (
+        k8s_networking_api.create_namespaced_ingress.call_args.kwargs["namespace"]
+        == "agents-old"
+    )
+    assert (
+        k8s_core_api._services[f"session-{THREAD_ID}"]["metadata"]["namespace"]
+        == "agents-old"
+    )
+    assert (
+        k8s_networking_api._ingresses[f"session-{THREAD_ID}"]["metadata"]["namespace"]
+        == "agents-old"
     )
 
+
+@pytest.mark.asyncio
+async def test_legacy_namespace_refuses_current_namespace_route_shadow(
+    svc, db, k8s_core_api, k8s_networking_api, monkeypatch
+):
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-old")
+    db.get_pinned_session_binding.return_value = _binding(pod_namespace="agents-old")
+    k8s_core_api._pod["metadata"]["namespace"] = "agents-old"
+    name = f"session-{THREAD_ID}"
+    shadow = svc._service_body(
+        THREAD_ID,
+        name,
+        POD_NAME,
+        POD_UID,
+        RUNTIME_GENERATION,
+        namespace="srw",
+    )
+    shadow["metadata"]["uid"] = "shadow-service-uid"
+    k8s_core_api._services[name] = shadow
+
+    with pytest.raises(
+        SessionRouteAuthorityError,
+        match="shadow exists outside authoritative namespace",
+    ):
+        await svc.ensure_route(THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION)
+
+    k8s_core_api.patch_namespaced_pod.assert_not_called()
     k8s_core_api.create_namespaced_service.assert_not_called()
     k8s_networking_api.create_namespaced_ingress.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_teardown_route_deletes_both_resources(
-    svc, k8s_core_api, k8s_networking_api
+async def test_legacy_namespace_refuses_other_allowlisted_route_shadow(
+    svc, db, k8s_core_api, k8s_networking_api, monkeypatch
 ):
-    """teardown_route deletes Service and Ingress; absent resources are OK."""
-    k8s_core_api.read_namespaced_service.side_effect = None
-    k8s_core_api.read_namespaced_service.return_value = _route_resource(
-        uid="service-uid"
+    monkeypatch.setenv(
+        "PINNED_LEGACY_AGENT_NAMESPACES",
+        "agents-old,agents-older",
     )
-    k8s_networking_api.read_namespaced_ingress.side_effect = None
-    k8s_networking_api.read_namespaced_ingress.return_value = _route_resource(
-        uid="ingress-uid"
+    db.get_pinned_session_binding.return_value = _binding(pod_namespace="agents-old")
+    k8s_core_api._pod["metadata"]["namespace"] = "agents-old"
+    name = f"session-{THREAD_ID}"
+    shadow = svc._service_body(
+        THREAD_ID,
+        name,
+        POD_NAME,
+        POD_UID,
+        RUNTIME_GENERATION,
+        namespace="agents-older",
     )
+    shadow["metadata"]["uid"] = "shadow-service-uid"
 
-    assert await svc.teardown_route(thread_id="t1") is True
-    k8s_core_api.delete_namespaced_service.assert_called_once()
-    k8s_networking_api.delete_namespaced_ingress.assert_called_once()
+    def read_service(*, name, namespace, **_kwargs):
+        if namespace == "agents-older":
+            return deepcopy(shadow)
+        raise _not_found()
+
+    k8s_core_api.read_namespaced_service.side_effect = read_service
+
+    with pytest.raises(
+        SessionRouteAuthorityError,
+        match="shadow exists outside authoritative namespace",
+    ):
+        await svc.ensure_route(THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION)
+
+    k8s_core_api.patch_namespaced_pod.assert_not_called()
+    k8s_core_api.create_namespaced_service.assert_not_called()
+    k8s_networking_api.create_namespaced_ingress.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_teardown_route_swallows_404(svc, k8s_core_api, k8s_networking_api):
-    """Deleting a missing resource is not an error."""
-    assert await svc.teardown_route(thread_id="t1") is True
+async def test_teardown_rejects_missing_namespace_authority(
+    svc, k8s_core_api, k8s_networking_api
+):
+    with pytest.raises(SessionRouteAuthorityError, match="namespace authority"):
+        await svc.teardown_route(
+            THREAD_ID,
+            expected_namespace="",
+            expected_runtime_generation=RUNTIME_GENERATION,
+            expected_owner_uid=POD_UID,
+        )
+
     k8s_core_api.delete_namespaced_service.assert_not_called()
     k8s_networking_api.delete_namespaced_ingress.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_ensure_route_tolerates_409_on_race(
+async def test_recycled_pod_uid_fails_before_any_mutation(
     svc, k8s_core_api, k8s_networking_api
 ):
-    """If a concurrent writer beats us to creating the resource, the create
-    call returns 409. ensure_route must treat that as success, not raise."""
-    from kubernetes.client.exceptions import ApiException
+    k8s_core_api._pod["metadata"]["uid"] = "pod-uid-successor"
 
-    # Reads still 404 (we think it doesn't exist).
-    # Creates return 409 (a racing writer created it just now).
-    k8s_core_api.create_namespaced_service.side_effect = ApiException(status=409)
-    k8s_networking_api.create_namespaced_ingress.side_effect = ApiException(status=409)
-    k8s_core_api.read_namespaced_service.side_effect = [
-        ApiException(status=404),
-        _route_resource(uid="service-uid"),
-    ]
-    k8s_networking_api.read_namespaced_ingress.side_effect = [
-        ApiException(status=404),
-        _route_resource(uid="ingress-uid"),
-    ]
+    with pytest.raises(SessionRouteAuthorityError):
+        await svc.ensure_route(THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION)
 
-    # Must not raise.
-    prefix = await svc.ensure_route(
-        thread_id="t1",
-        pod_name="srw-agent-abc",
-        pod_uid="pod-uid-1",
-        runtime_generation=RUNTIME_GENERATION,
+    k8s_core_api.patch_namespaced_pod.assert_not_called()
+    k8s_core_api.create_namespaced_service.assert_not_called()
+    k8s_networking_api.create_namespaced_ingress.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_binding_change_after_pod_read_fails_before_patch(
+    svc, db, k8s_core_api, k8s_networking_api
+):
+    db.get_pinned_session_binding.side_effect = [_binding(), None]
+
+    with pytest.raises(SessionRouteAuthorityError):
+        await svc.ensure_route(THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION)
+
+    k8s_core_api.patch_namespaced_pod.assert_not_called()
+    k8s_core_api.create_namespaced_service.assert_not_called()
+    k8s_networking_api.create_namespaced_ingress.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_foreign_existing_service_fails_before_pod_mutation(
+    svc, k8s_core_api, k8s_networking_api
+):
+    name = f"session-{THREAD_ID}"
+    foreign = svc._service_body(THREAD_ID, name, POD_NAME, POD_UID, RUNTIME_GENERATION)
+    foreign["metadata"]["uid"] = "service-uid"
+    foreign["spec"]["selector"]["srw.io/thread-id"] = "foreign-thread"
+    k8s_core_api._services[name] = foreign
+
+    with pytest.raises(SessionRouteAuthorityError):
+        await svc.ensure_route(THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION)
+
+    k8s_core_api.patch_namespaced_pod.assert_not_called()
+    k8s_core_api.create_namespaced_service.assert_not_called()
+    k8s_networking_api.create_namespaced_ingress.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_exact_route_is_generation_adopted(
+    svc, k8s_core_api, k8s_networking_api
+):
+    name = f"session-{THREAD_ID}"
+    service = svc._service_body(THREAD_ID, name, POD_NAME, POD_UID, None)
+    service["metadata"]["uid"] = "service-uid"
+    service["spec"]["selector"].pop("srw.io/runtime-generation")
+    ingress = svc._ingress_body(THREAD_ID, name, POD_NAME, POD_UID, None)
+    ingress["metadata"]["uid"] = "ingress-uid"
+    k8s_core_api._services[name] = service
+    k8s_networking_api._ingresses[name] = ingress
+
+    assert (
+        await svc.ensure_route(THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION)
+        == f"/p/{THREAD_ID}"
     )
-    assert prefix == "/p/t1"
+
+    assert (
+        k8s_core_api._services[name]["metadata"]["labels"]["srw.io/runtime-generation"]
+        == RUNTIME_GENERATION
+    )
+    assert (
+        k8s_networking_api._ingresses[name]["metadata"]["labels"][
+            "srw.io/runtime-generation"
+        ]
+        == RUNTIME_GENERATION
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_teardown_preserves_successor_generation(
+    svc, k8s_core_api, k8s_networking_api
+):
+    name = f"session-{THREAD_ID}"
+    successor_generation = "99999999-2222-4333-8444-555555555555"
+    service = svc._service_body(
+        THREAD_ID, name, POD_NAME, "successor-uid", successor_generation
+    )
+    service["metadata"]["uid"] = "service-successor"
+    ingress = svc._ingress_body(
+        THREAD_ID, name, POD_NAME, "successor-uid", successor_generation
+    )
+    ingress["metadata"]["uid"] = "ingress-successor"
+    k8s_core_api._services[name] = service
+    k8s_networking_api._ingresses[name] = ingress
+
+    assert (
+        await svc.teardown_route(
+            THREAD_ID,
+            expected_namespace="srw",
+            expected_runtime_generation=RUNTIME_GENERATION,
+            expected_owner_uid=POD_UID,
+        )
+        is True
+    )
+    k8s_core_api.delete_namespaced_service.assert_not_called()
+    k8s_networking_api.delete_namespaced_ingress.assert_not_called()

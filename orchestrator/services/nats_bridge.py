@@ -2,7 +2,9 @@
 
 Connects the orchestrator to the NATS messaging system for cross-cluster
 VM lifecycle communication. Publishes create/delete commands and subscribes
-to status updates from the VM Controller and Management Daemon.
+to authenticated status updates from the VM Controller. Guest-originated NATS
+registration, heartbeat, sudo and control remain disabled because the broker
+does not provide a per-VM identity or replay boundary.
 
 NATS is fully optional. When NATS_URL is not configured or nats-py is not
 installed, all operations gracefully return False/None and the system works
@@ -15,9 +17,6 @@ Subjects published:
 
 Subjects subscribed:
   vm.lifecycle.status.{oid}         VM Controller status updates
-  agent.vm.{oid}.*.register         Management Daemon registration
-  agent.vm.{oid}.*.heartbeat        Management Daemon heartbeats
-  sudo.request.{oid}.>              Sudo approval requests from sudo-gated daemons
   session.events.{oid}.>            Agent pod notification events (session.events.{oid}.{tid})
 
 {oid} is the value of the ORCHESTRATOR_ID env var (Helm: .Values.orchestratorId,
@@ -25,7 +24,7 @@ defaults to chart fullname). Required to safely share a NATS hub with other
 SRW orchestrators — empty value refuses to publish/subscribe.
 """
 
-import asyncio
+import base64
 from collections.abc import Mapping
 import json
 import logging
@@ -75,6 +74,46 @@ def _provision_generation(value: object) -> str | None:
     except (AttributeError, TypeError, ValueError):
         return None
     return value if str(parsed) == value else None
+
+
+def _ssh_host_key_fingerprint(value: object) -> str | None:
+    if not isinstance(value, str) or not value.startswith("SHA256:"):
+        return None
+    encoded = value.removeprefix("SHA256:")
+    if len(encoded) != 43:
+        return None
+    try:
+        digest = base64.b64decode((encoded + "=").encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError):
+        return None
+    return value if len(digest) == 32 else None
+
+
+def _opaque_vm_identity(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 256
+        or any(character.isspace() for character in value)
+    ):
+        return None
+    return value
+
+
+def _vm_context(row: object, entity_type: str) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        return {}
+    raw = row.get("metadata") if entity_type == "thread" else row.get("context")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(raw, Mapping):
+        return {}
+    vm = raw.get("vm")
+    return dict(vm) if isinstance(vm, Mapping) else {}
 
 
 class NatsBridge:
@@ -196,19 +235,15 @@ class NatsBridge:
                 await self._nc.subscribe(
                     f"vm.lifecycle.status.{oid}", cb=self._on_vm_lifecycle_status
                 )
-                await self._nc.subscribe(
-                    f"agent.vm.{oid}.*.register", cb=self._on_daemon_register
-                )
-                await self._nc.subscribe(
-                    f"agent.vm.{oid}.*.heartbeat", cb=self._on_daemon_heartbeat
-                )
-                # Subscribe to sudo approval requests (from sudo-gated daemons)
-                from .sudo_gate import sudo_gate
-
-                sudo_gate.connect(db=db, nc=self._nc)
-                await self._nc.subscribe(
-                    f"sudo.request.{oid}.>", cb=sudo_gate.on_sudo_request
-                )
+                # Guest-originated NATS registration, heartbeat, sudo and
+                # control used to share this unauthenticated broker. A client
+                # able to reach NATS could therefore impersonate any VM or
+                # signal its agent process. Keep NATS only for the
+                # controller-to-orchestrator lifecycle protocol, whose
+                # payloads are generation-bound and HMAC authenticated. VM
+                # guests must use the bearer-authenticated HTTP routes. The
+                # legacy handler methods remain temporarily as internal
+                # compatibility seams, but are deliberately not subscribed.
 
                 # Session event re-broadcast: agent pods publish notification
                 # events to session.events.{oid}.{thread_id}; we forward to
@@ -702,6 +737,17 @@ class NatsBridge:
                         "Ignoring invalid rootdisk PVC UID in lifecycle status for %s",
                         job_id,
                     )
+            if identity_authenticated and response_generation:
+                if (
+                    active_pod_uid := _provision_generation(data.get("active_pod_uid"))
+                ) is not None:
+                    identity_updates["active_pod_uid"] = active_pod_uid
+                if (
+                    fingerprint := _ssh_host_key_fingerprint(
+                        data.get("ssh_host_key_fingerprint")
+                    )
+                ) is not None:
+                    identity_updates["ssh_host_key_fingerprint"] = fingerprint
             if data.get("error"):
                 updates["error"] = data["error"]
             if data.get("pod_ip"):
@@ -822,12 +868,7 @@ class NatsBridge:
                 identity,
                 data,
                 authoritative=True,
-                on_ready=lambda resolved, host, port: self._notify_vm_ready(
-                    resolved.entity_id,
-                    resolved.entity_type == "thread",
-                    host,
-                    port,
-                ),
+                on_ready=self._notify_vm_ready,
             )
             if not result.merged:
                 return
@@ -858,13 +899,27 @@ class NatsBridge:
 
         return is_leader.is_set()
 
-    def _notify_vm_ready(
-        self, entity_id: str, is_thread: bool, ssh_host: str, ssh_port: int
+    async def _notify_vm_ready(
+        self, identity: Any, ssh_host: str, ssh_port: int
     ) -> None:
-        """Post-promotion side effects: IDE config seed + dispatch poke."""
-        asyncio.create_task(
-            self._seed_vm_ide_config(entity_id, is_thread, ssh_host, ssh_port)
-        )
+        """Run generation-bound VM seed work before dispatch is signalled.
+
+        The old callback detached a raw-IP task after marking the row ready.
+        A restarted/replaced guest could therefore inherit the endpoint while
+        the task was still carrying user profile bytes. Keep the callback
+        synchronous and require a fresh signed controller attestation before
+        and after every remote mutation.
+        """
+
+        seeded = await self._seed_vm_ide_config(identity, ssh_host, ssh_port)
+        if not seeded:
+            logger.warning(
+                "VM ready side effects deferred for %s %s: exact mutation "
+                "authority is unavailable",
+                identity.entity_type,
+                identity.entity_id,
+            )
+            return
 
         if self._on_vm_ready:
             try:
@@ -873,12 +928,13 @@ class NatsBridge:
                 logger.exception("on_vm_ready callback failed")
 
     async def _seed_vm_ide_config(
-        self, entity_id: str, is_thread: bool, ssh_host: str, ssh_port: int
-    ) -> None:
+        self, identity: Any, ssh_host: str, ssh_port: int
+    ) -> bool:
         """Seed the owner-user's code-server config into a freshly-ready VM.
 
-        Best-effort: resolves the job/thread owner, then writes their stored
-        settings/keybindings/snippets over SSH. Never raises.
+        Every write resolves the exact current generation/VM/launcher/endpoint
+        and host-key pin through the VM provisioner's signed controller
+        attestation. Incomplete rolling-upgrade rows fail closed with zero SSH.
         """
         if not orchestrator_can_reach(ssh_host):
             # Tailnet target — SSH from the orchestrator would black-hole.
@@ -888,24 +944,115 @@ class NatsBridge:
             logger.info(
                 "Skipping IDE config seed for %s %s (%s:%d): orchestrator "
                 "has no route to tailnet targets",
-                "thread" if is_thread else "job",
-                entity_id,
+                identity.entity_type,
+                identity.entity_id,
                 ssh_host,
                 ssh_port,
             )
-            return
+            return True
         if not self._db:
-            return
+            return False
         try:
+            from services.vm_provisioner import vm_provisioner
+
+            row = (
+                await self._db.get_thread(identity.entity_id)
+                if identity.entity_type == "thread"
+                else await self._db.get_job(identity.entity_id)
+            )
+            vm = _vm_context(row, identity.entity_type)
+            registration_id = vm.get("ssh_registration_id")
+            fingerprint = _ssh_host_key_fingerprint(vm.get("ssh_host_key_fingerprint"))
+            vm_uid = _opaque_vm_identity(vm.get("vm_uid"))
+            if (
+                _provision_generation(vm.get("provision_generation"))
+                != identity.provision_generation
+                or vm.get("identity_authenticated") is not True
+                or _provision_generation(vm.get("identity_provision_generation"))
+                != identity.provision_generation
+                or vm_uid is None
+                or fingerprint is None
+                or not isinstance(registration_id, str)
+                or not registration_id
+                or vm.get("ssh_host") != ssh_host
+                or int(vm.get("ssh_port") or 0) != ssh_port
+            ):
+                return False
+
+            # Bind the signed controller's current launcher UID to this exact
+            # daemon registration before asking the shared provisioner for its
+            # full mutation attestation. A concurrent registration makes this
+            # CAS fail instead of inheriting its endpoint.
+            status = await self.query_vm_status(
+                identity.entity_id,
+                provision_generation=identity.provision_generation,
+            )
+            launcher_uid = (
+                _provision_generation(status.get("active_pod_uid"))
+                if isinstance(status, Mapping)
+                and status.get("_identity_authenticated") is True
+                and status.get("ready") is True
+                and _provision_generation(status.get("provision_generation"))
+                == identity.provision_generation
+                and _opaque_vm_identity(status.get("vm_uid")) == vm_uid
+                else None
+            )
+            if launcher_uid is None:
+                return False
+            merge_current = (
+                self._db.merge_thread_vm_context_if_current
+                if identity.entity_type == "thread"
+                else self._db.merge_vm_context_if_current
+            )
+            if not await merge_current(
+                identity.entity_id,
+                registration_id,
+                {"active_pod_uid": launcher_uid},
+            ):
+                return False
+            initial = await vm_provisioner.attest_workspace_runtime(
+                identity.entity_id,
+                entity_type=identity.entity_type,
+            )
+            if initial.workspace_generation != identity.provision_generation:
+                return False
+            if initial.host != ssh_host or initial.port != ssh_port:
+                return False
+
+            async def mutation_authority() -> tuple[str, int, str] | None:
+                try:
+                    current = await vm_provisioner.attest_workspace_runtime(
+                        identity.entity_id,
+                        entity_type=identity.entity_type,
+                    )
+                except Exception:
+                    return None
+                if current != initial:
+                    return None
+                return (
+                    current.host,
+                    current.port,
+                    current.ssh_host_key_fingerprint,
+                )
+
             from services.ide_settings import seed_ide_config_for_user
 
             row = (
-                await self._db.get_thread(entity_id)
-                if is_thread
-                else await self._db.get_job(entity_id)
+                await self._db.get_thread(identity.entity_id)
+                if identity.entity_type == "thread"
+                else await self._db.get_job(identity.entity_id)
             )
             user_id = row.get("user_id") if isinstance(row, dict) else None
-            await seed_ide_config_for_user(self._db, user_id, ssh_host, ssh_port)
+            seeded = await seed_ide_config_for_user(
+                self._db,
+                user_id,
+                initial.host,
+                initial.port,
+                expected_host_key_fingerprint=initial.ssh_host_key_fingerprint,
+                mutation_authority=mutation_authority,
+            )
+            if not seeded:
+                return False
 
             # Restore license/globalStorage + non-Open-VSX bytes into the VM
             # (Phase B). Best-effort; no-ops when S3 is unavailable.
@@ -915,19 +1062,38 @@ class NatsBridge:
                 from services.ide_profile_store import IdeProfileStore
                 from services.ide_settings import IdeSettingsStore, seed_ide_profile
 
-                items = await IdeSettingsStore(self._db).get_extensions(str(user_id))
+                settings_store = IdeSettingsStore(self._db)
+                items = await settings_store.get_extensions(str(user_id))
+                profile_pointers = await settings_store.get_profile_pointers(
+                    str(user_id)
+                )
                 profile = IdeProfileStore(
                     snapshot_service._s3, snapshot_service._bucket
                 )
-                await seed_ide_profile(
+                seeded = await seed_ide_profile(
                     user_id=str(user_id),
-                    ssh_host=ssh_host,
-                    ssh_port=ssh_port,
+                    ssh_host=initial.host,
+                    ssh_port=initial.port,
                     profile_store=profile,
                     ext_items=items,
+                    profile_pointers=profile_pointers,
+                    expected_host_key_fingerprint=(initial.ssh_host_key_fingerprint),
+                    mutation_authority=mutation_authority,
                 )
+                if not seeded:
+                    return False
+            final = await vm_provisioner.attest_workspace_runtime(
+                identity.entity_id,
+                entity_type=identity.entity_type,
+            )
+            if final != initial:
+                return False
+            return bool(await merge_current(identity.entity_id, registration_id, {}))
         except Exception:
-            logger.debug("ide seed (vm) failed for %s", entity_id, exc_info=True)
+            logger.debug(
+                "ide seed (vm) failed for %s", identity.entity_id, exc_info=True
+            )
+            return False
 
     async def _on_daemon_heartbeat(self, msg) -> None:
         """Decode and delegate external-mode daemon heartbeat evidence."""

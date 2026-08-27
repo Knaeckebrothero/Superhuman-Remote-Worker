@@ -81,6 +81,20 @@ def workspace_ready(thread: dict) -> bool:
     return _active_context(thread).get("status") == "ready"
 
 
+def _vm_workspace_active(thread: dict) -> bool:
+    """Whether the selected live browser endpoint is a VM.
+
+    A Canvas binding/DB reread cannot continuously prove the signed VM,
+    launcher-Pod, and endpoint identity for a long-lived relay. Until the
+    browser protocol binds its token to that exact controller-attested tuple,
+    contain the VM path before SSH or browser startup. Kubernetes and explicit
+    local-container behavior remain unchanged.
+    """
+
+    vm = _metadata(thread).get("vm") or {}
+    return bool(isinstance(vm, dict) and vm.get("status") == "ready")
+
+
 _STATELESS_BROWSER_START_STATUSES = frozenset(
     {"created", "active", "idle", "awaiting_user"}
 )
@@ -152,6 +166,11 @@ async def exec_stream_info(
     generation_resolver: GenerationResolver,
 ) -> dict:
     """Cold-start browser-exec through the pinned SSH transport."""
+
+    if _vm_workspace_active(thread):
+        raise BrowserStreamUnavailable(
+            503, "VM browser streaming requires continuous runtime attestation"
+        )
 
     config = browser_stream_config()
     args: dict = {}
@@ -430,6 +449,9 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
         return
     if not workspace_ready(thread):
         await _reject_ws(ws, 4503, "Workspace not ready")
+        return
+    if _vm_workspace_active(thread):
+        await _reject_ws(ws, 4503, "VM browser streaming is unavailable")
         return
     try:
         _resolve_reachable_target(thread)

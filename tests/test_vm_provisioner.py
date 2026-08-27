@@ -7,7 +7,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -46,6 +46,7 @@ def mock_nats_bridge():
     """Create a mock nats_bridge with controllable is_available."""
     bridge = MagicMock()
     bridge.is_available = False
+    bridge.lifecycle_identity_authenticated = True
     bridge.request_vm_create = AsyncMock(return_value=True)
     bridge.request_vm_delete = AsyncMock(return_value=True)
     bridge.query_vm_status = AsyncMock(
@@ -154,7 +155,11 @@ class TestBackendSelection:
 
             provisioner = VMProvisioner()
             assert provisioner.mode == mode
-            assert provisioner.is_available is (mode != "off")
+            assert provisioner.is_available is (mode == "same-cluster")
+            if mode == "external":
+                assert "authenticated guest-management transport" in str(
+                    provisioner.unavailable_reason
+                )
 
     def test_unset_mode_is_off_and_warns_once(self, caplog):
         import orchestrator.services.vm_provisioner as vm_module
@@ -182,8 +187,8 @@ class TestBackendSelection:
 
             assert VMProvisioner().is_available is False
 
-    def test_external_requires_nats(self, mock_nats_bridge):
-        mock_nats_bridge.is_available = False
+    def test_external_is_contained_even_when_nats_is_connected(self, mock_nats_bridge):
+        mock_nats_bridge.is_available = True
         with (
             patch.dict(os.environ, {"VM_MODE": "external"}, clear=True),
             patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge),
@@ -191,6 +196,28 @@ class TestBackendSelection:
             from orchestrator.services.vm_provisioner import VMProvisioner
 
             assert VMProvisioner().is_available is False
+
+    @pytest.mark.asyncio
+    async def test_external_missing_lifecycle_secret_refuses_list_and_delete(
+        self, mock_nats_bridge, mock_db
+    ):
+        mock_nats_bridge.is_available = True
+        mock_nats_bridge.lifecycle_identity_authenticated = False
+        with (
+            patch.dict(os.environ, {"VM_MODE": "external"}, clear=True),
+            patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge),
+        ):
+            from orchestrator.services.vm_provisioner import VMProvisioner
+
+            provisioner = VMProvisioner()
+            provisioner._db = mock_db
+
+            assert provisioner.lifecycle_available is False
+            assert await provisioner.list_vms() is None
+            assert await provisioner.delete_vm("job-unsigned") is False
+
+        mock_nats_bridge.query_vm_status.assert_not_awaited()
+        mock_nats_bridge.request_vm_delete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_same_cluster_does_not_use_nats(self, mock_nats_bridge):
@@ -241,6 +268,7 @@ class TestVmWorkspaceRuntimeAttestation:
             "active_pod_uid": LAUNCHER_POD_UID,
             "ssh_host_key_fingerprint": TEST_HOST_KEY_FINGERPRINT,
             "ssh_ready_source": "provisioner_probe",
+            "ssh_registration_id": "registration-1",
             "ssh_host": "10.42.1.23",
             "ssh_port": 22,
         }
@@ -297,6 +325,93 @@ class TestVmWorkspaceRuntimeAttestation:
             "job-1",
             provision_generation=PROVISION_GENERATION,
         )
+        assert mock_db.get_job.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_thread_runtime_uses_thread_owner_and_exact_second_reread(
+        self, mock_db
+    ):
+        context = self._context()
+        mock_db.get_thread = AsyncMock(
+            side_effect=[
+                {"metadata": {"vm": dict(context)}},
+                {"metadata": {"vm": dict(context)}},
+            ]
+        )
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner = self._provisioner(mock_db, context, self._status())
+            attested = await provisioner.attest_workspace_runtime(
+                "thread-1", entity_type="thread"
+            )
+
+        assert attested.runtime_incarnation == LAUNCHER_POD_UID
+        assert attested.ssh_host_key_fingerprint == TEST_HOST_KEY_FINGERPRINT
+        assert mock_db.get_thread.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_successor_after_controller_probe_is_refused_before_return(
+        self, mock_db
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        current = self._context()
+        successor = self._context(
+            active_pod_uid="00000000-0000-4000-8000-000000000099",
+            ssh_host="10.42.1.23",
+        )
+        mock_db.get_job = AsyncMock(
+            side_effect=[
+                {"context": {"vm": current}},
+                {"context": {"vm": successor}},
+            ]
+        )
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner = self._provisioner(mock_db, current, self._status())
+            mock_db.get_job.side_effect = [
+                {"context": {"vm": current}},
+                {"context": {"vm": successor}},
+            ]
+            with pytest.raises(
+                WorkspaceRuntimeAuthorityError, match="authority changed"
+            ):
+                await provisioner.attest_workspace_runtime("job-1")
+
+    @pytest.mark.asyncio
+    async def test_external_runtime_uses_generation_bound_daemon_endpoint(
+        self, mock_db
+    ):
+        context = self._context(
+            ssh_host="192.0.2.44",
+            ssh_port=2202,
+        )
+        mock_db.get_job = AsyncMock(
+            side_effect=[
+                {"context": {"vm": dict(context)}},
+                {"context": {"vm": dict(context)}},
+            ]
+        )
+        with (
+            patch.dict(os.environ, {"VM_MODE": "external"}),
+            patch("orchestrator.services.vm_provisioner.nats_bridge") as bridge,
+        ):
+            bridge.is_available = True
+            bridge.lifecycle_identity_authenticated = True
+            bridge.query_vm_status = AsyncMock(return_value=self._status())
+            from orchestrator.services.vm_provisioner import VMProvisioner
+
+            provisioner = VMProvisioner()
+            provisioner._db = mock_db
+            provisioner._lifecycle_hmac_secret = (
+                b"external-attestation-secret-at-least-32-bytes"
+            )
+            attested = await provisioner.attest_workspace_runtime("job-1")
+
+        assert attested.host == "192.0.2.44"
+        assert attested.port == 2202
+        assert attested.pod_ip == "10.42.1.23"
+        assert attested.runtime_incarnation == LAUNCHER_POD_UID
 
     @pytest.mark.asyncio
     async def test_launcher_pod_uid_mismatch_is_refused(self, mock_db):
@@ -381,10 +496,10 @@ class TestCreateVm:
     """Tests for create_vm() across both backends."""
 
     @pytest.mark.asyncio
-    async def test_create_vm_nats_backend(
+    async def test_create_vm_external_mode_is_contained_before_state_or_nats(
         self, provisioner_with_nats, mock_nats_bridge
     ):
-        """create_vm() delegates to nats_bridge when NATS is available."""
+        """Broker reachability is not authenticated guest-management authority."""
         result = await provisioner_with_nats.create_vm(
             job_id="job-001",
             agent_config="developer",
@@ -393,18 +508,11 @@ class TestCreateVm:
             memory="8Gi",
             description="Build feature",
         )
-        assert result is True
-        mock_nats_bridge.request_vm_create.assert_awaited_once_with(
-            job_id="job-001",
-            agent_config="developer",
-            vm_image="my-image:v1",
-            cpu_cores=4,
-            memory="8Gi",
-            description="Build feature",
-            entity_type="job",
-            set_provisioning=True,
-            provision_generation=ANY,
-        )
+        assert result is False
+        assert provisioner_with_nats.is_available is False
+        assert provisioner_with_nats.lifecycle_available is True
+        mock_nats_bridge.request_vm_create.assert_not_awaited()
+        provisioner_with_nats._db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_http_create_carries_thread_owner_kind(self, provisioner_disabled):
@@ -549,10 +657,11 @@ class TestCreateVm:
     async def test_create_vm_nats_failure(
         self, provisioner_with_nats, mock_nats_bridge
     ):
-        """create_vm() returns False when NATS publish fails."""
+        """External creation remains closed independently of broker outcome."""
         mock_nats_bridge.request_vm_create = AsyncMock(return_value=False)
         result = await provisioner_with_nats.create_vm(job_id="job-006")
         assert result is False
+        mock_nats_bridge.request_vm_create.assert_not_awaited()
 
 
 # =============================================================================
@@ -587,14 +696,17 @@ class TestFreshProvisionReset:
         assert isinstance(ctx["provisioned_at"], float)
 
     @pytest.mark.asyncio
-    async def test_create_vm_nats_resets_before_dispatch(
+    async def test_create_vm_same_cluster_resets_before_dispatch(
         self, provisioner_with_nats, mock_nats_bridge, mock_db
     ):
-        await provisioner_with_nats.create_vm(job_id="reset-nats")
-        # First context write is the reset — before nats_bridge writes
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner_with_nats._controller_url = "http://controller"
+            provisioner_with_nats._create_http = AsyncMock(return_value=True)
+            await provisioner_with_nats.create_vm(job_id="reset-http")
+        # First context write is the reset — before the controller writes
         # 'provisioning' — so it can't clobber the live provisioning status.
         first = mock_db.merge_vm_context.await_args_list[0]
-        assert first[0][0] == "reset-nats"
+        assert first[0][0] == "reset-http"
         ctx = first[0][1]
         assert ctx["snapshot_attempts"] == 0
         assert ctx["ssh_host"] is None
@@ -602,16 +714,13 @@ class TestFreshProvisionReset:
 
     @pytest.mark.asyncio
     async def test_create_thread_vm_resets(self, mock_nats_bridge, mock_db):
-        mock_db.merge_thread_vm_context = AsyncMock()
-        with (
-            patch.dict(os.environ, {"VM_MODE": "external"}),
-            patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge),
-        ):
-            mock_nats_bridge.is_available = True
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
             from orchestrator.services.vm_provisioner import VMProvisioner
 
             prov = VMProvisioner()
             prov._db = mock_db
+            prov._controller_url = "http://controller"
+            prov._create_http = AsyncMock(return_value=True)
             await prov.create_thread_vm(
                 thread_id="reset-thread",
                 expected_runtime_generation=PROVISION_GENERATION,
@@ -624,34 +733,27 @@ class TestFreshProvisionReset:
         assert ctx["ssh_host"] is None
         assert ctx["_runtime_incarnation"] is None
         assert ctx["status"] == "provisioning"
-        assert mock_nats_bridge.request_vm_create.await_args.kwargs["entity_type"] == (
-            "thread"
-        )
-        assert (
-            mock_nats_bridge.request_vm_create.await_args.kwargs["set_provisioning"]
-            is False
-        )
+        assert prov._create_http.await_args.kwargs["entity_type"] == "thread"
+        assert prov._create_http.await_args.kwargs["set_provisioning"] is False
 
     @pytest.mark.asyncio
     async def test_create_thread_vm_refuses_dispatch_when_authority_cas_loses(
         self, mock_nats_bridge, mock_db
     ):
         mock_db.begin_pinned_thread_vm_provisioning = AsyncMock(return_value=False)
-        with (
-            patch.dict(os.environ, {"VM_MODE": "external"}),
-            patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge),
-        ):
-            mock_nats_bridge.is_available = True
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
             from orchestrator.services.vm_provisioner import VMProvisioner
 
             prov = VMProvisioner()
             prov._db = mock_db
+            prov._controller_url = "http://controller"
+            prov._create_http = AsyncMock(return_value=True)
             assert not await prov.create_thread_vm(
                 thread_id="stale-thread",
                 expected_runtime_generation=PROVISION_GENERATION,
                 expected_vm_context=None,
             )
-        mock_nats_bridge.request_vm_create.assert_not_awaited()
+        prov._create_http.assert_not_awaited()
 
 
 # =============================================================================
@@ -674,7 +776,10 @@ class TestGoldenPollCreate:
     async def test_poll_rolls_only_provisioned_at(
         self, provisioner_with_nats, mock_nats_bridge, mock_db
     ):
-        await provisioner_with_nats.create_vm(job_id="poll-1", fresh=False)
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner_with_nats._controller_url = "http://controller"
+            provisioner_with_nats._create_http = AsyncMock(return_value=True)
+            await provisioner_with_nats.create_vm(job_id="poll-1", fresh=False)
         first = mock_db.merge_vm_context.await_args_list[0]
         assert first[0][0] == "poll-1"
         ctx = first[0][1]
@@ -684,19 +789,25 @@ class TestGoldenPollCreate:
     async def test_poll_passes_set_provisioning_false(
         self, provisioner_with_nats, mock_nats_bridge
     ):
-        await provisioner_with_nats.create_vm(job_id="poll-2", fresh=False)
-        kwargs = mock_nats_bridge.request_vm_create.await_args.kwargs
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner_with_nats._controller_url = "http://controller"
+            provisioner_with_nats._create_http = AsyncMock(return_value=True)
+            await provisioner_with_nats.create_vm(job_id="poll-2", fresh=False)
+        kwargs = provisioner_with_nats._create_http.await_args.kwargs
         assert kwargs["set_provisioning"] is False
 
     @pytest.mark.asyncio
     async def test_fresh_default_resets_and_sets_provisioning(
         self, provisioner_with_nats, mock_nats_bridge, mock_db
     ):
-        await provisioner_with_nats.create_vm(job_id="fresh-1")
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner_with_nats._controller_url = "http://controller"
+            provisioner_with_nats._create_http = AsyncMock(return_value=True)
+            await provisioner_with_nats.create_vm(job_id="fresh-1")
         ctx = mock_db.merge_vm_context.await_args_list[0][0][1]
         assert ctx["snapshot_attempts"] == 0
         assert ctx["golden_wait_started_at"] is None
-        kwargs = mock_nats_bridge.request_vm_create.await_args.kwargs
+        kwargs = provisioner_with_nats._create_http.await_args.kwargs
         assert kwargs["set_provisioning"] is True
 
 
@@ -712,7 +823,9 @@ class TestDeleteVm:
     async def test_delete_vm_nats_backend(
         self, provisioner_with_nats, mock_nats_bridge
     ):
-        """delete_vm() delegates to nats_bridge when NATS is available."""
+        """Contained external creation does not strand exact-generation cleanup."""
+        assert provisioner_with_nats.is_available is False
+        assert provisioner_with_nats.lifecycle_available is True
         result = await provisioner_with_nats.delete_vm(job_id="job-del-001")
         assert result is True
         mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
@@ -1007,7 +1120,7 @@ class TestConcurrentOperations:
 
     @pytest.mark.asyncio
     async def test_multiple_creates_in_parallel(self, mock_nats_bridge, mock_db):
-        """Multiple create_vm() calls can run concurrently via NATS."""
+        """Concurrent callers cannot bypass external-mode containment."""
         with (
             patch.dict(os.environ, {"VM_MODE": "external"}),
             patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge),
@@ -1024,8 +1137,9 @@ class TestConcurrentOperations:
                 prov.create_vm(job_id="par-003"),
             )
 
-        assert all(r is True for r in results)
-        assert mock_nats_bridge.request_vm_create.await_count == 3
+        assert results == [False, False, False]
+        mock_nats_bridge.request_vm_create.assert_not_awaited()
+        mock_db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_and_query_in_parallel(self, mock_nats_bridge, mock_db):
@@ -1045,8 +1159,9 @@ class TestConcurrentOperations:
                 prov.query_status(job_id="mix-002"),
             )
 
-        assert create_result is True
+        assert create_result is False
         assert status_result is not None
+        mock_nats_bridge.request_vm_create.assert_not_awaited()
 
 
 # =============================================================================
@@ -1125,6 +1240,14 @@ def _snapshot_service(*, captured: bool):
     return svc
 
 
+def _make_process_retirement_settle(db):
+    async def settle(*_args, **_kwargs):
+        db.managed_repository_workspace_process_zero_is_current.return_value = True
+        return True
+
+    db.record_managed_repository_workspace_process_zero.side_effect = settle
+
+
 class TestReleaseReportsSnapshotOutcome:
     """A VM workspace lives on the tailnet, which the orchestrator cannot reach,
     so capture_vm_snapshot returns False for every VM. Release deletes the VM
@@ -1137,6 +1260,8 @@ class TestReleaseReportsSnapshotOutcome:
         self, provisioner_with_nats, mock_nats_bridge, caplog
     ):
         provisioner_with_nats._snapshot_service = _snapshot_service(captured=False)
+        provisioner_with_nats._db.managed_repository_workspace_process_zero_is_current.return_value = False
+        _make_process_retirement_settle(provisioner_with_nats._db)
         provisioner_with_nats._db.get_thread = AsyncMock(
             return_value={
                 "metadata": {
@@ -1160,6 +1285,8 @@ class TestReleaseReportsSnapshotOutcome:
         self, provisioner_with_nats, mock_nats_bridge, caplog
     ):
         provisioner_with_nats._snapshot_service = _snapshot_service(captured=True)
+        provisioner_with_nats._db.managed_repository_workspace_process_zero_is_current.return_value = False
+        _make_process_retirement_settle(provisioner_with_nats._db)
         provisioner_with_nats._db.get_thread = AsyncMock(
             return_value={
                 "metadata": {"vm": _ready_vm_context(ssh_host="10.0.0.9", ssh_port=22)}
@@ -1170,6 +1297,12 @@ class TestReleaseReportsSnapshotOutcome:
             await provisioner_with_nats.release_thread_vm("tid-2")
 
         assert "snapshot captured" in caplog.text.lower()
+        capture = provisioner_with_nats._snapshot_service.capture_vm_snapshot
+        assert (
+            capture.await_args.kwargs["expected_host_key_fingerprint"]
+            == TEST_HOST_KEY_FINGERPRINT
+        )
+        assert capture.await_args.kwargs["ssh_host"] == "10.0.0.9"
 
     @pytest.mark.asyncio
     async def test_job_release_does_not_claim_capture_when_skipped(
@@ -1177,6 +1310,8 @@ class TestReleaseReportsSnapshotOutcome:
     ):
         """release_vm carries the identical pattern for jobs."""
         provisioner_with_nats._snapshot_service = _snapshot_service(captured=False)
+        provisioner_with_nats._db.managed_repository_workspace_process_zero_is_current.return_value = False
+        _make_process_retirement_settle(provisioner_with_nats._db)
         provisioner_with_nats._db.get_job = AsyncMock(
             return_value={"context": {"vm": _ready_vm_context()}}
         )
@@ -1188,6 +1323,21 @@ class TestReleaseReportsSnapshotOutcome:
 
         assert ok is True
         assert "snapshot captured" not in caplog.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_replaced_vm_reusing_endpoint_receives_zero_snapshot_bytes(
+        self, provisioner_with_nats
+    ):
+        provisioner_with_nats._snapshot_service = _snapshot_service(captured=True)
+        provisioner_with_nats._db.managed_repository_workspace_process_zero_is_current.return_value = False
+        provisioner_with_nats.revalidate_vm_teardown_identity = AsyncMock(
+            return_value="superseded"
+        )
+
+        assert not await provisioner_with_nats.release_vm(
+            "job-reused-ip", ssh_host="100.64.1.9", ssh_port=22
+        )
+        provisioner_with_nats._snapshot_service.capture_vm_snapshot.assert_not_awaited()
 
 
 class TestPurgeDiskIntent:

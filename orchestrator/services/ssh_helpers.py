@@ -23,18 +23,30 @@ import os
 import secrets
 import shlex
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import paramiko
 
 from services import resolve_ssh_key_path
+from services.blocking_effect import joined_async_call
+from services.subprocess_effect import (
+    SubprocessOutputLimit,
+    communicate_bounded,
+    create_owned_subprocess_exec,
+    stop_and_reap,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class SSHPrivateKeyError(RuntimeError):
     """Configured workspace private key is absent, unreadable, or invalid."""
+
+
+class SSHHostKeyVerificationError(RuntimeError):
+    """The selected endpoint did not present its attested SSH host key."""
 
 
 async def _read_stream_tail(stream, *, limit: int = 64 * 1024) -> bytes:
@@ -105,10 +117,55 @@ def workspace_private_key_fingerprint(key_path: Optional[str]) -> str:
 # regardless of the agent-host login shell (`pipefail` is bash/ksh/zsh, not
 # POSIX sh/dash). The `-c` body is single-quoted, so `--xattrs-include`
 # switches to double quotes to still reach tar as a literal `*`.
-EXTRACT_REMOTE_CMD = (
-    "bash -c 'set -o pipefail; "
-    'zstd -d | tar --xattrs --xattrs-include="*" --acls -xf - -C /\''
-)
+_SNAPSHOT_UNCOMPRESSED_MAX_BYTES = 40 * 1024 * 1024 * 1024
+REMOTE_MUTATION_LOCK_PATH = "/tmp/.srw-vm-remote-operation.lock"
+
+
+def bounded_remote_mutation_command(remote_cmd: str, *, timeout_s: float) -> str:
+    """Serialize and remotely bound a workspace filesystem mutation.
+
+    A local SSH client reaching a terminal state is not proof that its remote
+    child stopped. Every retry therefore takes the same workspace-local flock,
+    while GNU ``timeout`` bounds the command which holds that lock. The local
+    caller keeps a slightly longer deadline and joins cancellation, so normal
+    cancellation observes the remote verdict before releasing its DB lease.
+    """
+
+    total_seconds = max(3, int(timeout_s))
+    lock_seconds = max(1, min(5, total_seconds // 10))
+    effect_seconds = max(1, total_seconds - lock_seconds - 2)
+    bounded = (
+        f"timeout --signal=TERM --kill-after=2s {effect_seconds}s "
+        f"bash -o pipefail -c {shlex.quote(remote_cmd)}"
+    )
+    return (
+        f"flock -w {lock_seconds} {shlex.quote(REMOTE_MUTATION_LOCK_PATH)} " + bounded
+    )
+
+
+def _bounded_extract_command(*, scoped_home: bool) -> str:
+    limiter = (
+        "import sys\n"
+        f"limit={_SNAPSHOT_UNCOMPRESSED_MAX_BYTES}\n"
+        "total=0\n"
+        "while True:\n"
+        " chunk=sys.stdin.buffer.read(1048576)\n"
+        " if not chunk: break\n"
+        " total += len(chunk)\n"
+        " if total > limit: raise SystemExit(73)\n"
+        " sys.stdout.buffer.write(chunk)\n"
+    )
+    members = " home/agent-host" if scoped_home else ""
+    pipeline = (
+        "set -o pipefail; zstd -dc | python3 -c "
+        + shlex.quote(limiter)
+        + " | tar --no-same-owner --no-same-permissions --no-overwrite-dir "
+        '--xattrs --xattrs-include="*" --acls -xf - -C /' + members
+    )
+    return "bash -c " + shlex.quote(pipeline)
+
+
+EXTRACT_REMOTE_CMD = _bounded_extract_command(scoped_home=False)
 
 # Scoped variant for in-cluster IDE pods: extract only the agent-host home.
 # Snapshots also carry /usr/local (VM restores need it), but in a
@@ -119,11 +176,7 @@ EXTRACT_REMOTE_CMD = (
 # member pattern is ``home/agent-host``. Same `pipefail` wrapper as
 # EXTRACT_REMOTE_CMD above, for the same masked-zstd-failure reason. Retain
 # xattrs/ACLs on the scoped home restore as well.
-EXTRACT_HOME_REMOTE_CMD = (
-    "bash -c 'set -o pipefail; "
-    'zstd -d | tar --xattrs --xattrs-include="*" --acls '
-    "-xf - -C / home/agent-host'"
-)
+EXTRACT_HOME_REMOTE_CMD = _bounded_extract_command(scoped_home=True)
 
 # Headscale/Tailscale mesh address space (CGNAT range). VM workspaces get
 # their SSH host from this range; only tailnet members (agent-pod sidecars)
@@ -255,7 +308,7 @@ async def _scan_pinned_host_key(
         return None, b"invalid pinned SSH host-key fingerprint"
 
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_owned_subprocess_exec(
             "ssh-keyscan",
             "-T",
             str(max(1, int(timeout_s))),
@@ -271,18 +324,16 @@ async def _scan_pinned_host_key(
         return None, f"SSH host-key scan could not start: {type(exc).__name__}".encode()
 
     try:
-        try:
-            stdout, _stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=max(1, int(timeout_s)) + 5
-            )
-        except asyncio.TimeoutError:
-            return None, b"SSH host-key scan timed out"
-    finally:
-        # Cancellation of the lifecycle owner must not orphan a keyscan child
-        # while the advisory lock is released to a successor.
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
+        stdout, _stderr = await communicate_bounded(
+            proc,
+            timeout=max(1, int(timeout_s)) + 5,
+            stdout_limit=1024 * 1024,
+            stderr_limit=64 * 1024,
+        )
+    except asyncio.TimeoutError:
+        return None, b"SSH host-key scan timed out"
+    except SubprocessOutputLimit:
+        return None, b"SSH host-key scan output exceeded limit"
 
     saw_candidate = False
     for raw_line in stdout.splitlines():
@@ -310,6 +361,43 @@ async def _scan_pinned_host_key(
     # the wording must not contain "fingerprint" or vm_readiness would demote
     # a ready VM on every blip (the k3d gate proved it did).
     return None, b"SSH host-key scan found no ed25519 host key"
+
+
+@asynccontextmanager
+async def pinned_agent_ssh_command(
+    ssh_host: str,
+    ssh_port: int,
+    remote_cmd: str,
+    *,
+    expected_host_key_fingerprint: str,
+    key_path: Optional[str] = None,
+    connect_timeout_s: int = 10,
+    batch_mode: bool = False,
+) -> AsyncIterator[list[str]]:
+    """Yield SSH argv pinned to the control-plane-attested host key."""
+
+    known_hosts_line, scan_error = await _scan_pinned_host_key(
+        ssh_host,
+        ssh_port,
+        expected_host_key_fingerprint,
+        timeout_s=connect_timeout_s,
+    )
+    if known_hosts_line is None:
+        raise SSHHostKeyVerificationError(scan_error.decode("utf-8", errors="replace"))
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="ascii", prefix="srw-known-host-", delete=True
+    ) as known_hosts:
+        known_hosts.write(known_hosts_line + "\n")
+        known_hosts.flush()
+        yield build_agent_ssh_cmd(
+            ssh_host,
+            ssh_port,
+            remote_cmd,
+            key_path=key_path,
+            connect_timeout_s=connect_timeout_s,
+            batch_mode=batch_mode,
+            known_hosts_path=known_hosts.name,
+        )
 
 
 async def stream_extract_snapshot(
@@ -355,30 +443,42 @@ async def stream_extract_snapshot(
         )
         return 255, b"skipped: unroutable tailnet target from orchestrator"
 
-    strict_timeout_s: float | None = None
+    try:
+        compressed_size = os.path.getsize(tar_path)
+        max_compressed_size = (
+            max(1, min(100, int(os.environ.get("SNAPSHOT_MAX_SIZE_GB", "10"))))
+            * 1024
+            * 1024
+            * 1024
+        )
+    except (OSError, TypeError, ValueError):
+        return 125, b"snapshot archive is unavailable or size cap is invalid"
+    if compressed_size <= 0 or compressed_size > max_compressed_size:
+        return 125, b"snapshot archive exceeds compressed-size cap"
+
+    try:
+        restore_timeout_s = max(
+            0.01,
+            float(os.environ.get("SNAPSHOT_RESTORE_TIMEOUT_S", "300")),
+        )
+    except (TypeError, ValueError):
+        restore_timeout_s = 300.0
     if require_pipefail:
         try:
-            strict_timeout_s = max(
+            restore_timeout_s = max(
                 0.01,
                 float(os.environ.get("STATELESS_SNAPSHOT_RESTORE_TIMEOUT_S", "300")),
             )
         except (TypeError, ValueError):
-            strict_timeout_s = 300.0
-        try:
-            remote_lock_timeout_s = max(
-                1,
-                int(os.environ.get("STATELESS_SNAPSHOT_RESTORE_LOCK_TIMEOUT_S", "300")),
-            )
-        except (TypeError, ValueError):
-            remote_lock_timeout_s = 300
-        # The lock lives outside the captured home tree. A cancelled SSH
-        # transport can leave its remote tar briefly draining; the next HA
-        # owner must serialize behind it rather than extract concurrently.
-        remote_cmd = (
-            f"flock -w {remote_lock_timeout_s} "
-            "/tmp/.srw-terminal-snapshot-restore.lock "
-            f"bash -o pipefail -c {shlex.quote(remote_cmd)}"
-        )
+            restore_timeout_s = 300.0
+    # The lock lives outside every captured tree and is shared by all remote
+    # filesystem mutation kinds. Even if the local SSH transport times out,
+    # the bounded remote wrapper retains the lock until that command is dead;
+    # a retry can fail or wait, but can never overlap it.
+    remote_cmd = bounded_remote_mutation_command(
+        remote_cmd,
+        timeout_s=max(3.0, restore_timeout_s - 1.0),
+    )
 
     known_hosts_line: Optional[str] = None
     if expected_host_key_fingerprint is not None:
@@ -413,41 +513,35 @@ async def stream_extract_snapshot(
         stderr_task: asyncio.Task[bytes] | None = None
         try:
             with open(tar_path, "rb") as f:
-                proc = await asyncio.create_subprocess_exec(
+                proc = await create_owned_subprocess_exec(
                     *ssh_cmd,
                     stdin=f,  # OS streams the fd; never read into our heap
-                    stdout=(
-                        asyncio.subprocess.DEVNULL
-                        if require_pipefail
-                        else asyncio.subprocess.PIPE
-                    ),
+                    stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
+                stderr_task = asyncio.create_task(_read_stream_tail(proc.stderr))
                 try:
-                    if strict_timeout_s is None:
-                        _stdout, stderr = await proc.communicate()
-                    else:
-                        stderr_task = asyncio.create_task(
-                            _read_stream_tail(proc.stderr)
-                        )
-                        await asyncio.wait_for(proc.wait(), timeout=strict_timeout_s)
-                        stderr = await stderr_task
+
+                    async def _complete() -> bytes:
+                        await asyncio.wait_for(proc.wait(), timeout=restore_timeout_s)
+                        return await stderr_task
+
+                    stderr = await joined_async_call(_complete())
                 except asyncio.TimeoutError:
-                    return 124, b"strict snapshot extraction timed out"
+                    return 124, b"snapshot extraction timed out"
             return proc.returncode, stderr
         finally:
             # This also runs on caller cancellation. Reap before returning the
             # lifecycle/advisory lock so no local SSH child continues feeding
             # a remote tar concurrently with a retry.
-            if proc is not None and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
-            if stderr_task is not None and not stderr_task.done():
-                stderr_task.cancel()
-                try:
-                    await stderr_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            async def _cleanup() -> None:
+                if proc is not None and proc.returncode is None:
+                    await stop_and_reap(proc)
+                if stderr_task is not None and not stderr_task.done():
+                    stderr_task.cancel()
+                    await asyncio.gather(stderr_task, return_exceptions=True)
+
+            await joined_async_call(_cleanup())
 
 
 async def wait_for_agent_ssh(
@@ -509,7 +603,7 @@ async def wait_for_agent_ssh(
                 known_hosts_path=known_hosts_path,
             )
             try:
-                proc = await asyncio.create_subprocess_exec(
+                proc = await create_owned_subprocess_exec(
                     *ssh_cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -521,13 +615,16 @@ async def wait_for_agent_ssh(
                     f"ssh readiness probe could not start: {type(exc).__name__}",
                 )
             try:
-                _stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=max(1, int(connect_timeout_s)) + 5
+                _stdout, stderr = await communicate_bounded(
+                    proc,
+                    timeout=max(1, int(connect_timeout_s)) + 5,
+                    stdout_limit=16 * 1024,
+                    stderr_limit=64 * 1024,
                 )
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
                 stderr = b"ssh readiness probe process timed out"
+            except SubprocessOutputLimit:
+                stderr = b"ssh readiness probe output exceeded limit"
 
             if proc.returncode == 0:
                 return True, attempts, ""

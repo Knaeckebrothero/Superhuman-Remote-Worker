@@ -38,6 +38,7 @@ from services.completion_lifecycle import (
     LifecycleActionPermit,
     LifecycleRouteDecision,
 )
+from services.blocking_effect import joined_blocking_call
 from services.ssh_helpers import orchestrator_can_reach
 from services.vm_provisioner import VMTeardownIdentity
 
@@ -385,7 +386,10 @@ class VMInstanceManager:
             except OSError:
                 return False
 
-        return await asyncio.to_thread(_connect)
+        # Cancellation of ``to_thread`` alone abandons the live socket worker.
+        # Join the bounded (five-second) probe before lifecycle ownership can
+        # move on to a replacement or retirement attempt.
+        return await joined_blocking_call(_connect)
 
     async def is_reachable(self, inst: Instance) -> bool:
         """Cached liveness probe to the VM's SSH endpoint.
@@ -629,53 +633,106 @@ class VMInstanceManager:
             return None
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
-        ssh_host = inst.metadata.get("ssh_host")
-        ssh_port = inst.metadata.get("ssh_port") or 22
-        if not ssh_host:
+        if not inst.metadata.get("ssh_host"):
             return None
         bound = inst.bound_to
         if not bound:
             return None
+        is_thread = inst.metadata.get("scope") == "thread"
+        owner_kind = "thread" if is_thread else "job"
         permit = inst.metadata.get("_completion_lifecycle_permit")
         identity = inst.metadata.get("_completion_lifecycle_vm_identity")
         if isinstance(
             permit, LifecycleActionPermit
         ) and not await self._permit_external(permit):
             return None
-        if (
-            self._completion_lifecycle is not None
-            and isinstance(permit, LifecycleActionPermit)
-            and permit.claim is not None
-        ):
-            if not isinstance(identity, VMTeardownIdentity):
-                permit.skip("vm_snapshot_identity_unknown")
+        if not isinstance(identity, VMTeardownIdentity):
+            try:
+                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                    identity = await self._provisioner.capture_vm_teardown_identity(
+                        bound,
+                        entity_type=owner_kind,
+                    )
+            except Exception:
+                if isinstance(permit, LifecycleActionPermit):
+                    permit.skip("vm_snapshot_identity_unknown")
                 return None
-            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                disposition = await self._provisioner.revalidate_vm_teardown_identity(
-                    bound, identity
-                )
-            if disposition != "matched":
+        if (
+            not identity.ssh_host
+            or not identity.ssh_port
+            or not identity.ssh_host_key_fingerprint
+        ):
+            if isinstance(permit, LifecycleActionPermit):
+                permit.skip("vm_snapshot_identity_unknown")
+            return None
+        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+            disposition = await self._provisioner.revalidate_vm_teardown_identity(
+                bound,
+                identity,
+                entity_type=owner_kind,
+            )
+        if disposition != "matched":
+            if isinstance(permit, LifecycleActionPermit):
                 permit.skip(
                     "vm_identity_superseded"
                     if disposition == "superseded"
                     else "vm_identity_unknown",
                     settled=disposition == "superseded",
                 )
-                return None
-            if not await self._permit_external(permit):
-                return None
-        is_thread = inst.metadata.get("scope") == "thread"
+            return None
+        if isinstance(
+            permit, LifecycleActionPermit
+        ) and not await self._permit_external(permit):
+            return None
         try:
+            exact_host = identity.ssh_host
+            exact_port = identity.ssh_port
+            exact_fingerprint = identity.ssh_host_key_fingerprint
+
+            async def capture_authority() -> bool:
+                if isinstance(
+                    permit, LifecycleActionPermit
+                ) and not await self._permit_external(permit):
+                    return False
+                return (
+                    await self._provisioner.revalidate_vm_teardown_identity(
+                        bound,
+                        identity,
+                        entity_type=owner_kind,
+                    )
+                    == "matched"
+                )
+
             async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
                 ok = await self._snapshot.capture_vm_snapshot(
                     job_id=bound,
-                    ssh_host=ssh_host,
-                    ssh_port=int(ssh_port),
+                    ssh_host=exact_host,
+                    ssh_port=int(exact_port),
                     source_type="vm",
                     entity_type="threads" if is_thread else "jobs",
                     work_marker=inst.metadata.get("total_turns"),
+                    expected_host_key_fingerprint=exact_fingerprint,
+                    capture_authority=capture_authority,
                 )
             if ok:
+                if isinstance(identity, VMTeardownIdentity):
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        disposition = (
+                            await self._provisioner.revalidate_vm_teardown_identity(
+                                bound,
+                                identity,
+                                entity_type="thread" if is_thread else "job",
+                            )
+                        )
+                    if disposition != "matched":
+                        if isinstance(permit, LifecycleActionPermit):
+                            permit.skip(
+                                "vm_identity_superseded"
+                                if disposition == "superseded"
+                                else "vm_identity_unknown",
+                                settled=disposition == "superseded",
+                            )
+                        return None
                 # Success clears the escape-hatch retry counter.
                 try:
                     if isinstance(
@@ -683,11 +740,17 @@ class VMInstanceManager:
                     ) and not await self._permit_external(permit):
                         return None
                     if is_thread:
-                        await self._db.merge_thread_vm_context(
-                            bound, {"snapshot_attempts": 0}
+                        await self._db.merge_thread_vm_context_if_provision_generation(
+                            bound,
+                            identity.provision_generation,
+                            {"snapshot_attempts": 0},
                         )
                     else:
-                        await self._db.merge_vm_context(bound, {"snapshot_attempts": 0})
+                        await self._db.merge_vm_context_if_provision_generation(
+                            bound,
+                            identity.provision_generation,
+                            {"snapshot_attempts": 0},
+                        )
                 except Exception:
                     logger.exception("Failed to reset attempts for VM %s", inst.id)
                 if isinstance(
@@ -1016,7 +1079,13 @@ class VMInstanceManager:
     # -------------------------------------------------------------------------
 
     def _provisioner_available(self) -> bool:
-        return bool(getattr(self._provisioner, "is_available", False))
+        # VMProvisioner deliberately closes ``is_available`` in external mode:
+        # that property is the create/admission gate.  The lifecycle manager is
+        # different -- it must keep observing and retiring exact-generation VMs
+        # which predate external-create containment.  Use the provisioner's
+        # explicitly narrower existing-runtime capability here; creation callers
+        # continue to gate on ``is_available`` at their own call sites.
+        return bool(getattr(self._provisioner, "lifecycle_available", False))
 
     async def _fetch_vm_rows(self) -> list[dict[str, Any]]:
         """Pull both job-bound and thread-bound VMs.

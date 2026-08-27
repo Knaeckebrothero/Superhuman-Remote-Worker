@@ -64,15 +64,7 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-import httpx
-
-from services.session_lifecycle import probe_ready
-from services.session_runtime_admission import (
-    thread_requests_protected_cloud,
-    thread_runtime_authority,
-)
 from src.shared.job_outcome import effective_job_status
-from src.shared.pinned_session_identity import PinnedSessionBinding
 from services.usage_ledger import llm_tokens_from_rows
 
 logger = logging.getLogger(__name__)
@@ -414,20 +406,10 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
     delivery_id = _job_wake_delivery_id(row)
     if not await db.assign_job_wake_delivery(str(row["id"]), delivery_id):
         return WakeDeliveryResult.FAILED
-    agent = await _resolve_live_agent(db, thread)
-    if agent is not None:
-        outcome = await _inject_live(agent, text, delivery_id=delivery_id, db=db)
-    else:
-        outcome = WakeDeliveryResult.FAILED
-    if outcome == WakeDeliveryResult.EXECUTED:
-        logger.info(
-            "session wake: injected into live thread %s (job %s)",
-            thread_id[:8],
-            str(row["id"])[:8],
-        )
-        return WakeDeliveryResult.EXECUTED
-    if outcome == WakeDeliveryResult.PERSISTED:
-        return outcome
+
+    # Pod IP is a recyclable coordinate, never recipient authority. All K8s
+    # wakes enter the durable inbox; the exact current runtime generation then
+    # claims them with its reciprocal thread/agent/Pod identity.
 
     # Suspended / detached / ended, or the live inject bounced. Write the notice
     # durably so it lands on the next resume, and tell the user out-of-band.
@@ -444,156 +426,6 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
         text,
         delivery_id=delivery_id,
     )
-
-
-# --------------------------------------------------------------------------
-# Liveness
-# --------------------------------------------------------------------------
-
-
-async def _resolve_live_agent(
-    db: Any, thread: dict[str, Any]
-) -> Optional[PinnedSessionBinding]:
-    """Return the agent pod serving this thread, or None if it isn't live.
-
-    Copied from ``GET /api/sessions/{thread_id}/connection`` — the only path
-    that combines DB state with a live probe. Two things make the copy
-    deliberate rather than lazy:
-
-    * **``probe_ready`` is not optional.** ``agent.status`` is heartbeat-driven
-      and lags reality by up to ~4 minutes (3-minute staleness timeout on a 60s
-      tick), and heartbeat freshness is deliberately not used against zombies
-      because zombies heartbeat normally. Without the probe we would POST into a
-      black hole and burn the attempt budget.
-    * **Do NOT reuse ``_resolve_thread_for_forwarding``.** It looks exactly
-      right and is wrong here: it RESTORES suspended workspaces as a side effect
-      — the Phase-2 resume path Phase 1 explicitly promises not to touch — omits
-      the ``status != 'offline'`` guard, and needs a user dict for owner auth.
-
-    Unlike ``/connection`` this does not self-heal a stale binding. Clearing
-    ``thread.agent_id`` is a user-driven repair on a foreground request; a
-    background delivery has no business mutating session bindings on the way
-    past.
-    """
-    runtime_authority = thread_runtime_authority(thread)
-    if runtime_authority is None:
-        return None
-    try:
-        binding = await db.get_pinned_session_binding(
-            runtime_authority.thread_id,
-            expected_runtime_generation=runtime_authority.generation,
-        )
-    except Exception:
-        return None
-    if binding is None or binding.agent_status not in ("ready", "working", "session"):
-        return None
-    if not await probe_ready(
-        binding.pod_ip,
-        binding.pod_port,
-        required_capability="durable_input_delivery",
-        require_protected_cloud=thread_requests_protected_cloud(thread),
-        expected_session_identity_fingerprint=binding.session_identity_fingerprint,
-    ):
-        return None
-
-    try:
-        current = await db.get_pinned_session_binding(
-            runtime_authority.thread_id,
-            expected_runtime_generation=runtime_authority.generation,
-        )
-    except Exception:
-        return None
-    if (
-        current is None
-        or current.target_key != binding.target_key
-        or current.agent_status not in ("ready", "working", "session")
-    ):
-        return None
-    return current
-
-
-async def _inject_live(
-    binding: PinnedSessionBinding,
-    text: str,
-    *,
-    delivery_id: str,
-    db: Any,
-) -> WakeDeliveryResult:
-    """POST input and report the durable execution boundary it reached.
-
-    ``/api/input`` persists the message and execution-ledger row before queueing
-    it (session_silent_failure_audit.md #1). Its 202 response means only
-    persisted/queued; 200 is reserved for an already admitted/settled retry.
-    ``role='event'`` keeps the row out of the human-bubble family so the
-    transcript does not claim the user said this.
-
-    A 503 means the loop is unavailable or termination-fenced. The caller must
-    leave its durable claim retryable; it may not report that wake delivered.
-
-    Split timeout on purpose: a flat 30s against a black-holed pod IP would burn
-    30s inside the drain for every dead session.
-    """
-    pod_ip = binding.pod_ip
-    pod_port = binding.pod_port
-    url = f"http://{pod_ip}:{pod_port}/api/input"
-    try:
-        headers: dict[str, str] = {}
-        internal_key = os.getenv("MCP_INTERNAL_KEY", "")
-        if internal_key:
-            headers["X-Internal-Key"] = internal_key
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0, connect=3.0)
-        ) as client:
-            # Entering a client may itself await pool/transport setup. Re-read
-            # the exact joined target after that boundary so a same-G Pod/IP
-            # rotation cannot receive an old wake. The effect endpoint also
-            # validates the fingerprint, but avoiding the stale POST entirely
-            # keeps selection truthful and covers transports that fail before
-            # the body reaches the agent.
-            try:
-                current = await db.get_pinned_session_binding(
-                    binding.thread_id,
-                    expected_runtime_generation=binding.runtime_generation,
-                )
-            except Exception:
-                return WakeDeliveryResult.FAILED
-            if (
-                current is None
-                or current.target_key != binding.target_key
-                or current.agent_status not in ("ready", "working", "session")
-            ):
-                return WakeDeliveryResult.FAILED
-            resp = await client.post(
-                url,
-                json={
-                    "content": text,
-                    "role": "event",
-                    "delivery_id": str(UUID(str(delivery_id))),
-                    "session_identity_fingerprint": (
-                        binding.session_identity_fingerprint
-                    ),
-                },
-                headers=headers,
-            )
-    except Exception as exc:
-        logger.info("session wake: live inject to %s failed: %s", pod_ip, exc)
-        return WakeDeliveryResult.FAILED
-    if resp.status_code in {200, 202}:
-        try:
-            body = resp.json()
-        except Exception:
-            body = None
-        state = body.get("delivery_state") if isinstance(body, dict) else None
-        if state in {"admitted", "settled"}:
-            return WakeDeliveryResult.EXECUTED
-        if state in {"persisted", "owned", "queued", "deferred"}:
-            return WakeDeliveryResult.PERSISTED
-    logger.info(
-        "session wake: live inject returned %s (%s)",
-        resp.status_code,
-        resp.text[:200],
-    )
-    return WakeDeliveryResult.FAILED
 
 
 # --------------------------------------------------------------------------
@@ -649,6 +481,15 @@ async def _deliver_durable(
         str(row["id"])[:8],
     )
 
+    state = _delivery_state_for_thread(result, thread_id)
+    if state is None:
+        logger.error(
+            "session wake: durable delivery identity did not resolve to intended "
+            "thread %s",
+            thread_id[:8],
+        )
+        return WakeDeliveryResult.FAILED
+
     # Best-effort user-facing ping. Only on the durable branch — a live session
     # already showed the user the wake, and emailing them about it would be
     # noise. Failure here must not un-deliver the notice above.
@@ -659,9 +500,31 @@ async def _deliver_durable(
             logger.warning(
                 "session wake: owner notification failed for thread %s", thread_id[:8]
             )
-    if str(result.get("state") or "") in {"admitted", "settled"}:
+    if state in {"admitted", "settled"}:
         return WakeDeliveryResult.EXECUTED
-    return WakeDeliveryResult.PERSISTED
+    if state in {"persisted", "owned", "queued", "deferred"}:
+        return WakeDeliveryResult.PERSISTED
+    return WakeDeliveryResult.FAILED
+
+
+def _delivery_state_for_thread(result: Any, thread_id: str) -> str | None:
+    """Return a delivery state only for the intended authoritative thread."""
+
+    if not isinstance(result, dict):
+        return None
+    if str(result.get("thread_id") or "") != str(thread_id):
+        return None
+    state = str(result.get("state") or "")
+    if state not in {
+        "persisted",
+        "owned",
+        "queued",
+        "deferred",
+        "admitted",
+        "settled",
+    }:
+        return None
+    return state
 
 
 async def _notify_owner(
@@ -1276,26 +1139,6 @@ async def deliver_officer_note(db: Any, thread: dict[str, Any], text: str) -> st
     """
     hold = _officer_hold(thread)
     delivery_id = str(uuid4())
-    if not hold.get("thread_id"):
-        try:
-            agent = await _resolve_live_agent(db, thread)
-            if agent is not None:
-                outcome = await _inject_live(
-                    agent,
-                    text,
-                    delivery_id=delivery_id,
-                    db=db,
-                )
-                if outcome == WakeDeliveryResult.EXECUTED:
-                    return "live"
-        except Exception:
-            # Resolving or reaching the pod may fail; the durable row below is
-            # the whole point of having a second path.
-            logger.warning(
-                "legate note: live attempt failed for thread %s — queuing",
-                str(thread.get("id"))[:8],
-                exc_info=True,
-            )
     project_id = thread.get("project_id")
     await db.enqueue_session_wake_event(
         str(thread["id"]),
@@ -1465,43 +1308,8 @@ async def drain_pending_event_wakes(
             if not text:
                 text = _format_officer_wake(rows)
                 state_patch = None
-            agent = await _resolve_live_agent(db, thread)
-            if agent is not None:
-                outcome = await _inject_live(
-                    agent,
-                    text,
-                    delivery_id=delivery_id,
-                    db=db,
-                )
-                if outcome is True or outcome == WakeDeliveryResult.EXECUTED:
-                    await db.finish_session_wake_events(ids)
-                    delivered += 1
-                    if state_patch:
-                        # Watermark rule (risk 5): fingerprints advance ONLY
-                        # here, on a live delivery the officer actually reads.
-                        # The durable branch below deliberately skips this —
-                        # its delta is re-computed at the respawn boot wake.
-                        try:
-                            await db.merge_thread_officer_state(thread_id, state_patch)
-                        except Exception:
-                            logger.exception(
-                                "officer wake: sitrep state merge failed "
-                                "(non-fatal; next sitrep re-diffs)"
-                            )
-                elif outcome == WakeDeliveryResult.PERSISTED:
-                    await db.defer_session_wake_events_for_input(
-                        ids,
-                        fire_at=datetime.now(timezone.utc) + timedelta(seconds=5),
-                    )
-                else:
-                    await db.release_session_wake_events(
-                        ids, max_attempts=_OFFICER_MAX_ATTEMPTS
-                    )
-                continue
-            # A missing, draining, or not-ready Officer is not delivery. Keep
-            # the outbox authoritative so the replacement receives this exact
-            # delivery identity; never stamp a wake sent merely because no pod
-            # was reachable during a lifecycle transition.
+            # A Pod IP is not a recipient. Keep the outbox authoritative so
+            # the exact current/replacement runtime claims this identity.
             persisted = await db.persist_thread_input_delivery(
                 thread_id=thread_id,
                 delivery_id=delivery_id,
@@ -1509,7 +1317,8 @@ async def drain_pending_event_wakes(
                 content=text,
                 source="officer_wake",
             )
-            if str((persisted or {}).get("state") or "") in {
+            delivery_state = _delivery_state_for_thread(persisted, thread_id)
+            if delivery_state in {
                 "admitted",
                 "settled",
             }:
@@ -1523,7 +1332,7 @@ async def drain_pending_event_wakes(
                             "officer wake: sitrep state merge failed "
                             "(non-fatal; next sitrep re-diffs)"
                         )
-            elif persisted:
+            elif delivery_state in {"persisted", "owned", "queued", "deferred"}:
                 await db.defer_session_wake_events_for_input(
                     ids,
                     fire_at=datetime.now(timezone.utc) + timedelta(seconds=5),

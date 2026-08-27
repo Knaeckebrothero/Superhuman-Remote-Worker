@@ -14,8 +14,8 @@ see knowledge-base/knowledge/features/workspace_durability_tiering.md §C1/C1b):
 the remote command is rewritten to discriminate the two stages via ``PIPESTATUS``.
 
 Also guards the extract-side ``pipefail`` guard (§C1/C1c): the restore pipeline
-(``zstd -d | tar ...``) already returns ``tar``'s (last stage's) own exit code
-unchanged, but a ``zstd -d`` decompression failure on a corrupt/truncated
+(``zstd -dc | byte limiter | tar ...``) already returns ``tar``'s (last stage's)
+own exit code unchanged, but a ``zstd -dc`` decompression failure on a corrupt/truncated
 archive is masked whenever ``tar`` still exits 0 — plain ``set -o pipefail``
 (no PIPESTATUS discrimination) fixes this without altering tar's own rc
 handling, including the benign full-extract tar rc==2 case.
@@ -25,6 +25,7 @@ import asyncio
 import base64
 import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -57,11 +58,12 @@ from orchestrator.services.ssh_helpers import (  # noqa: E402
 VALID_TEST_FINGERPRINT = "SHA256:" + ("A" * 43)
 
 
-def _fake_proc(returncode=0, stderr=b""):
+def _fake_proc(returncode=0, stderr=b"", stdout=b""):
     proc = MagicMock()
     proc.returncode = returncode
-    proc.communicate = AsyncMock(return_value=(b"", stderr))
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
     proc.wait = AsyncMock(return_value=returncode)
+    proc.stdout.read = AsyncMock(side_effect=[stdout, b""])
     proc.stderr.read = AsyncMock(side_effect=[stderr, b""])
     return proc
 
@@ -239,6 +241,27 @@ class TestWaitForAgentSsh:
 
 class TestStreamExtractSnapshot:
     @pytest.mark.asyncio
+    async def test_rejects_compressed_archive_over_cap_before_ssh(
+        self, tar_file, monkeypatch
+    ):
+        create = AsyncMock(side_effect=AssertionError("size cap precedes SSH"))
+        monkeypatch.setenv("SNAPSHOT_MAX_SIZE_GB", "1")
+        with (
+            patch(
+                "orchestrator.services.ssh_helpers.os.path.getsize",
+                return_value=(1024 * 1024 * 1024) + 1,
+            ),
+            patch("asyncio.create_subprocess_exec", new=create),
+        ):
+            rc, stderr = await stream_extract_snapshot(
+                "10.0.0.9", 22, tar_file, key_path="/tmp/k"
+            )
+
+        assert rc == 125
+        assert b"compressed-size cap" in stderr
+        create.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_streams_file_as_stdin_not_bytes(self, tar_file):
         fake = _fake_proc(returncode=0)
         with patch(
@@ -257,22 +280,30 @@ class TestStreamExtractSnapshot:
         assert not isinstance(stdin, (bytes, bytearray, memoryview))
         assert hasattr(stdin, "read") and hasattr(stdin, "fileno")
 
-        # communicate() must be awaited with NO input= (else it buffers in RAM).
-        fake.communicate.assert_awaited_once_with()
+        # The child is awaited directly while stderr is drained into a bounded
+        # tail; communicate(input=...) would buffer the archive in RAM.
+        fake.communicate.assert_not_awaited()
+        fake.wait.assert_awaited_once_with()
+        assert mock_exec.call_args.kwargs["stdout"] == asyncio.subprocess.DEVNULL
 
         # argv contract
         argv = mock_exec.call_args.args
         assert argv[0] == "ssh"
         assert "StrictHostKeyChecking=no" in argv
         assert "agent-host@10.0.0.9" in argv
-        assert argv[-1] == EXTRACT_REMOTE_CMD
+        remote_argv = shlex.split(argv[-1])
+        assert remote_argv[:2] == ["flock", "-w"]
+        assert remote_argv[3] == "/tmp/.srw-vm-remote-operation.lock"
+        assert "timeout" in remote_argv
+        assert remote_argv[-1] == EXTRACT_REMOTE_CMD
         # Verify extract command includes xattrs/acls for overlay whiteout
         # round-trip, wrapped in the `pipefail` guard that surfaces a masked
         # zstd decompression failure on restore (C1c).
-        assert EXTRACT_REMOTE_CMD == (
-            "bash -c 'set -o pipefail; "
-            'zstd -d | tar --xattrs --xattrs-include="*" --acls -xf - -C /\''
-        )
+        extract_body = shlex.split(EXTRACT_REMOTE_CMD)[2]
+        assert extract_body.startswith("set -o pipefail; zstd -dc | python3 -c ")
+        assert "limit=42949672960" in extract_body
+        assert "| tar --no-same-owner --no-same-permissions" in extract_body
+        assert '--xattrs-include="*" --acls -xf - -C /' in extract_body
 
     @pytest.mark.asyncio
     async def test_returns_rc_and_stderr_on_failure(self, tar_file):
@@ -291,11 +322,7 @@ class TestStreamExtractSnapshot:
         fingerprint = "SHA256:" + base64.b64encode(
             hashlib.sha256(key_blob).digest()
         ).decode("ascii").rstrip("=")
-        scan = _fake_proc()
-        scan.communicate.return_value = (
-            f"[10.0.0.9]:30022 ssh-ed25519 {encoded}\n".encode(),
-            b"",
-        )
+        scan = _fake_proc(stdout=f"[10.0.0.9]:30022 ssh-ed25519 {encoded}\n".encode())
         extract = _fake_proc()
 
         with patch(
@@ -324,11 +351,14 @@ class TestStreamExtractSnapshot:
             value for value in extract_argv if value.startswith("UserKnownHostsFile=")
         )
         assert known_hosts != "UserKnownHostsFile=/dev/null"
-        assert extract_argv[-1].startswith(
-            "flock -w 300 /tmp/.srw-terminal-snapshot-restore.lock "
-        )
-        assert "bash -o pipefail -c " in extract_argv[-1]
-        assert "zstd -d | tar" in extract_argv[-1]
+        remote_argv = shlex.split(extract_argv[-1])
+        assert remote_argv[:2] == ["flock", "-w"]
+        assert remote_argv[3] == "/tmp/.srw-vm-remote-operation.lock"
+        assert "timeout" in remote_argv
+        assert remote_argv[-5:-1] == ["bash", "-o", "pipefail", "-c"]
+        assert "zstd -dc | python3 -c" in remote_argv[-1]
+        assert "limit=42949672960" in remote_argv[-1]
+        assert "--no-same-owner" in remote_argv[-1]
 
     @pytest.mark.asyncio
     async def test_strict_extract_cancellation_kills_and_reaps_ssh_child(
@@ -367,7 +397,8 @@ class TestStreamExtractSnapshot:
                     require_pipefail=True,
                 )
 
-        extract.kill.assert_called_once_with()
+        extract.terminate.assert_called_once_with()
+        extract.kill.assert_not_called()
         assert extract.wait.await_count >= 1
 
     @pytest.mark.asyncio
@@ -409,7 +440,8 @@ class TestStreamExtractSnapshot:
 
         assert rc == 124
         assert b"timed out" in stderr
-        extract.kill.assert_called_once_with()
+        extract.terminate.assert_called_once_with()
+        extract.kill.assert_not_called()
         assert extract.wait.await_count >= 1
 
     @pytest.mark.asyncio
@@ -417,11 +449,7 @@ class TestStreamExtractSnapshot:
         self, tar_file
     ):
         encoded = base64.b64encode(b"different-host-key").decode("ascii")
-        scan = _fake_proc()
-        scan.communicate.return_value = (
-            f"[10.0.0.9]:30022 ssh-ed25519 {encoded}\n".encode(),
-            b"",
-        )
+        scan = _fake_proc(stdout=f"[10.0.0.9]:30022 ssh-ed25519 {encoded}\n".encode())
 
         with patch(
             "asyncio.create_subprocess_exec", new=AsyncMock(return_value=scan)
@@ -443,8 +471,9 @@ class TestStreamExtractSnapshot:
     async def test_cancelled_host_key_scan_kills_and_reaps_child(self, tar_file):
         scan = _fake_proc()
         scan.returncode = None
-        scan.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+        scan.stdout.read = AsyncMock(side_effect=asyncio.CancelledError)
         scan.kill = MagicMock()
+        scan.terminate = MagicMock()
         scan.wait = AsyncMock(return_value=0)
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=scan)):
@@ -458,8 +487,9 @@ class TestStreamExtractSnapshot:
                     require_pipefail=True,
                 )
 
-        scan.kill.assert_called_once_with()
-        scan.wait.assert_awaited_once_with()
+        scan.terminate.assert_called_once_with()
+        scan.kill.assert_not_called()
+        assert scan.wait.await_count >= 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -509,14 +539,15 @@ class TestStreamExtractSnapshot:
 class TestExtractRemoteCmdPipefail:
     """Extract-side ``set -o pipefail`` guard (§C1c).
 
-    Restore runs ``zstd -d | tar ...`` (see ``EXTRACT_REMOTE_CMD`` /
+    Restore runs ``zstd -dc | byte limiter | tar ...`` (see ``EXTRACT_REMOTE_CMD`` /
     ``EXTRACT_HOME_REMOTE_CMD`` above). A shell pipeline only reports the
     LAST stage's exit code; ``tar`` is already the last stage here, so
     today's pipeline correctly returns tar's own rc — but a ``zstd -d``
     failure on a corrupt/truncated archive is invisible whenever ``tar``
     still exits 0 (e.g. it received a short or empty stream and didn't
     itself error), so the restore is reported as a success on a partial or
-    empty extract.
+    empty extract. The middle stage additionally enforces an uncompressed-byte
+    cap before tar can write the stream.
 
     Unlike C1b's capture pipeline (``tar | zstd``, zstd last, where tar's
     benign rc==1 "file changed" warning had to be tolerated via a
@@ -530,21 +561,22 @@ class TestExtractRemoteCmdPipefail:
     def test_both_constants_are_wrapped_in_bash_c_pipefail(self):
         for cmd in (EXTRACT_REMOTE_CMD, EXTRACT_HOME_REMOTE_CMD):
             assert cmd.startswith("bash -c 'set -o pipefail; ")
-            assert "zstd -d | tar" in cmd
+            body = shlex.split(cmd)[2]
+            assert "zstd -dc | python3 -c" in body
+            assert "limit=42949672960" in body
+            assert "| tar --no-same-owner --no-same-permissions" in body
+            assert (
+                subprocess.run(["bash", "-n", "-c", cmd], check=False).returncode == 0
+            )
 
     def test_extract_remote_cmd_keeps_literal_star_and_valid_quoting(self):
-        # The `-c` body is single-quoted (see startswith check above), so
-        # the xattrs-include pattern must switch to double quotes to avoid
-        # prematurely closing the argument, while still reaching tar as a
-        # literal `*` (no local glob expansion). Exactly the opening and
-        # closing single quote should exist anywhere in the command — a
-        # stray single quote would prematurely close the `-c` argument and
-        # break the remote shell.
-        assert '--xattrs-include="*"' in EXTRACT_REMOTE_CMD
-        assert EXTRACT_REMOTE_CMD.count("'") == 2
+        body = shlex.split(EXTRACT_REMOTE_CMD)[2]
+        assert '--xattrs-include="*"' in body
+        assert body.endswith("-C /")
 
     def test_extract_home_remote_cmd_has_valid_quoting(self):
-        assert EXTRACT_HOME_REMOTE_CMD.count("'") == 2
+        body = shlex.split(EXTRACT_HOME_REMOTE_CMD)[2]
+        assert body.endswith("-C / home/agent-host")
 
     def test_pipefail_surfaces_masked_zstd_failure_under_real_bash(self):
         """Runs the actual pipeline SHAPE (``set -o pipefail; <stage0> |

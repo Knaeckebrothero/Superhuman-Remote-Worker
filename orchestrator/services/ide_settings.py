@@ -16,11 +16,8 @@ Storage shape::
         # ...other unrelated user settings live alongside "ide"...
     }
 
-``PostgresDB.update_user_settings`` is a SHALLOW top-level ``||`` JSONB merge, so
-writing ``{"ide": ...}`` replaces the whole ``ide`` value rather than deep-merging
-it. To avoid clobbering sibling files (or sibling ``ide`` sub-keys) we
-read-modify-write the entire ``ide`` subtree. This is safe because the only
-writer — the reconciler sweeper — is single-threaded.
+IDE components are merged atomically so a config/extensions reconciliation
+cannot erase a concurrently published content-addressed profile pointer.
 
 Conflict resolution is purely mtime-based: an applied file wins only if its mtime
 is strictly newer than what is stored. That makes ``apply_pulled_files`` order-
@@ -35,7 +32,16 @@ import base64
 import binascii
 import json
 import logging
+import os
+import shlex
 from typing import Any, Awaitable, Callable, Optional
+
+from services.blocking_effect import joined_async_call, joined_blocking_call
+from services.subprocess_effect import (
+    communicate_bounded,
+    create_owned_subprocess_exec,
+    stop_and_reap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,10 @@ DEFAULT_VM_SSH_PORT = 22
 # base64-encoded between them so arbitrary bytes/newlines survive transport.
 _FILE_MARKER = "__SRWFILE__"
 _END_MARKER = "__SRWEND__"
+_SSH_STDOUT_MAX_BYTES = 8 * 1024 * 1024
+_SSH_STDERR_MAX_BYTES = 64 * 1024
+_PROFILE_COMPRESSED_MAX_BYTES = 512 * 1024 * 1024
+_PROFILE_UNCOMPRESSED_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def build_pull_script() -> str:
@@ -195,7 +205,7 @@ async def _default_vsx_fetch(url: str) -> int:
         except urllib.error.HTTPError as e:
             return e.code
 
-    return await asyncio.to_thread(_get)
+    return await joined_blocking_call(_get)
 
 
 class OpenVsxClassifier:
@@ -328,30 +338,106 @@ def build_extension_install_script(items: dict[str, dict]) -> str:
 
 # Runner signature: (host, port, remote_script, key_path, timeout) -> (rc, stdout, stderr)
 SshRunner = Callable[..., Awaitable[tuple[int, Any, Any]]]
+RemoteMutationAuthority = Callable[[], Awaitable[tuple[str, int, str] | None]]
+
+
+async def _authorized_mutation_target(
+    ssh_host: str,
+    ssh_port: int,
+    expected_host_key_fingerprint: Optional[str],
+    mutation_authority: Optional[RemoteMutationAuthority],
+) -> tuple[str, int, Optional[str]] | None:
+    if mutation_authority is None:
+        return ssh_host, ssh_port, expected_host_key_fingerprint
+    target = await mutation_authority()
+    if not (
+        isinstance(target, tuple)
+        and len(target) == 3
+        and isinstance(target[0], str)
+        and target[0]
+        and isinstance(target[1], int)
+        and target[1] > 0
+        and isinstance(target[2], str)
+        and target[2]
+    ):
+        return None
+    return target
 
 
 async def _default_ssh_runner(
-    host: str, port: int, script: str, key_path: Optional[str] = None, timeout: int = 20
+    host: str,
+    port: int,
+    script: str,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    expected_host_key_fingerprint: Optional[str] = None,
 ) -> tuple[int, bytes, bytes]:
     """Run ``script`` on ``agent-host@host`` over SSH; return (rc, stdout, stderr)."""
     # Lazy import keeps this module import-light (no ssh/subprocess deps at import
     # time), mirroring ssh_helpers' own design.
-    from services.ssh_helpers import build_agent_ssh_cmd
-
-    cmd = build_agent_ssh_cmd(host, port, script, key_path=key_path)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    from services.ssh_helpers import (
+        bounded_remote_mutation_command,
+        build_agent_ssh_cmd,
+        pinned_agent_ssh_command,
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise
-    return proc.returncode, stdout, stderr
+
+    remote_script = bounded_remote_mutation_command(
+        script,
+        timeout_s=max(3, timeout - 1),
+    )
+
+    async def _run(cmd: list[str]) -> tuple[int, bytes, bytes]:
+        proc = await create_owned_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await joined_async_call(
+                communicate_bounded(
+                    proc,
+                    timeout=timeout,
+                    stdout_limit=_SSH_STDOUT_MAX_BYTES,
+                    stderr_limit=_SSH_STDERR_MAX_BYTES,
+                )
+            )
+        except BaseException:
+            if proc.returncode is None:
+                await stop_and_reap(proc)
+            raise
+        return proc.returncode, stdout, stderr
+
+    if expected_host_key_fingerprint is None:
+        return await _run(
+            build_agent_ssh_cmd(host, port, remote_script, key_path=key_path)
+        )
+    async with pinned_agent_ssh_command(
+        host,
+        port,
+        remote_script,
+        key_path=key_path,
+        expected_host_key_fingerprint=expected_host_key_fingerprint,
+    ) as cmd:
+        return await _run(cmd)
+
+
+async def _drain_stderr_tail(reader: asyncio.StreamReader) -> bytes:
+    import inspect
+
+    tail = bytearray()
+    while True:
+        value = reader.read(64 * 1024)
+        if not inspect.isawaitable(value):
+            return bytes(tail)
+        chunk = await value
+        if not isinstance(chunk, (bytes, bytearray)):
+            return bytes(tail)
+        if not chunk:
+            return bytes(tail)
+        tail.extend(chunk)
+        if len(tail) > _SSH_STDERR_MAX_BYTES:
+            del tail[: len(tail) - _SSH_STDERR_MAX_BYTES]
 
 
 async def pull_ide_config(
@@ -360,6 +446,8 @@ async def pull_ide_config(
     *,
     key_path: Optional[str] = None,
     timeout: int = 20,
+    expected_host_key_fingerprint: Optional[str] = None,
+    capture_authority: Optional[RemoteMutationAuthority] = None,
     _runner: Optional[SshRunner] = None,
 ) -> dict[str, dict]:
     """Read the code-server config files from a workspace over SSH.
@@ -370,9 +458,31 @@ async def pull_ide_config(
     """
     runner = _runner or _default_ssh_runner
     try:
-        rc, stdout, stderr = await runner(
-            ssh_host, ssh_port, build_pull_script(), key_path=key_path, timeout=timeout
+        target = await _authorized_mutation_target(
+            ssh_host,
+            ssh_port,
+            expected_host_key_fingerprint,
+            capture_authority,
         )
+        if target is None:
+            return {}
+        target_host, target_port, target_fingerprint = target
+        kwargs: dict[str, Any] = {"key_path": key_path, "timeout": timeout}
+        if target_fingerprint is not None:
+            kwargs["expected_host_key_fingerprint"] = target_fingerprint
+        rc, stdout, stderr = await runner(
+            target_host, target_port, build_pull_script(), **kwargs
+        )
+        if capture_authority is not None and (
+            await _authorized_mutation_target(
+                ssh_host,
+                ssh_port,
+                expected_host_key_fingerprint,
+                capture_authority,
+            )
+            != target
+        ):
+            return {}
     except Exception as e:  # noqa: BLE001 — must not abort the sweep
         logger.warning(
             "ide_settings: pull failed for %s:%s — %s", ssh_host, ssh_port, e
@@ -403,6 +513,7 @@ async def seed_ide_config(
     *,
     key_path: Optional[str] = None,
     timeout: int = 20,
+    expected_host_key_fingerprint: Optional[str] = None,
     _runner: Optional[SshRunner] = None,
 ) -> bool:
     """Write the user's stored config into a workspace over SSH (restore path).
@@ -413,12 +524,11 @@ async def seed_ide_config(
         return True
     runner = _runner or _default_ssh_runner
     try:
+        kwargs: dict[str, Any] = {"key_path": key_path, "timeout": timeout}
+        if expected_host_key_fingerprint is not None:
+            kwargs["expected_host_key_fingerprint"] = expected_host_key_fingerprint
         rc, _stdout, stderr = await runner(
-            ssh_host,
-            ssh_port,
-            build_seed_script(files),
-            key_path=key_path,
-            timeout=timeout,
+            ssh_host, ssh_port, build_seed_script(files), **kwargs
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
@@ -445,6 +555,8 @@ async def seed_ide_config_for_user(
     ssh_port: int,
     *,
     key_path: Optional[str] = None,
+    expected_host_key_fingerprint: Optional[str] = None,
+    mutation_authority: Optional[RemoteMutationAuthority] = None,
     _runner: Optional[SshRunner] = None,
 ) -> bool:
     """Seed a user's stored code-server config + extensions into a workspace over
@@ -466,10 +578,26 @@ async def seed_ide_config_for_user(
     script = (
         build_seed_script(files) + "\n" + build_extension_install_script(extensions)
     )
+    target = await _authorized_mutation_target(
+        ssh_host,
+        ssh_port,
+        expected_host_key_fingerprint,
+        mutation_authority,
+    )
+    if target is None:
+        return False
+    ssh_host, ssh_port, expected_host_key_fingerprint = target
+    if mutation_authority is not None and expected_host_key_fingerprint is None:
+        return False
+    if expected_host_key_fingerprint is not None:
+        # An authority-bound restore cannot let the background extension tail
+        # outlive its renewable lease or pinned SSH transport.
+        script += "\nwait\n"
     try:
-        rc, _out, stderr = await runner(
-            ssh_host, ssh_port, script, key_path=key_path, timeout=60
-        )
+        kwargs: dict[str, Any] = {"key_path": key_path, "timeout": 60}
+        if expected_host_key_fingerprint is not None:
+            kwargs["expected_host_key_fingerprint"] = expected_host_key_fingerprint
+        rc, _out, stderr = await runner(ssh_host, ssh_port, script, **kwargs)
     except Exception as e:  # noqa: BLE001
         logger.warning(
             "ide_settings: seed-for-user failed for %s:%s — %s", ssh_host, ssh_port, e
@@ -505,6 +633,61 @@ def _coerce_context(context: Any) -> dict:
     return context or {}
 
 
+def is_kubernetes_capture_context(context: Any) -> bool:
+    """Return whether a capture row names an unfenced Kubernetes runtime."""
+
+    from src.core.backends.factory import is_vm_backend
+
+    parsed = _coerce_context(context)
+    backend = ((parsed.get("config_override") or {}).get("workspace") or {}).get(
+        "backend"
+    )
+    if backend is not None and is_vm_backend(backend):
+        return False
+    container = parsed.get("workspace_container") or {}
+    if isinstance(container, dict):
+        provisioner = str(container.get("provisioner") or "").strip().lower()
+        if provisioner == "k8s":
+            return True
+        if provisioner != "docker" and any(
+            container.get(key)
+            for key in (
+                "pod_name",
+                "pod_ip",
+                "host",
+                "_runtime_incarnation",
+                "_workspace_generation",
+            )
+        ):
+            return True
+
+    ide_session = parsed.get("ide_session") or {}
+    if not isinstance(ide_session, dict):
+        return False
+    restore_type = str(ide_session.get("restore_type") or "").strip().lower()
+    if restore_type in {"vm", "container"}:
+        return False
+    if restore_type == "k8s_container":
+        return True
+    return bool(
+        ide_session.get("pod_name")
+        or ide_session.get("pod_ip")
+        or ide_session.get("host")
+        or ide_session.get("_runtime_incarnation")
+        or ide_session.get("status") in {"active", "idle", "restoring"}
+    )
+
+
+def capture_safe_workspaces(workspaces: list[dict]) -> list[dict]:
+    """Exclude Kubernetes rows before periodic capture can perform I/O."""
+
+    return [
+        workspace
+        for workspace in workspaces
+        if not is_kubernetes_capture_context(workspace.get("context"))
+    ]
+
+
 async def evict_dead_workspaces(
     workspaces: list[dict], provisioner: Any, db: Any
 ) -> list[dict]:
@@ -527,7 +710,11 @@ async def evict_dead_workspaces(
     for ws in workspaces:
         entity_type = ws.get("entity_type")
         try:
-            container = _coerce_context(ws.get("context")).get("workspace_container")
+            context = _coerce_context(ws.get("context"))
+            if is_vm_capture_context(context):
+                kept.append(ws)
+                continue
+            container = context.get("workspace_container")
             if not isinstance(container, dict) or not (
                 container.get("pod_name") or container.get("pod_ip")
             ):
@@ -592,7 +779,14 @@ async def reconcile_ide_settings(
         user_id = ws.get("user_id")
         if not user_id:
             continue
-        target = resolve_ssh_target(_coerce_context(ws.get("context")))
+        context = _coerce_context(ws.get("context"))
+        if is_kubernetes_capture_context(context):
+            logger.info(
+                "ide_settings: refusing Kubernetes settings capture without "
+                "durable exact-runtime capture authority"
+            )
+            continue
+        target = resolve_ssh_target(context)
         if not target:
             continue
         host, port = target
@@ -633,18 +827,38 @@ async def list_ide_extensions(
     *,
     key_path: Optional[str] = None,
     timeout: int = 20,
+    expected_host_key_fingerprint: Optional[str] = None,
+    capture_authority: Optional[RemoteMutationAuthority] = None,
     _runner: Optional[SshRunner] = None,
 ) -> dict[str, dict]:
     """SSH into a workspace and return installed extensions. Never raises."""
     runner = _runner or _default_ssh_runner
     try:
-        rc, stdout, _ = await runner(
+        target = await _authorized_mutation_target(
             ssh_host,
             ssh_port,
-            build_extensions_list_script(),
-            key_path=key_path,
-            timeout=timeout,
+            expected_host_key_fingerprint,
+            capture_authority,
         )
+        if target is None:
+            return {}
+        target_host, target_port, target_fingerprint = target
+        kwargs: dict[str, Any] = {"key_path": key_path, "timeout": timeout}
+        if target_fingerprint is not None:
+            kwargs["expected_host_key_fingerprint"] = target_fingerprint
+        rc, stdout, _ = await runner(
+            target_host, target_port, build_extensions_list_script(), **kwargs
+        )
+        if capture_authority is not None and (
+            await _authorized_mutation_target(
+                ssh_host,
+                ssh_port,
+                expected_host_key_fingerprint,
+                capture_authority,
+            )
+            != target
+        ):
+            return {}
     except Exception as e:  # noqa: BLE001
         logger.warning(
             "ide_settings: ext-list failed for %s:%s — %s", ssh_host, ssh_port, e
@@ -674,7 +888,14 @@ async def reconcile_extensions(
         user_id = ws.get("user_id")
         if not user_id:
             continue
-        target = resolve_ssh_target(_coerce_context(ws.get("context")))
+        context = _coerce_context(ws.get("context"))
+        if is_kubernetes_capture_context(context):
+            logger.info(
+                "ide_settings: refusing Kubernetes extension capture without "
+                "durable exact-runtime capture authority"
+            )
+            continue
+        target = resolve_ssh_target(context)
         if not target:
             continue
         host, port = target
@@ -706,6 +927,111 @@ async def reconcile_extensions(
     return changed_total
 
 
+def is_vm_capture_context(context: Any) -> bool:
+    """Use the canonical selected tier; never prefer stale opposite residue."""
+
+    from src.shared.workspace_contract import (
+        vm_mode_from_env,
+        workspace_contract_authority_identity,
+    )
+
+    parsed = _coerce_context(context)
+    selected = workspace_contract_authority_identity(
+        {
+            "context": parsed,
+            "config_override": parsed.get("config_override"),
+        },
+        vm_mode=vm_mode_from_env(),
+    )
+    return bool(selected and selected[0] == "vm")
+
+
+async def reconcile_vm_ide_workspace(
+    *,
+    store: "IdeSettingsStore",
+    workspace: dict[str, Any],
+    db: Any,
+    vm_provisioner: Any,
+    classifier: "OpenVsxClassifier",
+    profile_store: Any = None,
+) -> int:
+    """Capture one VM under one renewable, host-key-pinned exact receipt."""
+
+    from services.vm_remote_operation import (
+        VMRemoteOperationLeaseLost,
+        VMRemoteOperationUnavailable,
+        claim_vm_remote_operation,
+    )
+
+    owner_id = str(workspace.get("id") or "")
+    owner_kind = str(workspace.get("entity_type") or "")
+    user_id = str(workspace.get("user_id") or "")
+    if (
+        not owner_id
+        or owner_kind not in {"job", "thread"}
+        or not user_id
+        or not is_vm_capture_context(workspace.get("context"))
+    ):
+        return 0
+    try:
+        lease = await claim_vm_remote_operation(
+            db=db,
+            provisioner=vm_provisioner,
+            owner_id=owner_id,
+            owner_kind=owner_kind,
+            operation_kind="ide_settings",
+        )
+        async with lease:
+            identity = lease.identity
+            pulled = await pull_ide_config(
+                identity.ssh_host,
+                identity.ssh_port,
+                expected_host_key_fingerprint=identity.ssh_host_key_fingerprint,
+                capture_authority=lease.revalidate,
+            )
+            updated: list[str] = []
+            if pulled and await lease.revalidate() is not None:
+                updated = await store.apply_pulled_files(user_id, pulled)
+            listed = await list_ide_extensions(
+                identity.ssh_host,
+                identity.ssh_port,
+                expected_host_key_fingerprint=identity.ssh_host_key_fingerprint,
+                capture_authority=lease.revalidate,
+            )
+            if listed and await lease.revalidate() is not None:
+                items: dict[str, dict] = {}
+                for ext_id, info in listed.items():
+                    items[ext_id] = {
+                        "version": info.get("version", ""),
+                        "source": await classifier.classify(
+                            ext_id, info.get("version", "")
+                        ),
+                        "theme": bool(info.get("theme")),
+                    }
+                await store.apply_extensions(user_id, items)
+            if profile_store is not None:
+                await capture_ide_profile(
+                    store,
+                    user_id,
+                    identity.ssh_host,
+                    identity.ssh_port,
+                    profile_store,
+                    expected_host_key_fingerprint=(identity.ssh_host_key_fingerprint),
+                    capture_authority=lease.revalidate,
+                    vm_lease=lease,
+                )
+            if await lease.revalidate() is None:
+                return 0
+            return len(updated)
+    except (VMRemoteOperationUnavailable, VMRemoteOperationLeaseLost):
+        logger.info(
+            "ide_settings: exact VM capture unavailable for %s %s",
+            owner_kind,
+            owner_id,
+        )
+        return 0
+
+
 # Tar-fn signature: (host, port, remote_path, local_path, *, key_path) -> ok
 TarFn = Callable[..., Awaitable[bool]]
 
@@ -718,6 +1044,7 @@ async def _ssh_tar_to_file(
     *,
     key_path: Optional[str] = None,
     timeout: int = 120,
+    expected_host_key_fingerprint: Optional[str] = None,
 ) -> bool:
     """Stream ``ssh agent-host@host 'tar -cf - <remote_path> | zstd' > local`` —
     the snapshot_service transport, narrowed to one path. The remote command is
@@ -726,6 +1053,8 @@ async def _ssh_tar_to_file(
     knowledge-base/knowledge/features/workspace_durability_tiering.md §C1d). Returns False on error.
     """
     from services import resolve_ssh_key_path
+    from services.ssh_helpers import _scan_pinned_host_key, build_agent_ssh_cmd
+    import tempfile
 
     kp = key_path if key_path is not None else resolve_ssh_key_path()
     # tar | zstd only reports the LAST stage's exit code, so a fatal tar
@@ -735,46 +1064,87 @@ async def _ssh_tar_to_file(
     # benign "file changed as we read it" warning on a live workspace) with
     # a clean zstd; reject tar rc>=2 or any zstd failure. The `.tar.zst`
     # byte stream to stdout is unchanged — only the exit code's meaning is.
-    remote = (
-        "bash -c 'tar -cf - " + remote_path + " 2>/dev/null | zstd -1 -T0; "
+    quoted_remote_path = shlex.quote(remote_path)
+    capture = (
+        "__n=$(du -sb -- "
+        + quoted_remote_path
+        + " 2>/dev/null | cut -f1); "
+        + f'[ -n "$__n" ] && [ "$__n" -le {_PROFILE_UNCOMPRESSED_MAX_BYTES} ] || exit 1; '
+        + "tar -cf - -- "
+        + quoted_remote_path
+        + " 2>/dev/null | zstd -1 -T0; "
         '__ps=("${PIPESTATUS[@]}"); '
-        'if [ "${__ps[1]}" -ne 0 ] || [ "${__ps[0]}" -ge 2 ]; then exit 1; else exit 0; fi\''
+        'if [ "${__ps[1]}" -ne 0 ] || [ "${__ps[0]}" -ge 2 ]; then exit 1; else exit 0; fi'
     )
-    cmd = [
-        "ssh",
-        *(["-i", kp] if kp else []),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=10",
-        "-p",
-        str(ssh_port),
-        f"agent-host@{ssh_host}",
+    remote = "bash -c " + shlex.quote(capture)
+    known_hosts_path: str | None = None
+    if expected_host_key_fingerprint is not None:
+        known_host, _ = await _scan_pinned_host_key(
+            ssh_host, ssh_port, expected_host_key_fingerprint
+        )
+        if known_host is None:
+            return False
+        known_hosts = tempfile.NamedTemporaryFile(
+            mode="w", encoding="ascii", prefix="ide-profile-host-", delete=False
+        )
+        known_hosts.write(known_host + "\n")
+        known_hosts.close()
+        known_hosts_path = known_hosts.name
+    cmd = build_agent_ssh_cmd(
+        ssh_host,
+        ssh_port,
         remote,
-    ]
-    proc = await asyncio.create_subprocess_exec(
+        key_path=kp,
+        known_hosts_path=known_hosts_path,
+        batch_mode=True,
+    )
+    proc = await create_owned_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
+    stderr_task = asyncio.create_task(_drain_stderr_tail(proc.stderr))
     total = 0
+    succeeded = False
     try:
-        with open(local_path, "wb") as f:
-            while True:
-                chunk = await asyncio.wait_for(
-                    proc.stdout.read(1 << 20), timeout=timeout
-                )
-                if not chunk:
-                    break
-                total += len(chunk)
-                f.write(chunk)
-        await proc.wait()
-    except Exception as e:  # noqa: BLE001
+        async with asyncio.timeout(timeout):
+            with open(local_path, "wb") as f:
+                while True:
+                    chunk = await proc.stdout.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _PROFILE_COMPRESSED_MAX_BYTES:
+                        raise ValueError("IDE profile archive exceeds size cap")
+                    f.write(chunk)
+            await proc.wait()
+        stderr = await stderr_task
+        succeeded = proc.returncode == 0 and total > 0
+    except BaseException as e:  # noqa: BLE001
+        await stop_and_reap(proc)
+        await asyncio.gather(stderr_task, return_exceptions=True)
+        if isinstance(e, asyncio.CancelledError):
+            raise
         logger.warning(
             "ide_settings: tar capture failed %s:%s — %s", ssh_host, ssh_port, e
         )
         return False
-    return proc.returncode == 0 and total > 0
+    finally:
+        if known_hosts_path is not None:
+            try:
+                os.unlink(known_hosts_path)
+            except OSError:
+                pass
+        if not succeeded:
+            try:
+                os.unlink(local_path)
+            except FileNotFoundError:
+                pass
+    if not succeeded:
+        logger.warning(
+            "ide_settings: tar capture rc=%s %s",
+            proc.returncode,
+            stderr.decode(errors="replace")[-200:],
+        )
+    return succeeded
 
 
 async def _resolve_ext_dir(
@@ -784,6 +1154,7 @@ async def _resolve_ext_dir(
     version: str,
     *,
     key_path: Optional[str] = None,
+    expected_host_key_fingerprint: Optional[str] = None,
     _runner: Optional[SshRunner] = None,
 ) -> Optional[str]:
     """Return the on-disk extension folder name for ``ext_id@version``.
@@ -794,16 +1165,19 @@ async def _resolve_ext_dir(
     ``2.0.13``). Returns the first match, or ``None`` if neither exists. Never
     raises — used only to locate ``bytes``-source extensions for byte-copy."""
     runner = _runner or _default_ssh_runner
+    exact_folder = shlex.quote(f"{ext_id}-{version}")
+    folder_glob = shlex.quote(f"{ext_id}-{version}-") + "*"
     script = (
         f"cd {EXTENSIONS_DIR} 2>/dev/null || exit 0\n"
-        f'for d in "{ext_id}-{version}" "{ext_id}-{version}"-* ; do\n'
+        f"for d in {exact_folder} {folder_glob} ; do\n"
         '  [ -d "$d" ] && { printf \'%s\\n\' "$d"; break; }\n'
         "done\n"
     )
     try:
-        rc, out, _ = await runner(
-            ssh_host, ssh_port, script, key_path=key_path, timeout=20
-        )
+        kwargs: dict[str, Any] = {"key_path": key_path, "timeout": 20}
+        if expected_host_key_fingerprint is not None:
+            kwargs["expected_host_key_fingerprint"] = expected_host_key_fingerprint
+        rc, out, _ = await runner(ssh_host, ssh_port, script, **kwargs)
     except Exception:  # noqa: BLE001
         return None
     if rc != 0:
@@ -814,7 +1188,15 @@ async def _resolve_ext_dir(
         else (out or "")
     )
     name = text.strip().split("\n")[0].strip() if text.strip() else ""
-    return name or None
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\x00" in name
+        or len(name) > 512
+    ):
+        return None
+    return name
 
 
 async def capture_ide_profile(
@@ -825,8 +1207,11 @@ async def capture_ide_profile(
     profile_store: Any,
     *,
     key_path: Optional[str] = None,
+    expected_host_key_fingerprint: Optional[str] = None,
+    capture_authority: Optional[RemoteMutationAuthority] = None,
     _runner: Optional[SshRunner] = None,
     _tar_fn: Optional[TarFn] = None,
+    vm_lease: Any = None,
 ) -> int:
     """If the workspace's extensions/globalStorage changed since last capture,
     tar globalStorage (and any ``bytes`` extension's folder) to the S3 profile
@@ -837,9 +1222,31 @@ async def capture_ide_profile(
     runner = _runner or _default_ssh_runner
     tar_fn = _tar_fn or _ssh_tar_to_file
     try:
-        rc, out, _ = await runner(
-            ssh_host, ssh_port, build_signature_script(), key_path=key_path, timeout=30
+        target = await _authorized_mutation_target(
+            ssh_host,
+            ssh_port,
+            expected_host_key_fingerprint,
+            capture_authority,
         )
+        if target is None:
+            return 0
+        target_host, target_port, target_fingerprint = target
+        kwargs: dict[str, Any] = {"key_path": key_path, "timeout": 30}
+        if target_fingerprint is not None:
+            kwargs["expected_host_key_fingerprint"] = target_fingerprint
+        rc, out, _ = await runner(
+            target_host, target_port, build_signature_script(), **kwargs
+        )
+        if capture_authority is not None and (
+            await _authorized_mutation_target(
+                ssh_host,
+                ssh_port,
+                expected_host_key_fingerprint,
+                capture_authority,
+            )
+            != target
+        ):
+            return 0
     except Exception:  # noqa: BLE001
         return 0
     if rc != 0:
@@ -853,35 +1260,139 @@ async def capture_ide_profile(
         return 0
 
     uploaded = 0
+    complete = True
     # globalStorage bundle
+    global_name = "globalStorage"
+    expected_global = await store.get_profile_pointer(user_id, global_name)
     with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
+        target = await _authorized_mutation_target(
+            ssh_host,
+            ssh_port,
+            expected_host_key_fingerprint,
+            capture_authority,
+        )
+        if target is None:
+            return uploaded
+        target_host, target_port, target_fingerprint = target
+        tar_kwargs: dict[str, Any] = {"key_path": key_path}
+        if target_fingerprint is not None:
+            tar_kwargs["expected_host_key_fingerprint"] = target_fingerprint
         if tar_fn and await tar_fn(
-            ssh_host, ssh_port, GLOBAL_STORAGE_DIR, tmp.name, key_path=key_path
+            target_host, target_port, GLOBAL_STORAGE_DIR, tmp.name, **tar_kwargs
         ):
-            await profile_store.put_globalstorage(user_id, tmp.name)
-            uploaded += 1
+            if capture_authority is not None and (
+                await _authorized_mutation_target(
+                    ssh_host,
+                    ssh_port,
+                    expected_host_key_fingerprint,
+                    capture_authority,
+                )
+                != target
+            ):
+                return uploaded
+            pointer = await profile_store.put_globalstorage(user_id, tmp.name)
+            if not isinstance(pointer, dict):
+                uploaded += 1
+            elif await store.publish_profile_pointer(
+                user_id,
+                global_name,
+                expected_pointer=expected_global,
+                pointer=pointer,
+                vm_lease=vm_lease,
+            ):
+                uploaded += 1
+            else:
+                complete = False
+        else:
+            complete = False
     # bytes extensions (only those classified bytes + not already stored)
     items = await store.get_extensions(user_id)
     for ext_id, info in items.items():
         if info.get("source") != "bytes":
             continue
         version = info.get("version", "")
-        if await profile_store.ext_bytes_exists(user_id, ext_id, version):
+        pointer_name = f"extension:{ext_id}@{version}"
+        expected_pointer = await store.get_profile_pointer(user_id, pointer_name)
+        if expected_pointer is not None:
             continue
+        target = await _authorized_mutation_target(
+            ssh_host,
+            ssh_port,
+            expected_host_key_fingerprint,
+            capture_authority,
+        )
+        if target is None:
+            return uploaded
+        target_host, target_port, target_fingerprint = target
         folder = await _resolve_ext_dir(
-            ssh_host, ssh_port, ext_id, version, key_path=key_path, _runner=runner
+            target_host,
+            target_port,
+            ext_id,
+            version,
+            key_path=key_path,
+            expected_host_key_fingerprint=target_fingerprint,
+            _runner=runner,
         )
         if not folder:
+            complete = False
             continue
         with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
             remote = f"{EXTENSIONS_DIR}/{folder}"
+            target = await _authorized_mutation_target(
+                ssh_host,
+                ssh_port,
+                expected_host_key_fingerprint,
+                capture_authority,
+            )
+            if target is None:
+                return uploaded
+            target_host, target_port, target_fingerprint = target
+            tar_kwargs = {"key_path": key_path}
+            if target_fingerprint is not None:
+                tar_kwargs["expected_host_key_fingerprint"] = target_fingerprint
             if tar_fn and await tar_fn(
-                ssh_host, ssh_port, remote, tmp.name, key_path=key_path
+                target_host, target_port, remote, tmp.name, **tar_kwargs
             ):
-                await profile_store.put_ext_bytes(user_id, ext_id, version, tmp.name)
-                uploaded += 1
+                if capture_authority is not None and (
+                    await _authorized_mutation_target(
+                        ssh_host,
+                        ssh_port,
+                        expected_host_key_fingerprint,
+                        capture_authority,
+                    )
+                    != target
+                ):
+                    return uploaded
+                pointer = await profile_store.put_ext_bytes(
+                    user_id, ext_id, version, tmp.name
+                )
+                if not isinstance(pointer, dict):
+                    uploaded += 1
+                elif await store.publish_profile_pointer(
+                    user_id,
+                    pointer_name,
+                    expected_pointer=expected_pointer,
+                    pointer=pointer,
+                    vm_lease=vm_lease,
+                ):
+                    uploaded += 1
+                else:
+                    complete = False
+            else:
+                complete = False
 
-    await store.set_ext_signature(user_id, sig)
+    if capture_authority is not None and (
+        await _authorized_mutation_target(
+            ssh_host,
+            ssh_port,
+            expected_host_key_fingerprint,
+            capture_authority,
+        )
+        is None
+    ):
+        return uploaded
+    if complete:
+        await store.set_ext_signature(user_id, sig)
     return uploaded
 
 
@@ -892,6 +1403,7 @@ async def _ssh_untar_from_file(
     *,
     key_path: Optional[str] = None,
     timeout: int = 120,
+    expected_host_key_fingerprint: Optional[str] = None,
 ) -> bool:
     """Reverse of :func:`_ssh_tar_to_file`: stream a local ``.tar.zst`` into the
     workspace via ``ssh ... 'zstd -d | tar -xf - -C /'``. The archive was created
@@ -901,57 +1413,109 @@ async def _ssh_untar_from_file(
     decompression failure on a corrupt archive can't hide behind tar's own rc
     (§C1d). Returns False on error."""
     from services import resolve_ssh_key_path
+    from services.ssh_helpers import (
+        bounded_remote_mutation_command,
+        build_agent_ssh_cmd,
+        pinned_agent_ssh_command,
+    )
+    import os
+
+    try:
+        if os.path.getsize(local_path) > _PROFILE_COMPRESSED_MAX_BYTES:
+            return False
+    except OSError:
+        return False
 
     kp = key_path if key_path is not None else resolve_ssh_key_path()
-    # zstd -d | tar only reports the LAST stage's (tar's) exit code, masking
-    # a corrupt/truncated archive's decompression failure — the same pattern
-    # C1c fixed for the shared ssh_helpers extract commands. Same verdict
-    # shape as the capture side: accept tar rc in {0, 1}; reject tar rc>=2 or
-    # any zstd failure. stdin/stdout data flow is unchanged.
-    remote = (
-        "bash -c 'zstd -d | tar -xf - -C /; "
-        '__ps=("${PIPESTATUS[@]}"); '
-        'if [ "${__ps[0]}" -ne 0 ] || [ "${__ps[1]}" -ge 2 ]; then exit 1; else exit 0; fi\''
+    # Bound decompressed bytes *before* tar sees them. A compressed-size cap
+    # alone admits a tiny high-ratio archive which can fill the workspace
+    # disk. The middle filter exits before forwarding the overflowing chunk;
+    # PIPESTATUS then rejects truncation even if tar happened to accept it.
+    limiter = (
+        "import sys\n"
+        f"limit={_PROFILE_UNCOMPRESSED_MAX_BYTES}\n"
+        "total=0\n"
+        "while True:\n"
+        " chunk=sys.stdin.buffer.read(1048576)\n"
+        " if not chunk: break\n"
+        " total += len(chunk)\n"
+        " if total > limit: raise SystemExit(73)\n"
+        " sys.stdout.buffer.write(chunk)\n"
     )
-    cmd = [
-        "ssh",
-        *(["-i", kp] if kp else []),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=10",
-        "-p",
-        str(ssh_port),
-        f"agent-host@{ssh_host}",
+    extraction = (
+        "zstd -dc | python3 -c "
+        + shlex.quote(limiter)
+        + " | tar --no-same-owner --no-same-permissions --no-overwrite-dir "
+        "-xf - -C /; "
+        '__ps=("${PIPESTATUS[@]}"); '
+        'if [ "${__ps[0]}" -ne 0 ] || [ "${__ps[1]}" -ne 0 ] '
+        '|| [ "${__ps[2]}" -ge 2 ]; then exit 1; else exit 0; fi'
+    )
+    remote = bounded_remote_mutation_command(
+        extraction,
+        timeout_s=max(3, timeout - 1),
+    )
+
+    async def _run(cmd: list[str]) -> bool:
+        proc = None
+        stderr_task: asyncio.Task[bytes] | None = None
+        try:
+            proc = await create_owned_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stderr_task = asyncio.create_task(_drain_stderr_tail(proc.stderr))
+
+            async def _feed() -> None:
+                with open(local_path, "rb") as f:
+                    while True:
+                        chunk = f.read(1 << 20)
+                        if not chunk:
+                            break
+                        proc.stdin.write(chunk)
+                        await proc.stdin.drain()
+                proc.stdin.close()
+
+            async def _complete() -> bytes:
+                async with asyncio.timeout(timeout):
+                    await asyncio.gather(_feed(), proc.wait())
+                    return await stderr_task
+
+            stderr = await joined_async_call(_complete())
+        except BaseException as error:
+            if proc is not None:
+                await stop_and_reap(proc)
+            if stderr_task is not None:
+                await asyncio.gather(stderr_task, return_exceptions=True)
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            logger.warning(
+                "ide_settings: untar seed failed %s:%s — %s",
+                ssh_host,
+                ssh_port,
+                error,
+            )
+            return False
+        if proc.returncode != 0:
+            logger.warning(
+                "ide_settings: untar seed rc=%s — %s",
+                proc.returncode,
+                stderr.decode(errors="replace")[-200:],
+            )
+        return proc.returncode == 0
+
+    if expected_host_key_fingerprint is None:
+        return await _run(build_agent_ssh_cmd(ssh_host, ssh_port, remote, key_path=kp))
+    async with pinned_agent_ssh_command(
+        ssh_host,
+        ssh_port,
         remote,
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        async def _feed() -> None:
-            with open(local_path, "rb") as f:
-                while True:
-                    chunk = f.read(1 << 20)
-                    if not chunk:
-                        break
-                    proc.stdin.write(chunk)
-                    await proc.stdin.drain()
-            proc.stdin.close()
-
-        await asyncio.wait_for(asyncio.gather(_feed(), proc.wait()), timeout=timeout)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "ide_settings: untar seed failed %s:%s — %s", ssh_host, ssh_port, e
-        )
-        return False
-    return proc.returncode == 0
+        key_path=kp,
+        expected_host_key_fingerprint=expected_host_key_fingerprint,
+    ) as cmd:
+        return await _run(cmd)
 
 
 async def seed_ide_profile(
@@ -961,7 +1525,10 @@ async def seed_ide_profile(
     ssh_port: int,
     profile_store: Any,
     ext_items: dict,
+    profile_pointers: dict[str, dict[str, Any]] | None = None,
     key_path: Optional[str] = None,
+    expected_host_key_fingerprint: Optional[str] = None,
+    mutation_authority: Optional[RemoteMutationAuthority] = None,
     _runner: Optional[SshRunner] = None,
     _push_fn: Optional[Any] = None,
 ) -> bool:
@@ -972,26 +1539,82 @@ async def seed_ide_profile(
 
     runner = _runner or _default_ssh_runner
     push = _push_fn or _ssh_untar_from_file
+    pointers = profile_pointers or {}
     try:
         with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
-            if await profile_store.get_globalstorage(user_id, tmp.name):
-                await push(ssh_host, ssh_port, tmp.name, key_path=key_path)
+            global_pointer = pointers.get("globalStorage")
+            got_global = (
+                await profile_store.get_globalstorage(user_id, tmp.name, global_pointer)
+                if global_pointer is not None
+                else await profile_store.get_globalstorage(user_id, tmp.name)
+            )
+            if got_global:
+                target = await _authorized_mutation_target(
+                    ssh_host,
+                    ssh_port,
+                    expected_host_key_fingerprint,
+                    mutation_authority,
+                )
+                if target is None:
+                    return False
+                target_host, target_port, target_fingerprint = target
+                push_kwargs: dict[str, Any] = {"key_path": key_path}
+                if target_fingerprint is not None:
+                    push_kwargs["expected_host_key_fingerprint"] = target_fingerprint
+                await push(target_host, target_port, tmp.name, **push_kwargs)
         for ext_id, info in (ext_items or {}).items():
             if info.get("source") != "bytes":
                 continue
             with tempfile.NamedTemporaryFile(suffix=".tar.zst", delete=True) as tmp:
-                if await profile_store.get_ext_bytes(
-                    user_id, ext_id, info.get("version", ""), tmp.name
-                ):
-                    await push(ssh_host, ssh_port, tmp.name, key_path=key_path)
+                pointer = pointers.get(f"extension:{ext_id}@{info.get('version', '')}")
+                got_extension = (
+                    await profile_store.get_ext_bytes(
+                        user_id,
+                        ext_id,
+                        info.get("version", ""),
+                        tmp.name,
+                        pointer,
+                    )
+                    if pointer is not None
+                    else await profile_store.get_ext_bytes(
+                        user_id, ext_id, info.get("version", ""), tmp.name
+                    )
+                )
+                if got_extension:
+                    target = await _authorized_mutation_target(
+                        ssh_host,
+                        ssh_port,
+                        expected_host_key_fingerprint,
+                        mutation_authority,
+                    )
+                    if target is None:
+                        return False
+                    target_host, target_port, target_fingerprint = target
+                    push_kwargs = {"key_path": key_path}
+                    if target_fingerprint is not None:
+                        push_kwargs["expected_host_key_fingerprint"] = (
+                            target_fingerprint
+                        )
+                    await push(target_host, target_port, tmp.name, **push_kwargs)
         # chown + sentinel
-        rc, _o, _e = await runner(
+        target = await _authorized_mutation_target(
             ssh_host,
             ssh_port,
+            expected_host_key_fingerprint,
+            mutation_authority,
+        )
+        if target is None:
+            return False
+        target_host, target_port, target_fingerprint = target
+        runner_kwargs: dict[str, Any] = {"key_path": key_path, "timeout": 30}
+        if target_fingerprint is not None:
+            runner_kwargs["expected_host_key_fingerprint"] = target_fingerprint
+        rc, _o, _e = await runner(
+            target_host,
+            target_port,
             f"chown -R agent-host:agent-host {CODE_SERVER_USER_DIR} {EXTENSIONS_DIR} 2>/dev/null; "
             f"touch {SEED_STATE_SENTINEL}\n",
-            key_path=key_path,
-            timeout=30,
+            **runner_kwargs,
         )
         return rc == 0
     except Exception as e:  # noqa: BLE001
@@ -1015,6 +1638,82 @@ class IdeSettingsStore:
 
     def __init__(self, db: Any) -> None:
         self._db = db
+
+    async def _merge_component(
+        self, user_id: str, component: str, patch: dict[str, Any]
+    ) -> None:
+        merge = getattr(self._db, "merge_user_ide_component", None)
+        if callable(merge):
+            await merge(user_id, component=component, patch=patch)
+            return
+
+        # Compatibility seam for lightweight stores used outside Postgres and
+        # by tests. Production uses the atomic component merge above.
+        settings = await self._db.get_user_settings(user_id)
+        settings = settings if isinstance(settings, dict) else {}
+        ide = (
+            dict(settings.get("ide") or {})
+            if isinstance(settings.get("ide"), dict)
+            else {}
+        )
+        current = (
+            dict(ide.get(component) or {})
+            if isinstance(ide.get(component), dict)
+            else {}
+        )
+        current.update(patch)
+        ide[component] = current
+        await self._db.update_user_settings(user_id, {"ide": ide})
+
+    async def get_profile_pointer(
+        self, user_id: str, pointer_name: str
+    ) -> dict[str, Any] | None:
+        settings = await self._db.get_user_settings(user_id)
+        ide = settings.get("ide") if isinstance(settings, dict) else None
+        pointers = ide.get("profile_pointers") if isinstance(ide, dict) else None
+        pointer = pointers.get(pointer_name) if isinstance(pointers, dict) else None
+        return dict(pointer) if isinstance(pointer, dict) else None
+
+    async def get_profile_pointers(self, user_id: str) -> dict[str, dict[str, Any]]:
+        settings = await self._db.get_user_settings(user_id)
+        ide = settings.get("ide") if isinstance(settings, dict) else None
+        pointers = ide.get("profile_pointers") if isinstance(ide, dict) else None
+        if not isinstance(pointers, dict):
+            return {}
+        return {
+            str(name): dict(pointer)
+            for name, pointer in pointers.items()
+            if isinstance(name, str) and isinstance(pointer, dict)
+        }
+
+    async def publish_profile_pointer(
+        self,
+        user_id: str,
+        pointer_name: str,
+        *,
+        expected_pointer: dict[str, Any] | None,
+        pointer: dict[str, Any],
+        vm_lease: Any = None,
+    ) -> bool:
+        vm_fields: dict[str, Any] = {}
+        if vm_lease is not None:
+            identity = vm_lease.identity
+            vm_fields = {
+                "vm_operation_id": str(vm_lease.receipt["id"]),
+                "vm_claim_token": int(vm_lease.receipt["claim_token"]),
+                "vm_claimant": vm_lease.claimant,
+                "vm_owner_kind": identity.owner_kind,
+                "vm_owner_id": identity.owner_id,
+            }
+        return bool(
+            await self._db.cas_user_ide_profile_pointer(
+                user_id,
+                pointer_name=pointer_name,
+                expected_pointer=expected_pointer,
+                pointer=pointer,
+                **vm_fields,
+            )
+        )
 
     async def get_ide_files(self, user_id: str) -> dict[str, dict]:
         """Return the stored config files: ``{name: {"content", "mtime"}}``.
@@ -1066,8 +1765,11 @@ class IdeSettingsStore:
         if not updated:
             return []
 
-        ide["files"] = files
-        await self._db.update_user_settings(user_id, {"ide": ide})
+        await self._merge_component(
+            user_id,
+            "files",
+            {name: files[name] for name in updated},
+        )
         return updated
 
     async def get_extensions(self, user_id: str) -> dict[str, dict]:
@@ -1123,9 +1825,7 @@ class IdeSettingsStore:
 
         if not changed:
             return []
-        exts["items"] = stored
-        ide["extensions"] = exts
-        await self._db.update_user_settings(user_id, {"ide": ide})
+        await self._merge_component(user_id, "extensions", {"items": stored})
         return changed
 
     async def get_ext_signature(self, user_id: str) -> str:
@@ -1137,21 +1837,5 @@ class IdeSettingsStore:
         return exts.get("sig", "") if isinstance(exts, dict) else ""
 
     async def set_ext_signature(self, user_id: str, sig: str) -> None:
-        """Record the content signature so a later sweep can skip an unchanged
-        capture. Read-modify-writes the whole ``ide`` subtree (shallow merge)."""
-        settings = await self._db.get_user_settings(user_id)
-        if not isinstance(settings, dict):
-            settings = {}
-        ide = (
-            dict(settings.get("ide") or {})
-            if isinstance(settings.get("ide"), dict)
-            else {}
-        )
-        exts = (
-            dict(ide.get("extensions") or {})
-            if isinstance(ide.get("extensions"), dict)
-            else {}
-        )
-        exts["sig"] = sig
-        ide["extensions"] = exts
-        await self._db.update_user_settings(user_id, {"ide": ide})
+        """Record the cache signature without replacing items or pointers."""
+        await self._merge_component(user_id, "extensions", {"sig": sig})

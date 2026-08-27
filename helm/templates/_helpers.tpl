@@ -23,6 +23,28 @@ If release name contains chart name, don't repeat it.
 {{- end }}
 
 {{/*
+Orchestrator Kubernetes-mutation authority epoch. Only the ServiceAccount
+named by the current chart receives the namespace RoleBinding. Advancing the
+epoch therefore revokes predecessor replicas before their replacement image
+can own workspace lifecycle mutations. Reserve the suffix length explicitly:
+long release names must not truncate the authority epoch away.
+*/}}
+{{- define "srw.orchestratorServiceAccountName" -}}
+{{- $epoch := .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0195" | toString -}}
+{{- $base := include "srw.fullname" . | trunc 43 | trimSuffix "-" -}}
+{{- printf "%s-ows%s" $base $epoch | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{/*
+Temporary cross-namespace pinned adoption RBAC. Preserve the semantic suffix
+while keeping every legal long Helm release name within DNS-1123's 63 bytes.
+*/}}
+{{- define "srw.pinnedLegacyAuthorityName" -}}
+{{- $base := include "srw.fullname" . | trunc 39 | trimSuffix "-" -}}
+{{- printf "%s-pinned-legacy-authority" $base -}}
+{{- end }}
+
+{{/*
 Common labels applied to all resources.
 */}}
 {{- define "srw.labels" -}}

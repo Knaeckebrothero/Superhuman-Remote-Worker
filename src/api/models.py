@@ -253,6 +253,70 @@ class MetricsResponse(BaseModel):
 # =============================================================================
 
 
+class PinnedJobRecipient(BaseModel):
+    """Server-owned identity envelope for one pinned-worker mutation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_agent_id: str = Field(min_length=1)
+    expected_pod_uid: Optional[str] = None
+    expected_process_generation: str = Field(min_length=1)
+    expected_job_id: str = Field(min_length=1)
+
+
+class PinnedSessionRecipient(BaseModel):
+    """Server-owned identity envelope for one pinned-session mutation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_thread_id: str = Field(min_length=1)
+    expected_agent_id: str = Field(min_length=1)
+    expected_pod_uid: Optional[str] = None
+    expected_process_generation: str = Field(min_length=1)
+
+
+def pinned_session_recipient_matches(
+    recipient: Optional[PinnedSessionRecipient],
+    *,
+    thread_id: Optional[str],
+    agent_id: Optional[str],
+    pod_uid: Optional[str],
+    process_generation: Optional[str],
+) -> bool:
+    """Return whether an internal session mutation targets this process."""
+
+    if recipient is None:
+        return False
+    return bool(
+        str(thread_id or "") == recipient.expected_thread_id
+        and str(agent_id or "") == recipient.expected_agent_id
+        and (str(pod_uid or "").strip() or None)
+        == (str(recipient.expected_pod_uid or "").strip() or None)
+        and str(process_generation or "") == recipient.expected_process_generation
+    )
+
+
+def pinned_job_recipient_matches(
+    recipient: Optional[PinnedJobRecipient],
+    *,
+    agent_id: Optional[str],
+    pod_uid: Optional[str],
+    process_generation: Optional[str],
+    job_id: Optional[str],
+) -> bool:
+    """Return whether an internal mutation targets this exact process/job."""
+
+    if recipient is None:
+        return False
+    return bool(
+        str(agent_id or "") == recipient.expected_agent_id
+        and (str(pod_uid or "").strip() or None)
+        == (str(recipient.expected_pod_uid or "").strip() or None)
+        and str(process_generation or "") == recipient.expected_process_generation
+        and str(job_id or "") == recipient.expected_job_id
+    )
+
+
 class JobStartRequest(BaseModel):
     """Request from orchestrator to start a job."""
 
@@ -342,6 +406,10 @@ class JobStartRequest(BaseModel):
         default=None,
         description=("Safe server-owned requested/assigned/effective tier observation"),
     )
+    workspace_provisioner: Optional[str] = Field(
+        default=None,
+        description="Hidden server-derived physical workspace provisioner",
+    )
     workspace_generation: Optional[str] = Field(
         default=None,
         description="Control-plane-attested Kubernetes backing UID",
@@ -361,6 +429,11 @@ class JobStartRequest(BaseModel):
     workspace_owner_id: Optional[str] = Field(
         default=None,
         description="Owner UUID used by the workspace entrypoint process tag",
+    )
+    recipient: Optional[PinnedJobRecipient] = Field(
+        default=None,
+        repr=False,
+        description="Hidden server-owned pinned runtime recipient authority",
     )
 
     model_config = ConfigDict(
@@ -391,6 +464,11 @@ class JobCancelByOrchestratorRequest(BaseModel):
     reason: Optional[str] = Field(
         default=None,
         description="Reason for cancellation",
+    )
+    recipient: Optional[PinnedJobRecipient] = Field(
+        default=None,
+        repr=False,
+        description="Hidden server-owned pinned runtime recipient authority",
     )
 
 
@@ -456,6 +534,30 @@ class JobResumeRequest(BaseModel):
         default=None,
         description=("Safe server-owned requested/assigned/effective tier observation"),
     )
+    workspace_provisioner: Optional[str] = Field(
+        default=None,
+        description="Hidden server-derived physical workspace provisioner",
+    )
+    workspace_generation: Optional[str] = Field(
+        default=None,
+        description="Control-plane-attested Kubernetes backing UID",
+    )
+    workspace_runtime_incarnation: Optional[str] = Field(
+        default=None,
+        description="Control-plane-attested current workspace Pod UID",
+    )
+    workspace_ssh_host_key_fingerprint: Optional[str] = Field(
+        default=None,
+        description="Control-plane-attested SSH host-key fingerprint",
+    )
+    workspace_owner_kind: Optional[Literal["job", "session"]] = Field(
+        default=None,
+        description="Kind used by the workspace entrypoint process tag",
+    )
+    workspace_owner_id: Optional[str] = Field(
+        default=None,
+        description="Owner UUID used by the workspace entrypoint process tag",
+    )
     previous_status: Optional[str] = Field(
         default=None,
         description="Job status before resume. Graceful stops (cancelled, paused, pending_review, waiting) "
@@ -473,4 +575,9 @@ class JobResumeRequest(BaseModel):
         default=None,
         description="Results from completed delegation children (set by orchestrator when "
         "resuming a parent from 'waiting' status).",
+    )
+    recipient: Optional[PinnedJobRecipient] = Field(
+        default=None,
+        repr=False,
+        description="Hidden server-owned pinned runtime recipient authority",
     )

@@ -198,9 +198,11 @@ class TestCancelHardKillResets:
     @pytest.mark.asyncio
     async def test_hard_kill_timeout_resets_to_idle(self, monkeypatch):
         from src.api import dual_app
-        from src.api.models import JobCancelByOrchestratorRequest
+        from src.api.models import JobCancelByOrchestratorRequest, PinnedJobRecipient
 
-        _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
+        client = _reset_module(dual_app, pod_state=dual_app.PodState.WORKING)
+        client.dispatch_process_generation = "process-C"
+        monkeypatch.delenv("POD_UID", raising=False)
         dual_app._current_job_id = "job-C"
 
         # A real, never-finishing job task for the handler to hard-kill.
@@ -223,7 +225,17 @@ class TestCancelHardKillResets:
             r.endpoint for r in app.routes if getattr(r, "path", "") == "/job/cancel"
         )
 
-        result = await cancel_ep(JobCancelByOrchestratorRequest(reason="test"))
+        result = await cancel_ep(
+            JobCancelByOrchestratorRequest(
+                reason="test",
+                recipient=PinnedJobRecipient(
+                    expected_agent_id="agent-1",
+                    expected_pod_uid=None,
+                    expected_process_generation="process-C",
+                    expected_job_id="job-C",
+                ),
+            )
+        )
 
         assert result["status"] == "cancelled"
         assert result["graceful"] is False

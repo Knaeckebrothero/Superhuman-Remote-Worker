@@ -656,6 +656,7 @@ class PersistentSession:
         effective_backend = (workspace_override or {}).get("backend") or ws_data.backend
         self.workspace_backend_tier = str(effective_backend or "")
         remote_cfg = (workspace_override or {}).get("remote") or ws_data.remote
+        workspace_provisioner = (workspace_override or {}).get("workspace_provisioner")
         workspace_generation = (workspace_override or {}).get("workspace_generation")
         workspace_runtime_incarnation = (workspace_override or {}).get(
             "workspace_runtime_incarnation"
@@ -710,10 +711,20 @@ class PersistentSession:
                 "No workspace configured. Persistent sessions require "
                 "an isolated workspace (sandbox or vm) with SSH credentials."
             )
+        normalized_provisioner = str(workspace_provisioner or "").strip().lower()
+        if effective_backend == "sandbox" and normalized_provisioner not in {
+            "k8s",
+            "docker",
+        }:
+            raise WorkspaceUnavailableError(
+                "A sandbox session requires server-derived workspace "
+                "provisioner authority"
+            )
         physical_identity_required = bool(
             self.shell_owner_token is not None
             or self.protected_cloud_required
             or self.pinned_runtime_identity_required
+            or (effective_backend == "sandbox" and normalized_provisioner == "k8s")
         )
         if physical_identity_required and (
             not workspace_generation
@@ -772,6 +783,7 @@ class PersistentSession:
                         if physical_identity_required
                         else None
                     ),
+                    require_host_key_fingerprint=physical_identity_required,
                     workspace_tier=str(effective_backend),
                 )
                 self._workspace_backend_for_cleanup = workspace_backend

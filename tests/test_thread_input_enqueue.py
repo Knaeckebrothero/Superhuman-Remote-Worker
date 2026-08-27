@@ -32,6 +32,7 @@ def _pinned_binding() -> PinnedSessionBinding:
         agent_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
         runtime_attach_token="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         agent_hostname="persistent-aaaaaaaaaaaa",
+        pod_namespace="srw",
         pod_uid="pod-uid-a",
         pod_ip="10.0.0.9",
         pod_port=8001,

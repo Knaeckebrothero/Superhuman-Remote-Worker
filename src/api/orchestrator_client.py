@@ -372,6 +372,7 @@ class OrchestratorClient:
         self.user_id = user_id
 
         self.agent_id: Optional[str] = None
+        self.dispatch_process_generation: Optional[str] = None
         self.runtime_actor: RuntimeActorContext | None = None
         # Exact authority for one pinned session life.  This is deliberately
         # distinct from the process/agent id: a pool agent can serve the same
@@ -600,6 +601,7 @@ class OrchestratorClient:
                 )
                 return False
             self.agent_id = data.get("agent_id")
+            self.dispatch_process_generation = data.get("dispatch_process_generation")
             self.pinned_runtime_generation_contract = contract
             self.session_runtime_generation = delivered_generation
             self.session_runtime_attach_token = delivered_attach_token
@@ -1208,6 +1210,7 @@ class OrchestratorClient:
             if response.status_code == 200:
                 logger.info(f"Deregistered agent {self.agent_id} from orchestrator")
                 self.agent_id = None
+                self.dispatch_process_generation = None
                 self.clear_session_runtime_identity()
                 return True
             else:
@@ -1326,6 +1329,12 @@ class OrchestratorClient:
                 return False
             if pinned_agent_id is not None:
                 body["agent_id"] = pinned_agent_id
+                pod_uid = str(os.environ.get("POD_UID") or "").strip()
+                if pod_uid:
+                    body["pod_uid"] = pod_uid
+                if not self.dispatch_process_generation:
+                    return False
+                body["process_generation"] = self.dispatch_process_generation
                 generation = _canonical_runtime_uuid(
                     session_runtime_generation or self.session_runtime_generation
                 )

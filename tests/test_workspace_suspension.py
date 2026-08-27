@@ -9,11 +9,9 @@ Tests cover:
 
 import sys
 import asyncio
-import logging
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -32,7 +30,33 @@ from orchestrator.services.ssh_helpers import (  # noqa: E402
     EXTRACT_HOME_REMOTE_CMD,
     EXTRACT_REMOTE_CMD,
 )
+from services.container_provisioner import (  # noqa: E402
+    WorkspaceCleanupOutcome,
+    WorkspaceRuntimeAttestation,
+    WorkspaceTeardownIdentity,
+)
 from services.workspace_lifecycle import WorkspaceOwner  # noqa: E402
+from services.vm_provisioner import (  # noqa: E402
+    VMTeardownIdentity,
+    VMTeardownResult,
+)
+
+
+WORKSPACE_RUNTIME = "11111111-1111-4111-8111-111111111111"
+SUCCESSOR_RUNTIME = "22222222-2222-4222-8222-222222222222"
+CLEANUP_ID = "33333333-3333-4333-8333-333333333333"
+CREATION_ID = "44444444-4444-4444-8444-444444444444"
+CREATION_TOKEN = 17
+RESTORE_WORK_TOKEN = 23
+VM_GENERATION = "77777777-7777-4777-8777-777777777777"
+VM_UID = "vm-uid-a"
+VM_ROOTDISK_UID = "vm-rootdisk-a"
+VM_LAUNCHER_UID = "88888888-8888-4888-8888-888888888888"
+VM_FINGERPRINT = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+VM_SESSION_GENERATION = "99999999-9999-4999-8999-999999999999"
+VM_SESSION_AGENT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+VM_SESSION_ATTACH = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+VM_OPERATION_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
 
 # =============================================================================
@@ -62,6 +86,14 @@ def make_mock_db():
     mock_conn = AsyncMock()
     db.acquire = MagicMock(return_value=_MockAsyncCtx(mock_conn))
     db._conn = mock_conn
+
+    # Production pinned restores are serialized by PostgresDB's dedicated
+    # session advisory lock.  The generated AsyncMock type intentionally has
+    # no implementation unless the fixture installs this exact seam.
+    def _thread_advisory_lock(_db, _thread_id):
+        return _MockAsyncCtx(True)
+
+    type(db).thread_advisory_lock = _thread_advisory_lock
     return db
 
 
@@ -87,6 +119,72 @@ def make_service(*, s3_available=True, k8s_available=True):
     type(mock_container).is_available = PropertyMock(return_value=k8s_available)
     mock_container.create_workspace = AsyncMock(return_value=True)
     mock_container.delete_workspace = AsyncMock(return_value=True)
+    mock_container.capture_workspace_teardown_identity = AsyncMock(
+        return_value=WorkspaceTeardownIdentity(
+            pod_uid=WORKSPACE_RUNTIME,
+            pvc_uid="55555555-5555-4555-8555-555555555555",
+            service_uid="66666666-6666-4666-8666-666666666666",
+        )
+    )
+    mock_container.prepare_workspace_cleanup_intent = AsyncMock(
+        return_value={"id": CLEANUP_ID, "intent_generation": 1}
+    )
+    mock_container.reconcile_workspace_cleanup_intent = AsyncMock(
+        return_value=WorkspaceCleanupOutcome("settled", 1)
+    )
+    mock_container.get_settled_workspace_suspension = AsyncMock(
+        return_value={
+            "id": CLEANUP_ID,
+            "result_kind": "settled",
+            "target_disposition": "suspended",
+        }
+    )
+    creation_result = {
+        "id": CREATION_ID,
+        "operation_kind": "restore",
+        "result_kind": "settled",
+        "settled_at": datetime.now(timezone.utc),
+        "runtime_incarnation": SUCCESSOR_RUNTIME,
+        "claim_token": CREATION_TOKEN,
+    }
+    mock_container.get_workspace_creation_result = AsyncMock(
+        return_value=creation_result
+    )
+    mock_container.get_current_workspace_creation_result = AsyncMock(
+        return_value=creation_result
+    )
+
+    async def claim_restore_work(_owner, *, claimant, lease_seconds=300):
+        assert lease_seconds == 300
+        return {
+            **creation_result,
+            "restore_work_claimed_by": claimant,
+            "restore_work_claim_token": RESTORE_WORK_TOKEN,
+            "restore_work_completed_at": None,
+        }
+
+    mock_container.claim_workspace_restore_work = AsyncMock(
+        side_effect=claim_restore_work
+    )
+    mock_container.renew_workspace_restore_work = AsyncMock(
+        side_effect=lambda _owner, *, restore_work, **_kwargs: restore_work
+    )
+    mock_container.attest_workspace_runtime = AsyncMock(
+        return_value=WorkspaceRuntimeAttestation(
+            backing_id=("k8s-pod:test:" + SUCCESSOR_RUNTIME),
+            workspace_generation=SUCCESSOR_RUNTIME,
+            runtime_incarnation=SUCCESSOR_RUNTIME,
+            ssh_host_key_fingerprint=(
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            host="10.0.0.99",
+            pod_ip="10.0.0.99",
+        )
+    )
+    mock_container.release_workspace_restore_work = AsyncMock(return_value=True)
+    mock_container.complete_workspace_restore_work = AsyncMock(return_value=True)
+    mock_container.complete_strict_thread_restore_work = AsyncMock(return_value=True)
+    mock_container.workspace_pod_live = AsyncMock(return_value=True)
     mock_container.delete_workspace_pvc = AsyncMock(return_value=True)
 
     svc.connect(
@@ -104,13 +202,27 @@ def make_job(
     ws_status="ready",
     pod_ip="10.0.0.42",
     last_activity=None,
+    runtime=WORKSPACE_RUNTIME,
+    snapshot_restore_required=False,
+    creation_receipt=False,
 ):
     """Create a minimal job dict."""
     ws_ctx = {
         "status": ws_status,
+        "provisioner": "k8s",
         "pod_ip": pod_ip,
         "pod_name": f"workspace-{job_id[:12]}",
+        "_runtime_incarnation": runtime,
     }
+    if snapshot_restore_required:
+        ws_ctx["_snapshot_restore_required"] = True
+    if creation_receipt:
+        ws_ctx.update(
+            {
+                "_creation_reservation_id": CREATION_ID,
+                "_creation_claim_token": str(CREATION_TOKEN),
+            }
+        )
     if last_activity:
         ws_ctx["last_activity"] = last_activity
     return {
@@ -118,6 +230,30 @@ def make_job(
         "status": status,
         "context": {"workspace_container": ws_ctx},
     }
+
+
+def configure_job_restore(
+    svc,
+    *,
+    final_status="ready",
+    final_pod_ip="10.0.0.99",
+):
+    """Wire exact suspended-A -> settled restore-B reads."""
+
+    before = make_job(
+        ws_status="suspended",
+        pod_ip=None,
+        snapshot_restore_required=True,
+    )
+    after = make_job(
+        ws_status=final_status,
+        pod_ip=final_pod_ip,
+        runtime=SUCCESSOR_RUNTIME,
+        snapshot_restore_required=True,
+        creation_receipt=True,
+    )
+    svc._db.get_job.side_effect = [before, after]
+    return before, after
 
 
 # =============================================================================
@@ -154,33 +290,34 @@ class TestIsEnabled:
 
 class TestSuspendWorkspace:
     @pytest.mark.asyncio
-    async def test_suspend_success(self):
-        """Full suspend flow: capture → delete → status suspended."""
+    async def test_k8s_suspend_is_contained_before_capture_or_teardown(self):
+        """A stale A projection must never read or tear down a same-IP B."""
         svc = make_service()
         job = make_job()
         svc._db.get_job.return_value = job
-
-        result = await svc.suspend_workspace(job["id"])
-
-        assert result is True
-        # Snapshot captured
-        svc._snapshot_service.capture_vm_snapshot.assert_awaited_once_with(
-            job_id=job["id"],
-            ssh_host="10.0.0.42",
-            ssh_port=30022,
-            source_type="pod",
+        pull = AsyncMock(
+            side_effect=AssertionError("foreign successor must not be read")
         )
-        # Pod deleted
-        svc._container_provisioner.delete_workspace.assert_awaited_once_with(
-            WorkspaceOwner.job(job["id"])
+        profile = AsyncMock(
+            side_effect=AssertionError("foreign successor must not be archived")
         )
-        # Status transitions: suspending → suspended
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[0][0] == (job["id"], {"status": "suspending"})
-        last_call = calls[-1][0]
-        assert last_call[0] == job["id"]
-        assert last_call[1]["status"] == "suspended"
-        assert "suspended_at" in last_call[1]
+
+        with (
+            patch("services.ide_settings.pull_ide_config", pull),
+            patch("services.ide_settings.capture_ide_profile", profile),
+        ):
+            result = await svc.suspend_workspace(job["id"])
+
+        assert result is False
+        pull.assert_not_awaited()
+        profile.assert_not_awaited()
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.capture_workspace_teardown_identity.assert_not_awaited()
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+        svc._db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_suspend_capture_fails_reverts(self):
@@ -194,10 +331,8 @@ class TestSuspendWorkspace:
 
         assert result is False
         # Pod NOT deleted
-        svc._container_provisioner.delete_workspace.assert_not_awaited()
-        # Status reverted to ready
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[-1][0] == (job["id"], {"status": "ready"})
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_suspend_skips_non_ready(self):
@@ -278,7 +413,9 @@ class TestSuspendWorkspace:
         assert await pending is False
         svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
         svc._container_provisioner.delete_workspace.assert_not_awaited()
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
         svc._db.merge_workspace_container_context.assert_not_awaited()
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
         docker._reset_workspace_via_ssh.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -294,8 +431,56 @@ class TestSuspendWorkspace:
         result = await svc.suspend_workspace(job["id"])
 
         assert result is False
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[-1][0] == (job["id"], {"status": "ready"})
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_successor_runtime_survives_superseded_cleanup(self):
+        """A late suspension of A cannot project any lifecycle state onto B."""
+
+        svc = make_service()
+        job = make_job()
+        svc._db.get_job.return_value = job
+        successor = {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.0.0.99",
+            "pod_name": "workspace-successor",
+            "_runtime_incarnation": SUCCESSOR_RUNTIME,
+        }
+
+        async def reconcile_stale(*args, **kwargs):
+            job["context"]["workspace_container"] = successor
+            return WorkspaceCleanupOutcome("superseded", 1)
+
+        svc._container_provisioner.reconcile_workspace_cleanup_intent = AsyncMock(
+            side_effect=reconcile_stale
+        )
+
+        assert await svc.suspend_workspace(job["id"]) is False
+        assert job["context"]["workspace_container"] != successor
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_post_snapshot_identity_race_stops_before_intent(self):
+        svc = make_service()
+        job = make_job()
+        svc._db.get_job.return_value = job
+        svc._container_provisioner.capture_workspace_teardown_identity.return_value = (
+            WorkspaceTeardownIdentity(
+                pod_uid=SUCCESSOR_RUNTIME,
+                pvc_uid=None,
+                service_uid=None,
+            )
+        )
+
+        assert await svc.suspend_workspace(job["id"]) is False
+
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.capture_workspace_teardown_identity.assert_not_awaited()
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
 
 
 # =============================================================================
@@ -308,10 +493,7 @@ class TestRestoreWorkspace:
     async def test_restore_success(self):
         """Full restore flow: create pod → extract snapshot → status ready."""
         svc = make_service()
-        # After create_workspace, get_job returns the new pod IP
-        svc._db.get_job.return_value = make_job(
-            ws_status="restoring", pod_ip="10.0.0.99"
-        )
+        configure_job_restore(svc)
 
         with patch.object(
             svc, "_extract_snapshot", new_callable=AsyncMock
@@ -319,7 +501,11 @@ class TestRestoreWorkspace:
             result = await svc.restore_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
         assert result is True
-        svc._container_provisioner.create_workspace.assert_awaited_once()
+        svc._container_provisioner.create_workspace.assert_awaited_once_with(
+            WorkspaceOwner.job("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            operation_kind="restore",
+            operation_id=CLEANUP_ID,
+        )
         # Pod (not VM) restore extracts home-only: the extract runs as
         # agent-host and must not try to overwrite root-owned /usr/local.
         mock_extract.assert_awaited_once_with(
@@ -327,40 +513,255 @@ class TestRestoreWorkspace:
             "10.0.0.99",
             ssh_port=30022,
             scoped_home=True,
+            expected_host_key_fingerprint=(
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            mutation_authority=ANY,
         )
-        # Status transitions: restoring → ready
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[0][0] == (
-            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            {"status": "restoring"},
-        )
-        last_call = calls[-1][0]
-        assert last_call[1]["status"] == "ready"
-        assert "restored_at" in last_call[1]
+        # Only B is published ready, atomically with its durable work receipt;
+        # retired A never becomes restoring.
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+        complete = svc._container_provisioner.complete_workspace_restore_work
+        complete.assert_awaited_once()
+        assert complete.await_args.kwargs["success"] is True
 
     @pytest.mark.asyncio
     async def test_restore_pod_creation_fails(self):
         """If pod creation fails, status is set to failed."""
         svc = make_service()
         svc._container_provisioner.create_workspace.return_value = False
+        svc._container_provisioner.get_workspace_creation_result.return_value = None
+        configure_job_restore(svc)
 
         result = await svc.restore_workspace("some-job-id")
 
         assert result is False
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[-1][0][1]["status"] == "failed"
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_restore_no_pod_ip(self):
         """If pod has no IP after creation, status is set to failed."""
         svc = make_service()
-        svc._db.get_job.return_value = make_job(ws_status="restoring", pod_ip=None)
+        configure_job_restore(svc, final_pod_ip=None)
 
         result = await svc.restore_workspace("some-job-id")
 
         assert result is False
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[-1][0][1]["status"] == "failed"
+        call = svc._db.merge_workspace_container_context_if_runtime.await_args
+        assert call.args[1]["status"] == "failed"
+        assert call.kwargs == {"expected_runtime_incarnation": SUCCESSOR_RUNTIME}
+
+    @pytest.mark.asyncio
+    async def test_lost_create_response_recovers_from_exact_settled_result(self):
+        svc = make_service()
+        configure_job_restore(svc)
+        svc._container_provisioner.create_workspace.side_effect = RuntimeError(
+            "response lost after commit"
+        )
+        svc._extract_snapshot = AsyncMock(return_value=True)
+
+        assert await svc.restore_workspace("some-job-id") is True
+
+        svc._container_provisioner.get_workspace_creation_result.assert_awaited_once_with(
+            WorkspaceOwner.job("some-job-id"),
+            operation_kind="restore",
+            operation_id=CLEANUP_ID,
+        )
+        svc._container_provisioner.complete_workspace_restore_work.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_process_restart_continues_only_from_current_b_receipt(self):
+        svc = make_service()
+        current = make_job(
+            job_id="some-job-id",
+            ws_status="ready",
+            pod_ip="10.0.0.99",
+            runtime=SUCCESSOR_RUNTIME,
+            snapshot_restore_required=True,
+            creation_receipt=True,
+        )
+        svc._db.get_job.side_effect = [current, current]
+        svc._extract_snapshot = AsyncMock(return_value=True)
+
+        assert await svc.restore_workspace("some-job-id") is True
+
+        svc._container_provisioner.create_workspace.assert_not_awaited()
+        svc._container_provisioner.get_current_workspace_creation_result.assert_awaited_once_with(
+            WorkspaceOwner.job("some-job-id"), operation_kind="restore"
+        )
+
+    @pytest.mark.asyncio
+    async def test_successor_change_at_ready_cas_is_preserved(self):
+        svc = make_service()
+        configure_job_restore(svc)
+        svc._extract_snapshot = AsyncMock(return_value=True)
+        svc._container_provisioner.complete_workspace_restore_work.return_value = False
+
+        assert await svc.restore_workspace("some-job-id") is False
+
+        assert (
+            svc._container_provisioner.complete_workspace_restore_work.await_count == 2
+        )
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_service_instances_run_exact_b_effects_once(self):
+        """The durable claim, not either process's task map, owns extraction."""
+
+        first = make_service()
+        second = make_service()
+        configure_job_restore(first)
+        configure_job_restore(second)
+        shared = first._container_provisioner
+        second._container_provisioner = shared
+        claimed = False
+
+        async def claim(_owner, *, claimant, lease_seconds=300):
+            nonlocal claimed
+            assert lease_seconds == 300
+            if claimed:
+                return None
+            claimed = True
+            return {
+                **shared.get_workspace_creation_result.return_value,
+                "restore_work_claimed_by": claimant,
+                "restore_work_claim_token": RESTORE_WORK_TOKEN,
+                "restore_work_completed_at": None,
+            }
+
+        shared.claim_workspace_restore_work.side_effect = claim
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def extract(*_args, **_kwargs):
+            started.set()
+            await finish.wait()
+            return True
+
+        first._extract_snapshot = AsyncMock(side_effect=extract)
+        second._extract_snapshot = AsyncMock(return_value=True)
+        first_task = asyncio.create_task(first.restore_workspace("some-job-id"))
+        await started.wait()
+        assert await second.restore_workspace("some-job-id") is False
+        finish.set()
+        assert await first_task is True
+
+        assert first._extract_snapshot.await_count == 1
+        second._extract_snapshot.assert_not_awaited()
+        shared.complete_workspace_restore_work.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_expired_restore_lease_is_reclaimed_with_new_token(self):
+        """A restart accepts only the server-returned reclaimed exact-B token."""
+
+        svc = make_service()
+        configure_job_restore(svc)
+        observed_claimant = None
+
+        async def reclaim(_owner, *, claimant, lease_seconds=300):
+            nonlocal observed_claimant
+            observed_claimant = claimant
+            return {
+                **svc._container_provisioner.get_workspace_creation_result.return_value,
+                "restore_work_claimed_by": claimant,
+                "restore_work_claim_token": 91,
+                "restore_work_completed_at": None,
+            }
+
+        svc._container_provisioner.claim_workspace_restore_work.side_effect = reclaim
+        svc._extract_snapshot = AsyncMock(return_value=True)
+
+        assert await svc.restore_workspace("some-job-id") is True
+        assert observed_claimant is not None
+        complete = svc._container_provisioner.complete_workspace_restore_work
+        assert (
+            complete.await_args.kwargs["restore_work"]["restore_work_claim_token"] == 91
+        )
+
+    @pytest.mark.asyncio
+    async def test_lost_restore_completion_response_replays_same_claim(self):
+        svc = make_service()
+        configure_job_restore(svc)
+        svc._extract_snapshot = AsyncMock(return_value=True)
+        svc._container_provisioner.complete_workspace_restore_work.side_effect = [
+            RuntimeError("response lost after commit"),
+            True,
+        ]
+
+        assert await svc.restore_workspace("some-job-id") is True
+
+        calls = (
+            svc._container_provisioner.complete_workspace_restore_work.await_args_list
+        )
+        assert len(calls) == 2
+        assert calls[0].kwargs["restore_work"] is calls[1].kwargs["restore_work"]
+        assert calls[0].kwargs["claimant"] == calls[1].kwargs["claimant"]
+
+    @pytest.mark.asyncio
+    async def test_successor_ip_reuse_before_snapshot_stream_gets_zero_bytes(self):
+        """Fresh control-plane UID drift fences the mutable Pod IP."""
+
+        svc = make_service()
+        configure_job_restore(svc)
+        exact_b = svc._container_provisioner.attest_workspace_runtime.return_value
+        successor_c = WorkspaceRuntimeAttestation(
+            backing_id=f"k8s-pod:test:{WORKSPACE_RUNTIME}",
+            workspace_generation=WORKSPACE_RUNTIME,
+            runtime_incarnation=WORKSPACE_RUNTIME,
+            ssh_host_key_fingerprint=(
+                "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+            ),
+            host=exact_b.host,
+            pod_ip=exact_b.pod_ip,
+        )
+        svc._container_provisioner.attest_workspace_runtime.side_effect = [
+            exact_b,
+            successor_c,
+        ]
+
+        with patch(
+            "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+            new=AsyncMock(return_value=(0, b"")),
+        ) as stream:
+            assert not await svc.restore_workspace("some-job-id")
+
+        # The snapshot may be downloaded locally, but the same-IP successor
+        # receives neither an archive byte nor an unpinned SSH connection.
+        svc._snapshot_service.download_snapshot.assert_awaited_once()
+        stream.assert_not_awaited()
+        svc._container_provisioner.complete_workspace_restore_work.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_post_write_uid_replacement_cannot_settle_workspace_restore(self):
+        svc = make_service()
+        configure_job_restore(svc)
+        exact_b = svc._container_provisioner.attest_workspace_runtime.return_value
+        successor_c = WorkspaceRuntimeAttestation(
+            backing_id=f"k8s-pod:test:{WORKSPACE_RUNTIME}",
+            workspace_generation=WORKSPACE_RUNTIME,
+            runtime_incarnation=WORKSPACE_RUNTIME,
+            ssh_host_key_fingerprint=(
+                "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+            ),
+            host=exact_b.host,
+            pod_ip=exact_b.pod_ip,
+        )
+        svc._container_provisioner.attest_workspace_runtime.side_effect = [
+            exact_b,
+            successor_c,
+        ]
+        # Simulate a completed pinned write; the mandatory post-write fresh
+        # attestation must still fence settlement when UID C has won.
+        svc._extract_snapshot = AsyncMock(return_value=True)
+
+        assert not await svc.restore_workspace("some-job-id")
+
+        svc._extract_snapshot.assert_awaited_once()
+        svc._container_provisioner.workspace_pod_live.assert_not_awaited()
+        svc._container_provisioner.complete_workspace_restore_work.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_restore_disabled_returns_false(self):
@@ -505,8 +906,8 @@ class TestCheckIdleAll:
 
         count = await svc.check_idle_all()
 
-        assert count == 1
-        svc._snapshot_service.capture_vm_snapshot.assert_awaited_once()
+        assert count == 0
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sweep_skips_recent_activity(self):
@@ -557,7 +958,8 @@ class TestCheckIdleAll:
 
         count = await svc.check_idle_all()
 
-        assert count == 1
+        assert count == 0
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sweep_empty_results(self):
@@ -634,30 +1036,28 @@ class TestIdleTimeout:
 class TestStatusTransitions:
     @pytest.mark.asyncio
     async def test_suspend_transitions(self):
-        """Verify the exact status transition sequence during suspend."""
+        """Suspend projection belongs exclusively to durable settlement."""
         svc = make_service()
         svc._db.get_job.return_value = make_job()
 
         await svc.suspend_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        statuses = [c[0][1]["status"] for c in calls]
-        assert statuses == ["suspending", "suspended"]
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_restore_transitions(self):
         """Verify the exact status transition sequence during restore."""
         svc = make_service()
-        svc._db.get_job.return_value = make_job(
-            ws_status="restoring", pod_ip="10.0.0.99"
-        )
+        configure_job_restore(svc)
 
         with patch.object(svc, "_extract_snapshot", new_callable=AsyncMock):
             await svc.restore_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        statuses = [c[0][1]["status"] for c in calls]
-        assert statuses == ["restoring", "ready"]
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+        svc._container_provisioner.complete_workspace_restore_work.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_suspend_failure_transitions(self):
@@ -668,21 +1068,20 @@ class TestStatusTransitions:
 
         await svc.suspend_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        statuses = [c[0][1]["status"] for c in calls]
-        assert statuses == ["suspending", "ready"]
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_restore_failure_transitions(self):
         """Verify status set to failed on restore failure."""
         svc = make_service()
         svc._container_provisioner.create_workspace.return_value = False
+        svc._container_provisioner.get_workspace_creation_result.return_value = None
+        configure_job_restore(svc)
 
         await svc.restore_workspace("some-job-id")
 
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        statuses = [c[0][1]["status"] for c in calls]
-        assert statuses == ["restoring", "failed"]
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
 
 
 # =============================================================================
@@ -692,20 +1091,20 @@ class TestStatusTransitions:
 
 class TestSuspendClearsMetadata:
     @pytest.mark.asyncio
-    async def test_suspend_clears_pod_ip_and_name(self):
-        """After suspend, pod_ip and pod_name are set to None."""
+    async def test_contained_k8s_suspend_keeps_pod_metadata(self):
+        """Containment leaves the live workspace projection unchanged."""
         svc = make_service()
-        svc._db.get_job.return_value = make_job()
+        job = make_job()
+        svc._db.get_job.return_value = job
 
-        await svc.suspend_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        assert (
+            await svc.suspend_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") is False
+        )
 
-        # Find the "suspended" call
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        suspended_call = [c for c in calls if c[0][1].get("status") == "suspended"][0]
-        updates = suspended_call[0][1]
-        assert updates["pod_ip"] is None
-        assert updates["pod_name"] is None
-        assert updates["suspended_at"] is not None
+        assert job["context"]["workspace_container"]["pod_ip"] == "10.0.0.42"
+        assert job["context"]["workspace_container"]["pod_name"]
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
 
 
 # =============================================================================
@@ -726,17 +1125,17 @@ class TestRestoreExtractionFailure:
         and let the caller decide.
         """
         svc = make_service()
-        svc._db.get_job.return_value = make_job(
-            ws_status="restoring", pod_ip="10.0.0.99"
-        )
+        configure_job_restore(svc)
         svc._snapshot_service.download_snapshot.return_value = False
 
         result = await svc.restore_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
         assert result is False
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[-1][0][1]["status"] == "failed"
-        assert not any(c[0][1].get("status") == "ready" for c in calls)
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+        calls = svc._db.merge_workspace_container_context_if_runtime.call_args_list
+        assert calls[-1].args[1]["status"] == "failed"
+        assert calls[-1].kwargs == {"expected_runtime_incarnation": SUCCESSOR_RUNTIME}
+        assert not any(c.args[1].get("status") == "ready" for c in calls)
 
     @pytest.mark.asyncio
     async def test_extract_snapshot_reports_failure_instead_of_none(self):
@@ -811,9 +1210,7 @@ class TestRestoreExtractionFailure:
     async def test_restore_exception_during_extract(self):
         """If extraction throws, restore fails and status is set to failed."""
         svc = make_service()
-        svc._db.get_job.return_value = make_job(
-            ws_status="restoring", pod_ip="10.0.0.99"
-        )
+        configure_job_restore(svc)
 
         with patch.object(
             svc,
@@ -824,8 +1221,15 @@ class TestRestoreExtractionFailure:
             result = await svc.restore_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
         assert result is False
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[-1][0][1]["status"] == "failed"
+        # The exception path marks only exact B; retired A and any successor C
+        # remain outside the CAS.
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+        failure = svc._db.merge_workspace_container_context_if_runtime.await_args
+        assert failure.args[1] == {
+            "status": "failed",
+            "error": "restore exception",
+        }
+        assert failure.kwargs == {"expected_runtime_incarnation": SUCCESSOR_RUNTIME}
 
 
 # =============================================================================
@@ -881,9 +1285,9 @@ class TestMultipleContainerSweep:
 
         count = await svc.check_idle_all()
 
-        assert count == 2
-        assert svc._snapshot_service.capture_vm_snapshot.await_count == 2
-        assert svc._container_provisioner.delete_workspace.await_count == 2
+        assert count == 0
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sweep_partial_failure(self):
@@ -934,12 +1338,9 @@ class TestMultipleContainerSweep:
 
         count = await svc.check_idle_all()
 
-        # Only 1 succeeded
-        assert count == 1
-        # Pod only deleted for the second (successful) one
-        svc._container_provisioner.delete_workspace.assert_awaited_once_with(
-            WorkspaceOwner.job("bbbbbbbb-2222-2222-2222-222222222222")
-        )
+        assert count == 0
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
 
 
 # =============================================================================
@@ -949,8 +1350,8 @@ class TestMultipleContainerSweep:
 
 class TestSuspendRestoreRoundTrip:
     @pytest.mark.asyncio
-    async def test_full_round_trip(self):
-        """Suspend a workspace, then restore it — verify the full cycle."""
+    async def test_contained_suspend_does_not_block_existing_snapshot_restore(self):
+        """New K8s capture is refused; an already-settled A can still restore."""
         svc = make_service()
         job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
@@ -959,30 +1360,19 @@ class TestSuspendRestoreRoundTrip:
             job_id=job_id, ws_status="ready", pod_ip="10.0.0.42"
         )
         ok = await svc.suspend_workspace(job_id)
-        assert ok is True
-
-        # Verify snapshot was captured with the original pod IP
-        svc._snapshot_service.capture_vm_snapshot.assert_awaited_once_with(
-            job_id=job_id, ssh_host="10.0.0.42", ssh_port=30022, source_type="pod"
-        )
-
-        # Verify pod was deleted
-        svc._container_provisioner.delete_workspace.assert_awaited_once_with(
-            WorkspaceOwner.job(job_id)
-        )
+        assert ok is False
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
 
         # Reset mocks for restore phase
         svc._snapshot_service.capture_vm_snapshot.reset_mock()
-        svc._container_provisioner.delete_workspace.reset_mock()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.reset_mock()
         svc._container_provisioner.create_workspace.reset_mock()
         svc._db.merge_workspace_container_context.reset_mock()
+        svc._db.merge_workspace_container_context_if_runtime.reset_mock()
 
         # Phase 2: Restore
-        svc._db.get_job.return_value = make_job(
-            job_id=job_id,
-            ws_status="restoring",
-            pod_ip="10.0.0.99",  # new IP
-        )
+        configure_job_restore(svc)
 
         with patch.object(
             svc, "_extract_snapshot", new_callable=AsyncMock
@@ -993,19 +1383,27 @@ class TestSuspendRestoreRoundTrip:
 
         # Pod created
         svc._container_provisioner.create_workspace.assert_awaited_once_with(
-            WorkspaceOwner.job(job_id)
+            WorkspaceOwner.job(job_id),
+            operation_kind="restore",
+            operation_id=CLEANUP_ID,
         )
 
         # Snapshot extracted to new pod IP — home-only for a pod (agent-host
         # can't overwrite root-owned /usr/local).
         mock_extract.assert_awaited_once_with(
-            job_id, "10.0.0.99", ssh_port=30022, scoped_home=True
+            job_id,
+            "10.0.0.99",
+            ssh_port=30022,
+            scoped_home=True,
+            expected_host_key_fingerprint=(
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            mutation_authority=ANY,
         )
 
-        # Final status is ready
-        calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[-1][0][1]["status"] == "ready"
-        assert "restored_at" in calls[-1][0][1]
+        # Final status and receipt settle in one exact-B transaction.
+        svc._db.merge_workspace_container_context_if_runtime.assert_not_awaited()
+        svc._container_provisioner.complete_workspace_restore_work.assert_awaited_once()
 
 
 # =============================================================================
@@ -1176,41 +1574,145 @@ def make_vm_thread(thread_id="tid-vm", ssh_host="100.64.0.235"):
         "id": thread_id,
         "status": "active",
         "execution_lane": "pinned",
-        "runtime_generation": "00000000-0000-4000-8000-000000000001",
-        "agent_id": None,
-        "runtime_attach_token": None,
+        "runtime_generation": VM_SESSION_GENERATION,
+        "runtime_attach_token": VM_SESSION_ATTACH,
+        "agent_id": VM_SESSION_AGENT,
         "metadata": {
             "config_override": {"workspace": {"backend": "vm"}},
             "workspace_container": {
                 "git_remote_url": "http://gitea/srw/thread-tid-vm.git",
                 "repo_name": "thread-tid-vm",
             },
-            "vm": {"status": "ready", "ssh_host": ssh_host, "ssh_port": 22},
-        },
-    }
-
-
-def make_container_thread(thread_id="tid-pod"):
-    return {
-        "id": thread_id,
-        "status": "active",
-        "metadata": {
-            "config_override": {"workspace": {"backend": "sandbox"}},
-            "workspace_container": {
+            "vm": {
                 "status": "ready",
-                "pod_ip": "10.42.2.32",
-                "git_remote_url": "http://gitea/srw/thread-tid-pod.git",
+                "provision_generation": VM_GENERATION,
+                "vm_uid": VM_UID,
+                "active_pod_uid": VM_LAUNCHER_UID,
+                "ssh_host": ssh_host,
+                "ssh_port": 22,
+                "ssh_host_key_fingerprint": VM_FINGERPRINT,
+                "ssh_registration_id": "vm-registration-thread-a",
+                "identity_authenticated": True,
+                "identity_provision_generation": VM_GENERATION,
             },
         },
     }
 
 
-def make_vm_service():
+def make_container_thread(
+    thread_id="tid-pod",
+    *,
+    ws_status="ready",
+    pod_ip="10.42.2.32",
+    runtime=WORKSPACE_RUNTIME,
+    snapshot_restore_required=False,
+    creation_receipt=False,
+):
+    workspace = {
+        "status": ws_status,
+        "provisioner": "k8s",
+        "pod_ip": pod_ip,
+        "git_remote_url": "http://gitea/srw/thread-tid-pod.git",
+        "_runtime_incarnation": runtime,
+    }
+    if snapshot_restore_required:
+        workspace["_snapshot_restore_required"] = True
+    if creation_receipt:
+        workspace.update(
+            {
+                "_creation_reservation_id": CREATION_ID,
+                "_creation_claim_token": str(CREATION_TOKEN),
+            }
+        )
+    return {
+        "id": thread_id,
+        "status": "active",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": workspace,
+        },
+    }
+
+
+def configure_thread_restore(svc, *, before=None, after=None):
+    """Wire one exact settled suspended A to one settled restore B."""
+
+    before = before or make_container_thread(
+        ws_status="suspended",
+        pod_ip=None,
+        snapshot_restore_required=True,
+    )
+    after = after or make_container_thread(
+        ws_status="ready",
+        pod_ip="10.42.2.99",
+        runtime=SUCCESSOR_RUNTIME,
+        snapshot_restore_required=True,
+        creation_receipt=True,
+    )
+    svc._db.get_thread = AsyncMock(side_effect=[before, after])
+    return before, after
+
+
+def make_vm_service(*, host="100.64.0.235", port=22):
     svc = make_service()
     vm_prov = MagicMock()
     type(vm_prov).is_available = PropertyMock(return_value=True)
     vm_prov.delete_thread_vm = AsyncMock(return_value=True)
+    vm_prov.delete_vm = AsyncMock(return_value=True)
     vm_prov.create_thread_vm = AsyncMock(return_value=True)
+    identity = VMTeardownIdentity(
+        provision_generation=VM_GENERATION,
+        vm_uid=VM_UID,
+        rootdisk_pvc_uid=VM_ROOTDISK_UID,
+        ssh_host=host,
+        ssh_port=port,
+        ssh_host_key_fingerprint=VM_FINGERPRINT,
+    )
+    attestation = WorkspaceRuntimeAttestation(
+        backing_id=f"k8s-vmi:{VM_LAUNCHER_UID}",
+        workspace_generation=VM_GENERATION,
+        runtime_incarnation=VM_LAUNCHER_UID,
+        ssh_host_key_fingerprint=VM_FINGERPRINT,
+        host=host,
+        pod_ip="10.42.0.15",
+        port=port,
+        vm_uid=VM_UID,
+        launcher_pod_uid=VM_LAUNCHER_UID,
+    )
+    vm_prov.capture_vm_teardown_identity = AsyncMock(return_value=identity)
+    vm_prov.attest_workspace_runtime = AsyncMock(return_value=attestation)
+    vm_prov.revalidate_vm_teardown_identity = AsyncMock(return_value="matched")
+
+    async def release_vm_captured(
+        owner_id,
+        _identity,
+        *,
+        purge_disk,
+        capture_snapshot,
+        entity_type,
+    ):
+        assert _identity == identity
+        assert capture_snapshot is False
+        if entity_type == "thread":
+            await vm_prov.delete_thread_vm(owner_id, purge_disk=purge_disk)
+        else:
+            await vm_prov.delete_vm(owner_id, purge_disk=purge_disk)
+        return VMTeardownResult("completed", True)
+
+    vm_prov.release_vm_captured = AsyncMock(side_effect=release_vm_captured)
+    svc._db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    svc._db.merge_thread_vm_context_if_provision_generation = AsyncMock(
+        return_value=True
+    )
+    lease_receipt = {
+        "id": VM_OPERATION_ID,
+        "claim_token": 31,
+        "lease_expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    svc._db.activate_vm_remote_operation_protocol = AsyncMock(return_value=True)
+    svc._db.claim_vm_remote_operation = AsyncMock(return_value=lease_receipt)
+    svc._db.renew_vm_remote_operation = AsyncMock(return_value=lease_receipt)
+    svc._db.settle_vm_remote_operation = AsyncMock(return_value=True)
     svc._vm_provisioner = vm_prov
     svc._agent_provisioner = None
     return svc, vm_prov
@@ -1229,8 +1731,10 @@ class TestStatelessThreadSuspensionRefusal:
     def _assert_no_suspension_side_effects(svc):
         svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
         svc._container_provisioner.delete_workspace.assert_not_awaited()
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
         svc._agent_provisioner.delete_agent_pod_by_thread.assert_not_awaited()
         svc._db.merge_thread_workspace_context.assert_not_awaited()
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
         svc._db.merge_thread_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1277,11 +1781,67 @@ class TestStatelessThreadSuspensionRefusal:
         self._assert_no_suspension_side_effects(svc)
 
 
+class TestThreadSuspensionRuntimeRaces:
+    @pytest.mark.asyncio
+    async def test_successor_runtime_survives_superseded_cleanup(self, monkeypatch):
+        """A thread suspend queued for A must leave replacement B untouched."""
+
+        monkeypatch.delenv("WORKSPACE_RECLAIM_ON_IDLE", raising=False)
+        svc = make_service()
+        thread = make_container_thread()
+        svc._db.get_thread = AsyncMock(return_value=thread)
+        successor = {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.42.2.99",
+            "pod_name": "workspace-session-successor",
+            "_runtime_incarnation": SUCCESSOR_RUNTIME,
+        }
+
+        async def reconcile_stale(*args, **kwargs):
+            thread["metadata"]["workspace_container"] = successor
+            return WorkspaceCleanupOutcome("superseded", 1)
+
+        svc._container_provisioner.reconcile_workspace_cleanup_intent = AsyncMock(
+            side_effect=reconcile_stale
+        )
+
+        assert await svc.suspend_thread_workspace("tid-pod") is False
+        assert thread["metadata"]["workspace_container"] != successor
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
+        svc._db.merge_thread_workspace_context.assert_not_awaited()
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
+        svc._container_provisioner.delete_workspace_pvc.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_post_snapshot_identity_race_stops_before_intent(self):
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
+        svc._container_provisioner.capture_workspace_teardown_identity.return_value = (
+            WorkspaceTeardownIdentity(
+                pod_uid=SUCCESSOR_RUNTIME,
+                pvc_uid=None,
+                service_uid=None,
+            )
+        )
+
+        assert await svc.suspend_thread_workspace("tid-pod") is False
+
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.capture_workspace_teardown_identity.assert_not_awaited()
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
+
+
 class TestThreadTierIsExplicit:
     """A vm-tier thread must suspend via the VM branch. Previously the tier was
     inferred from whether metadata.workspace_container existed at all — and
     _setup_gitea makes it exist for every thread — so a VM session read as
     pod-tier and suspend bailed out entirely, leaving its VM running forever."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_vm_remote_operation_protocol(self, monkeypatch):
+        monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
 
     @pytest.mark.asyncio
     async def test_vm_tier_thread_actually_suspends(self):
@@ -1291,9 +1851,9 @@ class TestThreadTierIsExplicit:
         ok = await svc.suspend_thread_workspace("tid-vm")
 
         assert ok is True, "vm-tier suspend must not bail on the container status"
-        # purge_disk=True here: this suite does not enable VM_PERSISTENT_ROOTDISK,
-        # so there is no disk to keep. See TestVmSuspendRidesThePersistentRootdisk.
-        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm", purge_disk=True)
+        # Soft End is resumable. A successful snapshot is not authority to
+        # destroy the backing disk; only permanent End may purge it.
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm", purge_disk=False)
 
     @pytest.mark.asyncio
     async def test_vm_tier_snapshot_is_labelled_vm(self):
@@ -1320,22 +1880,45 @@ class TestThreadTierIsExplicit:
 
         await svc.suspend_thread_workspace("tid-vm")
 
-        assert svc._db.merge_thread_vm_context.await_count >= 1
+        assert svc._db.merge_thread_vm_context_if_provision_generation.await_count >= 1
         svc._db.merge_thread_workspace_context.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_container_tier_thread_still_uses_pod_branch(self):
-        """Regression guard: sandbox-tier threads are unaffected."""
+    async def test_vm_tier_never_dials_stale_ready_container_residue(self):
+        svc, vm_prov = make_vm_service()
+        thread = make_vm_thread()
+        thread["metadata"]["workspace_container"].update(
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.42.2.32",
+                "host": "workspace-successor.srw.svc.cluster.local",
+                "_runtime_incarnation": "deleted-runtime-a",
+            }
+        )
+        svc._db.get_thread = AsyncMock(return_value=thread)
+
+        assert await svc.suspend_thread_workspace("tid-vm") is True
+
+        capture = svc._snapshot_service.capture_vm_snapshot.await_args.kwargs
+        assert capture["ssh_host"] == "100.64.0.235"
+        assert capture["ssh_port"] == 22
+        assert capture["source_type"] == "vm"
+        vm_prov.delete_thread_vm.assert_awaited_once()
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_container_tier_thread_is_contained_before_pod_capture(self):
+        """Sandbox-tier capture stays live until durable capture authority exists."""
         svc, vm_prov = make_vm_service()
         svc._db.get_thread = AsyncMock(return_value=make_container_thread())
 
         ok = await svc.suspend_thread_workspace("tid-pod")
 
-        assert ok is True
+        assert ok is False
         vm_prov.delete_thread_vm.assert_not_awaited()
-        svc._container_provisioner.delete_workspace.assert_awaited()
-        kwargs = svc._snapshot_service.capture_vm_snapshot.await_args.kwargs
-        assert kwargs["source_type"] == "pod"
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_idle_sweep_actually_suspends_a_vm_thread(self):
@@ -1359,7 +1942,28 @@ class TestThreadTierIsExplicit:
         n = await svc.check_idle_threads()
 
         assert n == 1, "idle vm-tier thread must actually be suspended"
-        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm", purge_disk=True)
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm", purge_disk=False)
+
+    @pytest.mark.asyncio
+    async def test_vm_suspend_is_dark_before_any_snapshot_or_retirement(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "false")
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+
+        assert await svc.suspend_thread_workspace("tid-vm") is False
+
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        vm_prov.release_vm_captured.assert_not_awaited()
+        svc._db.activate_vm_remote_operation_protocol.assert_not_awaited()
+        assert [
+            call.args[2]
+            for call in svc._db.merge_thread_vm_context_if_provision_generation.await_args_list
+        ] == [
+            {"status": "suspending", "_suspend_remote_io_closed": None},
+            {"status": "ready", "_suspend_remote_io_closed": None},
+        ]
 
 
 class TestVmSuspendRidesThePersistentRootdisk:
@@ -1372,6 +1976,10 @@ class TestVmSuspendRidesThePersistentRootdisk:
     knowledge-base/knowledge/features/vm_workspace_persistence_reconciliation.md,
     knowledge-base/knowledge/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md.
     """
+
+    @pytest.fixture(autouse=True)
+    def _enable_vm_remote_operation_protocol(self, monkeypatch):
+        monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
 
     @pytest.mark.asyncio
     async def test_suspend_keeps_the_rootdisk(self, monkeypatch):
@@ -1409,8 +2017,10 @@ class TestVmSuspendRidesThePersistentRootdisk:
         await svc.suspend_thread_workspace("tid-vm")
 
         merged = {}
-        for call in svc._db.merge_thread_vm_context.await_args_list:
-            merged.update(call.args[1])
+        for (
+            call
+        ) in svc._db.merge_thread_vm_context_if_provision_generation.await_args_list:
+            merged.update(call.args[2])
         assert merged.get("rootdisk") == "kept"
 
     @pytest.mark.asyncio
@@ -1440,7 +2050,7 @@ class TestVmSuspendRidesThePersistentRootdisk:
         ok = await svc.suspend_thread_workspace("tid-pod")
 
         assert ok is False
-        svc._container_provisioner.delete_workspace.assert_not_awaited()
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_restore_does_not_extract_over_a_reattached_disk(self, monkeypatch):
@@ -1454,9 +2064,7 @@ class TestVmSuspendRidesThePersistentRootdisk:
         svc._db.get_thread = AsyncMock(return_value=thread)
         svc._extract_snapshot = AsyncMock()
 
-        ok = await svc.restore_thread_workspace(
-            "tid-vm", _pinned_runtime_lock_held=True
-        )
+        ok = await svc.restore_thread_workspace("tid-vm")
 
         assert ok is True
         svc._extract_snapshot.assert_not_awaited()
@@ -1472,7 +2080,7 @@ class TestVmSuspendRidesThePersistentRootdisk:
         svc._db.get_thread = AsyncMock(return_value=thread)
         svc._extract_snapshot = AsyncMock()
 
-        await svc.restore_thread_workspace("tid-vm", _pinned_runtime_lock_held=True)
+        await svc.restore_thread_workspace("tid-vm")
 
         svc._extract_snapshot.assert_awaited_once()
 
@@ -1483,20 +2091,38 @@ class TestVmJobSuspendRidesThePersistentRootdisk:
     orchestrator and a VM is only on the tailnet — so VM jobs never suspended
     either. Kept symmetric with the session path deliberately."""
 
+    @pytest.fixture(autouse=True)
+    def _enable_vm_remote_operation_protocol(self, monkeypatch):
+        monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
+
     def _vm_job(self):
         return {
             "id": "job-vm-1",
             "status": "paused",
+            "config_override": {"workspace": {"backend": "vm"}},
             # No workspace_container: jobs only get that key from
             # container-provisioning paths, so for a job its absence really
             # does mean VM tier (unlike threads — see _thread_is_vm_tier).
-            "context": {"vm": {"status": "ready", "ssh_host": "100.64.1.9"}},
+            "context": {
+                "vm": {
+                    "status": "ready",
+                    "provision_generation": VM_GENERATION,
+                    "vm_uid": VM_UID,
+                    "active_pod_uid": VM_LAUNCHER_UID,
+                    "ssh_host": "100.64.1.9",
+                    "ssh_port": 22,
+                    "ssh_host_key_fingerprint": VM_FINGERPRINT,
+                    "ssh_registration_id": "vm-registration-a",
+                    "identity_authenticated": True,
+                    "identity_provision_generation": VM_GENERATION,
+                }
+            },
         }
 
     @pytest.mark.asyncio
     async def test_suspend_keeps_the_rootdisk(self, monkeypatch):
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
-        svc, vm_prov = make_vm_service()
+        svc, vm_prov = make_vm_service(host="100.64.1.9")
         svc._db.get_job = AsyncMock(return_value=self._vm_job())
         svc._vm_provisioner.delete_vm = AsyncMock(return_value=True)
 
@@ -1508,9 +2134,30 @@ class TestVmJobSuspendRidesThePersistentRootdisk:
         )
 
     @pytest.mark.asyncio
+    async def test_git_only_container_metadata_does_not_hide_vm_target(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service(host="100.64.1.9")
+        job = self._vm_job()
+        job["context"]["workspace_container"] = {
+            "git_remote_url": "http://gitea/srw/job-vm-1.git",
+            "repo_name": "job-vm-1",
+        }
+        svc._db.get_job = AsyncMock(return_value=job)
+        svc._vm_provisioner.delete_vm = AsyncMock(return_value=True)
+
+        assert await svc.suspend_workspace("job-vm-1") is True
+
+        capture = svc._snapshot_service.capture_vm_snapshot.await_args.kwargs
+        assert capture["ssh_host"] == "100.64.1.9"
+        assert capture["source_type"] == "vm"
+        vm_prov.delete_vm.assert_awaited_once_with("job-vm-1", purge_disk=False)
+
+    @pytest.mark.asyncio
     async def test_unreachable_snapshot_no_longer_blocks_suspend(self, monkeypatch):
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
-        svc, _ = make_vm_service()
+        svc, _ = make_vm_service(host="100.64.1.9")
         svc._db.get_job = AsyncMock(return_value=self._vm_job())
         svc._vm_provisioner.delete_vm = AsyncMock(return_value=True)
         svc._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=False)
@@ -1538,18 +2185,63 @@ class TestVmJobSuspendRidesThePersistentRootdisk:
         assert await svc.suspend_workspace(make_job()["id"]) is False
         svc._container_provisioner.delete_workspace.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_same_endpoint_successor_gets_zero_settings_or_snapshot_reads(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service(host="100.64.1.9")
+        job = self._vm_job()
+        job["user_id"] = "user-a"
+        svc._db.get_job = AsyncMock(return_value=job)
+        initial = vm_prov.attest_workspace_runtime.return_value
+        successor = WorkspaceRuntimeAttestation(
+            backing_id="k8s-vmi:99999999-9999-4999-8999-999999999999",
+            workspace_generation=initial.workspace_generation,
+            runtime_incarnation="99999999-9999-4999-8999-999999999999",
+            ssh_host_key_fingerprint=initial.ssh_host_key_fingerprint,
+            host=initial.host,
+            pod_ip=initial.pod_ip,
+            port=initial.port,
+        )
+        vm_prov.attest_workspace_runtime = AsyncMock(
+            side_effect=[initial, successor, successor]
+        )
+        remote_reads = 0
+
+        async def guarded_pull(*_args, capture_authority, **_kwargs):
+            nonlocal remote_reads
+            if await capture_authority() is None:
+                return {}
+            remote_reads += 1
+            raise AssertionError("foreign successor must not be read")
+
+        with patch("services.ide_settings.pull_ide_config", guarded_pull):
+            assert await svc.suspend_workspace(job["id"]) is False
+
+        assert remote_reads == 0
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        vm_prov.release_vm_captured.assert_not_awaited()
+        assert [
+            call.args[2]
+            for call in svc._db.merge_vm_context_if_provision_generation.await_args_list
+        ] == [
+            {"status": "suspending", "_suspend_remote_io_closed": None},
+            {"status": "ready", "_suspend_remote_io_closed": None},
+        ]
+
 
 class TestUpgradedThreadReadsAsVmTier:
-    """A thread UPGRADED to VM keeps its original declared backend — the
-    upgrade endpoint provisions metadata.vm without rewriting
-    config_override.workspace.backend. Live-gate finding 2026-07-29 (thread
-    b4ae24bb): a virtual-tier session upgraded to VM still read as non-VM, so
-    suspend took the container branch and refused.
+    """A thread upgraded to VM carries an explicit server-owned VM contract.
 
-    The materialized VM context has to beat the stale declared backend. The
-    original fallback for this case was unreachable: `if backend:` returned
-    early for ANY non-empty string, including 'virtual' and 'sandbox'.
+    Runtime readiness must never beat a contradictory declared tier.  The VM
+    provisioning admission now stamps contract, config, and provision
+    generation atomically; suspension consumes that authority.
     """
+
+    @pytest.fixture(autouse=True)
+    def _enable_vm_remote_operation_protocol(self, monkeypatch):
+        monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
 
     def _upgraded(self, declared_backend):
         """Real shape from dev: lite/sandbox backend + a live VM + a git-only
@@ -1558,19 +2250,52 @@ class TestUpgradedThreadReadsAsVmTier:
             "id": "tid-up",
             "status": "active",
             "metadata": {
-                "config_override": {"workspace": {"backend": declared_backend}},
+                "config_override": {"workspace": {"backend": "vm"}},
+                "_workspace_contract": {
+                    "version": 1,
+                    "requested_backend": "vm",
+                    "assigned_backend": "vm",
+                    "assignment_source": "runtime_vm_upgrade",
+                },
                 "workspace_container": {
                     "git_remote_url": "http://gitea/srw/thread-tid-up.git",
                     "repo_name": "thread-tid-up",
                 },
-                "vm": {"status": "ready", "ssh_host": "100.64.2.6", "ssh_port": 22},
+                "vm": {
+                    "status": "ready",
+                    "provision_generation": VM_GENERATION,
+                    "vm_uid": VM_UID,
+                    "active_pod_uid": VM_LAUNCHER_UID,
+                    "ssh_host": "100.64.2.6",
+                    "ssh_port": 22,
+                    "ssh_host_key_fingerprint": VM_FINGERPRINT,
+                    "ssh_registration_id": "vm-registration-upgraded-a",
+                    "identity_authenticated": True,
+                    "identity_provision_generation": VM_GENERATION,
+                },
             },
         }
 
     @pytest.mark.asyncio
+    async def test_legacy_contradictory_upgrade_is_contained_before_snapshot(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service(host="100.64.2.6")
+        thread = self._upgraded("sandbox")
+        thread["metadata"].pop("_workspace_contract")
+        thread["metadata"]["config_override"]["workspace"]["backend"] = "sandbox"
+        svc._db.get_thread = AsyncMock(return_value=thread)
+
+        assert await svc.suspend_thread_workspace("tid-up") is False
+
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        vm_prov.release_vm_captured.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_virtual_upgraded_to_vm_suspends_via_the_vm_branch(self, monkeypatch):
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
-        svc, vm_prov = make_vm_service()
+        svc, vm_prov = make_vm_service(host="100.64.2.6")
         svc._db.get_thread = AsyncMock(return_value=self._upgraded("virtual"))
         svc._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=False)
 
@@ -1582,7 +2307,7 @@ class TestUpgradedThreadReadsAsVmTier:
     @pytest.mark.asyncio
     async def test_sandbox_upgraded_to_vm_reads_as_vm(self, monkeypatch):
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
-        svc, vm_prov = make_vm_service()
+        svc, vm_prov = make_vm_service(host="100.64.2.6")
         svc._db.get_thread = AsyncMock(return_value=self._upgraded("sandbox"))
 
         await svc.suspend_thread_workspace("tid-up")
@@ -1592,7 +2317,7 @@ class TestUpgradedThreadReadsAsVmTier:
     @pytest.mark.asyncio
     async def test_upgraded_thread_snapshot_is_labelled_vm(self, monkeypatch):
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
-        svc, _ = make_vm_service()
+        svc, _ = make_vm_service(host="100.64.2.6")
         svc._db.get_thread = AsyncMock(return_value=self._upgraded("virtual"))
 
         await svc.suspend_thread_workspace("tid-up")
@@ -1608,28 +2333,33 @@ class TestUpgradedThreadReadsAsVmTier:
         container-tier even if a stale vm context is lying around (a failed
         upgrade), because ws_ctx carries pod state."""
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
-        svc, vm_prov = make_vm_service()
+        svc, vm_prov = make_vm_service(host="100.64.0.9")
         thread = self._upgraded("sandbox")
         thread["metadata"]["workspace_container"].update(
-            {"status": "ready", "pod_ip": "10.42.2.32"}
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "pod_ip": "10.42.2.32",
+                "_runtime_incarnation": WORKSPACE_RUNTIME,
+            }
         )
         svc._db.get_thread = AsyncMock(return_value=thread)
 
         await svc.suspend_thread_workspace("tid-up")
 
         vm_prov.delete_thread_vm.assert_not_awaited()
-        svc._container_provisioner.delete_workspace.assert_awaited()
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_declared_vm_without_a_vm_context_yet_still_reads_vm(
+    async def test_declared_vm_without_container_state_still_reads_vm(
         self, monkeypatch
     ):
-        """Created-on-VM thread mid-provision: no vm.status yet, but the
-        declared backend says vm."""
+        """A declared-VM thread with no container runtime takes the VM path."""
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
-        svc, vm_prov = make_vm_service()
+        svc, vm_prov = make_vm_service(host="100.64.0.9")
         thread = self._upgraded("vm")
-        thread["metadata"]["vm"] = {"status": "ready", "ssh_host": "100.64.0.9"}
+        thread["metadata"]["vm"]["ssh_host"] = "100.64.0.9"
         svc._db.get_thread = AsyncMock(return_value=thread)
 
         await svc.suspend_thread_workspace("tid-up")
@@ -1653,38 +2383,6 @@ class TestVmRestoreEndsAtTheCreate:
         return thread
 
     @pytest.mark.asyncio
-    async def test_pinned_restore_refuses_when_runtime_lock_is_unavailable(self):
-        svc, vm_prov = make_vm_service()
-        svc._db.get_thread = AsyncMock(return_value=self._kept_thread())
-
-        ok = await svc.restore_thread_workspace("tid-vm")
-
-        assert ok is False
-        vm_prov.create_thread_vm.assert_not_awaited()
-        svc._container_provisioner.create_workspace.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_pinned_restore_refuses_when_runtime_lock_is_not_acquired(
-        self, monkeypatch
-    ):
-        svc, vm_prov = make_vm_service()
-        svc._db.get_thread = AsyncMock(return_value=self._kept_thread())
-
-        @asynccontextmanager
-        async def denied_lock(_db, _thread_id):
-            yield False
-
-        monkeypatch.setattr(
-            type(svc._db), "thread_advisory_lock", denied_lock, raising=False
-        )
-
-        ok = await svc.restore_thread_workspace("tid-vm")
-
-        assert ok is False
-        vm_prov.create_thread_vm.assert_not_awaited()
-        svc._container_provisioner.create_workspace.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_kept_disk_restore_succeeds_without_ssh_host(self, monkeypatch):
         monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
         svc, vm_prov = make_vm_service()
@@ -1696,17 +2394,15 @@ class TestVmRestoreEndsAtTheCreate:
         svc._db.get_thread = AsyncMock(side_effect=[before, after])
         svc._extract_snapshot = AsyncMock()
 
-        ok = await svc.restore_thread_workspace(
-            "tid-vm", _pinned_runtime_lock_held=True
-        )
+        ok = await svc.restore_thread_workspace("tid-vm")
 
         assert ok is True
         vm_prov.create_thread_vm.assert_awaited_once_with(
             "tid-vm",
-            expected_runtime_generation="00000000-0000-4000-8000-000000000001",
-            expected_agent_id=None,
-            expected_attach_token=None,
-            expected_vm_context=before["metadata"]["vm"],
+            expected_runtime_generation=VM_SESSION_GENERATION,
+            expected_agent_id=VM_SESSION_AGENT,
+            expected_attach_token=VM_SESSION_ATTACH,
+            expected_vm_context=ANY,
         )
         svc._extract_snapshot.assert_not_awaited()
 
@@ -1719,7 +2415,7 @@ class TestVmRestoreEndsAtTheCreate:
         after["metadata"]["vm"] = {"status": "provisioning", "rootdisk": "kept"}
         svc._db.get_thread = AsyncMock(side_effect=[before, after])
 
-        await svc.restore_thread_workspace("tid-vm", _pinned_runtime_lock_held=True)
+        await svc.restore_thread_workspace("tid-vm")
 
         for call in svc._db.merge_thread_vm_context.await_args_list:
             assert call.args[1].get("status") != "failed", (
@@ -1739,7 +2435,7 @@ class TestVmRestoreEndsAtTheCreate:
         after["metadata"]["vm"] = {"status": "provisioning", "rootdisk": "kept"}
         svc._db.get_thread = AsyncMock(side_effect=[before, after])
 
-        await svc.restore_thread_workspace("tid-vm", _pinned_runtime_lock_held=True)
+        await svc.restore_thread_workspace("tid-vm")
 
         for call in svc._db.merge_thread_vm_context.await_args_list:
             assert call.args[1].get("status") != "ready"
@@ -1755,9 +2451,7 @@ class TestVmRestoreEndsAtTheCreate:
         svc._db.get_thread = AsyncMock(return_value=thread)
         svc._extract_snapshot = AsyncMock()
 
-        ok = await svc.restore_thread_workspace(
-            "tid-vm", _pinned_runtime_lock_held=True
-        )
+        ok = await svc.restore_thread_workspace("tid-vm")
 
         assert ok is True
         svc._extract_snapshot.assert_awaited_once()
@@ -1790,6 +2484,27 @@ class TestSessionRestoreRidesTheReattachedVolume:
     def _svc(self, before, after):
         """restore reads the thread twice: once before create_workspace (the
         volume we are coming BACK to) and once after (what the new pod mounts)."""
+        before_workspace = before["metadata"]["workspace_container"]
+        before_workspace.update(
+            {
+                "status": "suspended",
+                "pod_ip": None,
+                "_runtime_incarnation": WORKSPACE_RUNTIME,
+                "_snapshot_restore_required": True,
+            }
+        )
+        before_workspace.pop("_creation_reservation_id", None)
+        before_workspace.pop("_creation_claim_token", None)
+        after_workspace = after["metadata"]["workspace_container"]
+        after_workspace.update(
+            {
+                "status": "ready",
+                "_runtime_incarnation": SUCCESSOR_RUNTIME,
+                "_snapshot_restore_required": True,
+                "_creation_reservation_id": CREATION_ID,
+                "_creation_claim_token": str(CREATION_TOKEN),
+            }
+        )
         svc = make_service()
         svc._db.get_thread = AsyncMock(side_effect=[before, after])
         svc._extract_snapshot = AsyncMock(return_value=True)
@@ -1804,11 +2519,8 @@ class TestSessionRestoreRidesTheReattachedVolume:
 
         assert ok is True
         svc._extract_snapshot.assert_not_awaited()
-        merged = {}
-        for call in svc._db.merge_thread_workspace_context.await_args_list:
-            merged.update(call.args[1])
-        assert merged["status"] == "ready"
-        assert merged["_snapshot_restore_required"] is False
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
+        svc._container_provisioner.complete_workspace_restore_work.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_emptydir_session_still_extracts(self):
@@ -1878,14 +2590,44 @@ class TestSessionRestoreRidesTheReattachedVolume:
         assert ok is False
         statuses = [
             call.args[1].get("status")
-            for call in svc._db.merge_thread_workspace_context.await_args_list
+            for call in svc._db.merge_thread_workspace_context_if_runtime.await_args_list
         ]
         assert statuses[-1] == "failed"
         assert "ready" not in statuses
-        merged = {}
-        for call in svc._db.merge_thread_workspace_context.await_args_list:
-            merged.update(call.args[1])
-        assert merged["_snapshot_restore_required"] is True
+        assert (
+            svc._db.merge_thread_workspace_context_if_runtime.await_args.kwargs[
+                "expected_runtime_incarnation"
+            ]
+            == SUCCESSOR_RUNTIME
+        )
+
+    @pytest.mark.asyncio
+    async def test_lost_create_response_uses_exact_restore_receipt(self):
+        svc = self._svc(self._thread(), self._thread())
+        svc._container_provisioner.create_workspace.side_effect = RuntimeError(
+            "response lost"
+        )
+
+        assert await svc.restore_thread_workspace("tid-pod") is True
+
+        svc._container_provisioner.get_workspace_creation_result.assert_awaited_once_with(
+            WorkspaceOwner.session("tid-pod"),
+            operation_kind="restore",
+            operation_id=CLEANUP_ID,
+        )
+
+    @pytest.mark.asyncio
+    async def test_successor_change_at_ready_cas_is_preserved(self):
+        svc = self._svc(self._thread(), self._thread())
+        svc._container_provisioner.complete_workspace_restore_work.return_value = False
+
+        assert await svc.restore_thread_workspace("tid-pod") is False
+
+        assert (
+            svc._container_provisioner.complete_workspace_restore_work.await_count == 2
+        )
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
+        svc._db.merge_thread_workspace_context.assert_not_awaited()
 
 
 class TestStrictTerminalSessionRestore:
@@ -1912,9 +2654,10 @@ class TestStrictTerminalSessionRestore:
             "metadata": {
                 "config_override": {"workspace": {"backend": "sandbox"}},
                 "workspace_container": {
-                    "status": "deleted",
+                    "status": "suspended",
                     "provisioner": "k8s",
                     "_snapshot_restore_required": marker,
+                    "_runtime_incarnation": WORKSPACE_RUNTIME,
                 },
                 "_workspace_binding": {
                     "generation": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
@@ -1950,6 +2693,8 @@ class TestStrictTerminalSessionRestore:
                         endpoint_generation or cls.GENERATION
                     ),
                     "_runtime_incarnation": runtime or cls.RUNTIME,
+                    "_creation_reservation_id": CREATION_ID,
+                    "_creation_claim_token": str(CREATION_TOKEN),
                 },
                 "_workspace_binding": {
                     "generation": cls.GENERATION,
@@ -1962,12 +2707,53 @@ class TestStrictTerminalSessionRestore:
 
     def _service(self, before=None, after=None):
         svc = make_service()
+        after_row = after or self._after()
         svc._db.get_thread = AsyncMock(
-            side_effect=[before or self._before(), after or self._after()]
+            side_effect=[before or self._before(), after_row]
         )
         svc._extract_snapshot = AsyncMock(return_value=True)
         svc._container_provisioner.workspace_pod_live = AsyncMock(return_value=True)
         svc._commit_strict_thread_restore_ready = AsyncMock(return_value=True)
+        creation = {
+            "id": CREATION_ID,
+            "operation_kind": "restore",
+            "result_kind": "settled",
+            "settled_at": datetime.now(timezone.utc),
+            "runtime_incarnation": self.RUNTIME,
+            "claim_token": CREATION_TOKEN,
+        }
+        svc._container_provisioner.get_workspace_creation_result.return_value = creation
+        svc._container_provisioner.get_current_workspace_creation_result.return_value = creation
+        try:
+            authority = _strict_session_restore_authority(after_row)
+        except RuntimeError:
+            # Malformed tuples are rejected before control-plane attestation;
+            # keep a valid default only so the mock cannot invent authority.
+            authority = _strict_session_restore_authority(self._after())
+        svc._container_provisioner.attest_workspace_runtime.return_value = (
+            WorkspaceRuntimeAttestation(
+                backing_id=authority.backing_id,
+                workspace_generation=("66666666-7777-4888-8999-aaaaaaaaaaaa"),
+                runtime_incarnation=authority.runtime_incarnation,
+                ssh_host_key_fingerprint=authority.host_key_fingerprint,
+                host=authority.ssh_host,
+                pod_ip=authority.ssh_host,
+                port=authority.ssh_port,
+            )
+        )
+
+        async def claim_restore_work(_owner, *, claimant, lease_seconds=300):
+            assert lease_seconds == 300
+            return {
+                **creation,
+                "restore_work_claimed_by": claimant,
+                "restore_work_claim_token": RESTORE_WORK_TOKEN,
+                "restore_work_completed_at": None,
+            }
+
+        svc._container_provisioner.claim_workspace_restore_work.side_effect = (
+            claim_restore_work
+        )
         return svc
 
     @pytest.mark.asyncio
@@ -1983,6 +2769,7 @@ class TestStrictTerminalSessionRestore:
             ssh_port=30022,
             entity_type="threads",
             expected_host_key_fingerprint=self.FINGERPRINT,
+            mutation_authority=ANY,
             remote_cmd=EXTRACT_HOME_REMOTE_CMD,
             require_pipefail=True,
         )
@@ -1990,11 +2777,11 @@ class TestStrictTerminalSessionRestore:
             WorkspaceOwner.session(self.THREAD_ID),
             expected_runtime_incarnation=self.RUNTIME,
         )
-        expected = svc._commit_strict_thread_restore_ready.await_args.args[1]
-        assert expected.workspace_generation == self.GENERATION
-        assert expected.endpoint_generation == self.GENERATION
-        assert expected.runtime_incarnation == self.RUNTIME
-        assert expected.host_key_fingerprint == self.FINGERPRINT
+        complete = svc._container_provisioner.complete_strict_thread_restore_work
+        complete.assert_awaited_once()
+        assert complete.await_args.kwargs["workspace_generation"] == self.GENERATION
+        assert complete.await_args.kwargs["endpoint_generation"] == self.GENERATION
+        assert complete.await_args.kwargs["host_key_fingerprint"] == self.FINGERPRINT
         assert not any(
             call.args[1].get("status") == "ready"
             and call.args[1].get("_snapshot_restore_required") is False
@@ -2021,7 +2808,7 @@ class TestStrictTerminalSessionRestore:
         )
         svc._container_provisioner.create_workspace.assert_not_awaited()
         svc._extract_snapshot.assert_awaited_once()
-        svc._commit_strict_thread_restore_ready.assert_awaited_once()
+        svc._container_provisioner.complete_strict_thread_restore_work.assert_awaited_once()
         assert not any(
             call.args[1].get("status") == "restoring"
             for call in svc._db.merge_thread_workspace_context.await_args_list
@@ -2046,7 +2833,7 @@ class TestStrictTerminalSessionRestore:
         assert ok is False
         svc._container_provisioner.create_workspace.assert_not_awaited()
         svc._extract_snapshot.assert_not_awaited()
-        svc._commit_strict_thread_restore_ready.assert_not_awaited()
+        svc._container_provisioner.complete_strict_thread_restore_work.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_cached_restore_runtime_drift_refuses_before_probe(self):
@@ -2079,7 +2866,7 @@ class TestStrictTerminalSessionRestore:
         ok = await self._restore_new(svc)
 
         assert ok is False
-        svc._commit_strict_thread_restore_ready.assert_not_awaited()
+        svc._container_provisioner.complete_strict_thread_restore_work.assert_not_awaited()
         assert not any(
             call.args[1].get("_snapshot_restore_required") is False
             for call in svc._db.merge_thread_workspace_context.await_args_list
@@ -2094,7 +2881,7 @@ class TestStrictTerminalSessionRestore:
 
         assert await self._restore_new(svc) is False
 
-        svc._commit_strict_thread_restore_ready.assert_not_awaited()
+        svc._container_provisioner.complete_strict_thread_restore_work.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_changed_endpoint_generation_fails_before_snapshot_bytes(self):
@@ -2134,7 +2921,7 @@ class TestStrictTerminalSessionRestore:
 
         svc._extract_snapshot.assert_not_awaited()
         svc._container_provisioner.workspace_pod_live.assert_awaited_once()
-        svc._commit_strict_thread_restore_ready.assert_awaited_once()
+        svc._container_provisioner.complete_strict_thread_restore_work.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_transactional_ready_commit_rejects_tuple_drift(self):
@@ -2187,230 +2974,81 @@ class TestStrictTerminalSessionRestore:
 
 
 # =============================================================================
-# Test: reclaim-on-idle (Task 7) — opt-in, fail-safe PVC drop on session
-# suspend once the S3 snapshot is confirmed restorable.
-# knowledge-base/knowledge/features/workspace_durability_tiering.md §D3
+# A suspended workspace is a preserve disposition. Shared resources belong to
+# the exact cleanup intent and are never reclaimed by a caller-side flag.
 # =============================================================================
 
 
-class TestReclaimOnIdleFlagParsing:
-    """``_reclaim_on_idle_enabled`` truthy-token parsing, mirroring
-    ``canvas_snapshots.snapshots_enabled()``'s style."""
-
-    @pytest.mark.parametrize("value", ["true", "1", "yes", "on", "TRUE", "On", " yes "])
-    def test_truthy_tokens_enable(self, monkeypatch, value):
-        from orchestrator.services.workspace_suspension import (
-            _reclaim_on_idle_enabled,
-        )
-
-        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", value)
-        assert _reclaim_on_idle_enabled() is True
-
-    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "garbage", ""])
-    def test_falsy_tokens_disable(self, monkeypatch, value):
-        from orchestrator.services.workspace_suspension import (
-            _reclaim_on_idle_enabled,
-        )
-
-        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", value)
-        assert _reclaim_on_idle_enabled() is False
-
-    def test_unset_defaults_disabled(self, monkeypatch):
-        from orchestrator.services.workspace_suspension import (
-            _reclaim_on_idle_enabled,
-        )
-
-        monkeypatch.delenv("WORKSPACE_RECLAIM_ON_IDLE", raising=False)
-        assert _reclaim_on_idle_enabled() is False
-
-
-class TestReclaimOnIdle:
-    """Task 7: on a session's idle-suspend, drop the hot-cache workspace PVC
-    once ``verify_snapshot`` confirms the S3 archive is restorable — so idle
-    sessions stop pinning volumes. Default OFF (zero behavior change); when
-    ON, an unverifiable snapshot must KEEP the PVC (fail-safe) rather than
-    risk the only copy of the live working tree."""
-
+class TestSuspendPreservesSharedResources:
     @pytest.mark.asyncio
-    async def test_flag_off_never_deletes_the_pvc(self, monkeypatch):
-        """Regression guarantee: with the flag unset, suspend behaves exactly
-        as before this feature existed — no verify call, no PVC delete."""
-        monkeypatch.delenv("WORKSPACE_RECLAIM_ON_IDLE", raising=False)
+    @pytest.mark.parametrize("legacy_flag", [None, "true"])
+    async def test_suspend_never_reclaims_the_workspace_pvc(
+        self, monkeypatch, legacy_flag
+    ):
+        if legacy_flag is None:
+            monkeypatch.delenv("WORKSPACE_RECLAIM_ON_IDLE", raising=False)
+        else:
+            monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", legacy_flag)
         svc = make_service()
         svc._db.get_thread = AsyncMock(return_value=make_container_thread())
 
-        ok = await svc.suspend_thread_workspace("tid-pod")
+        assert await svc.suspend_thread_workspace("tid-pod") is False
 
-        assert ok is True
+        svc._container_provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
         svc._snapshot_service.verify_snapshot.assert_not_awaited()
         svc._container_provisioner.delete_workspace_pvc.assert_not_awaited()
-        merged = {}
-        for call in svc._db.merge_thread_workspace_context.await_args_list:
-            merged.update(call.args[1])
-        assert merged["status"] == "suspended"
-        assert "volume_reclaimed" not in merged
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_flag_on_verified_snapshot_reclaims_the_pvc(self, monkeypatch):
-        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
+    async def test_agent_pod_is_not_deleted_without_capture_authority(self):
         svc = make_service()
         svc._db.get_thread = AsyncMock(return_value=make_container_thread())
-        svc._snapshot_service.verify_snapshot = AsyncMock(return_value=(True, "ok"))
-
-        ok = await svc.suspend_thread_workspace("tid-pod")
-
-        assert ok is True
-        svc._snapshot_service.verify_snapshot.assert_awaited_once_with(
-            "tid-pod", entity_type="threads"
-        )
-        svc._container_provisioner.delete_workspace_pvc.assert_awaited_once_with(
-            WorkspaceOwner.session("tid-pod")
-        )
-        merged = {}
-        for call in svc._db.merge_thread_workspace_context.await_args_list:
-            merged.update(call.args[1])
-        assert merged["status"] == "suspended"
-        assert merged["volume_reclaimed"] is True
-
-    @pytest.mark.asyncio
-    async def test_flag_on_unverified_snapshot_keeps_the_pvc(self, monkeypatch, caplog):
-        """The fail-safe case: verify_snapshot says the archive is NOT
-        trustworthy, so the PVC must survive — the session stays resumable
-        off the retained volume instead of risking the S3 copy."""
-        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
-        svc = make_service()
-        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
-        svc._snapshot_service.verify_snapshot = AsyncMock(
-            return_value=(False, "sha256 mismatch")
-        )
-
-        with caplog.at_level(logging.WARNING):
-            ok = await svc.suspend_thread_workspace("tid-pod")
-
-        assert ok is True, "an unverified snapshot must not fail the suspend itself"
-        svc._container_provisioner.delete_workspace_pvc.assert_not_awaited()
-        merged = {}
-        for call in svc._db.merge_thread_workspace_context.await_args_list:
-            merged.update(call.args[1])
-        assert merged["status"] == "suspended"
-        assert "volume_reclaimed" not in merged
-        assert "sha256 mismatch" in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_pvc_delete_failure_does_not_fail_the_suspend(self, monkeypatch):
-        """A PVC-delete failure (provisioner returns False, e.g. a non-404 API
-        error) must not lose the session — it stays resumable off the
-        retained PVC rather than the suspend itself failing."""
-        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
-        svc = make_service()
-        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
-        svc._snapshot_service.verify_snapshot = AsyncMock(return_value=(True, "ok"))
-        svc._container_provisioner.delete_workspace_pvc = AsyncMock(return_value=False)
-
-        ok = await svc.suspend_thread_workspace("tid-pod")
-
-        assert ok is True
-        # Prove the reclaim was actually attempted (and failed gracefully) —
-        # not merely skipped, which would make this assertion vacuous.
-        svc._container_provisioner.delete_workspace_pvc.assert_awaited_once()
-        merged = {}
-        for call in svc._db.merge_thread_workspace_context.await_args_list:
-            merged.update(call.args[1])
-        assert merged["status"] == "suspended"
-        assert "volume_reclaimed" not in merged
-
-    @pytest.mark.asyncio
-    async def test_pvc_delete_exception_does_not_fail_the_suspend(self, monkeypatch):
-        """Same guarantee when the provisioner call raises outright rather
-        than returning False — the reclaim is best-effort, the suspend is
-        not."""
-        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
-        svc = make_service()
-        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
-        svc._snapshot_service.verify_snapshot = AsyncMock(return_value=(True, "ok"))
-        svc._container_provisioner.delete_workspace_pvc = AsyncMock(
-            side_effect=RuntimeError("k8s api unavailable")
-        )
-
-        ok = await svc.suspend_thread_workspace("tid-pod")
-
-        assert ok is True
-        svc._container_provisioner.delete_workspace_pvc.assert_awaited_once()
-        merged = {}
-        for call in svc._db.merge_thread_workspace_context.await_args_list:
-            merged.update(call.args[1])
-        assert merged["status"] == "suspended"
-        assert "volume_reclaimed" not in merged
-
-    @pytest.mark.asyncio
-    async def test_agent_pvc_delete_not_attempted_via_agent_provisioner(
-        self, monkeypatch
-    ):
-        """The session AGENT pod's PVC (``pvc-agent-s-<id>``) is a SEPARATE
-        claim managed by ``AgentProvisioner`` — the type actually wired into
-        ``self._agent_provisioner`` (see orchestrator/main.py). That class
-        exposes no PVC-delete method (only the separate, unwired
-        ``PersistentProvisioner`` has ``delete_agent_pvc``, for a
-        differently-named legacy claim). A ``spec``'d mock without
-        ``delete_agent_pvc`` raises ``AttributeError`` if reclaim ever tries
-        to call it, so this pins today's "workspace PVC only" scope and
-        catches any future drift immediately. The pre-existing
-        delete_agent_pod_by_thread call must still fire unchanged."""
-        monkeypatch.setenv("WORKSPACE_RECLAIM_ON_IDLE", "true")
-        svc = make_service()
-        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
-        svc._snapshot_service.verify_snapshot = AsyncMock(return_value=(True, "ok"))
         agent_prov = MagicMock(spec=["is_available", "delete_agent_pod_by_thread"])
+        type(agent_prov).is_available = PropertyMock(return_value=True)
         agent_prov.delete_agent_pod_by_thread = AsyncMock(return_value=True)
         svc._agent_provisioner = agent_prov
 
-        ok = await svc.suspend_thread_workspace("tid-pod")
+        assert await svc.suspend_thread_workspace("tid-pod") is False
 
-        assert ok is True
-        svc._container_provisioner.delete_workspace_pvc.assert_awaited_once()
-        agent_prov.delete_agent_pod_by_thread.assert_awaited_once_with("tid-pod")
+        svc._container_provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
+        agent_prov.delete_agent_pod_by_thread.assert_not_awaited()
 
 
-class TestRestoreAfterReclaimOnIdle:
-    """Confirms — without changing restore logic — that a PVC dropped by
-    reclaim-on-idle is handled correctly on the next touch.
-
-    A reclaimed PVC is, to the restore path, indistinguishable from "first
-    PVC-backed create" or the single-replica node-loss fallback: ``delete``
-    then ``create_workspace`` mints a FRESH claim under the same deterministic
-    name, which K8s gives a brand new UID. ``_volume_survived_teardown``
-    compares the binding's ``backing_id`` (which embeds that UID, not the
-    name), so the changed id correctly reads as "not the same volume" and
-    falls through to the S3 extract — exactly the desired behavior, with no
-    special-casing needed in restore_thread_workspace."""
+class TestRestoreWithChangedBacking:
+    """A different backing UID on B requires restoring the captured bytes."""
 
     @pytest.mark.asyncio
     async def test_extract_fires_when_the_reclaimed_pvc_comes_back_fresh(self):
-        before = make_container_thread()
-        before["metadata"]["workspace_container"]["pod_ip"] = "10.42.2.32"
+        before = make_container_thread(
+            ws_status="suspended",
+            pod_ip=None,
+            snapshot_restore_required=True,
+        )
         before["metadata"]["_workspace_binding"] = {
             "backing_kind": "remote",
             "backing_id": "k8s-pvc:srw:11111111-old-reclaimed",
         }
 
-        after = make_container_thread()
-        after["metadata"]["workspace_container"]["pod_ip"] = "10.42.2.99"
-        # create_workspace minted a brand new PVC under the same deterministic
-        # name — reclaim deleted the old claim, so this UID is necessarily new.
+        after = make_container_thread(
+            ws_status="ready",
+            pod_ip="10.42.2.99",
+            runtime=SUCCESSOR_RUNTIME,
+            snapshot_restore_required=True,
+            creation_receipt=True,
+        )
         after["metadata"]["_workspace_binding"] = {
             "backing_kind": "remote",
             "backing_id": "k8s-pvc:srw:99999999-fresh",
         }
 
         svc = make_service()
-        svc._db.get_thread = AsyncMock(side_effect=[before, after])
+        configure_thread_restore(svc, before=before, after=after)
         svc._extract_snapshot = AsyncMock(return_value=True)
 
         ok = await svc.restore_thread_workspace("tid-pod")
 
         assert ok is True
         svc._extract_snapshot.assert_awaited_once()
-        merged = {}
-        for call in svc._db.merge_thread_workspace_context.await_args_list:
-            merged.update(call.args[1])
-        assert merged["status"] == "ready"
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
+        svc._container_provisioner.complete_workspace_restore_work.assert_awaited_once()

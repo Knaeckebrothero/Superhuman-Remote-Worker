@@ -20,8 +20,10 @@ PIPESTATUS-discriminated verdict. Follows the C1b/C1c real-bash pattern in
 catch shell bugs in the verdict tail itself.
 """
 
+import asyncio
 import base64
 import json
+import shlex
 import shutil
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -39,8 +41,10 @@ from orchestrator.services.ide_settings import (
     build_extensions_list_script,
     build_seed_script,
     build_signature_script,
+    capture_safe_workspaces,
     capture_ide_profile,
     evict_dead_workspaces,
+    is_kubernetes_capture_context,
     parse_extensions_list,
     parse_signature,
     parse_pull_output,
@@ -337,6 +341,53 @@ class TestResolveSshTarget:
         assert port > 0
 
 
+class TestKubernetesCaptureContainment:
+    def test_kubernetes_rows_require_exact_capture_authority(self):
+        current = {
+            "workspace_container": {
+                "provisioner": "k8s",
+                "pod_ip": "10.0.0.5",
+            }
+        }
+        legacy = {"workspace_container": {"pod_ip": "10.0.0.6"}}
+
+        assert is_kubernetes_capture_context(current)
+        assert is_kubernetes_capture_context(legacy)
+        assert (
+            capture_safe_workspaces(
+                [
+                    {"id": "current", "context": current},
+                    {"id": "legacy", "context": legacy},
+                ]
+            )
+            == []
+        )
+
+    def test_explicit_non_kubernetes_rows_remain_capture_candidates(self):
+        docker = {
+            "id": "docker",
+            "context": {
+                "workspace_container": {
+                    "provisioner": "docker",
+                    "host": "workspace-1",
+                }
+            },
+        }
+        vm = {
+            "id": "vm",
+            "context": {
+                "config_override": {"workspace": {"backend": "vm"}},
+                "workspace_container": {
+                    "provisioner": "k8s",
+                    "pod_ip": "10.0.0.5",
+                },
+                "vm": {"status": "ready", "ssh_host": "192.0.2.8"},
+            },
+        }
+
+        assert capture_safe_workspaces([docker, vm]) == [docker, vm]
+
+
 class TestBuildSeedScript:
     def test_empty_files_is_noop_script(self):
         # No files → nothing to write; must not emit destructive commands.
@@ -411,6 +462,7 @@ class TestReconcileIdeSettings:
                 "context": {
                     "workspace_container": {
                         "status": "ready",
+                        "provisioner": "docker",
                         "pod_ip": "10.0.0.5",
                         "port": 30022,
                     }
@@ -441,6 +493,7 @@ class TestReconcileIdeSettings:
                 "context": {
                     "workspace_container": {
                         "status": "ready",
+                        "provisioner": "docker",
                         "pod_ip": "10.0.0.2",
                         "port": 30022,
                     }
@@ -451,6 +504,7 @@ class TestReconcileIdeSettings:
                 "context": {
                     "workspace_container": {
                         "status": "ready",
+                        "provisioner": "docker",
                         "pod_ip": "10.0.0.1",
                         "port": 30022,
                     }
@@ -526,7 +580,7 @@ class TestReconcileIdeSettings:
         ws = [
             {
                 "user_id": UID,
-                "context": '{"workspace_container": {"status": "ready", "pod_ip": "10.0.0.5", "port": 30022}}',
+                "context": '{"workspace_container": {"status": "ready", "provisioner": "docker", "pod_ip": "10.0.0.5", "port": 30022}}',
             }
         ]
         count = await reconcile_ide_settings(store, ws, pull_fn)
@@ -549,6 +603,7 @@ class TestReconcileIdeSettings:
                 "context": {
                     "workspace_container": {
                         "status": "ready",
+                        "provisioner": "docker",
                         "pod_ip": "good",
                         "port": 30022,
                     }
@@ -768,7 +823,15 @@ class TestReconcileExtensions:
         db = FakeSettingsDB()
         store = IdeSettingsStore(db)
         workspaces = [
-            {"user_id": UID, "context": {"workspace_container": {"pod_ip": "10.0.0.1"}}}
+            {
+                "user_id": UID,
+                "context": {
+                    "workspace_container": {
+                        "provisioner": "docker",
+                        "pod_ip": "10.0.0.1",
+                    }
+                },
+            }
         ]
 
         async def list_fn(host, port):
@@ -917,7 +980,7 @@ class TestSshTarToFileCommandShape:
         assert remote_cmd.startswith("bash -c '")
         assert remote_cmd.endswith("'")
         assert (
-            "tar -cf - /var/lib/code-server/User/globalStorage 2>/dev/null"
+            "tar -cf - -- /var/lib/code-server/User/globalStorage 2>/dev/null"
             in remote_cmd
         )
         assert "| zstd -1 -T0" in remote_cmd
@@ -929,9 +992,7 @@ class TestSshTarToFileCommandShape:
         assert "${__ps[1]}" in remote_cmd
         assert "exit 1" in remote_cmd
         assert "exit 0" in remote_cmd
-        # The `-c` body is single-quoted: exactly the opening and closing
-        # quote should exist anywhere in the command.
-        assert remote_cmd.count("'") == 2
+        assert "du -sb -- /var/lib/code-server/User/globalStorage" in remote_cmd
 
     @pytest.mark.asyncio
     async def test_remote_path_has_no_single_quote_so_embedding_is_safe(self, tmp_path):
@@ -998,15 +1059,21 @@ class TestSshUntarFromFileCommandShape:
     async def test_wrapped_in_bash_c_with_pipestatus_verdict(self, tmp_path):
         remote_cmd = await _untar_remote_cmd(tmp_path)
 
-        assert remote_cmd.startswith("bash -c '")
-        assert remote_cmd.endswith("'")
-        assert "zstd -d | tar -xf - -C /" in remote_cmd
-        assert '__ps=("${PIPESTATUS[@]}")' in remote_cmd
-        assert "${__ps[0]}" in remote_cmd
-        assert "${__ps[1]}" in remote_cmd
-        assert "exit 1" in remote_cmd
-        assert "exit 0" in remote_cmd
-        assert remote_cmd.count("'") == 2
+        argv = shlex.split(remote_cmd)
+        assert argv[:2] == ["flock", "-w"]
+        assert argv[3] == "/tmp/.srw-vm-remote-operation.lock"
+        assert "timeout" in argv
+        assert argv[-5:-1] == ["bash", "-o", "pipefail", "-c"]
+        body = argv[-1]
+        assert "zstd -dc | python3 -c" in body
+        assert "limit=2147483648" in body
+        assert "tar --no-same-owner --no-same-permissions" in body
+        assert '__ps=("${PIPESTATUS[@]}")' in body
+        assert "${__ps[0]}" in body
+        assert "${__ps[1]}" in body
+        assert "${__ps[2]}" in body
+        assert "exit 1" in body
+        assert "exit 0" in body
 
     @pytest.mark.asyncio
     async def test_returns_true_on_accept_verdict(self, tmp_path):
@@ -1042,6 +1109,46 @@ class TestSshUntarFromFileCommandShape:
             ok = await _ssh_untar_from_file("h", 22, str(local), key_path="")
 
         assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_cancellation_joins_remote_mutation_before_return(self, tmp_path):
+        local = tmp_path / "in.tar.zst"
+        local.write_bytes(b"x")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        fake = MagicMock()
+        fake.returncode = None
+        fake.stdin.write = MagicMock()
+        fake.stdin.drain = AsyncMock(return_value=None)
+        fake.stdin.close = MagicMock()
+        fake.stderr.read = AsyncMock(side_effect=[b""])
+        fake.terminate = MagicMock()
+        fake.kill = MagicMock()
+
+        async def _wait():
+            entered.set()
+            await release.wait()
+            fake.returncode = 0
+            return 0
+
+        fake.wait = AsyncMock(side_effect=_wait)
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            mutation = asyncio.create_task(
+                _ssh_untar_from_file("h", 22, str(local), key_path="")
+            )
+            await entered.wait()
+            mutation.cancel()
+            await asyncio.sleep(0)
+            assert not mutation.done()
+            fake.terminate.assert_not_called()
+            fake.kill.assert_not_called()
+
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await mutation
+
+        fake.terminate.assert_not_called()
+        fake.kill.assert_not_called()
 
 
 class TestIdeSettingsHonestRcRealBash:
@@ -1113,12 +1220,11 @@ class TestIdeSettingsHonestRcRealBash:
             pytest.skip("bash not available")
 
         remote_cmd = await _untar_remote_cmd(tmp_path)
-        assert remote_cmd.startswith("bash -c '") and remote_cmd.endswith("'")
-        body = remote_cmd[len("bash -c '") : -1]
+        body = shlex.split(remote_cmd)[-1]
         tail = self._tail_after(body, "-C /; ")
 
-        def run(zstd_rc: int, tar_rc: int, *, wrapped: bool) -> int:
-            pipeline = f"( exit {zstd_rc} ) | ( exit {tar_rc} )"
+        def run(zstd_rc: int, limiter_rc: int, tar_rc: int, *, wrapped: bool) -> int:
+            pipeline = f"( exit {zstd_rc} ) | ( exit {limiter_rc} ) | ( exit {tar_rc} )"
             script = f"{pipeline}; {tail}" if wrapped else pipeline
             result = subprocess.run(
                 ["bash", "-c", script], capture_output=True, text=True
@@ -1128,15 +1234,17 @@ class TestIdeSettingsHonestRcRealBash:
         # (zstd_rc, tar_rc) -> honest verdict: accept a clean zstd (0) + tar
         # in {0,1}; reject any zstd failure or tar>=2.
         cases = [
-            (0, 0, 0),
-            (0, 1, 0),  # tolerated
-            (0, 2, 1),  # rejected: fatal tar failure
-            (1, 0, 1),  # rejected: masked zstd decompression failure
+            (0, 0, 0, 0),
+            (0, 0, 1, 0),  # tolerated tar warning
+            (0, 0, 2, 1),  # rejected: fatal tar failure
+            (1, 0, 0, 1),  # rejected: masked zstd decompression failure
+            (0, 73, 0, 1),  # rejected: decompressed byte cap exceeded
         ]
-        for zstd_rc, tar_rc, expected in cases:
-            got = run(zstd_rc, tar_rc, wrapped=True)
+        for zstd_rc, limiter_rc, tar_rc, expected in cases:
+            got = run(zstd_rc, limiter_rc, tar_rc, wrapped=True)
             assert got == expected, (
-                f"zstd_rc={zstd_rc} tar_rc={tar_rc}: expected {expected}, got {got}"
+                f"zstd_rc={zstd_rc} limiter_rc={limiter_rc} tar_rc={tar_rc}: "
+                f"expected {expected}, got {got}"
             )
 
         # The load-bearing with/without contrast for the extract-side
@@ -1146,8 +1254,8 @@ class TestIdeSettingsHonestRcRealBash:
         # short/empty stream and didn't itself error) reports SUCCESS on the
         # plain, unwrapped pipeline — exactly today's bug — and only stops
         # being a false 0 once the extracted verdict tail runs.
-        assert run(1, 0, wrapped=False) == 0
-        assert run(1, 0, wrapped=True) != 0
+        assert run(1, 0, 0, wrapped=False) == 0
+        assert run(1, 0, 0, wrapped=True) != 0
 
 
 class TestCaptureProfile:

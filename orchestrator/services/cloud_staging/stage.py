@@ -29,9 +29,20 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from services.cloud_staging.manifest import derive_manifest
+from services.cloud_staging.manifest import MAX_MANIFEST_JSON_BYTES, derive_manifest
 from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
+from services.blocking_effect import joined_blocking_call
 from services.ssh_helpers import _scan_pinned_host_key, build_agent_ssh_cmd
+from services.subprocess_effect import SubprocessOutputLimit, communicate_bounded
+from services.vm_remote_operation import (
+    VMRemoteOperationLease,
+    VMRemoteOperationUnavailable,
+    claim_vm_remote_operation,
+)
+from src.shared.workspace_contract import (
+    vm_mode_from_env,
+    workspace_contract_authority_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +56,11 @@ _EMPTY_SIGNATURE = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852
 _STAGE_MAX_BYTES = 9 * 1024**3
 
 _SSH_CAPTURE_TIMEOUT_S = 30.0
+_SSH_STREAM_TIMEOUT_S = 30 * 60.0
+_SSH_CHILD_TERM_GRACE_S = 0.5
+_SSH_CHILD_KILL_GRACE_S = 2.0
+_SSH_STDERR_TAIL_BYTES = 16 * 1024
+_SSH_CAPTURE_STDOUT_BYTES = 4096
 
 # Per-thread debounce: threads currently mid-stage. See module docstring.
 _inflight: set[str] = set()
@@ -78,6 +94,7 @@ def immutable_staging_keys(
     epoch: int,
     source_binding_sha256: str,
     tar_sha256: str,
+    claim_token: int | None = None,
 ) -> tuple[str, str]:
     """Content-addressed keys prevent a stale PUT overwriting a successor."""
 
@@ -89,9 +106,14 @@ def immutable_staging_keys(
         raise ValueError("staging source digest is malformed")
     if len(tar_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in tar_sha256):
         raise ValueError("staging tar digest is malformed")
+    claim_component = ""
+    if claim_token is not None:
+        if isinstance(claim_token, bool) or int(claim_token) <= 0:
+            raise ValueError("staging claim token is malformed")
+        claim_component = f"/vm-claim-{int(claim_token)}"
     prefix = (
         f"cloud-staging/{thread_id}/{generation}/{workspace}/"
-        f"{int(epoch)}/{source_binding_sha256}/{tar_sha256}"
+        f"{int(epoch)}/{source_binding_sha256}{claim_component}/{tar_sha256}"
     )
     return f"{prefix}/upper.tar", f"{prefix}/manifest.json"
 
@@ -118,7 +140,9 @@ def stage_tar_cmd() -> str:
     )
 
 
-def _resolve_workspace_ssh(metadata: dict) -> tuple[str, int] | None:
+def _resolve_workspace_ssh(
+    metadata: dict, *, allow_vm_suspending: bool = False
+) -> tuple[str, int] | None:
     """Resolve the workspace SSH host/port from thread metadata.
 
     Source: ``workspace_suspension.py``'s ``suspend_thread_workspace``
@@ -131,7 +155,36 @@ def _resolve_workspace_ssh(metadata: dict) -> tuple[str, int] | None:
     ws_ctx = metadata.get("workspace_container") or {}
     vm_ctx = metadata.get("vm") or {}
 
-    host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
+    selected = workspace_contract_authority_identity(
+        {
+            "context": metadata,
+            "config_override": metadata.get("config_override"),
+        },
+        vm_mode=vm_mode_from_env(),
+        allow_vm_suspending=allow_vm_suspending,
+    )
+    if selected is None:
+        # Compatibility for the historical local/container-only capture path.
+        # Never perform the same fallback to VM coordinates: VM remote effects
+        # require a selected contract and a durable receipt.
+        configured = (
+            (metadata.get("config_override") or {}).get("workspace") or {}
+        ).get("backend")
+        if configured is not None or vm_ctx:
+            return None
+        host = ws_ctx.get("pod_ip") or ws_ctx.get("host")
+        if not host:
+            return None
+        return str(host), int(ws_ctx.get("port") or 30022)
+    if selected[0] == "vm":
+        host = vm_ctx.get("ssh_host")
+        if not host:
+            return None
+        return str(host), int(vm_ctx.get("ssh_port") or 22)
+    if selected[0] != "sandbox":
+        return None
+
+    host = ws_ctx.get("pod_ip") or ws_ctx.get("host")
     if not host:
         return None
 
@@ -165,25 +218,121 @@ def _sha256_file(path: str) -> str:
 # =============================================================================
 
 
-async def _run_ssh_capture(cmd: list[str], *, timeout: float) -> bytes | None:
-    """Run ``cmd``, capturing stdout. Returns ``None`` on spawn/timeout/rc!=0."""
+async def _bounded_stop_and_reap(process: asyncio.subprocess.Process) -> None:
+    """Terminate then kill an owned SSH child, deferring cancellation."""
+
+    async def _stop() -> None:
+        if process.returncode is not None:
+            await process.wait()
+            return
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), _SSH_CHILD_TERM_GRACE_S)
+            return
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(process.wait(), _SSH_CHILD_KILL_GRACE_S)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            logger.error("stage: SSH child did not reap within the bounded cleanup")
+
+    cleanup = asyncio.create_task(_stop())
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    cleanup.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _stop_preserving_primary(
+    process: asyncio.subprocess.Process, primary: BaseException
+) -> None:
     try:
-        proc = await asyncio.create_subprocess_exec(
+        await _bounded_stop_and_reap(process)
+    except BaseException as cleanup_error:
+        if not isinstance(cleanup_error, asyncio.CancelledError):
+            logger.warning(
+                "stage: SSH cleanup failed while preserving %s",
+                type(primary).__name__,
+                exc_info=True,
+            )
+
+
+async def _spawn_owned_ssh_child(cmd: list[str]) -> asyncio.subprocess.Process:
+    """Do not let cancellation between fork and return orphan the child."""
+
+    spawn = asyncio.create_task(
+        asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not spawn.done():
+        try:
+            await asyncio.shield(spawn)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    try:
+        process = spawn.result()
+    except BaseException:
+        if cancellation is not None:
+            raise cancellation
+        raise
+    if cancellation is not None:
+        await _stop_preserving_primary(process, cancellation)
+        raise cancellation
+    return process
+
+
+async def _stderr_tail(reader: asyncio.StreamReader) -> bytes:
+    tail = bytearray()
+    while True:
+        chunk = await reader.read(64 * 1024)
+        if not chunk:
+            return bytes(tail)
+        tail.extend(chunk)
+        if len(tail) > _SSH_STDERR_TAIL_BYTES:
+            del tail[: len(tail) - _SSH_STDERR_TAIL_BYTES]
+
+
+async def _run_ssh_capture(cmd: list[str], *, timeout: float) -> bytes | None:
+    """Run ``cmd``, capturing stdout. Returns ``None`` on spawn/timeout/rc!=0."""
+    try:
+        proc = await _spawn_owned_ssh_child(cmd)
     except OSError as e:
         logger.error("stage: failed to spawn ssh capture: %s", e)
         return None
 
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        stdout, stderr = await communicate_bounded(
+            proc,
+            timeout=timeout,
+            stdout_limit=_SSH_CAPTURE_STDOUT_BYTES,
+            stderr_limit=_SSH_STDERR_TAIL_BYTES,
+        )
+    except TimeoutError:
         logger.warning("stage: ssh capture timed out after %ss", timeout)
         return None
+    except SubprocessOutputLimit:
+        logger.warning("stage: ssh capture exceeded its output cap")
+        return None
+    except BaseException as exc:
+        await _stop_preserving_primary(proc, exc)
+        raise
 
     if proc.returncode != 0:
         logger.warning(
@@ -203,42 +352,57 @@ async def _stream_tar_to_file(cmd: list[str], dest_path: str) -> bool:
     ``_STAGE_MAX_BYTES``: kills the child and returns ``False`` if exceeded.
     """
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        process = await _spawn_owned_ssh_child(cmd)
     except OSError as e:
         logger.error("stage: failed to spawn ssh tar: %s", e)
         return False
 
+    stderr_task = asyncio.create_task(_stderr_tail(process.stderr))
     total_bytes = 0
-    with open(dest_path, "wb") as f:
-        while True:
-            chunk = await process.stdout.read(1024 * 1024)  # 1 MiB chunks
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            if total_bytes > _STAGE_MAX_BYTES:
-                process.kill()
-                await process.wait()
-                logger.warning(
-                    "stage: upperdir tar exceeds cap (%d bytes), aborting",
-                    _STAGE_MAX_BYTES,
-                )
-                return False
-            f.write(chunk)
-
-    await process.wait()
-
-    if process.returncode != 0 and total_bytes == 0:
-        stderr = (await process.stderr.read()).decode(errors="replace")
-        logger.error(
-            "stage: ssh tar failed (rc=%s): %s", process.returncode, stderr[:500]
-        )
+    succeeded = False
+    try:
+        async with asyncio.timeout(_SSH_STREAM_TIMEOUT_S):
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = await process.stdout.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > _STAGE_MAX_BYTES:
+                        await _bounded_stop_and_reap(process)
+                        await stderr_task
+                        logger.warning(
+                            "stage: upperdir tar exceeds cap (%d bytes), aborting",
+                            _STAGE_MAX_BYTES,
+                        )
+                        return False
+                    f.write(chunk)
+            await process.wait()
+        stderr = (await stderr_task).decode(errors="replace")
+        if process.returncode != 0:
+            logger.error(
+                "stage: ssh tar failed (rc=%s): %s", process.returncode, stderr[-500:]
+            )
+            return False
+        succeeded = True
+        return True
+    except TimeoutError:
+        await _bounded_stop_and_reap(process)
+        await asyncio.gather(stderr_task, return_exceptions=True)
+        logger.warning("stage: SSH tar stream timed out")
         return False
-
-    return True
+    except BaseException as exc:
+        await _stop_preserving_primary(process, exc)
+        await asyncio.gather(stderr_task, return_exceptions=True)
+        raise
+    finally:
+        if not succeeded:
+            try:
+                os.unlink(dest_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("stage: could not remove partial tar")
 
 
 async def _run_authorized_ssh_capture(
@@ -364,6 +528,7 @@ async def stage_thread_cloud_diff(
     postgres_db: Any,
     snapshot_service: Any,
     authority: dict[str, Any] | None = None,
+    vm_provisioner: Any = None,
 ) -> dict | None:
     """Stage the protected session's upperdir diff to S3, if it changed.
 
@@ -394,6 +559,7 @@ async def stage_thread_cloud_diff(
             postgres_db=postgres_db,
             snapshot_service=snapshot_service,
             authority=authority,
+            vm_provisioner=vm_provisioner,
         )
     except Exception:
         logger.exception("stage: unhandled error staging thread %s", thread_id)
@@ -408,11 +574,51 @@ async def _stage_thread_cloud_diff(
     postgres_db: Any,
     snapshot_service: Any,
     authority: dict[str, Any] | None = None,
+    vm_provisioner: Any = None,
+    _vm_lease: VMRemoteOperationLease | None = None,
 ) -> dict | None:
     thread = await postgres_db.get_thread(thread_id)
     metadata = _parse_metadata(thread)
     if not metadata.get("protected_cloud"):
         return {"skipped": "not_protected"}
+
+    contract_identity = workspace_contract_authority_identity(
+        {
+            "context": metadata,
+            "config_override": metadata.get("config_override"),
+        },
+        vm_mode=vm_mode_from_env(),
+        allow_vm_suspending=True,
+    )
+    is_vm = bool(contract_identity and contract_identity[0] == "vm")
+    if is_vm and _vm_lease is None:
+        if vm_provisioner is None:
+            return {"skipped": "vm_capture_authority_unavailable"}
+        try:
+            lease = await claim_vm_remote_operation(
+                db=postgres_db,
+                provisioner=vm_provisioner,
+                owner_id=thread_id,
+                owner_kind="thread",
+                operation_kind="cloud_stage",
+            )
+            async with lease:
+                return await _stage_thread_cloud_diff(
+                    thread_id=thread_id,
+                    postgres_db=postgres_db,
+                    snapshot_service=snapshot_service,
+                    authority=authority,
+                    vm_provisioner=vm_provisioner,
+                    _vm_lease=lease,
+                )
+        except VMRemoteOperationUnavailable:
+            return {"skipped": "vm_capture_authority_unavailable"}
+
+    async def _vm_authorized() -> bool:
+        if _vm_lease is None:
+            return True
+        target = await _vm_lease.revalidate()
+        return target is not None
 
     row = await postgres_db.get_ro_mount_by_thread(thread_id)
     if not row or row.get("status") != "active":
@@ -426,20 +632,28 @@ async def _stage_thread_cloud_diff(
 
     if authority is not None and not _authority_matches(authority, thread, row):
         return {"skipped": "authority_changed"}
-    resolved = _resolve_workspace_ssh(
-        {
-            "workspace_container": authority.get("workspace") or {},
-            "vm": metadata.get("vm") or {},
-        }
-        if authority is not None
-        else metadata
-    )
+    resolved = _resolve_workspace_ssh(metadata, allow_vm_suspending=True)
     if resolved is None:
         return {"skipped": "no_workspace"}
     ssh_host, ssh_port = resolved
 
+    if _vm_lease is not None and (
+        ssh_host,
+        ssh_port,
+    ) != (_vm_lease.identity.ssh_host, _vm_lease.identity.ssh_port):
+        return {"skipped": "vm_capture_authority_changed"}
+    ssh_authority = authority
+    if _vm_lease is not None:
+        if not await _vm_authorized():
+            return {"skipped": "vm_capture_authority_changed"}
+        ssh_authority = {
+            "workspace_ssh_host_key_fingerprint": (
+                _vm_lease.identity.ssh_host_key_fingerprint
+            )
+        }
+
     raw = await _run_authorized_ssh_capture(
-        authority,
+        ssh_authority,
         ssh_host=ssh_host,
         ssh_port=ssh_port,
         remote_cmd=stage_signature_cmd(),
@@ -453,6 +667,8 @@ async def _stage_thread_cloud_diff(
         )
         return None
     signature = raw.decode(errors="replace").strip()
+    if not await _vm_authorized():
+        return {"skipped": "vm_capture_authority_changed"}
 
     if signature == _EMPTY_SIGNATURE:
         if authority is not None:
@@ -491,6 +707,29 @@ async def _stage_thread_cloud_diff(
                     "counts": counts,
                     "mount_id": str(row["id"]),
                 },
+                "publication": published,
+            }
+        if _vm_lease is not None:
+            if not await _vm_authorized():
+                return {"skipped": "vm_capture_authority_changed"}
+            published = await postgres_db.publish_vm_ro_mount_staging_exact(
+                row["id"],
+                thread_id=thread_id,
+                operation_id=str(_vm_lease.receipt["id"]),
+                claim_token=int(_vm_lease.receipt["claim_token"]),
+                claimant=_vm_lease.claimant,
+                expected_engage_attempt=str(row.get("engage_attempt") or ""),
+                expected_source_binding_sha256=source.sha256,
+                expected_staged_epoch=int(row["staged_epoch"]),
+                staged_epoch=int(row["staged_epoch"]) + 1,
+                staged_summary=None,
+            )
+            if published is None:
+                return {"skipped": "vm_capture_authority_changed"}
+            return {
+                "skipped": "empty",
+                "epoch": int(row["staged_epoch"]) + 1,
+                "counts": {"added": 0, "modified": 0, "deleted": 0},
                 "publication": published,
             }
         if row.get("staged_summary") is not None:
@@ -587,16 +826,19 @@ async def _stage_thread_cloud_diff(
             tar_path = tmp.name
 
         if not await _stream_authorized_tar(
-            authority,
+            ssh_authority,
             ssh_host=ssh_host,
             ssh_port=ssh_port,
             dest_path=tar_path,
         ):
             logger.warning("stage: tar stream failed for thread %s", thread_id)
             return None
+        if not await _vm_authorized():
+            return {"skipped": "vm_capture_authority_changed"}
 
         epoch = row["staged_epoch"] + 1
-        manifest = derive_manifest(
+        manifest = await joined_blocking_call(
+            derive_manifest,
             tar_path,
             baseline=row.get("etag_baseline") or {},
             epoch=epoch,
@@ -613,16 +855,31 @@ async def _stage_thread_cloud_diff(
         # the downloaded tar and treat a mismatch as staging-missing.
         # A hashing failure (e.g. OSError) propagates to the outer catch-all
         # in stage_thread_cloud_diff → logged, returns None (never raises).
-        manifest["tar_sha256"] = await asyncio.to_thread(_sha256_file, tar_path)
+        manifest["tar_sha256"] = await joined_blocking_call(_sha256_file, tar_path)
 
-        if authority is not None:
+        if authority is not None or _vm_lease is not None:
+            runtime_generation = (
+                authority["runtime_generation"]
+                if authority is not None
+                else _vm_lease.identity.launcher_pod_uid
+            )
+            workspace_generation = (
+                authority["workspace_generation"]
+                if authority is not None
+                else _vm_lease.identity.workspace_generation
+            )
             tar_key, manifest_key = immutable_staging_keys(
                 thread_id=thread_id,
-                runtime_generation=authority["runtime_generation"],
-                workspace_generation=authority["workspace_generation"],
+                runtime_generation=runtime_generation,
+                workspace_generation=workspace_generation,
                 epoch=epoch,
                 source_binding_sha256=source.sha256,
                 tar_sha256=manifest["tar_sha256"],
+                claim_token=(
+                    int(_vm_lease.receipt["claim_token"])
+                    if _vm_lease is not None
+                    else None
+                ),
             )
         else:
             tar_key = staging_tar_key(thread_id)
@@ -630,6 +887,8 @@ async def _stage_thread_cloud_diff(
 
         if not await _still_authorized(postgres_db, thread_id, authority):
             return {"skipped": "authority_changed"}
+        if not await _vm_authorized():
+            return {"skipped": "vm_capture_authority_changed"}
         if not await snapshot_service.upload_blob_file(tar_key, tar_path):
             logger.error("stage: tar upload failed for thread %s", thread_id)
             return None
@@ -638,10 +897,18 @@ async def _stage_thread_cloud_diff(
             suffix=".json", delete=False, mode="wb"
         ) as mtmp:
             manifest_path = mtmp.name
-            mtmp.write(json.dumps(manifest).encode())
+            manifest_bytes = json.dumps(
+                manifest, sort_keys=True, separators=(",", ":")
+            ).encode()
+            if len(manifest_bytes) > MAX_MANIFEST_JSON_BYTES:
+                logger.warning("stage: manifest exceeds its byte cap")
+                return None
+            mtmp.write(manifest_bytes)
 
         if not await _still_authorized(postgres_db, thread_id, authority):
             return {"skipped": "authority_changed"}
+        if not await _vm_authorized():
+            return {"skipped": "vm_capture_authority_changed"}
         if not await snapshot_service.upload_blob_file(manifest_key, manifest_path):
             logger.error("stage: manifest upload failed for thread %s", thread_id)
             return None
@@ -656,7 +923,7 @@ async def _stage_thread_cloud_diff(
         # Only the exact-authority path publishes immutable object names.
         # Keep the legacy summary shape stable while mixed-version callers
         # still use the deterministic compatibility keys.
-        if authority is not None:
+        if authority is not None or _vm_lease is not None:
             summary.update(
                 {
                     "tar_key": tar_key,
@@ -672,10 +939,32 @@ async def _stage_thread_cloud_diff(
                         "workspace_runtime_incarnation": authority[
                             "workspace_runtime_incarnation"
                         ],
+                    }
+                    if authority is not None
+                    else {
+                        "vm_operation_id": str(_vm_lease.receipt["id"]),
+                        "vm_claim_token": int(_vm_lease.receipt["claim_token"]),
+                        "workspace_generation": _vm_lease.identity.workspace_generation,
+                        "launcher_pod_uid": _vm_lease.identity.launcher_pod_uid,
                     },
                 }
             )
-        if authority is None:
+        if _vm_lease is not None:
+            if not await _vm_authorized():
+                return {"skipped": "vm_capture_authority_changed"}
+            publication = await postgres_db.publish_vm_ro_mount_staging_exact(
+                row["id"],
+                thread_id=thread_id,
+                operation_id=str(_vm_lease.receipt["id"]),
+                claim_token=int(_vm_lease.receipt["claim_token"]),
+                claimant=_vm_lease.claimant,
+                expected_engage_attempt=str(row.get("engage_attempt") or ""),
+                expected_source_binding_sha256=source.sha256,
+                expected_staged_epoch=int(row["staged_epoch"]),
+                staged_epoch=int(manifest["epoch"]),
+                staged_summary=summary,
+            )
+        elif authority is None:
             published = await postgres_db.update_ro_mount_staging(
                 row["id"],
                 staged_epoch=manifest["epoch"],

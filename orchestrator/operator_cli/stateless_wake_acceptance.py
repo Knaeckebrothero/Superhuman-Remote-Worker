@@ -244,7 +244,12 @@ class StatelessWakeGate:
                 [
                     "0189_stateless_input_deliveries.sql",
                     "0190_stateless_input_delivery_validate.sql",
+                    "0195_non_pinned_workspace_process_zero.sql",
+                    "0196_non_pinned_workspace_lifecycle_authority.sql",
                 ],
+            )
+            dirty_migrations = await conn.fetchval(
+                "SELECT count(*) FROM schema_migrations WHERE success = FALSE"
             )
             constraints = await conn.fetch(
                 "SELECT conname, convalidated FROM pg_constraint "
@@ -289,11 +294,15 @@ class StatelessWakeGate:
         expected_migrations = {
             "0189_stateless_input_deliveries.sql": True,
             "0190_stateless_input_delivery_validate.sql": True,
+            "0195_non_pinned_workspace_process_zero.sql": True,
+            "0196_non_pinned_workspace_lifecycle_authority.sql": True,
         }
         if migration_map != expected_migrations:
             raise GateError(
-                "migration_unavailable", "0185/0186 are not cleanly applied"
+                "migration_unavailable", "0189/0190/0195/0196 are not cleanly applied"
             )
+        if int(dirty_migrations or 0) != 0:
+            raise GateError("dirty_migration", "a failed migration row is present")
         if len(constraints) != 3 or not all(row["convalidated"] for row in constraints):
             raise GateError(
                 "constraint_unvalidated", "delivery constraints are not valid"

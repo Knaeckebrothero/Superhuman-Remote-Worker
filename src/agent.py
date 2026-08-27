@@ -76,12 +76,23 @@ from .utils.db_url import (
 _PG_CHECKPOINT_SCHEMA_READY = False
 
 
-def _stateless_worker_remote_authority(
-    metadata: Dict[str, Any], worker_lease_token: Optional[int]
+def _remote_workspace_authority(
+    metadata: Dict[str, Any],
+    worker_lease_token: Optional[int],
+    *,
+    backend: str,
 ) -> Dict[str, Any]:
-    """Build RemoteBackend authority kwargs for a leased worker claim."""
+    """Build exact Kubernetes SSH authority for stateless and pinned workers."""
 
-    if worker_lease_token is None:
+    provisioner = str(metadata.get("workspace_provisioner") or "").strip().lower()
+    if backend == "sandbox" and provisioner not in {"k8s", "docker"}:
+        raise WorkspaceUnavailableError(
+            "A sandbox worker requires server-derived workspace provisioner authority"
+        )
+    requires_exact_k8s_authority = worker_lease_token is not None or (
+        backend == "sandbox" and provisioner == "k8s"
+    )
+    if not requires_exact_k8s_authority:
         return {}
     fields = {
         "workspace_generation": metadata.get("workspace_generation"),
@@ -96,14 +107,29 @@ def _stateless_worker_remote_authority(
         not isinstance(value, str) or not value.strip() for value in fields.values()
     ):
         raise WorkspaceUnavailableError(
-            "A stateless worker claim requires an orchestrator-attested workspace "
+            "A Kubernetes worker requires an orchestrator-attested workspace "
             "owner, backing, runtime incarnation, and SSH host identity"
         )
     if fields["workspace_owner_kind"] != "job":
         raise WorkspaceUnavailableError(
-            "A stateless worker claim requires a job-owned workspace authority"
+            "A worker requires a job-owned workspace authority"
         )
+    fields["require_host_key_fingerprint"] = True
     return fields  # RemoteBackend performs canonical UUID/fingerprint validation.
+
+
+def _stateless_worker_remote_authority(
+    metadata: Dict[str, Any], worker_lease_token: Optional[int]
+) -> Dict[str, Any]:
+    """Compatibility wrapper for focused stateless authority tests."""
+
+    if worker_lease_token is None:
+        return {}
+    return _remote_workspace_authority(
+        metadata,
+        worker_lease_token,
+        backend="sandbox",
+    )
 
 
 # >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
@@ -2590,6 +2616,17 @@ class UniversalAgent:
             )
             return False
 
+        if target_tier == "sandbox":
+            # A live upgrade would deliver repository credentials and seed
+            # bytes after polling an endpoint with no durable exact-runtime
+            # receipt. Pause so normal redispatch can build an attested bundle.
+            logger.warning(
+                "[%s] In-process Kubernetes workspace upgrade is disabled: "
+                "exact runtime delivery authority is unavailable",
+                job_id,
+            )
+            return False
+
         logger.info(
             f"[{job_id}] In-process workspace upgrade requested → {target_tier}"
         )
@@ -3288,9 +3325,10 @@ class UniversalAgent:
 
                 remote_cfg = self.config.workspace.remote
                 shell_config = self.config.extra.get("shell", {})
-                worker_remote_authority = _stateless_worker_remote_authority(
+                worker_remote_authority = _remote_workspace_authority(
                     metadata,
                     self._worker_lease_token,
+                    backend=self.config.workspace.backend,
                 )
                 workspace_backend = RemoteBackend(
                     host=remote_cfg["host"],

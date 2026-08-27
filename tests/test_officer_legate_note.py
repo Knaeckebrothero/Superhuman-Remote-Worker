@@ -108,6 +108,7 @@ def _binding(agent: dict | None) -> PinnedSessionBinding | None:
         agent_id=AGENT_ID,
         runtime_attach_token=ATTACH_TOKEN,
         agent_hostname=str(agent["hostname"]),
+        pod_namespace="srw",
         pod_uid=str(agent["pod_uid"]),
         pod_ip=str(agent["pod_ip"]),
         pod_port=int(agent["pod_port"]),

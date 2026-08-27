@@ -45,7 +45,7 @@ _K8S_LIFECYCLE_STATUSES = frozenset(
     }
 )
 _WORKSPACE_RUNTIME_INCARNATION_KEY = "_runtime_incarnation"
-_WORKSPACE_RUNTIME_CREATION_KEY = "_stateless_runtime_creation"
+_WORKSPACE_RUNTIME_CREATION_KEY = "_runtime_creation"
 _WORKSPACE_RUNTIME_CREATION_FIELDS = frozenset(
     {"generation", "mode", "attempted", "replaces_uid"}
 )

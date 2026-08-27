@@ -142,6 +142,7 @@ class TestForwardingWorkspaceAuthority:
             agent_id="66666666-6666-4666-8666-666666666666",
             runtime_attach_token="77777777-7777-4777-8777-777777777777",
             agent_hostname="persistent-111111111111",
+            pod_namespace="srw",
             pod_uid="pod-uid-1",
             pod_ip="10.42.0.8",
             pod_port=8001,

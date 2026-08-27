@@ -118,6 +118,29 @@ class TestWorkspaceResolution:
 
 
 class TestExecStreamInfo:
+    def test_vm_runtime_is_contained_before_ssh(self, monkeypatch):
+        async def forbidden(**kwargs):
+            raise AssertionError(kwargs)
+
+        monkeypatch.setattr(broker.PINNED_SSH_TRANSPORT_POOL, "run_command", forbidden)
+        thread = _bound_thread()
+        thread["metadata"]["vm"] = {
+            "status": "ready",
+            "ssh_host": "192.0.2.8",
+            "ssh_port": 22,
+        }
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            asyncio.run(
+                broker.exec_stream_info(
+                    thread,
+                    generation_resolver=lambda: asyncio.sleep(0, result=thread),
+                )
+            )
+
+        assert error.value.status == 503
+        assert "continuous runtime attestation" in error.value.detail
+
     def test_uses_pinned_pool_and_parses_last_stdout_line(self, monkeypatch):
         captured = {}
 
@@ -685,6 +708,25 @@ def _install_hanging_relay(monkeypatch, *, db: _RelayDB | None = None):
 
 
 class TestRelayAuthGates:
+    def test_vm_runtime_is_rejected_before_browser_start(self, monkeypatch):
+        thread = _bound_thread()
+        thread["metadata"]["vm"] = {
+            "status": "ready",
+            "ssh_host": "192.0.2.8",
+            "ssh_port": 22,
+        }
+        app, _, _ = _install_hanging_relay(
+            monkeypatch,
+            db=_RelayDB(thread),
+        )
+
+        async def forbidden(*args, **kwargs):
+            raise AssertionError((args, kwargs))
+
+        monkeypatch.setattr(broker, "exec_stream_info", forbidden)
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4503
+
     def test_missing_origin_closes_4403_before_feature_gate(self, monkeypatch):
         monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
         app = _ws_app()

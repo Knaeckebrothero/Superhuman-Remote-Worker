@@ -38,6 +38,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from ._session_auth import validate_session_token as _validate_session_token
+from .models import PinnedSessionRecipient, pinned_session_recipient_matches
 from .orchestrator_client import (
     DuplicateThreadBinding,
     OrchestratorClient,
@@ -5727,6 +5728,12 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
     thread_id = request.get("thread_id")
     if not isinstance(thread_id, str) or not thread_id:
         return JSONResponse({"error": "thread_id is required"}, status_code=400)
+    recipient_refusal = _pinned_session_recipient_refusal(
+        request,
+        expected_thread_id=thread_id,
+    )
+    if recipient_refusal is not None:
+        return recipient_refusal
     runtime_contract = _pinned_runtime_generation_advertised(request)
     generation_raw = request.get("session_runtime_generation")
     attach_token_raw = request.get("session_runtime_attach_token")
@@ -5906,22 +5913,25 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             and _session.protected_cloud_ready()
         )
         session_identity_fingerprint = _current_pinned_session_identity_fingerprint()
+        capabilities: dict[str, Any] = {
+            "durable_input_delivery": True,
+            "pinned_session_identity_contract": (
+                PINNED_SESSION_READY_IDENTITY_CONTRACT
+            ),
+            "protected_cloud_contract": 1
+            if _session is not None and _session.protected_cloud_required
+            else None,
+            "protected_cloud_ready": protected_ready,
+        }
+        if _pinned_session_recipient_capable():
+            capabilities["pinned_session_recipient_binding"] = True
         return JSONResponse(
             {
                 "ready": is_ready,
                 "mode": "persistent",
                 "thread_id": _thread_id,
                 "session_identity_fingerprint": session_identity_fingerprint,
-                "capabilities": {
-                    "durable_input_delivery": True,
-                    "pinned_session_identity_contract": (
-                        PINNED_SESSION_READY_IDENTITY_CONTRACT
-                    ),
-                    "protected_cloud_contract": 1
-                    if _session is not None and _session.protected_cloud_required
-                    else None,
-                    "protected_cloud_ready": protected_ready,
-                },
+                "capabilities": capabilities,
             },
             status_code=200 if is_ready else 503,
         )
@@ -5950,6 +5960,34 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 if emb_service is not None
                 else None,
                 "app_guide": _app_guide_health(),
+            }
+        )
+
+    @app.post("/session/status")
+    async def recipient_bound_session_status(request: dict = {}):
+        """Report turn state only for this exact pinned runtime identity."""
+
+        expected = _canonical_pinned_session_identity_fingerprint(
+            request.get("session_identity_fingerprint")
+            if isinstance(request, dict)
+            else None
+        )
+        if (
+            expected is None
+            or _current_pinned_session_identity_fingerprint() != expected
+        ):
+            return JSONResponse(
+                {"error": "session_identity_mismatch", "retryable": True},
+                status_code=409,
+            )
+        return JSONResponse(
+            {
+                "ready": _session_ready(),
+                "thread_id": _thread_id,
+                "state": "session" if _session is not None else "idle",
+                "turn_in_flight": _turn_in_flight(),
+                "recipient_verified": True,
+                "session_identity_fingerprint": expected,
             }
         )
 
@@ -5987,7 +6025,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         return await _admit_pool_session_attach(request)
 
     @app.post("/session/detach")
-    async def session_detach():
+    async def session_detach(request: dict = {}):
         """Detach from the current thread and return to idle pool.
 
         Called by the orchestrator when a thread ends, or by the agent
@@ -5997,6 +6035,19 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             # A detach mid-lease would kill a claimed turn out-of-band; the
             # executor detaches its own cached session between claims.
             return _stateless_reject()
+        expected = _canonical_pinned_session_identity_fingerprint(
+            request.get("session_identity_fingerprint")
+            if isinstance(request, dict)
+            else None
+        )
+        if (
+            expected is None
+            or _current_pinned_session_identity_fingerprint() != expected
+        ):
+            return JSONResponse(
+                {"error": "session_identity_mismatch", "retryable": True},
+                status_code=409,
+            )
         if _session is None:
             return JSONResponse({"status": "already_idle", "thread_id": None})
 
@@ -8703,6 +8754,77 @@ def _registered_pinned_agent_id() -> Optional[str]:
         return None
 
 
+_PINNED_SESSION_RECIPIENT_KEY = "_recipient"
+
+
+def _pinned_session_recipient_capable() -> bool:
+    """Return whether this process can validate an orchestrator envelope."""
+
+    return bool(
+        _registered_pinned_agent_id()
+        and str(
+            getattr(_orchestrator_client, "dispatch_process_generation", None) or ""
+        ).strip()
+    )
+
+
+def _pinned_session_recipient_refusal(
+    body: Any,
+    *,
+    expected_thread_id: str | None,
+) -> JSONResponse | None:
+    """Fail closed before a session mutation reaches process-local state."""
+
+    recipient = (
+        body.get(_PINNED_SESSION_RECIPIENT_KEY) if isinstance(body, dict) else None
+    )
+    actual_pod_uid = str(os.environ.get("POD_UID") or "").strip() or None
+    exact_contract = bool(
+        isinstance(body, dict)
+        and type(body.get("pinned_runtime_generation_contract")) is int
+        and body["pinned_runtime_generation_contract"] == 1
+    )
+    if recipient is None and not (
+        actual_pod_uid or (exact_contract and _pinned_session_recipient_capable())
+    ):
+        # Explicit local/Docker compatibility lane. It cannot advertise the
+        # recipient capability unless registration supplied a process epoch.
+        return None
+    if not isinstance(recipient, dict):
+        return JSONResponse(
+            {"error": "recipient_authority_mismatch", "retryable": True},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+
+    try:
+        parsed_recipient = PinnedSessionRecipient.model_validate(recipient)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"error": "recipient_authority_mismatch", "retryable": True},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+
+    actual_agent_id = _registered_pinned_agent_id()
+    actual_generation = str(
+        getattr(_orchestrator_client, "dispatch_process_generation", None) or ""
+    ).strip()
+    if not pinned_session_recipient_matches(
+        parsed_recipient,
+        thread_id=expected_thread_id,
+        agent_id=actual_agent_id,
+        pod_uid=actual_pod_uid,
+        process_generation=actual_generation,
+    ):
+        return JSONResponse(
+            {"error": "recipient_authority_mismatch", "retryable": True},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+    return None
+
+
 def _control_receipt_matches(request: Any, receipt: Any) -> bool:
     """Reject a malformed/cross-linked receipt instead of phantom-applying it."""
 
@@ -10877,6 +10999,60 @@ async def _loop_settle_input_delivery(delivery_id: str, claim_generation: int) -
     return settled
 
 
+_PINNED_INPUT_POLL_SECONDS = 1.0
+
+
+async def _wait_for_persistent_input(
+    queue: asyncio.Queue,
+    *,
+    timeout: float | None = None,
+) -> Any:
+    """Wait while polling the durable pinned inbox for correctness.
+
+    Orchestrator-side input no longer needs a Pod-IP POST: it commits a stable
+    delivery and this exact reciprocal runtime claims it. LISTEN would only be
+    a latency optimization; the bounded poll means a lost notification, a pod
+    replacement, or an IP-reused foreign process cannot lose or consume work.
+    """
+
+    if _stateless_mode():
+        if timeout is None:
+            return await queue.get()
+        return await asyncio.wait_for(queue.get(), timeout=timeout)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout if timeout is not None else None
+    while True:
+        if _runtime_admission_closed():
+            # Leave every claimed/queued row for the successor. Normal
+            # teardown cancels this wait after preStop observes the park.
+            await asyncio.Future()
+        try:
+            await _reclaim_pending_pinned_inputs()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Durable pinned input poll failed for thread %s; retrying",
+                _thread_id,
+                exc_info=True,
+            )
+        if not queue.empty():
+            return await queue.get()
+
+        remaining = None if deadline is None else deadline - loop.time()
+        if remaining is not None and remaining <= 0:
+            raise asyncio.TimeoutError
+        wait_for = _PINNED_INPUT_POLL_SECONDS
+        if remaining is not None:
+            wait_for = min(wait_for, remaining)
+        try:
+            return await asyncio.wait_for(queue.get(), timeout=wait_for)
+        except asyncio.TimeoutError:
+            if deadline is not None and loop.time() >= deadline:
+                raise
+
+
 async def _loop_get_user_input() -> str:
     """Wait for the next user input. Honors session idle timeout.
 
@@ -10954,7 +11130,7 @@ async def _loop_get_user_input() -> str:
     _awaiting_input = True
     try:
         if _session is None:
-            return await queue.get()
+            return await _wait_for_persistent_input(queue)
 
         if officer_cfg is not None:
             # Officer park (centurion.md §4). The primary wake is the
@@ -10981,8 +11157,9 @@ async def _loop_get_user_input() -> str:
                     name="officer-file-wake",
                 )
             try:
-                return await asyncio.wait_for(
-                    queue.get(), timeout=officer_cfg.backstop_seconds
+                return await _wait_for_persistent_input(
+                    queue,
+                    timeout=officer_cfg.backstop_seconds,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -11005,7 +11182,10 @@ async def _loop_get_user_input() -> str:
         if idle_timeout_minutes and idle_timeout_minutes > 0:
             idle_timeout_seconds = idle_timeout_minutes * 60
             try:
-                return await asyncio.wait_for(queue.get(), timeout=idle_timeout_seconds)
+                return await _wait_for_persistent_input(
+                    queue,
+                    timeout=idle_timeout_seconds,
+                )
             except asyncio.TimeoutError:
                 logger.info(
                     "Idle timeout (%dmin) for thread %s",
@@ -11013,7 +11193,7 @@ async def _loop_get_user_input() -> str:
                     _thread_id,
                 )
                 raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
-        return await queue.get()
+        return await _wait_for_persistent_input(queue)
     finally:
         _awaiting_input = False
 
@@ -16170,6 +16350,21 @@ async def _handle_workspace_upgrade(
         return
 
     target_tier = target_tier or "sandbox"
+    if target_tier == "sandbox":
+        # The old in-process swap has no durable receipt spanning Pod
+        # attestation, repository-key delivery, and seed writes. Fail before
+        # provisioning or allowing any workspace bytes to leave this process.
+        await _ws_send(
+            ws,
+            "workspace_upgrade.failed",
+            {
+                "reason": (
+                    "Kubernetes hot workspace upgrades require exact runtime "
+                    "authority; use the normal pause/redispatch path"
+                )
+            },
+        )
+        return
     await _ws_send(
         ws,
         "workspace_upgrade.started",

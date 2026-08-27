@@ -15,6 +15,7 @@ from uuid import UUID
 import pytest
 
 from orchestrator.services.agent_provisioner import AgentProvisioner
+from orchestrator.services.pinned_k8s_effect import K8S_MUTATION_REQUEST_TIMEOUT
 
 
 # =============================================================================
@@ -72,6 +73,8 @@ def _make_provisioner(
         attempt_id,
         pod_name,
         provisioner,
+        namespace,
+        protection_protocol="finalizer_v1",
         pvc_name=None,
     ):
         claim = (
@@ -84,6 +87,8 @@ def _make_provisioner(
                 "pvc_name": pvc_name,
                 "status": "planned",
                 "pvc_uid": None,
+                "namespace": namespace,
+                "protection_protocol": protection_protocol,
             }
             if pvc_name
             else None
@@ -96,6 +101,8 @@ def _make_provisioner(
             "pod_name": pod_name,
             "status": "planned",
             "pod_uid": None,
+            "namespace": namespace,
+            "protection_protocol": protection_protocol,
             "workspace_claim": claim,
         }
 
@@ -129,6 +136,7 @@ def _make_pod(
     """
     pod = MagicMock()
     pod.metadata.name = name
+    pod.metadata.uid = f"uid-{name}"
     pod.metadata.labels = {
         "srw/managed-by": "agent-provisioner",
         "srw/purpose": purpose,
@@ -594,7 +602,12 @@ class TestScaleDownIdle:
 
         # DB has 4 idle agents
         conn.fetch.return_value = [
-            {"id": f"agent-{i}", "hostname": f"pod-{i}"} for i in range(4)
+            {
+                "id": f"agent-{i}",
+                "hostname": f"pod-{i}",
+                "pod_uid": f"uid-pod-{i}",
+            }
+            for i in range(4)
         ]
         p._count_idle_agents = AsyncMock(return_value=4)
 
@@ -617,7 +630,12 @@ class TestScaleDownIdle:
         p._core_api.list_namespaced_pod.return_value = pods_result
 
         conn.fetch.return_value = [
-            {"id": f"agent-{i}", "hostname": f"pod-{i}"} for i in range(8)
+            {
+                "id": f"agent-{i}",
+                "hostname": f"pod-{i}",
+                "pod_uid": f"uid-pod-{i}",
+            }
+            for i in range(8)
         ]
         p._count_idle_agents = AsyncMock(return_value=8)
 
@@ -646,7 +664,9 @@ class TestScaleDownIdle:
         pods_result.items = [_make_pod(f"pod-{i}") for i in range(4)]
         p._core_api.list_namespaced_pod.return_value = pods_result
 
-        conn.fetch.return_value = [{"id": "agent-0", "hostname": "pod-0"}]
+        conn.fetch.return_value = [
+            {"id": "agent-0", "hostname": "pod-0", "pod_uid": "uid-pod-0"}
+        ]
         p._count_idle_agents = AsyncMock(return_value=1)
 
         with patch(
@@ -699,7 +719,11 @@ class TestTryEvictForReservation:
 
         # DB: one idle job agent
         conn.fetch.return_value = [
-            {"id": "agent-idle-job", "hostname": "srw-agent-j-idle"},
+            {
+                "id": "agent-idle-job",
+                "hostname": "srw-agent-j-idle",
+                "pod_uid": "uid-srw-agent-j-idle",
+            },
         ]
 
         # K8s: one job pod matching the idle agent
@@ -740,7 +764,11 @@ class TestTryEvictForReservation:
         p, conn = _make_provisioner(reserved_job_slots=1)
 
         conn.fetch.return_value = [
-            {"id": "agent-idle-session", "hostname": "srw-agent-s-idle"},
+            {
+                "id": "agent-idle-session",
+                "hostname": "srw-agent-s-idle",
+                "pod_uid": "uid-srw-agent-s-idle",
+            },
         ]
 
         pods_result = MagicMock()
@@ -777,7 +805,13 @@ class TestProvisionWithEviction:
         # For eviction: one idle job agent matching a pod
         conn.fetch.side_effect = [
             # First fetch: idle agents for eviction
-            [{"id": "agent-idle", "hostname": "pod-0"}],
+            [
+                {
+                    "id": "agent-idle",
+                    "hostname": "pod-0",
+                    "pod_uid": "uid-pod-0",
+                }
+            ],
         ]
 
         # After eviction, need to list pods again for eviction check
@@ -1148,6 +1182,8 @@ class TestSessionAgentWorkspacePvc:
             attempt_id,
             pod_name,
             provisioner,
+            namespace,
+            protection_protocol="finalizer_v1",
             pvc_name=None,
         ):
             return {
@@ -1158,6 +1194,8 @@ class TestSessionAgentWorkspacePvc:
                 "pod_name": pod_name,
                 "status": "planned",
                 "pod_uid": None,
+                "namespace": namespace,
+                "protection_protocol": protection_protocol,
                 "workspace_claim": {
                     "claim_id": "33333333-3333-4333-8333-333333333333",
                     "thread_id": thread_id,
@@ -1167,6 +1205,8 @@ class TestSessionAgentWorkspacePvc:
                     "pvc_name": pvc_name,
                     "status": "planned",
                     "pvc_uid": None,
+                    "namespace": namespace,
+                    "protection_protocol": protection_protocol,
                 },
             }
 
@@ -1228,6 +1268,7 @@ class TestSessionAgentWorkspacePvc:
                 claim_id="33333333-3333-4333-8333-333333333333",
                 create_attempt="44444444-4444-4444-8444-444444444444",
                 expected_pvc_uid=None,
+                namespace="test-ns",
             )
         assert uid == "pvc-uid-after-timeout"
 
@@ -1246,6 +1287,7 @@ class TestSessionAgentWorkspacePvc:
                     claim_id="33333333-3333-4333-8333-333333333333",
                     create_attempt="44444444-4444-4444-8444-444444444444",
                     expected_pvc_uid=None,
+                    namespace="test-ns",
                 )
                 is None
             )
@@ -1275,6 +1317,7 @@ class TestSessionAgentWorkspacePvc:
                 expected_runtime_generation=("22222222-2222-4222-8222-222222222222"),
                 expected_claim_id="33333333-3333-4333-8333-333333333333",
                 expected_create_attempt="44444444-4444-4444-8444-444444444444",
+                namespace="test-ns",
             )
         assert result == {"state": "exact_original", "pvc_uid": "original-pvc-uid"}
 
@@ -1298,6 +1341,7 @@ class TestSessionAgentWorkspacePvc:
                 expected_runtime_generation=("22222222-2222-4222-8222-222222222222"),
                 expected_claim_id="33333333-3333-4333-8333-333333333333",
                 expected_create_attempt="44444444-4444-4444-8444-444444444444",
+                namespace="test-ns",
             )
         assert result == {"state": "exact_fence", "pvc_uid": "fence-pvc-uid"}
         manifest = (
@@ -1681,148 +1725,26 @@ def _make_snapshot_mock(available=True, put_ok=True):
 
 
 class TestArchivePodLogs:
-    """Tests for _archive_pod_logs() + the delete_agent_pod hook."""
-
-    def _wire_pod(self, p, pod, current="line1\nline2", previous=None):
-        """Wire read_namespaced_pod + read_namespaced_pod_log on the mock API."""
-        p._core_api.read_namespaced_pod.return_value = pod
-
-        def _read_log(name, namespace, container, **kwargs):
-            if kwargs.get("previous"):
-                if previous is None:
-                    raise RuntimeError("no previous container")
-                return previous
-            return current
-
-        p._core_api.read_namespaced_pod_log.side_effect = _read_log
+    """Deletion paths never read logs through a mutable Pod name."""
 
     @pytest.mark.asyncio
-    async def test_archives_and_stamps_session_pod(self):
+    async def test_archive_helper_refuses_name_addressed_read(self):
         p, conn = _make_provisioner()
-        pod = _make_pod(
-            "srw-agent-s-abc", thread_id="11111111-2222-3333-4444-555555555555"
-        )
-        pod.metadata.labels["srw.io/thread-id"] = "11111111-2222-3333-4444-555555555555"
-        self._wire_pod(p, pod, current="hello", previous="crashed earlier")
-        snap = _make_snapshot_mock()
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            await p._archive_pod_logs("srw-agent-s-abc")
-
-        # Both incarnations uploaded under agent_logs/<pod>/
-        keys = [c.args[0] for c in snap.put_blob.await_args_list]
-        assert len(keys) == 2
-        assert all(k.startswith("agent_logs/srw-agent-s-abc/") for k in keys)
-        assert any(k.endswith(".previous.log") for k in keys)
-
-        # Thread stamped (metadata) AND jobs stamped (context via agents join)
-        sqls = [c.args[0] for c in conn.execute.await_args_list]
-        assert any("UPDATE threads" in s for s in sqls)
-        assert any("UPDATE jobs" in s for s in sqls)
-        thread_call = next(
-            c for c in conn.execute.await_args_list if "UPDATE threads" in c.args[0]
-        )
-        assert thread_call.args[1] == "11111111-2222-3333-4444-555555555555"
-
-    @pytest.mark.asyncio
-    async def test_worker_pod_stamps_jobs_only(self):
-        p, conn = _make_provisioner()
-        pod = _make_pod("srw-agent-j-xyz")  # no thread labels
-        self._wire_pod(p, pod, current="worker log")
-        snap = _make_snapshot_mock()
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            await p._archive_pod_logs("srw-agent-j-xyz")
-
-        sqls = [c.args[0] for c in conn.execute.await_args_list]
-        assert not any("UPDATE threads" in s for s in sqls)
-        jobs_call = next(
-            c for c in conn.execute.await_args_list if "UPDATE jobs" in c.args[0]
-        )
-        # Resolves jobs through the agents registration by pod hostname
-        assert "agents" in jobs_call.args[0]
-        assert jobs_call.args[1] == "srw-agent-j-xyz"
-
-    @pytest.mark.asyncio
-    async def test_noop_when_snapshot_store_unavailable(self):
-        p, conn = _make_provisioner()
-        snap = _make_snapshot_mock(available=False)
-        with patch("services.snapshot_service.snapshot_service", snap):
-            await p._archive_pod_logs("srw-agent-j-xyz")
+        await p._archive_pod_logs("srw-agent-s-reused")
         p._core_api.read_namespaced_pod.assert_not_called()
+        p._core_api.read_namespaced_pod_log.assert_not_called()
         conn.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_noop_when_pod_already_gone(self):
-        p, conn = _make_provisioner()
-        err = RuntimeError("gone")
-        err.status = 404
-        p._core_api.read_namespaced_pod.side_effect = err
-        snap = _make_snapshot_mock()
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            await p._archive_pod_logs("srw-agent-j-xyz")
-        snap.put_blob.assert_not_awaited()
-        conn.execute.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_no_stamp_when_upload_fails(self):
-        p, conn = _make_provisioner()
-        pod = _make_pod("srw-agent-j-xyz")
-        self._wire_pod(p, pod, current="some log")
-        snap = _make_snapshot_mock(put_ok=False)
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            await p._archive_pod_logs("srw-agent-j-xyz")
-        conn.execute.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_archive_failure_never_blocks_deletion(self):
+    async def test_exact_delete_does_not_read_successor_logs(self):
         p, _ = _make_provisioner()
-        p._core_api.read_namespaced_pod.side_effect = RuntimeError("k8s down")
-        snap = _make_snapshot_mock()
-        with (
-            patch("services.snapshot_service.snapshot_service", snap),
-            patch(
-                "orchestrator.services.agent_provisioner.asyncio.to_thread",
-                side_effect=_fake_to_thread,
-            ),
-        ):
-            # Must not raise — and the pod delete must still go through.
-            assert await p.delete_agent_pod("srw-agent-j-xyz") is True
-        p._core_api.delete_namespaced_pod.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_delete_agent_pod_archives_first(self):
-        p, _ = _make_provisioner()
-        p._archive_pod_logs = AsyncMock()
         with patch(
             "orchestrator.services.agent_provisioner.asyncio.to_thread",
             side_effect=_fake_to_thread,
         ):
-            assert await p.delete_agent_pod("srw-agent-j-xyz") is True
-        p._archive_pod_logs.assert_awaited_once_with("srw-agent-j-xyz")
+            assert await p.delete_agent_pod("srw-agent-j-xyz", expected_pod_uid="uid-a")
         p._core_api.delete_namespaced_pod.assert_called_once()
+        p._core_api.read_namespaced_pod_log.assert_not_called()
 
 
 class TestExactClaimantPodAuthority:
@@ -1898,4 +1820,5 @@ class TestExactClaimantPodAuthority:
             namespace="test-ns",
             grace_period_seconds=180,
             body={"preconditions": {"uid": "uid-a"}},
+            _request_timeout=K8S_MUTATION_REQUEST_TIMEOUT,
         )

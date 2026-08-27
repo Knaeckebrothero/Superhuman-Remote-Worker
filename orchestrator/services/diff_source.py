@@ -26,28 +26,39 @@ depend on these dataclasses staying exactly as defined.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import io
 import json
+import os
 import tarfile
+import tempfile
 from dataclasses import dataclass
 from typing import Any
 
 from services.cloud.errors import CloudBackendError
 from services.cloud_staging.stage import staging_manifest_key, staging_tar_key
 from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
+from services.blocking_effect import joined_blocking_call
+from services.cloud_staging.manifest import (
+    MAX_MANIFEST_ENTRIES,
+    MAX_MANIFEST_JSON_BYTES,
+    MAX_PATH_BYTES,
+    MAX_STAGED_FILE_BYTES,
+)
 
 # Sentinel for the summary/manifest/tar memo fields below: distinguishes "not
 # computed yet" from a computed-and-cached ``None`` (no diff available).
 _UNSET: Any = object()
 
 
-def _sha256_hex(data: bytes) -> str:
-    """``hashlib.sha256(...).hexdigest()`` as a plain function — a thread
-    target for ``asyncio.to_thread`` (the staged tar can be GBs; hashing it
-    inline on the event loop would stall every other request)."""
-    return hashlib.sha256(data).hexdigest()
+MAX_STAGED_TAR_BYTES = 9 * 1024**3
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -154,8 +165,8 @@ class UpperdirDiffSource:
     orchestrator replicas, two concurrent stagings for the same thread can
     interleave those PUTs, leaving a manifest at the deterministic key that
     doesn't describe the tar sitting next to it. ``_get_tar()`` verifies
-    ``sha256(tar_bytes) == manifest["tar_sha256"]`` (hashed off-loop via
-    ``asyncio.to_thread``) before trusting the tar; on mismatch, a missing
+    ``sha256(tar_bytes) == manifest["tar_sha256"]`` (hashed off-loop via the
+    joined blocking-effect helper) before trusting the tar; on mismatch, a missing
     tar blob, or an absent hash, the tar is treated as unusable — ``file()``
     returns ``None`` for any entry that needs new-side bytes,
     ``raw_new_bytes()`` returns ``None``, and ``ensure_tar_bound()`` returns
@@ -190,6 +201,21 @@ class UpperdirDiffSource:
         # a real ``TarFile`` for "attempted and bound", ``_UNSET`` for "not
         # touched yet". ``summary()`` never populates this (manifest-only).
         self._tar_cache: tarfile.TarFile | None = _UNSET
+        self._tar_path: str | None = None
+
+    def close(self) -> None:
+        if isinstance(self._tar_cache, tarfile.TarFile):
+            self._tar_cache.close()
+        self._tar_cache = None
+        if self._tar_path is not None:
+            try:
+                os.unlink(self._tar_path)
+            except FileNotFoundError:
+                pass
+            self._tar_path = None
+
+    def __del__(self) -> None:
+        self.close()
 
     async def _get_manifest(self) -> dict[str, Any] | None:
         if self._manifest_cache is not _UNSET:
@@ -215,7 +241,10 @@ class UpperdirDiffSource:
         ):
             return None
         raw = await self._snapshot_service.get_blob(
-            staging_manifest_key(self._thread_id, self._mount_row.get("staged_summary"))
+            staging_manifest_key(
+                self._thread_id, self._mount_row.get("staged_summary")
+            ),
+            max_bytes=MAX_MANIFEST_JSON_BYTES,
         )
         if raw is None:
             return None
@@ -246,17 +275,32 @@ class UpperdirDiffSource:
         if not expected_sha:
             self._tar_cache = None
             return None
-        tar_bytes = await self._snapshot_service.get_blob(
-            staging_tar_key(self._thread_id, self._mount_row.get("staged_summary"))
+        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as temporary:
+            tar_path = temporary.name
+        downloaded = await self._snapshot_service.download_blob_file(
+            staging_tar_key(self._thread_id, self._mount_row.get("staged_summary")),
+            tar_path,
+            max_bytes=MAX_STAGED_TAR_BYTES,
         )
-        if tar_bytes is None:
+        if not downloaded:
+            try:
+                os.unlink(tar_path)
+            except FileNotFoundError:
+                pass
             self._tar_cache = None
             return None
-        actual_sha = await asyncio.to_thread(_sha256_hex, tar_bytes)
+        actual_sha = await joined_blocking_call(_sha256_file, tar_path)
         if actual_sha != expected_sha:
+            os.unlink(tar_path)
             self._tar_cache = None
             return None
-        self._tar_cache = tarfile.open(fileobj=io.BytesIO(tar_bytes))
+        try:
+            self._tar_cache = await joined_blocking_call(tarfile.open, tar_path, "r")
+        except (tarfile.TarError, OSError):
+            os.unlink(tar_path)
+            self._tar_cache = None
+            return None
+        self._tar_path = tar_path
         return self._tar_cache
 
     async def ensure_tar_bound(self) -> bool:
@@ -277,13 +321,21 @@ class UpperdirDiffSource:
         tar = await self._get_tar()
         if tar is None:
             return None
-        try:
-            member = tar.extractfile(f"upper/{path}")
-        except KeyError:
-            return None
-        if member is None:
-            return None
-        return member.read()
+
+        def _read() -> bytes | None:
+            try:
+                info = tar.getmember(f"upper/{path}")
+            except KeyError:
+                return None
+            if not info.isreg() or info.size < 0 or info.size > MAX_STAGED_FILE_BYTES:
+                return None
+            member = tar.extractfile(info)
+            if member is None:
+                return None
+            data = member.read(MAX_STAGED_FILE_BYTES + 1)
+            return data if len(data) <= MAX_STAGED_FILE_BYTES else None
+
+        return await joined_blocking_call(_read)
 
     async def summary(self) -> DiffSummary | None:
         if self._summary_cache is not _UNSET:
@@ -292,12 +344,25 @@ class UpperdirDiffSource:
         if manifest is None:
             self._summary_cache = None
             return None
+        entries = manifest.get("entries", [])
+        if not isinstance(entries, list) or len(entries) > MAX_MANIFEST_ENTRIES:
+            self._summary_cache = None
+            return None
+        if any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("path"), str)
+            or len(entry["path"].encode("utf-8", "surrogatepass")) > MAX_PATH_BYTES
+            or entry.get("status") not in {"added", "modified", "deleted"}
+            for entry in entries
+        ):
+            self._summary_cache = None
+            return None
         self._summary_cache = DiffSummary(
             files=[
                 DiffEntrySummary(
                     path=e["path"], status=e["status"], binary=e.get("binary", False)
                 )
-                for e in manifest.get("entries", [])
+                for e in entries
             ],
             meta={
                 "epoch": manifest.get("epoch"),

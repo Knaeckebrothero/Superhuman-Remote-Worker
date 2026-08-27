@@ -170,6 +170,12 @@ def test_real_agent_launch_reuse_generation_replace_and_retire(
     assert b"ssh-agent\0-a\0" in Path(f"/proc/{first_pid}/cmdline").read_bytes()
     assert private_key not in state_path.read_text()
 
+    launch = managed_repository_agent_launch_command(
+        home_path=str(tmp_path), authority_id=authority_id, generation=1
+    )
+    assert "ssh-agent -a " in launch
+    assert " -s 9>&-" in launch
+
     reused = _run(
         managed_repository_agent_launch_command(
             home_path=str(tmp_path),

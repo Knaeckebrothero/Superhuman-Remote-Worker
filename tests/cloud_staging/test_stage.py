@@ -5,6 +5,7 @@ subprocess seams (_run_ssh_capture / _stream_tar_to_file) are monkeypatched
 per-test so nothing here actually shells out to ssh.
 """
 
+import asyncio
 import hashlib
 import io
 import json
@@ -134,6 +135,161 @@ def test_command_strings_pinned():
 def test_key_builders():
     assert stage.staging_tar_key("t1") == "cloud-staging/t1/upper.tar"
     assert stage.staging_manifest_key("t1") == "cloud-staging/t1/manifest.json"
+
+
+class _LiveSshProcess:
+    def __init__(self):
+        self.returncode = None
+        self.stdout = MagicMock()
+        self.stdout.read = AsyncMock(return_value=b"")
+        self.stderr = MagicMock()
+        self.stderr.read = AsyncMock(return_value=b"")
+        self.terminated = asyncio.Event()
+        self.terminate = MagicMock(side_effect=self._terminate)
+        self.kill = MagicMock(side_effect=self._kill)
+        self.wait = AsyncMock(side_effect=self._wait)
+
+    def _terminate(self):
+        self.returncode = -15
+        self.terminated.set()
+
+    def _kill(self):
+        self.returncode = -9
+        self.terminated.set()
+
+    async def _wait(self):
+        if self.returncode is None:
+            await self.terminated.wait()
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_capture_cancellation_racing_spawn_still_owns_and_reaps_ssh(
+    monkeypatch,
+):
+    process = _LiveSshProcess()
+    spawn_started = asyncio.Event()
+    release_spawn = asyncio.Event()
+
+    async def delayed_spawn(*_args, **_kwargs):
+        # Model create_subprocess_exec having already forked the child while
+        # the coroutine has not yet returned ownership to the lease task.
+        spawn_started.set()
+        await release_spawn.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+
+    task = asyncio.create_task(stage._run_ssh_capture(["ssh"], timeout=60))
+    await spawn_started.wait()
+    task.cancel()
+    release_spawn.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    process.terminate.assert_called_once()
+    assert process.returncode is not None
+    assert process.wait.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_capture_lease_loss_cancellation_terminates_and_reaps_ssh(monkeypatch):
+    process = _LiveSshProcess()
+    started = asyncio.Event()
+
+    reads = 0
+
+    async def read(_size):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            started.set()
+            await process.terminated.wait()
+            return b"late bytes"
+        return b""
+
+    process.stdout.read = AsyncMock(side_effect=read)
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+
+    task = asyncio.create_task(stage._run_ssh_capture(["ssh"], timeout=60))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    process.terminate.assert_called_once()
+    assert process.returncode is not None
+    assert process.wait.await_count >= 1
+    reads_after_return = reads
+    await asyncio.sleep(0)
+    assert reads == reads_after_return
+
+
+@pytest.mark.asyncio
+async def test_tar_lease_loss_cancellation_reaps_ssh_and_removes_partial_file(
+    monkeypatch, tmp_path
+):
+    process = _LiveSshProcess()
+    process.terminate = MagicMock()
+    blocked = asyncio.Event()
+    reads = 0
+
+    async def read(_size):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return b"partial"
+        blocked.set()
+        await process.terminated.wait()
+        return b"late bytes"
+
+    process.stdout = MagicMock()
+    process.stdout.read = AsyncMock(side_effect=read)
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    destination = tmp_path / "partial.tar"
+
+    task = asyncio.create_task(stage._stream_tar_to_file(["ssh"], str(destination)))
+    await blocked.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    process.terminate.assert_called_once()
+    process.kill.assert_called_once()
+    assert process.returncode is not None
+    assert process.wait.await_count >= 1
+    assert not destination.exists()
+    reads_after_return = reads
+    await asyncio.sleep(0)
+    assert reads == reads_after_return
+
+
+@pytest.mark.asyncio
+async def test_nonzero_tar_with_partial_stdout_is_refused_and_removed(
+    monkeypatch, tmp_path
+):
+    process = _LiveSshProcess()
+    process.returncode = 1
+    process.stdout = MagicMock()
+    process.stdout.read = AsyncMock(side_effect=[b"truncated", b""])
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    destination = tmp_path / "truncated.tar"
+
+    assert not await stage._stream_tar_to_file(["ssh"], str(destination))
+    assert not destination.exists()
 
 
 # =============================================================================

@@ -19,7 +19,8 @@ import os
 import re
 import shlex
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
+from uuid import UUID, uuid4
 
 from .managed_repository_authority import (
     ManagedRepositoryAuthorityError,
@@ -27,11 +28,30 @@ from .managed_repository_authority import (
 )
 
 from services import resolve_ssh_key_path
+from services.blocking_effect import joined_async_call
+from services.container_provisioner import (
+    WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY,
+    WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY,
+    WORKSPACE_RUNTIME_INCARNATION_KEY,
+    WorkspaceRuntimeAttestation,
+    WorkspaceRuntimeAuthorityError,
+)
 from services.ssh_helpers import (
     EXTRACT_HOME_REMOTE_CMD,
-    build_agent_ssh_cmd,
+    SSHHostKeyVerificationError,
     orchestrator_can_reach,
+    pinned_agent_ssh_command,
     stream_extract_snapshot,
+)
+from services.subprocess_effect import (
+    communicate_bounded,
+    create_owned_subprocess_exec,
+    stop_and_reap,
+    wait_bounded,
+)
+from services.restore_work_lease import (
+    RestoreWorkLeaseHeartbeat,
+    RestoreWorkLeaseLost,
 )
 from src.core.managed_repository import (
     managed_repository_agent_launch_command,
@@ -42,7 +62,66 @@ from src.core.managed_repository import (
 logger = logging.getLogger(__name__)
 
 _VM_READY_TIMEOUT_SECONDS = 420
-_VM_RESTORE_TOPOLOGY_ERROR = "VM restore not supported on this topology"
+
+
+def _canonical_runtime(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return value if str(UUID(value)) == value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _settled_ide_restore_runtime(
+    session: Any,
+    creation: Any,
+    *,
+    retired_runtime: str | None = None,
+) -> str | None:
+    """Return exact IDE runtime B only when its durable receipt matches."""
+
+    if not isinstance(session, dict) or not isinstance(creation, dict):
+        return None
+    if (
+        str(creation.get("operation_kind") or "") != "restore"
+        or str(creation.get("result_kind") or "") != "settled"
+        or creation.get("settled_at") is None
+        or session.get(WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY)
+        != str(creation.get("id") or "")
+        or session.get(WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY)
+        != str(creation.get("claim_token") or "")
+    ):
+        return None
+    runtime = _canonical_runtime(session.get(WORKSPACE_RUNTIME_INCARNATION_KEY))
+    receipt_runtime = _canonical_runtime(creation.get("runtime_incarnation"))
+    if runtime is None or runtime != receipt_runtime or runtime == retired_runtime:
+        return None
+    return runtime
+
+
+def _claimed_ide_restore_work(
+    restore_work: Any,
+    *,
+    runtime_incarnation: str,
+    claimant: str,
+) -> bool:
+    """Validate one exact-B IDE post-create work lease."""
+
+    if not isinstance(restore_work, dict):
+        return False
+    try:
+        str(UUID(str(restore_work.get("id"))))
+        work_runtime = str(UUID(str(restore_work.get("runtime_incarnation"))))
+        work_token = int(restore_work.get("restore_work_claim_token"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        work_runtime == runtime_incarnation
+        and work_token > 0
+        and restore_work.get("restore_work_claimed_by") == claimant
+        and restore_work.get("restore_work_completed_at") is None
+    )
 
 
 def _build_code_server_url(
@@ -66,6 +145,11 @@ class IdeSessionService:
         self._vm_provisioner: Any = None
         self._container_provisioner: Any = None
         self._gitea_client: Any = None
+        # Background restores are process-local, but their runtime identity is
+        # durable.  The map prevents duplicate work from concurrent requests
+        # handled by this process; after a process restart, start_session()
+        # validates the durable B receipt and deliberately replays it.
+        self._restore_tasks: dict[str, asyncio.Task[None]] = {}
 
     @property
     def idle_timeout_minutes(self) -> int:
@@ -263,8 +347,6 @@ class IdeSessionService:
         current = await self.get_session_status(job_id)
         if current["status"] in ("active", "idle"):
             return current
-        if current["status"] == "restoring":
-            return current
         if current["status"] == "unavailable":
             return {
                 "status": "unavailable",
@@ -277,7 +359,46 @@ class IdeSessionService:
 
         ctx = self._parse_context(job)
         snapshot_ctx = ctx.get("snapshot", {})
+        session_ctx = ctx.get("ide_session", {})
         snapshot_type = snapshot_ctx.get("source_type", "vm")
+
+        if current["status"] == "restoring":
+            if self._restore_task_is_active(job_id):
+                return current
+            if (
+                session_ctx.get("restore_type") != "k8s_container"
+                or not self._container_provisioner
+                or not getattr(self._container_provisioner, "is_available", False)
+            ):
+                return current
+            resumed = await self._current_ide_restore_runtime(job_id)
+            if resumed is None:
+                # A restoring projection without an exact settled receipt is
+                # not authority to repeat external work.
+                return current
+            resumed_runtime, _pod_ip = resumed
+            source = str(session_ctx.get("source") or "")
+            if source not in {"snapshot", "gitea"}:
+                return current
+            snapshot_type = str(
+                session_ctx.get("snapshot_type") or snapshot_type or "vm"
+            )
+            if source == "snapshot" and snapshot_type == "vm":
+                return current
+            estimated_seconds = int(session_ctx.get("estimated_seconds") or 30)
+            cpu_cores = int(session_ctx.get("cpu_cores") or cpu_cores)
+            memory = str(session_ctx.get("memory") or memory)
+            self._schedule_restore_task(
+                job_id,
+                job,
+                source,
+                cpu_cores,
+                memory,
+                restore_operation_id=None,
+                restore_context={"snapshot_type": snapshot_type},
+                expected_restore_runtime=resumed_runtime,
+            )
+            return current
 
         # Determine restore method
         if snapshot_ctx.get("status") == "available":
@@ -294,30 +415,62 @@ class IdeSessionService:
         timeout = idle_timeout_minutes or self.idle_timeout_minutes
         now = datetime.now(timezone.utc).isoformat()
 
-        # Mark session as restoring
-        await self._set_session_context(
-            job_id,
-            {
-                "status": "restoring",
-                "source": source,
-                "snapshot_type": snapshot_type if source == "snapshot" else "gitea",
-                "started_at": now,
-                "code_server_url": None,
-                "last_activity": None,
-                "idle_timeout_minutes": timeout,
-                "max_lifetime_minutes": self.max_lifetime_minutes,
-                "estimated_seconds": estimated_seconds,
-                "cpu_cores": cpu_cores,
-                "memory": memory,
-            },
+        restore_context = {
+            "status": "restoring",
+            "source": source,
+            "snapshot_type": snapshot_type if source == "snapshot" else "gitea",
+            "started_at": now,
+            "code_server_url": None,
+            "last_activity": None,
+            "idle_timeout_minutes": timeout,
+            "max_lifetime_minutes": self.max_lifetime_minutes,
+            "estimated_seconds": estimated_seconds,
+            "cpu_cores": cpu_cores,
+            "memory": memory,
+        }
+        managed_k8s_restore = bool(
+            self._container_provisioner
+            and getattr(self._container_provisioner, "is_available", False)
+            and (source == "gitea" or snapshot_type != "vm")
         )
+        retired_runtime = None
+        if (
+            session_ctx.get("status") == "expired"
+            and session_ctx.get("restore_type") == "k8s_container"
+        ):
+            retired_runtime = _canonical_runtime(
+                session_ctx.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+            )
+            if retired_runtime is None or not managed_k8s_restore:
+                return {
+                    "status": "unavailable",
+                    "error": "Retired IDE runtime cannot be restored safely",
+                }
+        current_receipt = bool(
+            managed_k8s_restore
+            and _canonical_runtime(session_ctx.get(WORKSPACE_RUNTIME_INCARNATION_KEY))
+            and session_ctx.get(WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY)
+            and session_ctx.get(WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY)
+        )
+
+        # Empty first creation retains the historical projection. A settled
+        # retired A (or a retry already observing B's receipt) cannot be
+        # rewritten in place: its reservation publishes B first, then a
+        # runtime-guarded merge records restoring on B only.
+        if retired_runtime is None and not current_receipt:
+            await self._set_session_context(job_id, restore_context)
 
         # Start async restore (VM provisioning + snapshot extraction)
         # This runs in the background — the cockpit polls GET /ide for updates
-        import asyncio
-
-        asyncio.create_task(
-            self._restore_session(job_id, job, source, cpu_cores, memory)
+        self._schedule_restore_task(
+            job_id,
+            job,
+            source,
+            cpu_cores,
+            memory,
+            restore_operation_id=retired_runtime,
+            restore_context=restore_context,
+            expected_restore_runtime=None,
         )
 
         return {
@@ -325,6 +478,51 @@ class IdeSessionService:
             "snapshot_type": snapshot_type if source == "snapshot" else "gitea",
             "estimated_seconds": estimated_seconds,
         }
+
+    def _restore_task_is_active(self, job_id: str) -> bool:
+        task = self._restore_tasks.get(job_id)
+        if task is None:
+            return False
+        if not task.done():
+            return True
+        self._restore_tasks.pop(job_id, None)
+        return False
+
+    def _schedule_restore_task(
+        self,
+        job_id: str,
+        job: dict[str, Any],
+        source: str,
+        cpu_cores: int,
+        memory: str,
+        *,
+        restore_operation_id: str | None,
+        restore_context: dict[str, Any] | None,
+        expected_restore_runtime: str | None,
+    ) -> None:
+        """Start at most one local restore for a durable IDE generation."""
+
+        if self._restore_task_is_active(job_id):
+            return
+
+        async def run() -> None:
+            try:
+                await self._restore_session(
+                    job_id,
+                    job,
+                    source,
+                    cpu_cores,
+                    memory,
+                    restore_operation_id=restore_operation_id,
+                    restore_context=restore_context,
+                    expected_restore_runtime=expected_restore_runtime,
+                )
+            finally:
+                current = asyncio.current_task()
+                if self._restore_tasks.get(job_id) is current:
+                    self._restore_tasks.pop(job_id, None)
+
+        self._restore_tasks[job_id] = asyncio.create_task(run())
 
     async def stop_session(self, job_id: str) -> dict[str, Any]:
         """Manually tear down an active IDE session.
@@ -344,18 +542,29 @@ class IdeSessionService:
             return {"status": "no_active_session"}
 
         restore_type = session_ctx.get("restore_type", "vm")
+        expected_runtime_incarnation = session_ctx.get("_runtime_incarnation")
+        stale_target_settled = False
 
         if restore_type in ("container", "k8s_container"):
             container_name = session_ctx.get("container_name")
-            deleted = bool(
-                container_name
-                and await self._delete_ide_container(
+            if restore_type == "k8s_container" and container_name:
+                outcome = await self._delete_k8s_ide_container_with_outcome(
                     job_id,
-                    container_name,
-                    restore_type,
-                    expected_container_id=session_ctx.get("container_id"),
+                    expected_runtime_incarnation=expected_runtime_incarnation,
                 )
-            )
+                deleted = outcome.current_deleted
+                stale_target_settled = outcome.stale_target_settled
+            else:
+                deleted = bool(
+                    container_name
+                    and await self._delete_ide_container(
+                        job_id,
+                        container_name,
+                        restore_type,
+                        expected_container_id=session_ctx.get("container_id"),
+                        expected_runtime_incarnation=expected_runtime_incarnation,
+                    )
+                )
         else:
             vm_name = session_ctx.get("vm_name")
             deleted = False
@@ -364,25 +573,51 @@ class IdeSessionService:
                     deleted = await self._delete_ide_vm(job_id, vm_name)
                 except Exception as e:
                     logger.warning("Failed to delete IDE VM %s: %s", vm_name, e)
+        if stale_target_settled:
+            return {
+                "status": "superseded",
+                "job_id": job_id,
+                "retryable": False,
+            }
         if not deleted:
-            await self._set_session_context(
-                job_id,
-                {
-                    "status": "cleanup_pending",
-                    "code_server_url": None,
-                    "cleanup_failure": "managed_repository_process_zero_unproven",
-                },
-            )
+            updates = {
+                "status": "cleanup_pending",
+                "code_server_url": None,
+                "cleanup_failure": "managed_repository_process_zero_unproven",
+            }
+            if restore_type == "k8s_container":
+                if not await self._set_session_context_if_runtime(
+                    job_id,
+                    updates,
+                    expected_runtime_incarnation=expected_runtime_incarnation,
+                ):
+                    return {
+                        "status": "superseded",
+                        "job_id": job_id,
+                        "retryable": False,
+                    }
+            else:
+                await self._set_session_context(job_id, updates)
             return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
 
-        await self._set_session_context(
-            job_id,
-            {
-                "status": "expired",
-                "code_server_url": None,
-                "stopped_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
+        updates = {
+            "status": "expired",
+            "code_server_url": None,
+            "stopped_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if restore_type == "k8s_container":
+            if not await self._set_session_context_if_runtime(
+                job_id,
+                updates,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+            ):
+                return {
+                    "status": "superseded",
+                    "job_id": job_id,
+                    "retryable": False,
+                }
+        else:
+            await self._set_session_context(job_id, updates)
 
         return {"status": "stopped", "job_id": job_id}
 
@@ -469,6 +704,255 @@ class IdeSessionService:
     # Restore logic (runs as background task)
     # =========================================================================
 
+    async def _current_ide_restore_runtime(
+        self,
+        job_id: str,
+        *,
+        creation: dict[str, Any] | None = None,
+        retired_runtime: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Read B from its exact settled creation receipt and owner projection."""
+
+        if not self._container_provisioner:
+            return None
+        if creation is None:
+            creation = (
+                await self._container_provisioner.get_current_ide_creation_result(
+                    job_id
+                )
+            )
+        current = await self._get_job(job_id)
+        if not isinstance(current, dict):
+            return None
+        session = self._parse_context(current).get("ide_session", {})
+        runtime = _settled_ide_restore_runtime(
+            session,
+            creation,
+            retired_runtime=retired_runtime,
+        )
+        pod_ip = session.get("pod_ip") if isinstance(session, dict) else None
+        if runtime is None or not isinstance(pod_ip, str) or not pod_ip:
+            return None
+        return runtime, pod_ip
+
+    async def _exact_ide_restore_runtime(
+        self,
+        job_id: str,
+        *,
+        operation_id: str | None,
+        expected_runtime: str | None,
+    ) -> tuple[str, str] | None:
+        """Resolve B without accepting a later receipt-bearing successor C."""
+
+        if not self._container_provisioner:
+            return None
+        creation = None
+        if operation_id is not None:
+            creation = await self._container_provisioner.get_ide_creation_result(
+                job_id,
+                operation_id=operation_id,
+            )
+        elif expected_runtime is None:
+            return None
+        current = await self._current_ide_restore_runtime(
+            job_id,
+            creation=creation,
+            retired_runtime=operation_id,
+        )
+        if current is None:
+            return None
+        runtime, _pod_ip = current
+        if expected_runtime is not None and runtime != expected_runtime:
+            return None
+        return current
+
+    async def _claim_ide_restore_work(
+        self,
+        job_id: str,
+        *,
+        runtime_incarnation: str,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Claim B's external restore tail, replaying a lost claim response."""
+
+        claimant = f"ide-restore:{uuid4()}"
+        for _attempt in range(2):
+            try:
+                restore_work = await self._container_provisioner.claim_ide_restore_work(
+                    job_id,
+                    claimant=claimant,
+                    lease_seconds=300,
+                )
+            except Exception:
+                logger.warning(
+                    "IDE restore-work claim response was ambiguous for job %s",
+                    job_id,
+                )
+                continue
+            if _claimed_ide_restore_work(
+                restore_work,
+                runtime_incarnation=runtime_incarnation,
+                claimant=claimant,
+            ):
+                return claimant, restore_work
+            return None
+        return None
+
+    def _ide_restore_heartbeat(
+        self,
+        job_id: str,
+        *,
+        restore_work: dict[str, Any],
+        claimant: str,
+    ) -> RestoreWorkLeaseHeartbeat:
+        async def renew() -> object:
+            return await self._container_provisioner.renew_ide_restore_work(
+                job_id,
+                restore_work=restore_work,
+                claimant=claimant,
+                lease_seconds=300,
+            )
+
+        return RestoreWorkLeaseHeartbeat(renew, interval_seconds=60)
+
+    async def _attest_claimed_ide_restore_target(
+        self,
+        job_id: str,
+        *,
+        runtime_incarnation: str,
+        restore_work: dict[str, Any],
+        claimant: str,
+    ) -> WorkspaceRuntimeAttestation:
+        """Attest exact B, then re-lock and validate its work token.
+
+        Kubernetes Pod IPs are reusable. The control-plane UID/endpoint/key
+        observation is therefore followed immediately by a durable renewal;
+        no byte or repository key may leave this process unless both views
+        still name the same B generation.
+        """
+
+        attestation = await self._container_provisioner.attest_ide_runtime(
+            job_id,
+            expected_runtime_incarnation=runtime_incarnation,
+        )
+        if attestation.runtime_incarnation != runtime_incarnation:
+            raise WorkspaceRuntimeAuthorityError("IDE restore Pod UID changed")
+        renewed = await self._container_provisioner.renew_ide_restore_work(
+            job_id,
+            restore_work=restore_work,
+            claimant=claimant,
+            lease_seconds=300,
+        )
+        if not _claimed_ide_restore_work(
+            renewed,
+            runtime_incarnation=runtime_incarnation,
+            claimant=claimant,
+        ) or any(
+            str(renewed.get(key) or "") != str(restore_work.get(key) or "")
+            for key in ("id", "restore_work_claim_token")
+        ):
+            raise RestoreWorkLeaseLost(
+                "IDE restore authority changed after runtime attestation"
+            )
+        return attestation
+
+    async def _release_ide_restore_work(
+        self,
+        job_id: str,
+        *,
+        restore_work: dict[str, Any],
+        claimant: str,
+    ) -> None:
+        try:
+            await self._container_provisioner.release_ide_restore_work(
+                job_id,
+                restore_work=restore_work,
+                claimant=claimant,
+                retry_seconds=30,
+            )
+        except Exception:
+            # The bounded lease remains the restart/reclaim authority.
+            logger.warning(
+                "IDE restore-work release response was ambiguous for job %s",
+                job_id,
+            )
+
+    async def _complete_ide_restore_work(
+        self,
+        job_id: str,
+        *,
+        restore_work: dict[str, Any],
+        claimant: str,
+        success: bool,
+        error: str | None = None,
+    ) -> bool:
+        """Atomically publish exact B, replaying one lost completion response."""
+
+        code_server_url = _build_code_server_url(job_id) if success else None
+        last_activity = datetime.now(timezone.utc).isoformat() if success else None
+        for _attempt in range(2):
+            try:
+                if await self._container_provisioner.complete_ide_restore_work(
+                    job_id,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                    success=success,
+                    code_server_url=code_server_url,
+                    last_activity=last_activity,
+                    error=error,
+                ):
+                    return True
+            except Exception:
+                logger.warning(
+                    "IDE restore-work completion response was ambiguous for job %s",
+                    job_id,
+                )
+        return False
+
+    async def _create_or_resume_k8s_ide(
+        self,
+        job_id: str,
+        *,
+        operation_id: str | None,
+    ) -> tuple[str, str] | None:
+        """Create B, or resume the exact B after a committed/lost response."""
+
+        if not self._container_provisioner:
+            return None
+        if operation_id is None:
+            current = await self._current_ide_restore_runtime(job_id)
+            if current is not None:
+                return current
+        try:
+            if operation_id is None:
+                await self._container_provisioner.create_ide_pod(job_id)
+            else:
+                await self._container_provisioner.create_ide_pod(
+                    job_id,
+                    operation_id=operation_id,
+                )
+        except Exception:
+            logger.warning(
+                "IDE creation response was ambiguous for job %s",
+                job_id,
+                exc_info=True,
+            )
+        if operation_id is None:
+            creation = (
+                await self._container_provisioner.get_current_ide_creation_result(
+                    job_id
+                )
+            )
+        else:
+            creation = await self._container_provisioner.get_ide_creation_result(
+                job_id,
+                operation_id=operation_id,
+            )
+        return await self._current_ide_restore_runtime(
+            job_id,
+            creation=creation,
+            retired_runtime=operation_id,
+        )
+
     async def _restore_session(
         self,
         job_id: str,
@@ -476,6 +960,10 @@ class IdeSessionService:
         source: str,
         cpu_cores: int,
         memory: str,
+        *,
+        restore_operation_id: str | None = None,
+        restore_context: dict[str, Any] | None = None,
+        expected_restore_runtime: str | None = None,
     ) -> None:
         """Background task: provision environment and start code-server.
 
@@ -485,14 +973,50 @@ class IdeSessionService:
 
         Updates context.ide_session as the restore progresses.
         """
+        k8s_restore_kwargs: dict[str, Any] = {}
+        managed_restore_claim: tuple[str, dict[str, Any]] | None = None
+        managed_restore_finished = False
+        snapshot_type = str(
+            (restore_context or {}).get("snapshot_type")
+            or self._parse_context(job).get("snapshot", {}).get("source_type", "vm")
+        )
+        managed_k8s_restore = bool(
+            self._container_provisioner
+            and getattr(self._container_provisioner, "is_available", False)
+            and (source == "gitea" or snapshot_type != "vm")
+        )
         try:
+            if managed_k8s_restore:
+                restored = await self._create_or_resume_k8s_ide(
+                    job_id,
+                    operation_id=restore_operation_id,
+                )
+                if restored is None:
+                    return
+                runtime, _pod_ip = restored
+                managed_restore_claim = await self._claim_ide_restore_work(
+                    job_id,
+                    runtime_incarnation=runtime,
+                )
+                if managed_restore_claim is None:
+                    # Another replica owns the exact-B work lease. This local
+                    # task exits; retry/restart observes the same durable B.
+                    return
+                k8s_restore_kwargs = {
+                    "restore_operation_id": restore_operation_id,
+                    "restore_context": restore_context,
+                    "restored": restored,
+                    "restore_claim": managed_restore_claim,
+                    "settle_restore_work": False,
+                }
+
+            restored_ok = False
             if source == "gitea":
                 # Lightweight container path — no VM needed
-                await self._restore_gitea_container(job_id, job)
+                restored_ok = await self._restore_gitea_container(
+                    job_id, job, **k8s_restore_kwargs
+                )
             elif source == "snapshot":
-                snapshot_ctx = self._parse_context(job).get("snapshot", {})
-                snapshot_type = snapshot_ctx.get("source_type", "vm")
-
                 if snapshot_type == "vm":
                     # Legacy VM snapshots remain in the VM restore flow
                     await self._restore_vm_session(
@@ -500,50 +1024,86 @@ class IdeSessionService:
                     )
                     return
 
-                restored = False
+                restored_ok = False
                 if (
                     self._container_provisioner
                     and self._container_provisioner.is_available
                 ):
-                    restored = await self._restore_snapshot_container(job_id, job)
+                    restored_ok = await self._restore_snapshot_container(
+                        job_id, job, **k8s_restore_kwargs
+                    )
 
-                if not restored:
+                if not restored_ok:
                     if not job.get("repo_name"):
-                        if source == "snapshot":
-                            await self._set_session_context(
-                                job_id,
-                                {
-                                    "status": "failed",
-                                    "error": "Pod snapshot restore failed and no Gitea repo is available",
-                                },
-                            )
-                        return
+                        restored_ok = False
+                    else:
+                        logger.warning(
+                            "Pod snapshot restore failed for job %s; falling back to Gitea clone",
+                            job_id,
+                        )
+                        # The fallback runs under the same exact-B work token.
+                        # No failed projection or retry delay is inserted
+                        # between the two external strategies.
+                        restored_ok = await self._restore_gitea_container(
+                            job_id, job, **k8s_restore_kwargs
+                        )
 
-                    logger.warning(
-                        "Pod snapshot restore failed for job %s; falling back to Gitea clone",
-                        job_id,
-                    )
-                    # Clear the failed verdict before the fallback runs, or the
-                    # cockpit's 3s poll sees 'failed' mid-fallback and reports
-                    # an error for a session that may still come up.
-                    await self._set_session_context(
-                        job_id,
-                        {"status": "restoring", "error": None},
-                    )
-                    await self._restore_gitea_container(job_id, job)
             else:
                 # Full VM path — provision VM, extract snapshot
                 await self._restore_vm_session(job_id, job, source, cpu_cores, memory)
+                return
+
+            if managed_restore_claim is not None:
+                # Snapshot, repository and code-server failures are external
+                # and retryable. Only a proven successful tail is absorbing;
+                # otherwise release the exact-B lease so another request can
+                # resume the same generation after backoff. Marking every
+                # transient failure ``failed`` would permanently close the
+                # creation receipt and strand the durable restoring runtime.
+                if restored_ok:
+                    claimant, restore_work = managed_restore_claim
+                    managed_restore_finished = await self._complete_ide_restore_work(
+                        job_id,
+                        restore_work=restore_work,
+                        claimant=claimant,
+                        success=True,
+                    )
 
         except Exception as e:
             logger.exception("IDE session restore failed for job %s", job_id)
-            await self._set_session_context(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": str(e),
-                },
-            )
+            if managed_restore_claim is not None:
+                # Leave B in restoring and release its lease in ``finally``.
+                # The durable receipt plus current-runtime markers let a
+                # process restart retry without rebuilding or mutating A/C.
+                return
+            current_runtime = None
+            if k8s_restore_kwargs:
+                current_runtime = await self._exact_ide_restore_runtime(
+                    job_id,
+                    operation_id=restore_operation_id,
+                    expected_runtime=expected_restore_runtime,
+                )
+            if current_runtime is None:
+                if not k8s_restore_kwargs:
+                    await self._set_session_context(
+                        job_id,
+                        {"status": "failed", "error": str(e)},
+                    )
+            else:
+                runtime, _pod_ip = current_runtime
+                await self._set_session_context_if_runtime(
+                    job_id,
+                    {"status": "failed", "error": str(e)},
+                    expected_runtime_incarnation=runtime,
+                )
+        finally:
+            if managed_restore_claim is not None and not managed_restore_finished:
+                claimant, restore_work = managed_restore_claim
+                await self._release_ide_restore_work(
+                    job_id,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                )
 
     async def _restore_vm_session(
         self,
@@ -564,107 +1124,34 @@ class IdeSessionService:
             )
             return
 
-        # Provision a fresh VM for the IDE session
-        vm_name = f"ide-{job_id[:12]}"
-        config_name = job.get("config_name") or "worker_base"
-
-        ok = await self._vm_provisioner.create_vm(
-            job_id=job_id,
-            agent_config=config_name,
-            cpu_cores=cpu_cores,
-            memory=memory,
-            description=f"IDE session for job {job_id[:8]}",
-        )
-
-        if not ok:
-            await self._set_session_context(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": "VM provisioning failed",
-                },
-            )
-            return
-
+        # Temporary security containment.  VM restore currently has no
+        # durable operation receipt that can CAS the final ide_session
+        # projection to the same provision generation after snapshot/Git/
+        # profile writes.  A one-shot endpoint read would let a replacement VM
+        # at the same address receive archive bytes or a repository key, and a
+        # post-check alone cannot make that final publication atomic.  Keep the
+        # separately supported live-VM observation/proxy path available, but do
+        # not create or mutate a restore VM until that generation-CAS seam
+        # exists.
         await self._set_session_context(
             job_id,
             {
-                "vm_name": vm_name,
-                "restore_type": "vm",
+                "status": "unavailable",
+                "error": "VM IDE restore awaits exact generation authority",
             },
         )
 
-        # Wait for VM to become ready (poll context.vm.status)
-        ssh_host, ssh_port = await self._wait_for_vm_ready(
-            job_id, timeout=_VM_READY_TIMEOUT_SECONDS
-        )
-        if not ssh_host:
-            current = await self._get_job(job_id)
-            current_ctx = self._parse_context(current).get("vm", {}) if current else {}
-            vm_host = current_ctx.get("ssh_host") or current_ctx.get("pod_ip")
-            if vm_host and not orchestrator_can_reach(vm_host):
-                await self._set_session_context(
-                    job_id,
-                    {
-                        "status": "unavailable",
-                        "error": _VM_RESTORE_TOPOLOGY_ERROR,
-                    },
-                )
-                return
-
-            await self._set_session_context(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": "VM did not become ready within timeout",
-                },
-            )
-            return
-
-        repository_ready = True
-        if source == "snapshot":
-            await self._extract_snapshot_to_vm(job_id, ssh_host, ssh_port)
-            if job.get("repo_name"):
-                repository_ready = await self._repair_git_after_snapshot(
-                    job_id, job, ssh_host, ssh_port, backend="vm"
-                )
-        elif source == "gitea":
-            repository_ready = await self._clone_gitea_to_vm(
-                job_id, job, ssh_host, ssh_port
-            )
-
-        if not repository_ready:
-            await self._set_session_context(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": "Repository authorization failed for IDE session",
-                },
-            )
-            try:
-                await self._delete_ide_vm(job_id, vm_name)
-            except Exception:
-                logger.warning("Failed to remove unauthorized IDE VM for %s", job_id)
-            return
-
-        await self._seed_ide_profile_for_user(job_id, job, ssh_host, ssh_port)
-
-        # Code-server should already be running from base image
-        code_server_url = _build_code_server_url(job_id)
-
-        await self._set_session_context(
-            job_id,
-            {
-                "status": "active",
-                "code_server_url": code_server_url,
-                "restore_type": "vm",
-                "last_activity": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-
-        logger.info("IDE session active (VM) for job %s: %s", job_id, code_server_url)
-
-    async def _restore_gitea_container(self, job_id: str, job: dict) -> bool:
+    async def _restore_gitea_container(
+        self,
+        job_id: str,
+        job: dict,
+        *,
+        restore_operation_id: str | None = None,
+        restore_context: dict[str, Any] | None = None,
+        restored: tuple[str, str] | None = None,
+        restore_claim: tuple[str, dict[str, Any]] | None = None,
+        settle_restore_work: bool = True,
+    ) -> bool:
         """Restore an IDE session via a lightweight code-server container.
 
         Spins up a code-server container, clones the Gitea repo into it,
@@ -678,18 +1165,37 @@ class IdeSessionService:
         repo_name = job.get("repo_name")
         branch = job.get("branch_name") or "main"
         if not repo_name:
-            await self._set_session_context(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": "No Gitea repo available",
-                },
-            )
+            if restore_claim is not None:
+                # The receipt-backed caller owns retry/settlement. Do not
+                # bypass it with a standalone context verdict.
+                return False
+            failure = {
+                "status": "failed",
+                "error": "No Gitea repo available",
+            }
+            if restored is None:
+                await self._set_session_context(job_id, failure)
+            else:
+                await self._set_session_context_if_runtime(
+                    job_id,
+                    failure,
+                    expected_runtime_incarnation=restored[0],
+                )
             return False
 
         # Route to K8s or local container path
         if self._container_provisioner and self._container_provisioner.is_available:
-            return await self._restore_k8s_ide_container(job_id, job, repo_name, branch)
+            return await self._restore_k8s_ide_container(
+                job_id,
+                job,
+                repo_name,
+                branch,
+                restore_operation_id=restore_operation_id,
+                restore_context=restore_context,
+                restored=restored,
+                restore_claim=restore_claim,
+                settle_restore_work=settle_restore_work,
+            )
         else:
             return await self._restore_local_ide_container(job_id, repo_name, branch)
 
@@ -872,24 +1378,35 @@ class IdeSessionService:
 
         process = None
         try:
-            process = await asyncio.create_subprocess_exec(
+            process = await create_owned_subprocess_exec(
                 *command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            if process.stdin is None:
-                return False
-            process.stdin.write(secret)
-            await process.stdin.drain()
-            process.stdin.close()
-            secret[:] = b"\x00" * len(secret)
-            await asyncio.wait_for(process.wait(), timeout=timeout)
-            return process.returncode == 0
+
+            async def _complete() -> bool:
+                async with asyncio.timeout(timeout):
+                    if process.stdin is None:
+                        return False
+                    process.stdin.write(secret)
+                    await process.stdin.drain()
+                    process.stdin.close()
+                    secret[:] = b"\x00" * len(secret)
+                    await process.wait()
+                    return process.returncode == 0
+
+            return bool(await joined_async_call(_complete()))
+        except asyncio.CancelledError:
+            # Durable restore-work lease loss cancels the owner task. Reap the
+            # SSH transport before returning the token so no old replica keeps
+            # a repository-key operation alive against B (or an IP successor).
+            if process is not None and process.returncode is None:
+                await stop_and_reap(process)
+            raise
         except (OSError, asyncio.TimeoutError):
             if process is not None and process.returncode is None:
-                process.kill()
-                await process.wait()
+                await stop_and_reap(process)
             return False
         finally:
             for index in range(len(secret)):
@@ -905,9 +1422,17 @@ class IdeSessionService:
         branch: str,
         workspace_path: str,
         require_existing: bool = False,
+        expected_host_key_fingerprint: str | None = None,
+        mutation_authority: Callable[[], Awaitable[WorkspaceRuntimeAttestation]]
+        | None = None,
     ) -> bool:
         """Install repo-scoped authority into an IDE pod/VM and clone/fetch."""
 
+        # A raw coordinate is never recipient authority for a repository key.
+        # Every remote caller must supply both a pinned SSH identity and a
+        # fresh runtime/lease callback; refuse before even loading key bytes.
+        if expected_host_key_fingerprint is None or mutation_authority is None:
+            return False
         try:
             payload = await self._managed_repository_payload(job_id, backend=backend)
             command, private_key = self._managed_git_command(
@@ -916,91 +1441,173 @@ class IdeSessionService:
                 workspace_path=workspace_path,
                 require_existing=require_existing,
             )
-            ssh_command = build_agent_ssh_cmd(ssh_host, ssh_port, command)
-            return await self._run_secret_stdin_process(ssh_command, private_key)
-        except ManagedRepositoryAuthorityError:
+            try:
+                attestation = await mutation_authority()
+                ssh_host = attestation.pod_ip
+                ssh_port = attestation.port
+                expected_host_key_fingerprint = attestation.ssh_host_key_fingerprint
+                async with pinned_agent_ssh_command(
+                    ssh_host,
+                    ssh_port,
+                    command,
+                    expected_host_key_fingerprint=(expected_host_key_fingerprint),
+                ) as ssh_command:
+                    return await self._run_secret_stdin_process(
+                        ssh_command, private_key
+                    )
+            finally:
+                private_key[:] = b"\x00" * len(private_key)
+        except (ManagedRepositoryAuthorityError, SSHHostKeyVerificationError):
             return False
 
     async def _restore_k8s_ide_container(
-        self, job_id: str, job: dict, repo_name: str, branch: str
+        self,
+        job_id: str,
+        job: dict,
+        repo_name: str,
+        branch: str,
+        *,
+        restore_operation_id: str | None = None,
+        restore_context: dict[str, Any] | None = None,
+        restored: tuple[str, str] | None = None,
+        restore_claim: tuple[str, dict[str, Any]] | None = None,
+        settle_restore_work: bool = True,
     ) -> bool:
         """Create an IDE pod on Kubernetes, clone the repo, return code-server URL."""
         pod_name = f"ide-{job_id[:12]}"
 
-        await self._set_session_context(
-            job_id,
-            {
-                "container_name": pod_name,
-                "restore_type": "k8s_container",
-            },
-        )
-
-        # Create IDE pod via ContainerProvisioner
-        pod_ip = await self._container_provisioner.create_ide_pod(job_id)
-        if not pod_ip:
-            await self._set_session_context(
+        if restored is None:
+            restored = await self._create_or_resume_k8s_ide(
                 job_id,
-                {
-                    "status": "failed",
-                    "error": "IDE pod did not become ready within timeout",
-                },
+                operation_id=restore_operation_id,
             )
+        if restored is None:
             return False
-
-        # Clone through the exact repository deploy key. No Gitea credential,
-        # URL userinfo, or private-key file enters the IDE workspace.
-        installed = await self._install_and_sync_managed_repository_over_ssh(
-            job_id,
-            backend="sandbox",
-            ssh_host=pod_ip,
-            ssh_port=30022,
-            branch=branch,
-            workspace_path="/home/agent-host/workspace",
-        )
-        if not installed:
-            logger.warning("Scoped Git setup failed for IDE session job %s", job_id)
-            await self._set_session_context(
+        runtime, pod_ip = restored
+        owns_claim = restore_claim is None
+        if restore_claim is None:
+            restore_claim = await self._claim_ide_restore_work(
                 job_id,
-                {
-                    "status": "failed",
-                    "error": "Repository authorization failed for IDE session",
-                    "pod_ip": pod_ip,
-                },
+                runtime_incarnation=runtime,
             )
+        if restore_claim is None:
+            return False
+        claimant, restore_work = restore_claim
+        restore_work_finished = False
+        effects_ok = False
+        try:
             try:
-                await self._container_provisioner.delete_ide_pod(job_id)
-            except Exception:
-                logger.warning("Failed to remove unauthorized IDE pod for %s", job_id)
-            return False
+                async with self._ide_restore_heartbeat(
+                    job_id,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                ):
+                    attestation = await self._attest_claimed_ide_restore_target(
+                        job_id,
+                        runtime_incarnation=runtime,
+                        restore_work=restore_work,
+                        claimant=claimant,
+                    )
+                    pod_ip = attestation.pod_ip
+                    host_fingerprint = attestation.ssh_host_key_fingerprint
 
-        # code-server is already running from the workspace entrypoint
-        code_server_url = _build_code_server_url(job_id)
+                    async def mutation_authority() -> WorkspaceRuntimeAttestation:
+                        return await self._attest_claimed_ide_restore_target(
+                            job_id,
+                            runtime_incarnation=runtime,
+                            restore_work=restore_work,
+                            claimant=claimant,
+                        )
 
-        # Verify code-server is responding
-        ready = await self._wait_for_code_server(f"http://{pod_ip}:38080", timeout=15)
-        if not ready:
-            logger.warning(
-                "code-server not responding on IDE pod %s — setting active anyway",
-                pod_name,
+                    initial = {
+                        **(restore_context or {}),
+                        "status": "restoring",
+                        "error": None,
+                        "container_name": pod_name,
+                        "restore_type": "k8s_container",
+                    }
+                    if not await self._set_session_context_if_runtime(
+                        job_id,
+                        initial,
+                        expected_runtime_incarnation=runtime,
+                    ):
+                        return False
+
+                    # Clone through the exact repository deploy key. No Gitea
+                    # credential, URL userinfo, or private-key file enters the
+                    # IDE workspace.
+                    installed = (
+                        await self._install_and_sync_managed_repository_over_ssh(
+                            job_id,
+                            backend="sandbox",
+                            ssh_host=pod_ip,
+                            ssh_port=attestation.port,
+                            branch=branch,
+                            workspace_path="/home/agent-host/workspace",
+                            expected_host_key_fingerprint=host_fingerprint,
+                            mutation_authority=mutation_authority,
+                        )
+                    )
+                    if installed:
+                        # code-server is already running from the workspace
+                        # entrypoint. Its health check remains inside the
+                        # renewable lease because it may consume the whole
+                        # bounded timeout.
+                        ready = await self._wait_for_code_server(
+                            f"http://{pod_ip}:38080", timeout=15
+                        )
+                        if not ready:
+                            logger.warning(
+                                "code-server not responding on IDE pod %s — "
+                                "setting active anyway",
+                                pod_name,
+                            )
+                        post_attestation = await mutation_authority()
+                        effects_ok = post_attestation == attestation and (
+                            await self._container_provisioner.ide_pod_live(
+                                job_id,
+                                expected_runtime_incarnation=runtime,
+                            )
+                            is True
+                        )
+                    else:
+                        logger.warning(
+                            "Scoped Git setup failed for IDE session job %s", job_id
+                        )
+            except (RestoreWorkLeaseLost, WorkspaceRuntimeAuthorityError):
+                logger.warning("IDE restore-work authority changed for job %s", job_id)
+                return False
+
+            if not settle_restore_work:
+                return effects_ok
+            if not effects_ok:
+                # Repository and readiness failures are retryable. Releasing
+                # the lease preserves exact B; deleting its Pod after the
+                # creation receipt settled would make the same generation
+                # impossible to resume.
+                return False
+            if not await self._complete_ide_restore_work(
+                job_id,
+                restore_work=restore_work,
+                claimant=claimant,
+                success=True,
+            ):
+                return False
+            restore_work_finished = True
+
+            logger.info(
+                "IDE session active (K8s container) for job %s: %s",
+                job_id,
+                _build_code_server_url(job_id),
             )
-
-        await self._set_session_context(
-            job_id,
-            {
-                "status": "active",
-                "code_server_url": code_server_url,
-                "restore_type": "k8s_container",
-                "pod_ip": pod_ip,
-                "last_activity": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-
-        logger.info(
-            "IDE session active (K8s container) for job %s: %s",
-            job_id,
-            code_server_url,
-        )
-        return True
+            return True
+        finally:
+            if owns_claim and not restore_work_finished:
+                await self._release_ide_restore_work(
+                    job_id,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                )
 
     async def _restore_local_ide_container(
         self, job_id: str, repo_name: str, branch: str
@@ -1053,12 +1660,17 @@ class IdeSessionService:
                 entrypoint_script,
             ]
 
-            proc = await asyncio.create_subprocess_exec(
+            proc = await create_owned_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await communicate_bounded(
+                proc,
+                timeout=120,
+                stdout_limit=4096,
+                stderr_limit=64 * 1024,
+            )
 
             if proc.returncode != 0:
                 error_msg = stderr.decode(errors="replace")[:500]
@@ -1206,116 +1818,196 @@ class IdeSessionService:
                 pass
             return False
 
-    async def _restore_snapshot_container(self, job_id: str, job: dict) -> bool:
+    async def _restore_snapshot_container(
+        self,
+        job_id: str,
+        job: dict,
+        *,
+        restore_operation_id: str | None = None,
+        restore_context: dict[str, Any] | None = None,
+        restored: tuple[str, str] | None = None,
+        restore_claim: tuple[str, dict[str, Any]] | None = None,
+        settle_restore_work: bool = True,
+    ) -> bool:
         """Restore an IDE session via in-cluster pod from an in-cluster snapshot."""
         pod_name = f"ide-{job_id[:12]}"
-
-        await self._set_session_context(
-            job_id,
-            {
-                "container_name": pod_name,
-                "restore_type": "k8s_container",
-            },
-        )
 
         if not self._container_provisioner or not getattr(
             self._container_provisioner, "is_available", True
         ):
-            await self._set_session_context(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": "IDE pod provisioner not available",
-                },
-            )
             return False
 
-        pod_ip = await self._container_provisioner.create_ide_pod(job_id)
-        if not pod_ip:
-            await self._set_session_context(
+        if restored is None:
+            restored = await self._create_or_resume_k8s_ide(
                 job_id,
-                {
-                    "status": "failed",
-                    "error": "IDE pod did not become ready within timeout",
-                },
+                operation_id=restore_operation_id,
             )
+        if restored is None:
             return False
-
-        extracted = await self._extract_snapshot_to_k8s_pod(job_id, pod_ip, 30022)
-        if not extracted:
-            return False
-
-        repaired = await self._repair_git_after_snapshot(
-            job_id, job, pod_ip, 30022, backend="sandbox"
-        )
-        if job.get("repo_name") and not repaired:
-            await self._set_session_context(
+        runtime, pod_ip = restored
+        owns_claim = restore_claim is None
+        if restore_claim is None:
+            restore_claim = await self._claim_ide_restore_work(
                 job_id,
-                {
-                    "status": "failed",
-                    "error": "Repository authorization failed for IDE session",
-                },
+                runtime_incarnation=runtime,
             )
+        if restore_claim is None:
+            return False
+        claimant, restore_work = restore_claim
+        restore_work_finished = False
+        effects_ok = False
+        try:
             try:
-                await self._container_provisioner.delete_ide_pod(job_id)
-            except Exception:
-                logger.warning("Failed to remove unauthorized IDE pod for %s", job_id)
-            return False
-        await self._seed_ide_profile_for_user(job_id, job, pod_ip, 30022)
+                async with self._ide_restore_heartbeat(
+                    job_id,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                ):
+                    attestation = await self._attest_claimed_ide_restore_target(
+                        job_id,
+                        runtime_incarnation=runtime,
+                        restore_work=restore_work,
+                        claimant=claimant,
+                    )
+                    pod_ip = attestation.pod_ip
+                    host_fingerprint = attestation.ssh_host_key_fingerprint
 
-        # code-server should already be running from the workspace entrypoint
-        code_server_url = _build_code_server_url(job_id)
+                    async def mutation_authority() -> WorkspaceRuntimeAttestation:
+                        return await self._attest_claimed_ide_restore_target(
+                            job_id,
+                            runtime_incarnation=runtime,
+                            restore_work=restore_work,
+                            claimant=claimant,
+                        )
 
-        # Verify code-server is responding before marking active.
-        ready = await self._wait_for_code_server(f"http://{pod_ip}:38080", timeout=15)
-        if not ready:
-            logger.warning(
-                "code-server not responding on IDE pod %s — setting active anyway",
-                pod_name,
+                    if not await self._set_session_context_if_runtime(
+                        job_id,
+                        {
+                            **(restore_context or {}),
+                            "status": "restoring",
+                            "error": None,
+                            "container_name": pod_name,
+                            "restore_type": "k8s_container",
+                        },
+                        expected_runtime_incarnation=runtime,
+                    ):
+                        return False
+
+                    extracted = await self._extract_snapshot_to_k8s_pod(
+                        job_id,
+                        pod_ip,
+                        attestation.port,
+                        expected_runtime_incarnation=runtime,
+                        expected_host_key_fingerprint=(host_fingerprint),
+                        mutation_authority=mutation_authority,
+                    )
+                    if extracted:
+                        repaired = await self._repair_git_after_snapshot(
+                            job_id,
+                            job,
+                            pod_ip,
+                            attestation.port,
+                            backend="sandbox",
+                            expected_host_key_fingerprint=(host_fingerprint),
+                            mutation_authority=mutation_authority,
+                        )
+                        if job.get("repo_name") and not repaired:
+                            logger.warning(
+                                "Scoped Git repair failed for IDE session job %s",
+                                job_id,
+                            )
+                        else:
+                            await self._seed_ide_profile_for_user(
+                                job_id,
+                                job,
+                                pod_ip,
+                                attestation.port,
+                                expected_host_key_fingerprint=(host_fingerprint),
+                                mutation_authority=mutation_authority,
+                            )
+
+                            # code-server should already be running from the
+                            # workspace entrypoint. Keep its bounded health
+                            # probe under the renewable exact-B lease.
+                            ready = await self._wait_for_code_server(
+                                f"http://{pod_ip}:38080", timeout=15
+                            )
+                            if not ready:
+                                logger.warning(
+                                    "code-server not responding on IDE pod %s — "
+                                    "setting active anyway",
+                                    pod_name,
+                                )
+                            post_attestation = await mutation_authority()
+                            effects_ok = post_attestation == attestation and (
+                                await self._container_provisioner.ide_pod_live(
+                                    job_id,
+                                    expected_runtime_incarnation=runtime,
+                                )
+                                is True
+                            )
+            except (RestoreWorkLeaseLost, WorkspaceRuntimeAuthorityError):
+                logger.warning("IDE restore-work authority changed for job %s", job_id)
+                return False
+
+            if not settle_restore_work:
+                return effects_ok
+            if not effects_ok:
+                return False
+            if not await self._complete_ide_restore_work(
+                job_id,
+                restore_work=restore_work,
+                claimant=claimant,
+                success=True,
+            ):
+                return False
+            restore_work_finished = True
+
+            logger.info(
+                "IDE session active (K8s container snapshot restore) for job %s: %s",
+                job_id,
+                _build_code_server_url(job_id),
             )
-
-        await self._set_session_context(
-            job_id,
-            {
-                "status": "active",
-                "code_server_url": code_server_url,
-                "restore_type": "k8s_container",
-                "pod_ip": pod_ip,
-                "last_activity": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-
-        logger.info(
-            "IDE session active (K8s container snapshot restore) for job %s: %s",
-            job_id,
-            code_server_url,
-        )
-        return True
+            return True
+        finally:
+            if owns_claim and not restore_work_finished:
+                await self._release_ide_restore_work(
+                    job_id,
+                    restore_work=restore_work,
+                    claimant=claimant,
+                )
 
     async def _extract_snapshot_to_k8s_pod(
-        self, job_id: str, pod_ip: str, ssh_port: int = 30022
+        self,
+        job_id: str,
+        pod_ip: str,
+        ssh_port: int = 30022,
+        *,
+        expected_runtime_incarnation: str | None = None,
+        expected_host_key_fingerprint: str | None = None,
+        mutation_authority: Callable[[], Awaitable[WorkspaceRuntimeAttestation]]
+        | None = None,
     ) -> bool:
         """Download S3 snapshot and extract into the IDE pod via SSH."""
         import tempfile
 
+        async def fail(error: str) -> None:
+            updates = {"status": "failed", "error": error}
+            if expected_runtime_incarnation is None:
+                await self._set_session_context(job_id, updates)
+            else:
+                await self._set_session_context_if_runtime(
+                    job_id,
+                    updates,
+                    expected_runtime_incarnation=expected_runtime_incarnation,
+                )
+
         if not self._snapshot_service:
-            await self._set_session_context(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": "Snapshot service not available",
-                },
-            )
+            await fail("Snapshot service not available")
             return False
 
         if not getattr(self._snapshot_service, "is_available", True):
-            await self._set_session_context(
-                job_id,
-                {
-                    "status": "failed",
-                    "error": "Snapshot service is unavailable",
-                },
-            )
+            await fail("Snapshot service is unavailable")
             return False
 
         with tempfile.NamedTemporaryFile(
@@ -1330,14 +2022,16 @@ class IdeSessionService:
                     "Failed to download snapshot for job %s",
                     job_id,
                 )
-                await self._set_session_context(
-                    job_id,
-                    {
-                        "status": "failed",
-                        "error": error_msg,
-                    },
-                )
+                await fail(error_msg)
                 return False
+
+            # Snapshot download is local. Re-attest and re-lock immediately
+            # before the first archive byte can leave for a mutable Pod IP.
+            if mutation_authority is not None:
+                attestation = await mutation_authority()
+                pod_ip = attestation.pod_ip
+                ssh_port = attestation.port
+                expected_host_key_fingerprint = attestation.ssh_host_key_fingerprint
 
             key_path = resolve_ssh_key_path()
             if not key_path:
@@ -1351,13 +2045,18 @@ class IdeSessionService:
                 tar_path,
                 key_path=key_path,
                 remote_cmd=EXTRACT_HOME_REMOTE_CMD,
+                expected_host_key_fingerprint=expected_host_key_fingerprint,
             )
             if rc != 0:
                 # tar exits 2 on any per-file error even when the payload
                 # extracted fine (e.g. an unwritable stray path). Probe the
                 # workspace before declaring failure — a populated workspace
                 # beats a hard error for a browse tool.
-                if await self._workspace_populated(pod_ip, ssh_port):
+                if await self._workspace_populated(
+                    pod_ip,
+                    ssh_port,
+                    expected_host_key_fingerprint=(expected_host_key_fingerprint),
+                ):
                     logger.warning(
                         "Snapshot extraction for job %s exited rc=%d but the "
                         "workspace is populated — continuing: %s",
@@ -1371,29 +2070,37 @@ class IdeSessionService:
                     f"{stderr.decode(errors='replace')[:500]}"
                 )
                 logger.warning(error_msg)
-                await self._set_session_context(
-                    job_id,
-                    {
-                        "status": "failed",
-                        "error": error_msg,
-                    },
-                )
+                await fail(error_msg)
                 return False
 
         return True
 
-    async def _workspace_populated(self, ssh_host: str, ssh_port: int) -> bool:
+    async def _workspace_populated(
+        self,
+        ssh_host: str,
+        ssh_port: int,
+        *,
+        expected_host_key_fingerprint: str | None = None,
+    ) -> bool:
         """True when the pod's workspace directory exists and is non-empty."""
         import asyncio
 
         probe_cmd = 'test -n "$(ls -A /home/agent-host/workspace 2>/dev/null)"'
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *build_agent_ssh_cmd(ssh_host, ssh_port, probe_cmd),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            return (await proc.wait()) == 0
+            if expected_host_key_fingerprint is None:
+                return False
+            async with pinned_agent_ssh_command(
+                ssh_host,
+                ssh_port,
+                probe_cmd,
+                expected_host_key_fingerprint=expected_host_key_fingerprint,
+            ) as command:
+                proc = await create_owned_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                return (await wait_bounded(proc, timeout=20)) == 0
         except Exception:
             return False
 
@@ -1405,6 +2112,9 @@ class IdeSessionService:
         ssh_port: int,
         *,
         backend: str = "sandbox",
+        expected_host_key_fingerprint: str | None = None,
+        mutation_authority: Callable[[], Awaitable[WorkspaceRuntimeAttestation]]
+        | None = None,
     ) -> bool:
         """Replace legacy origin authority and refetch after snapshot restore.
 
@@ -1428,20 +2138,39 @@ class IdeSessionService:
             branch=branch,
             workspace_path="/home/agent-host/workspace",
             require_existing=True,
+            expected_host_key_fingerprint=expected_host_key_fingerprint,
+            mutation_authority=mutation_authority,
         )
         if not repaired:
             logger.info("Scoped Git repair failed for IDE session job %s", job_id)
         return repaired
 
     async def _seed_ide_profile_for_user(
-        self, job_id: str, job: dict, ssh_host: str, ssh_port: int
+        self,
+        job_id: str,
+        job: dict,
+        ssh_host: str,
+        ssh_port: int,
+        *,
+        expected_host_key_fingerprint: str | None = None,
+        mutation_authority: Callable[[], Awaitable[WorkspaceRuntimeAttestation]]
+        | None = None,
     ) -> None:
         """Seed IDE config and profile for restored IDE pods."""
         try:
             from services.ide_settings import seed_ide_config_for_user
 
             await seed_ide_config_for_user(
-                self._db, job.get("user_id"), ssh_host, ssh_port
+                self._db,
+                job.get("user_id"),
+                ssh_host,
+                ssh_port,
+                expected_host_key_fingerprint=(expected_host_key_fingerprint),
+                mutation_authority=(
+                    (lambda: self._ide_mutation_target_tuple(mutation_authority))
+                    if mutation_authority is not None
+                    else None
+                ),
             )
 
             # Restore license/globalStorage + non-Open-VSX bytes into the IDE
@@ -1456,7 +2185,11 @@ class IdeSessionService:
                 from services.ide_profile_store import IdeProfileStore
                 from services.ide_settings import IdeSettingsStore, seed_ide_profile
 
-                items = await IdeSettingsStore(self._db).get_extensions(str(user_id))
+                settings_store = IdeSettingsStore(self._db)
+                items = await settings_store.get_extensions(str(user_id))
+                profile_pointers = await settings_store.get_profile_pointers(
+                    str(user_id)
+                )
                 profile = IdeProfileStore(
                     self._snapshot_service._s3, self._snapshot_service._bucket
                 )
@@ -1466,6 +2199,13 @@ class IdeSessionService:
                     ssh_port=ssh_port,
                     profile_store=profile,
                     ext_items=items,
+                    profile_pointers=profile_pointers,
+                    expected_host_key_fingerprint=(expected_host_key_fingerprint),
+                    mutation_authority=(
+                        (lambda: self._ide_mutation_target_tuple(mutation_authority))
+                        if mutation_authority is not None
+                        else None
+                    ),
                 )
         except Exception:
             logger.warning(
@@ -1473,6 +2213,17 @@ class IdeSessionService:
                 job_id,
                 exc_info=True,
             )
+
+    @staticmethod
+    async def _ide_mutation_target_tuple(
+        mutation_authority: Callable[[], Awaitable[WorkspaceRuntimeAttestation]],
+    ) -> tuple[str, int, str]:
+        attestation = await mutation_authority()
+        return (
+            attestation.pod_ip,
+            attestation.port,
+            attestation.ssh_host_key_fingerprint,
+        )
 
     async def _wait_for_vm_ready(
         self, job_id: str, timeout: int = _VM_READY_TIMEOUT_SECONDS
@@ -1505,7 +2256,14 @@ class IdeSessionService:
         return None, None
 
     async def _extract_snapshot_to_vm(
-        self, job_id: str, ssh_host: str, ssh_port: int
+        self,
+        job_id: str,
+        ssh_host: str,
+        ssh_port: int,
+        *,
+        expected_host_key_fingerprint: str | None = None,
+        mutation_authority: Callable[[], Awaitable[WorkspaceRuntimeAttestation]]
+        | None = None,
     ) -> bool:
         """Download snapshot from S3 and extract into the VM via SSH.
 
@@ -1522,6 +2280,23 @@ class IdeSessionService:
         import tempfile
 
         if not self._snapshot_service:
+            return False
+        if expected_host_key_fingerprint is None or mutation_authority is None:
+            logger.warning(
+                "VM snapshot extraction refused without exact runtime authority "
+                "for job %s",
+                job_id,
+            )
+            return False
+        try:
+            initial = await mutation_authority()
+        except Exception:
+            return False
+        if (
+            initial.host != ssh_host
+            or initial.port != ssh_port
+            or initial.ssh_host_key_fingerprint != expected_host_key_fingerprint
+        ):
             return False
 
         with tempfile.NamedTemporaryFile(
@@ -1542,8 +2317,18 @@ class IdeSessionService:
                     "No SSH key available for snapshot extraction (job %s)",
                     job_id,
                 )
+            try:
+                current = await mutation_authority()
+            except Exception:
+                return False
+            if current != initial:
+                return False
             rc, stderr = await stream_extract_snapshot(
-                ssh_host, ssh_port, tar_path, key_path=key_path
+                ssh_host,
+                ssh_port,
+                tar_path,
+                key_path=key_path,
+                expected_host_key_fingerprint=expected_host_key_fingerprint,
             )
 
             if rc != 0:
@@ -1555,14 +2340,29 @@ class IdeSessionService:
                 )
                 return False
 
-            return True
+            try:
+                return await mutation_authority() == initial
+            except Exception:
+                return False
 
     async def _clone_gitea_to_vm(
-        self, job_id: str, job: dict, ssh_host: str, ssh_port: int
+        self,
+        job_id: str,
+        job: dict,
+        ssh_host: str,
+        ssh_port: int,
+        *,
+        expected_host_key_fingerprint: str | None = None,
+        mutation_authority: Callable[[], Awaitable[WorkspaceRuntimeAttestation]]
+        | None = None,
     ) -> bool:
         """Clone the job's Gitea repo into the VM as a fallback."""
         repo_name = job.get("repo_name")
-        if not repo_name:
+        if (
+            not repo_name
+            or expected_host_key_fingerprint is None
+            or mutation_authority is None
+        ):
             return False
         branch = job.get("branch_name") or "main"
         return await self._install_and_sync_managed_repository_over_ssh(
@@ -1572,11 +2372,13 @@ class IdeSessionService:
             ssh_port=ssh_port,
             branch=branch,
             workspace_path="/home/agent-host/workspace",
+            expected_host_key_fingerprint=expected_host_key_fingerprint,
+            mutation_authority=mutation_authority,
         )
 
     async def _delete_ide_vm(self, job_id: str, vm_name: str) -> bool:
         """Delete an IDE session VM."""
-        if self._vm_provisioner and self._vm_provisioner.is_available:
+        if self._vm_provisioner and self._vm_provisioner.lifecycle_available:
             return bool(await self._vm_provisioner.delete_vm(job_id))
         return False
 
@@ -1587,11 +2389,17 @@ class IdeSessionService:
         restore_type: str = "container",
         *,
         expected_container_id: str | None = None,
+        expected_runtime_incarnation: str | None = None,
     ) -> bool:
         """Stop and remove an IDE session container (K8s pod or local container)."""
         if restore_type == "k8s_container":
             if self._container_provisioner:
-                return bool(await self._container_provisioner.delete_ide_pod(job_id))
+                return bool(
+                    await self._container_provisioner.delete_ide_pod(
+                        job_id,
+                        expected_runtime_incarnation=expected_runtime_incarnation,
+                    )
+                )
             return False
 
         # Local dev path (podman/docker)
@@ -1644,7 +2452,7 @@ class IdeSessionService:
                 + "; "
                 + managed_repository_agent_zero_command(home_path="/home/coder")
             )
-            process = await asyncio.create_subprocess_exec(
+            process = await create_owned_subprocess_exec(
                 runtime,
                 "exec",
                 expected_container_id,
@@ -1654,7 +2462,7 @@ class IdeSessionService:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            if await process.wait() != 0:
+            if await wait_bounded(process, timeout=120) != 0:
                 return False
             observed_after = await self._inspect_container_id(runtime, container_name)
             if observed_after is not None and observed_after != expected_container_id:
@@ -1676,6 +2484,23 @@ class IdeSessionService:
             logger.warning("Failed to remove IDE container %s: %s", container_name, e)
             return False
 
+    async def _delete_k8s_ide_container_with_outcome(
+        self,
+        job_id: str,
+        *,
+        expected_runtime_incarnation: str | None,
+    ) -> Any:
+        """Return the provisioner's explicit immutable-runtime outcome."""
+
+        if self._container_provisioner is None:
+            from services.container_provisioner import RuntimeDeletionOutcome
+
+            return RuntimeDeletionOutcome("refused")
+        return await self._container_provisioner.delete_ide_pod_with_outcome(
+            job_id,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+        )
+
     # =========================================================================
     # Snapshot restore for job resume
     # =========================================================================
@@ -1683,43 +2508,21 @@ class IdeSessionService:
     async def restore_snapshot_for_resume(
         self, job_id: str, ssh_host: str, ssh_port: int
     ) -> bool:
-        """Restore S3 snapshot into a VM as part of job resume.
-
-        Called by the resume endpoint after a new VM is provisioned.
-        Extracts the environment snapshot so the agent picks up where
-        it left off.
-
-        Returns:
-            True if snapshot was restored, False if no snapshot or failed.
-        """
+        """Refuse the legacy pre-claim VM resume snapshot path."""
         if not self._snapshot_service or not self._snapshot_service.is_available:
             return False
 
-        job = await self._get_job(job_id)
-        if not job:
-            return False
-
-        ctx = self._parse_context(job)
-        snapshot_ctx = ctx.get("snapshot", {})
-
-        if snapshot_ctx.get("status") != "available":
-            return False
-
-        try:
-            ok = await self._extract_snapshot_to_vm(job_id, ssh_host, ssh_port)
-            if not ok:
-                logger.error(
-                    "Snapshot restore FAILED for resume of job %s (extract failed)",
-                    job_id,
-                )
-                return False
-            logger.info("Snapshot restored for job resume: %s", job_id)
-            return True
-        except Exception as e:
-            logger.warning(
-                "Snapshot restore failed for resume of job %s: %s", job_id, e
-            )
-            return False
+        # Public resume has not yet acquired the job/agent/execution lease when
+        # this legacy hook runs, so it cannot own a durable VM restore
+        # operation.  Refuse before S3 download or SSH; the authoritative
+        # dispatch/resume path must perform restoration under a future exact
+        # generation receipt instead of trusting caller-provided coordinates.
+        logger.warning(
+            "VM resume snapshot extraction refused without durable resume "
+            "authority for job %s",
+            job_id,
+        )
+        return False
 
     # =========================================================================
     # Helpers
@@ -1750,6 +2553,51 @@ class IdeSessionService:
             await self._db.merge_ide_session_context(job_id, updates)
         except Exception:
             logger.exception("Failed to update IDE session context for job %s", job_id)
+
+    async def _set_session_context_if_runtime(
+        self,
+        job_id: str,
+        updates: dict,
+        *,
+        expected_runtime_incarnation: str | None,
+    ) -> bool:
+        """Merge lifecycle state only while the captured Pod UID is current.
+
+        The class-level lookup is intentional: permissive mocks must not
+        fabricate a production authority seam dynamically. Missing or invalid
+        immutable runtime identity fails closed.
+        """
+
+        if self._db is None or not isinstance(expected_runtime_incarnation, str):
+            return False
+        try:
+            if str(UUID(expected_runtime_incarnation)) != expected_runtime_incarnation:
+                return False
+        except (TypeError, ValueError):
+            return False
+
+        merge_if_current = getattr(
+            type(self._db),
+            "merge_ide_session_context_if_runtime",
+            None,
+        )
+        if not callable(merge_if_current):
+            return False
+        try:
+            return bool(
+                await merge_if_current(
+                    self._db,
+                    job_id,
+                    updates,
+                    expected_runtime_incarnation=expected_runtime_incarnation,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to update exact IDE runtime context for job %s",
+                job_id,
+            )
+            return False
 
     @staticmethod
     def _compute_expiry(session_ctx: dict) -> Optional[str]:
@@ -1815,7 +2663,7 @@ class IdeSessionService:
     ) -> str | None:
         """Resolve a mutable local-container name only as an ID assertion."""
 
-        process = await asyncio.create_subprocess_exec(
+        process = await create_owned_subprocess_exec(
             runtime,
             "inspect",
             "--format",
@@ -1824,7 +2672,12 @@ class IdeSessionService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await process.communicate()
+        stdout, _ = await communicate_bounded(
+            process,
+            timeout=30,
+            stdout_limit=4096,
+            stderr_limit=64 * 1024,
+        )
         if process.returncode != 0:
             return None
         observed = stdout.decode(errors="replace").strip()
@@ -1854,7 +2707,7 @@ class IdeSessionService:
         if observed is not None and observed != expected_container_id:
             return False
 
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_owned_subprocess_exec(
             runtime,
             "rm",
             "-f",
@@ -1862,8 +2715,8 @@ class IdeSessionService:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await proc.wait()
-        probe = await asyncio.create_subprocess_exec(
+        await wait_bounded(proc, timeout=60)
+        probe = await create_owned_subprocess_exec(
             runtime,
             "ps",
             "-a",
@@ -1871,9 +2724,14 @@ class IdeSessionService:
             "--format",
             "{{.ID}}",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await probe.communicate()
+        stdout, _ = await communicate_bounded(
+            probe,
+            timeout=30,
+            stdout_limit=1024 * 1024,
+            stderr_limit=64 * 1024,
+        )
         if probe.returncode != 0:
             return False
         return expected_container_id not in stdout.decode(errors="replace").splitlines()

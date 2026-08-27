@@ -1,4 +1,8 @@
 {{- $runtimeAuthorityCutover := .Values.orchestrator.runtimeAuthorityMigrationMaintenanceAck | default false -}}
+{{- $vmRemoteProtocol := .Values.orchestrator.vmRemoteOperationProtocol.enabled | default false -}}
+{{- $workspaceCleanupProtocol := .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false -}}
+{{- $workspaceLifecycleCutover := .Values.orchestrator.workspaceLifecycleProtocolCutoverEnabled | default false -}}
+{{- $orchestratorRecreate := or $runtimeAuthorityCutover (or $vmRemoteProtocol (or $workspaceLifecycleCutover $workspaceCleanupProtocol)) -}}
 {{- if and $runtimeAuthorityCutover (ne (lower (toString (.Values.agent.requirePinnedStatusIdentity | default "true"))) "true") -}}
 {{- fail "orchestrator.runtimeAuthorityMigrationMaintenanceAck requires agent.requirePinnedStatusIdentity=true" -}}
 {{- end }}
@@ -15,7 +19,7 @@ metadata:
 spec:
   replicas: {{ .Values.orchestrator.replicas }}
   strategy:
-    type: {{ ternary "Recreate" "RollingUpdate" $runtimeAuthorityCutover }}
+    type: {{ ternary "Recreate" "RollingUpdate" $orchestratorRecreate }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 6 }}
@@ -23,6 +27,9 @@ spec:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 8 }}
+        {{- if $vmRemoteProtocol }}
+        srw.io/vm-remote-operation-protocol: v1
+        {{- end }}
       annotations:
         checksum/infrastructure-metering-gates: {{ toJson .Values.infrastructureMetering | sha256sum | quote }}
         # This flag is a money-spending admission fence. The orchestrator reads
@@ -31,8 +38,12 @@ spec:
         # controlled enable/disable therefore deterministically converges every
         # replica before operators rely on the new policy.
         checksum/officer-auto-pull-release: {{ dict "officerAutoPullReleaseEnabled" (.Values.orchestrator.officerAutoPullReleaseEnabled | default false) | toJson | sha256sum | quote }}
+        checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
+        checksum/workspace-lifecycle-protocol-cutover: {{ dict "enabled" $workspaceLifecycleCutover | toJson | sha256sum | quote }}
+        checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0195" | toString | sha256sum | quote }}
+        checksum/vm-remote-operation-protocol: {{ dict "enabled" $vmRemoteProtocol | toJson | sha256sum | quote }}
     spec:
-      serviceAccountName: {{ include "srw.fullname" . }}-orchestrator
+      serviceAccountName: {{ include "srw.orchestratorServiceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -78,6 +89,16 @@ spec:
             # old orchestrator overlaps the migration transaction.
             - name: MIGRATION_MAINTENANCE_GATES
               value: {{ ternary "pinned-runtime-authority-v1" "" $runtimeAuthorityCutover | quote }}
+            - name: VM_REMOTE_OPERATION_PROTOCOL_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VM_REMOTE_OPERATION_PROTOCOL_ENABLED
+            - name: WORKSPACE_CLEANUP_RECONCILIATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_CLEANUP_RECONCILIATION_ENABLED
             - name: PORT
               value: "8085"
             # License acceptance — orchestrator refuses to start if not "true"

@@ -25,14 +25,26 @@ import json
 import logging
 import os
 import shlex
-from contextlib import suppress
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from services import resolve_ssh_key_path
+from services.blocking_effect import joined_async_call, joined_blocking_call
+from services.subprocess_effect import (
+    SubprocessOutputLimit,
+    communicate_bounded,
+    create_owned_subprocess_exec,
+    stop_and_reap,
+)
 
 logger = logging.getLogger(__name__)
+
+SnapshotCaptureAuthority = Callable[[], Awaitable[bool]]
+
+DEFAULT_BLOB_READ_MAX_BYTES = 64 * 1024 * 1024
+MAX_SNAPSHOT_MANIFEST_BYTES = 16 * 1024 * 1024
+_BLOB_STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 def _sha256_file(path: str) -> str:
@@ -41,6 +53,14 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _snapshot_archive_max_bytes() -> int:
+    try:
+        gibibytes = int(os.environ.get("SNAPSHOT_MAX_SIZE_GB", "10"))
+    except (TypeError, ValueError):
+        gibibytes = 10
+    return max(1, min(100, gibibytes)) * 1024 * 1024 * 1024
 
 
 def _valid_ssh_sha256_fingerprint(value: object) -> bool:
@@ -106,23 +126,7 @@ async def _joined_blocking_call(func, /, *args, **kwargs):
     reached a real terminal result.
     """
 
-    task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
-    cancelled = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cancelled = True
-        except Exception:
-            if not cancelled:
-                raise
-    if cancelled:
-        # Retrieve a blocking-call exception before honoring cancellation; the
-        # stale effect is terminal either way and can no longer race a retry.
-        with suppress(BaseException):
-            task.result()
-        raise asyncio.CancelledError
-    return task.result()
+    return await joined_blocking_call(func, *args, **kwargs)
 
 
 def _snapshot_tar_pipeline(include_dirs: list[str], *, strict_terminal: bool) -> str:
@@ -241,7 +245,7 @@ class SnapshotService:
             )
 
             # Ensure bucket exists (auto-create for dev)
-            await asyncio.to_thread(self._ensure_bucket)
+            await _joined_blocking_call(self._ensure_bucket)
             self._available = True
             logger.info(
                 "Snapshot service ready: endpoint=%s bucket=%s",
@@ -277,6 +281,7 @@ class SnapshotService:
         phase_number: Optional[int] = None,
         entity_type: str = "jobs",
         terminal_generation: Optional[str] = None,
+        publication_authority: Optional[SnapshotCaptureAuthority] = None,
     ) -> bool:
         """Upload a snapshot tarball + manifest to S3.
 
@@ -302,6 +307,8 @@ class SnapshotService:
         """
         if not self._available:
             return False
+        if publication_authority is not None and not await publication_authority():
+            return False
 
         prefix = f"{entity_type}/{job_id}"
         phase_prefix = (
@@ -319,6 +326,11 @@ class SnapshotService:
 
             # Upload tarball + manifest to phase-specific prefix
             if phase_prefix:
+                if (
+                    publication_authority is not None
+                    and not await publication_authority()
+                ):
+                    return False
                 await _joined_blocking_call(
                     self._s3.upload_file,
                     tar_path,
@@ -394,6 +406,15 @@ class SnapshotService:
                         # point ever wrote to it. `finally` below deletes
                         # the bad staging object.
                         return False
+
+                # The SSH read and staging upload are external awaits. Re-prove
+                # the exact runtime immediately before the first durable
+                # canonical/history publication.
+                if (
+                    publication_authority is not None
+                    and not await publication_authority()
+                ):
+                    return False
 
                 # Promote (size-safe copy). Use the MANAGED `s3.copy` —
                 # never `copy_object`: that's a single-part CopyObject API
@@ -476,6 +497,11 @@ class SnapshotService:
                         job_id,
                     )
 
+            # Never project success onto the owner after its exact runtime
+            # authority changed during S3 settlement.
+            if publication_authority is not None and not await publication_authority():
+                return False
+
             # Update entity context
             await self._set_snapshot_context(
                 job_id,
@@ -554,8 +580,8 @@ class SnapshotService:
         sha = hashlib.sha256(data).hexdigest()
         key = f"{prefix}/{sha[:2]}/{sha}"
         try:
-            if not await asyncio.to_thread(self._object_exists, key):
-                await asyncio.to_thread(
+            if not await _joined_blocking_call(self._object_exists, key):
+                await _joined_blocking_call(
                     self._s3.put_object,
                     Bucket=self._bucket,
                     Key=key,
@@ -583,7 +609,7 @@ class SnapshotService:
         if not self._available or not data:
             return False
         try:
-            await asyncio.to_thread(
+            await _joined_blocking_call(
                 self._s3.put_object,
                 Bucket=self._bucket,
                 Key=key,
@@ -595,15 +621,34 @@ class SnapshotService:
             logger.error("put_blob failed (key=%s): %s", key, e)
             return False
 
-    async def get_blob(self, key: str) -> Optional[bytes]:
+    async def get_blob(
+        self, key: str, *, max_bytes: int = DEFAULT_BLOB_READ_MAX_BYTES
+    ) -> Optional[bytes]:
         """Fetch the raw bytes for a blob ``key``; ``None`` if missing/unavailable."""
         if not self._available or not key:
             return None
         try:
-            resp = await asyncio.to_thread(
+            resp = await _joined_blocking_call(
                 self._s3.get_object, Bucket=self._bucket, Key=key
             )
-            return await asyncio.to_thread(resp["Body"].read)
+            body = resp["Body"]
+
+            def _read() -> bytes:
+                result = bytearray()
+                try:
+                    while True:
+                        chunk = body.read(_BLOB_STREAM_CHUNK_BYTES)
+                        if not chunk:
+                            return bytes(result)
+                        result.extend(chunk)
+                        if len(result) > max_bytes:
+                            raise ValueError("S3 object exceeds byte-read cap")
+                finally:
+                    close = getattr(body, "close", None)
+                    if callable(close):
+                        close()
+
+            return await _joined_blocking_call(_read)
         except Exception as e:
             logger.debug("get_blob miss (key=%s): %s", key, e)
             return None
@@ -618,10 +663,55 @@ class SnapshotService:
         if not self._available:
             return False
         try:
-            await asyncio.to_thread(self._s3.upload_file, local_path, self._bucket, key)
+            await _joined_blocking_call(
+                self._s3.upload_file, local_path, self._bucket, key
+            )
             return True
         except Exception as e:
             logger.error(f"S3 upload_blob_file failed for {key}: {e}")
+            return False
+
+    async def download_blob_file(
+        self, key: str, local_path: str, *, max_bytes: int
+    ) -> bool:
+        """Stream one S3 object to disk with a hard cap and owned cleanup."""
+
+        if not self._available or not key or max_bytes <= 0:
+            return False
+
+        def _download() -> bool:
+            try:
+                response = self._s3.get_object(Bucket=self._bucket, Key=key)
+            except ClientError:
+                return False
+            body = response["Body"]
+            total = 0
+            try:
+                with open(local_path, "wb") as output:
+                    while True:
+                        chunk = body.read(_BLOB_STREAM_CHUNK_BYTES)
+                        if not chunk:
+                            return True
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ValueError("S3 object exceeds download cap")
+                        output.write(chunk)
+            finally:
+                close = getattr(body, "close", None)
+                if callable(close):
+                    close()
+
+        try:
+            return bool(await _joined_blocking_call(_download))
+        except BaseException as exc:
+            if not isinstance(exc, asyncio.CancelledError):
+                logger.warning("S3 download failed for %s: %s", key, exc)
+            try:
+                os.unlink(local_path)
+            except FileNotFoundError:
+                pass
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             return False
 
     async def delete_blob(self, key: str) -> bool:
@@ -652,6 +742,7 @@ class SnapshotService:
         terminal_generation: Optional[str] = None,
         terminal_created_at: Optional[str] = None,
         expected_runtime_incarnation: Optional[str] = None,
+        capture_authority: Optional[SnapshotCaptureAuthority] = None,
     ) -> bool:
         """Capture a VM environment snapshot via SSH tar and upload to S3.
 
@@ -671,6 +762,8 @@ class SnapshotService:
             True if capture + upload succeeded.
         """
         if not self._available:
+            return False
+        if capture_authority is not None and not await capture_authority():
             return False
 
         if terminal_generation is not None:
@@ -753,6 +846,8 @@ class SnapshotService:
         # Remembered before "capturing" overwrites it: a failed re-capture must
         # hand an existing snapshot back rather than bury it under an error.
         had_available_snapshot = await self._snapshot_is_available(job_id, entity_type)
+        if capture_authority is not None and not await capture_authority():
+            return False
         await self._set_snapshot_context(
             job_id, {"status": "capturing"}, entity_type=entity_type
         )
@@ -869,7 +964,7 @@ class SnapshotService:
                 "UserKnownHostsFile=/dev/null",
             ]
             if expected_host_key_fingerprint is not None:
-                scan_process = await asyncio.create_subprocess_exec(
+                scan_process = await create_owned_subprocess_exec(
                     "ssh-keyscan",
                     "-T",
                     "10",
@@ -877,11 +972,19 @@ class SnapshotService:
                     str(ssh_port),
                     ssh_host,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                scanned, _ = await asyncio.wait_for(
-                    scan_process.communicate(), timeout=15
-                )
+                try:
+                    scanned, _ = await communicate_bounded(
+                        scan_process,
+                        timeout=15,
+                        stdout_limit=1024 * 1024,
+                        stderr_limit=64 * 1024,
+                    )
+                except SubprocessOutputLimit as exc:
+                    raise RuntimeError(
+                        "workspace SSH host-key scan exceeded output limit"
+                    ) from exc
                 matching_lines: list[bytes] = []
                 for line in scanned.splitlines():
                     fields = line.split()
@@ -924,46 +1027,41 @@ class SnapshotService:
             ]
 
             # Run SSH tar → local file
-            max_size = (
-                int(os.environ.get("SNAPSHOT_MAX_SIZE_GB", "10")) * 1024 * 1024 * 1024
-            )
-            process = await asyncio.create_subprocess_exec(
+            max_size = _snapshot_archive_max_bytes()
+            if capture_authority is not None and not await capture_authority():
+                return False
+            process = await create_owned_subprocess_exec(
                 *ssh_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stderr_task = asyncio.create_task(_read_stream_tail(process.stderr))
-            strict_deadline: float | None = None
-            if strict_terminal:
-                try:
-                    capture_timeout_s = max(
-                        0.01,
-                        float(
-                            os.environ.get(
-                                "STATELESS_TERMINAL_SNAPSHOT_TIMEOUT_S", "300"
-                            )
-                        ),
-                    )
-                except (TypeError, ValueError):
-                    capture_timeout_s = 300.0
-                strict_deadline = asyncio.get_running_loop().time() + capture_timeout_s
+            timeout_env = (
+                "STATELESS_TERMINAL_SNAPSHOT_TIMEOUT_S"
+                if strict_terminal
+                else "SNAPSHOT_CAPTURE_TIMEOUT_S"
+            )
+            try:
+                capture_timeout_s = max(
+                    0.01,
+                    float(os.environ.get(timeout_env, "300")),
+                )
+            except (TypeError, ValueError):
+                capture_timeout_s = 300.0
+            capture_deadline = asyncio.get_running_loop().time() + capture_timeout_s
 
             total_bytes = 0
             with open(tar_path, "wb") as f:
                 while True:
                     read = process.stdout.read(1024 * 1024)  # 1 MB chunks
-                    if strict_deadline is None:
-                        chunk = await read
-                    else:
-                        remaining = strict_deadline - asyncio.get_running_loop().time()
-                        if remaining <= 0:
-                            raise asyncio.TimeoutError
-                        chunk = await asyncio.wait_for(read, timeout=remaining)
+                    remaining = capture_deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    chunk = await asyncio.wait_for(read, timeout=remaining)
                     if not chunk:
                         break
                     total_bytes += len(chunk)
                     if total_bytes > max_size:
-                        process.kill()
                         logger.warning(
                             "Snapshot too large for %s %s (>%s GB), aborting",
                             entity_type.rstrip("s"),
@@ -981,14 +1079,14 @@ class SnapshotService:
                         return False
                     f.write(chunk)
 
-            if strict_deadline is None:
-                await process.wait()
-            else:
-                remaining = strict_deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-                await asyncio.wait_for(process.wait(), timeout=remaining)
-            stderr_tail = await stderr_task
+            remaining = capture_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(process.wait(), timeout=remaining)
+            remaining = capture_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            stderr_tail = await asyncio.wait_for(stderr_task, timeout=remaining)
 
             # Honest accept gate: tar rc==1 ("file changed as we read it") is
             # a routine warning on a live workspace, not a failure — only
@@ -1019,7 +1117,7 @@ class SnapshotService:
             if strict_terminal:
                 if total_bytes == 0:
                     raise RuntimeError("terminal snapshot archive is empty")
-                verify_process = await asyncio.create_subprocess_exec(
+                verify_process = await create_owned_subprocess_exec(
                     "bash",
                     "-o",
                     "pipefail",
@@ -1055,6 +1153,7 @@ class SnapshotService:
                     ssh_host,
                     ssh_port,
                     known_hosts_path=known_hosts_path,
+                    capture_authority=capture_authority,
                 )
             )
 
@@ -1086,7 +1185,7 @@ class SnapshotService:
                 manifest["phase_number"] = phase_number
             if strict_terminal:
                 manifest["strict_terminal"] = True
-                manifest["sha256_compressed"] = await asyncio.to_thread(
+                manifest["sha256_compressed"] = await _joined_blocking_call(
                     _sha256_file, tar_path
                 )
             if terminal_generation is not None:
@@ -1106,6 +1205,7 @@ class SnapshotService:
                 phase_number=phase_number,
                 entity_type=entity_type,
                 terminal_generation=terminal_generation,
+                publication_authority=capture_authority,
             )
             # Record the work-marker (turn count at capture) into the workspace
             # context so the lifecycle reaper's is_dirty can tell whether new
@@ -1140,26 +1240,25 @@ class SnapshotService:
             )
             return False
         finally:
-            if scan_process is not None and scan_process.returncode is None:
-                scan_process.kill()
-                with suppress(Exception):
-                    await scan_process.wait()
-            if process is not None and process.returncode is None:
-                process.kill()
-                with suppress(Exception):
-                    await process.wait()
-            if stderr_task is not None and not stderr_task.done():
-                stderr_task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await stderr_task
-            if verify_process is not None and verify_process.returncode is None:
-                verify_process.kill()
-                with suppress(Exception):
-                    await verify_process.wait()
-            if verify_stderr_task is not None and not verify_stderr_task.done():
-                verify_stderr_task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await verify_stderr_task
+
+            async def _cleanup_processes() -> None:
+                # Readers stay active until their producers are terminal so a
+                # full pipe cannot deadlock cleanup. Reap every started child
+                # before the lifecycle owner can release its authority lock.
+                for child in (scan_process, process, verify_process):
+                    if child is not None and child.returncode is None:
+                        await stop_and_reap(child)
+                tasks = tuple(
+                    task
+                    for task in (stderr_task, verify_stderr_task)
+                    if task is not None and not task.done()
+                )
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            await joined_async_call(_cleanup_processes())
             # Clean up temp file
             if tar_path:
                 try:
@@ -1178,6 +1277,7 @@ class SnapshotService:
         ssh_port: int,
         *,
         known_hosts_path: str | None = None,
+        capture_authority: Optional[SnapshotCaptureAuthority] = None,
     ) -> dict[str, Any]:
         """Collect package manifests from the VM via SSH.
 
@@ -1209,8 +1309,15 @@ class SnapshotService:
             ]
         )
         for key, cmd in commands.items():
+            proc: asyncio.subprocess.Process | None = None
             try:
-                proc = await asyncio.create_subprocess_exec(
+                # The package probes are separate SSH connections after the
+                # archive stream. Re-prove the same durable VM claim before
+                # each one; a post-publication check alone would still permit
+                # reading a same-address successor into the local manifest.
+                if capture_authority is not None and not await capture_authority():
+                    return info
+                proc = await create_owned_subprocess_exec(
                     "ssh",
                     *(["-i", key_path] if key_path else []),
                     *host_key_options,
@@ -1221,9 +1328,14 @@ class SnapshotService:
                     f"agent-host@{ssh_host}",
                     cmd,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+                stdout, _ = await communicate_bounded(
+                    proc,
+                    timeout=15,
+                    stdout_limit=8 * 1024 * 1024,
+                    stderr_limit=64 * 1024,
+                )
                 output = stdout.decode(errors="replace").strip()
                 if output:
                     if key == "pip_freeze":
@@ -1232,6 +1344,9 @@ class SnapshotService:
                         info[key] = output
             except Exception:
                 pass
+            finally:
+                if proc is not None and proc.returncode is None:
+                    await joined_async_call(stop_and_reap(proc))
 
         return info
 
@@ -1264,17 +1379,18 @@ class SnapshotService:
             key = f"{entity_type}/{job_id}/manifest.json"
 
         try:
-            response = await asyncio.to_thread(
-                self._s3.get_object,
-                Bucket=self._bucket,
-                Key=key,
-            )
-            body = await asyncio.to_thread(response["Body"].read)
-            return json.loads(body)
+            body = await self.get_blob(key, max_bytes=MAX_SNAPSHOT_MANIFEST_BYTES)
+            if body is None:
+                return None
+            parsed = json.loads(body)
+            return parsed if isinstance(parsed, dict) else None
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") == "NoSuchKey":
                 return None
             logger.error("Failed to get manifest for job %s: %s", job_id, e)
+            return None
+        except (TypeError, ValueError):
+            logger.warning("Snapshot manifest is malformed for %s", job_id)
             return None
 
     async def reconcile_terminal_snapshot_generation(
@@ -1316,7 +1432,7 @@ class SnapshotService:
         archive_head: dict[str, Any] | None = None
         manifest_bytes: bytes | None = None
         try:
-            archive_head = await asyncio.to_thread(
+            archive_head = await _joined_blocking_call(
                 self._s3.head_object, Bucket=self._bucket, Key=archive_key
             )
         except ClientError as exc:
@@ -1325,10 +1441,9 @@ class SnapshotService:
         except Exception as exc:
             return False, f"probe error: {exc}"
         try:
-            response = await asyncio.to_thread(
-                self._s3.get_object, Bucket=self._bucket, Key=manifest_key
+            manifest_bytes = await self.get_blob(
+                manifest_key, max_bytes=MAX_SNAPSHOT_MANIFEST_BYTES
             )
-            manifest_bytes = await asyncio.to_thread(response["Body"].read)
         except ClientError as exc:
             if not _snapshot_object_missing(exc):
                 return False, f"probe error: {exc}"
@@ -1361,11 +1476,12 @@ class SnapshotService:
             or isinstance(size, bool)
             or not isinstance(size, int)
             or size <= 0
+            or size > _snapshot_archive_max_bytes()
             or archive_head.get("ContentLength") != size
         ):
             return False, "partial: identity or integrity metadata mismatch"
         try:
-            observed_digest = await asyncio.to_thread(
+            observed_digest = await _joined_blocking_call(
                 self._streaming_sha256_from_s3, archive_key
             )
         except Exception as exc:
@@ -1432,18 +1548,40 @@ class SnapshotService:
         else:
             key = f"{entity_type}/{job_id}/env.tar.zst"
 
+        succeeded = False
         try:
-            await asyncio.to_thread(
-                self._s3.download_file,
-                self._bucket,
-                key,
-                dest_path,
-            )
             manifest = await self.get_manifest(
                 job_id,
                 phase_number=phase_number,
                 entity_type=entity_type,
             )
+            archive_cap = _snapshot_archive_max_bytes()
+            expected_size = (
+                manifest.get("size_compressed_bytes")
+                if isinstance(manifest, dict)
+                else None
+            )
+            if expected_size is not None and (
+                isinstance(expected_size, bool)
+                or not isinstance(expected_size, int)
+                or not 0 < expected_size <= archive_cap
+            ):
+                logger.error(
+                    "Snapshot size metadata is invalid for %s %s",
+                    entity_type.rstrip("s"),
+                    job_id,
+                )
+                return False
+            if not await self.download_blob_file(key, dest_path, max_bytes=archive_cap):
+                return False
+            actual_size = await _joined_blocking_call(os.path.getsize, dest_path)
+            if expected_size is not None and actual_size != expected_size:
+                logger.error(
+                    "Snapshot size mismatch for %s %s",
+                    entity_type.rstrip("s"),
+                    job_id,
+                )
+                return False
             manifest_is_strict = bool(
                 isinstance(manifest, dict) and manifest.get("strict_terminal") is True
             )
@@ -1472,7 +1610,7 @@ class SnapshotService:
                 if (
                     not isinstance(expected_digest, str)
                     or len(expected_digest) != 64
-                    or await asyncio.to_thread(_sha256_file, dest_path)
+                    or await _joined_blocking_call(_sha256_file, dest_path)
                     != expected_digest
                 ):
                     logger.error(
@@ -1481,10 +1619,17 @@ class SnapshotService:
                         job_id,
                     )
                     return False
+            succeeded = True
             return True
         except ClientError as e:
             logger.error("Failed to download snapshot for job %s: %s", job_id, e)
             return False
+        finally:
+            if not succeeded:
+                try:
+                    os.unlink(dest_path)
+                except FileNotFoundError:
+                    pass
 
     async def list_phase_snapshots(self, job_id: str) -> list[dict[str, Any]]:
         """List all phase snapshots for a job.
@@ -1587,7 +1732,7 @@ class SnapshotService:
         key = f"{entity_type}/{job_id}/env.tar.zst"
 
         try:
-            head = await asyncio.to_thread(
+            head = await _joined_blocking_call(
                 self._s3.head_object, Bucket=self._bucket, Key=key
             )
         except ClientError:
@@ -1622,7 +1767,7 @@ class SnapshotService:
                 # "nothing to check" as "checked and fine".
                 return False, "no checksum in manifest (unverifiable)"
             try:
-                got = await asyncio.to_thread(self._streaming_sha256_from_s3, key)
+                got = await _joined_blocking_call(self._streaming_sha256_from_s3, key)
             except Exception as e:
                 # Covers both a TOCTOU ClientError (object vanished between
                 # the HEAD above and this GET) and any other transient S3
@@ -1847,7 +1992,7 @@ class SnapshotService:
             paginator = self._s3.get_paginator("list_objects_v2")
             pages = paginator.paginate(Bucket=self._bucket, Prefix="jobs/")
 
-            for page in await asyncio.to_thread(lambda: list(pages)):
+            for page in await _joined_blocking_call(lambda: list(pages)):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
                     # Only check top-level manifests (not phase sub-manifests)
@@ -1906,7 +2051,7 @@ class SnapshotService:
             pages = paginator.paginate(Bucket=self._bucket, Prefix="gc/pending_delete/")
 
             objects_to_purge = []
-            for page in await asyncio.to_thread(lambda: list(pages)):
+            for page in await _joined_blocking_call(lambda: list(pages)):
                 for obj in page.get("Contents", []):
                     if (
                         obj.get("LastModified")
@@ -1919,7 +2064,7 @@ class SnapshotService:
 
             for i in range(0, len(objects_to_purge), 1000):
                 batch = objects_to_purge[i : i + 1000]
-                await asyncio.to_thread(
+                await _joined_blocking_call(
                     self._s3.delete_objects,
                     Bucket=self._bucket,
                     Delete={"Objects": batch},
@@ -1940,13 +2085,13 @@ class SnapshotService:
             paginator = self._s3.get_paginator("list_objects_v2")
             pages = paginator.paginate(Bucket=self._bucket, Prefix=src_prefix)
 
-            for page in await asyncio.to_thread(lambda: list(pages)):
+            for page in await _joined_blocking_call(lambda: list(pages)):
                 for obj in page.get("Contents", []):
                     src_key = obj["Key"]
                     dst_key = src_key.replace(src_prefix, dst_prefix, 1)
 
                     # Copy to gc/
-                    await asyncio.to_thread(
+                    await _joined_blocking_call(
                         self._s3.copy_object,
                         Bucket=self._bucket,
                         CopySource={"Bucket": self._bucket, "Key": src_key},
@@ -1954,7 +2099,7 @@ class SnapshotService:
                     )
 
                     # Delete original
-                    await asyncio.to_thread(
+                    await _joined_blocking_call(
                         self._s3.delete_object,
                         Bucket=self._bucket,
                         Key=src_key,
@@ -2005,7 +2150,7 @@ class SnapshotService:
             # bytes still consume real storage (counted unconditionally
             # below).
             pages = paginator.paginate(Bucket=self._bucket, Prefix="jobs/")
-            for page in await asyncio.to_thread(lambda: list(pages)):
+            for page in await _joined_blocking_call(lambda: list(pages)):
                 for obj in page.get("Contents", []):
                     if (
                         obj["Key"].endswith("/manifest.json")
@@ -2017,7 +2162,7 @@ class SnapshotService:
 
             # Count GC pending
             pages = paginator.paginate(Bucket=self._bucket, Prefix="gc/pending_delete/")
-            for page in await asyncio.to_thread(lambda: list(pages)):
+            for page in await _joined_blocking_call(lambda: list(pages)):
                 for obj in page.get("Contents", []):
                     stats["gc_pending_count"] += 1
                     stats["gc_pending_size_bytes"] += obj.get("Size", 0)
@@ -2127,7 +2272,7 @@ class SnapshotService:
     def _streaming_sha256_from_s3(self, key: str) -> str:
         """SHA-256 of an S3 object, streamed in 1 MB chunks (O(1) memory).
 
-        Synchronous (run via ``asyncio.to_thread``) — mirrors
+        Synchronous (run via the joined blocking-effect helper) — mirrors
         ``_compute_sha256`` but reads the S3 object body instead of a local
         file, so a possibly multi-GB object is never buffered in memory at
         once. Backs ``verify_snapshot``'s deep check; never use the

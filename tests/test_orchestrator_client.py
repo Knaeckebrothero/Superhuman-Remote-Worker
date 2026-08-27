@@ -19,6 +19,7 @@ from src.api.orchestrator_client import (
 RUNTIME_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 RUNTIME_ATTACH_TOKEN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 RUNTIME_RETIREMENT_TOKEN = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+PROCESS_GENERATION = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 
 
 class TestGetAgentIp:
@@ -246,6 +247,7 @@ class TestOrchestratorClient:
         mock_response.json.return_value = {
             "agent_id": "agent-123",
             "heartbeat_interval_seconds": 60,
+            "dispatch_process_generation": "process-123",
         }
 
         with patch.object(client, "_client", AsyncMock()) as mock_client:
@@ -255,6 +257,7 @@ class TestOrchestratorClient:
 
             assert result is True
             assert client.agent_id == "agent-123"
+            assert client.dispatch_process_generation == "process-123"
             assert client.heartbeat_interval == 60
             mock_client.post.assert_called_once()
 
@@ -443,6 +446,7 @@ class TestOrchestratorClient:
         client._client = MagicMock()
         client._client.put = AsyncMock(return_value=response)
         client.pinned_runtime_generation_contract = True
+        client.dispatch_process_generation = PROCESS_GENERATION
         client.session_runtime_generation = RUNTIME_GENERATION
         client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
 
@@ -455,6 +459,7 @@ class TestOrchestratorClient:
         assert client._client.put.await_args.kwargs["json"] == {
             "status": "active",
             "agent_id": "agent-123",
+            "process_generation": PROCESS_GENERATION,
             "session_runtime_generation": RUNTIME_GENERATION,
             "session_runtime_attach_token": RUNTIME_ATTACH_TOKEN,
         }
@@ -469,6 +474,7 @@ class TestOrchestratorClient:
         client._client = MagicMock()
         client._client.put = AsyncMock(return_value=response)
         client.pinned_runtime_generation_contract = True
+        client.dispatch_process_generation = PROCESS_GENERATION
         client.session_runtime_generation = RUNTIME_GENERATION
         client.session_runtime_attach_token = RUNTIME_ATTACH_TOKEN
 
@@ -483,6 +489,7 @@ class TestOrchestratorClient:
             "status": status,
             "retirement_disposition": disposition,
             "agent_id": "agent-123",
+            "process_generation": PROCESS_GENERATION,
             "session_runtime_generation": RUNTIME_GENERATION,
             "session_runtime_attach_token": RUNTIME_ATTACH_TOKEN,
         }
@@ -647,6 +654,7 @@ class TestOrchestratorClient:
     async def test_deregister_success(self, client):
         """Test successful deregistration."""
         client.agent_id = "agent-123"
+        client.dispatch_process_generation = "process-123"
 
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -658,6 +666,7 @@ class TestOrchestratorClient:
 
             assert result is True
             assert client.agent_id is None
+            assert client.dispatch_process_generation is None
 
     @pytest.mark.asyncio
     async def test_deregister_without_agent_id(self, client):

@@ -146,11 +146,16 @@ class TestIdeSeedTailnetGuard:
     @pytest.mark.asyncio
     async def test_tailnet_target_skipped_before_db_access(self):
         from services.nats_bridge import NatsBridge
+        from security.vm_guest import VmGuestIdentity
 
         bridge = NatsBridge()
         bridge._db = AsyncMock()
 
-        await bridge._seed_vm_ide_config("job-1", False, "100.64.23.180", 22)
+        assert await bridge._seed_vm_ide_config(
+            VmGuestIdentity("job", "job-1", "00000000-0000-4000-8000-000000000001"),
+            "100.64.23.180",
+            22,
+        )
 
         bridge._db.get_job.assert_not_awaited()
         bridge._db.get_thread.assert_not_awaited()

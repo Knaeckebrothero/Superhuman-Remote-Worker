@@ -2,19 +2,19 @@
 """
 SRW Management Daemon — runs inside KubeVirt agent VMs.
 
-Bridges the VM to the orchestrator over same-cluster HTTP or external NATS:
-  - Registers VM identity and network details; external mode also reports its
-    legacy tailnet-based ssh_ready evidence
+Bridges the VM to the orchestrator over authenticated HTTP:
+  - Registers VM identity and network details
   - Sends periodic heartbeats with resource usage
   - Relays control commands (freeze/resume/terminate) to the agent process
   - Reports agent process exit status
 
 Configuration (written by cloud-init at VM creation):
   /etc/default/srw-guest          — same-cluster HTTP credentials and identity
-  /etc/default/management-daemon  — NATS_URL, JOB_ID (sourced by systemd)
+  /etc/default/management-daemon  — legacy values (NATS guest transport refused)
   /run/agent/job-config.json      — full job config (job_id, agent_config, etc.)
 
-See knowledge-base/knowledge/features/nats.md for the NATS subject design.
+The old unauthenticated guest NATS path is intentionally fail-closed.  NATS
+remains available to the separately authenticated VM lifecycle controller.
 """
 
 import asyncio
@@ -79,6 +79,10 @@ def load_config() -> dict:
             log.error("ENTITY_ID must be set in HTTP mode")
             sys.exit(1)
     elif nats_url:
+        # Keep parsing the historical image/cloud-init shape so operators get
+        # a deterministic runtime refusal instead of a misleading malformed-
+        # configuration error.  ``run`` exits before any NATS connect,
+        # publish, subscription, registration, heartbeat or control action.
         transport = "nats"
         if not job_id or not orchestrator_id:
             log.error(
@@ -639,6 +643,18 @@ class ManagementDaemon:
     async def run(self):
         """Main entry point."""
         log.info("Management daemon starting (transport=%s)", self.transport)
+
+        if self.transport == "nats":
+            # The broker has no guest identity or subject ACL boundary.  Do
+            # not expose registration, heartbeat, agent-control or process
+            # status on it.  The generation-authenticated HTTP guest API is
+            # the only supported transport until external NATS gains
+            # per-generation credentials and durable replay protection.
+            log.error(
+                "Unauthenticated VM guest NATS transport is disabled; "
+                "configure ORCHESTRATOR_URL and VM_AUTH_TOKEN"
+            )
+            return
 
         # Wait for cloud-init to write job config
         await self._wait_for_cloud_init()

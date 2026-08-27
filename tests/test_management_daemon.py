@@ -648,30 +648,28 @@ class TestNATSMode:
         kill.assert_called_once_with(321, signal.SIGSTOP)
 
     @pytest.mark.asyncio
-    async def test_nats_run_keeps_legacy_workflow(self, connected):
+    async def test_nats_run_is_contained_before_any_network_or_process_action(
+        self, connected
+    ):
         connected._wait_for_cloud_init = AsyncMock()
         connected._wait_for_tailscale = AsyncMock()
         connected.connect_nats = AsyncMock()
         connected.register = AsyncMock()
 
-        async def heartbeat_once():
-            connected.request_shutdown()
-
-        connected.heartbeat_loop = AsyncMock(side_effect=heartbeat_once)
+        connected.heartbeat_loop = AsyncMock()
         connected.agent_monitor_loop = AsyncMock()
         connected.ip_update_loop = AsyncMock()
         await connected.run()
 
-        connected._wait_for_cloud_init.assert_awaited_once()
-        connected._wait_for_tailscale.assert_awaited_once()
-        connected.connect_nats.assert_awaited_once()
-        connected.register.assert_awaited_once()
-        connected.nc.subscribe.assert_awaited_once_with(
-            "agent.vm.orch-1.job-1.control", cb=connected._on_control
-        )
-        connected.agent_monitor_loop.assert_awaited_once()
-        connected.ip_update_loop.assert_awaited_once()
-        connected.nc.drain.assert_awaited_once()
+        connected._wait_for_cloud_init.assert_not_awaited()
+        connected._wait_for_tailscale.assert_not_awaited()
+        connected.connect_nats.assert_not_awaited()
+        connected.register.assert_not_awaited()
+        connected.nc.subscribe.assert_not_awaited()
+        connected.heartbeat_loop.assert_not_awaited()
+        connected.agent_monitor_loop.assert_not_awaited()
+        connected.ip_update_loop.assert_not_awaited()
+        connected.nc.drain.assert_not_awaited()
 
 
 class TestHelpers:
@@ -1645,7 +1643,7 @@ class TestWaitForTailscale:
 
 class TestDaemonRun:
     @pytest.mark.asyncio
-    async def test_run_calls_lifecycle_methods_in_order(self, daemon):
+    async def test_run_refuses_legacy_nats_before_lifecycle_methods(self, daemon):
         mock_nc = AsyncMock(is_connected=True)
         mock_nc.subscribe = AsyncMock()
         mock_nc.drain = AsyncMock()
@@ -1677,11 +1675,11 @@ class TestDaemonRun:
 
             await asyncio.gather(daemon.run(), shutdown())
 
-        mock_cloud.assert_called_once()
-        mock_tailscale.assert_called_once()
-        mock_connect.assert_called_once()
-        mock_register.assert_called_once()
-        mock_nc.subscribe.assert_called_once()
+        mock_cloud.assert_not_called()
+        mock_tailscale.assert_not_called()
+        mock_connect.assert_not_called()
+        mock_register.assert_not_called()
+        mock_nc.subscribe.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_run_exits_early_when_shutdown_during_connect(self, daemon):
@@ -1703,7 +1701,7 @@ class TestDaemonRun:
         mock_register.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_run_drains_nats_on_shutdown(self, daemon):
+    async def test_run_never_connects_or_drains_legacy_nats(self, daemon):
         mock_nc = AsyncMock(is_connected=True)
         mock_nc.subscribe = AsyncMock()
         mock_nc.drain = AsyncMock()
@@ -1731,10 +1729,11 @@ class TestDaemonRun:
 
             await asyncio.gather(daemon.run(), shutdown())
 
-        mock_nc.drain.assert_called_once()
+        mock_connect.assert_not_called()
+        mock_nc.drain.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_run_subscribes_to_control_subject(self, daemon):
+    async def test_run_never_subscribes_to_legacy_control_subject(self, daemon):
         mock_nc = AsyncMock(is_connected=True)
         mock_nc.subscribe = AsyncMock()
         mock_nc.drain = AsyncMock()
@@ -1762,10 +1761,8 @@ class TestDaemonRun:
 
             await asyncio.gather(daemon.run(), shutdown())
 
-        mock_nc.subscribe.assert_awaited_once_with(
-            "agent.vm.test-orch-001.test-job-001.control",
-            cb=daemon._on_control,
-        )
+        mock_connect.assert_not_awaited()
+        mock_nc.subscribe.assert_not_awaited()
 
 
 class TestRequestShutdown:

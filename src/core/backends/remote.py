@@ -439,6 +439,7 @@ class RemoteBackend(WorkspaceBackend):
         workspace_generation: Optional[str] = None,
         runtime_incarnation: Optional[str] = None,
         expected_host_key_fingerprint: Optional[str] = None,
+        require_host_key_fingerprint: bool = False,
         workspace_owner_kind: Optional[str] = None,
         workspace_owner_id: Optional[str] = None,
         workspace_tier: Optional[str] = None,
@@ -516,6 +517,11 @@ class RemoteBackend(WorkspaceBackend):
         self._expected_host_key_fingerprint = _validated_expected_host_key_fingerprint(
             expected_host_key_fingerprint
         )
+        if require_host_key_fingerprint and self._expected_host_key_fingerprint is None:
+            raise WorkspaceAuthenticationError(
+                "This Kubernetes workspace requires an orchestrator-attested "
+                "SSH host key fingerprint"
+            )
         if workspace_tier is not None and workspace_tier not in {
             "sandbox",
             "vm",

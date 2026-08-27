@@ -15,20 +15,28 @@ UIDs.
   exactly `srw`. The wrapper refuses every other current context even though it
   also passes `--context=k3d-srw` on each call.
 - The final integration image must be deployed to every orchestrator and
-  stateless executor. The wrapper's first action checks symbols inside every
-  running orchestrator container. A successful rollout or tag alone is not
-  evidence.
-- Migrations `0189_stateless_input_deliveries.sql` and
-  `0190_stateless_input_delivery_validate.sql` must be successful, with all
-  constraints validated and trigger fences present. Later additive migrations
-  are allowed.
+  stateless executor. Both Deployments must have one observed generation,
+  every desired replica updated/Ready/available, no extra old or terminating
+  selected Pod, and one actual image digest per component. The wrapper checks
+  symbols inside every running container. A successful rollout or tag alone is
+  not evidence.
+- Migrations `0189_stateless_input_deliveries.sql`,
+  `0190_stateless_input_delivery_validate.sql`,
+  `0195_non_pinned_workspace_process_zero.sql`, and
+  `0196_non_pinned_workspace_lifecycle_authority.sql` must be successful, with
+  all constraints validated and trigger fences present. The migration ledger
+  must have no `success=false` row. Later additive migrations are allowed.
 - At least two stateless executor Pods must be Ready. No unrelated queued or
   leased `run_queue` work may exist during either fault injection. Run this on
   an otherwise idle disposable k3d cluster.
 - Supply the UUID of an existing approved local test user. The gate does not
   create, alter, print, or delete identity-provider state.
-- `auto_pull` must be false everywhere. The operator checks this before and
-  after the run and never writes an Officer Post.
+- `WORKSPACE_CLEANUP_RECONCILIATION_ENABLED`,
+  `WORKSPACE_REATTACH_FRESH_FALLBACK`, and
+  `OFFICER_AUTO_PULL_RELEASE_ENABLED` must all be the literal `false` in
+  `srw-config` and the running orchestrators. `auto_pull` must be false in
+  every durable Post and thread mirror. The operator checks database state
+  before and after the run and never writes an Officer Post.
 - The configured model for `session_base` must be reachable. This is an
   execution gate and deliberately spends the small bounded set of fixture
   turns.

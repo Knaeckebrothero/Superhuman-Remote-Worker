@@ -410,7 +410,7 @@ class PostgresDB:
         return self._row_to_dict(row)
 
     async def end_thread(self, thread_id: str) -> None:
-        """End a persistent thread."""
+        """Legacy non-pinned fallback; pinned End is orchestrator-owned."""
         async with self.acquire() as conn:
             await conn.execute(
                 """
@@ -419,6 +419,7 @@ class PostgresDB:
                     ended_at = CURRENT_TIMESTAMP,
                     control_admission_agent_id = NULL
                 WHERE id = $1
+                  AND execution_lane <> 'pinned'
                 """,
                 thread_id,
             )
@@ -437,6 +438,10 @@ class PostgresDB:
                     END
                 WHERE id = $1
                   AND (status <> 'ended' OR $2 = 'ended')
+                  AND NOT (
+                      execution_lane = 'pinned'
+                      AND $2 IN ('ending', 'ended', 'suspended')
+                  )
                 """,
                 thread_id,
                 status,

@@ -27,6 +27,20 @@ from .runtime_actor import (
     issue_runtime_actor_bootstrap,
     issue_runtime_actor_pod_bootstrap,
 )
+from .pinned_k8s_effect import (
+    PINNED_AUTHORITY_FINALIZER,
+    PINNED_AUTHORITY_PROTECTION_PROTOCOL,
+    discover_exact_pinned_pod_authority,
+    fence_unmodified_planned_pod_authority,
+    finalizer_release_patch,
+    legacy_pinned_namespace_candidates,
+    observe_planned_pinned_pod_authority,
+    protect_planned_pinned_pod_authority,
+    protect_legacy_pinned_agent_authority as protect_legacy_pinned_objects,
+    release_planned_pinned_pod_authority,
+    run_bounded_k8s_call,
+    run_bounded_k8s_mutation,
+)
 from .session_runtime_admission import (
     ThreadRuntimeAuthority,
     same_thread_runtime_authority,
@@ -390,6 +404,7 @@ class AgentProvisioner:
         short_id = uuid4().hex[:8]
         pod_name = f"srw-agent-{purpose[0]}-{short_id}"
         provision_attempt: str | None = None
+        intent_namespace = self._namespace
 
         # Session agents get a PVC-backed /workspace; job agents keep emptyDir.
         # The pod name is random per provision (srw-agent-s-<8hex>), so the
@@ -416,13 +431,16 @@ class AgentProvisioner:
                 attempt_id=candidate_attempt,
                 pod_name=pod_name,
                 provisioner="agent",
+                namespace=self._namespace,
+                protection_protocol=PINNED_AUTHORITY_PROTECTION_PROTOCOL,
                 pvc_name=pvc_name,
             )
             if not isinstance(intent, dict):
                 return None
             pod_name = str(intent.get("pod_name") or "")
             provision_attempt = str(intent.get("attempt_id") or "")
-            if not pod_name or not provision_attempt:
+            intent_namespace = str(intent.get("namespace") or "")
+            if not pod_name or not provision_attempt or not intent_namespace:
                 return None
             workspace_claim = intent.get("workspace_claim")
             if pvc_name:
@@ -441,6 +459,7 @@ class AgentProvisioner:
                     expected_pvc_uid=(
                         str(workspace_claim.get("pvc_uid") or "") or None
                     ),
+                    namespace=str(workspace_claim.get("namespace") or ""),
                 )
                 if (
                     not claim_uid
@@ -450,6 +469,7 @@ class AgentProvisioner:
                         claim_id=claim_id,
                         pvc_name=pvc_name,
                         pvc_uid=claim_uid,
+                        namespace=str(workspace_claim.get("namespace") or ""),
                     )
                 ):
                     logger.error(
@@ -511,6 +531,7 @@ class AgentProvisioner:
                 session_authority.generation if session_authority else None
             ),
             provision_attempt=provision_attempt,
+            namespace=intent_namespace,
         )
 
         if purpose == "session" and not await self._same_session_runtime_authority(
@@ -519,9 +540,9 @@ class AgentProvisioner:
             return None
 
         try:
-            created_pod = await asyncio.to_thread(
+            created_pod = await run_bounded_k8s_mutation(
                 self._core_api.create_namespaced_pod,
-                namespace=self._namespace,
+                namespace=intent_namespace,
                 body=manifest,
             )
             created_uid = str(
@@ -532,7 +553,7 @@ class AgentProvisioner:
                     observed = await asyncio.to_thread(
                         self._core_api.read_namespaced_pod,
                         name=pod_name,
-                        namespace=self._namespace,
+                        namespace=intent_namespace,
                     )
                     observed_labels = dict(
                         getattr(getattr(observed, "metadata", None), "labels", None)
@@ -564,7 +585,9 @@ class AgentProvisioner:
                 )
                 if created_uid:
                     await self.delete_agent_pod_exact(
-                        pod_name, expected_pod_uid=created_uid
+                        pod_name,
+                        expected_pod_uid=created_uid,
+                        namespace=intent_namespace,
                     )
                 return None
             logger.info(
@@ -582,11 +605,13 @@ class AgentProvisioner:
                     attempt_id=provision_attempt,
                     pod_name=pod_name,
                     pod_uid=created_uid,
-                    namespace=self._namespace,
+                    namespace=intent_namespace,
                 ):
                     if created_uid:
                         await self.delete_agent_pod_exact(
-                            pod_name, expected_pod_uid=created_uid
+                            pod_name,
+                            expected_pod_uid=created_uid,
+                            namespace=intent_namespace,
                         )
                     return None
                 now_iso = datetime.now(timezone.utc).isoformat()
@@ -595,7 +620,7 @@ class AgentProvisioner:
                     {
                         "status": "created",
                         "pod_name": pod_name,
-                        "namespace": self._namespace,
+                        "namespace": intent_namespace,
                         "pod_uid": created_uid or None,
                         "provision_attempt": provision_attempt,
                         "runtime_generation": session_authority.generation,
@@ -611,7 +636,9 @@ class AgentProvisioner:
                 ):
                     if created_uid:
                         await self.delete_agent_pod_exact(
-                            pod_name, expected_pod_uid=created_uid
+                            pod_name,
+                            expected_pod_uid=created_uid,
+                            namespace=intent_namespace,
                         )
                     return None
 
@@ -622,7 +649,7 @@ class AgentProvisioner:
                     incumbent = await asyncio.to_thread(
                         self._core_api.read_namespaced_pod,
                         name=pod_name,
-                        namespace=self._namespace,
+                        namespace=intent_namespace,
                     )
                 except Exception:
                     return None
@@ -649,7 +676,7 @@ class AgentProvisioner:
                             attempt_id=provision_attempt,
                             pod_name=pod_name,
                             pod_uid=incumbent_uid,
-                            namespace=self._namespace,
+                            namespace=intent_namespace,
                         )
                     ):
                         return None
@@ -668,7 +695,7 @@ class AgentProvisioner:
                     incumbent = await asyncio.to_thread(
                         self._core_api.read_namespaced_pod,
                         name=pod_name,
-                        namespace=self._namespace,
+                        namespace=intent_namespace,
                     )
                     labels = dict(
                         getattr(getattr(incumbent, "metadata", None), "labels", None)
@@ -695,7 +722,7 @@ class AgentProvisioner:
                             attempt_id=provision_attempt,
                             pod_name=pod_name,
                             pod_uid=incumbent_uid,
-                            namespace=self._namespace,
+                            namespace=intent_namespace,
                         )
                     ):
                         return pod_name
@@ -706,37 +733,20 @@ class AgentProvisioner:
                     )
             return None
 
-    async def delete_agent_pod(self, pod_name: str) -> bool:
-        """Delete a specific agent pod by name.
+    async def delete_agent_pod(
+        self, pod_name: str, *, expected_pod_uid: str | None = None
+    ) -> bool:
+        """Delete one exact agent Pod, never whichever object owns a name."""
 
-        Returns:
-            True if deleted (or already gone), False on error.
-        """
-        if not self._k8s_available:
+        expected_uid = str(expected_pod_uid or "").strip()
+        if not self._k8s_available or not expected_uid:
+            logger.warning("Refusing name-only agent Pod deletion for %s", pod_name)
             return False
-
-        # Post-mortem log preservation (knowledge-base/knowledge/features/job_log_archive.md):
-        # archive the full pod log to S3 before the pod — and the log the
-        # kubelet holds for it — disappears. This is the one choke point all
-        # deletion paths share (reap, scale-down, session end, suspension,
-        # orphan cleanup). Exception-safe by contract.
-        await self._archive_pod_logs(pod_name)
-
-        try:
-            await asyncio.to_thread(
-                self._core_api.delete_namespaced_pod,
-                name=pod_name,
-                namespace=self._namespace,
-                grace_period_seconds=STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS,
-            )
-            logger.info("Agent pod deleted: %s", pod_name)
-            return True
-        except Exception as e:
-            if hasattr(e, "status") and e.status == 404:
-                logger.debug("Agent pod already gone: %s", pod_name)
-                return True
-            logger.error("Failed to delete agent pod %s: %s", pod_name, e)
-            return False
+        return await self.delete_agent_pod_exact(
+            pod_name,
+            expected_pod_uid=expected_uid,
+            namespace=self._namespace,
+        )
 
     async def agent_pod_live(self, pod_name: str) -> Optional[bool]:
         """Return exact pod liveness for terminal claimant reconciliation.
@@ -781,6 +791,7 @@ class AgentProvisioner:
         pod_name: str,
         *,
         expected_pod_uid: str,
+        namespace: str | None = None,
     ) -> str:
         """Classify one immutable claimant Pod identity.
 
@@ -799,7 +810,7 @@ class AgentProvisioner:
             pod = await asyncio.to_thread(
                 self._core_api.read_namespaced_pod,
                 name=name,
-                namespace=self._namespace,
+                namespace=namespace or self._namespace,
             )
         except Exception as exc:
             if getattr(exc, "status", None) == 404:
@@ -835,6 +846,112 @@ class AgentProvisioner:
             return "unknown"
         return "unknown"
 
+    async def attest_pinned_job_recipient(
+        self,
+        pod_name: str,
+        *,
+        expected_pod_uid: str,
+        expected_pod_ip: str,
+    ) -> bool:
+        """Freshly attest one exact, ready job-agent Pod before mutation I/O."""
+
+        name = str(pod_name or "").strip()
+        expected_uid = str(expected_pod_uid or "").strip()
+        expected_ip = str(expected_pod_ip or "").strip()
+        if not self._k8s_available or not name or not expected_uid or not expected_ip:
+            return False
+        try:
+            pod = await run_bounded_k8s_call(
+                self._core_api.read_namespaced_pod,
+                name=name,
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            logger.debug("Pinned recipient Pod probe failed for %s: %s", name, exc)
+            return False
+
+        metadata = getattr(pod, "metadata", None)
+        status = getattr(pod, "status", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
+        if (
+            str(getattr(metadata, "name", "") or "") != name
+            or str(getattr(metadata, "uid", "") or "") != expected_uid
+            or getattr(metadata, "deletion_timestamp", None) is not None
+            or str(getattr(status, "phase", "") or "") != "Running"
+            or str(getattr(status, "pod_ip", "") or "") != expected_ip
+            or labels.get("srw/component") != "agent"
+            or labels.get("srw/managed-by") != "agent-provisioner"
+            or labels.get("srw/purpose") != "job"
+        ):
+            return False
+
+        return any(
+            str(getattr(item, "name", "") or "") == "agent"
+            and getattr(item, "ready", None) is True
+            for item in getattr(status, "container_statuses", None) or []
+        )
+
+    async def attest_pinned_session_recipient(
+        self,
+        pod_name: str,
+        *,
+        thread_id: str,
+        expected_pod_uid: str,
+        expected_pod_ip: str,
+        namespace: str | None = None,
+    ) -> bool:
+        """Freshly attest one exact, ready session Pod before mutation I/O."""
+
+        name = str(pod_name or "").strip()
+        tid = str(thread_id or "").strip()
+        expected_uid = str(expected_pod_uid or "").strip()
+        expected_ip = str(expected_pod_ip or "").strip()
+        captured_namespace = str(namespace or self._namespace).strip()
+        if not all(
+            (
+                self._k8s_available,
+                name,
+                tid,
+                expected_uid,
+                expected_ip,
+                captured_namespace,
+            )
+        ):
+            return False
+        try:
+            pod = await run_bounded_k8s_call(
+                self._core_api.read_namespaced_pod,
+                name=name,
+                namespace=captured_namespace,
+            )
+        except Exception as exc:
+            logger.debug("Pinned session recipient probe failed for %s: %s", name, exc)
+            return False
+
+        metadata = getattr(pod, "metadata", None)
+        status = getattr(pod, "status", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
+        if (
+            str(getattr(metadata, "name", "") or "") != name
+            or str(getattr(metadata, "namespace", "") or captured_namespace)
+            != captured_namespace
+            or str(getattr(metadata, "uid", "") or "") != expected_uid
+            or getattr(metadata, "deletion_timestamp", None) is not None
+            or str(getattr(status, "phase", "") or "") != "Running"
+            or str(getattr(status, "pod_ip", "") or "") != expected_ip
+            or labels.get("srw/component") != "agent"
+            or labels.get("srw/managed-by") != "agent-provisioner"
+            or labels.get("srw/purpose") != "session"
+            or labels.get("srw.io/thread-id") != tid
+        ):
+            return False
+
+        return any(
+            str(getattr(item, "name", "") or "") == "agent"
+            and getattr(item, "ready", None) is True
+            for item in getattr(status, "container_statuses", None) or []
+        )
+
     async def agent_pod_provision_intent_authority(
         self,
         pod_name: str,
@@ -842,17 +959,18 @@ class AgentProvisioner:
         expected_thread_id: str,
         expected_runtime_generation: str,
         expected_attempt_id: str,
+        namespace: str,
     ) -> dict[str, str | None]:
         """Observe one pre-effect Pod name through its immutable labels."""
 
         name = str(pod_name or "").strip()
-        if not self._k8s_available or not name:
+        if not self._k8s_available or not name or not namespace:
             return {"state": "unknown", "pod_uid": None}
         try:
             pod = await asyncio.to_thread(
                 self._core_api.read_namespaced_pod,
                 name=name,
-                namespace=self._namespace,
+                namespace=namespace,
             )
         except Exception as exc:
             if getattr(exc, "status", None) == 404:
@@ -883,6 +1001,153 @@ class AgentProvisioner:
             "pod_uid": pod_uid if exact else None,
         }
 
+    async def protect_legacy_pinned_agent_authority(
+        self, authority: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Grandfather one exact pre-0198 session Pod/PVC tuple."""
+
+        if not self._k8s_available or self._core_api is None:
+            return None
+        thread_id = str(authority.get("thread_id") or "")
+        generation = str(authority.get("runtime_generation") or "")
+        attempt_id = str(authority.get("attempt_id") or "")
+        pod_name = str(authority.get("pod_name") or "")
+        if not all((thread_id, generation, attempt_id, pod_name)):
+            return None
+        claim = authority.get("workspace_claim")
+        if claim is not None and not isinstance(claim, dict):
+            return None
+        pvc_labels = None
+        pvc_name = None
+        expected_pvc_uid = None
+        if claim is not None:
+            claim_id = str(claim.get("claim_id") or "")
+            claim_attempt = str(claim.get("create_attempt") or "")
+            pvc_name = str(claim.get("pvc_name") or "")
+            if not all((claim_id, claim_attempt, pvc_name)):
+                return None
+            expected_pvc_uid = str(claim.get("pvc_uid") or "") or None
+            pvc_labels = {
+                "srw.io/thread-id": thread_id,
+                "srw.io/runtime-generation": generation,
+                "srw.io/workspace-claim": claim_id,
+                "srw.io/provision-attempt": claim_attempt,
+                "srw.io/claim-provisioner": "agent",
+            }
+        return await protect_legacy_pinned_objects(
+            self._core_api,
+            namespaces=legacy_pinned_namespace_candidates(self._namespace),
+            pod_name=pod_name,
+            expected_pod_uid=str(authority.get("pod_uid") or "") or None,
+            pod_labels={
+                "srw/managed-by": "agent-provisioner",
+                "srw/purpose": "session",
+                "srw.io/thread-id": thread_id,
+                "srw.io/runtime-generation": generation,
+                "srw.io/provision-attempt": attempt_id,
+            },
+            pvc_name=pvc_name,
+            expected_pvc_uid=expected_pvc_uid,
+            pvc_labels=pvc_labels,
+        )
+
+    @staticmethod
+    def _warm_binding_labels(_authority: dict[str, Any]) -> dict[str, str]:
+        return {
+            "srw/managed-by": "agent-provisioner",
+            "srw/purpose": "job",
+        }
+
+    async def discover_pinned_warm_agent_authority(
+        self, authority: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Read one exact pool Pod before Postgres owns its finalizer effect."""
+
+        if not self._k8s_available or self._core_api is None:
+            return None
+        pod_name = str(authority.get("pod_name") or "")
+        pod_uid = str(authority.get("pod_uid") or "")
+        if not pod_name or not pod_uid:
+            return None
+        return await discover_exact_pinned_pod_authority(
+            self._core_api,
+            namespaces=legacy_pinned_namespace_candidates(self._namespace),
+            pod_name=pod_name,
+            expected_pod_uid=pod_uid,
+            expected_labels=self._warm_binding_labels(authority),
+        )
+
+    async def protect_planned_pinned_warm_agent_authority(
+        self, authority: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Install protection only after the exact warm plan is durable."""
+
+        if (
+            not self._k8s_available
+            or self._core_api is None
+            or str(authority.get("status") or "") != "protecting"
+            or not str(authority.get("effect_token") or "")
+        ):
+            return None
+        return await protect_planned_pinned_pod_authority(
+            self._core_api,
+            namespace=str(authority.get("namespace") or ""),
+            pod_name=str(authority.get("pod_name") or ""),
+            expected_pod_uid=str(authority.get("pod_uid") or ""),
+            expected_discovered_resource_version=str(
+                authority.get("discovered_resource_version") or ""
+            ),
+            protection_id=str(authority.get("protection_id") or ""),
+            effect_token=str(authority.get("effect_token") or ""),
+            expected_labels=self._warm_binding_labels(authority),
+            allow_current_resource_version=(
+                str(authority.get("source") or "") == "legacy_binding"
+            ),
+        )
+
+    async def fence_expired_pinned_warm_agent_authority(
+        self, authority: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Fence one expired attach effect before returning its Pod to pool."""
+
+        if not self._k8s_available or self._core_api is None:
+            return {"state": "unknown"}
+        return await fence_unmodified_planned_pod_authority(
+            self._core_api,
+            namespace=str(authority.get("namespace") or ""),
+            pod_name=str(authority.get("pod_name") or ""),
+            expected_pod_uid=str(authority.get("pod_uid") or ""),
+            protection_id=str(authority.get("protection_id") or ""),
+            effect_token=str(authority.get("effect_token") or ""),
+            expected_labels=self._warm_binding_labels(authority),
+        )
+
+    async def observe_planned_pinned_warm_agent_authority(
+        self, authority: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self._k8s_available or self._core_api is None:
+            return {"state": "unknown", "finalizer_present": None}
+        return await observe_planned_pinned_pod_authority(
+            self._core_api,
+            namespace=str(authority.get("namespace") or ""),
+            pod_name=str(authority.get("pod_name") or ""),
+            expected_pod_uid=str(authority.get("pod_uid") or ""),
+            expected_labels=self._warm_binding_labels(authority),
+        )
+
+    async def release_planned_pinned_warm_agent_authority(
+        self, authority: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if not self._k8s_available or self._core_api is None:
+            return None
+        return await release_planned_pinned_pod_authority(
+            self._core_api,
+            namespace=str(authority.get("namespace") or ""),
+            pod_name=str(authority.get("pod_name") or ""),
+            expected_pod_uid=str(authority.get("pod_uid") or ""),
+            expected_labels=self._warm_binding_labels(authority),
+        )
+
     async def fence_agent_pod_provision_intent(
         self,
         pod_name: str,
@@ -890,6 +1155,7 @@ class AgentProvisioner:
         expected_thread_id: str,
         expected_runtime_generation: str,
         expected_attempt_id: str,
+        namespace: str,
     ) -> dict[str, str | None]:
         """Causally close an ambiguous create with the same Kubernetes name.
 
@@ -902,7 +1168,7 @@ class AgentProvisioner:
         """
 
         name = str(pod_name or "").strip()
-        if not self._k8s_available or not name:
+        if not self._k8s_available or not name or not namespace:
             return {"state": "unknown", "pod_uid": None}
         labels = {
             "app": "srw-agent",
@@ -918,8 +1184,9 @@ class AgentProvisioner:
             "kind": "Pod",
             "metadata": {
                 "name": name,
-                "namespace": self._namespace,
+                "namespace": namespace,
                 "labels": labels,
+                "finalizers": [PINNED_AUTHORITY_FINALIZER],
             },
             "spec": {
                 "automountServiceAccountToken": False,
@@ -939,9 +1206,9 @@ class AgentProvisioner:
         }
         incumbent = None
         try:
-            incumbent = await asyncio.to_thread(
+            incumbent = await run_bounded_k8s_mutation(
                 self._core_api.create_namespaced_pod,
-                namespace=self._namespace,
+                namespace=namespace,
                 body=manifest,
             )
         except Exception as exc:
@@ -952,7 +1219,7 @@ class AgentProvisioner:
                     incumbent = await asyncio.to_thread(
                         self._core_api.read_namespaced_pod,
                         name=name,
-                        namespace=self._namespace,
+                        namespace=namespace,
                     )
                 except Exception:
                     return {"state": "unknown", "pod_uid": None}
@@ -961,7 +1228,7 @@ class AgentProvisioner:
                     incumbent = await asyncio.to_thread(
                         self._core_api.read_namespaced_pod,
                         name=name,
-                        namespace=self._namespace,
+                        namespace=namespace,
                     )
                 except Exception:
                     return {"state": "unknown", "pod_uid": None}
@@ -998,18 +1265,19 @@ class AgentProvisioner:
         expected_runtime_generation: str,
         expected_claim_id: str,
         expected_create_attempt: str,
+        namespace: str,
         expected_pvc_uid: str | None = None,
     ) -> dict[str, str | None]:
         """Classify one durable agent-workspace PVC by immutable labels/UID."""
 
         name = str(pvc_name or "").strip()
-        if not self._k8s_available or not name:
+        if not self._k8s_available or not name or not namespace:
             return {"state": "unknown", "pvc_uid": None}
         try:
             claim = await asyncio.to_thread(
                 self._core_api.read_namespaced_persistent_volume_claim,
                 name=name,
-                namespace=self._namespace,
+                namespace=namespace,
             )
         except Exception as exc:
             if getattr(exc, "status", None) == 404:
@@ -1049,6 +1317,7 @@ class AgentProvisioner:
         expected_runtime_generation: str,
         expected_claim_id: str,
         expected_create_attempt: str,
+        namespace: str,
         expected_pvc_uid: str | None = None,
     ) -> str | None:
         """Create/re-attest the exact retained PVC during a soft retirement."""
@@ -1060,6 +1329,7 @@ class AgentProvisioner:
             claim_id=expected_claim_id,
             create_attempt=expected_create_attempt,
             expected_pvc_uid=expected_pvc_uid,
+            namespace=namespace,
         )
 
     async def fence_agent_workspace_claim(
@@ -1070,11 +1340,12 @@ class AgentProvisioner:
         expected_runtime_generation: str,
         expected_claim_id: str,
         expected_create_attempt: str,
+        namespace: str,
     ) -> dict[str, str | None]:
         """Acquire a PVC name with an inert, non-provisioning tombstone."""
 
         name = str(pvc_name or "").strip()
-        if not self._k8s_available or not name:
+        if not self._k8s_available or not name or not namespace:
             return {"state": "unknown", "pvc_uid": None}
         labels = {
             "app": "srw-agent",
@@ -1093,8 +1364,9 @@ class AgentProvisioner:
             "kind": "PersistentVolumeClaim",
             "metadata": {
                 "name": name,
-                "namespace": self._namespace,
+                "namespace": namespace,
                 "labels": labels,
+                "finalizers": [PINNED_AUTHORITY_FINALIZER],
             },
             "spec": {
                 "accessModes": ["ReadWriteOnce"],
@@ -1106,9 +1378,9 @@ class AgentProvisioner:
         }
         incumbent = None
         try:
-            incumbent = await asyncio.to_thread(
+            incumbent = await run_bounded_k8s_mutation(
                 self._core_api.create_namespaced_persistent_volume_claim,
-                namespace=self._namespace,
+                namespace=namespace,
                 body=manifest,
             )
         except Exception:
@@ -1116,7 +1388,7 @@ class AgentProvisioner:
                 incumbent = await asyncio.to_thread(
                     self._core_api.read_namespaced_persistent_volume_claim,
                     name=name,
-                    namespace=self._namespace,
+                    namespace=namespace,
                 )
             except Exception:
                 return {"state": "unknown", "pvc_uid": None}
@@ -1150,19 +1422,61 @@ class AgentProvisioner:
         pvc_name: str,
         *,
         expected_pvc_uid: str,
+        namespace: str,
     ) -> bool:
         """Delete only one immutable PVC UID; never a same-name successor."""
 
         name = str(pvc_name or "").strip()
         uid = str(expected_pvc_uid or "").strip()
-        if not self._k8s_available or not name or not uid:
+        if not self._k8s_available or not name or not uid or not namespace:
             return False
         try:
-            await asyncio.to_thread(
+            await run_bounded_k8s_mutation(
                 self._core_api.delete_namespaced_persistent_volume_claim,
                 name=name,
-                namespace=self._namespace,
+                namespace=namespace,
                 body={"preconditions": {"uid": uid}},
+            )
+            return True
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404
+
+    async def release_agent_workspace_claim_finalizer_exact(
+        self,
+        pvc_name: str,
+        *,
+        expected_pvc_uid: str,
+        namespace: str,
+    ) -> bool:
+        """Release only SRW's finalizer from one exact PVC UID."""
+
+        try:
+            claim = await run_bounded_k8s_call(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=namespace,
+            )
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404
+        metadata = getattr(claim, "metadata", None)
+        uid = str(getattr(metadata, "uid", "") or "")
+        resource_version = str(getattr(metadata, "resource_version", "") or "")
+        finalizers = [
+            str(value) for value in getattr(metadata, "finalizers", None) or []
+        ]
+        if uid != str(expected_pvc_uid) or not resource_version:
+            return False
+        patch = finalizer_release_patch(
+            uid=uid, resource_version=resource_version, finalizers=finalizers
+        )
+        if patch is None:
+            return True
+        try:
+            await run_bounded_k8s_mutation(
+                self._core_api.patch_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=namespace,
+                body=patch,
             )
             return True
         except Exception as exc:
@@ -1173,6 +1487,7 @@ class AgentProvisioner:
         pod_name: str,
         *,
         expected_pod_uid: str,
+        namespace: str | None = None,
     ) -> bool:
         """Request deletion of only the exact credential-bearing claimant."""
 
@@ -1180,11 +1495,12 @@ class AgentProvisioner:
         expected_uid = str(expected_pod_uid or "").strip()
         if not self._k8s_available or not name or not expected_uid:
             return False
+        captured_namespace = namespace or self._namespace
         try:
-            await asyncio.to_thread(
+            await run_bounded_k8s_mutation(
                 self._core_api.delete_namespaced_pod,
                 name=name,
-                namespace=self._namespace,
+                namespace=captured_namespace,
                 grace_period_seconds=STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS,
                 body={"preconditions": {"uid": expected_uid}},
             )
@@ -1202,90 +1518,67 @@ class AgentProvisioner:
             logger.warning("Exact claimant pod delete failed for %s: %s", name, exc)
             return False
 
-    async def _archive_pod_logs(self, pod_name: str) -> None:
-        """Archive the agent container's full log to S3 before pod deletion.
+    async def release_agent_pod_finalizer_exact(
+        self,
+        pod_name: str,
+        *,
+        expected_pod_uid: str,
+        namespace: str,
+        terminal_required: bool = True,
+    ) -> bool:
+        """Release only SRW's finalizer from one exact Pod UID."""
 
-        Reads via the k8s API (works on crashed/OOM-killed containers — the
-        kubelet keeps the log until the pod *object* is deleted, and we are
-        the deletion point), uploads to the snapshot bucket, and stamps the
-        object keys onto the jobs/threads the pod served so the read path
-        never has to resolve pod names after the rows' agent FK nulls out.
-
-        Always exception-safe: archiving must never block pod deletion.
-        """
         try:
-            from services.snapshot_service import snapshot_service
+            pod = await run_bounded_k8s_call(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=namespace,
+            )
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404
+        metadata = getattr(pod, "metadata", None)
+        uid = str(getattr(metadata, "uid", "") or "")
+        resource_version = str(getattr(metadata, "resource_version", "") or "")
+        finalizers = [
+            str(value) for value in getattr(metadata, "finalizers", None) or []
+        ]
+        if uid != str(expected_pod_uid) or not resource_version:
+            return False
+        if terminal_required:
+            statuses = (
+                getattr(getattr(pod, "status", None), "container_statuses", None) or []
+            )
+            if not statuses or not all(
+                getattr(getattr(status, "state", None), "terminated", None) is not None
+                for status in statuses
+            ):
+                return False
+        patch = finalizer_release_patch(
+            uid=uid, resource_version=resource_version, finalizers=finalizers
+        )
+        if patch is None:
+            return True
+        try:
+            await run_bounded_k8s_mutation(
+                self._core_api.patch_namespaced_pod,
+                name=pod_name,
+                namespace=namespace,
+                body=patch,
+            )
+            return True
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404
 
-            if not snapshot_service.is_available:
-                return
+    async def _archive_pod_logs(self, pod_name: str) -> None:
+        """Refuse name-addressed log reads during an exact-UID teardown.
 
-            try:
-                pod = await asyncio.to_thread(
-                    self._core_api.read_namespaced_pod,
-                    name=pod_name,
-                    namespace=self._namespace,
-                )
-            except Exception as e:
-                if getattr(e, "status", None) == 404:
-                    return
-                raise
+        Kubernetes log subresources have no UID precondition.  A GET followed
+        by a log request can therefore cross a same-name Pod replacement and
+        expose the successor's output.  Exact teardown intentionally gives up
+        this best-effort archive rather than reading through a mutable name.
+        """
 
-            # 50 MB cap per incarnation — generous; the kubelet rotates at
-            # ~10Mi/file anyway, so anything larger never survives node-side.
-            limit_bytes = 50 * 1024 * 1024
-            logs: dict[str, str] = {}
-            try:
-                current = await asyncio.to_thread(
-                    self._core_api.read_namespaced_pod_log,
-                    name=pod_name,
-                    namespace=self._namespace,
-                    container="agent",
-                    timestamps=True,
-                    limit_bytes=limit_bytes,
-                )
-                if current:
-                    logs["current"] = current
-            except Exception as e:
-                logger.debug("Log archive: no current log for %s: %s", pod_name, e)
-            # The pre-restart incarnation holds the crash that *caused* the
-            # restart (OOMKilled traceback etc.). Most pods have none — the
-            # API errors when there is no previous container; best-effort.
-            try:
-                previous = await asyncio.to_thread(
-                    self._core_api.read_namespaced_pod_log,
-                    name=pod_name,
-                    namespace=self._namespace,
-                    container="agent",
-                    timestamps=True,
-                    previous=True,
-                    limit_bytes=limit_bytes,
-                )
-                if previous:
-                    logs["previous"] = previous
-            except Exception:
-                pass
-
-            if not logs:
-                return
-
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            keys: list[str] = []
-            for kind, text in logs.items():
-                suffix = ".previous.log" if kind == "previous" else ".log"
-                key = f"agent_logs/{pod_name}/{ts}{suffix}"
-                if await snapshot_service.put_blob(
-                    key,
-                    text.encode("utf-8", "replace"),
-                    content_type="text/plain; charset=utf-8",
-                ):
-                    keys.append(key)
-            if not keys:
-                return
-
-            await self._stamp_log_archive_keys(pod, keys)
-            logger.info("Archived agent pod logs: pod=%s keys=%s", pod_name, keys)
-        except Exception:
-            logger.exception("Log archive failed for pod %s (non-fatal)", pod_name)
+        del pod_name
 
     async def _stamp_log_archive_keys(self, pod, keys: list) -> None:
         """Append archive keys to the jobs/threads this pod served."""
@@ -1332,42 +1625,22 @@ class AgentProvisioner:
                 keys_json,
             )
 
-    async def delete_agent_pod_by_thread(self, thread_id: str) -> bool:
-        """Delete agent pod(s) matching a thread_id label.
+    async def delete_agent_pod_by_thread(
+        self,
+        thread_id: str,
+        *,
+        expected_pod_name: str | None = None,
+        expected_pod_uid: str | None = None,
+    ) -> bool:
+        """Compatibility wrapper requiring one captured immutable Pod identity."""
 
-        Returns:
-            True if at least one pod was deleted or none existed.
-        """
-        if not self._k8s_available:
+        del thread_id
+        if not expected_pod_name or not expected_pod_uid:
+            logger.warning("Refusing label-only agent Pod deletion")
             return False
-
-        try:
-            pods = await asyncio.to_thread(
-                self._core_api.list_namespaced_pod,
-                namespace=self._namespace,
-                label_selector=f"srw/thread-id={thread_id[:12]}",
-            )
-            if not pods.items:
-                logger.debug("No agent pods found for thread %s", thread_id)
-                return True
-
-            for pod in pods.items:
-                await self.delete_agent_pod(pod.metadata.name)
-            await self._set_thread_context(
-                thread_id,
-                {
-                    "status": "deleted",
-                    "deleted_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-            return True
-        except Exception as e:
-            logger.error(
-                "Failed to find/delete agent pods for thread %s: %s",
-                thread_id,
-                e,
-            )
-            return False
+        return await self.delete_agent_pod(
+            expected_pod_name, expected_pod_uid=expected_pod_uid
+        )
 
     async def get_pod_status(self, thread_id: str) -> Optional[dict]:
         """Query pod status by thread_id label (for session pods).
@@ -1623,7 +1896,8 @@ class AgentProvisioner:
             # persistent_session_permission_check_race incident — see
             # knowledge-base/knowledge/issues/persistent_session_permission_check_race.md.
             await self._capture_agent_logs_before_reap(pod, category)
-            if await self.delete_agent_pod(pod.metadata.name):
+            pod_uid = str(getattr(pod.metadata, "uid", "") or "")
+            if await self.delete_agent_pod(pod.metadata.name, expected_pod_uid=pod_uid):
                 stats[category] += 1
 
         if sum(stats.values()) > 0:
@@ -1859,7 +2133,7 @@ class AgentProvisioner:
             async with self._db.acquire() as conn:
                 idle_rows = await conn.fetch(
                     """
-                    SELECT id, hostname FROM agents
+                    SELECT id, hostname, pod_uid FROM agents
                     WHERE status = 'ready'
                       AND current_job_id IS NULL
                       AND thread_id IS NULL
@@ -1889,7 +2163,8 @@ class AgentProvisioner:
         for row in idle_rows[:to_terminate]:
             hostname = row["hostname"]
             agent_id = str(row["id"])
-            if await self.delete_agent_pod(hostname):
+            pod_uid = str(row.get("pod_uid") or "")
+            if await self.delete_agent_pod(hostname, expected_pod_uid=pod_uid):
                 # Mark agent offline so it doesn't get re-counted as idle
                 try:
                     async with self._db.acquire() as conn:
@@ -1937,7 +2212,7 @@ class AgentProvisioner:
             async with self._db.acquire() as conn:
                 idle_rows = await conn.fetch(
                     """
-                    SELECT id, hostname FROM agents
+                    SELECT id, hostname, pod_uid FROM agents
                     WHERE status = 'ready'
                       AND current_job_id IS NULL
                       AND thread_id IS NULL
@@ -1961,7 +2236,19 @@ class AgentProvisioner:
                     continue
                 if pod.metadata.name in idle_hostnames:
                     agent_id = str(idle_hostnames[pod.metadata.name]["id"])
-                    if await self.delete_agent_pod(pod.metadata.name):
+                    row_uid = str(
+                        idle_hostnames[pod.metadata.name].get("pod_uid") or ""
+                    )
+                    pod_uid = str(getattr(pod.metadata, "uid", "") or "")
+                    if row_uid != pod_uid:
+                        logger.info(
+                            "Eviction skipped for replaced agent Pod %s",
+                            pod.metadata.name,
+                        )
+                        continue
+                    if await self.delete_agent_pod(
+                        pod.metadata.name, expected_pod_uid=pod_uid
+                    ):
                         # Mark evicted agent offline
                         try:
                             async with self._db.acquire() as conn:
@@ -2004,6 +2291,7 @@ class AgentProvisioner:
         runtime_actor_pod_bootstrap: Optional[str] = None,
         session_runtime_generation: Optional[str] = None,
         provision_attempt: Optional[str] = None,
+        namespace: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for an agent.
 
@@ -2350,14 +2638,18 @@ class AgentProvisioner:
                 {"name": "tailscale-state", "emptyDir": {"sizeLimit": "16Mi"}}
             )
 
+        pod_metadata = {
+            "name": pod_name,
+            "namespace": namespace or self._namespace,
+            "labels": labels,
+        }
+        if provision_attempt:
+            pod_metadata["finalizers"] = [PINNED_AUTHORITY_FINALIZER]
+
         return {
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {
-                "name": pod_name,
-                "namespace": self._namespace,
-                "labels": labels,
-            },
+            "metadata": pod_metadata,
             "spec": {
                 "restartPolicy": "Never",
                 "terminationGracePeriodSeconds": 180,
@@ -2475,11 +2767,19 @@ class AgentProvisioner:
         claim_id: str,
         create_attempt: str,
         expected_pvc_uid: str | None,
+        namespace: str,
     ) -> str | None:
         """Create/observe only the exact durable PVC claim and return its UID."""
 
         if not self._k8s_available or not all(
-            (pvc_name, thread_id, runtime_generation, claim_id, create_attempt)
+            (
+                pvc_name,
+                thread_id,
+                runtime_generation,
+                claim_id,
+                create_attempt,
+                namespace,
+            )
         ):
             return None
         labels = {
@@ -2498,8 +2798,9 @@ class AgentProvisioner:
             "kind": "PersistentVolumeClaim",
             "metadata": {
                 "name": pvc_name,
-                "namespace": self._namespace,
+                "namespace": namespace,
                 "labels": labels,
+                "finalizers": [PINNED_AUTHORITY_FINALIZER],
             },
             "spec": {
                 "accessModes": ["ReadWriteOnce"],
@@ -2513,7 +2814,7 @@ class AgentProvisioner:
                 claim = await asyncio.to_thread(
                     self._core_api.read_namespaced_persistent_volume_claim,
                     name=pvc_name,
-                    namespace=self._namespace,
+                    namespace=namespace,
                 )
             except Exception:
                 return None
@@ -2537,9 +2838,9 @@ class AgentProvisioner:
         if expected_pvc_uid:
             return await _read_exact()
         try:
-            created = await asyncio.to_thread(
+            created = await run_bounded_k8s_mutation(
                 self._core_api.create_namespaced_persistent_volume_claim,
-                namespace=self._namespace,
+                namespace=namespace,
                 body=manifest,
             )
             created_uid = str(

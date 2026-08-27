@@ -70,6 +70,7 @@ def _connection_binding(
         agent_id=agent_id,
         runtime_attach_token=attach_token,
         agent_hostname=hostname,
+        pod_namespace="srw",
         pod_uid=pod_uid,
         pod_ip=pod_ip,
         pod_port=pod_port,
@@ -610,6 +611,7 @@ async def test_do_prepare_never_publishes_ready_for_a_changed_binding(
         fake_main.session_router.ensure_route.assert_awaited_once()
         fake_main.session_router.teardown_route.assert_awaited_once_with(
             CONNECTION_THREAD_ID,
+            expected_namespace="srw",
             expected_runtime_generation=CONNECTION_GENERATION,
             expected_owner_uid=CONNECTION_POD_UID,
         )
@@ -684,6 +686,7 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
     ]
     fake_main.session_router.teardown_route.assert_awaited_once_with(
         CONNECTION_THREAD_ID,
+        expected_namespace="srw",
         expected_runtime_generation=CONNECTION_GENERATION,
         expected_owner_uid=CONNECTION_POD_UID,
     )
@@ -1240,6 +1243,7 @@ def test_connection_refuses_any_changed_physical_binding_after_await(
         fake_main.session_router.ensure_route.assert_awaited_once()
         fake_main.session_router.teardown_route.assert_awaited_once_with(
             CONNECTION_THREAD_ID,
+            expected_namespace="srw",
             expected_runtime_generation=CONNECTION_GENERATION,
             expected_owner_uid=CONNECTION_POD_UID,
         )
@@ -1308,6 +1312,7 @@ def test_connection_cleans_partial_route_on_every_exception(
         fake_main.session_tokens.mint.assert_not_called()
     fake_main.session_router.teardown_route.assert_awaited_once_with(
         CONNECTION_THREAD_ID,
+        expected_namespace="srw",
         expected_runtime_generation=CONNECTION_GENERATION,
         expected_owner_uid=CONNECTION_POD_UID,
     )
@@ -1415,6 +1420,7 @@ def test_connection_regates_agent_status_after_readiness(
         fake_main.session_router.ensure_route.assert_awaited_once()
         fake_main.session_router.teardown_route.assert_awaited_once_with(
             CONNECTION_THREAD_ID,
+            expected_namespace="srw",
             expected_runtime_generation=CONNECTION_GENERATION,
             expected_owner_uid=CONNECTION_POD_UID,
         )

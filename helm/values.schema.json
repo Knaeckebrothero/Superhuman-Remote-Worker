@@ -209,6 +209,23 @@
         }
       }
     },
+    "agent": {
+      "type": "object",
+      "properties": {
+        "pinnedLegacyNamespaces": {
+          "type": "array",
+          "maxItems": 15,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63,
+            "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
     "provenance": {
       "type": "object",
       "properties": {
@@ -1169,6 +1186,33 @@
     },
     "orchestratorId": {
       "type": "string"
+    },
+    "orchestrator": {
+      "type": "object",
+      "properties": {
+        "workspaceCleanupReconciliationEnabled": {
+          "type": "boolean"
+        },
+        "workspaceLifecycleProtocolCutoverEnabled": {
+          "type": "boolean"
+        },
+        "workspaceLifecycleServiceAccountGeneration": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,14}[a-z0-9])?$"
+        },
+        "vmRemoteOperationProtocol": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
     },
     "databases": {
       "type": "object",

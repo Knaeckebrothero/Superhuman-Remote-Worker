@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 from uuid import UUID
@@ -10,6 +11,7 @@ from uuid import UUID
 
 PINNED_SESSION_READY_IDENTITY_CONTRACT = 1
 _DOMAIN = b"srw:pinned-session-ready:v1\0"
+_KUBERNETES_NAMESPACE = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 
 
 def _canonical_uuid(value: Any) -> str:
@@ -27,6 +29,13 @@ def _required_text(value: Any, *, field: str) -> str:
     return value
 
 
+def _required_kubernetes_namespace(value: Any) -> str:
+    namespace = _required_text(value, field="pod_namespace")
+    if _KUBERNETES_NAMESPACE.fullmatch(namespace) is None:
+        raise ValueError("pod_namespace must be a valid Kubernetes namespace")
+    return namespace
+
+
 @dataclass(frozen=True, slots=True)
 class PinnedSessionBinding:
     """One immutable reciprocal DB/routing snapshot for a pinned runtime."""
@@ -36,6 +45,7 @@ class PinnedSessionBinding:
     agent_id: str
     runtime_attach_token: str = field(repr=False)
     agent_hostname: str
+    pod_namespace: str
     pod_uid: str
     pod_ip: str
     pod_port: int
@@ -53,6 +63,11 @@ class PinnedSessionBinding:
             self,
             "runtime_attach_token",
             _canonical_uuid(self.runtime_attach_token),
+        )
+        object.__setattr__(
+            self,
+            "pod_namespace",
+            _required_kubernetes_namespace(self.pod_namespace),
         )
         for attribute in ("agent_hostname", "pod_uid", "pod_ip", "agent_status"):
             object.__setattr__(
@@ -76,6 +91,7 @@ class PinnedSessionBinding:
             agent_id=row.get("agent_id"),
             runtime_attach_token=row.get("runtime_attach_token"),
             agent_hostname=row.get("agent_hostname"),
+            pod_namespace=row.get("pod_namespace"),
             pod_uid=row.get("pod_uid"),
             pod_ip=row.get("pod_ip"),
             pod_port=8001 if port is None else port,
@@ -96,7 +112,7 @@ class PinnedSessionBinding:
         return fingerprint
 
     @property
-    def target_key(self) -> tuple[str, str, str, str, str, str, str, int]:
+    def target_key(self) -> tuple[str, str, str, str, str, str, str, str, int]:
         """All immutable DB/routing coordinates compared after every await."""
 
         return (
@@ -105,6 +121,7 @@ class PinnedSessionBinding:
             self.agent_id,
             self.runtime_attach_token,
             self.agent_hostname,
+            self.pod_namespace,
             self.pod_uid,
             self.pod_ip,
             self.pod_port,

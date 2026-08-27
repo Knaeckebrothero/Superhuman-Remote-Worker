@@ -34,7 +34,11 @@ from .models import (
     JobResumeRequest,
     JobStartRequest,
     JobStartResponse,
+    PinnedJobRecipient,
+    PinnedSessionRecipient,
     ReadyResponse,
+    pinned_job_recipient_matches,
+    pinned_session_recipient_matches,
 )
 from ._session_auth import validate_session_token as _validate_session_token
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
@@ -89,6 +93,72 @@ _current_job_task: Optional[asyncio.Task] = None
 _stop_requested: asyncio.Event = asyncio.Event()
 _stop_reason: Optional[str] = None
 _stop_completed: asyncio.Event = asyncio.Event()
+
+_PINNED_RECIPIENT_MISMATCH = {"code": "pinned_recipient_mismatch"}
+
+
+def _require_pinned_job_recipient(
+    recipient: Optional[PinnedJobRecipient],
+    *,
+    job_id: Optional[str],
+) -> None:
+    """Fail closed unless this exact registered process owns the mutation."""
+
+    client = _orchestrator_client
+    if not pinned_job_recipient_matches(
+        recipient,
+        agent_id=getattr(client, "agent_id", None),
+        pod_uid=os.environ.get("POD_UID"),
+        process_generation=getattr(client, "dispatch_process_generation", None),
+        job_id=job_id,
+    ):
+        raise HTTPException(status_code=409, detail=_PINNED_RECIPIENT_MISMATCH)
+
+
+def _pinned_session_recipient_capable() -> bool:
+    return bool(
+        getattr(_orchestrator_client, "agent_id", None)
+        and str(
+            getattr(_orchestrator_client, "dispatch_process_generation", None) or ""
+        ).strip()
+    )
+
+
+def _pinned_session_recipient_refusal(
+    request: Any,
+    *,
+    expected_thread_id: str,
+) -> JSONResponse | None:
+    recipient = request.get("_recipient") if isinstance(request, dict) else None
+    actual_pod_uid = str(os.environ.get("POD_UID") or "").strip() or None
+    exact_contract = bool(
+        isinstance(request, dict)
+        and type(request.get("pinned_runtime_generation_contract")) is int
+        and request["pinned_runtime_generation_contract"] == 1
+    )
+    if recipient is None and not (
+        actual_pod_uid or (exact_contract and _pinned_session_recipient_capable())
+    ):
+        return None
+    try:
+        parsed = PinnedSessionRecipient.model_validate(recipient)
+    except (TypeError, ValueError):
+        parsed = None
+    if not pinned_session_recipient_matches(
+        parsed,
+        thread_id=expected_thread_id,
+        agent_id=getattr(_orchestrator_client, "agent_id", None),
+        pod_uid=actual_pod_uid,
+        process_generation=getattr(
+            _orchestrator_client, "dispatch_process_generation", None
+        ),
+    ):
+        return JSONResponse(
+            {"error": "recipient_authority_mismatch", "retryable": True},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+    return None
 
 
 def _request_stop(reason: str) -> None:
@@ -1142,28 +1212,37 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 runtime_attach_token=pa._session_runtime_attach_token,
                 pod_uid=os.environ.get("POD_UID"),
             )
+            capabilities: dict[str, bool | int] = {
+                "durable_input_delivery": True,
+                "pinned_session_identity_contract": (
+                    PINNED_SESSION_READY_IDENTITY_CONTRACT
+                ),
+                # Exact integer protocol version: the orchestrator rejects
+                # bool/float/string lookalikes from mixed-version agents.
+                "protected_cloud_contract": 1,
+                "protected_cloud_ready": protected_ready,
+            }
+            if _pinned_session_recipient_capable():
+                capabilities["pinned_session_recipient_binding"] = True
             return ReadyResponse(
                 ready=session_ready,
                 message="Session ready" if session_ready else "Session initializing",
                 connections=status["connections"],
                 session_identity_fingerprint=session_identity_fingerprint,
-                capabilities={
-                    "durable_input_delivery": True,
-                    "pinned_session_identity_contract": (
-                        PINNED_SESSION_READY_IDENTITY_CONTRACT
-                    ),
-                    # Exact integer protocol version: the orchestrator rejects
-                    # bool/float/string lookalikes from mixed-version agents.
-                    "protected_cloud_contract": 1,
-                    "protected_cloud_ready": protected_ready,
-                },
+                capabilities=capabilities,
             )
 
+        capabilities = {
+            "resolved_config_resume": True,
+            "pinned_recipient_binding": True,
+        }
+        if _pinned_session_recipient_capable():
+            capabilities["pinned_session_recipient_binding"] = True
         return ReadyResponse(
             ready=base_ready,
             message="Ready to accept work" if base_ready else "Not ready",
             connections=status["connections"],
-            capabilities={"resolved_config_resume": True},
+            capabilities=capabilities,
         )
 
     @app.get("/status", tags=["Health"])
@@ -1194,8 +1273,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         except ImportError:
             raise HTTPException(501, "psutil not installed")
 
-    @app.get("/system/shell-state", tags=["Monitoring"])
-    async def shell_state() -> Dict[str, Any]:
+    @app.post("/system/shell-state", tags=["Monitoring"])
+    async def shell_state(recipient: PinnedJobRecipient) -> Dict[str, Any]:
+        _require_pinned_job_recipient(recipient, job_id=_current_job_id)
+
         if _agent is None:
             return {"tabs": [], "message": "Agent not initialized"}
         shell_manager = getattr(_agent, "_shell_manager", None)
@@ -1251,10 +1332,19 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
     async def start_job(request: JobStartRequest) -> JobStartResponse:
         global _pod_state, _current_job_id, _current_job_task
 
+        _require_pinned_job_recipient(request.recipient, job_id=request.job_id)
+
         if _agent is None:
             raise HTTPException(503, "Agent not initialized")
         if _shutdown_requested:
             raise HTTPException(503, "Agent is shutting down")
+
+        if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
+            return JobStartResponse(
+                job_id=request.job_id,
+                status="accepted",
+                message="Job was already accepted by this runtime",
+            )
 
         try:
             validate_worker_workspace_projection(
@@ -1278,6 +1368,17 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         start_context = dict(request.context or {})
         start_context["workspace_runtime"] = request.workspace_runtime
+        for field in (
+            "workspace_provisioner",
+            "workspace_generation",
+            "workspace_runtime_incarnation",
+            "workspace_ssh_host_key_fingerprint",
+            "workspace_owner_kind",
+            "workspace_owner_id",
+        ):
+            value = getattr(request, field)
+            if value:
+                start_context[field] = value
         _current_job_task = asyncio.create_task(
             _process_orchestrator_job(
                 job_id=request.job_id,
@@ -1310,11 +1411,18 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         )
 
     @app.post("/job/cancel", tags=["Worker"])
-    async def cancel_job(request: JobCancelByOrchestratorRequest) -> Dict[str, Any]:
+    async def cancel_job(
+        request: Optional[JobCancelByOrchestratorRequest] = None,
+    ) -> Dict[str, Any]:
         global _current_job_id, _current_job_task
 
         if _pod_state != PodState.WORKING or _current_job_id is None:
             raise HTTPException(404, "No job currently running")
+
+        _require_pinned_job_recipient(
+            request.recipient if request is not None else None,
+            job_id=_current_job_id,
+        )
 
         job_id = _current_job_id
         _request_stop("cancel")
@@ -1325,7 +1433,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             return {
                 "job_id": job_id,
                 "status": "cancelled",
-                "reason": request.reason or "Cancelled by orchestrator",
+                "reason": (request.reason if request is not None else None)
+                or "Cancelled by orchestrator",
                 "graceful": True,
             }
         except asyncio.TimeoutError:
@@ -1343,14 +1452,24 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             return {
                 "job_id": job_id,
                 "status": "cancelled",
-                "reason": f"{request.reason or 'Cancelled'} (hard-killed)",
+                "reason": (
+                    f"{(request.reason if request is not None else None) or 'Cancelled'} "
+                    "(hard-killed)"
+                ),
                 "graceful": False,
             }
 
     @app.post("/job/pause", tags=["Worker"])
-    async def pause_job() -> Dict[str, Any]:
+    async def pause_job(
+        request: Optional[JobCancelByOrchestratorRequest] = None,
+    ) -> Dict[str, Any]:
         if _pod_state != PodState.WORKING or _current_job_id is None:
             raise HTTPException(404, "No job currently running")
+
+        _require_pinned_job_recipient(
+            request.recipient if request is not None else None,
+            job_id=_current_job_id,
+        )
 
         job_id = _current_job_id
         _request_stop("pause")
@@ -1374,10 +1493,19 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
     async def resume_job(request: JobResumeRequest) -> JobStartResponse:
         global _pod_state, _current_job_id, _current_job_task
 
+        _require_pinned_job_recipient(request.recipient, job_id=request.job_id)
+
         if _agent is None:
             raise HTTPException(503, "Agent not initialized")
         if _shutdown_requested:
             raise HTTPException(503, "Agent is shutting down")
+
+        if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
+            return JobStartResponse(
+                job_id=request.job_id,
+                status="accepted",
+                message="Job resume was already accepted by this runtime",
+            )
 
         try:
             validate_worker_workspace_projection(
@@ -1437,6 +1565,17 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 if request.runtime_actor:
                     resume_metadata["runtime_actor"] = request.runtime_actor
                 resume_metadata["workspace_runtime"] = request.workspace_runtime
+                for field in (
+                    "workspace_provisioner",
+                    "workspace_generation",
+                    "workspace_runtime_incarnation",
+                    "workspace_ssh_host_key_fingerprint",
+                    "workspace_owner_kind",
+                    "workspace_owner_id",
+                ):
+                    value = getattr(request, field)
+                    if value:
+                        resume_metadata[field] = value
                 if request.git_remote_url:
                     # Feeds the pod-handoff clone fallback in
                     # _setup_job_workspace (resume_fresh_workspace_no_clone_
@@ -1542,6 +1681,12 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         thread_id = request.get("thread_id")
         if not thread_id:
             return JSONResponse({"error": "thread_id is required"}, status_code=400)
+        recipient_refusal = _pinned_session_recipient_refusal(
+            request,
+            expected_thread_id=str(thread_id),
+        )
+        if recipient_refusal is not None:
+            return recipient_refusal
         runtime_contract = bool(
             type(request.get("pinned_runtime_generation_contract")) is int
             and request["pinned_runtime_generation_contract"] == 1
@@ -1806,6 +1951,41 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             }
         )
 
+    @app.post("/session/status", tags=["Session"])
+    async def recipient_bound_session_status(request: dict = {}) -> JSONResponse:
+        """Return mutation-authorizing state only to the exact bound life."""
+
+        import src.api.persistent_app as pa
+
+        expected = pa._canonical_pinned_session_identity_fingerprint(
+            request.get("session_identity_fingerprint")
+            if isinstance(request, dict)
+            else None
+        )
+        if (
+            expected is None
+            or pa._current_pinned_session_identity_fingerprint() != expected
+        ):
+            return JSONResponse(
+                {"error": "session_identity_mismatch", "retryable": True},
+                status_code=409,
+            )
+        if _pod_state != PodState.SESSION:
+            return JSONResponse(
+                {"error": "session_recipient_unavailable", "retryable": True},
+                status_code=503,
+            )
+        return JSONResponse(
+            {
+                "ready": pa._session_ready(),
+                "thread_id": pa._thread_id,
+                "state": "session",
+                "turn_in_flight": pa._turn_in_flight(),
+                "recipient_verified": True,
+                "session_identity_fingerprint": expected,
+            }
+        )
+
     @app.get("/session/toolset", tags=["Session"])
     async def session_toolset() -> JSONResponse:
         """Same measured toolset read as the dedicated-session app.
@@ -1821,15 +2001,29 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         return JSONResponse(pa._session_toolset_report())
 
     @app.post("/session/detach", tags=["Session"])
-    async def session_detach() -> JSONResponse:
+    async def session_detach(request: dict = {}) -> JSONResponse:
         global _pod_state
+
+        import src.api.persistent_app as pa
+
+        expected = pa._canonical_pinned_session_identity_fingerprint(
+            request.get("session_identity_fingerprint")
+            if isinstance(request, dict)
+            else None
+        )
+        if (
+            expected is None
+            or pa._current_pinned_session_identity_fingerprint() != expected
+        ):
+            return JSONResponse(
+                {"error": "session_identity_mismatch", "retryable": True},
+                status_code=409,
+            )
 
         if _pod_state != PodState.SESSION:
             return JSONResponse({"status": "not_in_session"}, status_code=404)
 
         try:
-            import src.api.persistent_app as pa
-
             thread_id = pa._thread_id
             # Same reason string as persistent_app's /session/detach so the
             # documented "Terminate(rest_detach)" signal greps identically

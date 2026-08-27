@@ -33,6 +33,7 @@ def _make_manager(
     job_rows: list[dict] | None = None,
     thread_rows: list[dict] | None = None,
     is_available: bool = True,
+    lifecycle_available: bool | None = None,
     snapshot_available: bool = True,
     suspension_enabled: bool = True,
     shared_child_exists: bool = False,
@@ -42,6 +43,9 @@ def _make_manager(
 ):
     provisioner = MagicMock()
     provisioner.is_available = is_available
+    provisioner.lifecycle_available = (
+        is_available if lifecycle_available is None else lifecycle_available
+    )
     provisioner.delete_vm = AsyncMock(return_value=True)
     provisioner.delete_thread_vm = AsyncMock(return_value=True)
     provisioner.capture_vm_teardown_identity = AsyncMock(
@@ -49,6 +53,9 @@ def _make_manager(
             provision_generation="00000000-0000-4000-8000-000000000001",
             vm_uid="vm-uid-1",
             rootdisk_pvc_uid="rootdisk-uid-1",
+            ssh_host="10.0.0.5",
+            ssh_port=2222,
+            ssh_host_key_fingerprint="SHA256:" + ("A" * 43),
         )
     )
     provisioner.revalidate_vm_teardown_identity = AsyncMock(return_value="matched")
@@ -179,6 +186,45 @@ class TestListInstances:
     async def test_empty_when_provisioner_unavailable(self):
         mgr, *_ = _make_manager(is_available=False)
         assert await mgr.list_instances() == []
+
+    @pytest.mark.asyncio
+    async def test_external_create_closed_still_lists_existing_vm(self):
+        job = {
+            "id": "job-external",
+            "status": "processing",
+            "execution_lane": "pinned",
+            "context": {"vm": {"status": "ready", "ssh_host": "100.64.0.8"}},
+        }
+        mgr, provisioner, *_ = _make_manager(
+            job_rows=[job],
+            is_available=False,
+            lifecycle_available=True,
+        )
+
+        [instance] = await mgr.list_instances()
+
+        assert instance.bound_to == "job-external"
+        assert provisioner.is_available is False
+        assert provisioner.lifecycle_available is True
+
+    @pytest.mark.asyncio
+    async def test_external_lifecycle_auth_unavailable_does_not_list_or_reap(self):
+        job = {
+            "id": "job-unsigned-external",
+            "status": "completed",
+            "execution_lane": "pinned",
+            "context": {"vm": {"status": "ready", "ssh_host": "100.64.0.8"}},
+        }
+        mgr, provisioner, *_ = _make_manager(
+            job_rows=[job],
+            is_available=False,
+            lifecycle_available=False,
+        )
+
+        assert await mgr.list_instances() == []
+        assert await mgr.reap_orphans() == 0
+        provisioner.list_vms.assert_not_called()
+        provisioner.delete_orphan_vm_captured.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_flag_off_does_not_read_or_publish_control_marker(self):
@@ -837,6 +883,8 @@ class TestSnapshot:
         call_kwargs = snapshot.capture_vm_snapshot.call_args.kwargs
         assert call_kwargs["source_type"] == "vm"
         assert call_kwargs["ssh_port"] == 2222
+        assert call_kwargs["ssh_host"] == "10.0.0.5"
+        assert call_kwargs["expected_host_key_fingerprint"] == "SHA256:" + ("A" * 43)
 
     @pytest.mark.asyncio
     async def test_returns_none_without_ssh_host(self):
@@ -1377,7 +1425,7 @@ class TestAttemptCounter:
     @pytest.mark.asyncio
     async def test_record_attempt_increments_job_vm_context(self):
         mgr, _, _, _, db = _make_manager()
-        db.merge_vm_context = AsyncMock(return_value=True)
+        db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
         inst = Instance(
             kind="vm",
             id="x",
@@ -1483,7 +1531,11 @@ class TestSnapshotResetsAttempts:
         )
         ref = await mgr.snapshot(inst)
         assert ref == "j1"
-        db.merge_vm_context.assert_awaited_with("j1", {"snapshot_attempts": 0})
+        db.merge_vm_context_if_provision_generation.assert_awaited_with(
+            "j1",
+            "00000000-0000-4000-8000-000000000001",
+            {"snapshot_attempts": 0},
+        )
 
 
 # =============================================================================

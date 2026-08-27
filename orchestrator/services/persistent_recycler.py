@@ -9,6 +9,7 @@ immutable pod UIDs plus the generation label on the replacement.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -21,6 +22,7 @@ from .persistent_provisioner import (
     PersistentPodCreateStatus,
     PersistentProvisioner,
 )
+from .pinned_agent_authority import reconcile_legacy_pinned_agent_authority
 from .runtime_actor import lock_current_officer_runtime_grant
 
 logger = logging.getLogger(__name__)
@@ -136,8 +138,13 @@ class PersistentThreadRecycler:
         self._on_complete = on_complete
 
     async def observe(self, thread_id: str) -> PersistentPodObservation | None:
+        thread = await self._db.get_thread(thread_id)
+        metadata = _json_object((thread or {}).get("metadata"))
+        agent_pod = _json_object(metadata.get("agent_pod"))
+        namespace = str(agent_pod.get("namespace") or "") or None
         return PersistentPodObservation.from_status(
-            thread_id, await self._provisioner.get_pod_status(thread_id)
+            thread_id,
+            await self._provisioner.get_pod_status(thread_id, namespace=namespace),
         )
 
     async def request_and_reconcile(
@@ -151,6 +158,36 @@ class PersistentThreadRecycler:
     ) -> PersistentRecycleResult:
         """Create/reuse one generation and advance it through safe boundaries."""
 
+        try:
+            legacy = await reconcile_legacy_pinned_agent_authority(
+                self._db,
+                persistent_provisioner=self._provisioner,
+                thread_id=thread_id,
+                limit=2,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Legacy pinned Kubernetes authority adoption failed for %s",
+                thread_id,
+            )
+            return PersistentRecycleResult(
+                str(thread_id),
+                "blocked",
+                "blocked",
+                failure_class="pinned_k8s_authority_adoption_failed",
+            )
+        if not legacy.complete:
+            # Do not write the durable recycle generation yet. A namespace or
+            # finalizer rollout retry must remain free to adopt the same 0185
+            # row instead of inheriting an unrecoverable `blocked` marker.
+            return PersistentRecycleResult(
+                str(thread_id),
+                "blocked",
+                "blocked",
+                failure_class="pinned_k8s_authority_adoption_unresolved",
+            )
         if observation is None:
             observation = await self.observe(thread_id)
         requested = await self._request(
@@ -275,6 +312,18 @@ class PersistentThreadRecycler:
                     )
                 ):
                     initial_failure = "reciprocal_binding_mismatch"
+                if initial_failure is None and not (
+                    str(agent_pod.get("namespace") or "")
+                    and str(agent_pod.get("protection_protocol") or "")
+                    == "finalizer_v1"
+                    and str(agent_pod.get("provision_attempt") or "")
+                    and observation is not None
+                    and str(agent_pod.get("pod_uid") or "") == observation.pod_uid
+                ):
+                    # A finalizer-bearing exact object is the prerequisite for
+                    # terminal proof followed by an atomic successor handoff.
+                    # Absence or a legacy marker cannot be upgraded by guess.
+                    initial_failure = "pinned_pod_protection_unresolved"
 
                 generation = str(uuid.uuid4())
                 target_image_ref = str(
@@ -312,13 +361,7 @@ class PersistentThreadRecycler:
                         metadata["config_override"] = config
 
                 old_agent_id = str(agent["id"]) if agent is not None else None
-                phase = (
-                    "blocked"
-                    if initial_failure
-                    else "awaiting_old_pod_exit"
-                    if observation is not None
-                    else "fencing_old_authority"
-                )
+                phase = "blocked" if initial_failure else "awaiting_old_pod_exit"
                 recycle = {
                     "generation": generation,
                     "runtime_generation": str(thread.get("runtime_generation") or ""),
@@ -336,6 +379,7 @@ class PersistentThreadRecycler:
                         observation.pod_uid if observation is not None else None
                     ),
                     "old_agent_id": old_agent_id,
+                    "namespace": str(agent_pod.get("namespace") or ""),
                     "project_id": (
                         str(thread.get("project_id"))
                         if thread.get("project_id")
@@ -547,8 +591,24 @@ class PersistentThreadRecycler:
             old_uid = str(current.get("old_pod_uid") or "")
             if observation is not None and observation.pod_uid == old_uid:
                 if observation.terminal:
-                    await self._provisioner.delete_agent_pod_exact(
-                        thread_id, expected_pod_uid=old_uid
+                    deleted = await self._provisioner.delete_agent_pod_exact(
+                        thread_id,
+                        expected_pod_uid=old_uid,
+                        namespace=str(current.get("namespace") or ""),
+                    )
+                    if not deleted:
+                        return self._result(thread_id, current)
+                    changed = await self._set_phase(
+                        thread_id,
+                        generation=str(current["generation"]),
+                        expected_phase=phase,
+                        phase="fencing_old_authority",
+                        extras={"old_pod_terminal_at": _iso()},
+                    )
+                    return (
+                        self._result(thread_id, changed)
+                        if changed
+                        else self._lost(thread_id)
                     )
                 else:
                     started = self._parse_time(current.get("drain_wait_started_at"))
@@ -582,14 +642,14 @@ class PersistentThreadRecycler:
                     "replacement_authority_mismatch",
                     resume_phase="awaiting_old_pod_exit",
                 )
-            changed = await self._set_phase(
+            # With finalizer_v1 an exact old Pod cannot disappear before the
+            # terminal handoff receipt.  Never turn a 404/node partition into
+            # process-zero or a replacement authority.
+            return await self._fail(
                 thread_id,
-                generation=str(current["generation"]),
-                expected_phase=phase,
-                phase="fencing_old_authority",
-            )
-            return (
-                self._result(thread_id, changed) if changed else self._lost(thread_id)
+                current,
+                "old_pod_absent_without_terminal_proof",
+                resume_phase="awaiting_old_pod_exit",
             )
 
         if phase == "fencing_old_authority":
@@ -610,6 +670,7 @@ class PersistentThreadRecycler:
                 config_name=str(current.get("config_name") or "session_base"),
                 lifecycle_generation=str(current["generation"]),
                 target_image_ref=str(current.get("target_image_ref") or "") or None,
+                namespace=str(current.get("namespace") or "") or None,
             )
             if result.status == PersistentPodCreateStatus.TERMINATING:
                 return self._result(thread_id, current)
@@ -717,82 +778,45 @@ class PersistentThreadRecycler:
     async def _fence_old_authority(
         self, thread_id: str, current: dict[str, Any]
     ) -> dict[str, Any] | None:
-        thread_uuid = uuid.UUID(str(thread_id))
-        async with self._db.acquire() as conn:
-            async with conn.transaction():
-                locked = await self._lock_authority(conn, thread_uuid=thread_uuid)
-                if locked is None:
-                    return None
-                thread, _post, agent = locked
-                metadata = _json_object(thread.get("metadata"))
-                agent_pod = _json_object(metadata.get("agent_pod"))
-                recycle = _json_object(agent_pod.get(_RECYCLE_KEY))
-                if not self._same_state(recycle, current, "fencing_old_authority"):
-                    return recycle or None
+        observed_at = self._parse_time(current.get("old_pod_terminal_at"))
+        namespace = str(current.get("namespace") or "")
+        old_uid = str(current.get("old_pod_uid") or "")
+        if observed_at is None or not namespace or not old_uid:
+            return current
+        successor_attempt = str(current.get("successor_attempt") or "")
+        if not successor_attempt:
+            successor_attempt = str(uuid.uuid4())
+        handoff = await self._db.commit_pinned_agent_pod_recycle_handoff(
+            thread_id,
+            expected_runtime_generation=str(current.get("runtime_generation") or ""),
+            recycle_generation=str(current.get("generation") or ""),
+            successor_attempt_id=successor_attempt,
+            process_zero_observed_at=observed_at,
+        )
+        if not handoff:
+            return current
 
-                old_agent_id = current.get("old_agent_id")
-                if old_agent_id:
-                    old_uuid = uuid.UUID(str(old_agent_id))
-                    try:
-                        runtime_generation = uuid.UUID(
-                            str(current.get("runtime_generation") or "")
-                        )
-                        old_attach_token = uuid.UUID(
-                            str(current.get("old_runtime_attach_token") or "")
-                        )
-                    except (TypeError, ValueError):
-                        # A pre-0185/malformed recycle has no proof-bearing
-                        # detach edge. Preserve it for operator/reconciler
-                        # recovery; never broaden into a pointer-only clear.
-                        return recycle or None
-                    # Grant is locked after agent, preserving the runtime actor
-                    # lifecycle order. DELETE's database trigger revokes it and
-                    # retains the immutable agent UUID provenance snapshot.
-                    await conn.fetch(
-                        "SELECT id FROM runtime_actor_grants "
-                        "WHERE agent_id = $1 AND revoked_at IS NULL FOR UPDATE",
-                        old_uuid,
-                    )
-                    cleared = await conn.execute(
-                        "UPDATE threads SET agent_id = NULL, "
-                        "control_admission_agent_id = NULL, "
-                        "runtime_attach_token = NULL "
-                        "WHERE id = $1 AND agent_id = $2 "
-                        "AND runtime_generation = $3 "
-                        "AND runtime_attach_token = $4 "
-                        "AND runtime_retirement_token IS NULL",
-                        thread_uuid,
-                        old_uuid,
-                        runtime_generation,
-                        old_attach_token,
-                    )
-                    if cleared != "UPDATE 1":
-                        return None
-                    await conn.execute("DELETE FROM agents WHERE id = $1", old_uuid)
-
-                recycle.update(
-                    {
-                        "phase": "provisioning",
-                        "updated_at": _iso(),
-                        "config_name": str(thread.get("config_name") or "session_base"),
-                    }
-                )
-                agent_pod[_RECYCLE_KEY] = recycle
-                metadata["agent_pod"] = agent_pod
-                result = await conn.execute(
-                    """
-                    UPDATE threads
-                       SET metadata = $2::jsonb,
-                           status = CASE WHEN status = 'suspended' THEN 'active'
-                                         ELSE status END,
-                           awaiting_user_since = NULL,
-                           control_admission_agent_id = NULL
-                     WHERE id = $1 AND status <> 'ended'
-                    """,
-                    thread_uuid,
-                    json.dumps(metadata),
-                )
-                return recycle if result == "UPDATE 1" else None
+        current = await self._read_recycle(thread_id)
+        if not await self._provisioner.release_agent_pod_finalizer_exact(
+            thread_id,
+            expected_pod_uid=old_uid,
+            namespace=namespace,
+            terminal_required=True,
+        ):
+            return current
+        authority = await self._provisioner.agent_pod_authority(
+            f"persistent-{thread_id[:12]}",
+            expected_pod_uid=old_uid,
+            namespace=namespace,
+        )
+        if authority not in {"exact_absent", "replacement"}:
+            return current
+        return await self._set_phase(
+            thread_id,
+            generation=str(current.get("generation") or ""),
+            expected_phase="fencing_old_authority",
+            phase="provisioning",
+        )
 
     async def _complete_if_authoritative(
         self,
@@ -965,6 +989,9 @@ class PersistentThreadRecycler:
         next_recycle = {
             "generation": generation,
             "runtime_generation": str(thread.get("runtime_generation") or ""),
+            "namespace": str(
+                agent_pod.get("namespace") or recycle.get("namespace") or ""
+            ),
             "old_runtime_attach_token": str(thread.get("runtime_attach_token") or ""),
             "phase": "awaiting_old_pod_exit",
             "reason": "desired_image_changed_during_recycle",

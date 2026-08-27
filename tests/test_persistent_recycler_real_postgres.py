@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -14,8 +16,9 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from orchestrator.security import crypto
+from security import crypto
 from orchestrator.services import runtime_actor
+from orchestrator.services.agent_provisioner import AgentProvisioner
 from services.cloud.backend_instance_authority import (
     MainCloudBackendInstanceAuthority,
     main_cloud_installation_proof_sha256,
@@ -28,8 +31,18 @@ from services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
 from orchestrator.services.persistent_provisioner import (
+    PersistentProvisioner,
     PersistentPodCreateResult,
     PersistentPodCreateStatus,
+)
+from orchestrator.services.pinned_agent_authority import (
+    reconcile_legacy_pinned_agent_authority,
+    reconcile_pinned_warm_binding_protections,
+    reserve_pinned_warm_agent_binding,
+)
+from orchestrator.services.pinned_k8s_effect import (
+    PINNED_AUTHORITY_FINALIZER,
+    PINNED_WARM_PROTECTION_FENCE_ANNOTATION,
 )
 from orchestrator.services.persistent_recycler import (
     PersistentPodObservation,
@@ -51,6 +64,26 @@ SCHEMA_FILE = (
     / "orchestrator"
     / "database"
     / "schema_current.sql"
+)
+PINNED_RECYCLE_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "orchestrator"
+    / "database"
+    / "migrations"
+    / "app"
+    / "0198_pinned_agent_recycle_authority.sql"
+)
+NON_PINNED_LIFECYCLE_MIGRATIONS = tuple(
+    Path(__file__).resolve().parents[1]
+    / "orchestrator"
+    / "database"
+    / "migrations"
+    / "app"
+    / name
+    for name in (
+        "0195_non_pinned_workspace_process_zero.sql",
+        "0196_non_pinned_workspace_lifecycle_authority.sql",
+    )
 )
 
 
@@ -78,6 +111,20 @@ async def _schema_applied(pg_dsn):
     conn = await asyncpg.connect(pg_dsn)
     try:
         await conn.execute(SCHEMA_FILE.read_text())
+        # schema_current.sql replays the whole migration chain, so these files
+        # are already in the snapshot once it is regenerated; re-applying them
+        # would fail on CREATE TABLE/TRIGGER.
+        if not await conn.fetchval(
+            "SELECT to_regclass("
+            "'public.managed_repository_workspace_creation_reservations'"
+            ") IS NOT NULL"
+        ):
+            for migration in NON_PINNED_LIFECYCLE_MIGRATIONS:
+                await conn.execute(migration.read_text())
+        if not await conn.fetchval(
+            "SELECT to_regclass('public.thread_agent_pod_recycle_handoffs') IS NOT NULL"
+        ):
+            await conn.execute(PINNED_RECYCLE_MIGRATION.read_text())
     finally:
         await conn.close()
 
@@ -98,6 +145,9 @@ async def db(pg_dsn, _schema_applied, monkeypatch):
             "TRUNCATE cloud_ro_effect_intents, cloud_ro_mounts, thread_mounts, "
             "main_cloud_active_backend, main_cloud_backend_instances, "
             "thread_workspace_provision_intents, "
+            "thread_agent_k8s_authority_adoptions, "
+            "thread_agent_warm_binding_protections, "
+            "thread_agent_pod_recycle_handoffs, "
             "thread_agent_pod_provision_intents, "
             "thread_agent_workspace_claims, "
             "runtime_actor_access_tokens, runtime_actor_grants, "
@@ -117,7 +167,8 @@ class FakeProvisioner:
     image_ref = "example.test/agent:sha-new-build"
     is_available = True
 
-    def __init__(self):
+    def __init__(self, db: PostgresDB | None = None):
+        self.db = db
         self.current: dict | None = None
         self.create_calls = 0
         self.created_targets: list[str | None] = []
@@ -125,14 +176,49 @@ class FakeProvisioner:
         self.pvc_identities: dict[str, tuple[str, str]] = {}
         self.fail_creates = False
 
-    async def get_pod_status(self, thread_id: str):
+    async def get_pod_status(self, thread_id: str, *, namespace: str | None = None):
+        assert namespace in {None, "agents-a"}
         return dict(self.current) if self.current else None
 
-    async def delete_agent_pod_exact(self, thread_id: str, *, expected_pod_uid: str):
+    async def delete_agent_pod_exact(
+        self,
+        thread_id: str,
+        *,
+        expected_pod_uid: str,
+        namespace: str | None = None,
+    ):
+        del namespace
         self.deleted_uids.append(expected_pod_uid)
         if self.current and self.current.get("pod_uid") == expected_pod_uid:
             self.current = None
         return True
+
+    async def release_agent_pod_finalizer_exact(
+        self,
+        thread_id: str,
+        *,
+        expected_pod_uid: str,
+        namespace: str,
+        terminal_required: bool = True,
+    ):
+        del thread_id, expected_pod_uid, namespace, terminal_required
+        return True
+
+    async def agent_pod_authority(
+        self,
+        pod_name: str,
+        *,
+        expected_pod_uid: str,
+        namespace: str | None = None,
+    ):
+        del pod_name, namespace
+        if self.current is None:
+            return "exact_absent"
+        return (
+            "exact_live"
+            if str(self.current.get("pod_uid") or "") == expected_pod_uid
+            else "replacement"
+        )
 
     async def create_agent_pod(
         self,
@@ -141,7 +227,9 @@ class FakeProvisioner:
         config_name: str,
         lifecycle_generation: str,
         target_image_ref: str | None = None,
+        namespace: str | None = None,
     ):
+        assert namespace in {None, "agents-a"}
         self.create_calls += 1
         self.created_targets.append(target_image_ref)
         # Production provisioning uses create-or-reuse for this deterministic
@@ -163,6 +251,34 @@ class FakeProvisioner:
             else self.expected_build_sha
         )
         uid = f"replacement-{lifecycle_generation[:8]}"
+        if self.db is not None:
+            thread = await self.db.get_thread(thread_id)
+            runtime_generation = str(thread["runtime_generation"])
+            intent = await self.db.reserve_pinned_agent_pod_provision_intent(
+                thread_id,
+                expected_runtime_generation=runtime_generation,
+                attempt_id=str(uuid4()),
+                pod_name=f"persistent-{thread_id[:12]}",
+                provisioner="persistent",
+                namespace=namespace or "agents-a",
+                pvc_name=f"pvc-persistent-{thread_id[:12]}",
+            )
+            if (
+                not intent
+                or not await self.db.publish_pinned_agent_pod_provision_intent(
+                    thread_id,
+                    expected_runtime_generation=runtime_generation,
+                    attempt_id=str(intent["attempt_id"]),
+                    pod_name=str(intent["pod_name"]),
+                    pod_uid=uid,
+                    namespace=str(intent["namespace"]),
+                )
+            ):
+                return PersistentPodCreateResult(
+                    PersistentPodCreateStatus.FAILED,
+                    f"persistent-{thread_id[:12]}",
+                    failure_class="fake_provision_intent_publication_refused",
+                )
         self.current = _pod_status(
             thread_id,
             uid=uid,
@@ -176,6 +292,260 @@ class FakeProvisioner:
             pod_uid=uid,
             build_sha=build,
         )
+
+
+class _K8sError(Exception):
+    def __init__(self, status: int):
+        super().__init__(f"Kubernetes status {status}")
+        self.status = status
+
+
+class StatefulPinnedK8sApi:
+    """Small API-server model: deletion waits for the SRW finalizer."""
+
+    def __init__(self) -> None:
+        self.pods: dict[tuple[str, str], SimpleNamespace] = {}
+        self.pvcs: dict[tuple[str, str], SimpleNamespace] = {}
+        self.created_pod_manifests: list[dict] = []
+        self.mutation_timeouts: list[tuple[float, float] | None] = []
+        self.lose_next_pod_create_response = False
+        self.lose_next_pod_patch_response = False
+        self.block_next_pod_patch_started: threading.Event | None = None
+        self.block_next_pod_patch_release: threading.Event | None = None
+        self._uid_sequence = 0
+
+    @staticmethod
+    def _status(*, phase: str, ready: bool, terminal: bool) -> SimpleNamespace:
+        terminated = SimpleNamespace() if terminal else None
+        container = SimpleNamespace(
+            ready=ready,
+            state=SimpleNamespace(terminated=terminated),
+        )
+        return SimpleNamespace(
+            phase=phase,
+            pod_ip="10.0.0.8" if ready else None,
+            container_statuses=[container],
+        )
+
+    @staticmethod
+    def _metadata(
+        *, uid: str, labels: dict[str, str], finalizers: list[str]
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            uid=uid,
+            labels=dict(labels),
+            finalizers=list(finalizers),
+            annotations={},
+            resource_version="1",
+            deletion_timestamp=None,
+        )
+
+    def install_old_pod(
+        self,
+        *,
+        namespace: str,
+        name: str,
+        uid: str,
+        labels: dict[str, str],
+        protected: bool = True,
+    ) -> None:
+        self.pods[(namespace, name)] = SimpleNamespace(
+            metadata=self._metadata(
+                uid=uid,
+                labels=labels,
+                finalizers=[PINNED_AUTHORITY_FINALIZER] if protected else [],
+            ),
+            status=self._status(phase="Running", ready=True, terminal=False),
+        )
+
+    def install_pvc(
+        self,
+        *,
+        namespace: str,
+        name: str,
+        uid: str,
+        labels: dict[str, str],
+        protected: bool = True,
+    ) -> None:
+        self.pvcs[(namespace, name)] = SimpleNamespace(
+            metadata=self._metadata(
+                uid=uid,
+                labels=labels,
+                finalizers=[PINNED_AUTHORITY_FINALIZER] if protected else [],
+            )
+        )
+
+    def mark_terminal(self, namespace: str, name: str) -> None:
+        pod = self.pods[(namespace, name)]
+        pod.status = self._status(phase="Succeeded", ready=False, terminal=True)
+
+    def mark_ready(self, namespace: str, name: str) -> None:
+        pod = self.pods[(namespace, name)]
+        pod.status = self._status(phase="Running", ready=True, terminal=False)
+
+    def read_namespaced_pod(self, *, name: str, namespace: str, **_kwargs):
+        try:
+            return self.pods[(namespace, name)]
+        except KeyError as exc:
+            raise _K8sError(404) from exc
+
+    def create_namespaced_pod(
+        self, *, namespace: str, body: dict, _request_timeout=None, **_kwargs
+    ):
+        self.mutation_timeouts.append(_request_timeout)
+        name = str(body["metadata"]["name"])
+        key = (namespace, name)
+        if key in self.pods:
+            raise _K8sError(409)
+        self._uid_sequence += 1
+        pod = SimpleNamespace(
+            metadata=self._metadata(
+                uid=f"replacement-pod-{self._uid_sequence}",
+                labels=body["metadata"].get("labels") or {},
+                finalizers=body["metadata"].get("finalizers") or [],
+            ),
+            status=self._status(phase="Pending", ready=False, terminal=False),
+        )
+        self.pods[key] = pod
+        self.created_pod_manifests.append(body)
+        if self.lose_next_pod_create_response:
+            self.lose_next_pod_create_response = False
+            raise TimeoutError("API server committed Pod; response was lost")
+        return pod
+
+    def delete_namespaced_pod(
+        self,
+        *,
+        name: str,
+        namespace: str,
+        body: dict | None = None,
+        _request_timeout=None,
+        **_kwargs,
+    ):
+        self.mutation_timeouts.append(_request_timeout)
+        pod = self.read_namespaced_pod(name=name, namespace=namespace)
+        expected_uid = ((body or {}).get("preconditions") or {}).get("uid")
+        if expected_uid and pod.metadata.uid != expected_uid:
+            raise _K8sError(409)
+        pod.metadata.deletion_timestamp = "now"
+        if not pod.metadata.finalizers:
+            self.pods.pop((namespace, name), None)
+        return SimpleNamespace()
+
+    def patch_namespaced_pod(
+        self,
+        *,
+        name: str,
+        namespace: str,
+        body: list[dict],
+        _request_timeout=None,
+    ):
+        self.mutation_timeouts.append(_request_timeout)
+        if self.block_next_pod_patch_started is not None:
+            started = self.block_next_pod_patch_started
+            release = self.block_next_pod_patch_release
+            self.block_next_pod_patch_started = None
+            self.block_next_pod_patch_release = None
+            started.set()
+            if release is None or not release.wait(timeout=10):
+                raise TimeoutError("test patch barrier timed out")
+        pod = self.read_namespaced_pod(name=name, namespace=namespace)
+        tests = {
+            entry["path"]: entry["value"] for entry in body if entry["op"] == "test"
+        }
+        if (
+            tests.get("/metadata/uid") != pod.metadata.uid
+            or tests.get("/metadata/resourceVersion") != pod.metadata.resource_version
+            or (
+                "/metadata/finalizers" in tests
+                and tests["/metadata/finalizers"] != pod.metadata.finalizers
+            )
+        ):
+            raise _K8sError(409)
+        annotation_path = "/metadata/annotations/srw.io~1warm-protection-fence"
+        if annotation_path in tests and tests[
+            annotation_path
+        ] != pod.metadata.annotations.get("srw.io/warm-protection-fence"):
+            raise _K8sError(409)
+        for entry in body:
+            if entry["op"] not in {"add", "replace"}:
+                continue
+            if entry["path"] == "/metadata/finalizers":
+                pod.metadata.finalizers = list(entry["value"])
+            elif entry["path"] == "/metadata/annotations":
+                pod.metadata.annotations = dict(entry["value"])
+            elif entry["path"] == annotation_path:
+                pod.metadata.annotations["srw.io/warm-protection-fence"] = entry[
+                    "value"
+                ]
+        pod.metadata.resource_version = str(int(pod.metadata.resource_version) + 1)
+        if pod.metadata.deletion_timestamp and not pod.metadata.finalizers:
+            self.pods.pop((namespace, name), None)
+        if self.lose_next_pod_patch_response:
+            self.lose_next_pod_patch_response = False
+            raise TimeoutError("API server committed patch; response was lost")
+        return pod
+
+    def read_namespaced_persistent_volume_claim(
+        self, *, name: str, namespace: str, **_kwargs
+    ):
+        try:
+            return self.pvcs[(namespace, name)]
+        except KeyError as exc:
+            raise _K8sError(404) from exc
+
+    def create_namespaced_persistent_volume_claim(
+        self, *, namespace: str, body: dict, _request_timeout=None, **_kwargs
+    ):
+        self.mutation_timeouts.append(_request_timeout)
+        name = str(body["metadata"]["name"])
+        key = (namespace, name)
+        if key in self.pvcs:
+            raise _K8sError(409)
+        self._uid_sequence += 1
+        claim = SimpleNamespace(
+            metadata=self._metadata(
+                uid=f"pvc-{self._uid_sequence}",
+                labels=body["metadata"].get("labels") or {},
+                finalizers=body["metadata"].get("finalizers") or [],
+            )
+        )
+        self.pvcs[key] = claim
+        return claim
+
+    def patch_namespaced_persistent_volume_claim(
+        self,
+        *,
+        name: str,
+        namespace: str,
+        body: list[dict],
+        _request_timeout=None,
+    ):
+        self.mutation_timeouts.append(_request_timeout)
+        claim = self.read_namespaced_persistent_volume_claim(
+            name=name, namespace=namespace
+        )
+        tests = {
+            entry["path"]: entry["value"] for entry in body if entry["op"] == "test"
+        }
+        if (
+            tests.get("/metadata/uid") != claim.metadata.uid
+            or tests.get("/metadata/resourceVersion") != claim.metadata.resource_version
+            or (
+                "/metadata/finalizers" in tests
+                and tests["/metadata/finalizers"] != claim.metadata.finalizers
+            )
+        ):
+            raise _K8sError(409)
+        replacement = next(
+            entry["value"]
+            for entry in body
+            if entry["op"] in {"add", "replace"}
+            and entry["path"] == "/metadata/finalizers"
+        )
+        claim.metadata.finalizers = list(replacement)
+        claim.metadata.resource_version = str(int(claim.metadata.resource_version) + 1)
+        return claim
 
 
 def _pod_status(
@@ -205,12 +575,29 @@ def _pod_status(
     }
 
 
+def _terminal_pod_status(
+    thread_id: str, *, uid: str, build: str, generation: str | None = None
+) -> dict:
+    return {
+        **_pod_status(
+            thread_id,
+            uid=uid,
+            build=build,
+            generation=generation,
+            ready=False,
+        ),
+        "phase": "Succeeded",
+        "terminating": True,
+    }
+
+
 async def _seed(
     db: PostgresDB,
     *,
     preexisting_hold: dict | None = None,
     bind_agent: bool = True,
     publish_agent_pod: bool = True,
+    protected_agent_pod: bool = False,
 ):
     ids = {key: str(uuid4()) for key in ("user", "project", "thread", "agent")}
     ids["attach_token"] = str(uuid4())
@@ -223,7 +610,10 @@ async def _seed(
             "workspace": {"backend": "none"},
         },
     }
-    if publish_agent_pod:
+    if publish_agent_pod and not protected_agent_pod:
+        # Historical 0185 fixture used by retirement tests. It deliberately
+        # has no 0198 namespace/finalizer claim and therefore cannot enter the
+        # new recycle protocol.
         metadata["agent_pod"] = {
             "pod_name": f"persistent-{ids['thread'][:12]}",
             "pod_uid": "old-pod",
@@ -254,7 +644,56 @@ async def _seed(
             UUID(ids["project"]),
             json.dumps(metadata),
         )
-        if bind_agent:
+        await conn.execute(
+            "INSERT INTO project_officers (project_id,thread_id) VALUES ($1,$2)",
+            UUID(ids["project"]),
+            UUID(ids["thread"]),
+        )
+
+    if publish_agent_pod and protected_agent_pod:
+        thread = await db.get_thread(ids["thread"])
+        generation = str(thread["runtime_generation"])
+        attempt = str(uuid4())
+        reserved = await db.reserve_pinned_agent_pod_provision_intent(
+            ids["thread"],
+            expected_runtime_generation=generation,
+            attempt_id=attempt,
+            pod_name=f"persistent-{ids['thread'][:12]}",
+            provisioner="persistent",
+            namespace="agents-a",
+            pvc_name=f"pvc-persistent-{ids['thread'][:12]}",
+        )
+        assert reserved is not None
+        claim = reserved["workspace_claim"]
+        assert claim is not None
+        assert await db.publish_pinned_agent_workspace_claim(
+            ids["thread"],
+            expected_runtime_generation=generation,
+            claim_id=str(claim["claim_id"]),
+            pvc_name=str(claim["pvc_name"]),
+            pvc_uid=f"pvc-{ids['thread']}",
+            namespace="agents-a",
+        )
+        assert await db.publish_pinned_agent_pod_provision_intent(
+            ids["thread"],
+            expected_runtime_generation=generation,
+            attempt_id=attempt,
+            pod_name=f"persistent-{ids['thread'][:12]}",
+            pod_uid="old-pod",
+            namespace="agents-a",
+        )
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_set(metadata,"
+                "'{agent_pod,observed_build_sha}',to_jsonb('old-build'::text),true) "
+                "WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+        ids["provision_attempt"] = attempt
+        ids["workspace_claim_id"] = str(claim["claim_id"])
+
+    if bind_agent:
+        async with db.acquire() as conn:
             await conn.execute(
                 "INSERT INTO agents "
                 "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,last_heartbeat) "
@@ -263,6 +702,10 @@ async def _seed(
                 f"persistent-{ids['thread'][:12]}",
             )
             async with conn.transaction():
+                if not protected_agent_pod:
+                    # Seed a pre-0198 reciprocal row; post-0198 direct binds
+                    # must carry either create-intent or warm-protection proof.
+                    await conn.execute("SET LOCAL session_replication_role = 'replica'")
                 await conn.execute(
                     "UPDATE threads SET agent_id=$2, control_admission_agent_id=$2, "
                     "runtime_attach_token=$3 WHERE id=$1",
@@ -276,17 +719,249 @@ async def _seed(
                     UUID(ids["agent"]),
                     UUID(ids["thread"]),
                 )
-        await conn.execute(
-            "INSERT INTO project_officers (project_id,thread_id) VALUES ($1,$2)",
-            UUID(ids["project"]),
-            UUID(ids["thread"]),
-        )
     if bind_agent:
         actor = await runtime_actor.mint_thread_runtime_actor(
             db, thread_id=ids["thread"], agent_id=ids["agent"]
         )
         ids["old_access"] = actor.access_credential
     return ids
+
+
+async def _seed_legacy_0185_authority(
+    db: PostgresDB, *, bind_agent: bool = True, published: bool = True
+) -> dict[str, str]:
+    """Install an exact open 0185 shape that predates migration 0198."""
+
+    if bind_agent and not published:
+        raise ValueError("a planned legacy intent cannot already bind an agent")
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    attempt = str(uuid4())
+    claim_id = str(uuid4())
+    pod_name = f"persistent-{ids['thread'][:12]}"
+    pvc_name = f"pvc-persistent-{ids['thread'][:12]}"
+    pvc_uid = f"pvc-{ids['thread']}"
+    marker = (
+        {
+            "pod_name": pod_name,
+            "pod_uid": "old-pod",
+            "runtime_generation": generation,
+            "provision_attempt": attempt,
+            "observed_build_sha": "old-build",
+        }
+        if published
+        else None
+    )
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            # These are not post-0198 writes: seed the already-committed 0185
+            # rows exactly as the migration encounters them at deployment.
+            await conn.execute("SET LOCAL session_replication_role = 'replica'")
+            if published:
+                await conn.execute(
+                    "INSERT INTO thread_agent_workspace_claims ("
+                    "claim_id,thread_id,created_runtime_generation,create_attempt,"
+                    "provisioner,pvc_name,status,pvc_uid,resolved_at) VALUES ("
+                    "$1::uuid,$2::uuid,$3::uuid,$4::uuid,'persistent',$5,"
+                    "'ready',$6,now())",
+                    UUID(claim_id),
+                    UUID(ids["thread"]),
+                    UUID(generation),
+                    UUID(attempt),
+                    pvc_name,
+                    pvc_uid,
+                )
+                await conn.execute(
+                    "INSERT INTO thread_agent_pod_provision_intents ("
+                    "attempt_id,thread_id,runtime_generation,provisioner,"
+                    "workspace_claim_id,pod_name,status,pod_uid,resolved_at) VALUES ("
+                    "$1::uuid,$2::uuid,$3::uuid,'persistent',$4::uuid,$5,"
+                    "'published','old-pod',now())",
+                    UUID(attempt),
+                    UUID(ids["thread"]),
+                    UUID(generation),
+                    UUID(claim_id),
+                    pod_name,
+                )
+                await conn.execute(
+                    "UPDATE threads SET metadata=jsonb_set(metadata,'{agent_pod}',"
+                    "$2::jsonb,true),runtime_authority_exposed=true "
+                    "WHERE id=$1::uuid",
+                    UUID(ids["thread"]),
+                    json.dumps(marker),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO thread_agent_workspace_claims ("
+                    "claim_id,thread_id,created_runtime_generation,create_attempt,"
+                    "provisioner,pvc_name) VALUES ("
+                    "$1::uuid,$2::uuid,$3::uuid,$4::uuid,'persistent',$5)",
+                    UUID(claim_id),
+                    UUID(ids["thread"]),
+                    UUID(generation),
+                    UUID(attempt),
+                    pvc_name,
+                )
+                await conn.execute(
+                    "INSERT INTO thread_agent_pod_provision_intents ("
+                    "attempt_id,thread_id,runtime_generation,provisioner,"
+                    "workspace_claim_id,pod_name) VALUES ("
+                    "$1::uuid,$2::uuid,$3::uuid,'persistent',$4::uuid,$5)",
+                    UUID(attempt),
+                    UUID(ids["thread"]),
+                    UUID(generation),
+                    UUID(claim_id),
+                    pod_name,
+                )
+                await conn.execute(
+                    "UPDATE threads SET runtime_authority_exposed=true "
+                    "WHERE id=$1::uuid",
+                    UUID(ids["thread"]),
+                )
+    if bind_agent:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO agents (id,config_name,hostname,pod_ip,pod_uid,"
+                "status,agent_mode,last_heartbeat) VALUES ("
+                "$1::uuid,'centurion',$2,'127.0.0.1','old-pod','session',"
+                "'persistent',now())",
+                UUID(ids["agent"]),
+                pod_name,
+            )
+            async with conn.transaction():
+                # This helper models a binding already live when 0198 lands.
+                await conn.execute("SET LOCAL session_replication_role = 'replica'")
+                await conn.execute(
+                    "UPDATE threads SET agent_id=$2::uuid,"
+                    "control_admission_agent_id=$2::uuid,"
+                    "runtime_attach_token=$3::uuid WHERE id=$1::uuid",
+                    UUID(ids["thread"]),
+                    UUID(ids["agent"]),
+                    UUID(ids["attach_token"]),
+                )
+                await conn.execute(
+                    "UPDATE agents SET thread_id=$2::uuid "
+                    "WHERE id=$1::uuid AND thread_id IS NULL",
+                    UUID(ids["agent"]),
+                    UUID(ids["thread"]),
+                )
+    ids.update(
+        {
+            "runtime_generation": generation,
+            "provision_attempt": attempt,
+            "workspace_claim_id": claim_id,
+            "pod_name": pod_name,
+            "pvc_name": pvc_name,
+            "pvc_uid": pvc_uid,
+        }
+    )
+    return ids
+
+
+async def _seed_warm_pool_binding(db: PostgresDB, *, bound: bool) -> dict[str, str]:
+    """Seed a dual-agent pool Pod, optionally already bound before 0198."""
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    ids["pod_name"] = f"srw-agent-j-{ids['agent'][:8]}"
+    ids["pod_uid"] = f"warm-{ids['agent']}"
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO agents (id,config_name,hostname,pod_ip,pod_uid,status,"
+            "agent_mode,last_heartbeat) VALUES ("
+            "$1::uuid,'worker_base',$2,'127.0.0.1',$3,$4,'dual',now())",
+            UUID(ids["agent"]),
+            ids["pod_name"],
+            ids["pod_uid"],
+            "session" if bound else "ready",
+        )
+        if bound:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL session_replication_role='replica'")
+                await conn.execute(
+                    "UPDATE threads SET agent_id=$2::uuid,"
+                    "control_admission_agent_id=$2::uuid,"
+                    "runtime_attach_token=$3::uuid,runtime_authority_exposed=true "
+                    "WHERE id=$1::uuid",
+                    UUID(ids["thread"]),
+                    UUID(ids["agent"]),
+                    UUID(ids["attach_token"]),
+                )
+                await conn.execute(
+                    "UPDATE agents SET thread_id=$2::uuid WHERE id=$1::uuid",
+                    UUID(ids["agent"]),
+                    UUID(ids["thread"]),
+                )
+    ids["runtime_generation"] = str(
+        (await db.get_thread(ids["thread"]))["runtime_generation"]
+    )
+    return ids
+
+
+def _install_warm_pool_pod(
+    api: StatefulPinnedK8sApi,
+    ids: dict[str, str],
+    *,
+    namespace: str = "agents-a",
+    protected: bool = False,
+) -> None:
+    api.install_old_pod(
+        namespace=namespace,
+        name=ids["pod_name"],
+        uid=ids["pod_uid"],
+        labels={
+            "srw/managed-by": "agent-provisioner",
+            "srw/purpose": "job",
+        },
+        protected=protected,
+    )
+
+
+def _production_warm_provisioner(
+    db: PostgresDB, api: StatefulPinnedK8sApi, *, namespace: str = "agents-b"
+) -> AgentProvisioner:
+    provisioner = AgentProvisioner()
+    provisioner._db = db
+    provisioner._core_api = api
+    provisioner._k8s_available = True
+    provisioner._namespace = namespace
+    return provisioner
+
+
+def _install_legacy_0185_objects(
+    api: StatefulPinnedK8sApi, ids: dict[str, str]
+) -> None:
+    api.install_old_pod(
+        namespace="agents-a",
+        name=ids["pod_name"],
+        uid="old-pod",
+        protected=False,
+        labels={
+            "app": "srw-persistent-agent",
+            "srw/component": "persistent-agent",
+            "srw/thread-id": ids["thread"],
+            "srw/build-sha": "old-build",
+            "srw.io/runtime-generation": ids["runtime_generation"],
+            "srw.io/provision-attempt": ids["provision_attempt"],
+        },
+    )
+    api.install_pvc(
+        namespace="agents-a",
+        name=ids["pvc_name"],
+        uid=ids["pvc_uid"],
+        protected=False,
+        labels={
+            "app": "srw-persistent-agent",
+            "srw/component": "agent-workspace-pvc",
+            "srw.io/component": "agent-workspace",
+            "srw/thread-id": ids["thread"],
+            "srw.io/thread-id": ids["thread"],
+            "srw.io/runtime-generation": ids["runtime_generation"],
+            "srw.io/workspace-claim": ids["workspace_claim_id"],
+            "srw.io/provision-attempt": ids["provision_attempt"],
+            "srw.io/claim-provisioner": "persistent",
+        },
+    )
 
 
 async def _seed_protected_ro_attempt(
@@ -431,7 +1106,7 @@ async def _seed_protected_ro_attempt(
 
 
 @pytest.mark.asyncio
-async def test_pinned_session_binding_reads_one_reciprocal_pool_snapshot(db):
+async def test_pinned_session_binding_rejects_marker_free_pool_snapshot(db):
     ids = await _seed(db, publish_agent_pod=False)
     thread = await db.get_thread(ids["thread"])
 
@@ -440,16 +1115,7 @@ async def test_pinned_session_binding_reads_one_reciprocal_pool_snapshot(db):
         expected_runtime_generation=str(thread["runtime_generation"]),
     )
 
-    assert binding is not None
-    assert binding.thread_id == ids["thread"]
-    assert binding.runtime_generation == str(thread["runtime_generation"])
-    assert binding.agent_id == ids["agent"]
-    assert binding.runtime_attach_token == ids["attach_token"]
-    assert binding.agent_hostname == f"persistent-{ids['thread'][:12]}"
-    assert binding.pod_uid == "old-pod"
-    assert binding.pod_ip == "127.0.0.1"
-    assert binding.pod_port == 8001
-    assert binding.agent_status == "session"
+    assert binding is None
 
     assert (
         await db.get_pinned_session_binding(
@@ -486,6 +1152,7 @@ async def test_pinned_session_binding_requires_exact_dedicated_pod_attempt(db):
         attempt_id=attempt,
         pod_name=pod_name,
         provisioner="persistent",
+        namespace="agents-a",
     )
     assert reserved is not None
     assert await db.publish_pinned_agent_pod_provision_intent(
@@ -494,6 +1161,7 @@ async def test_pinned_session_binding_requires_exact_dedicated_pod_attempt(db):
         attempt_id=attempt,
         pod_name=pod_name,
         pod_uid="dedicated-pod-uid",
+        namespace="agents-a",
     )
     async with db.acquire() as conn:
         await conn.execute(
@@ -518,12 +1186,11 @@ async def test_pinned_session_binding_requires_exact_dedicated_pod_attempt(db):
                 UUID(ids["thread"]),
             )
 
-    assert (
-        await db.get_pinned_session_binding(
-            ids["thread"], expected_runtime_generation=generation
-        )
-        is not None
+    binding = await db.get_pinned_session_binding(
+        ids["thread"], expected_runtime_generation=generation
     )
+    assert binding is not None
+    assert binding.pod_namespace == "agents-a"
 
     # The row trigger deliberately owns name/UID reciprocity; the joined
     # selection additionally refuses a stale/corrupt G or provision-attempt
@@ -663,6 +1330,34 @@ async def _reconcile_until_phase(
     )
 
 
+async def _park_and_terminalize_old_pod(
+    recycler: PersistentThreadRecycler,
+    provisioner: FakeProvisioner,
+    ids: dict[str, str],
+    *,
+    reason: str,
+    expected_build_sha: str,
+) -> None:
+    if provisioner.current is None:
+        provisioner.current = _pod_status(
+            ids["thread"], uid="old-pod", build="old-build"
+        )
+    requested = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason=reason,
+        expected_build_sha=expected_build_sha,
+        expected_project_id=ids["project"],
+    )
+    assert requested.phase == "awaiting_old_pod_exit"
+    acknowledged = await recycler.acknowledge_parked_boundary(
+        thread_id=ids["thread"], agent_id=None
+    )
+    assert acknowledged.acknowledged is True
+    provisioner.current = _terminal_pod_status(
+        ids["thread"], uid="old-pod", build="old-build"
+    )
+
+
 def _managed_gitea(*, probe: bool = True) -> MagicMock:
     client = MagicMock()
     client.repository_owner = "srw"
@@ -753,7 +1448,7 @@ async def test_ended_transition_trigger_blocks_old_agent_but_allows_resume(db):
 
 @pytest.mark.asyncio
 async def test_pinned_retirement_closes_admission_until_exact_abort(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     authority = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
 
     assert authority["state"] == "pending"
@@ -771,6 +1466,30 @@ async def test_pinned_retirement_closes_admission_until_exact_abort(db):
         ids["thread"], authority["generation"]
     )
     assert await db.resume_thread(ids["thread"]) is False
+
+    blocked_delivery_id = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            with pytest.raises(
+                InputDeliveryAuthorityLost,
+                match="retirement owns input",
+            ):
+                await persist_input_delivery(
+                    conn,
+                    thread_id=ids["thread"],
+                    delivery_id=blocked_delivery_id,
+                    role="human",
+                    content="must not cross End",
+                    source="direct_human",
+                    turn_number=1,
+                )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM thread_input_deliveries WHERE delivery_id=$1",
+                blocked_delivery_id,
+            )
+            == 0
+        )
 
     async with db.acquire() as conn:
         with pytest.raises(asyncpg.CheckViolationError) as refused:
@@ -818,6 +1537,146 @@ async def test_pinned_retirement_closes_admission_until_exact_abort(db):
     assert str(reopened["agent_id"]) == ids["agent"]
     assert str(reopened["control_admission_agent_id"]) == ids["agent"]
     assert str(reopened["runtime_attach_token"]) == ids["attach_token"]
+
+
+@pytest.mark.asyncio
+async def test_direct_input_committed_before_end_remains_durable(db):
+    """The opposite row-lock linearization preserves the committed input."""
+
+    ids = await _seed(db, protected_agent_pod=True)
+    delivery_id = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            persisted = await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=delivery_id,
+                role="human",
+                content="committed before End",
+                source="direct_human",
+                turn_number=1,
+            )
+    assert persisted["state"] == "persisted"
+
+    authority = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert authority["state"] == "pending"
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT state, thread_id FROM thread_input_deliveries WHERE delivery_id=$1",
+            delivery_id,
+        )
+    assert row is not None
+    assert row["state"] == "persisted"
+    assert str(row["thread_id"]) == ids["thread"]
+
+
+@pytest.mark.parametrize("terminal_state", ["admitted", "settled"])
+@pytest.mark.asyncio
+async def test_terminal_input_lost_response_replays_after_soft_end(db, terminal_state):
+    """A response lost before End remains observable to its exact old owner."""
+
+    ids = await _seed(db, protected_agent_pod=True)
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    delivery_id = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            delivery = await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=delivery_id,
+                role="human",
+                content="accepted before End response loss",
+                source="direct_human",
+                turn_number=1,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=generation,
+                runtime_attach_token=ids["attach_token"],
+            )
+            claim_generation = int(delivery["claim_generation"])
+            assert await mark_input_delivery_queued(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=generation,
+                runtime_attach_token=ids["attach_token"],
+                claim_generation=claim_generation,
+            )
+            assert await transition_input_delivery(
+                conn,
+                delivery_id=delivery_id,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=generation,
+                runtime_attach_token=ids["attach_token"],
+                claim_generation=claim_generation,
+                transition="admitted",
+                turn_number=1,
+            )
+            if terminal_state == "settled":
+                assert await transition_input_delivery(
+                    conn,
+                    delivery_id=delivery_id,
+                    agent_id=ids["agent"],
+                    pod_uid="old-pod",
+                    runtime_generation=generation,
+                    runtime_attach_token=ids["attach_token"],
+                    claim_generation=claim_generation,
+                    transition="settled",
+                )
+
+    authority = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    await _authorize_and_ack(db, ids, authority)
+    assert await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=authority["token"],
+        generation=authority["generation"],
+        final_status="ended",
+    )
+    ended = await db.get_thread(ids["thread"])
+    assert ended["status"] == "ended"
+    assert ended["agent_id"] is None
+    assert ended["runtime_attach_token"] is None
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            replay = await persist_input_delivery(
+                conn,
+                thread_id=ids["thread"],
+                delivery_id=delivery_id,
+                role="human",
+                content="accepted before End response loss",
+                source="direct_human",
+                turn_number=1,
+                agent_id=ids["agent"],
+                pod_uid="old-pod",
+                runtime_generation=generation,
+                runtime_attach_token=ids["attach_token"],
+            )
+    assert replay["state"] == terminal_state
+    assert replay["transcript_inserted"] is False
+    assert replay["queue_state"] is None
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            with pytest.raises(
+                InputDeliveryAuthorityLost,
+                match="belongs to another runtime",
+            ):
+                await persist_input_delivery(
+                    conn,
+                    thread_id=ids["thread"],
+                    delivery_id=delivery_id,
+                    role="human",
+                    content="accepted before End response loss",
+                    source="direct_human",
+                    turn_number=1,
+                    agent_id=ids["agent"],
+                    pod_uid="same-ip-successor-pod",
+                    runtime_generation=generation,
+                    runtime_attach_token=ids["attach_token"],
+                )
 
 
 @pytest.mark.asyncio
@@ -1749,7 +2608,7 @@ async def test_runtime_exposure_is_monotonic_within_generation(db):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("permanent", [False, True])
-async def test_pre_registration_agent_pod_is_exact_stopped_before_retirement(
+async def test_legacy_pre_registration_agent_pod_fails_closed_without_protocol(
     db, permanent
 ):
     import main as orch_main
@@ -1796,16 +2655,15 @@ async def test_pre_registration_agent_pod_is_exact_stopped_before_retirement(
             ids["thread"], entry, permanent=permanent, force=True
         )
 
-    assert result == {"status": "deleted" if permanent else "ended"}
-    provisioner.delete_agent_pod_exact.assert_awaited_once_with(
-        f"persistent-{ids['thread'][:12]}", expected_pod_uid="old-pod"
-    )
-    if permanent:
-        assert await db.get_thread(ids["thread"]) is None
-    else:
-        settled = await db.get_thread(ids["thread"])
-        assert settled is not None and settled["status"] == "ended"
-        assert "agent_pod" not in _json(settled["metadata"])
+    assert result == {
+        "status": "ending",
+        "retirement_disposition": "ended",
+        "retirement_permanent": permanent,
+    }
+    provisioner.delete_agent_pod_exact.assert_not_awaited()
+    pending = await db.get_thread(ids["thread"])
+    assert pending is not None
+    assert pending["runtime_retirement_token"] is not None
 
 
 @pytest.mark.asyncio
@@ -1904,6 +2762,7 @@ async def test_response_lost_agent_create_uses_retained_pod_and_pvc_fences(
         attempt_id=attempt_id,
         pod_name=f"srw-agent-s-{attempt_id[:8]}",
         provisioner="agent",
+        namespace="agents-a",
         pvc_name=claim_name,
     )
     assert intent is not None
@@ -1924,7 +2783,11 @@ async def test_response_lost_agent_create_uses_retained_pod_and_pvc_fences(
     provisioner.agent_pod_provision_intent_authority = AsyncMock()
     provisioner.agent_workspace_claim_authority = AsyncMock()
     provisioner.delete_agent_workspace_claim_exact = AsyncMock(return_value=True)
+    provisioner.release_agent_workspace_claim_finalizer_exact = AsyncMock(
+        return_value=True
+    )
     provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
     with (
         patch.object(orch_main, "postgres_db", db),
         patch.object(orch_main, "agent_provisioner", provisioner),
@@ -1997,9 +2860,11 @@ async def test_k8s_create_fence_rows_cannot_be_forged_terminal_at_insert(db):
             await conn.execute(
                 "INSERT INTO thread_agent_workspace_claims ("
                 "claim_id,thread_id,created_runtime_generation,create_attempt,"
-                "provisioner,pvc_name,status,pvc_uid,fenced_at,gc_after) "
+                "provisioner,pvc_name,status,pvc_uid,fenced_at,gc_after,"
+                "namespace,protection_protocol) "
                 "VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'agent',$5,"
-                "'fenced','fake-pvc-uid',now(),now()+interval '10 minutes')",
+                "'fenced','fake-pvc-uid',now(),now()+interval '10 minutes',"
+                "'agents-a','finalizer_v1')",
                 uuid4(),
                 UUID(ids["thread"]),
                 UUID(generation),
@@ -2014,9 +2879,11 @@ async def test_k8s_create_fence_rows_cannot_be_forged_terminal_at_insert(db):
             await conn.execute(
                 "INSERT INTO thread_agent_pod_provision_intents ("
                 "attempt_id,thread_id,runtime_generation,provisioner,pod_name,"
-                "status,pod_uid,fenced_at,gc_after) VALUES ("
+                "status,pod_uid,fenced_at,gc_after,namespace,"
+                "protection_protocol) VALUES ("
                 "$1::uuid,$2::uuid,$3::uuid,'agent',$4,'fenced',"
-                "'fake-pod-uid',now(),now()+interval '10 minutes')",
+                "'fake-pod-uid',now(),now()+interval '10 minutes',"
+                "'agents-a','finalizer_v1')",
                 uuid4(),
                 UUID(ids["thread"]),
                 UUID(generation),
@@ -2041,6 +2908,7 @@ async def test_published_agent_create_intent_is_idempotently_adopted(db):
         attempt_id=original_attempt,
         pod_name=pod_name,
         provisioner="agent",
+        namespace="agents-a",
         pvc_name=pvc_name,
     )
     assert reserved is not None
@@ -2051,6 +2919,7 @@ async def test_published_agent_create_intent_is_idempotently_adopted(db):
         claim_id=str(claim["claim_id"]),
         pvc_name=pvc_name,
         pvc_uid="pvc-uid",
+        namespace="agents-a",
     )
     assert await db.publish_pinned_agent_pod_provision_intent(
         ids["thread"],
@@ -2058,7 +2927,7 @@ async def test_published_agent_create_intent_is_idempotently_adopted(db):
         attempt_id=original_attempt,
         pod_name=pod_name,
         pod_uid="pod-uid",
-        namespace="test",
+        namespace="agents-a",
     )
 
     adopted = await db.reserve_pinned_agent_pod_provision_intent(
@@ -2067,6 +2936,7 @@ async def test_published_agent_create_intent_is_idempotently_adopted(db):
         attempt_id=str(uuid4()),
         pod_name="srw-agent-s-unused",
         provisioner="agent",
+        namespace="agents-a",
         pvc_name=pvc_name,
     )
     assert adopted is not None
@@ -2085,6 +2955,92 @@ async def test_published_agent_create_intent_is_idempotently_adopted(db):
 
 
 @pytest.mark.asyncio
+async def test_pinned_k8s_coordinates_are_required_and_immutable(db):
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    attempt = str(uuid4())
+    pod_name = f"srw-agent-s-{attempt[:8]}"
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as missing:
+            await conn.execute(
+                "INSERT INTO thread_agent_pod_provision_intents ("
+                "attempt_id,thread_id,runtime_generation,provisioner,pod_name) "
+                "VALUES ($1::uuid,$2::uuid,$3::uuid,'agent',$4)",
+                UUID(attempt),
+                UUID(ids["thread"]),
+                UUID(generation),
+                pod_name,
+            )
+        assert missing.value.constraint_name == "pinned_agent_k8s_coordinates"
+
+    reserved = await db.reserve_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt,
+        pod_name=pod_name,
+        provisioner="agent",
+        namespace="agents-a",
+    )
+    assert reserved is not None
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as rewritten:
+            await conn.execute(
+                "UPDATE thread_agent_pod_provision_intents "
+                "SET namespace='agents-b',status='published',pod_uid='pod-u1',"
+                "resolved_at=transaction_timestamp() WHERE attempt_id=$1::uuid",
+                UUID(attempt),
+            )
+        assert rewritten.value.constraint_name == "pinned_agent_k8s_coordinates"
+
+
+@pytest.mark.asyncio
+async def test_legacy_null_namespace_intent_is_not_adopted(db):
+    """A pre-0198 row remains visible for fencing but is never guessed current."""
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    attempt = str(uuid4())
+    pod_name = f"srw-agent-s-{attempt[:8]}"
+    async with db.acquire() as conn:
+        await conn.execute(
+            "ALTER TABLE thread_agent_pod_provision_intents DISABLE TRIGGER "
+            "zz_thread_agent_pod_provision_coordinates"
+        )
+        try:
+            await conn.execute(
+                "INSERT INTO thread_agent_pod_provision_intents ("
+                "attempt_id,thread_id,runtime_generation,provisioner,pod_name) "
+                "VALUES ($1::uuid,$2::uuid,$3::uuid,'agent',$4)",
+                UUID(attempt),
+                UUID(ids["thread"]),
+                UUID(generation),
+                pod_name,
+            )
+        finally:
+            await conn.execute(
+                "ALTER TABLE thread_agent_pod_provision_intents ENABLE TRIGGER "
+                "zz_thread_agent_pod_provision_coordinates"
+            )
+
+    assert (
+        await db.reserve_pinned_agent_pod_provision_intent(
+            ids["thread"],
+            expected_runtime_generation=generation,
+            attempt_id=str(uuid4()),
+            pod_name="srw-agent-s-do-not-adopt",
+            provisioner="agent",
+            namespace="agents-a",
+        )
+        is None
+    )
+    rows = await db.list_pinned_agent_create_intents_for_reconcile()
+    assert len(rows) == 1
+    assert str(rows[0]["attempt_id"]) == attempt
+    assert rows[0]["namespace"] is None
+    assert rows[0]["protection_protocol"] is None
+
+
+@pytest.mark.asyncio
 async def test_planned_agent_create_intent_cannot_be_reissued_after_end_begins(db):
     ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
@@ -2096,6 +3052,7 @@ async def test_planned_agent_create_intent_cannot_be_reissued_after_end_begins(d
         attempt_id=attempt,
         pod_name=pod_name,
         provisioner="agent",
+        namespace="agents-a",
     )
     open_rows = await db.list_pinned_agent_create_intents_for_reconcile()
     assert len(open_rows) == 1
@@ -2110,6 +3067,7 @@ async def test_planned_agent_create_intent_cannot_be_reissued_after_end_begins(d
             attempt_id=attempt,
             pod_name=pod_name,
             provisioner="agent",
+            namespace="agents-a",
         )
         is None
     )
@@ -2313,6 +3271,14 @@ async def test_pinned_vm_provision_generation_is_installed_under_exact_actor(db)
     assert stored["identity_authenticated"] is False
     assert stored["vm_uid"] is None
     assert stored["_runtime_incarnation"] is None
+    metadata = _json((await db.get_thread(ids["thread"]))["metadata"])
+    assert metadata["_workspace_contract"] == {
+        "version": 1,
+        "requested_backend": "vm",
+        "assigned_backend": "vm",
+        "assignment_source": "runtime_vm_upgrade",
+    }
+    assert metadata["config_override"]["workspace"]["backend"] == "vm"
 
     replacement = VMProvisioner._fresh_provision_ctx()
     replacement["status"] = "provisioning"
@@ -3441,8 +4407,746 @@ async def test_stale_connection_self_heal_cannot_clear_successor_binding(db):
 
 
 @pytest.mark.asyncio
+async def test_legacy_0185_planned_response_loss_is_adopted_by_leader(db, monkeypatch):
+    """A crash after Pod/PVC CREATE is reconciled without the old caller."""
+
+    ids = await _seed_legacy_0185_authority(db, bind_agent=False, published=False)
+    api = StatefulPinnedK8sApi()
+    _install_legacy_0185_objects(api, ids)
+    monkeypatch.setenv("AGENT_NAMESPACE", "agents-b")
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = PersistentProvisioner()
+    provisioner._db = db
+    provisioner._core_api = api
+    provisioner._k8s_available = True
+
+    result = await reconcile_legacy_pinned_agent_authority(
+        db,
+        persistent_provisioner=provisioner,
+        thread_id=ids["thread"],
+        limit=2,
+    )
+
+    assert result.scanned == 1
+    assert result.adopted == 1
+    assert result.unresolved == 0
+    async with db.acquire() as conn:
+        intent = await conn.fetchrow(
+            "SELECT status,pod_uid,namespace,protection_protocol FROM "
+            "thread_agent_pod_provision_intents WHERE attempt_id=$1::uuid",
+            UUID(ids["provision_attempt"]),
+        )
+        claim = await conn.fetchrow(
+            "SELECT status,pvc_uid,namespace,protection_protocol FROM "
+            "thread_agent_workspace_claims WHERE claim_id=$1::uuid",
+            UUID(ids["workspace_claim_id"]),
+        )
+    thread = await db.get_thread(ids["thread"])
+    marker = _json(thread["metadata"])["agent_pod"]
+    assert dict(intent) == {
+        "status": "published",
+        "pod_uid": "old-pod",
+        "namespace": "agents-a",
+        "protection_protocol": "finalizer_v1",
+    }
+    assert dict(claim) == {
+        "status": "ready",
+        "pvc_uid": ids["pvc_uid"],
+        "namespace": "agents-a",
+        "protection_protocol": "finalizer_v1",
+    }
+    assert marker["provision_attempt"] == ids["provision_attempt"]
+    assert marker["namespace"] == "agents-a"
+    assert api.pods[("agents-a", ids["pod_name"])].metadata.finalizers == [
+        PINNED_AUTHORITY_FINALIZER
+    ]
+    assert api.pvcs[("agents-a", ids["pvc_name"])].metadata.finalizers == [
+        PINNED_AUTHORITY_FINALIZER
+    ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_0185_live_authority_is_adopted_before_first_end(db, monkeypatch):
+    """A deployed pinned session reaches 0198 without freezing NULL authority."""
+
+    import main as orch_main
+
+    ids = await _seed_legacy_0185_authority(db)
+    before = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert before == {
+        "state": "malformed",
+        "reason": "agent_k8s_authority_adoption_required",
+    }
+    assert (await db.get_thread(ids["thread"]))["runtime_retirement_token"] is None
+
+    api = StatefulPinnedK8sApi()
+    _install_legacy_0185_objects(api, ids)
+    monkeypatch.setenv("AGENT_NAMESPACE", "agents-b")
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = PersistentProvisioner()
+    provisioner._db = db
+    provisioner._core_api = api
+    provisioner._k8s_available = True
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata=jsonb_set(metadata,"
+            "'{config_override,officer,enabled}','false'::jsonb,true) "
+            "WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+    entry = await db.get_thread(ids["thread"])
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "persistent_provisioner", provisioner),
+        patch.object(
+            orch_main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"id": "owner"}, entry)),
+        ),
+        patch.object(
+            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+        ),
+        patch.object(
+            orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
+        ),
+    ):
+        result = await orch_main.end_thread(
+            ids["thread"], SimpleNamespace(), permanent=False, force=True
+        )
+    assert result == {
+        "status": "ending",
+        "retirement_disposition": "ended",
+        "retirement_permanent": False,
+    }
+    assert api.pods[("agents-a", ids["pod_name"])].metadata.finalizers == [
+        PINNED_AUTHORITY_FINALIZER
+    ]
+    assert api.pvcs[("agents-a", ids["pvc_name"])].metadata.finalizers == [
+        PINNED_AUTHORITY_FINALIZER
+    ]
+
+    async with db.acquire() as conn:
+        context = await conn.fetchval(
+            "SELECT runtime_retirement_context FROM threads WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+        receipt = await conn.fetchrow(
+            "SELECT * FROM thread_agent_k8s_authority_adoptions "
+            "WHERE attempt_id=$1::uuid",
+            UUID(ids["provision_attempt"]),
+        )
+    context = _json(context)
+    assert context["agent_pod"]["namespace"] == "agents-a"
+    assert context["agent_pod"]["protection_protocol"] == "finalizer_v1"
+    assert context["agent_workspace_claim"]["namespace"] == "agents-a"
+    assert receipt is not None
+    assert str(receipt["pod_uid"]) == "old-pod"
+    assert str(receipt["pvc_uid"]) == ids["pvc_uid"]
+    assert str(receipt["namespace"]) == "agents-a"
+
+
+@pytest.mark.asyncio
+async def test_legacy_0185_live_authority_is_adopted_before_first_recycle(
+    db, monkeypatch
+):
+    ids = await _seed_legacy_0185_authority(db)
+    api = StatefulPinnedK8sApi()
+    _install_legacy_0185_objects(api, ids)
+    monkeypatch.setenv("AGENT_NAMESPACE", "agents-b")
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = PersistentProvisioner()
+    provisioner._db = db
+    provisioner._core_api = api
+    provisioner._k8s_available = True
+    recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+
+    result = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="operator_requested",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert result.phase == "awaiting_old_pod_exit"
+    thread = await db.get_thread(ids["thread"])
+    marker = _json(thread["metadata"])["agent_pod"]
+    assert marker["namespace"] == "agents-a"
+    assert marker["protection_protocol"] == "finalizer_v1"
+    assert marker["recycle"]["phase"] == "awaiting_old_pod_exit"
+    assert api.mutation_timeouts
+    assert all(timeout is not None for timeout in api.mutation_timeouts)
+
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as rewritten:
+            await conn.execute(
+                "UPDATE thread_agent_k8s_authority_adoptions "
+                "SET namespace='agents-b' WHERE attempt_id=$1::uuid",
+                UUID(ids["provision_attempt"]),
+            )
+    assert rewritten.value.constraint_name == "thread_agent_k8s_authority_adoption"
+
+
+@pytest.mark.asyncio
+async def test_pre_0198_warm_binding_is_adopted_before_actual_end(db, monkeypatch):
+    """A deployed pool-bound session gains exact authority before End freezes T."""
+
+    import main as orch_main
+
+    ids = await _seed_warm_pool_binding(db, bound=True)
+    assert await db.begin_pinned_thread_retirement(ids["thread"], permanent=False) == {
+        "state": "malformed",
+        "reason": "agent_warm_binding_adoption_required",
+    }
+    api = StatefulPinnedK8sApi()
+    _install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = _production_warm_provisioner(db, api)
+    entry = await db.get_thread(ids["thread"])
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "agent_provisioner", provisioner),
+        patch.object(
+            orch_main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"id": "owner"}, entry)),
+        ),
+        patch.object(
+            orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+        ),
+        patch.object(
+            orch_main, "_conclude_conference_if_any", AsyncMock(return_value=None)
+        ),
+    ):
+        result = await orch_main.end_thread(
+            ids["thread"], SimpleNamespace(), permanent=False, force=True
+        )
+    assert result["status"] == "ending"
+    assert api.pods[("agents-a", ids["pod_name"])].metadata.finalizers == [
+        PINNED_AUTHORITY_FINALIZER
+    ]
+    async with db.acquire() as conn:
+        warm = await conn.fetchrow(
+            "SELECT * FROM thread_agent_warm_binding_protections "
+            "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid",
+            UUID(ids["thread"]),
+            UUID(ids["runtime_generation"]),
+        )
+        context = await conn.fetchval(
+            "SELECT runtime_retirement_context FROM threads WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+    assert warm is not None and warm["status"] == "bound"
+    assert warm["source"] == "legacy_binding"
+    marker = _json(context)["agent_pod"]
+    assert marker["namespace"] == "agents-a"
+    assert marker["warm_binding_protection"] == str(warm["protection_id"])
+
+
+@pytest.mark.asyncio
+async def test_warm_attach_patch_response_loss_binds_exact_marker(db, monkeypatch):
+    ids = await _seed_warm_pool_binding(db, bound=False)
+    api = StatefulPinnedK8sApi()
+    _install_warm_pool_pod(api, ids)
+    api.lose_next_pod_patch_response = True
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = _production_warm_provisioner(db, api)
+
+    result = await reserve_pinned_warm_agent_binding(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        thread_id=ids["thread"],
+        agent_id=ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+
+    assert result.bound
+    thread = await db.get_thread(ids["thread"])
+    marker = _json(thread["metadata"])["agent_pod"]
+    assert str(thread["agent_id"]) == ids["agent"]
+    assert str(thread["runtime_attach_token"]) == result.attach_token
+    assert marker["pod_uid"] == ids["pod_uid"]
+    assert marker["namespace"] == "agents-a"
+    assert marker["protection_protocol"] == "finalizer_v1"
+    binding = await db.get_pinned_session_binding(
+        ids["thread"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    assert binding is not None
+    assert binding.pod_namespace == "agents-a"
+    assert binding.agent_id == ids["agent"]
+    assert binding.pod_uid == ids["pod_uid"]
+    assert api.mutation_timeouts and all(
+        timeout is not None for timeout in api.mutation_timeouts
+    )
+
+
+@pytest.mark.asyncio
+async def test_crash_after_warm_finalizer_patch_is_released_by_leader(db, monkeypatch):
+    """A finalizer committed before DB publication remains owned and retryable."""
+
+    ids = await _seed_warm_pool_binding(db, bound=False)
+    api = StatefulPinnedK8sApi()
+    _install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = _production_warm_provisioner(db, api)
+    candidate = await db.get_pinned_warm_binding_candidate(
+        ids["thread"],
+        ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    discovery = await provisioner.discover_pinned_warm_agent_authority(candidate)
+    protection_id = str(uuid4())
+    planned = await db.plan_pinned_warm_binding_protection(
+        ids["thread"],
+        expected_runtime_generation=ids["runtime_generation"],
+        runtime_attach_token=str(uuid4()),
+        agent_id=ids["agent"],
+        protection_id=protection_id,
+        source="attach",
+        provisioner="agent",
+        namespace=str(discovery["namespace"]),
+        pod_name=ids["pod_name"],
+        pod_uid=ids["pod_uid"],
+        discovered_resource_version=str(discovery["pod_resource_version"]),
+    )
+    assert planned is not None
+    effect_token = str(uuid4())
+    claimed = await db.claim_pinned_warm_binding_effect(
+        protection_id, effect_token=effect_token
+    )
+    assert claimed is not None
+    evidence = await provisioner.protect_planned_pinned_warm_agent_authority(claimed)
+    assert evidence is not None
+    # Model process death and lease time elapsing without mutating any other
+    # authority field. The next leader must discover this planned row.
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE thread_agent_warm_binding_protections "
+                "SET effect_expires_at=effect_started_at+interval '1 microsecond' "
+                "WHERE protection_id=$1::uuid",
+                UUID(protection_id),
+            )
+
+    reconciled = await reconcile_pinned_warm_binding_protections(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        limit=2,
+    )
+    assert reconciled.unresolved == 0
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status,release_outcome FROM "
+            "thread_agent_warm_binding_protections "
+            "WHERE protection_id=$1::uuid",
+            UUID(protection_id),
+        )
+        agent = await conn.fetchrow(
+            "SELECT status::text,thread_id FROM agents WHERE id=$1::uuid",
+            UUID(ids["agent"]),
+        )
+    assert dict(row) == {
+        "status": "released",
+        "release_outcome": "exact_live_unprotected_v1",
+    }
+    assert dict(agent) == {"status": "ready", "thread_id": None}
+    assert api.pods[("agents-a", ids["pod_name"])].metadata.finalizers == []
+    assert (await db.get_thread(ids["thread"]))["agent_id"] is None
+
+    # Terminal attempts are immutable audit rows, not a generation tombstone.
+    # A different exact pool Pod can immediately reserve this still-open G.
+    second_agent = str(uuid4())
+    second_name = f"srw-agent-j-{second_agent[:8]}"
+    second_uid = f"warm-{second_agent}"
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO agents (id,config_name,hostname,pod_ip,pod_uid,status,"
+            "agent_mode,last_heartbeat) VALUES ("
+            "$1::uuid,'worker_base',$2,'127.0.0.2',$3,'ready','dual',now())",
+            UUID(second_agent),
+            second_name,
+            second_uid,
+        )
+    second = dict(ids)
+    second.update(agent=second_agent, pod_name=second_name, pod_uid=second_uid)
+    _install_warm_pool_pod(api, second)
+    rebound = await reserve_pinned_warm_agent_binding(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        thread_id=ids["thread"],
+        agent_id=second_agent,
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    assert rebound.bound
+
+
+@pytest.mark.asyncio
+async def test_unmodified_warm_plan_abort_can_retry_same_generation(db, monkeypatch):
+    ids = await _seed_warm_pool_binding(db, bound=False)
+    api = StatefulPinnedK8sApi()
+    _install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = _production_warm_provisioner(db, api)
+    candidate = await db.get_pinned_warm_binding_candidate(
+        ids["thread"],
+        ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    discovery = await provisioner.discover_pinned_warm_agent_authority(candidate)
+    protection_id = str(uuid4())
+    assert await db.plan_pinned_warm_binding_protection(
+        ids["thread"],
+        expected_runtime_generation=ids["runtime_generation"],
+        runtime_attach_token=str(uuid4()),
+        agent_id=ids["agent"],
+        protection_id=protection_id,
+        source="attach",
+        provisioner="agent",
+        namespace=str(discovery["namespace"]),
+        pod_name=ids["pod_name"],
+        pod_uid=ids["pod_uid"],
+        discovered_resource_version=str(discovery["pod_resource_version"]),
+    )
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE thread_agent_warm_binding_protections "
+                "SET lease_expires_at=created_at+interval '1 microsecond' "
+                "WHERE protection_id=$1::uuid",
+                UUID(protection_id),
+            )
+    settled = await reconcile_pinned_warm_binding_protections(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        limit=2,
+    )
+    assert settled.unresolved == 0
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT status FROM thread_agent_warm_binding_protections "
+                "WHERE protection_id=$1::uuid",
+                UUID(protection_id),
+            )
+            == "aborted"
+        )
+    retried = await reserve_pinned_warm_agent_binding(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        thread_id=ids["thread"],
+        agent_id=ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    assert retried.bound
+
+
+@pytest.mark.asyncio
+async def test_expired_warm_effect_fence_beats_delayed_finalizer_and_retry_succeeds(
+    db, monkeypatch
+):
+    """The annotation and delayed finalizer contend on one resourceVersion."""
+
+    ids = await _seed_warm_pool_binding(db, bound=False)
+    api = StatefulPinnedK8sApi()
+    _install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = _production_warm_provisioner(db, api)
+    candidate = await db.get_pinned_warm_binding_candidate(
+        ids["thread"],
+        ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    discovery = await provisioner.discover_pinned_warm_agent_authority(candidate)
+    protection_id = str(uuid4())
+    planned = await db.plan_pinned_warm_binding_protection(
+        ids["thread"],
+        expected_runtime_generation=ids["runtime_generation"],
+        runtime_attach_token=str(uuid4()),
+        agent_id=ids["agent"],
+        protection_id=protection_id,
+        source="attach",
+        provisioner="agent",
+        namespace=str(discovery["namespace"]),
+        pod_name=ids["pod_name"],
+        pod_uid=ids["pod_uid"],
+        discovered_resource_version=str(discovery["pod_resource_version"]),
+    )
+    assert planned is not None
+    effect_token = str(uuid4())
+    claimed = await db.claim_pinned_warm_binding_effect(
+        protection_id, effect_token=effect_token
+    )
+    assert claimed is not None
+
+    # Pause the owner after it has built its RV=1 finalizer patch but before
+    # the API server applies it. The reconciler's fence is allowed to commit
+    # RV=2 first; the delayed mutation must then receive 409 and never retry a
+    # newer resourceVersion.
+    started = threading.Event()
+    release = threading.Event()
+    api.block_next_pod_patch_started = started
+    api.block_next_pod_patch_release = release
+    delayed = asyncio.create_task(
+        provisioner.protect_planned_pinned_warm_agent_authority(claimed)
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE thread_agent_warm_binding_protections "
+                "SET effect_expires_at=effect_started_at+interval '1 microsecond' "
+                "WHERE protection_id=$1::uuid",
+                UUID(protection_id),
+            )
+    reconciled = await reconcile_pinned_warm_binding_protections(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        limit=2,
+    )
+    assert reconciled.unresolved == 0
+    pod = api.pods[("agents-a", ids["pod_name"])]
+    assert pod.metadata.finalizers == []
+    expected_fence = f"{protection_id}:{effect_token}"
+    assert (
+        pod.metadata.annotations[PINNED_WARM_PROTECTION_FENCE_ANNOTATION]
+        == expected_fence
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status,abort_fence_protocol,abort_fence_resource_version,"
+            "abort_fence_value FROM thread_agent_warm_binding_protections "
+            "WHERE protection_id=$1::uuid",
+            UUID(protection_id),
+        )
+        agent_status = await conn.fetchval(
+            "SELECT status::text FROM agents WHERE id=$1::uuid",
+            UUID(ids["agent"]),
+        )
+    assert dict(row) == {
+        "status": "aborted",
+        "abort_fence_protocol": "exact_rv_annotation_fence_v1",
+        "abort_fence_resource_version": "2",
+        "abort_fence_value": expected_fence,
+    }
+    assert agent_status == "ready"
+
+    release.set()
+    assert await delayed is None
+    assert pod.metadata.finalizers == []
+
+    retried = await reserve_pinned_warm_agent_binding(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        thread_id=ids["thread"],
+        agent_id=ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    assert retried.bound
+    assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_warm_effect_stays_protecting_until_reconciled(db, monkeypatch):
+    """Cancellation joins K8s and cannot return a claimed agent to ready."""
+
+    ids = await _seed_warm_pool_binding(db, bound=False)
+    api = StatefulPinnedK8sApi()
+    _install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = _production_warm_provisioner(db, api)
+    started = threading.Event()
+    release = threading.Event()
+    api.block_next_pod_patch_started = started
+    api.block_next_pod_patch_release = release
+    attach = asyncio.create_task(
+        reserve_pinned_warm_agent_binding(
+            db,
+            agent_provisioner=provisioner,
+            persistent_provisioner=None,
+            thread_id=ids["thread"],
+            agent_id=ids["agent"],
+            expected_runtime_generation=ids["runtime_generation"],
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+    attach.cancel()
+    await asyncio.sleep(0.02)
+    assert not attach.done()
+    async with db.acquire() as conn:
+        before = await conn.fetchrow(
+            "SELECT warm.protection_id,warm.status,warm.effect_token,"
+            "a.status::text AS agent_status "
+            "FROM thread_agent_warm_binding_protections warm "
+            "JOIN agents a ON a.id=warm.agent_id "
+            "WHERE warm.thread_id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+    assert before["status"] == "protecting"
+    assert before["effect_token"] is not None
+    assert before["agent_status"] == "draining"
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await attach
+    assert api.pods[("agents-a", ids["pod_name"])].metadata.finalizers == [
+        PINNED_AUTHORITY_FINALIZER
+    ]
+    async with db.acquire() as conn:
+        # Simulate the immutable bounded horizon elapsing after process death.
+        async with conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE thread_agent_warm_binding_protections "
+                "SET effect_expires_at=effect_started_at+interval '1 microsecond' "
+                "WHERE protection_id=$1::uuid",
+                before["protection_id"],
+            )
+    reconciled = await reconcile_pinned_warm_binding_protections(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        limit=2,
+    )
+    assert reconciled.unresolved == 0
+    async with db.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT warm.status,a.status::text AS agent_status "
+            "FROM thread_agent_warm_binding_protections warm "
+            "JOIN agents a ON a.id=warm.agent_id "
+            "WHERE warm.protection_id=$1::uuid",
+            before["protection_id"],
+        )
+    assert dict(after) == {"status": "released", "agent_status": "ready"}
+    assert api.pods[("agents-a", ids["pod_name"])].metadata.finalizers == []
+
+
+@pytest.mark.asyncio
+async def test_end_does_not_reconcile_live_warm_patch_lease(db, monkeypatch):
+    """End cannot abort a plan while its owner can still commit the patch."""
+
+    import main as orch_main
+
+    ids = await _seed_warm_pool_binding(db, bound=False)
+    api = StatefulPinnedK8sApi()
+    _install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = _production_warm_provisioner(db, api)
+    started = threading.Event()
+    release = threading.Event()
+    api.block_next_pod_patch_started = started
+    api.block_next_pod_patch_release = release
+    attach = asyncio.create_task(
+        reserve_pinned_warm_agent_binding(
+            db,
+            agent_provisioner=provisioner,
+            persistent_provisioner=None,
+            thread_id=ids["thread"],
+            agent_id=ids["agent"],
+            expected_runtime_generation=ids["runtime_generation"],
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+    try:
+        with (
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "agent_provisioner", provisioner),
+        ):
+            begin = await orch_main._begin_pinned_thread_retirement(
+                ids["thread"], permanent=False
+            )
+        assert begin == {
+            "state": "malformed",
+            "reason": "agent_warm_binding_protection_pending",
+        }
+        assert (await db.get_thread(ids["thread"]))["runtime_retirement_token"] is None
+        async with db.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT status FROM thread_agent_warm_binding_protections "
+                    "WHERE thread_id=$1::uuid",
+                    UUID(ids["thread"]),
+                )
+                == "protecting"
+            )
+    finally:
+        release.set()
+    result = await attach
+    assert result.bound
+    assert api.pods[("agents-a", ids["pod_name"])].metadata.finalizers == [
+        PINNED_AUTHORITY_FINALIZER
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bound_warm_attach_abort_releases_finalizer_before_pool_reuse(
+    db, monkeypatch
+):
+    import main as orch_main
+
+    ids = await _seed_warm_pool_binding(db, bound=False)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created' WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+    api = StatefulPinnedK8sApi()
+    _install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = _production_warm_provisioner(db, api)
+    reserved = await reserve_pinned_warm_agent_binding(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        thread_id=ids["thread"],
+        agent_id=ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    assert reserved.bound
+
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "agent_provisioner", provisioner),
+    ):
+        released = await orch_main._release_session_attach_binding(
+            ids["agent"],
+            ids["thread"],
+            expected_runtime_generation=ids["runtime_generation"],
+            expected_attach_token=str(reserved.attach_token),
+            pre_delivery=True,
+        )
+    assert released == "released"
+    async with db.acquire() as conn:
+        warm = await conn.fetchrow(
+            "SELECT status,release_outcome FROM "
+            "thread_agent_warm_binding_protections "
+            "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid",
+            UUID(ids["thread"]),
+            UUID(ids["runtime_generation"]),
+        )
+        agent = await conn.fetchrow(
+            "SELECT status::text,thread_id FROM agents WHERE id=$1::uuid",
+            UUID(ids["agent"]),
+        )
+    assert dict(warm) == {
+        "status": "released",
+        "release_outcome": "exact_live_unprotected_v1",
+    }
+    assert dict(agent) == {"status": "ready", "thread_id": None}
+    assert api.pods[("agents-a", ids["pod_name"])].metadata.finalizers == []
+
+
+@pytest.mark.asyncio
 async def test_turn_boundary_recycle_preserves_thread_and_replaces_authority(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     assert await db.enqueue_session_wake_event(
         ids["thread"],
         source="legate",
@@ -3450,7 +5154,7 @@ async def test_turn_boundary_recycle_preserves_thread_and_replaces_authority(db)
         payload={"message": "survives pod replacement"},
         project_id=ids["project"],
     )
-    provisioner = FakeProvisioner()
+    provisioner = FakeProvisioner(db)
     provisioner.current = _pod_status(ids["thread"], uid="old-pod", build="old-build")
     recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
     old = PersistentPodObservation.from_status(ids["thread"], provisioner.current)
@@ -3473,8 +5177,14 @@ async def test_turn_boundary_recycle_preserves_thread_and_replaces_authority(db)
     )
     assert acknowledgement.acknowledged is True
 
-    # The exact old object has disappeared after the runtime's clean exit.
-    provisioner.current = None
+    # The finalizer keeps the exact old object observable until its terminal
+    # state has been recorded and the recycle handoff owns its release.
+    provisioner.current = {
+        **_pod_status(ids["thread"], uid="old-pod", build="old-build"),
+        "phase": "Succeeded",
+        "ready": False,
+        "terminating": True,
+    }
     await _reconcile_until_phase(
         recycler,
         thread_id=ids["thread"],
@@ -3540,12 +5250,189 @@ async def test_turn_boundary_recycle_preserves_thread_and_replaces_authority(db)
 
 
 @pytest.mark.asyncio
+async def test_production_recycler_recovers_lost_create_in_captured_namespace(db):
+    """Real provisioner + PG survive U1 release and a lost U2 CREATE response."""
+
+    ids = await _seed(db, protected_agent_pod=True)
+    thread = await db.get_thread(ids["thread"])
+    generation = str(thread["runtime_generation"])
+    metadata = _json(thread["metadata"])
+    marker = metadata["agent_pod"]
+    pod_name = str(marker["pod_name"])
+    pvc_name = f"pvc-persistent-{ids['thread'][:12]}"
+    async with db.acquire() as conn:
+        claim = await conn.fetchrow(
+            "SELECT claim_id,create_attempt,pvc_uid FROM "
+            "thread_agent_workspace_claims WHERE thread_id=$1",
+            UUID(ids["thread"]),
+        )
+    assert claim is not None
+
+    api = StatefulPinnedK8sApi()
+    api.install_old_pod(
+        namespace="agents-a",
+        name=pod_name,
+        uid="old-pod",
+        labels={
+            "srw/component": "persistent-agent",
+            "srw/thread-id": ids["thread"],
+            "srw/build-sha": "old-build",
+            "srw.io/runtime-generation": generation,
+            "srw.io/provision-attempt": str(marker["provision_attempt"]),
+        },
+    )
+    api.install_pvc(
+        namespace="agents-a",
+        name=pvc_name,
+        uid=str(claim["pvc_uid"]),
+        labels={
+            "srw/component": "agent-workspace-pvc",
+            "srw.io/thread-id": ids["thread"],
+            "srw.io/runtime-generation": generation,
+            "srw.io/workspace-claim": str(claim["claim_id"]),
+            "srw.io/provision-attempt": str(claim["create_attempt"]),
+            "srw.io/claim-provisioner": "persistent",
+        },
+    )
+
+    provisioner = PersistentProvisioner()
+    provisioner._db = db
+    provisioner._core_api = api
+    provisioner._k8s_available = True
+    # Prove lifecycle effects use the namespace captured by 0198, not the
+    # current deployment default after a namespace move.
+    provisioner._namespace = "wrong-current-namespace"
+    provisioner._agent_image = "example.test/agent:sha-new-build"
+    provisioner._wait_for_ready = AsyncMock(return_value="10.0.0.8")
+    recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+
+    requested = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert requested.phase == "awaiting_old_pod_exit"
+    parked = await recycler.acknowledge_parked_boundary(
+        thread_id=ids["thread"], agent_id=None
+    )
+    assert parked.acknowledged is True
+    api.mark_terminal("agents-a", pod_name)
+
+    # Crash/failure immediately after the atomic DB handoff must leave U1
+    # protected and make the exact A2 adoptable by a fresh reconciler.
+    release_finalizer = provisioner.release_agent_pod_finalizer_exact
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=False)
+    stranded = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert stranded.phase == "fencing_old_authority"
+    assert api.pods[("agents-a", pod_name)].metadata.finalizers == [
+        PINNED_AUTHORITY_FINALIZER
+    ]
+    assert api.created_pod_manifests == []
+    provisioner.release_agent_pod_finalizer_exact = release_finalizer
+
+    after_handoff_restart = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    api.lose_next_pod_create_response = True
+
+    await _reconcile_until_phase(
+        after_handoff_restart,
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+        phases={"awaiting_replacement"},
+    )
+
+    assert len(api.created_pod_manifests) == 1
+    replacement_manifest = api.created_pod_manifests[0]
+    assert replacement_manifest["metadata"]["namespace"] == "agents-a"
+    assert replacement_manifest["metadata"]["finalizers"] == [
+        PINNED_AUTHORITY_FINALIZER
+    ]
+    assert all(timeout is not None for timeout in api.mutation_timeouts)
+    state, metadata = await _recycle_state(db, ids["thread"])
+    replacement_uid = str(metadata["agent_pod"]["pod_uid"])
+    assert replacement_uid.startswith("replacement-pod-")
+    assert metadata["agent_pod"]["namespace"] == "agents-a"
+    assert metadata["agent_pod"]["protection_protocol"] == "finalizer_v1"
+    async with db.acquire() as conn:
+        handoffs = await conn.fetch(
+            "SELECT predecessor_pod_uid,successor_attempt_id,namespace "
+            "FROM thread_agent_pod_recycle_handoffs WHERE thread_id=$1",
+            UUID(ids["thread"]),
+        )
+        published = await conn.fetchval(
+            "SELECT count(*) FROM thread_agent_pod_provision_intents "
+            "WHERE thread_id=$1 AND status='published'",
+            UUID(ids["thread"]),
+        )
+    assert len(handoffs) == 1
+    assert handoffs[0]["predecessor_pod_uid"] == "old-pod"
+    assert handoffs[0]["namespace"] == "agents-a"
+    assert str(handoffs[0]["successor_attempt_id"]) == state["successor_attempt"]
+    assert published == 2
+
+    # A restarted reconciler adopts the same published A2/U2 and never emits
+    # an A3 while agent registration is still catching up.
+    restarted = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    pending = await restarted.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert pending.phase == "awaiting_replacement"
+    assert len(api.created_pod_manifests) == 1
+
+    successor, _actor = await _bind_replacement_agent(
+        db, thread_id=ids["thread"], pod_uid=replacement_uid
+    )
+    api.mark_ready("agents-a", pod_name)
+    completed = await restarted.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert completed.phase == "complete"
+    current = await db.get_thread(ids["thread"])
+    assert str(current["agent_id"]) == successor
+    assert len(api.created_pod_manifests) == 1
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as rewritten:
+            await conn.execute(
+                "UPDATE thread_agent_pod_recycle_handoffs "
+                "SET process_zero_observed_at=process_zero_observed_at "
+                "WHERE thread_id=$1",
+                UUID(ids["thread"]),
+            )
+        assert (
+            rewritten.value.constraint_name
+            == "thread_agent_pod_recycle_handoff_authority"
+        )
+        with pytest.raises(asyncpg.CheckViolationError) as deleted:
+            await conn.execute(
+                "DELETE FROM thread_agent_pod_recycle_handoffs WHERE thread_id=$1",
+                UUID(ids["thread"]),
+            )
+        assert (
+            deleted.value.constraint_name
+            == "thread_agent_pod_recycle_handoff_authority"
+        )
+
+
+@pytest.mark.asyncio
 async def test_recycler_legacy_thread_recovers_through_registration_route(db, caplog):
     """0177 recovery uses the same adoption/bind/grant path as a real pod."""
 
     import main as orch_main
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     message_id = await db.save_thread_message(
         ids["thread"], "human", "continuity marker", turn_number=7
     )
@@ -3610,7 +5497,7 @@ async def test_recycler_legacy_thread_recovers_through_registration_route(db, ca
             )
         )
 
-    provisioner = FakeProvisioner()
+    provisioner = FakeProvisioner(db)
     pvc_identity = (
         f"pvc-persistent-{ids['thread'][:12]}",
         f"pvc-fixture-{uuid4()}",
@@ -3635,7 +5522,9 @@ async def test_recycler_legacy_thread_recovers_through_registration_route(db, ca
     )
     assert acknowledged.acknowledged is True
 
-    provisioner.current = None
+    provisioner.current = _terminal_pod_status(
+        ids["thread"], uid="old-pod", build="old-build"
+    )
     advanced = await _reconcile_until_phase(
         recycler,
         thread_id=ids["thread"],
@@ -3877,8 +5766,8 @@ async def test_recycler_legacy_thread_recovers_through_registration_route(db, ca
 
 
 @pytest.mark.asyncio
-async def test_concurrent_missing_pod_recovery_uses_one_generation_and_create(db):
-    ids = await _seed(db)
+async def test_concurrent_missing_pod_does_not_forge_process_zero(db):
+    ids = await _seed(db, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
 
@@ -3901,8 +5790,10 @@ async def test_concurrent_missing_pod_recovery_uses_one_generation_and_create(db
     )
     state, _ = await _recycle_state(db, ids["thread"])
     assert len({r.generation for r in results if r.generation}) == 1
-    assert state["phase"] == "awaiting_replacement"
-    assert provisioner.create_calls == 1
+    assert state["phase"] == "blocked"
+    assert state["last_failure"]["class"] == "pinned_pod_protection_unresolved"
+    assert provisioner.create_calls == 0
+    assert str((await db.get_thread(ids["thread"]))["agent_id"]) == ids["agent"]
 
 
 @pytest.mark.asyncio
@@ -3910,12 +5801,12 @@ async def test_raw_delete_wake_rejection_survives_hold_and_replacement(db):
     """The observed ordering: wake claim precedes the 60s lifecycle tick.
 
     The terminating runtime refuses that first delivery, so the outbox row is
-    released rather than stamped sent.  Missing-pod reconciliation then owns a
-    maintenance hold; after exact replacement authority is healthy, the same
-    durable delivery id is claimed and can be settled once.
+    released rather than stamped sent. The finalizer-preserved terminal Pod
+    then enters an exact handoff; after replacement authority is healthy, the
+    same durable delivery id is claimed and can be settled once.
     """
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     assert await db.enqueue_session_wake_event(
         ids["thread"],
         source="timer",
@@ -3935,6 +5826,13 @@ async def test_raw_delete_wake_rejection_survives_hold_and_replacement(db):
 
     provisioner = FakeProvisioner()
     recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    await _park_and_terminalize_old_pod(
+        recycler,
+        provisioner,
+        ids,
+        reason="missing_pod",
+        expected_build_sha="new-build",
+    )
     missing = await _reconcile_until_phase(
         recycler,
         thread_id=ids["thread"],
@@ -4855,7 +6753,7 @@ async def test_preexisting_maintenance_hold_is_never_claimed_or_cleared(db):
         "since": "2026-08-20T00:00:00+00:00",
         "note": "operator maintenance",
     }
-    ids = await _seed(db, preexisting_hold=original)
+    ids = await _seed(db, preexisting_hold=original, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     provisioner.current = _pod_status(ids["thread"], uid="old-pod", build="old-build")
     recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
@@ -4879,7 +6777,7 @@ async def test_conference_hold_blocks_recycle_without_mutating_its_authority(db)
         "thread_id": conference_thread,
         "since": "2026-08-20T00:00:00+00:00",
     }
-    ids = await _seed(db, preexisting_hold=original)
+    ids = await _seed(db, preexisting_hold=original, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     provisioner.current = _pod_status(ids["thread"], uid="old-pod", build="old-build")
     recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
@@ -4904,7 +6802,7 @@ async def test_conference_hold_blocks_recycle_without_mutating_its_authority(db)
 
 @pytest.mark.asyncio
 async def test_retryable_failure_keeps_hold_and_pages_once_before_convergence(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     provisioner.fail_creates = True
     pages: list[tuple[str, str, str]] = []
@@ -4915,6 +6813,13 @@ async def test_retryable_failure_keeps_hold_and_pages_once_before_convergence(db
 
     recycler = PersistentThreadRecycler(
         db=db, provisioner=provisioner, failure_notifier=notify
+    )
+    await _park_and_terminalize_old_pod(
+        recycler,
+        provisioner,
+        ids,
+        reason="missing_pod",
+        expected_build_sha="new-build",
     )
     failed = await _reconcile_until_phase(
         recycler,
@@ -4980,7 +6885,7 @@ async def test_retryable_failure_keeps_hold_and_pages_once_before_convergence(db
 
 @pytest.mark.asyncio
 async def test_unsettled_old_runtime_times_out_without_forced_deletion(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     provisioner.current = _pod_status(ids["thread"], uid="old-pod", build="old-build")
     pages: list[tuple[str, str, str]] = []
@@ -5026,7 +6931,7 @@ async def test_unsettled_old_runtime_times_out_without_forced_deletion(db):
 
 @pytest.mark.asyncio
 async def test_reciprocal_uid_mismatch_holds_and_pages_without_mutation(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     provisioner.current = _pod_status(
         ids["thread"], uid="foreign-pod", build="new-build"
@@ -5111,7 +7016,7 @@ async def test_decommission_or_new_incarnation_cannot_be_revived(db):
 
 @pytest.mark.asyncio
 async def test_headerless_and_asserted_parked_boundary_use_locked_generation(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     provisioner.current = _pod_status(ids["thread"], uid="old-pod", build="old-build")
     recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
@@ -5142,7 +7047,7 @@ async def test_headerless_and_asserted_parked_boundary_use_locked_generation(db)
 
 @pytest.mark.asyncio
 async def test_headerless_ordinary_persistent_generation_needs_no_workspace(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET metadata = jsonb_set("
@@ -5176,10 +7081,17 @@ async def test_headerless_ordinary_persistent_generation_needs_no_workspace(db):
 
 @pytest.mark.asyncio
 async def test_notification_claim_crash_reclaims_once_and_success_is_terminal(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     provisioner.fail_creates = True
     unpaged = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    await _park_and_terminalize_old_pod(
+        unpaged,
+        provisioner,
+        ids,
+        reason="missing_pod",
+        expected_build_sha="new-build",
+    )
     failed = await _reconcile_until_phase(
         unpaged,
         thread_id=ids["thread"],
@@ -5260,7 +7172,7 @@ async def test_notification_claim_crash_reclaims_once_and_success_is_terminal(db
 
 @pytest.mark.asyncio
 async def test_failed_notification_retries_after_bounded_backoff(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     provisioner.fail_creates = True
     deliveries = [False, True]
@@ -5273,6 +7185,13 @@ async def test_failed_notification_retries_after_bounded_backoff(db):
 
     recycler = PersistentThreadRecycler(
         db=db, provisioner=provisioner, failure_notifier=notify
+    )
+    await _park_and_terminalize_old_pod(
+        recycler,
+        provisioner,
+        ids,
+        reason="missing_pod",
+        expected_build_sha="new-build",
     )
     await _reconcile_until_phase(
         recycler,
@@ -5325,9 +7244,16 @@ async def test_failed_notification_retries_after_bounded_backoff(db):
 
 @pytest.mark.asyncio
 async def test_officer_replacement_requires_exact_current_grant(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     provisioner = FakeProvisioner()
     recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    await _park_and_terminalize_old_pod(
+        recycler,
+        provisioner,
+        ids,
+        reason="missing_pod",
+        expected_build_sha="new-build",
+    )
     await _reconcile_until_phase(
         recycler,
         thread_id=ids["thread"],
@@ -5381,8 +7307,8 @@ async def test_officer_replacement_requires_exact_current_grant(db):
 
 @pytest.mark.asyncio
 async def test_two_desired_image_changes_chain_without_releasing_hold(db):
-    ids = await _seed(db)
-    provisioner = FakeProvisioner()
+    ids = await _seed(db, protected_agent_pod=True)
+    provisioner = FakeProvisioner(db)
     provisioner.current = _pod_status(ids["thread"], uid="old-pod", build="old-build")
     recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
     await recycler.request_and_reconcile(
@@ -5400,7 +7326,12 @@ async def test_two_desired_image_changes_chain_without_releasing_hold(db):
             thread_id=ids["thread"], agent_id=None
         )
         assert acknowledgement.acknowledged
-        provisioner.current = None
+        provisioner.current = {
+            **provisioner.current,
+            "phase": "Succeeded",
+            "ready": False,
+            "terminating": True,
+        }
         await _reconcile_until_phase(
             recycler,
             thread_id=ids["thread"],

@@ -71,22 +71,6 @@ class _FakeS3Body:
         return chunk
 
 
-class _FullReadFakeS3Body:
-    """Stand-in for boto3's ``StreamingBody`` supporting a full, unbounded
-    ``read()`` (no size argument) — unlike ``_FakeS3Body`` above (which
-    deliberately *requires* a bounded ``read(n)`` to guard the
-    streaming-hash regression), this backs ``FakeS3.get_object`` for
-    callers like ``get_manifest``/``get_blob`` that correctly read a
-    small object in one shot rather than streaming it.
-    """
-
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-
-    def read(self) -> bytes:
-        return self._data
-
-
 class FakeS3:
     """Minimal in-memory S3 double, dict-backed so a test can assert on the
     actual key set a staging -> verify -> promote -> prune sequence leaves
@@ -142,7 +126,10 @@ class FakeS3:
     def get_object(self, Bucket: str, Key: str) -> dict:
         if Key not in self.store:
             raise _not_found("GetObject")
-        return {"Body": _FullReadFakeS3Body(self.store[Key])}
+        return {
+            "Body": _FakeS3Body(self.store[Key]),
+            "ContentLength": len(self.store[Key]),
+        }
 
     def download_file(self, Bucket: str, Key: str, Filename: str) -> None:
         if Key not in self.store:
@@ -228,6 +215,28 @@ def _clean_verify_deep_env(monkeypatch):
     leak in from the outer environment.
     """
     monkeypatch.delenv("SNAPSHOT_VERIFY_DEEP", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_upload_revalidates_authority_before_canonical_publication(
+    fake_svc, fake_s3, tmp_path
+):
+    archive = _write_tar(tmp_path, "authority.tar.zst", b"captured-bytes")
+    authority = AsyncMock(side_effect=[True, False])
+
+    uploaded = await fake_svc.upload_snapshot(
+        job_id="job-authority",
+        tar_path=archive,
+        manifest={"version": 1, "size_compressed_bytes": len(b"captured-bytes")},
+        publication_authority=authority,
+    )
+
+    assert uploaded is False
+    assert authority.await_count == 2
+    assert not _staging_keys(fake_s3, "jobs/job-authority")
+    assert "jobs/job-authority/env.tar.zst" not in fake_s3.store
+    assert not _history_generations(fake_s3, "jobs/job-authority")
+    fake_svc._set_snapshot_context.assert_not_awaited()
 
 
 # =============================================================================

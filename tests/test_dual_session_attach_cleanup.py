@@ -16,6 +16,7 @@ ATTACH_TOKEN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 WORKSPACE_GENERATION = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 WORKSPACE_RUNTIME = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 POD_UID = "pod-uid-a"
+PROCESS_GENERATION = "process-a"
 
 
 def _attach_endpoint():
@@ -40,6 +41,12 @@ def _request(*, workspace: bool = False) -> dict:
         "pinned_runtime_generation_contract": 1,
         "session_runtime_generation": GENERATION,
         "session_runtime_attach_token": ATTACH_TOKEN,
+        "_recipient": {
+            "expected_thread_id": "thread-a",
+            "expected_agent_id": "agent-a",
+            "expected_pod_uid": POD_UID,
+            "expected_process_generation": PROCESS_GENERATION,
+        },
     }
     if workspace:
         payload.update(
@@ -103,6 +110,7 @@ def _restore_globals(monkeypatch):
 def _client(*, bound: bool = True, release=True) -> MagicMock:
     client = MagicMock()
     client.agent_id = "agent-a"
+    client.dispatch_process_generation = PROCESS_GENERATION
     client.adopt_session_runtime_identity.return_value = True
     client.bind_pod_runtime_actor = AsyncMock(return_value=bound)
     client.release_thread_agent = AsyncMock(

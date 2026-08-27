@@ -534,6 +534,17 @@ class TestRemoteBackendInit:
                 expected_host_key_fingerprint=fingerprint,
             )
 
+    def test_required_kubernetes_host_identity_has_no_autoadd_fallback(self):
+        with pytest.raises(
+            WorkspaceAuthenticationError,
+            match="requires an orchestrator-attested SSH host key fingerprint",
+        ):
+            RemoteBackend(
+                host="workspace.test",
+                workspace_path="/ws",
+                require_host_key_fingerprint=True,
+            )
+
 
 class TestRemoteBackendConnect:
     """Tests for RemoteBackend.connect()."""

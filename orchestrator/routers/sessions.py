@@ -35,6 +35,7 @@ from security.auth import require_approved_user
 from services.session_lifecycle import emit as lifecycle_emit
 from services.session_lifecycle import probe_ready, wait_for_binding, wait_for_ready
 from services.session_provisioning_state import agent_pod_provisioning_in_progress
+from services.session_router import SessionRouteAuthorityError
 from services.session_runtime_admission import (
     ThreadRuntimeAuthority,
     pinned_binding_invalid_detail,
@@ -591,6 +592,7 @@ async def _do_prepare(
             if not route_published:
                 route_removed = await session_router.teardown_route(
                     thread_id,
+                    expected_namespace=binding.pod_namespace,
                     expected_runtime_generation=runtime_authority.generation,
                     expected_owner_uid=binding.pod_uid,
                 )
@@ -889,6 +891,8 @@ async def get_connection(
         )
         route_committed = True
         return response
+    except SessionRouteAuthorityError as exc:
+        raise HTTPException(status_code=425, detail="session not ready") from exc
     finally:
         # Exact cleanup covers partial Service/Ingress creation, a failed final
         # DB read, a status/identity race, and token construction failure.  It
@@ -896,6 +900,7 @@ async def get_connection(
         if not route_committed:
             route_removed = await session_router.teardown_route(
                 runtime_authority.thread_id,
+                expected_namespace=binding.pod_namespace,
                 expected_runtime_generation=runtime_authority.generation,
                 expected_owner_uid=binding.pod_uid,
             )

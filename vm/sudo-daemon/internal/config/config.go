@@ -156,7 +156,7 @@ func (c *Config) Transport() (string, error) {
 		return "http", nil
 	}
 	if c.NATS.URL != "" {
-		return "nats", nil
+		return "", fmt.Errorf("unauthenticated VM guest NATS transport is disabled; configure ORCHESTRATOR_URL and VM_AUTH_TOKEN")
 	}
-	return "", fmt.Errorf("no guest transport configured: set ORCHESTRATOR_URL and VM_AUTH_TOKEN, or NATS_URL")
+	return "", fmt.Errorf("no guest transport configured: set ORCHESTRATOR_URL and VM_AUTH_TOKEN")
 }

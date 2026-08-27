@@ -4011,7 +4011,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
             (False, False, False),
         ],
     )
-    async def test_live_swap_uses_attested_canvas_capability(
+    async def test_sandbox_hot_swap_fails_before_provision_or_backend_effect(
         self, attested, live_attested, browser_attested
     ):
         import sys
@@ -4050,15 +4050,26 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
                 return_value=workspace,
             ),
             patch.dict(sys.modules, {"src.core.backends.remote": remote_module}),
-            patch("src.core.backends.seed.seed_workspace", return_value=1),
+            patch(
+                "src.core.backends.seed.seed_workspace", return_value=1
+            ) as seed_workspace,
         ):
             await _handle_workspace_upgrade(ws, target_tier="sandbox")
 
-        assert new_backend.supports_canvas_presentation is attested
-        assert new_backend.supports_canvas_live_apps is live_attested
-        assert new_backend.supports_canvas_shared_browser is browser_attested
-        session.swap_backend.assert_called_once_with(new_backend)
-        session.resetup_tools_for_backend.assert_called_once()
+        client.request_thread_workspace_upgrade.assert_not_awaited()
+        client.get_thread_workspace.assert_not_awaited()
+        remote_module.RemoteBackend.assert_not_called()
+        seed_workspace.assert_not_called()
+        new_backend.connect.assert_not_called()
+        session.swap_backend.assert_not_called()
+        session.resetup_tools_for_backend.assert_not_called()
+        failed = [
+            call
+            for call in ws.send_json.call_args_list
+            if call.args[0].get("method") == "workspace_upgrade.failed"
+        ]
+        assert len(failed) == 1
+        assert "exact runtime authority" in failed[0].args[0]["params"]["reason"]
 
     @pytest.mark.asyncio
     async def test_sandbox_to_unattested_vm_withdraws_browser_capability(self):
@@ -4106,7 +4117,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         session.resetup_tools_for_backend.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_stateless_live_swap_claims_paired_runtime_before_exposure(self):
+    async def test_stateless_sandbox_hot_swap_fails_before_claim_or_exposure(self):
         import sys
 
         ws = AsyncMock()
@@ -4141,23 +4152,21 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
                 return_value=workspace,
             ),
             patch.dict(sys.modules, {"src.core.backends.remote": remote_module}),
-            patch("src.core.backends.seed.seed_workspace", return_value=1),
+            patch(
+                "src.core.backends.seed.seed_workspace", return_value=1
+            ) as seed_workspace,
         ):
             await _handle_workspace_upgrade(ws, target_tier="sandbox")
 
-        kwargs = remote_module.RemoteBackend.call_args.kwargs
-        assert kwargs["workspace_generation"] == workspace["workspace_generation"]
-        assert (
-            kwargs["runtime_incarnation"] == workspace["workspace_runtime_incarnation"]
-        )
-        assert (
-            kwargs["expected_host_key_fingerprint"]
-            == (workspace["workspace_ssh_host_key_fingerprint"])
-        )
-        new_backend.set_shell_owner_token.assert_called_once_with(73)
-        new_backend.connect.assert_called_once_with()
-        new_backend.claim_shell_owner.assert_called_once_with()
-        session.swap_backend.assert_called_once_with(new_backend)
+        client.request_thread_workspace_upgrade.assert_not_awaited()
+        client.get_thread_workspace.assert_not_awaited()
+        remote_module.RemoteBackend.assert_not_called()
+        seed_workspace.assert_not_called()
+        new_backend.set_shell_owner_token.assert_not_called()
+        new_backend.connect.assert_not_called()
+        new_backend.claim_shell_owner.assert_not_called()
+        session.swap_backend.assert_not_called()
+        session.resetup_tools_for_backend.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("marker", [True, None, "true"])

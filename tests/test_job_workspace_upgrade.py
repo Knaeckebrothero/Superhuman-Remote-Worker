@@ -518,15 +518,16 @@ class TestAgentInprocessUpgradeGuards:
         assert await agent._perform_inprocess_workspace_upgrade("sandbox") is False
 
     @pytest.mark.asyncio
-    async def test_provision_refused_returns_false(self):
+    async def test_sandbox_upgrade_fails_before_provision_or_seed_effect(self):
         agent = _bare_agent()
         agent._workspace_manager = MagicMock()
         agent._workspace_manager.backend.supports_shell = False
         agent._orchestrator_client = MagicMock()
         agent._orchestrator_client.request_job_workspace_upgrade = AsyncMock(
-            return_value=False
+            return_value=True
         )
         assert await agent._perform_inprocess_workspace_upgrade("sandbox") is False
+        agent._orchestrator_client.request_job_workspace_upgrade.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_poll_timeout_returns_false_before_backend_build(self):

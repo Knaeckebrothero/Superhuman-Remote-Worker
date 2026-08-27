@@ -69,12 +69,17 @@ async def retire_managed_repository_processes(
         logger.warning("%s refused without exact SSH authority", operation)
         return False
 
+    # The whole-workspace retirement form deliberately ends each generated
+    # cleanup loop with ``;``. Appending another separator verbatim produces
+    # ``done; ; set -eu``, which both bash and dash reject. Normalize only the
+    # generated trailing delimiter at this composition boundary.
+    retirement = managed_repository_agent_retirement_command(
+        home_path=home_path,
+        authority_ids=None,
+        remove_configs=True,
+    ).rstrip()
     command = (
-        managed_repository_agent_retirement_command(
-            home_path=home_path,
-            authority_ids=None,
-            remove_configs=True,
-        )
+        retirement.rstrip(";")
         + "; "
         + managed_repository_agent_zero_command(home_path=home_path)
     )

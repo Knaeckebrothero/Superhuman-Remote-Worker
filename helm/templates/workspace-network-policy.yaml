@@ -67,6 +67,12 @@ spec:
               {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "orchestrator") | nindent 14 }}
       ports:
         {{- if include "srw.vmSameCluster" $ }}
+        # Keep the pre-v1 transport path available while the exact-effect
+        # protocol is dark.  Read-only capture/probe paths for already-running
+        # VMs also use guest SSH, so NetworkPolicy cannot be the activation
+        # fence without turning a dark rollout into an availability cutover.
+        # The flag-triggered Recreate plus the monotonic database gate is the
+        # zero-old-replica mutation fence.
         - protocol: TCP
           port: 22
         {{- end }}

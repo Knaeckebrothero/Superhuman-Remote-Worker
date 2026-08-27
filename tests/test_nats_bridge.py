@@ -17,7 +17,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -241,28 +241,23 @@ class TestConnect:
         monkeypatch.setenv("ORCHESTRATOR_ID", "srw-test")
         bridge = NatsBridge(url="nats://test:4222")
 
-        mock_sudo_gate = MagicMock()
-        mock_sudo_module = MagicMock()
-        mock_sudo_module.sudo_gate = mock_sudo_gate
-        with patch.dict(
-            "sys.modules", {"orchestrator.services.sudo_gate": mock_sudo_module}
-        ):
-            await bridge.connect(db=mock_db)
+        await bridge.connect(db=mock_db)
 
         assert bridge._available is True
         assert bridge._nc is mock_nc
         assert bridge._db is mock_db
 
-        # Verify subscriptions were created (4 VM lifecycle + 1 sudo + 1 session.events)
-        assert mock_nc.subscribe.call_count == 5
+        # Only the authenticated controller lifecycle feed and the existing
+        # session-event feed remain. Guest registration/heartbeat/sudo are
+        # never exposed on the unauthenticated broker.
+        assert mock_nc.subscribe.call_count == 2
 
         # All broadcast subjects are per-orchestrator scoped.
         subjects = [call.args[0] for call in mock_nc.subscribe.call_args_list]
         assert "vm.lifecycle.status.srw-test" in subjects
-        assert "agent.vm.srw-test.*.register" in subjects
-        assert "agent.vm.srw-test.*.heartbeat" in subjects
-        assert "sudo.request.srw-test.>" in subjects
         assert "session.events.srw-test.>" in subjects
+        assert not any(subject.startswith("agent.vm.") for subject in subjects)
+        assert not any(subject.startswith("sudo.request.") for subject in subjects)
         # Regression: legacy flat subjects must not appear
         for flat in (
             "vm.lifecycle.status",
@@ -1064,8 +1059,152 @@ class TestOnDaemonRegister:
         assert updates["ssh_probe_error"] is None
         callback.assert_called_once()
         bridge_with_db._seed_vm_ide_config.assert_called_once_with(
-            "job-reg-001", False, "100.64.1.5", 22
+            ANY,
+            "100.64.1.5",
+            22,
         )
+        seeded_identity = bridge_with_db._seed_vm_ide_config.call_args.args[0]
+        assert seeded_identity.entity_type == "job"
+        assert seeded_identity.entity_id == "job-reg-001"
+        assert seeded_identity.provision_generation == PROVISION_GENERATION
+
+    @pytest.mark.asyncio
+    async def test_current_generation_seed_is_pinned_and_post_revalidated(
+        self, bridge_with_db, mock_db, monkeypatch
+    ):
+        from security.vm_guest import VmGuestIdentity
+        from services.container_provisioner import WorkspaceRuntimeAttestation
+
+        fingerprint = "SHA256:" + ("A" * 43)
+        attestation = WorkspaceRuntimeAttestation(
+            backing_id="k8s-vmi:00000000-0000-4000-8000-000000000010",
+            workspace_generation=PROVISION_GENERATION,
+            runtime_incarnation="00000000-0000-4000-8000-000000000010",
+            ssh_host_key_fingerprint=fingerprint,
+            host="192.0.2.44",
+            pod_ip="10.42.0.44",
+            port=22,
+        )
+        provisioner = MagicMock()
+        provisioner.query_status = AsyncMock(return_value={"ready": True})
+        provisioner.attest_workspace_runtime = AsyncMock(return_value=attestation)
+        effects = []
+
+        async def seed(*_args, **kwargs):
+            assert kwargs["expected_host_key_fingerprint"] == fingerprint
+            target = await kwargs["mutation_authority"]()
+            if target is not None:
+                effects.append(target)
+            return target is not None
+
+        monkeypatch.setattr("services.vm_provisioner.vm_provisioner", provisioner)
+        monkeypatch.setattr("services.ide_settings.seed_ide_config_for_user", seed)
+        monkeypatch.setattr(
+            "services.snapshot_service.snapshot_service",
+            MagicMock(is_available=False),
+        )
+        identity = VmGuestIdentity("job", "job-current", PROVISION_GENERATION)
+        mock_db.get_job.return_value = {
+            "id": "job-current",
+            "user_id": "user-1",
+            "context": {
+                "vm": {
+                    "provision_generation": PROVISION_GENERATION,
+                    "identity_provision_generation": PROVISION_GENERATION,
+                    "identity_authenticated": True,
+                    "vm_uid": "vm-uid-1",
+                    "ssh_host": "192.0.2.44",
+                    "ssh_port": 22,
+                    "ssh_host_key_fingerprint": fingerprint,
+                    "ssh_registration_id": "registration-1",
+                }
+            },
+        }
+        bridge_with_db.query_vm_status = AsyncMock(
+            return_value={
+                "_identity_authenticated": True,
+                "ready": True,
+                "provision_generation": PROVISION_GENERATION,
+                "vm_uid": "vm-uid-1",
+                "active_pod_uid": ("00000000-0000-4000-8000-000000000010"),
+            }
+        )
+
+        assert await bridge_with_db._seed_vm_ide_config(identity, "192.0.2.44", 22)
+        assert effects == [("192.0.2.44", 22, fingerprint)]
+        assert provisioner.attest_workspace_runtime.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_replaced_vm_reusing_endpoint_receives_zero_seed_bytes(
+        self, bridge_with_db, mock_db, monkeypatch
+    ):
+        from security.vm_guest import VmGuestIdentity
+        from services.container_provisioner import WorkspaceRuntimeAttestation
+
+        fingerprint_a = "SHA256:" + ("A" * 43)
+        fingerprint_b = "SHA256:" + ("B" * 43)
+
+        def attestation(uid, fingerprint):
+            return WorkspaceRuntimeAttestation(
+                backing_id=f"k8s-vmi:{uid}",
+                workspace_generation=PROVISION_GENERATION,
+                runtime_incarnation=uid,
+                ssh_host_key_fingerprint=fingerprint,
+                host="192.0.2.44",
+                pod_ip="10.42.0.44",
+                port=22,
+            )
+
+        first = attestation("00000000-0000-4000-8000-000000000010", fingerprint_a)
+        successor = attestation("00000000-0000-4000-8000-000000000011", fingerprint_b)
+        provisioner = MagicMock()
+        provisioner.query_status = AsyncMock(return_value={"ready": True})
+        provisioner.attest_workspace_runtime = AsyncMock(
+            side_effect=[first, successor, successor]
+        )
+        effects = []
+
+        async def seed(*_args, **kwargs):
+            target = await kwargs["mutation_authority"]()
+            if target is not None:
+                effects.append(target)
+            return target is not None
+
+        monkeypatch.setattr("services.vm_provisioner.vm_provisioner", provisioner)
+        monkeypatch.setattr("services.ide_settings.seed_ide_config_for_user", seed)
+        monkeypatch.setattr(
+            "services.snapshot_service.snapshot_service",
+            MagicMock(is_available=False),
+        )
+        identity = VmGuestIdentity("job", "job-replaced", PROVISION_GENERATION)
+        mock_db.get_job.return_value = {
+            "id": "job-replaced",
+            "user_id": "user-1",
+            "context": {
+                "vm": {
+                    "provision_generation": PROVISION_GENERATION,
+                    "identity_provision_generation": PROVISION_GENERATION,
+                    "identity_authenticated": True,
+                    "vm_uid": "vm-uid-1",
+                    "ssh_host": "192.0.2.44",
+                    "ssh_port": 22,
+                    "ssh_host_key_fingerprint": fingerprint_a,
+                    "ssh_registration_id": "registration-1",
+                }
+            },
+        }
+        bridge_with_db.query_vm_status = AsyncMock(
+            return_value={
+                "_identity_authenticated": True,
+                "ready": True,
+                "provision_generation": PROVISION_GENERATION,
+                "vm_uid": "vm-uid-1",
+                "active_pod_uid": ("00000000-0000-4000-8000-000000000010"),
+            }
+        )
+
+        assert not await bridge_with_db._seed_vm_ide_config(identity, "192.0.2.44", 22)
+        assert effects == []
 
     @pytest.mark.asyncio
     async def test_ssh_ready_false_holds_ssh_pending(

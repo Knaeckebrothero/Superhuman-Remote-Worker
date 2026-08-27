@@ -25,6 +25,8 @@ from .models import (
     JobStartResponse,
     JobCancelByOrchestratorRequest,
     JobResumeRequest,
+    PinnedJobRecipient,
+    pinned_job_recipient_matches,
 )
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
 from ..agent import UniversalAgent
@@ -56,6 +58,26 @@ _stop_reason: Optional[str] = None  # "pause" or "cancel"
 _stop_completed: asyncio.Event = (
     asyncio.Event()
 )  # Signals waiting endpoint that stop finished
+
+_PINNED_RECIPIENT_MISMATCH = {"code": "pinned_recipient_mismatch"}
+
+
+def _require_pinned_job_recipient(
+    recipient: Optional[PinnedJobRecipient],
+    *,
+    job_id: Optional[str],
+) -> None:
+    """Fail closed unless this exact registered process owns the mutation."""
+
+    client = _orchestrator_client
+    if not pinned_job_recipient_matches(
+        recipient,
+        agent_id=getattr(client, "agent_id", None),
+        pod_uid=os.environ.get("POD_UID"),
+        process_generation=getattr(client, "dispatch_process_generation", None),
+        job_id=job_id,
+    ):
+        raise HTTPException(status_code=409, detail=_PINNED_RECIPIENT_MISMATCH)
 
 
 def _request_stop(reason: str) -> None:
@@ -778,7 +800,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             ready=ready,
             message="Ready to accept jobs" if ready else "Not ready",
             connections=status["connections"],
-            capabilities={"resolved_config_resume": True},
+            capabilities={
+                "resolved_config_resume": True,
+                "pinned_recipient_binding": True,
+            },
         )
 
     @app.get("/status", response_model=AgentStatusResponse, tags=["Health"])
@@ -849,14 +874,16 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.get("/system/shell-state", tags=["Monitoring"])
-    async def shell_state() -> Dict[str, Any]:
+    @app.post("/system/shell-state", tags=["Monitoring"])
+    async def shell_state(recipient: PinnedJobRecipient) -> Dict[str, Any]:
         """Get current shell tab state including recent output.
 
         Returns the list of open terminal tabs with their type and
         recent output lines. Useful for inspecting what the agent is
         doing in its shell sessions.
         """
+        _require_pinned_job_recipient(recipient, job_id=_current_job_id)
+
         if _agent is None:
             return {"tabs": [], "message": "Agent not initialized"}
 
@@ -926,11 +953,20 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         """
         global _current_job_id, _current_job_task
 
+        _require_pinned_job_recipient(request.recipient, job_id=request.job_id)
+
         if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not initialized")
 
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
+
+        if _current_job_id == request.job_id:
+            return JobStartResponse(
+                job_id=request.job_id,
+                status="accepted",
+                message="Job was already accepted by this runtime",
+            )
 
         try:
             validate_worker_workspace_projection(
@@ -955,6 +991,17 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         # Start processing in background
         start_context = dict(request.context or {})
         start_context["workspace_runtime"] = request.workspace_runtime
+        for field in (
+            "workspace_provisioner",
+            "workspace_generation",
+            "workspace_runtime_incarnation",
+            "workspace_ssh_host_key_fingerprint",
+            "workspace_owner_kind",
+            "workspace_owner_id",
+        ):
+            value = getattr(request, field)
+            if value:
+                start_context[field] = value
         _current_job_task = asyncio.create_task(
             _process_orchestrator_job(
                 job_id=request.job_id,
@@ -1000,7 +1047,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         },
     )
     async def cancel_current_job(
-        request: JobCancelByOrchestratorRequest,
+        request: Optional[JobCancelByOrchestratorRequest] = None,
     ) -> Dict[str, Any]:
         """Cancel the currently running job (cooperative with hard-kill fallback).
 
@@ -1017,8 +1064,15 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 detail="No job currently running",
             )
 
+        _require_pinned_job_recipient(
+            request.recipient if request is not None else None,
+            job_id=_current_job_id,
+        )
+
         job_id = _current_job_id
-        reason = request.reason or "Cancelled by orchestrator"
+        reason = (
+            request.reason if request is not None else None
+        ) or "Cancelled by orchestrator"
 
         # Signal the streaming loop to stop after the current node
         _request_stop("cancel")
@@ -1065,7 +1119,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             408: {"model": ErrorResponse, "description": "Pause timed out"},
         },
     )
-    async def pause_current_job() -> Dict[str, Any]:
+    async def pause_current_job(
+        request: Optional[JobCancelByOrchestratorRequest] = None,
+    ) -> Dict[str, Any]:
         """Gracefully pause the currently running job.
 
         Sets a cooperative flag that is checked between graph node executions.
@@ -1079,6 +1135,11 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 status_code=404,
                 detail="No job currently running",
             )
+
+        _require_pinned_job_recipient(
+            request.recipient if request is not None else None,
+            job_id=_current_job_id,
+        )
 
         job_id = _current_job_id
 
@@ -1127,11 +1188,20 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         """
         global _current_job_id, _current_job_task
 
+        _require_pinned_job_recipient(request.recipient, job_id=request.job_id)
+
         if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not initialized")
 
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
+
+        if _current_job_id == request.job_id:
+            return JobStartResponse(
+                job_id=request.job_id,
+                status="accepted",
+                message="Job resume was already accepted by this runtime",
+            )
 
         try:
             validate_worker_workspace_projection(
@@ -1186,6 +1256,17 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if request.runtime_actor:
             resume_metadata["runtime_actor"] = request.runtime_actor
         resume_metadata["workspace_runtime"] = request.workspace_runtime
+        for field in (
+            "workspace_provisioner",
+            "workspace_generation",
+            "workspace_runtime_incarnation",
+            "workspace_ssh_host_key_fingerprint",
+            "workspace_owner_kind",
+            "workspace_owner_id",
+        ):
+            value = getattr(request, field)
+            if value:
+                resume_metadata[field] = value
         if request.git_remote_url:
             # Feeds the pod-handoff clone fallback in _setup_job_workspace
             # (resume_fresh_workspace_no_clone_fallback.md).

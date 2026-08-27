@@ -11,9 +11,14 @@ See `knowledge-base/knowledge/features/direct_session_websockets.md` §Component
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import re
 from typing import Any, Optional
+
+from services.pinned_k8s_effect import (
+    legacy_pinned_namespace_candidates,
+    run_bounded_k8s_call,
+)
 
 try:
     from kubernetes import client as k8s_client
@@ -28,6 +33,40 @@ except ImportError:
     KUBERNETES_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+_KUBERNETES_NAMESPACE = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
+
+
+class SessionRouteAuthorityError(RuntimeError):
+    """The requested route is not bound to one exact live session Pod."""
+
+
+def _value(obj: Any, *names: str) -> Any:
+    """Read one Kubernetes model/dict field without trusting mock defaults."""
+
+    if isinstance(obj, dict):
+        for name in names:
+            if name in obj:
+                return obj[name]
+        return None
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None and value.__class__.__module__ != "unittest.mock":
+            return value
+    return None
+
+
+def _owner_reference_matches(resource: Any, *, pod_name: str, pod_uid: str) -> bool:
+    metadata = _value(resource, "metadata")
+    references = _value(metadata, "owner_references", "ownerReferences")
+    if not isinstance(references, (list, tuple)) or len(references) != 1:
+        return False
+    reference = references[0]
+    return bool(
+        _value(reference, "api_version", "apiVersion") == "v1"
+        and _value(reference, "kind") == "Pod"
+        and _value(reference, "name") == pod_name
+        and str(_value(reference, "uid") or "") == pod_uid
+    )
 
 
 def _is_k8s_status(exc: BaseException, status: int) -> bool:
@@ -52,6 +91,7 @@ class SessionRouterService:
         ingress_class: str = "traefik",
         annotations: Optional[dict[str, str]] = None,
         tls_secret_name: Optional[str] = None,
+        db: Any = None,
         # Injected for testability; lazy-resolved in production.
         core_api: Any = None,
         networking_api: Any = None,
@@ -64,6 +104,7 @@ class SessionRouterService:
         # entrypoint as the cockpit (mkcert/cert-manager). When set, the
         # Ingress gets a `tls:` block + websecure entrypoint annotation.
         self._tls_secret_name = tls_secret_name
+        self._db = db
         self._core_api = core_api
         self._networking_api = networking_api
 
@@ -99,41 +140,121 @@ class SessionRouterService:
         pod_uid: str,
         runtime_generation: str | None = None,
     ) -> str:
-        """Create Service + Ingress if missing. Patch the pod's thread-id
-        label so the Service selector matches. Returns the path prefix."""
+        """Publish only the route for one exact reciprocal live runtime."""
+
         self._lazy_init_apis()
-        if not str(pod_uid or "").strip() or not str(runtime_generation or "").strip():
-            raise RuntimeError("session route requires Pod UID and runtime generation")
+        thread_id = str(thread_id or "").strip()
+        pod_name = str(pod_name or "").strip()
+        pod_uid = str(pod_uid or "").strip()
+        runtime_generation = str(runtime_generation or "").strip()
+        if (
+            not all((thread_id, pod_name, pod_uid, runtime_generation))
+            or self._db is None
+        ):
+            raise SessionRouteAuthorityError("session route authority is unavailable")
         name = f"session-{thread_id}"
 
-        # Stamp the pod's srw.io/thread-id label. The Service selector matches
-        # this label; idle-pool agents that get attached via main._send_session_attach
-        # are bound in DB but never get their K8s pod metadata updated, so the
-        # Service ends up with zero endpoints. Patching here is idempotent —
-        # same value is a no-op, and a no-longer-bound thread can claim the
-        # pod next by overwriting the label.
-        #
-        # Also stamp the short-form srw/thread-id (lifecycle reconciler
-        # selects on it) and flip srw/purpose to "session": a warm pool pod
-        # is provisioned as purpose=job, and serving a session under a job
-        # label breaks purpose-based selectors and dashboards
-        # (knowledge-base/knowledge/issues/session_silent_failure_audit.md #16).
-        try:
-            pod = await self._call(
-                self._core_api.read_namespaced_pod,
-                name=pod_name,
-                namespace=self._namespace,
+        binding = await self._require_current_binding(
+            thread_id=thread_id,
+            runtime_generation=runtime_generation,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+        )
+        pod_ip = binding.pod_ip
+        namespace = binding.pod_namespace
+
+        # A route with the same host/path in the release namespace can race or
+        # conflict with a legacy-namespace route. Never publish a second route
+        # until the prior deterministic resources have been removed through an
+        # exact owner/generation-fenced lifecycle path.
+        for candidate_namespace in legacy_pinned_namespace_candidates(self._namespace):
+            if candidate_namespace == namespace:
+                continue
+            shadow_service = await self._read_or_none(
+                self._core_api.read_namespaced_service,
+                name,
+                namespace=candidate_namespace,
             )
-            if str(getattr(getattr(pod, "metadata", None), "uid", "") or "") != str(
-                pod_uid
-            ):
-                raise RuntimeError("session route Pod identity changed")
+            shadow_ingress = await self._read_or_none(
+                self._networking_api.read_namespaced_ingress,
+                name,
+                namespace=candidate_namespace,
+            )
+            if shadow_service is not None or shadow_ingress is not None:
+                raise SessionRouteAuthorityError(
+                    "session route shadow exists outside authoritative namespace"
+                )
+
+        # Refuse foreign or malformed deterministic resources before touching
+        # the Pod. A predecessor route may omit G, but it must already have the
+        # exact owner and immutable routing shape before it can be adopted.
+        service = await self._read_or_none(
+            self._core_api.read_namespaced_service,
+            name,
+            namespace=namespace,
+        )
+        ingress = await self._read_or_none(
+            self._networking_api.read_namespaced_ingress,
+            name,
+            namespace=namespace,
+        )
+        if service is not None and not self._service_matches(
+            service,
+            thread_id=thread_id,
+            name=name,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            runtime_generation=runtime_generation,
+            namespace=namespace,
+            allow_missing_generation=True,
+        ):
+            raise SessionRouteAuthorityError("existing session Service is not trusted")
+        if ingress is not None and not self._ingress_matches(
+            ingress,
+            thread_id=thread_id,
+            name=name,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            runtime_generation=runtime_generation,
+            namespace=namespace,
+            allow_missing_generation=True,
+        ):
+            raise SessionRouteAuthorityError("existing session Ingress is not trusted")
+
+        pod = await self._read_exact_ready_pod(
+            thread_id=thread_id,
+            runtime_generation=runtime_generation,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            pod_ip=pod_ip,
+            namespace=namespace,
+        )
+        resource_version = str(
+            _value(_value(pod, "metadata"), "resource_version", "resourceVersion") or ""
+        ).strip()
+        if not resource_version:
+            raise SessionRouteAuthorityError("session Pod version is unavailable")
+        await self._require_current_binding(
+            thread_id=thread_id,
+            runtime_generation=runtime_generation,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            pod_ip=pod_ip,
+            pod_namespace=namespace,
+        )
+
+        try:
             await self._call(
                 self._core_api.patch_namespaced_pod,
                 name=pod_name,
-                namespace=self._namespace,
+                namespace=namespace,
                 body=[
                     {"op": "test", "path": "/metadata/uid", "value": pod_uid},
+                    {
+                        "op": "test",
+                        "path": "/metadata/resourceVersion",
+                        "value": resource_version,
+                    },
                     {
                         "op": "add",
                         "path": "/metadata/labels/srw.io~1thread-id",
@@ -157,60 +278,232 @@ class SessionRouterService:
                 ],
                 _content_type="application/json-patch+json",
             )
-        except Exception as e:
-            if _is_k8s_status(e, 404):
-                raise RuntimeError(
-                    "session route Pod disappeared before exact binding"
-                ) from e
+        except Exception as exc:
+            if any(_is_k8s_status(exc, status) for status in (404, 409, 422)):
+                raise SessionRouteAuthorityError(
+                    "session Pod changed before route publication"
+                ) from exc
             raise
 
-        # Service
-        service = await self._read_or_none(self._core_api.read_namespaced_service, name)
-        if service is None:
+        await self._read_exact_ready_pod(
+            thread_id=thread_id,
+            runtime_generation=runtime_generation,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            pod_ip=pod_ip,
+            namespace=namespace,
+            require_route_labels=True,
+        )
+        await self._require_current_binding(
+            thread_id=thread_id,
+            runtime_generation=runtime_generation,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            pod_ip=pod_ip,
+            pod_namespace=namespace,
+        )
+
+        service = await self._publish_service(
+            existing=service,
+            thread_id=thread_id,
+            name=name,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            runtime_generation=runtime_generation,
+            namespace=namespace,
+        )
+        ingress = await self._publish_ingress(
+            existing=ingress,
+            thread_id=thread_id,
+            name=name,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            runtime_generation=runtime_generation,
+            namespace=namespace,
+        )
+
+        await self._require_current_binding(
+            thread_id=thread_id,
+            runtime_generation=runtime_generation,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            pod_ip=pod_ip,
+            pod_namespace=namespace,
+        )
+        # Delete/recreate can replace a validated deterministic object between
+        # any two awaits. The final API-server observations are the token
+        # publication boundary used by the caller's final DB reread.
+        service = await self._read_or_none(
+            self._core_api.read_namespaced_service,
+            name,
+            namespace=namespace,
+        )
+        ingress = await self._read_or_none(
+            self._networking_api.read_namespaced_ingress,
+            name,
+            namespace=namespace,
+        )
+        if service is None or not self._service_matches(
+            service,
+            thread_id=thread_id,
+            name=name,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            runtime_generation=runtime_generation,
+            namespace=namespace,
+        ):
+            raise SessionRouteAuthorityError("final session Service is not trusted")
+        if ingress is None or not self._ingress_matches(
+            ingress,
+            thread_id=thread_id,
+            name=name,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            runtime_generation=runtime_generation,
+            namespace=namespace,
+        ):
+            raise SessionRouteAuthorityError("final session Ingress is not trusted")
+        return f"/p/{thread_id}"
+
+    async def _require_current_binding(
+        self,
+        *,
+        thread_id: str,
+        runtime_generation: str,
+        pod_name: str,
+        pod_uid: str,
+        pod_ip: str | None = None,
+        pod_namespace: str | None = None,
+    ) -> Any:
+        try:
+            binding = await self._db.get_pinned_session_binding(
+                thread_id,
+                expected_runtime_generation=runtime_generation,
+            )
+        except Exception as exc:
+            raise SessionRouteAuthorityError(
+                "session route binding could not be verified"
+            ) from exc
+        if not (
+            binding is not None
+            and binding.thread_id == thread_id
+            and binding.runtime_generation == runtime_generation
+            and binding.agent_hostname == pod_name
+            and isinstance(binding.pod_namespace, str)
+            and _KUBERNETES_NAMESPACE.fullmatch(binding.pod_namespace) is not None
+            and (pod_namespace is None or binding.pod_namespace == pod_namespace)
+            and binding.pod_uid == pod_uid
+            and binding.agent_status in {"booting", "ready", "working", "session"}
+            and (pod_ip is None or binding.pod_ip == pod_ip)
+        ):
+            raise SessionRouteAuthorityError(
+                "session route binding is no longer reciprocal"
+            )
+        return binding
+
+    async def _read_exact_ready_pod(
+        self,
+        *,
+        thread_id: str,
+        runtime_generation: str,
+        pod_name: str,
+        pod_uid: str,
+        pod_ip: str,
+        namespace: str,
+        require_route_labels: bool = False,
+    ) -> Any:
+        try:
+            pod = await self._call(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=namespace,
+            )
+        except Exception as exc:
+            raise SessionRouteAuthorityError(
+                "session Pod could not be verified"
+            ) from exc
+
+        metadata = _value(pod, "metadata")
+        status = _value(pod, "status")
+        labels = _value(metadata, "labels")
+        container_statuses = _value(status, "container_statuses", "containerStatuses")
+        component = labels.get("srw/component") if isinstance(labels, dict) else None
+        managed_pool = bool(
+            component == "agent"
+            and labels.get("srw/managed-by") == "agent-provisioner"
+            and labels.get("srw/purpose") in {"job", "session"}
+        )
+        dedicated = bool(
+            component == "persistent-agent"
+            and labels.get("srw/thread-id") == thread_id
+            and pod_name == f"persistent-{thread_id[:12]}"
+        )
+        route_labels_match = bool(
+            isinstance(labels, dict)
+            and labels.get("srw.io/thread-id") == thread_id
+            and labels.get("srw/thread-id") == thread_id[:12]
+            and labels.get("srw/purpose") == "session"
+            and labels.get("srw.io/runtime-generation") == runtime_generation
+        )
+        ready_agent = bool(
+            isinstance(container_statuses, (list, tuple))
+            and any(
+                str(_value(item, "name") or "") == "agent"
+                and _value(item, "ready") is True
+                for item in container_statuses
+            )
+        )
+        if not (
+            str(_value(metadata, "name") or "") == pod_name
+            and str(_value(metadata, "namespace") or "") == namespace
+            and str(_value(metadata, "uid") or "") == pod_uid
+            and _value(metadata, "deletion_timestamp", "deletionTimestamp") is None
+            and str(_value(status, "phase") or "") == "Running"
+            and str(_value(status, "pod_ip", "podIP") or "") == pod_ip
+            and ready_agent
+            and (managed_pool or dedicated)
+            and (not require_route_labels or route_labels_match)
+        ):
+            raise SessionRouteAuthorityError(
+                "session Pod identity or readiness no longer matches"
+            )
+        return pod
+
+    async def _publish_service(
+        self,
+        *,
+        existing: Any | None,
+        thread_id: str,
+        name: str,
+        pod_name: str,
+        pod_uid: str,
+        runtime_generation: str,
+        namespace: str,
+    ) -> Any:
+        if existing is None:
             try:
                 await self._call(
                     self._core_api.create_namespaced_service,
-                    namespace=self._namespace,
+                    namespace=namespace,
                     body=self._service_body(
                         thread_id,
                         name,
                         pod_name,
                         pod_uid,
                         runtime_generation,
+                        namespace=namespace,
                     ),
                 )
-            except Exception as e:
-                # 409 = a racing writer beat us; the resource exists. Anything
-                # else propagates. Duck-type on `.status` rather than the
-                # ApiException class — see _is_k8s_status docstring.
-                if not _is_k8s_status(e, 409):
+            except Exception as exc:
+                if not _is_k8s_status(exc, 409):
                     raise
-            service = await self._read_or_none(
-                self._core_api.read_namespaced_service, name
-            )
-            if service is None or not self._resource_matches_authority(
-                service,
-                pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
-                require_generation=runtime_generation is not None,
-            ):
-                raise RuntimeError(
-                    "session Service create lost runtime-generation authority"
-                )
-
-        elif not self._resource_matches_authority(
-            service,
-            pod_uid=pod_uid,
-            runtime_generation=runtime_generation,
-        ):
-            raise RuntimeError("session Service belongs to another runtime generation")
-        elif runtime_generation:
+        else:
             await self._call(
                 self._core_api.patch_namespaced_service,
                 name=name,
-                namespace=self._namespace,
+                namespace=namespace,
                 body=self._route_authority_patch(
-                    service,
+                    existing,
                     pod_name,
                     pod_uid,
                     runtime_generation,
@@ -218,53 +511,58 @@ class SessionRouterService:
                 ),
                 _content_type="application/json-patch+json",
             )
-
-        # Ingress
-        ingress = await self._read_or_none(
-            self._networking_api.read_namespaced_ingress, name
+        observed = await self._read_or_none(
+            self._core_api.read_namespaced_service,
+            name,
+            namespace=namespace,
         )
-        if ingress is None:
+        if observed is None or not self._service_matches(
+            observed,
+            thread_id=thread_id,
+            name=name,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            runtime_generation=runtime_generation,
+            namespace=namespace,
+        ):
+            raise SessionRouteAuthorityError("created session Service is not trusted")
+        return observed
+
+    async def _publish_ingress(
+        self,
+        *,
+        existing: Any | None,
+        thread_id: str,
+        name: str,
+        pod_name: str,
+        pod_uid: str,
+        runtime_generation: str,
+        namespace: str,
+    ) -> Any:
+        if existing is None:
             try:
                 await self._call(
                     self._networking_api.create_namespaced_ingress,
-                    namespace=self._namespace,
+                    namespace=namespace,
                     body=self._ingress_body(
                         thread_id,
                         name,
                         pod_name,
                         pod_uid,
                         runtime_generation,
+                        namespace=namespace,
                     ),
                 )
-            except Exception as e:
-                if not _is_k8s_status(e, 409):
+            except Exception as exc:
+                if not _is_k8s_status(exc, 409):
                     raise
-            ingress = await self._read_or_none(
-                self._networking_api.read_namespaced_ingress, name
-            )
-            if ingress is None or not self._resource_matches_authority(
-                ingress,
-                pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
-                require_generation=runtime_generation is not None,
-            ):
-                raise RuntimeError(
-                    "session Ingress create lost runtime-generation authority"
-                )
-
-        elif not self._resource_matches_authority(
-            ingress,
-            pod_uid=pod_uid,
-            runtime_generation=runtime_generation,
-        ):
-            raise RuntimeError("session Ingress belongs to another runtime generation")
-        elif runtime_generation:
+        else:
             await self._call(
                 self._networking_api.patch_namespaced_ingress,
                 name=name,
-                namespace=self._namespace,
+                namespace=namespace,
                 body=self._route_authority_patch(
-                    ingress,
+                    existing,
                     pod_name,
                     pod_uid,
                     runtime_generation,
@@ -272,18 +570,162 @@ class SessionRouterService:
                 ),
                 _content_type="application/json-patch+json",
             )
+        observed = await self._read_or_none(
+            self._networking_api.read_namespaced_ingress,
+            name,
+            namespace=namespace,
+        )
+        if observed is None or not self._ingress_matches(
+            observed,
+            thread_id=thread_id,
+            name=name,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            runtime_generation=runtime_generation,
+            namespace=namespace,
+        ):
+            raise SessionRouteAuthorityError("created session Ingress is not trusted")
+        return observed
 
-        return f"/p/{thread_id}"
+    @staticmethod
+    def _route_generation_matches(
+        labels: Any,
+        selector: Any,
+        *,
+        thread_id: str,
+        runtime_generation: str,
+        allow_missing_generation: bool,
+    ) -> bool:
+        if not isinstance(labels, dict) or labels.get("srw.io/thread-id") != thread_id:
+            return False
+        label_generation = labels.get("srw.io/runtime-generation")
+        if label_generation != runtime_generation and not (
+            allow_missing_generation and label_generation in {None, ""}
+        ):
+            return False
+        if selector is None:
+            return True
+        expected = {"srw.io/thread-id": thread_id}
+        if selector == {**expected, "srw.io/runtime-generation": runtime_generation}:
+            return True
+        return allow_missing_generation and selector == expected
+
+    def _service_matches(
+        self,
+        resource: Any,
+        *,
+        thread_id: str,
+        name: str,
+        pod_name: str,
+        pod_uid: str,
+        runtime_generation: str,
+        namespace: str,
+        allow_missing_generation: bool = False,
+    ) -> bool:
+        metadata = _value(resource, "metadata")
+        spec = _value(resource, "spec")
+        labels = _value(metadata, "labels")
+        selector = _value(spec, "selector")
+        ports = _value(spec, "ports")
+        matching_port = bool(
+            isinstance(ports, (list, tuple))
+            and len(ports) == 1
+            and _value(ports[0], "port") == 8001
+            and _value(ports[0], "target_port", "targetPort") == 8001
+        )
+        return bool(
+            _value(metadata, "name") == name
+            and _value(metadata, "namespace") == namespace
+            and isinstance(labels, dict)
+            and labels.get("srw.io/managed-by") == "orchestrator"
+            and self._route_generation_matches(
+                labels,
+                selector,
+                thread_id=thread_id,
+                runtime_generation=runtime_generation,
+                allow_missing_generation=allow_missing_generation,
+            )
+            and _value(spec, "type") == "ClusterIP"
+            and matching_port
+            and _owner_reference_matches(resource, pod_name=pod_name, pod_uid=pod_uid)
+        )
+
+    def _ingress_matches(
+        self,
+        resource: Any,
+        *,
+        thread_id: str,
+        name: str,
+        pod_name: str,
+        pod_uid: str,
+        runtime_generation: str,
+        namespace: str,
+        allow_missing_generation: bool = False,
+    ) -> bool:
+        metadata = _value(resource, "metadata")
+        spec = _value(resource, "spec")
+        labels = _value(metadata, "labels")
+        annotations = _value(metadata, "annotations") or {}
+        rules = _value(spec, "rules")
+        if not isinstance(rules, (list, tuple)) or len(rules) != 1:
+            return False
+        rule = rules[0]
+        paths = _value(_value(rule, "http"), "paths")
+        if not isinstance(paths, (list, tuple)) or len(paths) != 1:
+            return False
+        path = paths[0]
+        service = _value(_value(path, "backend"), "service")
+        port = _value(service, "port")
+        actual_tls = _value(spec, "tls") or []
+        if self._tls_secret_name:
+            tls_matches = bool(
+                isinstance(actual_tls, (list, tuple))
+                and len(actual_tls) == 1
+                and _value(actual_tls[0], "hosts") == [self._ingress_host]
+                and _value(actual_tls[0], "secret_name", "secretName")
+                == self._tls_secret_name
+            )
+        else:
+            tls_matches = not actual_tls
+        return bool(
+            _value(metadata, "name") == name
+            and _value(metadata, "namespace") == namespace
+            and isinstance(labels, dict)
+            and labels.get("srw.io/managed-by") == "orchestrator"
+            and self._route_generation_matches(
+                labels,
+                None,
+                thread_id=thread_id,
+                runtime_generation=runtime_generation,
+                allow_missing_generation=allow_missing_generation,
+            )
+            and annotations == self._annotations
+            and _value(spec, "ingress_class_name", "ingressClassName")
+            == self._ingress_class
+            and _value(rule, "host") == self._ingress_host
+            and _value(path, "path") == f"/p/{thread_id}"
+            and _value(path, "path_type", "pathType") == "Prefix"
+            and _value(service, "name") == name
+            and _value(port, "number") == 8001
+            and tls_matches
+            and _owner_reference_matches(resource, pod_name=pod_name, pod_uid=pod_uid)
+        )
 
     async def teardown_route(
         self,
         thread_id: str,
         *,
+        expected_namespace: str,
         expected_runtime_generation: str | None = None,
         expected_owner_uid: str | None = None,
     ) -> bool:
         """Delete only the captured route generation. 404 is exact success."""
         self._lazy_init_apis()
+        expected_namespace = str(expected_namespace or "").strip()
+        if _KUBERNETES_NAMESPACE.fullmatch(expected_namespace) is None:
+            raise SessionRouteAuthorityError(
+                "session route namespace authority is unavailable"
+            )
         name = f"session-{thread_id}"
 
         complete = True
@@ -299,7 +741,7 @@ class SessionRouterService:
         ):
             try:
                 resource = await self._call(
-                    read_fn, name=name, namespace=self._namespace
+                    read_fn, name=name, namespace=expected_namespace
                 )
             except Exception as e:
                 if _is_k8s_status(e, 404):
@@ -317,9 +759,7 @@ class SessionRouterService:
             ):
                 # A replacement owns this deterministic name. Preserve it.
                 continue
-            resource_uid = str(
-                getattr(getattr(resource, "metadata", None), "uid", "") or ""
-            )
+            resource_uid = str(_value(_value(resource, "metadata"), "uid") or "")
             if not resource_uid:
                 complete = False
                 continue
@@ -327,7 +767,7 @@ class SessionRouterService:
                 await self._call(
                     delete_fn,
                     name=name,
-                    namespace=self._namespace,
+                    namespace=expected_namespace,
                     body={"preconditions": {"uid": resource_uid}},
                 )
             except Exception as e:
@@ -346,18 +786,24 @@ class SessionRouterService:
     # Helpers
     # --------------------------------------------------------------------- #
 
-    async def _exists(self, read_fn: Any, name: str) -> bool:
+    async def _exists(self, read_fn: Any, name: str, *, namespace: str) -> bool:
         try:
-            await self._call(read_fn, name=name, namespace=self._namespace)
+            await self._call(read_fn, name=name, namespace=namespace)
             return True
         except Exception as e:
             if _is_k8s_status(e, 404):
                 return False
             raise
 
-    async def _read_or_none(self, read_fn: Any, name: str) -> Any | None:
+    async def _read_or_none(
+        self,
+        read_fn: Any,
+        name: str,
+        *,
+        namespace: str,
+    ) -> Any | None:
         try:
-            return await self._call(read_fn, name=name, namespace=self._namespace)
+            return await self._call(read_fn, name=name, namespace=namespace)
         except Exception as exc:
             if _is_k8s_status(exc, 404):
                 return None
@@ -371,16 +817,13 @@ class SessionRouterService:
         runtime_generation: str | None,
         require_generation: bool = False,
     ) -> bool:
-        metadata = getattr(resource, "metadata", None)
-        labels = dict(getattr(metadata, "labels", None) or {})
-        owners = list(getattr(metadata, "owner_references", None) or [])
-        owner_uids = {
-            str(getattr(owner, "uid", "") or "")
-            if not isinstance(owner, dict)
-            else str(owner.get("uid") or "")
-            for owner in owners
-        }
-        if pod_uid and str(pod_uid) not in owner_uids:
+        metadata = _value(resource, "metadata")
+        labels_value = _value(metadata, "labels")
+        labels = dict(labels_value) if isinstance(labels_value, dict) else {}
+        owners_value = _value(metadata, "owner_references", "ownerReferences")
+        owners = list(owners_value) if isinstance(owners_value, (list, tuple)) else []
+        owner_uids = {str(_value(owner, "uid") or "") for owner in owners}
+        if pod_uid and (len(owners) != 1 or str(pod_uid) not in owner_uids):
             return False
         observed_generation = labels.get("srw.io/runtime-generation")
         if runtime_generation:
@@ -407,8 +850,8 @@ class SessionRouterService:
         interleaving fail without mutating the replacement.
         """
 
-        metadata = getattr(resource, "metadata", None)
-        resource_uid = str(getattr(metadata, "uid", "") or "")
+        metadata = _value(resource, "metadata")
+        resource_uid = str(_value(metadata, "uid") or "")
         if not resource_uid:
             raise RuntimeError("session route resource has no immutable UID")
         patch: list[dict[str, Any]] = [
@@ -431,7 +874,7 @@ class SessionRouterService:
                     "path": "/spec/selector",
                     "value": {
                         "srw.io/thread-id": str(
-                            (getattr(metadata, "labels", None) or {}).get(
+                            (_value(metadata, "labels") or {}).get(
                                 "srw.io/thread-id", ""
                             )
                         ),
@@ -443,9 +886,7 @@ class SessionRouterService:
 
     @staticmethod
     async def _call(fn: Any, **kwargs: Any) -> Any:
-        # kubernetes client is sync; run in executor to keep the loop free.
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: fn(**kwargs))
+        return await run_bounded_k8s_call(fn, **kwargs)
 
     def _owner_ref(self, pod_name: str, pod_uid: str) -> dict[str, Any]:
         return {
@@ -464,13 +905,16 @@ class SessionRouterService:
         pod_name: str,
         pod_uid: str,
         runtime_generation: str | None = None,
+        *,
+        namespace: str | None = None,
     ) -> dict[str, Any]:
+        namespace = namespace or self._namespace
         return {
             "apiVersion": "v1",
             "kind": "Service",
             "metadata": {
                 "name": name,
-                "namespace": self._namespace,
+                "namespace": namespace,
                 "labels": {
                     "srw.io/thread-id": thread_id,
                     "srw.io/managed-by": "orchestrator",
@@ -509,7 +953,10 @@ class SessionRouterService:
         pod_name: str,
         pod_uid: str,
         runtime_generation: str | None = None,
+        *,
+        namespace: str | None = None,
     ) -> dict[str, Any]:
+        namespace = namespace or self._namespace
         annotations = dict(self._annotations)
         spec: dict[str, Any] = {
             "ingressClassName": self._ingress_class,
@@ -545,7 +992,7 @@ class SessionRouterService:
             "kind": "Ingress",
             "metadata": {
                 "name": name,
-                "namespace": self._namespace,
+                "namespace": namespace,
                 "labels": {
                     "srw.io/thread-id": thread_id,
                     "srw.io/managed-by": "orchestrator",

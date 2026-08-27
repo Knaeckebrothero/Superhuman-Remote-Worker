@@ -88,6 +88,7 @@ class AgentInstanceManager:
             metadata: dict[str, Any] = {
                 "pod_phase": pod.status.phase,
                 "row_present": row is not None,
+                "pod_uid": str(getattr(pod.metadata, "uid", "") or ""),
             }
             version: str | None = None
             bound_to: str | None = None
@@ -212,7 +213,10 @@ class AgentInstanceManager:
         """Force-delete the underlying pod via the provisioner."""
         if not self._provisioner_ready():
             return
-        await self._provisioner.delete_agent_pod(inst.id)
+        await self._provisioner.delete_agent_pod(
+            inst.id,
+            expected_pod_uid=str(inst.metadata.get("pod_uid") or ""),
+        )
 
     # -------------------------------------------------------------------------
     # Startup reconciliation (called from main.lifespan)

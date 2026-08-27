@@ -87,7 +87,6 @@ from fastapi import (  # noqa: E402
     Request,
     UploadFile,
     WebSocket,
-    WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import (  # noqa: E402
@@ -472,6 +471,7 @@ from src.core.product_capabilities import (  # noqa: E402
     ComponentProvenance,
     ProvenanceStatus,
 )
+from src.api.models import PinnedJobRecipient  # noqa: E402
 
 # Lite (no-workspace-pod) backend names. Canonical set lives agent-side in the
 # backend factory; imported (not re-declared) so the dispatch/provisioning
@@ -533,6 +533,7 @@ from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.vm_readiness import vm_readiness_prober  # noqa: E402
 from services.container_provisioner import (  # noqa: E402
     WORKSPACE_RUNTIME_INCARNATION_KEY,
+    WorkspaceCleanupOutcome,
     WorkspaceRuntimeAttestation,
     WorkspaceRuntimeAuthorityError,
     WorkspaceTeardownIdentity,
@@ -552,6 +553,11 @@ from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.persistent_recycler import (  # noqa: E402
     PersistentThreadRecycler,
     persistent_recycle_view,
+)
+from services.pinned_agent_authority import (  # noqa: E402
+    reconcile_legacy_pinned_agent_authority,
+    release_pinned_warm_binding_protection,
+    reserve_pinned_warm_agent_binding,
 )
 from services.agent_provisioner import agent_provisioner  # noqa: E402
 from services.runtime_actor import (  # noqa: E402
@@ -610,7 +616,7 @@ from services.workspace_suspension import (  # noqa: E402
 )
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
-from services.ide_proxy import ide_proxy_service  # noqa: E402
+from services.ide_proxy import IdeProxyUnavailable, ide_proxy_service  # noqa: E402
 from services.email import email_service  # noqa: E402
 from services import headless_notifications  # noqa: E402
 from services.brand import TRAVERTINE as _BRAND  # noqa: E402
@@ -1378,6 +1384,7 @@ session_router = SessionRouterService(
     ingress_class=os.environ.get("SESSION_INGRESS_CLASS", "traefik"),
     annotations=_session_annotations,
     tls_secret_name=os.environ.get("SESSION_INGRESS_TLS_SECRET") or None,
+    db=postgres_db,
 )
 
 _session_jwt_secret = os.environ.get("SESSION_JWT_SECRET", "")
@@ -2055,7 +2062,10 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
             for orphan in orphaned_sessions or []:
                 deleted = await _step(
                     "orphaned_session_pod_delete",
-                    agent_provisioner.delete_agent_pod(orphan["hostname"]),
+                    agent_provisioner.delete_agent_pod(
+                        orphan["hostname"],
+                        expected_pod_uid=str(orphan.get("pod_uid") or ""),
+                    ),
                 )
                 logger.warning(
                     "Reaped orphaned session agent %s (pod=%s, deleted=%s): "
@@ -2682,7 +2692,9 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
         pull_ide_config,
         reconcile_extensions,
         reconcile_ide_settings,
+        reconcile_vm_ide_workspace,
         resolve_ssh_target,
+        is_vm_capture_context,
     )
 
     interval = float(os.environ.get("IDE_SETTINGS_SYNC_INTERVAL_S", "600"))
@@ -2692,10 +2704,20 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
     while not shutdown_event.is_set():
         try:
             workspaces = await postgres_db.list_active_ide_workspaces()
+            vm_workspaces = [
+                workspace
+                for workspace in workspaces
+                if is_vm_capture_context(workspace.get("context"))
+            ]
+            workspaces = [
+                workspace
+                for workspace in workspaces
+                if not is_vm_capture_context(workspace.get("context"))
+            ]
             workspaces = await evict_dead_workspaces(
                 workspaces, container_provisioner, postgres_db
             )
-            if workspaces:
+            if workspaces or vm_workspaces:
                 # Dial-target visibility: stable Service DNS survives pod
                 # restarts; raw IPs are legacy rows predating the headless
                 # Service and go stale with the pod.
@@ -2754,6 +2776,27 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
                             )
                         except Exception as e:  # noqa: BLE001
                             logger.warning("ide profile capture failed: %s", e)
+                    for ws in vm_workspaces:
+                        try:
+                            await reconcile_vm_ide_workspace(
+                                store=store,
+                                workspace=ws,
+                                db=postgres_db,
+                                vm_provisioner=vm_provisioner,
+                                classifier=classifier,
+                                profile_store=profile,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("VM IDE capture failed: %s", e)
+                else:
+                    for ws in vm_workspaces:
+                        await reconcile_vm_ide_workspace(
+                            store=store,
+                            workspace=ws,
+                            db=postgres_db,
+                            vm_provisioner=vm_provisioner,
+                            classifier=classifier,
+                        )
         except Exception as e:
             logger.error("Error in code-server settings sweeper: %s", e)
 
@@ -2811,6 +2854,18 @@ async def pinned_agent_create_intent_reconciler(
     logger.info("Pinned agent create-intent reconciler started")
     while not shutdown_event.is_set():
         try:
+            legacy = await reconcile_legacy_pinned_agent_authority(
+                postgres_db,
+                agent_provisioner=agent_provisioner,
+                persistent_provisioner=persistent_provisioner,
+                limit=50,
+            )
+            if legacy.unresolved:
+                logger.warning(
+                    "Pinned legacy Kubernetes authority remains unresolved "
+                    "for %d row(s)",
+                    legacy.unresolved,
+                )
             rows = await postgres_db.list_pinned_agent_create_intents_for_reconcile(
                 limit=50
             )
@@ -2830,7 +2885,13 @@ async def pinned_agent_create_intent_reconciler(
                     generation = str(row.get("runtime_generation") or "")
                     attempt_id = str(row.get("attempt_id") or "")
                     pod_name = str(row.get("pod_name") or "")
-                    if not all((thread_id, generation, attempt_id, pod_name)):
+                    namespace = str(row.get("namespace") or "")
+                    if (
+                        not all(
+                            (thread_id, generation, attempt_id, pod_name, namespace)
+                        )
+                        or str(row.get("protection_protocol") or "") != "finalizer_v1"
+                    ):
                         continue
 
                     claim = row.get("workspace_claim")
@@ -2845,14 +2906,24 @@ async def pinned_agent_create_intent_reconciler(
                         claim_name = str(claim.get("pvc_name") or "")
                         claim_status = str(claim.get("status") or "")
                         claim_uid = str(claim.get("pvc_uid") or "")
-                        if not all(
-                            (
-                                claim_id,
-                                claim_generation,
-                                claim_attempt,
-                                claim_name,
+                        claim_namespace = str(claim.get("namespace") or "")
+                        if (
+                            not all(
+                                (
+                                    claim_id,
+                                    claim_generation,
+                                    claim_attempt,
+                                    claim_name,
+                                    claim_namespace,
+                                )
                             )
-                        ) or claim_status not in {"planned", "ready"}:
+                            or claim_status not in {"planned", "ready"}
+                            or not (
+                                claim_namespace == namespace
+                                and str(claim.get("protection_protocol") or "")
+                                == "finalizer_v1"
+                            )
+                        ):
                             continue
                         observed_claim = await provider.agent_workspace_claim_authority(
                             claim_name,
@@ -2860,6 +2931,7 @@ async def pinned_agent_create_intent_reconciler(
                             expected_runtime_generation=claim_generation,
                             expected_claim_id=claim_id,
                             expected_create_attempt=claim_attempt,
+                            namespace=claim_namespace,
                             expected_pvc_uid=claim_uid or None,
                         )
                         observed_claim_uid = str(
@@ -2880,6 +2952,7 @@ async def pinned_agent_create_intent_reconciler(
                                 claim_id=claim_id,
                                 pvc_name=claim_name,
                                 pvc_uid=observed_claim_uid,
+                                namespace=claim_namespace,
                             )
                         ):
                             continue
@@ -2889,6 +2962,7 @@ async def pinned_agent_create_intent_reconciler(
                         expected_thread_id=thread_id,
                         expected_runtime_generation=generation,
                         expected_attempt_id=attempt_id,
+                        namespace=namespace,
                     )
                     pod_uid = str((observed_pod or {}).get("pod_uid") or "")
                     if not (
@@ -2902,6 +2976,7 @@ async def pinned_agent_create_intent_reconciler(
                         attempt_id=attempt_id,
                         pod_name=pod_name,
                         pod_uid=pod_uid,
+                        namespace=namespace,
                     )
                 except Exception:
                     logger.exception(
@@ -2915,6 +2990,38 @@ async def pinned_agent_create_intent_reconciler(
         except TimeoutError:
             pass
     logger.info("Pinned agent create-intent reconciler stopped")
+
+
+async def _begin_pinned_thread_retirement(
+    thread_id: str, **kwargs: Any
+) -> dict[str, Any]:
+    """Adopt exact 0185 objects before freezing retirement authority."""
+
+    try:
+        legacy = await reconcile_legacy_pinned_agent_authority(
+            postgres_db,
+            agent_provisioner=agent_provisioner,
+            persistent_provisioner=persistent_provisioner,
+            thread_id=thread_id,
+            limit=2,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Pinned legacy Kubernetes authority adoption failed before End: %s",
+            thread_id,
+        )
+        return {
+            "state": "malformed",
+            "reason": "agent_k8s_authority_adoption_failed",
+        }
+    if not legacy.complete:
+        return {
+            "state": "malformed",
+            "reason": "agent_k8s_authority_adoption_unresolved",
+        }
+    return await postgres_db.begin_pinned_thread_retirement(thread_id, **kwargs)
 
 
 async def pinned_k8s_create_fence_gc_sweeper(
@@ -2954,15 +3061,20 @@ async def pinned_k8s_create_fence_gc_sweeper(
                 generation = str(row.get("runtime_generation") or "")
                 create_attempt = str(row.get("create_attempt") or "")
                 authority_id = str(row.get("authority_id") or "")
-                if not all(
-                    (
-                        resource_name,
-                        resource_uid,
-                        thread_id,
-                        generation,
-                        create_attempt,
-                        authority_id,
+                namespace = str(row.get("namespace") or "")
+                if (
+                    not all(
+                        (
+                            resource_name,
+                            resource_uid,
+                            thread_id,
+                            generation,
+                            create_attempt,
+                            authority_id,
+                            namespace,
+                        )
                     )
+                    or str(row.get("protection_protocol") or "") != "finalizer_v1"
                 ):
                     continue
                 if resource_kind == "pod":
@@ -2971,26 +3083,49 @@ async def pinned_k8s_create_fence_gc_sweeper(
                         expected_thread_id=thread_id,
                         expected_runtime_generation=generation,
                         expected_attempt_id=create_attempt,
+                        namespace=namespace,
                     )
                     state = str((observed or {}).get("state") or "")
                     observed_uid = str((observed or {}).get("pod_uid") or "")
                     if state == "exact_fence" and observed_uid == resource_uid:
                         deleted = (
                             await persistent_provisioner.delete_agent_pod_exact(
-                                thread_id, expected_pod_uid=resource_uid
+                                thread_id,
+                                expected_pod_uid=resource_uid,
+                                namespace=namespace,
                             )
                             if provisioner == "persistent"
                             else await agent_provisioner.delete_agent_pod_exact(
-                                resource_name, expected_pod_uid=resource_uid
+                                resource_name,
+                                expected_pod_uid=resource_uid,
+                                namespace=namespace,
                             )
                         )
                         if not deleted:
+                            continue
+                        released = (
+                            await persistent_provisioner.release_agent_pod_finalizer_exact(
+                                thread_id,
+                                expected_pod_uid=resource_uid,
+                                namespace=namespace,
+                                terminal_required=False,
+                            )
+                            if provisioner == "persistent"
+                            else await agent_provisioner.release_agent_pod_finalizer_exact(
+                                resource_name,
+                                expected_pod_uid=resource_uid,
+                                namespace=namespace,
+                                terminal_required=False,
+                            )
+                        )
+                        if not released:
                             continue
                         observed = await provider.agent_pod_provision_intent_authority(
                             resource_name,
                             expected_thread_id=thread_id,
                             expected_runtime_generation=generation,
                             expected_attempt_id=create_attempt,
+                            namespace=namespace,
                         )
                         state = str((observed or {}).get("state") or "")
                     if state != "exact_absent":
@@ -3002,13 +3137,22 @@ async def pinned_k8s_create_fence_gc_sweeper(
                         expected_runtime_generation=generation,
                         expected_claim_id=authority_id,
                         expected_create_attempt=create_attempt,
+                        namespace=namespace,
                         expected_pvc_uid=resource_uid,
                     )
                     state = str((observed or {}).get("state") or "")
                     observed_uid = str((observed or {}).get("pvc_uid") or "")
                     if state == "exact_fence" and observed_uid == resource_uid:
                         if not await provider.delete_agent_workspace_claim_exact(
-                            resource_name, expected_pvc_uid=resource_uid
+                            resource_name,
+                            expected_pvc_uid=resource_uid,
+                            namespace=namespace,
+                        ):
+                            continue
+                        if not await provider.release_agent_workspace_claim_finalizer_exact(
+                            resource_name,
+                            expected_pvc_uid=resource_uid,
+                            namespace=namespace,
                         ):
                             continue
                         observed = await provider.agent_workspace_claim_authority(
@@ -3017,6 +3161,7 @@ async def pinned_k8s_create_fence_gc_sweeper(
                             expected_runtime_generation=generation,
                             expected_claim_id=authority_id,
                             expected_create_attempt=create_attempt,
+                            namespace=namespace,
                             expected_pvc_uid=resource_uid,
                         )
                         state = str((observed or {}).get("state") or "")
@@ -5199,6 +5344,15 @@ async def _build_job_start_request(
             project_id=str(job["project_id"]) if job.get("project_id") else None,
             runtime_actor=runtime_actor.to_payload(),
             workspace_runtime=workspace_runtime_projection,
+            workspace_provisioner=(
+                (str(_get_container_context(job).get("provisioner") or "") or None)
+                if workspace_decision.effective_backend == "sandbox"
+                else (
+                    str(_get_vm_context(job).get("provisioner") or "vm")
+                    if workspace_decision.effective_backend == "vm"
+                    else None
+                )
+            ),
         )
 
         return job_start
@@ -5228,6 +5382,119 @@ def _redispatch_livelock_trip(job: Mapping[str, Any]) -> Mapping[str, Any] | Non
     if isinstance(recovery, Mapping) and recovery.get("state") == "tripped":
         return recovery
     return None
+
+
+class _PinnedJobMutationTarget(NamedTuple):
+    agent: dict[str, Any]
+    recipient: PinnedJobRecipient
+
+
+async def _prepare_pinned_job_mutation_target(
+    *,
+    agent_id: str,
+    job_id: str,
+    require_idle: bool,
+) -> _PinnedJobMutationTarget | None:
+    """Resolve and freshly attest the exact process for pinned job control."""
+
+    fresh = await postgres_db.get_agent(agent_id)
+    if not fresh or not fresh.get("pod_ip"):
+        logger.warning(
+            "Pinned recipient unavailable for job %s (agent=%s)", job_id, agent_id
+        )
+        return None
+
+    status = str(fresh.get("status") or "")
+    current_job_id = str(fresh.get("current_job_id") or "") or None
+    if require_idle:
+        is_fresh_accept = status == "ready" and current_job_id is None
+        is_exact_retry = status == "working" and current_job_id == job_id
+        if not (is_fresh_accept or is_exact_retry):
+            logger.warning(
+                "Pinned recipient cannot accept/replay job %s "
+                "(agent=%s status=%s current=%s)",
+                job_id,
+                agent_id,
+                status,
+                current_job_id,
+            )
+            return None
+    elif status != "working" or current_job_id != job_id:
+        logger.warning(
+            "Pinned recipient no longer owns job %s (agent=%s status=%s current=%s)",
+            job_id,
+            agent_id,
+            status,
+            current_job_id,
+        )
+        return None
+
+    metadata = fresh.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+    process_generation = (
+        str(metadata.get("dispatch_process_generation") or "").strip()
+        if isinstance(metadata, Mapping)
+        else ""
+    )
+    if not process_generation:
+        logger.warning(
+            "Pinned recipient lacks process generation for job %s (agent=%s)",
+            job_id,
+            agent_id,
+        )
+        return None
+
+    pod_uid = str(fresh.get("pod_uid") or "").strip() or None
+    ready_url = f"http://{fresh['pod_ip']}:{fresh['pod_port']}/ready"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            ready_response = await client.get(ready_url)
+        ready_payload = (
+            ready_response.json() if ready_response.status_code == 200 else {}
+        )
+    except Exception as exc:
+        logger.info(
+            "Pinned recipient capability probe failed for agent %s (%s)",
+            agent_id,
+            type(exc).__name__,
+        )
+        return None
+    if not (
+        isinstance(ready_payload, Mapping)
+        and ready_payload.get("ready") is True
+        and isinstance(ready_payload.get("capabilities"), Mapping)
+        and ready_payload["capabilities"].get("pinned_recipient_binding") is True
+    ):
+        logger.warning(
+            "Pinned recipient binding capability unavailable for agent %s", agent_id
+        )
+        return None
+
+    if pod_uid is not None and not await agent_provisioner.attest_pinned_job_recipient(
+        str(fresh.get("hostname") or ""),
+        expected_pod_uid=pod_uid,
+        expected_pod_ip=str(fresh["pod_ip"]),
+    ):
+        logger.warning(
+            "Pinned recipient Pod attestation failed for job %s (agent=%s)",
+            job_id,
+            agent_id,
+        )
+        return None
+
+    return _PinnedJobMutationTarget(
+        agent=fresh,
+        recipient=PinnedJobRecipient(
+            expected_agent_id=agent_id,
+            expected_pod_uid=pod_uid,
+            expected_process_generation=process_generation,
+            expected_job_id=job_id,
+        ),
+    )
 
 
 async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
@@ -5264,6 +5531,17 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         )
         return False
 
+    durable_job = job
+    try:
+        job, workspace_authority = await _attest_pinned_k8s_job_workspace(job)
+    except WorkspaceRuntimeAuthorityError as exc:
+        logger.warning(
+            "Dispatch: refusing unattested Kubernetes workspace for job %s (%s)",
+            job_id,
+            exc,
+        )
+        return False
+
     _log_token = bind_log_context(job_id=job_id, agent_id=agent_id)
     try:
         job_start = await _build_job_start_request(
@@ -5273,7 +5551,24 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         if job_start is None:
             return False
 
-        if not await _workspace_runtime_unchanged_before_delivery(job):
+        if workspace_authority is not None:
+            attested = workspace_authority.attestation
+            job_start = job_start.model_copy(
+                update={
+                    "workspace_provisioner": "k8s",
+                    "workspace_generation": attested.workspace_generation,
+                    "workspace_runtime_incarnation": attested.runtime_incarnation,
+                    "workspace_ssh_host_key_fingerprint": (
+                        attested.ssh_host_key_fingerprint
+                    ),
+                    "workspace_owner_kind": workspace_authority.owner.kind,
+                    "workspace_owner_id": workspace_authority.owner.id,
+                }
+            )
+
+        if not await _pinned_k8s_job_workspace_authority_is_current(
+            durable_job, workspace_authority
+        ):
             logger.warning(
                 "Dispatch: workspace authority changed while assembling job %s",
                 job_id,
@@ -5288,7 +5583,26 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             )
             return False
 
-        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/start"
+        if not await _pinned_k8s_job_workspace_authority_is_current(
+            durable_job, workspace_authority
+        ):
+            logger.warning(
+                "Dispatch: workspace authority changed at delivery for job %s",
+                job_id,
+            )
+            return False
+
+        target = await _prepare_pinned_job_mutation_target(
+            agent_id=agent_id,
+            job_id=job_id,
+            require_idle=True,
+        )
+        if target is None:
+            return False
+        job_start = job_start.model_copy(update={"recipient": target.recipient})
+        agent_url = (
+            f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/start"
+        )
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 agent_url,
@@ -5376,6 +5690,17 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             "Resume dispatch: job %s waiting for workspace authority recovery (%s)",
             job_id,
             workspace_reason or workspace_action,
+        )
+        return False
+
+    durable_job = job
+    try:
+        job, workspace_authority = await _attest_pinned_k8s_job_workspace(job)
+    except WorkspaceRuntimeAuthorityError as exc:
+        logger.warning(
+            "Resume dispatch: refusing unattested Kubernetes workspace for job %s (%s)",
+            job_id,
+            exc,
         )
         return False
 
@@ -5710,7 +6035,33 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             "managed_repository_credentials": managed_repository_credentials,
             "runtime_actor": runtime_actor.to_payload(),
             WORKSPACE_RUNTIME_CONTEXT_KEY: workspace_decision.safe_projection(),
+            "workspace_provisioner": (
+                "k8s"
+                if workspace_authority is not None
+                else (
+                    str(_get_container_context(job).get("provisioner") or "") or None
+                    if workspace_decision.effective_backend == "sandbox"
+                    else (
+                        str(_get_vm_context(job).get("provisioner") or "vm")
+                        if workspace_decision.effective_backend == "vm"
+                        else None
+                    )
+                )
+            ),
         }
+        if workspace_authority is not None:
+            attested = workspace_authority.attestation
+            resume_payload.update(
+                {
+                    "workspace_generation": attested.workspace_generation,
+                    "workspace_runtime_incarnation": attested.runtime_incarnation,
+                    "workspace_ssh_host_key_fingerprint": (
+                        attested.ssh_host_key_fingerprint
+                    ),
+                    "workspace_owner_kind": workspace_authority.owner.kind,
+                    "workspace_owner_id": workspace_authority.owner.id,
+                }
+            )
         if queued_feedback:
             resume_payload["feedback"] = queued_feedback
             if queued_feedback_reason:
@@ -5718,7 +6069,9 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         if delegation_results:
             resume_payload["delegation_results"] = delegation_results
 
-        if not await _workspace_runtime_unchanged_before_delivery(job):
+        if not await _pinned_k8s_job_workspace_authority_is_current(
+            durable_job, workspace_authority
+        ):
             logger.warning(
                 "Resume dispatch: workspace authority changed while assembling job %s",
                 job_id,
@@ -5733,7 +6086,26 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             )
             return False
 
-        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
+        if not await _pinned_k8s_job_workspace_authority_is_current(
+            durable_job, workspace_authority
+        ):
+            logger.warning(
+                "Resume dispatch: workspace authority changed at delivery for job %s",
+                job_id,
+            )
+            return False
+
+        target = await _prepare_pinned_job_mutation_target(
+            agent_id=agent_id,
+            job_id=job_id,
+            require_idle=True,
+        )
+        if target is None:
+            return False
+        resume_payload["recipient"] = target.recipient.model_dump(mode="json")
+        agent_url = (
+            f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/resume"
+        )
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 agent_url,
@@ -5847,9 +6219,21 @@ async def _initiate_pause(job: dict) -> None:
                     else None
                 ),
             )
-        agent_url = f"http://{job['pod_ip']}:{job['pod_port']}/job/pause"
+        target = await _prepare_pinned_job_mutation_target(
+            agent_id=agent_id,
+            job_id=job_id,
+            require_idle=False,
+        )
+        if target is None:
+            return
+        agent_url = (
+            f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/pause"
+        )
         async with httpx.AsyncClient(timeout=130.0) as client:
-            response = await client.post(agent_url)
+            response = await client.post(
+                agent_url,
+                json={"recipient": target.recipient.model_dump(mode="json")},
+            )
 
         if response.status_code == 200:
             release_pause_claim = True
@@ -6073,51 +6457,38 @@ async def _reserve_session_attach_binding(
     the lane is still pinned.  We never need to tear down an already-started
     session merely because a post-delivery lane CAS lost.
     """
-    attach_token = str(uuid4())
     try:
-        async with postgres_db.acquire() as conn:
-            async with conn.transaction():
-                # Match control admission's lock order: threads -> agents.
-                # Taking these in the opposite order creates a deterministic
-                # deadlock when a control is admitted during a warm bind.
-                thread_bound = await conn.execute(
-                    "UPDATE threads SET agent_id = $2, "
-                    "runtime_attach_token = $4::uuid, "
-                    "control_admission_agent_id = NULL "
-                    "WHERE id = $1 AND execution_lane = $3 "
-                    "AND agent_id IS NULL "
-                    "AND status IN ('created','active','awaiting_user','suspended') "
-                    "AND runtime_generation = $5::uuid "
-                    "AND runtime_retirement_token IS NULL",
-                    thread_id,
-                    agent_id,
-                    "pinned",
-                    attach_token,
-                    expected_runtime_generation,
-                )
-                if thread_bound != "UPDATE 1":
-                    raise RuntimeError(
-                        "thread is no longer detached on the pinned lane"
-                    )
-
-                agent_bound = await conn.execute(
-                    "UPDATE agents SET thread_id = $2, status = 'session' "
-                    "WHERE id = $1 AND thread_id IS NULL "
-                    "AND current_job_id IS NULL AND status = 'ready'",
-                    agent_id,
-                    thread_id,
-                )
-                if agent_bound != "UPDATE 1":
-                    raise RuntimeError("agent is no longer idle")
-        return attach_token
+        result = await reserve_pinned_warm_agent_binding(
+            postgres_db,
+            agent_provisioner=agent_provisioner,
+            persistent_provisioner=persistent_provisioner,
+            thread_id=thread_id,
+            agent_id=agent_id,
+            expected_runtime_generation=expected_runtime_generation,
+        )
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
-        logger.info(
-            "Session attach reservation refused for agent %s / thread %s: %s",
+        # A durable plan may already own a finalizer effect.  Treat every
+        # post-plan error as ambiguous; the leader reconciler will either bind
+        # or release it and no caller may provision a competing runtime.
+        logger.exception(
+            "Warm session attach reservation became ambiguous for agent %s / "
+            "thread %s: %s",
             agent_id,
             thread_id,
             exc,
         )
-        return None
+        raise _WarmBindingReservationPending from exc
+    if result.bound:
+        return result.attach_token
+    if result.state == "pending":
+        raise _WarmBindingReservationPending
+    return None
+
+
+class _WarmBindingReservationPending(RuntimeError):
+    """A durable warm protection plan must settle before fallback creation."""
 
 
 SessionAttachReleaseOutcome = Literal["released", "already_detached", "unsafe"]
@@ -6559,6 +6930,7 @@ async def _release_session_attach_binding(
     class _AttachAbortCASLost(RuntimeError):
         pass
 
+    warm_release_id: str | None = None
     try:
         async with postgres_db.acquire() as conn:
             async with conn.transaction():
@@ -6644,6 +7016,39 @@ async def _release_session_attach_binding(
                     # the marker proven reciprocal to the captured agent in
                     # this same rotation transaction—never UID-delete it.
                     updated_metadata.pop("agent_pod", None)
+                warm_binding = None
+                if isinstance(agent_pod_marker, dict) and str(
+                    agent_pod_marker.get("warm_binding_protection") or ""
+                ):
+                    try:
+                        warm_release_id = str(
+                            UUID(str(agent_pod_marker.get("warm_binding_protection")))
+                        )
+                    except (TypeError, ValueError):
+                        return "unsafe"
+                    warm_binding = await conn.fetchrow(
+                        "SELECT * FROM "
+                        "thread_agent_warm_binding_protections "
+                        "WHERE protection_id=$1::uuid FOR UPDATE",
+                        warm_release_id,
+                    )
+                    if not (
+                        warm_binding is not None
+                        and str(warm_binding["status"]) == "bound"
+                        and str(warm_binding["source"]) == "attach"
+                        and str(warm_binding["thread_id"]) == thread_id
+                        and str(warm_binding["runtime_generation"])
+                        == expected_runtime_generation
+                        and str(warm_binding["runtime_attach_token"])
+                        == expected_attach_token
+                        and str(warm_binding["agent_id"]) == agent_id
+                        and str(warm_binding["pod_name"])
+                        == str(agent.get("hostname") or "")
+                        and str(warm_binding["pod_uid"]) == current_pod_uid
+                        and str(warm_binding["namespace"])
+                        == str(agent_pod_marker.get("namespace") or "")
+                    ):
+                        return "unsafe"
                 config = metadata.get("config_override") or {}
                 workspace_cfg = (
                     config.get("workspace") if isinstance(config, dict) else {}
@@ -6741,6 +7146,16 @@ async def _release_session_attach_binding(
                         captured_workspace_runtime or None
                     ),
                 }
+                if warm_binding is not None:
+                    releasing = await conn.execute(
+                        "UPDATE thread_agent_warm_binding_protections SET "
+                        "status='releasing',"
+                        "release_started_at=transaction_timestamp() "
+                        "WHERE protection_id=$1::uuid AND status='bound'",
+                        warm_release_id,
+                    )
+                    if releasing != "UPDATE 1":
+                        raise _AttachAbortCASLost
                 thread_updated = await conn.execute(
                     "UPDATE threads SET agent_id=NULL, runtime_attach_token=NULL, "
                     "control_admission_agent_id=NULL, "
@@ -6759,12 +7174,13 @@ async def _release_session_attach_binding(
                     json.dumps(updated_metadata, sort_keys=True, separators=(",", ":")),
                 )
                 agent_updated = await conn.execute(
-                    "UPDATE agents SET thread_id=NULL, status='ready' "
+                    "UPDATE agents SET thread_id=NULL, status=$4 "
                     "WHERE id=$1::uuid AND thread_id=$2::uuid "
                     "AND pod_uid=$3 AND current_job_id IS NULL AND status='session'",
                     agent_id,
                     thread_id,
                     current_pod_uid,
+                    "draining" if warm_binding is not None else "ready",
                 )
                 if thread_updated != "UPDATE 1" or agent_updated != "UPDATE 1":
                     raise _AttachAbortCASLost
@@ -6789,6 +7205,23 @@ async def _release_session_attach_binding(
                 )
                 if outcome_inserted != "INSERT 0 1":
                     raise _AttachAbortCASLost
+        if warm_release_id is not None:
+            try:
+                await release_pinned_warm_binding_protection(
+                    postgres_db,
+                    protection_id=warm_release_id,
+                    agent_provisioner=agent_provisioner,
+                    persistent_provisioner=persistent_provisioner,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Warm Pod finalizer release remains durable after attach "
+                    "abort (thread=%s protection=%s)",
+                    thread_id,
+                    warm_release_id,
+                )
         return "released"
     except _AttachAbortCASLost:
         return "unsafe"
@@ -7089,6 +7522,217 @@ async def _assemble_session_attach_payload(
     }
 
 
+class _PinnedSessionMutationTarget(NamedTuple):
+    agent: dict[str, Any]
+    binding: PinnedSessionBinding | None
+    recipient: dict[str, Any]
+    process_generation: str
+    runtime_generation: str
+    attach_token: str
+
+
+def _agent_process_generation(agent: Mapping[str, Any]) -> str:
+    metadata = agent.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+    return (
+        str(metadata.get("dispatch_process_generation") or "").strip()
+        if isinstance(metadata, Mapping)
+        else ""
+    )
+
+
+async def _attest_pinned_session_mutation_pod(
+    *,
+    binding: PinnedSessionBinding,
+) -> bool:
+    """Prove the exact namespace/Pod coordinate selected by PostgreSQL."""
+
+    if binding.agent_hostname == f"persistent-{binding.thread_id[:12]}":
+        return await persistent_provisioner.attest_pinned_session_recipient(
+            binding.agent_hostname,
+            thread_id=binding.thread_id,
+            expected_runtime_generation=binding.runtime_generation,
+            expected_pod_uid=binding.pod_uid,
+            expected_pod_ip=binding.pod_ip,
+            namespace=binding.pod_namespace,
+        )
+    return await agent_provisioner.attest_pinned_session_recipient(
+        binding.agent_hostname,
+        thread_id=binding.thread_id,
+        expected_pod_uid=binding.pod_uid,
+        expected_pod_ip=binding.pod_ip,
+        namespace=binding.pod_namespace,
+    )
+
+
+def _local_pinned_session_target_matches(
+    *,
+    thread: Mapping[str, Any] | None,
+    agent: Mapping[str, Any] | None,
+    thread_id: str,
+    agent_id: str,
+    runtime_generation: str,
+    attach_token: str,
+    process_generation: str,
+    pod_ip: str,
+    pod_port: int,
+) -> bool:
+    """Validate the explicit non-Kubernetes pool transport after every await."""
+
+    authority = thread_runtime_authority(thread)
+    return bool(
+        authority is not None
+        and authority.generation == runtime_generation
+        and str((thread or {}).get("agent_id") or "") == agent_id
+        and str((thread or {}).get("runtime_attach_token") or "") == attach_token
+        and agent
+        and str(agent.get("id") or "") == agent_id
+        and str(agent.get("thread_id") or "") == thread_id
+        and str(agent.get("status") or "") == "session"
+        and not agent.get("current_job_id")
+        and not str(agent.get("pod_uid") or "").strip()
+        and str(agent.get("pod_ip") or "") == pod_ip
+        and int(agent.get("pod_port") or 8001) == pod_port
+        and _agent_process_generation(agent) == process_generation
+    )
+
+
+async def _prepare_pinned_session_mutation_target(
+    *,
+    thread_id: str,
+    agent_id: str,
+    runtime_generation: str,
+    attach_token: str,
+) -> _PinnedSessionMutationTarget | None:
+    """Resolve one exact registered process before delivering session state."""
+
+    agent = await postgres_db.get_agent(agent_id)
+    process_generation = _agent_process_generation(agent or {})
+    if not agent or not process_generation or not agent.get("pod_ip"):
+        return None
+    pod_uid = str(agent.get("pod_uid") or "").strip() or None
+    binding = None
+    if pod_uid is not None:
+        binding = await postgres_db.get_pinned_session_binding(
+            thread_id,
+            expected_runtime_generation=runtime_generation,
+        )
+        if not (
+            binding
+            and binding.agent_id == agent_id
+            and binding.runtime_attach_token == attach_token
+            and binding.agent_status == "session"
+            and binding.agent_hostname == str(agent.get("hostname") or "")
+            and binding.pod_uid == pod_uid
+            and binding.pod_ip == str(agent.get("pod_ip") or "")
+            and binding.pod_port == int(agent.get("pod_port") or 8001)
+            and str(agent.get("thread_id") or "") == thread_id
+            and not agent.get("current_job_id")
+        ):
+            return None
+        target_ip = binding.pod_ip
+        target_port = binding.pod_port
+    else:
+        thread = await postgres_db.get_thread(thread_id)
+        target_ip = str(agent.get("pod_ip") or "")
+        target_port = int(agent.get("pod_port") or 8001)
+        if not _local_pinned_session_target_matches(
+            thread=thread,
+            agent=agent,
+            thread_id=thread_id,
+            agent_id=agent_id,
+            runtime_generation=runtime_generation,
+            attach_token=attach_token,
+            process_generation=process_generation,
+            pod_ip=target_ip,
+            pod_port=target_port,
+        ):
+            return None
+
+    # This GET carries no credentials or user input. It only prevents a mixed
+    # rollout runtime that would ignore the process recipient envelope from
+    # receiving the subsequent mutation.
+    ready_url = f"http://{target_ip}:{target_port}/ready"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(ready_url)
+        ready = response.json()
+    except Exception:
+        return None
+    capabilities = ready.get("capabilities") if isinstance(ready, Mapping) else None
+    observed_thread = ready.get("thread_id") if isinstance(ready, Mapping) else None
+    if not (
+        isinstance(capabilities, Mapping)
+        and capabilities.get("pinned_session_recipient_binding") is True
+        and observed_thread in {None, "", thread_id}
+    ):
+        return None
+    if binding is not None and not await _attest_pinned_session_mutation_pod(
+        binding=binding
+    ):
+        return None
+
+    target = _PinnedSessionMutationTarget(
+        agent=dict(agent),
+        binding=binding,
+        process_generation=process_generation,
+        runtime_generation=runtime_generation,
+        attach_token=attach_token,
+        recipient={
+            "expected_thread_id": thread_id,
+            "expected_agent_id": agent_id,
+            "expected_pod_uid": pod_uid,
+            "expected_process_generation": process_generation,
+        },
+    )
+    return target if await _pinned_session_mutation_target_is_current(target) else None
+
+
+async def _pinned_session_mutation_target_is_current(
+    target: _PinnedSessionMutationTarget,
+) -> bool:
+    """Re-read every DB/Kubernetes fact after an await or HTTP response."""
+
+    recipient = target.recipient
+    thread_id = str(recipient["expected_thread_id"])
+    agent_id = str(recipient["expected_agent_id"])
+    fresh_agent = await postgres_db.get_agent(agent_id)
+    if target.binding is None:
+        fresh_thread = await postgres_db.get_thread(thread_id)
+        return _local_pinned_session_target_matches(
+            thread=fresh_thread,
+            agent=fresh_agent,
+            thread_id=thread_id,
+            agent_id=agent_id,
+            runtime_generation=target.runtime_generation,
+            attach_token=target.attach_token,
+            process_generation=target.process_generation,
+            pod_ip=str(target.agent.get("pod_ip") or ""),
+            pod_port=int(target.agent.get("pod_port") or 8001),
+        )
+
+    fresh_binding = await postgres_db.get_pinned_session_binding(
+        thread_id,
+        expected_runtime_generation=target.binding.runtime_generation,
+    )
+    if not (
+        fresh_binding
+        and fresh_binding.target_key == target.binding.target_key
+        and fresh_binding.agent_status == "session"
+        and fresh_agent
+        and str(fresh_agent.get("thread_id") or "") == thread_id
+        and str(fresh_agent.get("status") or "") == "session"
+        and not fresh_agent.get("current_job_id")
+        and _agent_process_generation(fresh_agent) == target.process_generation
+    ):
+        return False
+    return await _attest_pinned_session_mutation_pod(binding=fresh_binding)
+
+
 async def _send_session_attach_locked(
     agent: dict,
     thread_id: str,
@@ -7174,11 +7818,20 @@ async def _send_session_attach_locked(
     ):
         return False
     agent_id = str(agent["id"])
-    attach_token = await _reserve_session_attach_binding(
-        agent_id,
-        thread_id,
-        expected_runtime_generation=runtime_authority.generation,
-    )
+    try:
+        attach_token = await _reserve_session_attach_binding(
+            agent_id,
+            thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+        )
+    except _WarmBindingReservationPending:
+        logger.warning(
+            "Warm session attach protection remains pending for agent %s / "
+            "thread %s; refusing a competing runtime",
+            agent_id,
+            thread_id,
+        )
+        return True
     if attach_token is None:
         return False
     payload = await _assemble_session_attach_payload(
@@ -7261,23 +7914,67 @@ async def _send_session_attach_locked(
         # as ambiguous and leave the reconciler/process latch to fence it.
         return release not in {"released", "already_detached"}
 
-    agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
+    target = await _prepare_pinned_session_mutation_target(
+        thread_id=thread_id,
+        agent_id=agent_id,
+        runtime_generation=runtime_authority.generation,
+        attach_token=attach_token,
+    )
+    if target is None:
+        try:
+            release = await _release_session_attach_binding(
+                agent_id,
+                thread_id,
+                expected_runtime_generation=runtime_authority.generation,
+                expected_attach_token=attach_token,
+                pre_delivery=True,
+            )
+        except Exception:
+            logger.exception(
+                "Session attach recipient proof failed and reservation release "
+                "was ambiguous for agent %s / thread %s",
+                agent_id,
+                thread_id,
+            )
+            return True
+        if release in {"released", "already_detached"}:
+            _schedule_attach_abort_successor(
+                thread_id,
+                retired_runtime_generation=runtime_authority.generation,
+                retired_attach_token=attach_token,
+                retired_agent_id=agent_id,
+            )
+        return release not in {"released", "already_detached"}
+
+    payload["_recipient"] = target.recipient
+    agent_url = (
+        f"http://{target.agent['pod_ip']}:"
+        f"{int(target.agent.get('pod_port') or 8001)}/session/attach"
+    )
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(agent_url, json=payload)
+        target_current = await _pinned_session_mutation_target_is_current(target)
+        if not target_current:
+            logger.error(
+                "Session attach response for agent %s lost exact recipient "
+                "authority; retaining reservation for reconciliation",
+                agent_id,
+            )
+            return True
         if response.status_code == 200:
             logger.info(
                 "Assigned thread %s to persistent agent %s (%s:%s)",
                 thread_id,
-                agent["id"],
-                agent["pod_ip"],
-                agent["pod_port"],
+                target.agent["id"],
+                target.agent["pod_ip"],
+                target.agent["pod_port"],
             )
             return True
         logger.error(
             "Persistent agent %s returned ambiguous attach response %s; "
             "retaining reservation to prevent duplicate execution",
-            agent["id"],
+            target.agent["id"],
             response.status_code,
         )
         return True
@@ -7285,7 +7982,7 @@ async def _send_session_attach_locked(
         logger.exception(
             "Session attach delivery to agent %s is ambiguous; retaining "
             "the DB reservation to prevent duplicate execution",
-            agent["id"],
+            target.agent["id"],
         )
         return True
 
@@ -8355,6 +9052,105 @@ def _stateless_worker_workspace_owner(job: dict) -> WorkspaceOwner:
     if parent_id and ctx.get("inherits_parent_workspace"):
         return WorkspaceOwner.job(str(parent_id))
     return WorkspaceOwner.job(str(job["id"]))
+
+
+@dataclass(frozen=True, slots=True)
+class _PinnedK8sJobWorkspaceAuthority:
+    """One exact server-attested Kubernetes workspace delivery tuple."""
+
+    owner: WorkspaceOwner
+    attestation: WorkspaceRuntimeAttestation
+
+
+async def _attest_pinned_k8s_job_workspace(
+    job: dict[str, Any],
+) -> tuple[dict[str, Any], _PinnedK8sJobWorkspaceAuthority | None]:
+    """Replace a pinned job's Kubernetes endpoint with a fresh attestation."""
+
+    decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
+    if not decision.ready or decision.effective_backend != "sandbox":
+        return job, None
+    workspace = _get_container_context(job)
+    provisioner = str(workspace.get("provisioner") or "").strip().lower()
+    if provisioner == "docker":
+        return job, None
+    if provisioner != "k8s":
+        raise WorkspaceRuntimeAuthorityError(
+            "sandbox workspace provisioner authority is unavailable"
+        )
+    try:
+        expected_runtime = str(
+            UUID(str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
+        )
+        stored_port = int(workspace.get("port") or 30022)
+    except (TypeError, ValueError) as exc:
+        raise WorkspaceRuntimeAuthorityError(
+            "sandbox workspace runtime authority is malformed"
+        ) from exc
+
+    owner = _stateless_worker_workspace_owner(job)
+    attestation = await container_provisioner.attest_workspace_runtime(owner)
+    if attestation.runtime_incarnation != expected_runtime:
+        raise WorkspaceRuntimeAuthorityError(
+            "sandbox workspace runtime changed before delivery"
+        )
+    stored_host = workspace.get("host")
+    stored_ip = workspace.get("pod_ip")
+    if (
+        (stored_host and str(stored_host) != attestation.host)
+        or (stored_ip and str(stored_ip) != attestation.pod_ip)
+        or stored_port != attestation.port
+    ):
+        raise WorkspaceRuntimeAuthorityError(
+            "sandbox workspace endpoint changed before delivery"
+        )
+
+    exact_workspace = copy.deepcopy(workspace)
+    exact_workspace.update(
+        {
+            "status": "ready",
+            "provisioner": "k8s",
+            "host": attestation.host,
+            "pod_ip": attestation.pod_ip,
+            "port": attestation.port,
+            WORKSPACE_RUNTIME_INCARNATION_KEY: attestation.runtime_incarnation,
+        }
+    )
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise WorkspaceRuntimeAuthorityError(
+                "sandbox workspace context is malformed"
+            ) from exc
+    if not isinstance(context, Mapping):
+        raise WorkspaceRuntimeAuthorityError("sandbox workspace context is malformed")
+    exact_job = copy.deepcopy(job)
+    exact_context = copy.deepcopy(dict(context))
+    exact_context["workspace_container"] = exact_workspace
+    exact_job["context"] = exact_context
+    return exact_job, _PinnedK8sJobWorkspaceAuthority(owner, attestation)
+
+
+async def _pinned_k8s_job_workspace_authority_is_current(
+    durable_job: dict[str, Any],
+    authority: _PinnedK8sJobWorkspaceAuthority | None,
+) -> bool:
+    """Revalidate the exact workspace tuple at the final network boundary."""
+
+    if not await _workspace_runtime_unchanged_before_delivery(durable_job):
+        return False
+    if authority is None:
+        return True
+    try:
+        latest = await postgres_db.get_job(str(durable_job["id"]))
+        if latest is None:
+            return False
+        _, confirmed = await _attest_pinned_k8s_job_workspace(latest)
+        return confirmed == authority
+    except Exception:
+        return False
 
 
 async def _attest_stateless_worker_workspace(
@@ -9819,7 +10615,7 @@ async def _archive_and_cleanup_workspace(
 
         # VM cleanup (snapshot + delete)
         if _vm_needs_release(vm_ctx):
-            if vm_provisioner.is_available:
+            if vm_provisioner.lifecycle_available:
                 teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
                     entity_id,
                     entity_type="thread",
@@ -9863,7 +10659,7 @@ async def _archive_and_cleanup_workspace(
 
         # VM cleanup (snapshot + delete)
         if _vm_needs_release(vm_ctx):
-            if vm_provisioner.is_available:
+            if vm_provisioner.lifecycle_available:
                 teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
                     entity_id
                 )
@@ -9933,28 +10729,31 @@ async def _detach_agent_session(thread_id: str, timeout: float = 150.0) -> bool:
     """
     try:
         thread = await postgres_db.get_thread(thread_id)
-        agent_id = (thread or {}).get("agent_id")
-        if not agent_id:
+        runtime_authority = thread_runtime_authority(thread)
+        if runtime_authority is None or not _thread_uses_pinned_execution(thread):
             return False
-        row = await postgres_db.fetchrow(
-            "SELECT pod_ip, pod_port, status FROM agents WHERE id = $1",
-            str(agent_id),
+        binding = await postgres_db.get_pinned_session_binding(
+            thread_id,
+            expected_runtime_generation=runtime_authority.generation,
         )
-        agent = dict(row) if row else None
         # 'session' is the heartbeat status of an agent serving a live
         # session — anything else (ready/offline/busy) either has nothing
         # to capture or is unreachable, so skip fast and let the normal
         # teardown run.
-        if not agent or not agent.get("pod_ip") or agent.get("status") != "session":
+        if binding is None or binding.agent_status != "session":
             return False
-        url = (
-            f"http://{agent['pod_ip']}:{int(agent.get('pod_port') or 8001)}"
-            "/session/detach"
-        )
+        url = f"http://{binding.pod_ip}:{binding.pod_port}/session/detach"
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(timeout, connect=3.0)
         ) as client:
-            resp = await client.post(url)
+            resp = await client.post(
+                url,
+                json={
+                    "session_identity_fingerprint": (
+                        binding.session_identity_fingerprint
+                    )
+                },
+            )
         if resp.status_code == 200:
             logger.info(
                 "Thread %s: agent detach completed before teardown",
@@ -10577,45 +11376,65 @@ def _retirement_has_exact_local_quiescence(
 
 
 async def _wait_for_captured_agent_pod_retired(
-    pod_name: str, pod_uid: str, *, timeout_s: float = 60.0
-) -> bool:
+    pod_name: str,
+    pod_uid: str,
+    *,
+    namespace: str,
+    allowed: set[str],
+    timeout_s: float = 60.0,
+) -> str | None:
     """Wait until one exact Pod process is absent/terminal, never by name."""
 
     deadline = asyncio.get_running_loop().time() + timeout_s
     while True:
         authority = await agent_provisioner.agent_pod_authority(
-            pod_name, expected_pod_uid=pod_uid
+            pod_name, expected_pod_uid=pod_uid, namespace=namespace
         )
-        if authority in {"exact_absent", "exact_terminal", "replacement"}:
-            return True
+        if authority in allowed:
+            return authority
         if authority != "exact_live" and asyncio.get_running_loop().time() >= deadline:
-            return False
+            return None
         if asyncio.get_running_loop().time() >= deadline:
-            return False
+            return None
         await asyncio.sleep(0.25)
 
 
 def _captured_retirement_agent_pods(
     retirement: Mapping[str, Any],
-) -> set[tuple[str, str]]:
+) -> set[tuple[str, str, str, str]]:
     """Return immutable agent Pod name/UID pairs from one Begin context."""
 
     context = retirement.get("context")
     context = {} if context is None else context
     if not isinstance(context, Mapping):
         return set()
-    captured: set[tuple[str, str]] = set()
+    captured: set[tuple[str, str, str, str]] = set()
+    agent_pod = context.get("agent_pod") or {}
+    pod_namespace = (
+        str(agent_pod.get("namespace") or "") if isinstance(agent_pod, Mapping) else ""
+    )
+    protection_protocol = (
+        str(agent_pod.get("protection_protocol") or "")
+        if isinstance(agent_pod, Mapping)
+        else ""
+    )
     agent = context.get("agent") or {}
     if isinstance(agent, Mapping) and agent:
         captured.add(
-            (str(agent.get("hostname") or ""), str(agent.get("pod_uid") or ""))
+            (
+                str(agent.get("hostname") or ""),
+                str(agent.get("pod_uid") or ""),
+                pod_namespace,
+                protection_protocol,
+            )
         )
-    agent_pod = context.get("agent_pod") or {}
     if isinstance(agent_pod, Mapping) and agent_pod:
         captured.add(
             (
                 str(agent_pod.get("pod_name") or ""),
                 str(agent_pod.get("pod_uid") or ""),
+                pod_namespace,
+                protection_protocol,
             )
         )
     return captured
@@ -10626,17 +11445,51 @@ async def _stop_captured_retirement_agent(
 ) -> None:
     """Delete/wait only the exact captured actor process, never by name."""
 
-    for pod_name, pod_uid in _captured_retirement_agent_pods(retirement):
+    for (
+        pod_name,
+        pod_uid,
+        namespace,
+        protection_protocol,
+    ) in _captured_retirement_agent_pods(retirement):
         if not pod_name and not pod_uid:
             continue
-        if not pod_name or not pod_uid or not agent_provisioner.is_available:
+        if not (
+            pod_name
+            and pod_uid
+            and namespace
+            and protection_protocol == "finalizer_v1"
+            and agent_provisioner.is_available
+        ):
             raise RuntimeError("captured agent Pod identity is incomplete")
         if not await agent_provisioner.delete_agent_pod_exact(
-            pod_name, expected_pod_uid=pod_uid
+            pod_name,
+            expected_pod_uid=pod_uid,
+            namespace=namespace,
         ):
             raise RuntimeError("exact agent Pod deletion is retryable")
-        if not await _wait_for_captured_agent_pod_retired(pod_name, pod_uid):
+        terminal = await _wait_for_captured_agent_pod_retired(
+            pod_name,
+            pod_uid,
+            namespace=namespace,
+            allowed={"exact_terminal"},
+        )
+        if terminal != "exact_terminal":
             raise RuntimeError("exact agent Pod termination is retryable")
+        if not await agent_provisioner.release_agent_pod_finalizer_exact(
+            pod_name,
+            expected_pod_uid=pod_uid,
+            namespace=namespace,
+            terminal_required=True,
+        ):
+            raise RuntimeError("exact agent Pod finalizer release is retryable")
+        absent = await _wait_for_captured_agent_pod_retired(
+            pod_name,
+            pod_uid,
+            namespace=namespace,
+            allowed={"exact_absent", "replacement"},
+        )
+        if absent not in {"exact_absent", "replacement"}:
+            raise RuntimeError("exact agent Pod final deletion is retryable")
 
 
 def _pre_registration_agent_pod_zero_candidate(
@@ -10759,6 +11612,8 @@ def _agent_pod_provision_intent_zero_candidate(
     attempt_id = str(intent.get("attempt_id") or "")
     pod_name = str(intent.get("pod_name") or "")
     provisioner = str(intent.get("provisioner") or "")
+    namespace = str(intent.get("namespace") or "")
+    protection_protocol = str(intent.get("protection_protocol") or "")
     try:
         UUID(attempt_id)
     except (TypeError, ValueError):
@@ -10766,6 +11621,8 @@ def _agent_pod_provision_intent_zero_candidate(
     if not (
         provisioner in {"agent", "persistent"}
         and pod_name
+        and namespace
+        and protection_protocol == "finalizer_v1"
         and str(intent.get("status") or "") == "planned"
         and str(intent.get("thread_id") or "") == str(context.get("thread_id") or "")
         and str(intent.get("runtime_generation") or "")
@@ -10790,6 +11647,8 @@ def _agent_pod_provision_intent_zero_candidate(
         "attempt_id": attempt_id,
         "pod_name": pod_name,
         "provisioner": provisioner,
+        "namespace": namespace,
+        "protection_protocol": protection_protocol,
     }
 
 
@@ -10843,6 +11702,7 @@ async def _recover_agent_pod_provision_intent_zero(
             expected_thread_id=thread_id,
             expected_runtime_generation=generation,
             expected_attempt_id=intent["attempt_id"],
+            namespace=intent["namespace"],
         )
         if not (
             isinstance(observed, Mapping)
@@ -10864,6 +11724,7 @@ async def _recover_agent_pod_provision_intent_zero(
                 expected_thread_id=thread_id,
                 expected_runtime_generation=generation,
                 expected_attempt_id=intent["attempt_id"],
+                namespace=intent["namespace"],
             )
             if not isinstance(fenced, Mapping):
                 return False
@@ -10876,18 +11737,41 @@ async def _recover_agent_pod_provision_intent_zero(
                 return False
             deleted = (
                 await persistent_provisioner.delete_agent_pod_exact(
-                    thread_id, expected_pod_uid=candidate_uid
+                    thread_id,
+                    expected_pod_uid=candidate_uid,
+                    namespace=intent["namespace"],
                 )
                 if intent["provisioner"] == "persistent"
                 else await agent_provisioner.delete_agent_pod_exact(
-                    intent["pod_name"], expected_pod_uid=candidate_uid
+                    intent["pod_name"],
+                    expected_pod_uid=candidate_uid,
+                    namespace=intent["namespace"],
                 )
             )
             if not deleted:
                 return False
+            released = (
+                await persistent_provisioner.release_agent_pod_finalizer_exact(
+                    thread_id,
+                    expected_pod_uid=candidate_uid,
+                    namespace=intent["namespace"],
+                    terminal_required=True,
+                )
+                if intent["provisioner"] == "persistent"
+                else await agent_provisioner.release_agent_pod_finalizer_exact(
+                    intent["pod_name"],
+                    expected_pod_uid=candidate_uid,
+                    namespace=intent["namespace"],
+                    terminal_required=True,
+                )
+            )
+            if not released:
+                return False
             while True:
                 authority = await provider.agent_pod_authority(
-                    intent["pod_name"], expected_pod_uid=candidate_uid
+                    intent["pod_name"],
+                    expected_pod_uid=candidate_uid,
+                    namespace=intent["namespace"],
                 )
                 if authority == "exact_absent":
                     break
@@ -10950,6 +11834,8 @@ def _captured_agent_workspace_claim(
         "pvc_name": str(raw.get("pvc_name") or ""),
         "status": str(raw.get("status") or ""),
         "pvc_uid": str(raw.get("pvc_uid") or ""),
+        "namespace": str(raw.get("namespace") or ""),
+        "protection_protocol": str(raw.get("protection_protocol") or ""),
     }
     try:
         UUID(values["claim_id"])
@@ -10962,6 +11848,8 @@ def _captured_agent_workspace_claim(
         values["thread_id"] == str(context.get("thread_id") or "")
         and values["provisioner"] in {"agent", "persistent"}
         and values["pvc_name"]
+        and values["namespace"]
+        and values["protection_protocol"] == "finalizer_v1"
         and values["status"] in {"planned", "ready"}
         and (values["status"] == "ready") == bool(values["pvc_uid"])
     ):
@@ -10995,6 +11883,7 @@ async def _reconcile_agent_workspace_claim_for_retirement(
             expected_runtime_generation=claim["created_runtime_generation"],
             expected_claim_id=claim["claim_id"],
             expected_create_attempt=claim["create_attempt"],
+            namespace=claim["namespace"],
             expected_pvc_uid=claim["pvc_uid"] or None,
         )
         if (
@@ -11006,6 +11895,7 @@ async def _reconcile_agent_workspace_claim_for_retirement(
                 claim_id=claim["claim_id"],
                 pvc_name=claim["pvc_name"],
                 pvc_uid=retained_uid,
+                namespace=claim["namespace"],
             )
         ):
             raise RuntimeError("exact agent workspace retention is retryable")
@@ -11036,6 +11926,7 @@ async def _reconcile_agent_workspace_claim_for_retirement(
             expected_runtime_generation=claim["created_runtime_generation"],
             expected_claim_id=claim["claim_id"],
             expected_create_attempt=claim["create_attempt"],
+            namespace=claim["namespace"],
             expected_pvc_uid=fence_uid,
         )
         if not (
@@ -11056,6 +11947,7 @@ async def _reconcile_agent_workspace_claim_for_retirement(
             expected_runtime_generation=claim["created_runtime_generation"],
             expected_claim_id=claim["claim_id"],
             expected_create_attempt=claim["create_attempt"],
+            namespace=claim["namespace"],
         )
         if not isinstance(fenced, Mapping):
             raise RuntimeError("agent workspace fence observation is malformed")
@@ -11067,9 +11959,17 @@ async def _reconcile_agent_workspace_claim_for_retirement(
         if state != "exact_original" or not candidate_uid:
             raise RuntimeError("agent workspace name has foreign authority")
         if not await provider.delete_agent_workspace_claim_exact(
-            claim["pvc_name"], expected_pvc_uid=candidate_uid
+            claim["pvc_name"],
+            expected_pvc_uid=candidate_uid,
+            namespace=claim["namespace"],
         ):
             raise RuntimeError("exact agent workspace deletion is retryable")
+        if not await provider.release_agent_workspace_claim_finalizer_exact(
+            claim["pvc_name"],
+            expected_pvc_uid=candidate_uid,
+            namespace=claim["namespace"],
+        ):
+            raise RuntimeError("agent workspace finalizer release is retryable")
         if asyncio.get_running_loop().time() >= deadline:
             raise RuntimeError("agent workspace fence acquisition timed out")
         await asyncio.sleep(0.25)
@@ -11448,12 +12348,19 @@ async def _cleanup_pinned_thread_retirement(
     if not isinstance(route, Mapping):
         raise RuntimeError("captured route identity is malformed")
     route_owner_uid = str((route or {}).get("owner_pod_uid") or "")
-    if not await session_router.teardown_route(
-        thread_id,
-        expected_runtime_generation=generation,
-        expected_owner_uid=route_owner_uid or None,
-    ):
-        raise RuntimeError("exact session route cleanup is retryable")
+    if route_owner_uid:
+        route_namespace = str(
+            (route or {}).get("namespace") or (agent_pod or {}).get("namespace") or ""
+        ).strip()
+        if not route_namespace:
+            raise RuntimeError("captured route namespace authority is malformed")
+        if not await session_router.teardown_route(
+            thread_id,
+            expected_namespace=route_namespace,
+            expected_runtime_generation=generation,
+            expected_owner_uid=route_owner_uid,
+        ):
+            raise RuntimeError("exact session route cleanup is retryable")
 
     workspace_provision_intent_zero = (
         await _reconcile_workspace_provision_intent_for_retirement(retirement)
@@ -11548,7 +12455,7 @@ async def _cleanup_pinned_thread_retirement(
         vm_uid = str(vm.get("vm_uid") or "")
         rootdisk_uid = str(vm.get("rootdisk_pvc_uid") or "")
         if (
-            not vm_provisioner.is_available
+            not vm_provisioner.lifecycle_available
             or not provision_generation
             or not vm_uid
             or (permanent and not rootdisk_uid)
@@ -13680,6 +14587,10 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Safe server-owned workspace runtime authority projection",
     )
+    workspace_provisioner: str | None = Field(
+        default=None,
+        description="Server-derived physical workspace provisioner",
+    )
     delegation_context: str | None = Field(
         default=None,
         description="Shared context from parent delegation",
@@ -13703,6 +14614,11 @@ class JobStartRequest(BaseModel):
     workspace_owner_id: str | None = Field(
         default=None,
         description="Owner UUID used by the workspace entrypoint process tag",
+    )
+    recipient: PinnedJobRecipient | None = Field(
+        default=None,
+        repr=False,
+        description="Hidden server-owned pinned runtime recipient authority",
     )
 
 
@@ -15509,8 +16425,14 @@ async def lifespan(app: FastAPI):
         agent_provisioner=agent_provisioner,
     )
 
-    # Initialize IDE proxy service (pod IP resolution + cache)
-    ide_proxy_service.connect(db=postgres_db)
+    # Initialize IDE proxy service. Kubernetes coordinates are freshly
+    # control-plane-attested, VM browser relay is contained pending a guest
+    # tunnel, and only explicit local-Docker targets may use its short cache.
+    ide_proxy_service.connect(
+        db=postgres_db,
+        container_provisioner=container_provisioner,
+        vm_provisioner=vm_provisioner,
+    )
 
     # Initialize notification feed (SSE broadcast for cockpit)
     from services.notification_feed import notification_feed
@@ -18459,15 +19381,24 @@ async def _cascade_cancel_to_children(job_id: str) -> bool:
             return True
         if not agent_id:
             return False
-        agent = await postgres_db.get_agent(str(agent_id))
-        if not agent or not agent.get("pod_ip") or agent["status"] == "offline":
+        target = await _prepare_pinned_job_mutation_target(
+            agent_id=str(agent_id),
+            job_id=child_id,
+            require_idle=False,
+        )
+        if target is None:
             return False
-        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/cancel"
+        agent_url = (
+            f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/cancel"
+        )
         try:
             async with httpx.AsyncClient(timeout=130.0) as client:
                 response = await client.post(
                     agent_url,
-                    json={"reason": f"Parent job {job_id} cancelled"},
+                    json={
+                        "reason": f"Parent job {job_id} cancelled",
+                        "recipient": target.recipient.model_dump(mode="json"),
+                    },
                 )
             return response.status_code == 200
         except Exception as e:
@@ -18645,15 +19576,26 @@ async def _cascade_pause_to_children(job_id: str) -> None:
         if not agent_id and not require_positive_quiescence:
             return True
         if agent_id:
-            agent = await postgres_db.get_agent(str(agent_id))
-            if not agent or not agent.get("pod_ip") or agent["status"] == "offline":
-                if not require_positive_quiescence:
-                    return True
+            target = await _prepare_pinned_job_mutation_target(
+                agent_id=str(agent_id),
+                job_id=child_id,
+                require_idle=False,
+            )
+            if target is None:
+                return False
             else:
-                agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/pause"
+                agent_url = (
+                    f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}"
+                    "/job/pause"
+                )
                 try:
                     async with httpx.AsyncClient(timeout=130.0) as client:
-                        response = await client.post(agent_url)
+                        response = await client.post(
+                            agent_url,
+                            json={
+                                "recipient": target.recipient.model_dump(mode="json")
+                            },
+                        )
                 except Exception as e:
                     logger.warning(
                         f"Could not reach agent to pause child {child_id}: {e}"
@@ -18940,16 +19882,26 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
         # If job is assigned to an agent, send cancel request to agent pod
         assigned_agent_id = job.get("assigned_agent_id")
         if assigned_agent_id:
-            agent = await postgres_db.get_agent(str(assigned_agent_id))
-            if agent and agent.get("pod_ip") and agent["status"] not in ("offline",):
-                agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/cancel"
+            target = await _prepare_pinned_job_mutation_target(
+                agent_id=str(assigned_agent_id),
+                job_id=job_id,
+                require_idle=False,
+            )
+            if target is not None:
+                agent_url = (
+                    f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}"
+                    "/job/cancel"
+                )
                 try:
                     # 130s timeout: agent tries cooperative stop for up to 120s,
                     # then falls back to hard kill. We wait slightly longer.
                     async with httpx.AsyncClient(timeout=130.0) as client:
                         response = await client.post(
                             agent_url,
-                            json={"reason": "Cancelled via cockpit"},
+                            json={
+                                "reason": "Cancelled via cockpit",
+                                "recipient": target.recipient.model_dump(mode="json"),
+                            },
                         )
                         if response.status_code == 200:
                             resp_data = response.json()
@@ -19105,16 +20057,28 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
             assigned_agent_id = job.get("assigned_agent_id")
             agent_quiescent = not assigned_agent_id
             if assigned_agent_id:
-                agent = await postgres_db.get_agent(str(assigned_agent_id))
-                if not agent or not agent.get("pod_ip") or agent["status"] == "offline":
-                    agent_quiescent = True
+                target = await _prepare_pinned_job_mutation_target(
+                    agent_id=str(assigned_agent_id),
+                    job_id=job_id,
+                    require_idle=False,
+                )
+                if target is None:
+                    agent_quiescent = False
                 else:
                     agent_url = (
-                        f"http://{agent['pod_ip']}:{agent['pod_port']}/job/pause"
+                        f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}"
+                        "/job/pause"
                     )
                     try:
                         async with httpx.AsyncClient(timeout=130.0) as client:
-                            response = await client.post(agent_url)
+                            response = await client.post(
+                                agent_url,
+                                json={
+                                    "recipient": target.recipient.model_dump(
+                                        mode="json"
+                                    )
+                                },
+                            )
                         if response.status_code == 200:
                             agent_quiescent = True
                             logger.info(f"Agent confirmed pause for job {job_id}")
@@ -22482,7 +23446,7 @@ async def get_vm_status(
     result: dict[str, Any] = {"job_id": job_id, "vm": vm_ctx}
 
     if live:
-        if not vm_provisioner.is_available:
+        if not vm_provisioner.lifecycle_available:
             result["live_error"] = "VM provisioning not available"
         else:
             live_status = await vm_provisioner.query_status(job_id)
@@ -22520,7 +23484,7 @@ async def delete_vm(request: Request, job_id: str) -> dict[str, str]:
                 detail="Only the job owner, the project owner, or an admin may delete this VM",
             )
 
-    if not vm_provisioner.is_available:
+    if not vm_provisioner.lifecycle_available:
         raise HTTPException(
             status_code=503, detail="VM provisioning not available (no NATS or K8s)"
         )
@@ -24252,23 +25216,87 @@ async def _capture_workspace_snapshot_for_freeze(job: dict, job_id: str) -> bool
         return False
     container_ctx = _get_container_context(job)
     vm_ctx = _get_vm_context(job)
+    assigned_backend = resolve_workspace_contract(job).assigned_backend
     container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
-    if container_ctx.get("status") == "ready" and container_host:
-        ssh_host, ssh_port, source = container_host, 30022, "pod"
+    if (
+        assigned_backend == "vm"
+        and vm_ctx.get("status") == "ready"
+        and vm_ctx.get("ssh_host")
+    ):
+        source = "vm"
+    elif container_ctx.get("status") == "ready" and container_host:
+        if str(container_ctx.get("provisioner") or "").strip().lower() != "docker":
+            # A Ready Pod endpoint—even a freshly attested one—does not provide
+            # crash-safe authority across the whole snapshot/S3 operation.
+            logger.warning(
+                "Freeze capture refused for %s: Kubernetes capture authority "
+                "is unavailable",
+                job_id,
+            )
+            return False
+        ssh_host = container_host
+        ssh_port, source = int(container_ctx.get("port") or 30022), "pod"
     elif vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
-        ssh_host = vm_ctx["ssh_host"]
-        ssh_port, source = int(vm_ctx.get("ssh_port") or 22), "vm"
+        # Legacy residue is never trusted directly: the exact VM claim below
+        # re-reads the authoritative selected workspace contract and refuses a
+        # stale VM projection when another tier is selected.
+        source = "vm"
     else:
         logger.info(f"Freeze capture skipped for {job_id}: no live workspace endpoint")
         return True
     try:
-        ok = await snapshot_service.capture_vm_snapshot(
-            job_id=job_id,
-            ssh_host=ssh_host,
-            ssh_port=ssh_port,
-            source_type=source,
-            agent_config=canonical_config_name(job.get("config_name") or "worker_base"),
-        )
+        if source == "vm":
+            from services.vm_remote_operation import (
+                VMRemoteOperationLeaseLost,
+                VMRemoteOperationUnavailable,
+                claim_vm_remote_operation,
+            )
+
+            try:
+                lease = await claim_vm_remote_operation(
+                    db=postgres_db,
+                    provisioner=vm_provisioner,
+                    owner_id=job_id,
+                    owner_kind="job",
+                    operation_kind="snapshot_capture",
+                )
+                async with lease:
+
+                    async def capture_authority() -> bool:
+                        return await lease.revalidate() is not None
+
+                    identity = lease.identity
+                    ssh_host = identity.ssh_host
+                    ssh_port = identity.ssh_port
+                    ok = await snapshot_service.capture_vm_snapshot(
+                        job_id=job_id,
+                        ssh_host=ssh_host,
+                        ssh_port=ssh_port,
+                        source_type="vm",
+                        agent_config=canonical_config_name(
+                            job.get("config_name") or "worker_base"
+                        ),
+                        expected_host_key_fingerprint=(
+                            identity.ssh_host_key_fingerprint
+                        ),
+                        capture_authority=capture_authority,
+                    )
+            except (VMRemoteOperationUnavailable, VMRemoteOperationLeaseLost):
+                logger.warning(
+                    "Freeze capture refused for %s: exact VM authority is unavailable",
+                    job_id,
+                )
+                return False
+        else:
+            ok = await snapshot_service.capture_vm_snapshot(
+                job_id=job_id,
+                ssh_host=ssh_host,
+                ssh_port=ssh_port,
+                source_type=source,
+                agent_config=canonical_config_name(
+                    job.get("config_name") or "worker_base"
+                ),
+            )
         logger.info(
             f"Freeze capture for {job_id} ({source} {ssh_host}:{ssh_port}): "
             f"{'ok' if ok else 'failed/skipped'}"
@@ -31359,37 +32387,43 @@ async def _complete_job_legacy(
                 # See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G1)
                 # and knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md.
                 async def _delete_pod(jid: str) -> bool:
-                    delete_kwargs: dict[str, Any] = {}
                     owner = WorkspaceOwner.job(jid)
-                    if _effect_runner is not None:
-                        runtime_incarnation = _get_container_context(job).get(
-                            "_runtime_incarnation"
-                        )
-                        if runtime_incarnation:
-                            authority = (
-                                await container_provisioner.workspace_pod_authority(
-                                    owner,
-                                    expected_runtime_incarnation=str(
-                                        runtime_incarnation
-                                    ),
-                                )
-                            )
-                            if authority in {"exact_absent", "replacement"}:
-                                # The captured runtime is already gone. A
-                                # same-name replacement is not this command's
-                                # delete target and must survive.
-                                return True
-                            if authority not in {"exact_live", "exact_terminal"}:
-                                return False
-                            delete_kwargs = {
-                                "expected_runtime_incarnation": str(
-                                    runtime_incarnation
-                                ),
-                                "wait_for_exact_absence": True,
-                            }
-                    return await container_provisioner.delete_workspace(
-                        owner, **delete_kwargs
+                    runtime_incarnation = _get_container_context(job).get(
+                        WORKSPACE_RUNTIME_INCARNATION_KEY
                     )
+                    try:
+                        runtime_incarnation = str(UUID(str(runtime_incarnation)))
+                    except (TypeError, ValueError):
+                        # Name-only deletion can consume a replacement at the
+                        # deterministic Pod name. Legacy recovery now fails
+                        # closed on rows that cannot identify runtime A.
+                        return False
+
+                    intent = (
+                        await container_provisioner.prepare_workspace_cleanup_intent(
+                            owner,
+                            expected_runtime_incarnation=runtime_incarnation,
+                            target_disposition="deleted",
+                            reclaim_shared_resources=False,
+                        )
+                    )
+                    if not isinstance(intent, dict):
+                        return False
+                    cleanup = (
+                        await container_provisioner.reconcile_workspace_cleanup_intent(
+                            owner,
+                            expected_runtime_incarnation=runtime_incarnation,
+                            intent_generation=int(intent["intent_generation"]),
+                        )
+                    )
+                    if not isinstance(cleanup, WorkspaceCleanupOutcome):
+                        return False
+                    if cleanup.superseded:
+                        # A reached process-zero and disappeared. A successor B
+                        # owns the current context and must not be projected
+                        # back to A's recovery state.
+                        return True
+                    return cleanup.settled
 
                 async def _recover_pod_workspace() -> dict[str, Any]:
                     return await handle_pod_workspace_recovery(
@@ -33401,36 +34435,202 @@ async def stop_ide_session(request: Request, job_id: str) -> dict[str, Any]:
 # IDE Proxy — reverse proxy HTTP + WebSocket to code-server in workspace pods
 # =============================================================================
 
-# Shared httpx client for IDE proxy (long-lived, created once)
-_ide_http_client: httpx.AsyncClient | None = None
-
-
-def _get_ide_http_client() -> httpx.AsyncClient:
-    global _ide_http_client
-    if _ide_http_client is None:
-        _ide_http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0),
-            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-            follow_redirects=False,
-        )
-    return _ide_http_client
-
-
-# Headers that should not be forwarded to the upstream code-server
-_PROXY_HOP_HEADERS = frozenset(
+# code-server runs with ``auth: none`` behind this authenticated BFF. Browser
+# headers are therefore data, never upstream identity. Forward only protocol
+# fields that a read-only asset/document request actually needs; forwarding
+# every header except a known denylist would turn future identity headers into
+# credentials at the unauthenticated upstream.
+_IDE_PROXY_REQUEST_ALLOW_HEADERS = frozenset(
     {
-        "host",
-        "authorization",
-        "connection",
-        "upgrade",
-        "transfer-encoding",
-        "keep-alive",
-        "te",
-        "trailer",
-        "proxy-authorization",
-        "proxy-connection",
+        "accept",
+        "accept-language",
+        "cache-control",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "pragma",
+        "range",
+        "user-agent",
     }
 )
+
+_IDE_PROXY_RESPONSE_ALLOW_HEADERS = frozenset(
+    {
+        "accept-ranges",
+        "cache-control",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-range",
+        "content-type",
+        "etag",
+        "expires",
+        "last-modified",
+    }
+)
+
+_IDE_PROXY_SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# The IDE proxy is a shared control-plane process.  Browser assets are allowed
+# to be moderately large, but one tenant-controlled code-server must never make
+# a replica buffer an unbounded body.  The transport reads raw (not decoded)
+# bytes and rejects byte max+1 before a response can be returned.
+_IDE_PROXY_MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024
+
+_IDE_PROXY_SECRET_QUERY_FIELDS = frozenset(
+    {
+        "access_token",
+        "assertion",
+        "apikey",
+        "api_key",
+        "authorization",
+        "client_secret",
+        "code",
+        "code_verifier",
+        "id_token",
+        "key",
+        "password",
+        "proxy-authorization",
+        "refresh_token",
+        "samlresponse",
+        "secret",
+        "session_token",
+        "signature",
+        "state",
+        "token",
+    }
+)
+
+
+class _IdeProxyAuthorityLost(Exception):
+    """The exact runtime changed at an upstream network boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class _IdeProxyHttpResponse:
+    status_code: int
+    headers: tuple[tuple[str, str], ...]
+    body: bytes
+
+
+def _ide_proxy_query(raw_query: str) -> str:
+    """Remove browser-auth material without altering code-server state fields."""
+
+    if not raw_query:
+        return ""
+    pairs = urllib.parse.parse_qsl(raw_query, keep_blank_values=True)
+    filtered = [
+        (key, value)
+        for key, value in pairs
+        if key.strip().lower() not in _IDE_PROXY_SECRET_QUERY_FIELDS
+    ]
+    return urllib.parse.urlencode(filtered, doseq=True)
+
+
+async def _request_exact_ide_http(
+    *,
+    target: Any,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    content: Any,
+    max_response_body_bytes: int = _IDE_PROXY_MAX_RESPONSE_BODY_BYTES,
+) -> _IdeProxyHttpResponse:
+    """Open one unpooled socket, then re-attest before sending HTTP bytes.
+
+    httpcore's async trace callback runs after TCP connection establishment and
+    before the HTTP protocol writes the request.  A new client per request is
+    intentional: a process-global pool keyed by a reusable Pod IP could hand a
+    new owner a socket established to an old runtime.
+    """
+
+    if method.upper() not in _IDE_PROXY_SAFE_HTTP_METHODS or content is not None:
+        raise IdeProxyUnavailable(
+            "ide_mutation_operation_lease_unavailable",
+            "IDE mutation transport requires a durable operation lease",
+        )
+    if getattr(target, "backend", None) != "docker":
+        # A fresh Pod-UID/owner attestation is still point-in-time authority.
+        # Kubernetes may delete the Pod and reuse its IP after that proof but
+        # before the first HTTP byte is written. Until traffic is carried by an
+        # exact guest/container-bound tunnel or a durable lifecycle lease,
+        # remote K8s and VM transports remain availability-contained.
+        raise IdeProxyUnavailable(
+            "ide_remote_transport_unavailable",
+            "Remote IDE transport requires a connection-level exact identity",
+        )
+    if (
+        isinstance(max_response_body_bytes, bool)
+        or not isinstance(max_response_body_bytes, int)
+        or max_response_body_bytes < 1
+    ):
+        raise IdeProxyUnavailable(
+            "ide_response_limit_invalid",
+            "IDE response limit is unavailable",
+        )
+
+    async def trace(event_name: str, info: dict[str, Any]) -> None:
+        if (
+            event_name == "connection.connect_tcp.complete"
+            and not await ide_proxy_service.revalidate_target(target)
+        ):
+            # A failure raised from a ``complete`` trace prevents pool
+            # adoption, but httpcore does not promise prompt peer-visible EOF.
+            # Close the just-opened stream before refusing the request.
+            stream = info.get("return_value")
+            close = getattr(stream, "aclose", None)
+            if callable(close):
+                await close()
+            raise _IdeProxyAuthorityLost
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0),
+        limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        async with client.stream(
+            method=method,
+            url=url,
+            headers=headers,
+            content=content,
+            extensions={"trace": trace},
+        ) as response:
+            raw_length = response.headers.get("content-length")
+            if raw_length is not None:
+                try:
+                    declared_length = int(raw_length)
+                except (TypeError, ValueError) as exc:
+                    raise IdeProxyUnavailable(
+                        "ide_response_invalid",
+                        "IDE response metadata is invalid",
+                    ) from exc
+                if declared_length < 0 or declared_length > max_response_body_bytes:
+                    raise IdeProxyUnavailable(
+                        "ide_response_too_large",
+                        "IDE response exceeds the proxy byte limit",
+                    )
+
+            body = bytearray()
+            async for chunk in response.aiter_raw():
+                if len(body) + len(chunk) > max_response_body_bytes:
+                    raise IdeProxyUnavailable(
+                        "ide_response_too_large",
+                        "IDE response exceeds the proxy byte limit",
+                    )
+                body.extend(chunk)
+            status_code = response.status_code
+            response_headers = tuple(response.headers.multi_items())
+
+        if not await ide_proxy_service.revalidate_target(target):
+            raise _IdeProxyAuthorityLost
+        return _IdeProxyHttpResponse(
+            status_code=status_code,
+            headers=response_headers,
+            body=bytes(body),
+        )
 
 
 def _is_browser_navigation(request: Request) -> bool:
@@ -33516,85 +34716,99 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
         )
         raise HTTPException(status_code=403, detail="IDE access denied")
 
-    await _require_stateless_ide_lifecycle(job_id)
-
-    pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
-    if not pod_ip:
-        raise HTTPException(status_code=503, detail="IDE session not active")
-
-    # Live VM workspaces live on the Tailscale mesh; the orchestrator pod is
-    # not a tailnet member, so proxying directly to pod_ip black-holes and the
-    # request hangs into a Cloudflare 504. Until IDE traffic for mesh VMs is
-    # routed through the agent (knowledge-base/knowledge/features/vm_snapshots_and_ide.md,
-    # "Live-VM IDE Access via the Agent"), fail fast with a clear status.
-    from services.ssh_helpers import orchestrator_can_reach
-
-    if not orchestrator_can_reach(pod_ip):
+    # An exact target attestation is a point-in-time proof, not a durable
+    # operation lease serialized against End/recycle. Until that lease exists,
+    # never begin a body-bearing or otherwise mutating HTTP operation: a
+    # lifecycle transition could otherwise commit between the last proof and a
+    # later upload chunk. The request body remains unread and no upstream
+    # connection is opened.
+    if str(request.method or "").upper() not in _IDE_PROXY_SAFE_HTTP_METHODS:
         raise HTTPException(
             status_code=503,
-            detail="IDE is not yet available for VM-backed workspaces.",
+            detail={
+                "code": "ide_mutation_operation_lease_unavailable",
+                "message": "IDE mutation transport requires a durable operation lease",
+            },
         )
 
-    # Build upstream URL (pod_ip may include port for Docker Compose, e.g. "localhost:8081")
-    host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
-    upstream_url = f"http://{host}/{path}"
-    if request.url.query:
-        # Strip 'token' param (reserved for future auth) but forward the rest
-        query = str(request.url.query)
-        upstream_url += f"?{query}"
+    await _require_stateless_ide_lifecycle(job_id)
 
-    # Build upstream headers (strip hop-by-hop and proxy-specific)
+    # Browser identity is never meaningful to auth-none code-server. Build the
+    # request from a small positive protocol allowlist, then add only forwarding
+    # fields derived by this server.
     upstream_headers = {}
     for key, value in request.headers.items():
-        if key.lower() not in _PROXY_HOP_HEADERS:
+        if key.lower() in _IDE_PROXY_REQUEST_ALLOW_HEADERS:
             upstream_headers[key] = value
-    upstream_headers["host"] = host
     upstream_headers["x-forwarded-for"] = request.client.host if request.client else ""
     upstream_headers["x-forwarded-proto"] = "https"
+    # Ask for identity so ordinary code-server responses avoid compression
+    # entirely.  A non-compliant upstream is still safe: the helper buffers
+    # bounded raw bytes and preserves Content-Encoding without decoding them.
+    upstream_headers["accept-encoding"] = "identity"
 
-    client = _get_ide_http_client()
+    from services.ssh_helpers import orchestrator_can_reach
 
     try:
         # Recheck at the upstream credential/use boundary. A request that
         # passed authorization before End waited on unrelated work must never
-        # reach the code-server after the terminal marker is durable.
+        # reach the code-server after the terminal marker is durable. K8s
+        # resolution itself performs the fresh Pod-UID control-plane proof;
+        # keeping only this boundary lookup avoids doubling API-server traffic
+        # for every code-server asset request.
         await _require_stateless_ide_lifecycle(job_id)
-        pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
-        if not pod_ip:
+        target = await ide_proxy_service.resolve_target(job_id)
+        if target is None:
             raise HTTPException(status_code=503, detail="IDE session not active")
-        if not orchestrator_can_reach(pod_ip):
+        if not orchestrator_can_reach(target.host):
             raise HTTPException(
                 status_code=503,
                 detail="IDE is not yet available for VM-backed workspaces.",
             )
-        host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
-        upstream_url = f"http://{host}/{path}"
-        if request.url.query:
-            upstream_url += f"?{request.url.query}"
-        upstream_headers["host"] = host
-        upstream_resp = await client.request(
+        upstream_url = f"http://{target.authority}/{path}"
+        safe_query = _ide_proxy_query(request.url.query)
+        if safe_query:
+            upstream_url += f"?{safe_query}"
+        upstream_headers["host"] = target.authority
+        upstream_resp = await _request_exact_ide_http(
+            target=target,
             method=request.method,
             url=upstream_url,
             headers=upstream_headers,
-            content=request.stream()
-            if request.method in ("POST", "PUT", "PATCH")
-            else None,
+            content=None,
         )
+    except IdeProxyUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.code, "message": exc.detail},
+        ) from exc
+    except _IdeProxyAuthorityLost:
+        ide_proxy_service.evict(job_id)
+        raise HTTPException(status_code=503, detail="IDE runtime authority changed")
     except httpx.ConnectError:
         ide_proxy_service.evict(job_id)
         raise HTTPException(status_code=502, detail="code-server unreachable")
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="code-server timeout")
 
-    # Build response headers (pass through relevant ones)
+    # The unauthenticated upstream cannot mint browser identity, cookies, or
+    # authentication challenges. Forward only inert representation metadata.
     response_headers = {}
-    for key, value in upstream_resp.headers.multi_items():
+    upstream_header_items = upstream_resp.headers
+    if callable(multi_items := getattr(upstream_header_items, "multi_items", None)):
+        upstream_header_items = multi_items()
+    for key, value in upstream_header_items:
         lower = key.lower()
-        if lower not in ("transfer-encoding", "connection", "keep-alive"):
+        if lower in _IDE_PROXY_RESPONSE_ALLOW_HEADERS:
             response_headers[key] = value
 
-    return StreamingResponse(
-        content=upstream_resp.aiter_bytes(),
+    response_body = getattr(upstream_resp, "body", None)
+    if response_body is None:
+        # Compatibility for focused route tests which replace the bounded
+        # transport helper with an ordinary in-memory httpx.Response.
+        response_body = upstream_resp.content
+    return Response(
+        content=response_body,
         status_code=upstream_resp.status_code,
         headers=response_headers,
     )
@@ -33611,14 +34825,14 @@ async def shared_browser_stream_ws(ws: WebSocket, thread_id: str):
 
 @app.websocket("/api/ide/{job_id}/proxy/{path:path}")
 async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
-    """Reverse proxy WebSocket connections to code-server in a workspace pod."""
-    import asyncio
+    """Authorize, then contain IDE WebSockets until operation leases exist.
 
-    import websockets
-
-    # H1: close the zero-auth hole. Browsers send the BFF session cookie on
-    # WS handshake automatically; pre-fix, this endpoint accepted any caller
-    # who knew (or guessed) the entity UUID. Same pattern as persistent_ws_proxy.
+    A WebSocket is an unbounded mutating operation. Point-in-time runtime
+    attestations cannot serialize it against End/recycle, and rechecking before
+    each message still leaves a check-to-write race. Refuse before resolving or
+    connecting to auth-none code-server so browser cookies, bearer credentials,
+    and proxy-auth material cannot cross this boundary.
+    """
     user = await resolve_ws_user(ws, postgres_db)
     if not user:
         await ws.close(code=4401, reason="Authentication required")
@@ -33644,98 +34858,7 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
     except HTTPException:
         await ws.close(code=4409, reason="Workspace lifecycle fenced")
         return
-
-    pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
-    if not pod_ip:
-        await ws.close(code=4503, reason="IDE session not active")
-        return
-
-    # See ide_proxy_http: mesh VMs are unreachable from the orchestrator pod.
-    from services.ssh_helpers import orchestrator_can_reach
-
-    if not orchestrator_can_reach(pod_ip):
-        await ws.close(code=4503, reason="IDE not available for VM workspaces")
-        return
-
-    try:
-        try:
-            await _require_stateless_ide_lifecycle(job_id)
-        except HTTPException:
-            await ws.close(code=4409, reason="Workspace lifecycle fenced")
-            return
-        pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
-        if not pod_ip:
-            await ws.close(code=4503, reason="IDE session not active")
-            return
-        if not orchestrator_can_reach(pod_ip):
-            await ws.close(code=4503, reason="IDE not available for VM workspaces")
-            return
-        # Resolve again only after the final lifecycle check/cache eviction, so
-        # an End U1 -> Resume U2 transition cannot route this handshake to IP1.
-        ws_host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
-        upstream_url = f"ws://{ws_host}/{path}"
-        if ws.url.query:
-            upstream_url += f"?{ws.url.query}"
-        await ws.accept()
-        async with websockets.connect(
-            upstream_url,
-            max_size=16 * 1024 * 1024,  # 16 MB max message
-            ping_interval=30,
-            ping_timeout=10,
-            close_timeout=5,
-        ) as upstream_ws:
-
-            async def browser_to_pod():
-                """Forward messages from browser to code-server."""
-                try:
-                    while True:
-                        msg = await ws.receive()
-                        if msg["type"] == "websocket.receive":
-                            if "text" in msg and msg["text"] is not None:
-                                await upstream_ws.send(msg["text"])
-                            elif "bytes" in msg and msg["bytes"] is not None:
-                                await upstream_ws.send(msg["bytes"])
-                        elif msg["type"] == "websocket.disconnect":
-                            break
-                except WebSocketDisconnect:
-                    pass
-
-            async def pod_to_browser():
-                """Forward messages from code-server to browser."""
-                try:
-                    async for message in upstream_ws:
-                        if isinstance(message, str):
-                            await ws.send_text(message)
-                        elif isinstance(message, bytes):
-                            await ws.send_bytes(message)
-                except websockets.ConnectionClosed:
-                    pass
-
-            # Run both directions concurrently; when one finishes, cancel the other
-            tasks = [
-                asyncio.create_task(browser_to_pod()),
-                asyncio.create_task(pod_to_browser()),
-            ]
-            done, pending = await asyncio.wait(
-                tasks, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-
-    except (OSError, websockets.InvalidURI, websockets.InvalidHandshake) as e:
-        ide_proxy_service.evict(job_id)
-        logger.debug("IDE WS proxy failed for job %s: %s", job_id, e)
-        try:
-            await ws.close(code=4502, reason="code-server unreachable")
-        except Exception:
-            pass
-    except Exception:
-        logger.debug("IDE WS proxy ended for job %s", job_id, exc_info=True)
-    finally:
-        try:
-            await ws.close()
-        except Exception:
-            pass
+    await ws.close(code=4503, reason="ide_stream_operation_lease_unavailable")
 
 
 @app.post("/api/jobs/{job_id}/ensure-workspace-access")
@@ -41050,7 +42173,7 @@ async def register_agent(
                     )
 
                 planned_provision = await postgres_db.fetchrow(
-                    "SELECT attempt_id,pod_name FROM "
+                    "SELECT attempt_id,pod_name,namespace FROM "
                     "thread_agent_pod_provision_intents "
                     "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid "
                     "AND status='planned'",
@@ -41071,6 +42194,7 @@ async def register_agent(
                             attempt_id=str(planned_provision["attempt_id"]),
                             pod_name=str(registration.hostname),
                             pod_uid=str(registration.pod_uid),
+                            namespace=str(planned_provision["namespace"] or ""),
                         )
                     ):
                         raise HTTPException(
@@ -41765,6 +42889,94 @@ def _agent_canvas_workspace_capabilities(
     )
 
 
+async def _attest_pinned_thread_k8s_workspace(
+    thread_id: str,
+    thread: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    workspace: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    workspace_backend: str | None,
+) -> WorkspaceRuntimeAttestation | None:
+    """Return exact Kubernetes SSH authority for a pinned session attach."""
+
+    if (
+        thread.get("execution_lane") == "stateless"
+        or workspace_backend != "sandbox"
+        or workspace.get("status") != "ready"
+    ):
+        return None
+    provisioner = str(workspace.get("provisioner") or "").strip().lower()
+    if provisioner == "docker":
+        return None
+    if provisioner != "k8s":
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace provisioner authority is unavailable",
+        )
+    try:
+        expected_runtime = str(
+            UUID(str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)))
+        )
+        binding_generation = str(UUID(str(binding.get("generation"))))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace runtime authority is malformed",
+        ) from exc
+    if (
+        binding.get("kind") != "remote"
+        or workspace.get("_canvas_workspace_generation") != binding_generation
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace backing authority is unavailable",
+        )
+    try:
+        attestation = await container_provisioner.attest_workspace_runtime(
+            WorkspaceOwner.session(thread_id)
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace runtime attestation is unavailable",
+        ) from exc
+    try:
+        stored_port = int(workspace.get("port") or workspace.get("pod_port") or 30022)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace endpoint authority is malformed",
+        ) from exc
+    if (
+        attestation.runtime_incarnation != expected_runtime
+        or binding.get("backing_id") != attestation.backing_id
+        or binding.get("ssh_host_key_fingerprint")
+        != attestation.ssh_host_key_fingerprint
+        or str(workspace.get("pod_ip") or "") != attestation.pod_ip
+        or stored_port != attestation.port
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Workspace authority changed during attach",
+        )
+
+    refreshed = await postgres_db.get_thread(thread_id)
+    if refreshed is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    refreshed_metadata = thread_metadata_object(refreshed)
+    if (
+        refreshed.get("execution_lane") == "stateless"
+        or _thread_workspace_backend(refreshed) != "sandbox"
+        or refreshed_metadata.get("workspace_container") != workspace
+        or refreshed_metadata.get("_workspace_binding") != binding
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Workspace authority changed during attach",
+        )
+    return attestation
+
+
 @app.get("/api/agents/threads/{thread_id}/workspace")
 async def agent_get_thread_workspace(
     request: Request, thread_id: str
@@ -42132,6 +43344,24 @@ async def _agent_get_thread_workspace_locked(
                 "_canvas_workspace_generation": None,
                 WORKSPACE_RUNTIME_INCARNATION_KEY: None,
             }
+    pinned_k8s_attestation = await _attest_pinned_thread_k8s_workspace(
+        thread_id,
+        thread,
+        metadata,
+        ws,
+        binding,
+        workspace_backend,
+    )
+    if pinned_k8s_attestation is not None:
+        ws = {
+            **ws,
+            "host": pinned_k8s_attestation.host,
+            "pod_ip": pinned_k8s_attestation.pod_ip,
+            "port": pinned_k8s_attestation.port,
+            WORKSPACE_RUNTIME_INCARNATION_KEY: (
+                pinned_k8s_attestation.runtime_incarnation
+            ),
+        }
     workspace_generation: str | None = None
     workspace_runtime_incarnation: str | None = None
     workspace_ssh_host_key_fingerprint: str | None = None
@@ -42211,6 +43441,12 @@ async def _agent_get_thread_workspace_locked(
                     workspace_ssh_host_key_fingerprint = binding[
                         "ssh_host_key_fingerprint"
                     ]
+    if pinned_k8s_attestation is not None:
+        workspace_generation = pinned_k8s_attestation.workspace_generation
+        workspace_runtime_incarnation = pinned_k8s_attestation.runtime_incarnation
+        workspace_ssh_host_key_fingerprint = (
+            pinned_k8s_attestation.ssh_host_key_fingerprint
+        )
     if (
         entry_protected_marker == "on"
         and workspace_backend not in {"virtual", "none"}
@@ -42410,6 +43646,24 @@ async def _agent_get_thread_workspace_locked(
             status_code=503,
             detail="Workspace repository authority changed during attach",
         )
+    if pinned_k8s_attestation is not None:
+        latest = await postgres_db.get_thread(thread_id)
+        if latest is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        latest_metadata = thread_metadata_object(latest)
+        confirmed = await _attest_pinned_thread_k8s_workspace(
+            thread_id,
+            latest,
+            latest_metadata,
+            latest_metadata.get("workspace_container") or {},
+            latest_metadata.get("_workspace_binding") or {},
+            _thread_workspace_backend(latest),
+        )
+        if confirmed != pinned_k8s_attestation:
+            raise HTTPException(
+                status_code=409,
+                detail="Workspace authority changed during attach",
+            )
     # Complete protected-reader and exact selected-mount validation before the
     # final lifecycle read. The endpoint holds ``thread_datasource_lock`` for
     # this whole function, so selection cannot change after this snapshot;
@@ -42538,6 +43792,11 @@ async def _agent_get_thread_workspace_locked(
         # ready generation/runtime tuple above is accepted, and is consumed as
         # an exact Paramiko host-key pin before any SFTP, exec, or tmux claim.
         "workspace_ssh_host_key_fingerprint": (workspace_ssh_host_key_fingerprint),
+        "workspace_provisioner": (
+            str(vm.get("provisioner") or "vm")
+            if vm.get("status") == "ready" and vm.get("ssh_host")
+            else (str(ws.get("provisioner") or "") or None)
+        ),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
         "pod_ip": ws.get("pod_ip") or ws.get("host"),
         "pod_name": ws.get("pod_name"),
@@ -42870,7 +44129,9 @@ def _retirement_stage_event_from_receipt(
     return True, event
 
 
-def _cloud_stage_task_key(thread_id: str, authority: Mapping[str, Any]) -> str:
+def _cloud_stage_task_key(thread_id: str, authority: Mapping[str, Any] | None) -> str:
+    if authority is None:
+        return f"{thread_id}:vm"
     return ":".join(
         (
             thread_id,
@@ -42879,6 +44140,18 @@ def _cloud_stage_task_key(thread_id: str, authority: Mapping[str, Any]) -> str:
             str(authority.get("expected_staged_epoch") or ""),
         )
     )
+
+
+def _thread_selected_vm_workspace(thread: Mapping[str, Any]) -> bool:
+    metadata = thread_metadata_object(thread)
+    decision = resolve_workspace_runtime(
+        {
+            "context": metadata,
+            "config_override": metadata.get("config_override"),
+        },
+        vm_mode=vm_provisioner.mode,
+    )
+    return bool(decision.ready and decision.effective_backend == "vm")
 
 
 def _broadcast_cloud_stage_result(result: Mapping[str, Any] | None) -> None:
@@ -42918,7 +44191,9 @@ async def agent_trigger_cloud_stage(request: Request, thread_id: str) -> dict[st
     )
     row = await postgres_db.get_ro_mount_by_thread(thread_id)
     authority = _capture_cloud_stage_authority(thread, row or {})
-    if authority is None or authority.get("runtime_retirement_token") is not None:
+    if (authority is None and not _thread_selected_vm_workspace(thread)) or (
+        authority is not None and authority.get("runtime_retirement_token") is not None
+    ):
         raise HTTPException(
             status_code=409, detail={"code": "cloud_stage_authority_unavailable"}
         )
@@ -42932,6 +44207,7 @@ async def agent_trigger_cloud_stage(request: Request, thread_id: str) -> dict[st
                     postgres_db=postgres_db,
                     snapshot_service=snapshot_service,
                     authority=authority,
+                    vm_provisioner=vm_provisioner,
                 )
             _broadcast_cloud_stage_result(result)
         finally:
@@ -43143,6 +44419,8 @@ class AgentThreadStatusRequest(BaseModel):
     # omit it; pinned status writes require it after the 0185 drained cutover so
     # the transition is serialized with the reciprocal thread/agent binding.
     agent_id: UUID | None = None
+    pod_uid: UUID | None = None
+    process_generation: str | None = Field(default=None, max_length=256)
     session_runtime_generation: UUID | None = None
     session_runtime_attach_token: UUID | None = None
     session_runtime_retirement_token: UUID | None = None
@@ -43168,6 +44446,12 @@ class AgentThreadStatusRequest(BaseModel):
     ) = None
     workspace_generation: UUID | None = None
     workspace_runtime_incarnation: UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_exact_pinned_process(self) -> "AgentThreadStatusRequest":
+        if self.agent_id is not None and not str(self.process_generation or "").strip():
+            raise ValueError("agent_id requires exact process_generation")
+        return self
 
 
 class OfficerWakeRequest(BaseModel):
@@ -45459,16 +46743,27 @@ async def agent_update_thread_status(
                     )
                 if str(thread_record["status"] or "") == "ended":
                     return {"status": "ended"}
-                reciprocal = await conn.fetchval(
-                    "SELECT 1 FROM agents WHERE id = $1::uuid "
+                reciprocal = await conn.fetchrow(
+                    "SELECT pod_uid, metadata FROM agents WHERE id = $1::uuid "
                     "AND thread_id = $2::uuid FOR SHARE",
                     agent_id,
                     thread_id,
                 )
-                if reciprocal is None:
+                reciprocal_metadata = (
+                    thread_metadata_object({"metadata": reciprocal["metadata"]})
+                    if reciprocal is not None
+                    else {}
+                )
+                if (
+                    reciprocal is None
+                    or (str(reciprocal["pod_uid"] or "") or None)
+                    != (str(body.pod_uid or "") or None)
+                    or str(reciprocal_metadata.get("dispatch_process_generation") or "")
+                    != str(body.process_generation or "")
+                ):
                     raise HTTPException(
                         status_code=409,
-                        detail="Pinned session ownership is not reciprocal",
+                        detail="Pinned session process ownership changed",
                     )
 
                 thread_row = dict(thread_record)
@@ -45552,7 +46847,7 @@ async def agent_update_thread_status(
                     )
 
         if result_status == "begin_retirement":
-            retirement = await postgres_db.begin_pinned_thread_retirement(
+            retirement = await _begin_pinned_thread_retirement(
                 thread_id,
                 permanent=bool(body.retirement_permanent),
                 settle_status=str(body.retirement_disposition),
@@ -45606,7 +46901,7 @@ async def agent_update_thread_status(
             # A direct final request may race or replace the begin-only call.
             # Install/reuse the immutable marker first, then append the exact
             # local proof under that token before any staging or cleanup.
-            retirement = await postgres_db.begin_pinned_thread_retirement(
+            retirement = await _begin_pinned_thread_retirement(
                 thread_id,
                 permanent=bool(body.retirement_permanent),
                 settle_status=settle_disposition,
@@ -45907,7 +47202,7 @@ async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, An
             status_code=409,
             detail={"code": "pinned_retirement_token_required"},
         ) from exc
-    retirement = await postgres_db.begin_pinned_thread_retirement(
+    retirement = await _begin_pinned_thread_retirement(
         thread_id,
         permanent=False,
         settle_status="suspended",
@@ -46677,7 +47972,7 @@ async def agent_abort_thread_vm_upgrade(
         raise HTTPException(status_code=404, detail="Thread not found")
 
     deleted = False
-    if vm_provisioner.is_available:
+    if vm_provisioner.lifecycle_available:
         try:
             deleted = await vm_provisioner.delete_thread_vm(thread_id)
         except Exception as e:
@@ -48369,7 +49664,7 @@ async def create_thread(
             metadata_patch["workspace_container"] = {
                 "status": "pending",
                 "provisioner": "k8s",
-                "_stateless_runtime_creation": {
+                "_runtime_creation": {
                     "generation": str(uuid4()),
                     "mode": "create",
                     "attempted": False,
@@ -50952,7 +52247,9 @@ async def restage_thread_cloud_diff(thread_id: str, request: Request) -> dict[st
         raise HTTPException(status_code=409, detail={"code": "no_workspace"})
     row = await postgres_db.get_ro_mount_by_thread(thread_id)
     authority = _capture_cloud_stage_authority(thread, row or {})
-    if authority is None or authority.get("runtime_retirement_token") is not None:
+    if (authority is None and not _thread_selected_vm_workspace(thread)) or (
+        authority is not None and authority.get("runtime_retirement_token") is not None
+    ):
         raise HTTPException(
             status_code=409, detail={"code": "cloud_stage_authority_unavailable"}
         )
@@ -50966,6 +52263,7 @@ async def restage_thread_cloud_diff(thread_id: str, request: Request) -> dict[st
                     postgres_db=postgres_db,
                     snapshot_service=snapshot_service,
                     authority=authority,
+                    vm_provisioner=vm_provisioner,
                 )
             _broadcast_cloud_stage_result(result)
         finally:
@@ -51197,27 +52495,106 @@ async def reject_thread_cloud_diff(
 
 
 async def _thread_turn_in_flight(thread: dict) -> bool:
-    """Best-effort probe: is the thread's agent currently executing a turn?
+    """Return idle only after the exact pinned runtime attests it.
 
-    Asks the bound agent's ``/session/status``. Any failure (no agent, pod
-    gone, timeout) returns False — ending a dead or unreachable session must
-    always be possible.
+    A recycled Pod IP, an old replica, or a failed probe is not an idle
+    observation.  Unknown therefore fails closed as ``True``; callers may use
+    force-End when they intentionally accept that uncertainty.
     """
     agent_id = thread.get("agent_id")
     if not agent_id:
         return False
     try:
-        agent = await postgres_db.get_agent(str(agent_id))
-        if not agent or not agent.get("pod_ip"):
-            return False
-        url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/status"
+        context = thread.get("runtime_retirement_context") or {}
+        if isinstance(context, str):
+            context = json.loads(context)
+        retirement_token = str(thread.get("runtime_retirement_token") or "")
+        if retirement_token and isinstance(context, Mapping):
+            captured_agent = context.get("agent")
+            if not isinstance(captured_agent, Mapping):
+                return True
+            captured_agent_pod = context.get("agent_pod")
+            if not isinstance(captured_agent_pod, Mapping):
+                return True
+            binding = PinnedSessionBinding(
+                thread_id=str(thread.get("id") or context.get("thread_id") or ""),
+                runtime_generation=str(
+                    thread.get("runtime_generation") or context.get("generation") or ""
+                ),
+                agent_id=str(captured_agent.get("id") or ""),
+                runtime_attach_token=str(context.get("runtime_attach_token") or ""),
+                agent_hostname=str(captured_agent.get("hostname") or ""),
+                pod_namespace=str(captured_agent_pod.get("namespace") or ""),
+                pod_uid=str(captured_agent.get("pod_uid") or ""),
+                pod_ip=str(captured_agent.get("pod_ip") or ""),
+                pod_port=int(captured_agent.get("pod_port") or 8001),
+                agent_status=str(captured_agent.get("status") or ""),
+            )
+        else:
+            generation = str(thread.get("runtime_generation") or "")
+            thread_id = str(thread.get("id") or "")
+            if not generation or not thread_id:
+                return True
+            binding = await postgres_db.get_pinned_session_binding(
+                thread_id,
+                expected_runtime_generation=generation,
+            )
+            if binding is None or binding.agent_id != str(agent_id):
+                return True
+        url = f"http://{binding.pod_ip}:{binding.pod_port}/session/status"
         async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(url)
+            response = await client.post(
+                url,
+                json={
+                    "session_identity_fingerprint": (
+                        binding.session_identity_fingerprint
+                    )
+                },
+            )
         if response.status_code != 200:
-            return False
-        return bool(response.json().get("turn_in_flight"))
+            return True
+        payload = response.json()
+        if not (
+            isinstance(payload, Mapping)
+            and payload.get("recipient_verified") is True
+            and payload.get("session_identity_fingerprint")
+            == binding.session_identity_fingerprint
+            and str(payload.get("thread_id") or "") == binding.thread_id
+            and isinstance(payload.get("turn_in_flight"), bool)
+        ):
+            return True
+
+        if retirement_token:
+            current = await postgres_db.get_thread(binding.thread_id)
+            current_context = (current or {}).get("runtime_retirement_context") or {}
+            if isinstance(current_context, str):
+                current_context = json.loads(current_context)
+            if not (
+                current
+                and str(current.get("runtime_generation") or "")
+                == binding.runtime_generation
+                and str(current.get("runtime_retirement_token") or "")
+                == retirement_token
+                and isinstance(current_context, Mapping)
+                and str(current_context.get("runtime_attach_token") or "")
+                == binding.runtime_attach_token
+                and str((current_context.get("agent") or {}).get("id") or "")
+                == binding.agent_id
+            ):
+                return True
+        else:
+            current_binding = await postgres_db.get_pinned_session_binding(
+                binding.thread_id,
+                expected_runtime_generation=binding.runtime_generation,
+            )
+            if (
+                current_binding is None
+                or current_binding.target_key != binding.target_key
+            ):
+                return True
+        return payload["turn_in_flight"]
     except Exception:
-        return False
+        return True
 
 
 def _stateless_retirement_marker(thread: dict[str, Any]) -> dict[str, Any]:
@@ -51254,6 +52631,29 @@ async def _reconcile_stateless_thread_retirement(
         stateless_retirement_release_authorized,
     )
 
+    async def _rebase_stale_terminal_runtime_or_raise(
+        *,
+        terminal_token: int,
+        retired_runtime_incarnation: str,
+    ) -> None:
+        """Retarget the pending fence, then require a fresh retirement pass."""
+
+        rebased = await postgres_db.rebase_stateless_thread_workspace_retirement(
+            thread_id,
+            terminal_token=terminal_token,
+            retired_runtime_incarnation=retired_runtime_incarnation,
+            permanent=permanent,
+        )
+        if not rebased:
+            raise HTTPException(
+                status_code=503,
+                detail="Terminal workspace successor authority is not yet safe",
+            )
+        raise HTTPException(
+            status_code=503,
+            detail="Terminal workspace authority advanced; retry retirement",
+        )
+
     # A transitional/legacy Kubernetes row can lack its immutable Pod UID.
     # There is no safe absence proof for that shape: Pod creation precedes DB
     # binding/runtime publication, so even a backing-less 404 can follow a
@@ -51280,11 +52680,26 @@ async def _reconcile_stateless_thread_retirement(
             isinstance(pending_authority, dict)
             and pending_authority.get("runtime_incarnation")
         )
+        restore_marker_present = "_snapshot_restore_required" in preflight_workspace
+        restore_required = preflight_workspace.get("_snapshot_restore_required", False)
+        if restore_marker_present and type(restore_required) is not bool:
+            raise HTTPException(
+                status_code=503,
+                detail="Stateless workspace restore authority is malformed",
+            )
+        creation_pending = "_runtime_creation" in preflight_workspace
+        restore_pending = (
+            preflight_thread.get("status") != "ended" and restore_required is True
+        )
+        # The durable creation marker is the only authority that may bridge a
+        # committed Kubernetes create and its exact UID publication. Markerless
+        # historical rows remain fail-closed.
         if (
             preflight_physical
             and not preflight_runtime
             and not settled_present
             and not pending_retains_runtime
+            and not creation_pending
         ):
             raise HTTPException(
                 status_code=503,
@@ -51293,17 +52708,6 @@ async def _reconcile_stateless_thread_retirement(
                     "workspace reconciliation must publish an exact UID first"
                 ),
             )
-        restore_marker_present = "_snapshot_restore_required" in preflight_workspace
-        restore_required = preflight_workspace.get("_snapshot_restore_required", False)
-        if restore_marker_present and type(restore_required) is not bool:
-            raise HTTPException(
-                status_code=503,
-                detail="Stateless workspace restore authority is malformed",
-            )
-        creation_pending = "_stateless_runtime_creation" in preflight_workspace
-        restore_pending = (
-            preflight_thread.get("status") != "ended" and restore_required is True
-        )
         if creation_pending or restore_pending:
             # Cancellation after the one-shot Pod call may leave a published
             # UID but no Ready binding/fingerprint. Terminal retirement cannot
@@ -51350,7 +52754,7 @@ async def _reconcile_stateless_thread_retirement(
                 creation_refusal is not None
                 or not isinstance(preflight_workspace, dict)
                 or preflight_workspace.get("status") != "ready"
-                or "_stateless_runtime_creation" in preflight_workspace
+                or "_runtime_creation" in preflight_workspace
                 or post_restore_malformed
                 or post_restore_pending
             ):
@@ -51405,21 +52809,43 @@ async def _reconcile_stateless_thread_retirement(
             runtime_incarnation = closure.get("runtime_incarnation")
             if isinstance(backing_id, str) and backing_id.startswith("k8s-"):
                 # Soft End already proved process zero and removed the exact
-                # Pod. Permanent upgrade only reclaims any retained PVC and
-                # idempotently removes the Service; it never reruns shell or
-                # snapshot effects or mints another queue token.
+                # Pod. Permanent upgrade creates a new terminal-reclaim
+                # generation: preserve authority cannot authorize PVC deletion.
                 if not runtime_incarnation:
                     raise HTTPException(
                         status_code=503,
                         detail=("Settled workspace runtime authority is unavailable"),
                     )
-                released = await container_provisioner.release_absent_workspace(
-                    WorkspaceOwner.session(thread_id),
-                    reclaim_volume=True,
-                    expected_runtime_incarnation=str(runtime_incarnation),
-                    strict=True,
+                cleanup_intent = (
+                    await container_provisioner.prepare_workspace_cleanup_intent(
+                        WorkspaceOwner.session(thread_id),
+                        expected_runtime_incarnation=str(runtime_incarnation),
+                        target_disposition="deleted",
+                        reclaim_shared_resources=True,
+                    )
                 )
-                if not released:
+                if (
+                    not isinstance(cleanup_intent, dict)
+                    or cleanup_intent.get("resources_captured_at") is None
+                    or cleanup_intent.get("reclaim_shared_resources") is not True
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Settled workspace permanent cleanup authority is incomplete"
+                        ),
+                    )
+                cleanup = (
+                    await container_provisioner.reconcile_workspace_cleanup_intent(
+                        WorkspaceOwner.session(thread_id),
+                        expected_runtime_incarnation=str(runtime_incarnation),
+                        intent_generation=int(cleanup_intent["intent_generation"]),
+                    )
+                )
+                if (
+                    not isinstance(cleanup, WorkspaceCleanupOutcome)
+                    or not cleanup.settled
+                ):
                     raise HTTPException(
                         status_code=503,
                         detail="Settled workspace permanent cleanup is incomplete",
@@ -51716,12 +53142,37 @@ async def _reconcile_stateless_thread_retirement(
                 status_code=503,
                 detail="Required emptyDir snapshot was not durably captured",
             )
-        released = await container_provisioner.release_absent_workspace(
-            WorkspaceOwner.session(thread_id),
-            reclaim_volume=permanent,
-            expected_runtime_incarnation=str(runtime_incarnation),
-            strict=True,
-        )
+        if permanent:
+            cleanup_intent = (
+                await container_provisioner.prepare_workspace_cleanup_intent(
+                    WorkspaceOwner.session(thread_id),
+                    expected_runtime_incarnation=str(runtime_incarnation),
+                    target_disposition="deleted",
+                    reclaim_shared_resources=True,
+                )
+            )
+            if (
+                not isinstance(cleanup_intent, dict)
+                or cleanup_intent.get("resources_captured_at") is None
+                or cleanup_intent.get("reclaim_shared_resources") is not True
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless absent workspace cleanup authority is incomplete",
+                )
+            cleanup = await container_provisioner.reconcile_workspace_cleanup_intent(
+                WorkspaceOwner.session(thread_id),
+                expected_runtime_incarnation=str(runtime_incarnation),
+                intent_generation=int(cleanup_intent["intent_generation"]),
+            )
+            released = isinstance(cleanup, WorkspaceCleanupOutcome) and cleanup.settled
+        else:
+            released = await container_provisioner.release_absent_workspace(
+                WorkspaceOwner.session(thread_id),
+                reclaim_volume=False,
+                expected_runtime_incarnation=str(runtime_incarnation),
+                strict=True,
+            )
         if not released:
             raise HTTPException(
                 status_code=503,
@@ -51742,26 +53193,50 @@ async def _reconcile_stateless_thread_retirement(
                     status_code=503,
                     detail="Required emptyDir snapshot was not durably captured",
                 )
-            # Exact observed container termination is durable process-zero
-            # proof. Delete that immutable Pod object first; a subsequent
-            # exact-absence pass owns Service/PVC cleanup. If API deletion is
-            # still converging, leave the marker for retry.
-            if not await container_provisioner.delete_workspace(
+            # Persist disposition and exact captured resource identities before
+            # any Kubernetes effect. Permanent End cannot reuse preserve-only
+            # authority to reclaim PVC/Service state.
+            cleanup_intent = (
+                await container_provisioner.prepare_workspace_cleanup_intent(
+                    WorkspaceOwner.session(thread_id),
+                    expected_runtime_incarnation=str(runtime_incarnation),
+                    target_disposition="deleted",
+                    reclaim_shared_resources=permanent,
+                )
+            )
+            if (
+                not isinstance(cleanup_intent, dict)
+                or cleanup_intent.get("resources_captured_at") is None
+                or bool(cleanup_intent.get("reclaim_shared_resources")) is not permanent
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Terminal workspace cleanup authority is incomplete",
+                )
+            deletion = await container_provisioner.delete_workspace_with_outcome(
                 WorkspaceOwner.session(thread_id),
                 expected_runtime_incarnation=str(runtime_incarnation),
                 wait_for_exact_absence=True,
-            ):
+                target_disposition="deleted",
+                reclaim_shared_resources=permanent,
+                cleanup_intent=cleanup_intent,
+            )
+            if deletion.stale_target_settled:
+                await _rebase_stale_terminal_runtime_or_raise(
+                    terminal_token=terminal_token,
+                    retired_runtime_incarnation=str(runtime_incarnation),
+                )
+            if not deletion.current_deleted:
                 raise HTTPException(
                     status_code=503,
                     detail="Terminal workspace Pod deletion remains incomplete",
                 )
-            released = await container_provisioner.release_absent_workspace(
+            cleanup = await container_provisioner.reconcile_workspace_cleanup_intent(
                 WorkspaceOwner.session(thread_id),
-                reclaim_volume=permanent,
                 expected_runtime_incarnation=str(runtime_incarnation),
-                strict=True,
+                intent_generation=int(cleanup_intent["intent_generation"]),
             )
-            if not released:
+            if not isinstance(cleanup, WorkspaceCleanupOutcome) or not cleanup.settled:
                 raise HTTPException(
                     status_code=503,
                     detail="Terminal workspace cleanup remains incomplete",
@@ -52074,7 +53549,7 @@ async def _end_thread_flow(
                 "expected_attach_token": expected_attach_token,
                 "require_agent_offline": require_expected_agent_offline,
             }
-        retirement = await postgres_db.begin_pinned_thread_retirement(
+        retirement = await _begin_pinned_thread_retirement(
             thread_id,
             permanent=permanent,
             settle_status=settle_status,
@@ -52197,9 +53672,13 @@ async def _end_thread_flow(
                 context.get("agent") if isinstance(context, Mapping) else None
             )
             probe_thread = {
+                "id": thread_id,
+                "runtime_generation": retirement.get("generation"),
+                "runtime_retirement_token": retirement.get("token"),
+                "runtime_retirement_context": context,
                 "agent_id": (captured_agent or {}).get("id")
                 if isinstance(captured_agent, Mapping)
-                else None
+                else None,
             }
             if (
                 not already_authorized
@@ -52512,6 +53991,7 @@ async def _end_thread_flow(
                                 postgres_db=postgres_db,
                                 snapshot_service=snapshot_service,
                                 authority=stage_authority,
+                                vm_provisioner=vm_provisioner,
                             )
                             if stage_result is None or stage_result.get("skipped") in {
                                 "authority_changed",
@@ -56950,6 +58430,248 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
     return {"status": "unavailable", "code_server_url": None, "gitea_url": gitea_url}
 
 
+def _required_thread_upload_uuid(value: Any, *, label: str) -> str:
+    from services.thread_uploads import ThreadUploadError
+
+    try:
+        parsed = UUID(str(value))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ThreadUploadError(
+            status_code=409,
+            detail=f"Pinned workspace {label} is unavailable",
+        ) from exc
+    if parsed.int == 0:
+        raise ThreadUploadError(
+            status_code=409,
+            detail=f"Pinned workspace {label} is unavailable",
+        )
+    return str(parsed)
+
+
+async def _prepare_pinned_k8s_thread_upload(
+    thread_id: str,
+    thread: dict[str, Any],
+    destination: Any,
+) -> tuple[str, str, str, Callable[[], Awaitable[str]]]:
+    """Capture and repeatedly prove one pinned Kubernetes workspace target."""
+
+    from services.thread_uploads import (
+        ThreadUploadError,
+        _SshTarget,
+        is_kubernetes_thread_upload_destination,
+        resolve_thread_upload_destination,
+    )
+
+    live_statuses = {"created", "active", "idle", "awaiting_user"}
+    live_agent_statuses = {"ready", "working", "session"}
+
+    def _thread_snapshot(row: dict[str, Any] | None) -> tuple[Any, ...] | None:
+        if (
+            not isinstance(row, dict)
+            or str(row.get("id") or "") != thread_id
+            or row.get("execution_lane") != "pinned"
+            or row.get("status") not in live_statuses
+            or row.get("runtime_retirement_token") is not None
+            or not is_kubernetes_thread_upload_destination(row)
+        ):
+            return None
+        metadata = thread_metadata_object(row)
+        workspace = metadata.get("workspace_container")
+        binding = metadata.get("_workspace_binding")
+        if not isinstance(workspace, dict) or not isinstance(binding, dict):
+            return None
+        backing_id = binding.get("backing_id")
+        fingerprint = binding.get("ssh_host_key_fingerprint")
+        if not (
+            workspace.get("status") == "ready"
+            and workspace.get("provisioner") in {"k8s", "kubernetes"}
+            and binding.get("kind") == "remote"
+            and isinstance(backing_id, str)
+            and backing_id.startswith(("k8s-pod:", "k8s-pvc:"))
+            and isinstance(fingerprint, str)
+            and fingerprint.startswith("SHA256:")
+            and not any(char.isspace() for char in fingerprint)
+            and (
+                "_snapshot_restore_required" not in workspace
+                or workspace.get("_snapshot_restore_required") is False
+            )
+        ):
+            return None
+        try:
+            runtime_generation = _required_thread_upload_uuid(
+                row.get("runtime_generation"), label="session generation"
+            )
+            generation = _required_thread_upload_uuid(
+                binding.get("generation"), label="generation"
+            )
+            endpoint_generation = _required_thread_upload_uuid(
+                workspace.get("_canvas_workspace_generation"),
+                label="endpoint generation",
+            )
+            runtime_incarnation = _required_thread_upload_uuid(
+                workspace.get("_runtime_incarnation"),
+                label="runtime incarnation",
+            )
+        except ThreadUploadError:
+            return None
+        if generation != endpoint_generation:
+            return None
+        try:
+            resolved = resolve_thread_upload_destination(row)
+        except ThreadUploadError:
+            return None
+        if not isinstance(resolved, _SshTarget):
+            return None
+        return (
+            str(row.get("agent_id") or ""),
+            runtime_generation,
+            generation,
+            runtime_incarnation,
+            backing_id,
+            fingerprint,
+            str(workspace.get("pod_ip") or ""),
+            resolved,
+        )
+
+    expected_thread = _thread_snapshot(thread)
+    if expected_thread is None or expected_thread[-1] != destination:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Pinned Kubernetes workspace authority is unavailable",
+        )
+    (
+        expected_agent_id,
+        session_generation,
+        generation,
+        runtime_incarnation,
+        backing_id,
+        fingerprint,
+        pod_ip,
+        _expected_destination,
+    ) = expected_thread
+    if not expected_agent_id or not pod_ip:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Pinned session binding is unavailable",
+        )
+
+    async def _read_session_binding() -> Any | None:
+        try:
+            binding = await postgres_db.get_pinned_session_binding(
+                thread_id,
+                expected_runtime_generation=session_generation,
+            )
+        except Exception:
+            return None
+        if not (
+            binding is not None
+            and binding.agent_id == expected_agent_id
+            and binding.agent_status in live_agent_statuses
+        ):
+            return None
+        return binding
+
+    expected_binding = await _read_session_binding()
+    if expected_binding is None:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Pinned session agent authority is unavailable",
+        )
+    expected_binding_target = expected_binding.target_key
+
+    async def _probe_runtime() -> str:
+        try:
+            before = await postgres_db.get_thread(thread_id)
+        except Exception:
+            return "unknown"
+        if _thread_snapshot(before) != expected_thread:
+            return "replacement"
+        current_binding = await _read_session_binding()
+        if (
+            current_binding is None
+            or current_binding.target_key != expected_binding_target
+        ):
+            return "replacement"
+        try:
+            attestation = await container_provisioner.attest_workspace_runtime(
+                WorkspaceOwner.session(thread_id)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return "unknown"
+        if not (
+            attestation.runtime_incarnation == runtime_incarnation
+            and attestation.workspace_generation == generation
+            and attestation.backing_id == backing_id
+            and attestation.ssh_host_key_fingerprint == fingerprint
+            and attestation.pod_ip == pod_ip
+            and attestation.host == destination.host
+            and int(attestation.port) == int(destination.port)
+        ):
+            return "replacement"
+        try:
+            after = await postgres_db.get_thread(thread_id)
+        except Exception:
+            return "unknown"
+        if _thread_snapshot(after) != expected_thread:
+            return "replacement"
+        current_binding = await _read_session_binding()
+        if (
+            current_binding is None
+            or current_binding.target_key != expected_binding_target
+        ):
+            return "replacement"
+        return "exact_live"
+
+    return generation, runtime_incarnation, fingerprint, _probe_runtime
+
+
+async def _prepare_pinned_vm_thread_operation(
+    thread_id: str,
+    thread: dict[str, Any],
+    destination: Any,
+    *,
+    operation_kind: str,
+) -> Any:
+    from services.thread_uploads import ThreadUploadError, _SshTarget
+    from services.vm_remote_operation import (
+        VMRemoteOperationUnavailable,
+        claim_vm_remote_operation,
+    )
+
+    if (
+        thread.get("execution_lane") != "pinned"
+        or _thread_workspace_backend(thread) != "vm"
+        or not isinstance(destination, _SshTarget)
+    ):
+        raise ThreadUploadError(409, "Pinned VM workspace authority is unavailable")
+    try:
+        lease = await claim_vm_remote_operation(
+            db=postgres_db,
+            provisioner=vm_provisioner,
+            owner_id=thread_id,
+            owner_kind="thread",
+            operation_kind=operation_kind,
+        )
+    except VMRemoteOperationUnavailable as exc:
+        raise ThreadUploadError(
+            503, "VM workspace runtime authority could not be verified"
+        ) from exc
+    if (destination.host, int(destination.port)) != (
+        lease.identity.ssh_host,
+        lease.identity.ssh_port,
+    ):
+        await postgres_db.settle_vm_remote_operation(
+            str(lease.receipt["id"]),
+            claim_token=int(lease.receipt["claim_token"]),
+            claimant=lease.claimant,
+            result_kind="replaced",
+        )
+        raise ThreadUploadError(409, "VM endpoint changed before operation")
+    return lease
+
+
 @app.post("/api/persistent/threads/{thread_id}/uploads")
 async def upload_files_to_thread(
     thread_id: str,
@@ -56968,9 +58690,15 @@ async def upload_files_to_thread(
         ``{"thread_id": "...", "files": [{name, size, mime_type, path}, ...]}``
     """
     from services.thread_uploads import (
+        MAX_FILES_PER_REQUEST,
+        MAX_FILE_SIZE,
+        MAX_TOTAL_UPLOAD_BYTES,
         ThreadUploadError,
+        is_kubernetes_thread_upload_destination,
         resolve_thread_upload_destination,
+        upload_files_to_attested_k8s_workspace,
         upload_files_to_attested_stateless_workspace,
+        upload_files_to_attested_vm_workspace,
         upload_files_to_thread_workspace,
     )
     from src.shared.run_queue import LANE_STATELESS
@@ -56979,14 +58707,46 @@ async def upload_files_to_thread(
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
+    if len(files) > MAX_FILES_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {MAX_FILES_PER_REQUEST} files per request",
+        )
 
     async def _materialize_payloads() -> list[tuple[str, bytes, str]]:
         payloads: list[tuple[str, bytes, str]] = []
+        total = 0
         for item in files:
+            content = bytearray()
+            legacy_read = False
+            while True:
+                try:
+                    chunk = await item.read(1024 * 1024)
+                except TypeError:
+                    # Minimal UploadFile fakes and older adapters expose only
+                    # read(); production Starlette uploads take a size.
+                    chunk = await item.read()
+                    legacy_read = True
+                if not chunk:
+                    break
+                content.extend(chunk)
+                total += len(chunk)
+                if len(content) > MAX_FILE_SIZE:
+                    raise ThreadUploadError(
+                        413,
+                        f"File '{item.filename or 'unnamed'}' exceeds "
+                        f"{MAX_FILE_SIZE // (1024 * 1024)}MB",
+                    )
+                if total > MAX_TOTAL_UPLOAD_BYTES:
+                    raise ThreadUploadError(
+                        413, "Combined upload payload exceeds 300MB"
+                    )
+                if legacy_read:
+                    break
             payloads.append(
                 (
                     item.filename or "unnamed",
-                    await item.read(),
+                    bytes(content),
                     item.content_type or "application/octet-stream",
                 )
             )
@@ -56994,12 +58754,68 @@ async def upload_files_to_thread(
 
     try:
         if thread.get("execution_lane") != LANE_STATELESS:
-            destination = resolve_thread_upload_destination(thread)
-            results = await upload_files_to_thread_workspace(
-                thread,
-                await _materialize_payloads(),
-                destination=destination,
-            )
+            fresh = await postgres_db.get_thread(thread_id)
+            if fresh is None:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            destination = resolve_thread_upload_destination(fresh)
+            payloads = await _materialize_payloads()
+            if _thread_workspace_backend(fresh) == "vm":
+                lease = await _prepare_pinned_vm_thread_operation(
+                    thread_id,
+                    fresh,
+                    destination,
+                    operation_kind="thread_upload",
+                )
+                async with lease:
+
+                    async def _probe_vm_runtime() -> str:
+                        return (
+                            "exact_live"
+                            if await lease.revalidate() is not None
+                            else "unknown"
+                        )
+
+                    results = await upload_files_to_attested_vm_workspace(
+                        fresh,
+                        payloads,
+                        destination=destination,
+                        expected_workspace_generation=(
+                            lease.identity.workspace_generation
+                        ),
+                        expected_runtime_incarnation=(lease.identity.launcher_pod_uid),
+                        expected_host_key_fingerprint=(
+                            lease.identity.ssh_host_key_fingerprint
+                        ),
+                        authority_probe=_probe_vm_runtime,
+                    )
+            elif fresh.get(
+                "execution_lane"
+            ) == "pinned" and is_kubernetes_thread_upload_destination(fresh):
+                (
+                    generation,
+                    runtime_incarnation,
+                    fingerprint,
+                    authority_probe,
+                ) = await _prepare_pinned_k8s_thread_upload(
+                    thread_id,
+                    fresh,
+                    destination,
+                )
+                results = await upload_files_to_attested_k8s_workspace(
+                    fresh,
+                    payloads,
+                    destination=destination,
+                    expected_workspace_generation=generation,
+                    expected_runtime_incarnation=runtime_incarnation,
+                    expected_host_key_fingerprint=fingerprint,
+                    authority_probe=authority_probe,
+                )
+            else:
+                results = await upload_files_to_thread_workspace(
+                    fresh,
+                    payloads,
+                    destination=destination,
+                )
         else:
             # Serialize the entire body materialization + remote write against
             # End/Resume. A marker-first upload never opens SFTP; a write-first
@@ -57123,8 +58939,11 @@ async def delete_thread_upload(
     """
     from services.thread_uploads import (
         ThreadUploadError,
+        delete_file_from_attested_k8s_workspace,
         delete_file_from_attested_stateless_workspace,
+        delete_file_from_attested_vm_workspace,
         delete_file_from_thread_workspace,
+        is_kubernetes_thread_upload_destination,
         resolve_thread_upload_destination,
     )
     from src.shared.run_queue import LANE_STATELESS
@@ -57133,7 +58952,65 @@ async def delete_thread_upload(
 
     try:
         if thread.get("execution_lane") != LANE_STATELESS:
-            removed = await delete_file_from_thread_workspace(thread, path)
+            fresh = await postgres_db.get_thread(thread_id)
+            if fresh is None:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            destination = resolve_thread_upload_destination(fresh)
+            if _thread_workspace_backend(fresh) == "vm":
+                lease = await _prepare_pinned_vm_thread_operation(
+                    thread_id,
+                    fresh,
+                    destination,
+                    operation_kind="thread_delete",
+                )
+                async with lease:
+
+                    async def _probe_vm_runtime() -> str:
+                        return (
+                            "exact_live"
+                            if await lease.revalidate() is not None
+                            else "unknown"
+                        )
+
+                    removed = await delete_file_from_attested_vm_workspace(
+                        fresh,
+                        path,
+                        destination=destination,
+                        expected_workspace_generation=(
+                            lease.identity.workspace_generation
+                        ),
+                        expected_runtime_incarnation=(lease.identity.launcher_pod_uid),
+                        expected_host_key_fingerprint=(
+                            lease.identity.ssh_host_key_fingerprint
+                        ),
+                        authority_probe=_probe_vm_runtime,
+                    )
+            elif fresh.get(
+                "execution_lane"
+            ) == "pinned" and is_kubernetes_thread_upload_destination(fresh):
+                (
+                    generation,
+                    runtime_incarnation,
+                    fingerprint,
+                    authority_probe,
+                ) = await _prepare_pinned_k8s_thread_upload(
+                    thread_id,
+                    fresh,
+                    destination,
+                )
+                removed = await delete_file_from_attested_k8s_workspace(
+                    fresh,
+                    path,
+                    destination=destination,
+                    expected_workspace_generation=generation,
+                    expected_runtime_incarnation=runtime_incarnation,
+                    expected_host_key_fingerprint=fingerprint,
+                    authority_probe=authority_probe,
+                )
+            else:
+                removed = await delete_file_from_thread_workspace(
+                    fresh, path, destination=destination
+                )
         else:
             try:
                 async with postgres_db.stateless_session_workspace_ensure_lock(
@@ -57753,8 +59630,8 @@ async def get_job_llm_requests(
 async def get_job_shell_state(request: Request, job_id: str) -> dict[str, Any]:
     """Proxy shell state request to the agent processing a job.
 
-    Resolves job -> assigned agent -> pod IP, then proxies to
-    the agent's GET /system/shell-state endpoint.
+    The stored Pod IP is only a coordinate. Freshly attest the exact registered
+    process and require its recipient envelope before returning shell output.
     """
     import httpx as _httpx
 
@@ -57770,23 +59647,34 @@ async def get_job_shell_state(request: Request, job_id: str) -> dict[str, Any]:
         if not assigned_agent_id:
             raise HTTPException(status_code=400, detail="Job has no assigned agent")
 
-        agent = await postgres_db.get_agent(str(assigned_agent_id))
-        if not agent:
-            raise HTTPException(status_code=404, detail="Assigned agent not found")
-
-        pod_ip = agent.get("pod_ip")
-        if not pod_ip:
+        target = await _prepare_pinned_job_mutation_target(
+            agent_id=str(assigned_agent_id),
+            job_id=job_id,
+            require_idle=False,
+        )
+        if target is None:
             raise HTTPException(
-                status_code=400, detail="Agent has no pod IP configured"
+                status_code=409,
+                detail={"code": "pinned_recipient_unavailable"},
             )
 
-        pod_port = agent.get("pod_port", 8001)
-        agent_url = f"http://{pod_ip}:{pod_port}/system/shell-state"
+        agent_url = (
+            f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}"
+            "/system/shell-state"
+        )
 
         async with _httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(agent_url)
+            response = await client.post(
+                agent_url,
+                json=target.recipient.model_dump(mode="json"),
+            )
 
         if response.status_code != 200:
+            if response.status_code == 409:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "pinned_recipient_mismatch"},
+                )
             raise HTTPException(
                 status_code=502,
                 detail=f"Agent returned {response.status_code}: {response.text}",

@@ -4,10 +4,9 @@ Covers:
 * ``POST /api/agents/threads/{thread_id}/cloud-stage`` — internal-key gate,
   flag-off no-op, fire-and-forget task scheduling + de-dupe registry
   (``main._cloud_stage_tasks``, mirrors ``_protected_engage_tasks``).
-* ``WorkspaceSuspensionService.suspend_thread_workspace`` — the teardown
-  hook stages the protected thread's upperdir diff BEFORE the S3 VM
-  snapshot capture, and swallows staging errors so the snapshot (the
-  durable, load-bearing path) always still runs.
+* ``WorkspaceSuspensionService.suspend_thread_workspace`` — Kubernetes
+  capture is contained before any remote read, while a VM snapshot runs only
+  under its own lease and never borrows that lease for multi-write staging.
 
 Follows the house patterns: ``tests/test_export_to_cloud_endpoint.py``
 (ExitStack-patch + ``import main`` directly) and
@@ -16,13 +15,17 @@ Follows the house patterns: ``tests/test_export_to_cloud_endpoint.py``
 """
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 
 import main
 import security.access as access_module
+from services.container_provisioner import WorkspaceRuntimeAttestation
+from services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 from services.workspace_suspension import WorkspaceSuspensionService
 
 
@@ -115,6 +118,7 @@ class TestCloudStageEndpoint:
             postgres_db=main.postgres_db,
             snapshot_service=main.snapshot_service,
             authority=_STAGE_AUTHORITY,
+            vm_provisioner=main.vm_provisioner,
         )
         # Self-evicts once the task completes.
         assert task_key not in main._cloud_stage_tasks
@@ -163,14 +167,28 @@ class TestCloudStageEndpoint:
 
 
 def _make_protected_thread(**overrides):
+    generation = "11111111-1111-4111-8111-111111111111"
+    launcher_uid = "22222222-2222-4222-8222-222222222222"
+    fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     thread = {
         "id": "thread-1",
         "metadata": {
             "protected_cloud": True,
+            "config_override": {"workspace": {"backend": "vm"}},
             "workspace_container": {
+                "git_remote_url": "http://gitea/srw/thread-1.git",
+            },
+            "vm": {
                 "status": "ready",
-                "pod_ip": "10.0.0.5",
-                "port": 30022,
+                "provision_generation": generation,
+                "identity_provision_generation": generation,
+                "identity_authenticated": True,
+                "vm_uid": "vm-a",
+                "active_pod_uid": launcher_uid,
+                "ssh_host": "100.64.0.5",
+                "ssh_port": 22,
+                "ssh_host_key_fingerprint": fingerprint,
+                "ssh_registration_id": "registration-a",
             },
         },
     }
@@ -186,10 +204,42 @@ def _make_suspension_service(db):
     container_provisioner = MagicMock()
     container_provisioner.is_available = True
     container_provisioner.delete_workspace = AsyncMock(return_value=True)
+    vm_provisioner = MagicMock()
+    vm_provisioner.is_available = True
+    generation = "11111111-1111-4111-8111-111111111111"
+    launcher_uid = "22222222-2222-4222-8222-222222222222"
+    fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    identity = VMTeardownIdentity(
+        provision_generation=generation,
+        vm_uid="vm-a",
+        rootdisk_pvc_uid="rootdisk-a",
+        ssh_host="100.64.0.5",
+        ssh_port=22,
+        ssh_host_key_fingerprint=fingerprint,
+    )
+    vm_provisioner.capture_vm_teardown_identity = AsyncMock(return_value=identity)
+    vm_provisioner.attest_workspace_runtime = AsyncMock(
+        return_value=WorkspaceRuntimeAttestation(
+            backing_id=f"k8s-vmi:{launcher_uid}",
+            workspace_generation=generation,
+            runtime_incarnation=launcher_uid,
+            ssh_host_key_fingerprint=fingerprint,
+            host="100.64.0.5",
+            pod_ip="10.42.0.5",
+            port=22,
+            vm_uid="vm-a",
+            launcher_pod_uid=launcher_uid,
+        )
+    )
+    vm_provisioner.revalidate_vm_teardown_identity = AsyncMock(return_value="matched")
+    vm_provisioner.release_vm_captured = AsyncMock(
+        return_value=VMTeardownResult("completed", True)
+    )
     svc.connect(
         db=db,
         snapshot_service=snapshot_service,
         container_provisioner=container_provisioner,
+        vm_provisioner=vm_provisioner,
     )
     return svc, snapshot_service, container_provisioner
 
@@ -199,21 +249,64 @@ def _make_db(thread):
     db.get_thread = AsyncMock(return_value=thread)
     db.merge_thread_workspace_context = AsyncMock(return_value=True)
     db.merge_thread_vm_context = AsyncMock(return_value=True)
+    db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    receipt_id = str(uuid4())
+    receipt = {
+        "id": receipt_id,
+        "claim_token": 7,
+        "lease_expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    db.activate_vm_remote_operation_protocol = AsyncMock(return_value=True)
+    db.claim_vm_remote_operation = AsyncMock(return_value=receipt)
+    db.renew_vm_remote_operation = AsyncMock(return_value=receipt)
+    db.settle_vm_remote_operation = AsyncMock(return_value=True)
     return db
 
 
 class TestTeardownStageHook:
     @pytest.mark.asyncio
-    async def test_teardown_hook_stages_before_snapshot(self):
-        """The teardown hook must call stage_thread_cloud_diff and AWAIT it
-        to completion before the S3 VM snapshot capture starts."""
+    async def test_k8s_thread_is_refused_before_cloud_stage_or_snapshot(self):
+        thread = {
+            "id": "thread-1",
+            "execution_lane": "pinned",
+            "metadata": {
+                "protected_cloud": True,
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace_container": {
+                    "status": "ready",
+                    "provisioner": "k8s",
+                    "pod_ip": "10.0.0.5",
+                    "_runtime_incarnation": ("33333333-3333-4333-8333-333333333333"),
+                },
+            },
+        }
+        db = _make_db(thread)
+        svc, snapshot_service, _ = _make_suspension_service(db)
+        stage_mock = AsyncMock(
+            side_effect=AssertionError("foreign successor must not be read")
+        )
+
+        with patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock):
+            assert await svc.suspend_thread_workspace("thread-1") is False
+
+        stage_mock.assert_not_awaited()
+        snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        db.merge_thread_workspace_context.assert_not_awaited()
+        db.merge_thread_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_teardown_hook_contains_unleased_cloud_stage_before_snapshot(
+        self, monkeypatch
+    ):
+        """VM suspension cannot lend its filesystem lease to cloud staging."""
+        monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
         thread = _make_protected_thread()
         db = _make_db(thread)
         svc, snapshot_service, _ = _make_suspension_service(db)
 
         call_order: list[str] = []
 
-        async def fake_stage(*, thread_id, postgres_db, snapshot_service):
+        async def fake_stage(**_kwargs):
             call_order.append("stage")
             return {"epoch": 1, "counts": {}}
 
@@ -230,12 +323,11 @@ class TestTeardownStageHook:
             result = await svc.suspend_thread_workspace("thread-1")
 
         assert result is True
-        assert call_order == ["stage", "snapshot"]
+        assert call_order == ["snapshot"]
 
     @pytest.mark.asyncio
-    async def test_teardown_hook_swallows_stage_errors(self):
-        """A staging failure must not block or fail the teardown — the
-        snapshot (durable path) still runs and suspend still succeeds."""
+    async def test_teardown_hook_does_not_enter_unleased_stage(self, monkeypatch):
+        monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
         thread = _make_protected_thread()
         db = _make_db(thread)
         svc, snapshot_service, _ = _make_suspension_service(db)
@@ -245,22 +337,15 @@ class TestTeardownStageHook:
             result = await svc.suspend_thread_workspace("thread-1")
 
         assert result is True
-        stage_mock.assert_awaited_once()
+        stage_mock.assert_not_awaited()
         snapshot_service.capture_vm_snapshot.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_teardown_hook_skipped_for_unprotected_thread(self):
+    async def test_teardown_hook_skipped_for_unprotected_thread(self, monkeypatch):
         """Non-protected threads never call the stage path at all."""
-        thread = _make_protected_thread(
-            metadata={
-                "protected_cloud": False,
-                "workspace_container": {
-                    "status": "ready",
-                    "pod_ip": "10.0.0.5",
-                    "port": 30022,
-                },
-            }
-        )
+        monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
+        thread = _make_protected_thread()
+        thread["metadata"]["protected_cloud"] = False
         db = _make_db(thread)
         svc, snapshot_service, _ = _make_suspension_service(db)
 

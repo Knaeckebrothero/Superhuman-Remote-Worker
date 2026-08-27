@@ -1064,9 +1064,9 @@ class TestSetupWorkspace:
 
     @pytest.mark.asyncio
     async def test_remote_backend_creation(self):
-        """Remote backend created and connected when config says 'sandbox'."""
+        """A generic explicit remote keeps its non-Kubernetes trust contract."""
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
         )
         cfg.extra = {"shell": {"default_timeout": 60, "max_tabs": 5}}
@@ -1119,6 +1119,7 @@ class TestSetupWorkspace:
         remote_constructor = MagicMock(return_value=mock_remote)
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1165,6 +1166,7 @@ class TestSetupWorkspace:
         remote_constructor = MagicMock(return_value=mock_remote)
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1213,6 +1215,7 @@ class TestSetupWorkspace:
         )
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1274,6 +1277,7 @@ class TestSetupWorkspace:
         session.shell_owner_token = 24
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             **workspace_override,
         }
@@ -1306,6 +1310,7 @@ class TestSetupWorkspace:
         )
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1333,6 +1338,7 @@ class TestSetupWorkspace:
         )
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "10.0.0.1", "port": 22, "key_path": "/key"},
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
@@ -1371,10 +1377,11 @@ class TestSetupWorkspace:
         remote_constructor = MagicMock(return_value=mock_remote)
         workspace_override = {
             "backend": "sandbox",
+            "workspace_provisioner": "k8s",
             "remote": {"host": "paired.test", "port": 30022},
-            # A pinned attach during rollout may see the pre-existing durable
-            # backing generation before its pod context carries the new UID.
             "workspace_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "workspace_runtime_incarnation": ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "workspace_ssh_host_key_fingerprint": "SHA256:trusted",
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
             "canvas_shared_browser_available": True,
@@ -1399,11 +1406,38 @@ class TestSetupWorkspace:
         assert mock_remote.supports_canvas_presentation is True
         assert mock_remote.supports_canvas_live_apps is True
         assert mock_remote.supports_canvas_shared_browser is True
-        assert remote_constructor.call_args.kwargs["workspace_generation"] is None
-        assert remote_constructor.call_args.kwargs["runtime_incarnation"] is None
-        assert (
-            remote_constructor.call_args.kwargs["expected_host_key_fingerprint"] is None
+        assert remote_constructor.call_args.kwargs["workspace_generation"] == (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         )
+        assert remote_constructor.call_args.kwargs["runtime_incarnation"] == (
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        )
+        assert (
+            remote_constructor.call_args.kwargs["expected_host_key_fingerprint"]
+            == "SHA256:trusted"
+        )
+        assert remote_constructor.call_args.kwargs["require_host_key_fingerprint"]
+
+    @pytest.mark.asyncio
+    async def test_config_cannot_forge_docker_to_bypass_k8s_host_identity(self):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "configured.test", "port": 22},
+        )
+        # Config is caller state, not the server-derived wire authority.
+        cfg.workspace.provisioner = "docker"
+        session = _make_session(config=cfg)
+        workspace_override = {
+            "backend": "sandbox",
+            "workspace_provisioner": "k8s",
+            "remote": {"host": "reused-ip.test", "port": 30022},
+        }
+
+        with pytest.raises(
+            WorkspaceUnavailableError,
+            match="backing, runtime incarnation, and SSH host identity",
+        ):
+            await session._setup_workspace(workspace_override=workspace_override)
 
     @pytest.mark.asyncio
     async def test_vm_remote_backend_disables_canvas_presentation(self):
@@ -1439,7 +1473,7 @@ class TestSetupWorkspace:
     async def test_remote_retry_succeeds_after_failures(self):
         """Retry loop recovers when connect fails then succeeds."""
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1"},
         )
         session = _make_session(config=cfg)
@@ -1468,7 +1502,7 @@ class TestSetupWorkspace:
     async def test_remote_retry_raises_after_timeout(self):
         """Retry loop raises WorkspaceUnavailableError after max duration."""
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1"},
         )
         session = _make_session(config=cfg)
@@ -1505,7 +1539,7 @@ class TestSetupWorkspace:
         session = _make_session(config=cfg)
 
         override = {
-            "backend": "sandbox",
+            "backend": "remote",
             "remote": {"host": "override-host"},
         }
 
@@ -1658,7 +1692,7 @@ class TestSetupWorkspaceGuardWiring:
         mock_remote.list_dir = MagicMock(return_value=[])
 
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
         )
         session = _make_session(config=cfg)
@@ -1687,7 +1721,7 @@ class TestSetupWorkspaceGuardWiring:
         mock_remote.exists = MagicMock(return_value=True)
 
         cfg = _make_config(
-            ws_backend="sandbox",
+            ws_backend="remote",
             ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
         )
         session = _make_session(config=cfg)

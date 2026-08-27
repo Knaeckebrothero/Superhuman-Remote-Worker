@@ -167,6 +167,7 @@ async def test_http_virtual_stateless_ide_refuses_before_proxy_resolution():
     proxy.resolve_pod_ip = AsyncMock()
     request = MagicMock()
     request.headers = {}
+    request.method = "GET"
     with (
         patch.object(main, "postgres_db", db),
         patch.object(main, "ide_proxy_service", proxy),
@@ -218,18 +219,17 @@ async def test_ws_malformed_stateless_class_refuses_before_proxy_resolution():
 
 
 @pytest.mark.asyncio
-async def test_http_stateless_cache_is_refreshed_again_at_use_boundary():
+async def test_http_stateless_remote_is_contained_before_network_connect():
     from orchestrator import main
 
     db = MagicMock()
     db.get_thread = AsyncMock(return_value=_valid_sandbox_thread())
     proxy = MagicMock()
-    proxy.resolve_pod_ip = AsyncMock(side_effect=["10.0.0.1", "10.0.0.2"])
-    client = MagicMock()
-    upstream = MagicMock()
-    upstream.headers.multi_items.return_value = []
-    upstream.status_code = 200
-    client.request = AsyncMock(return_value=upstream)
+    target = MagicMock()
+    target.backend = "k8s"
+    target.host = "10.0.0.2"
+    target.authority = "10.0.0.2:38080"
+    proxy.resolve_target = AsyncMock(return_value=target)
     request = MagicMock()
     request.headers = {}
     request.method = "GET"
@@ -242,25 +242,26 @@ async def test_http_stateless_cache_is_refreshed_again_at_use_boundary():
             main, "require_approved_user", AsyncMock(return_value={"id": "u"})
         ),
         patch.object(main, "user_can_access_ide_entity", AsyncMock(return_value=True)),
-        patch.object(main, "_get_ide_http_client", return_value=client),
         patch("services.ssh_helpers.orchestrator_can_reach", return_value=True),
+        patch("httpx.AsyncClient") as client,
+        pytest.raises(HTTPException) as exc,
     ):
         await main.ide_proxy_http(request, "thread-a", "workspace")
 
-    assert proxy.resolve_pod_ip.await_count == 2
-    assert client.request.await_args.kwargs["url"] == (
-        "http://10.0.0.2:38080/workspace"
-    )
+    assert exc.value.status_code == 503
+    assert exc.value.detail["code"] == "ide_remote_transport_unavailable"
+    proxy.resolve_target.assert_awaited_once_with("thread-a")
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_ws_stateless_cache_is_refreshed_again_before_accept_and_connect():
+async def test_ws_stateless_remote_is_contained_before_resolution_or_connect():
     from orchestrator import main
 
     db = MagicMock()
     db.get_thread = AsyncMock(return_value=_valid_sandbox_thread())
     proxy = MagicMock()
-    proxy.resolve_pod_ip = AsyncMock(side_effect=["10.0.0.1", "10.0.0.2"])
+    proxy.resolve_target = AsyncMock()
     ws = MagicMock()
     ws.url.query = ""
     ws.accept = AsyncMock()
@@ -306,9 +307,13 @@ async def test_ws_stateless_cache_is_refreshed_again_before_accept_and_connect()
     ):
         await main.ide_proxy_ws(ws, "thread-a", "workspace")
 
-    assert proxy.resolve_pod_ip.await_count == 2
-    assert connected_urls == ["ws://10.0.0.2:38080/workspace"]
-    ws.accept.assert_awaited_once()
+    proxy.resolve_target.assert_not_awaited()
+    assert connected_urls == []
+    ws.accept.assert_not_awaited()
+    ws.close.assert_awaited_once_with(
+        code=4503,
+        reason="ide_stream_operation_lease_unavailable",
+    )
 
 
 @pytest.mark.asyncio
