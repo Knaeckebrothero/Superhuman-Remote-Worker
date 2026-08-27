@@ -381,6 +381,7 @@ def test_server_bundle_verifies_before_nextcloud_and_exposes_only_five_posts() -
         in common
     )
     assert "srw_effect_verify_request(" in prepend
+    assert "($_SERVER['SRW_PROTECTED_EFFECT_CAPABILITY'] ?? '') === '1'" in prepend
     assert "/var/www/html/index.php" not in prepend
     assert (
         "request_terminate_timeout = ${NEXTCLOUD_PROTECTED_EFFECT_HANDLER_BOUND_SECONDS}s"
@@ -397,5 +398,6 @@ def test_server_bundle_verifies_before_nextcloud_and_exposes_only_five_posts() -
     assert (
         nginx.count("fastcgi_pass unix:/run/srw-nextcloud/protected-effect.sock") == 3
     )
+    assert nginx.count("fastcgi_param SRW_PROTECTED_EFFECT_CAPABILITY 1;") == 1
     assert nginx.count("fastcgi_param HTTP_ACCEPT $http_accept;") == 2
     assert nginx.count("fastcgi_param HTTP_OCS_APIREQUEST $http_ocs_apirequest;") == 2
