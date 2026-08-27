@@ -1753,6 +1753,7 @@ async def _retire_orphaned_pinned_runtime(candidate: Mapping[str, Any]) -> bool:
         if str(candidate.get("status") or "") in {"awaiting_user", "suspended"}
         else "ended"
     )
+
     thread = await postgres_db.get_thread(thread_id)
     if not isinstance(thread, Mapping):
         return False
@@ -6131,7 +6132,12 @@ async def _reserve_session_attach_binding(
         return None
 
 
-SessionAttachReleaseOutcome = Literal["released", "already_detached", "unsafe"]
+SessionAttachReleaseOutcome = Literal[
+    "released",
+    "already_detached",
+    "retirement_acknowledged",
+    "unsafe",
+]
 _attach_abort_successor_tasks: dict[
     tuple[str, str, str, str], "asyncio.Task[None]"
 ] = {}
@@ -6803,6 +6809,76 @@ async def _release_session_attach_binding(
         return "released"
     except _AttachAbortCASLost:
         return "unsafe"
+
+
+async def _acknowledge_retiring_failed_attach(
+    agent_id: str,
+    thread_id: str,
+    *,
+    expected_runtime_generation: str,
+    expected_attach_token: str,
+    expected_agent_pod_uid: str,
+    local_quiescence_protocol: str,
+    workspace_generation: str | None,
+    workspace_runtime_incarnation: str | None,
+) -> bool:
+    """Route one exact failed-attach proof into an existing retirement.
+
+    Owner End may install and authorize T after an attach payload is delivered
+    but before the agent finishes setup.  Normal attach abort must then refuse
+    to rotate G or schedule a successor.  The same exact agent can instead
+    append its process-zero proof to T; every authority and physical-identity
+    predicate is repeated by the receipt transaction.
+    """
+
+    async def _settled_readback() -> bool:
+        return await postgres_db.has_exact_pinned_runtime_retirement_outcome(
+            thread_id,
+            runtime_generation=expected_runtime_generation,
+            agent_id=agent_id,
+            runtime_attach_token=expected_attach_token,
+        )
+
+    thread = await postgres_db.get_thread(thread_id)
+    if not isinstance(thread, Mapping):
+        return await _settled_readback()
+    retirement_token = str(thread.get("runtime_retirement_token") or "")
+    context = thread.get("runtime_retirement_context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (TypeError, ValueError):
+            return False
+    if not retirement_token or not isinstance(context, Mapping):
+        return await _settled_readback()
+    settle_status = str(context.get("settle_status") or "")
+    if settle_status not in {"ended", "suspended"}:
+        return await _settled_readback()
+
+    receipt_protocol = local_quiescence_protocol
+    if local_quiescence_protocol == "agent_attach_not_started_v1":
+        # The agent owns this monotonic pre-setup latch.  Under T, zero
+        # admitted input/control plus the captured physical tuple derives the
+        # ordinary retirement protocol without changing its receipt schema.
+        receipt_protocol = (
+            "workspace_process_zero_v1"
+            if workspace_generation and workspace_runtime_incarnation
+            else "agent_runtime_zero_v1"
+        )
+    receipt = await postgres_db.acknowledge_pinned_thread_local_quiescence(
+        thread_id,
+        expected_runtime_generation=expected_runtime_generation,
+        expected_retirement_token=retirement_token,
+        expected_agent_id=agent_id,
+        expected_attach_token=expected_attach_token,
+        expected_settle_status=settle_status,
+        expected_quiescence_protocol=receipt_protocol,
+        expected_workspace_generation=workspace_generation,
+        expected_workspace_runtime_incarnation=workspace_runtime_incarnation,
+        expected_agent_pod_uid=expected_agent_pod_uid,
+        require_zero_admission=True,
+    )
+    return receipt is not None or await _settled_readback()
 
 
 async def _assemble_session_attach_payload(
@@ -44697,6 +44773,17 @@ async def agent_release_thread_agent(
         workspace_generation=workspace_generation,
         workspace_runtime_incarnation=workspace_runtime_incarnation,
     )
+    if outcome == "unsafe" and await _acknowledge_retiring_failed_attach(
+        agent_id,
+        thread_id,
+        expected_runtime_generation=runtime_generation,
+        expected_attach_token=attach_token,
+        expected_agent_pod_uid=agent_pod_uid.strip(),
+        local_quiescence_protocol=local_quiescence_protocol,
+        workspace_generation=workspace_generation,
+        workspace_runtime_incarnation=workspace_runtime_incarnation,
+    ):
+        outcome = "retirement_acknowledged"
     if outcome in {"released", "already_detached"}:
         _schedule_attach_abort_successor(
             thread_id,

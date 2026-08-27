@@ -95,6 +95,7 @@ class TestOrchestratorClient:
         [
             ("released", True),
             ("already_detached", True),
+            ("retirement_acknowledged", True),
             ("unsafe", False),
             ("unchanged", False),
         ],

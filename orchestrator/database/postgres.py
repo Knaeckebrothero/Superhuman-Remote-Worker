@@ -24130,6 +24130,8 @@ class PostgresDB:
         expected_workspace_generation: str | None,
         expected_workspace_runtime_incarnation: str | None,
         quiescence_actor: str = "agent",
+        expected_agent_pod_uid: str | None = None,
+        require_zero_admission: bool = False,
     ) -> dict[str, Any] | None:
         """Append the exact agent's local-cleanup receipt once.
 
@@ -24161,20 +24163,26 @@ class PostgresDB:
             parsed_attach = UUID(str(expected_attach_token))
         except (TypeError, ValueError):
             return None
+        expected_agent_pod_uid = str(expected_agent_pod_uid or "")
+        if require_zero_admission and not expected_agent_pod_uid:
+            return None
         async with self.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    "SELECT runtime_retirement_token, "
-                    "runtime_retirement_permanent, "
-                    "runtime_retirement_context, "
-                    "runtime_retirement_local_quiescence "
-                    "FROM threads WHERE id=$1::uuid "
-                    "AND execution_lane='pinned' "
-                    "AND runtime_generation=$2::uuid "
-                    "AND agent_id=$3::uuid "
-                    "AND runtime_attach_token=$4::uuid "
-                    "AND runtime_retirement_token=$5::uuid "
-                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    "SELECT t.status, t.runtime_authority_exposed, "
+                    "t.runtime_retirement_token, "
+                    "t.runtime_retirement_permanent, "
+                    "t.runtime_retirement_context, "
+                    "t.runtime_retirement_local_quiescence, "
+                    "a.pod_uid AS current_agent_pod_uid "
+                    "FROM threads t JOIN agents a ON a.id=t.agent_id "
+                    "AND a.thread_id=t.id WHERE t.id=$1::uuid "
+                    "AND t.execution_lane='pinned' "
+                    "AND t.runtime_generation=$2::uuid "
+                    "AND t.agent_id=$3::uuid "
+                    "AND t.runtime_attach_token=$4::uuid "
+                    "AND t.runtime_retirement_token=$5::uuid "
+                    "AND t.runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
                     parsed_thread,
                     parsed_generation,
                     parsed_agent,
@@ -24183,6 +24191,35 @@ class PostgresDB:
                 )
                 if row is None:
                     return None
+                if (
+                    expected_agent_pod_uid
+                    and str(row["current_agent_pod_uid"] or "")
+                    != expected_agent_pod_uid
+                ):
+                    return None
+                if require_zero_admission:
+                    if (
+                        str(row["status"] or "") != "created"
+                        or row["runtime_authority_exposed"] is not True
+                    ):
+                        return None
+                    admitted_input = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
+                        "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
+                        "AND owner_runtime_generation=$3::uuid "
+                        "AND state IN ('admitted','settled'))",
+                        parsed_thread,
+                        parsed_agent,
+                        parsed_generation,
+                    )
+                    admitted_control = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
+                        "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid)",
+                        parsed_thread,
+                        parsed_generation,
+                    )
+                    if admitted_input or admitted_control:
+                        return None
                 context = row["runtime_retirement_context"]
                 context = {} if context is None else context
                 existing = row["runtime_retirement_local_quiescence"]
@@ -24234,6 +24271,13 @@ class PostgresDB:
                     and (not agent.get("hostname") or not agent.get("pod_uid"))
                     or agent_pod
                     and (not agent_pod.get("pod_name") or not agent_pod.get("pod_uid"))
+                ):
+                    return None
+                if expected_agent_pod_uid and (
+                    agent
+                    and str(agent.get("pod_uid") or "") != expected_agent_pod_uid
+                    or agent_pod
+                    and str(agent_pod.get("pod_uid") or "") != expected_agent_pod_uid
                 ):
                     return None
                 workspace_backend = str(context.get("workspace_backend") or "")
@@ -24942,6 +24986,45 @@ class PostgresDB:
             "outcome": str(row["outcome"]),
             "settled_at": row["settled_at"],
         }
+
+    async def has_exact_pinned_runtime_retirement_outcome(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        agent_id: str,
+        runtime_attach_token: str,
+    ) -> bool:
+        """Confirm a lost failed-attach ACK from append-only retirement proof.
+
+        The partial-attach agent does not know an owner-created retirement
+        token.  Its own exact G/agent/attach tuple is nevertheless sufficient
+        for read-only confirmation after settlement because the insert trigger
+        proved that tuple against T and the outcome row is append-only.  The
+        query exposes no retirement token or successor coordinates.
+        """
+
+        try:
+            identifiers = tuple(
+                UUID(str(value))
+                for value in (
+                    thread_id,
+                    runtime_generation,
+                    agent_id,
+                    runtime_attach_token,
+                )
+            )
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT count(*) FROM thread_runtime_retirement_outcomes "
+                "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid "
+                "AND agent_id=$3::uuid AND runtime_attach_token=$4::uuid "
+                "AND outcome IN ('settled','deleted')",
+                *identifiers,
+            )
+        return int(count or 0) == 1
 
     async def pinned_thread_has_prior_soft_settlement(
         self,
