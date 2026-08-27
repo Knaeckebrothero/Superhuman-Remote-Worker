@@ -4132,7 +4132,6 @@ class ContainerProvisioner:
                     name=pod_name,
                     namespace=self._namespace,
                     body=patch,
-                    _content_type="application/json-patch+json",
                 )
             return True
         except Exception:

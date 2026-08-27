@@ -276,7 +276,6 @@ class SessionRouterService:
                         "value": runtime_generation,
                     },
                 ],
-                _content_type="application/json-patch+json",
             )
         except Exception as exc:
             if any(_is_k8s_status(exc, status) for status in (404, 409, 422)):
@@ -509,7 +508,6 @@ class SessionRouterService:
                     runtime_generation,
                     service=True,
                 ),
-                _content_type="application/json-patch+json",
             )
         observed = await self._read_or_none(
             self._core_api.read_namespaced_service,
@@ -568,7 +566,6 @@ class SessionRouterService:
                     runtime_generation,
                     service=False,
                 ),
-                _content_type="application/json-patch+json",
             )
         observed = await self._read_or_none(
             self._networking_api.read_namespaced_ingress,

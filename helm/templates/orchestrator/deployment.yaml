@@ -99,6 +99,16 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_CLEANUP_RECONCILIATION_ENABLED
+            # The orchestrator is the only reader of this key
+            # (services/pinned_k8s_effect.py). Without it the bounded legacy
+            # namespace search collapses to the release namespace alone, which
+            # silently disables both 0185 adoption across a namespace move and
+            # the session-route shadow refusal.
+            - name: PINNED_LEGACY_AGENT_NAMESPACES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: PINNED_LEGACY_AGENT_NAMESPACES
             - name: PORT
               value: "8085"
             # License acceptance — orchestrator refuses to start if not "true"

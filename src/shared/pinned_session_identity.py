@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 PINNED_SESSION_READY_IDENTITY_CONTRACT = 1
@@ -156,3 +158,41 @@ def pinned_session_ready_identity_fingerprint(
         return None
     material = _DOMAIN + "\0".join((*identity, pod_uid)).encode("utf-8")
     return f"sha256:{hashlib.sha256(material).hexdigest()}"
+
+
+class PinnedJobRecipient(BaseModel):
+    """Server-owned identity envelope for one pinned-worker mutation.
+
+    This model is the wire contract between the orchestrator and a pinned
+    worker process, so it lives beside the other shared identity types rather
+    than in ``src.api.models``: importing that package would drag the whole
+    agent runtime (and its agent-only dependencies) into the orchestrator.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_agent_id: str = Field(min_length=1)
+    expected_pod_uid: Optional[str] = None
+    expected_process_generation: str = Field(min_length=1)
+    expected_job_id: str = Field(min_length=1)
+
+
+def pinned_job_recipient_matches(
+    recipient: Optional[PinnedJobRecipient],
+    *,
+    agent_id: Optional[str],
+    pod_uid: Optional[str],
+    process_generation: Optional[str],
+    job_id: Optional[str],
+) -> bool:
+    """Return whether an internal mutation targets this exact process/job."""
+
+    if recipient is None:
+        return False
+    return bool(
+        str(agent_id or "") == recipient.expected_agent_id
+        and (str(pod_uid or "").strip() or None)
+        == (str(recipient.expected_pod_uid or "").strip() or None)
+        and str(process_generation or "") == recipient.expected_process_generation
+        and str(job_id or "") == recipient.expected_job_id
+    )

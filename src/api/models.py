@@ -10,6 +10,15 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
+# The pinned-worker recipient envelope lives in ``src.shared`` so the
+# orchestrator can import it without pulling in this package's
+# ``__init__`` -> ``app`` -> ``agent`` chain (and its agent-only
+# dependencies). Re-exported here for the agent-side API surface.
+from src.shared.pinned_session_identity import (  # noqa: F401
+    PinnedJobRecipient,
+    pinned_job_recipient_matches,
+)
+
 
 class JobStatus(str, Enum):
     """Job processing status."""
@@ -253,17 +262,6 @@ class MetricsResponse(BaseModel):
 # =============================================================================
 
 
-class PinnedJobRecipient(BaseModel):
-    """Server-owned identity envelope for one pinned-worker mutation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    expected_agent_id: str = Field(min_length=1)
-    expected_pod_uid: Optional[str] = None
-    expected_process_generation: str = Field(min_length=1)
-    expected_job_id: str = Field(min_length=1)
-
-
 class PinnedSessionRecipient(BaseModel):
     """Server-owned identity envelope for one pinned-session mutation."""
 
@@ -293,27 +291,6 @@ def pinned_session_recipient_matches(
         and (str(pod_uid or "").strip() or None)
         == (str(recipient.expected_pod_uid or "").strip() or None)
         and str(process_generation or "") == recipient.expected_process_generation
-    )
-
-
-def pinned_job_recipient_matches(
-    recipient: Optional[PinnedJobRecipient],
-    *,
-    agent_id: Optional[str],
-    pod_uid: Optional[str],
-    process_generation: Optional[str],
-    job_id: Optional[str],
-) -> bool:
-    """Return whether an internal mutation targets this exact process/job."""
-
-    if recipient is None:
-        return False
-    return bool(
-        str(agent_id or "") == recipient.expected_agent_id
-        and (str(pod_uid or "").strip() or None)
-        == (str(recipient.expected_pod_uid or "").strip() or None)
-        and str(process_generation or "") == recipient.expected_process_generation
-        and str(job_id or "") == recipient.expected_job_id
     )
 
 

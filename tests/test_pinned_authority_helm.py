@@ -73,6 +73,27 @@ def test_explicit_legacy_namespace_renders_config_and_bounded_authority() -> Non
         _configmap(documents)["data"]["PINNED_LEGACY_AGENT_NAMESPACES"] == "agents-old"
     )
 
+    # The orchestrator is the only reader of this key. A ConfigMap entry the
+    # container never receives leaves the cross-namespace RBAC below granted
+    # but unusable: the bounded search collapses to the release namespace and
+    # the session-route shadow refusal silently stops firing.
+    orchestrator = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name", "").endswith("-orchestrator")
+    )
+    container = orchestrator["spec"]["template"]["spec"]["containers"][0]
+    legacy_env = next(
+        entry
+        for entry in container["env"]
+        if entry["name"] == "PINNED_LEGACY_AGENT_NAMESPACES"
+    )
+    assert (
+        legacy_env["valueFrom"]["configMapKeyRef"]["key"]
+        == "PINNED_LEGACY_AGENT_NAMESPACES"
+    )
+
     role = next(
         document
         for document in documents

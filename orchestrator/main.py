@@ -471,7 +471,9 @@ from src.core.product_capabilities import (  # noqa: E402
     ComponentProvenance,
     ProvenanceStatus,
 )
-from src.api.models import PinnedJobRecipient  # noqa: E402
+from src.shared.pinned_session_identity import (  # noqa: E402
+    PinnedJobRecipient,
+)
 
 # Lite (no-workspace-pod) backend names. Canonical set lives agent-side in the
 # backend factory; imported (not re-declared) so the dispatch/provisioning

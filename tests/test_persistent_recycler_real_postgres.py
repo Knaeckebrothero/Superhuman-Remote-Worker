@@ -598,6 +598,7 @@ async def _seed(
     bind_agent: bool = True,
     publish_agent_pod: bool = True,
     protected_agent_pod: bool = False,
+    workspace_claim: bool = True,
 ):
     ids = {key: str(uuid4()) for key in ("user", "project", "thread", "agent")}
     ids["attach_token"] = str(uuid4())
@@ -661,19 +662,25 @@ async def _seed(
             pod_name=f"persistent-{ids['thread'][:12]}",
             provisioner="persistent",
             namespace="agents-a",
-            pvc_name=f"pvc-persistent-{ids['thread'][:12]}",
+            # The pinned lite tier runs an emptyDir Pod with no separate
+            # workspace PVC; only a claim-bearing fixture owes a fenced claim
+            # before permanent physical clearance.
+            pvc_name=(
+                f"pvc-persistent-{ids['thread'][:12]}" if workspace_claim else None
+            ),
         )
         assert reserved is not None
         claim = reserved["workspace_claim"]
-        assert claim is not None
-        assert await db.publish_pinned_agent_workspace_claim(
-            ids["thread"],
-            expected_runtime_generation=generation,
-            claim_id=str(claim["claim_id"]),
-            pvc_name=str(claim["pvc_name"]),
-            pvc_uid=f"pvc-{ids['thread']}",
-            namespace="agents-a",
-        )
+        assert (claim is not None) is workspace_claim
+        if claim is not None:
+            assert await db.publish_pinned_agent_workspace_claim(
+                ids["thread"],
+                expected_runtime_generation=generation,
+                claim_id=str(claim["claim_id"]),
+                pvc_name=str(claim["pvc_name"]),
+                pvc_uid=f"pvc-{ids['thread']}",
+                namespace="agents-a",
+            )
         assert await db.publish_pinned_agent_pod_provision_intent(
             ids["thread"],
             expected_runtime_generation=generation,
@@ -690,7 +697,8 @@ async def _seed(
                 UUID(ids["thread"]),
             )
         ids["provision_attempt"] = attempt
-        ids["workspace_claim_id"] = str(claim["claim_id"])
+        if claim is not None:
+            ids["workspace_claim_id"] = str(claim["claim_id"])
 
     if bind_agent:
         async with db.acquire() as conn:
@@ -921,6 +929,30 @@ def _production_warm_provisioner(
     db: PostgresDB, api: StatefulPinnedK8sApi, *, namespace: str = "agents-b"
 ) -> AgentProvisioner:
     provisioner = AgentProvisioner()
+    provisioner._db = db
+    provisioner._core_api = api
+    provisioner._k8s_available = True
+    provisioner._namespace = namespace
+    return provisioner
+
+
+def _warm_rebind_provisioner(
+    db: PostgresDB, ids: dict[str, str], *, namespace: str = "agents-a"
+) -> PersistentProvisioner:
+    """Wire the exact live pool Pod a post-0198 warm re-attach must protect."""
+
+    api = StatefulPinnedK8sApi()
+    api.install_old_pod(
+        namespace=namespace,
+        name=f"persistent-{ids['thread'][:12]}",
+        uid="old-pod",
+        labels={
+            "srw/component": "persistent-agent",
+            "srw/thread-id": ids["thread"],
+        },
+        protected=False,
+    )
+    provisioner = PersistentProvisioner()
     provisioner._db = db
     provisioner._core_api = api
     provisioner._k8s_available = True
@@ -1371,20 +1403,64 @@ def _managed_gitea(*, probe: bool = True) -> MagicMock:
 
 
 async def _bind_replacement_agent(
-    db: PostgresDB, *, thread_id: str, pod_uid: str
+    db: PostgresDB,
+    *,
+    thread_id: str,
+    pod_uid: str,
+    namespace: str = "agents-a",
+    pod_name: str | None = None,
 ) -> tuple[str, runtime_actor.RuntimeActorContext]:
+    """Bind a successor agent the way the provisioner does after 0198.
+
+    A pinned bind may not be a raw write: the exact Pod must first publish a
+    create intent so ``metadata.agent_pod`` carries the namespace and
+    finalizer protocol that both the row trigger and Begin require.  When the
+    current generation cannot mint a fresh intent (the recycle protocol
+    already owns it), fall back to the pre-0198 reciprocal shape so those
+    tests keep exercising their own subject.
+    """
+
     agent_id = str(uuid4())
     attach_token = str(uuid4())
+    # The recycle protocol keeps the deterministic name; a caller that rebinds
+    # while the predecessor agent row still exists must pass its own, because
+    # the publication CAS refuses any hostname an agent row still carries.
+    pod_name = pod_name or f"persistent-{thread_id[:12]}"
+    thread = await db.get_thread(thread_id)
+    generation = str(thread["runtime_generation"])
+    attempt = str(uuid4())
+    reserved = await db.reserve_pinned_agent_pod_provision_intent(
+        thread_id,
+        expected_runtime_generation=generation,
+        attempt_id=attempt,
+        pod_name=pod_name,
+        provisioner="persistent",
+        namespace=namespace,
+        # The pinned lite tier successor is an emptyDir Pod: requesting a PVC
+        # here would collide with the predecessor's still-ready claim.
+    )
+    published = False
+    if reserved is not None:
+        published = await db.publish_pinned_agent_pod_provision_intent(
+            thread_id,
+            expected_runtime_generation=generation,
+            attempt_id=attempt,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            namespace=namespace,
+        )
     async with db.acquire() as conn:
         await conn.execute(
             "INSERT INTO agents "
             "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,last_heartbeat) "
             "VALUES ($1,'centurion',$2,'127.0.0.2',$3,'session','persistent',now())",
             UUID(agent_id),
-            f"persistent-{thread_id[:12]}",
+            pod_name,
             pod_uid,
         )
         async with conn.transaction():
+            if not published:
+                await conn.execute("SET LOCAL session_replication_role = 'replica'")
             old_agent_id = await conn.fetchval(
                 "SELECT agent_id FROM threads WHERE id=$1 FOR UPDATE",
                 UUID(thread_id),
@@ -1403,7 +1479,7 @@ async def _bind_replacement_agent(
                 UUID(thread_id),
                 UUID(agent_id),
                 UUID(attach_token),
-                f"persistent-{thread_id[:12]}",
+                pod_name,
                 pod_uid,
             )
             await conn.execute(
@@ -1681,7 +1757,7 @@ async def test_terminal_input_lost_response_replays_after_soft_end(db, terminal_
 
 @pytest.mark.asyncio
 async def test_authorized_retirement_is_irrevocable(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     authority = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     assert await db.authorize_pinned_thread_retirement(
         ids["thread"],
@@ -1717,7 +1793,7 @@ async def test_authorized_retirement_is_irrevocable(db):
 
 @pytest.mark.asyncio
 async def test_permanent_retirement_is_abortable_only_before_authorization(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     hidden = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
     assert await db.abort_pinned_thread_retirement(
         ids["thread"],
@@ -1760,7 +1836,7 @@ async def test_permanent_retirement_is_abortable_only_before_authorization(db):
 async def test_permanent_delete_requires_exact_physical_quiescence(db):
     """DELETE cannot bypass the soft-settlement UPDATE trigger."""
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
     async with db.acquire() as conn:
         with pytest.raises(asyncpg.CheckViolationError) as no_begin:
             await conn.execute("DELETE FROM threads WHERE id=$1", UUID(ids["thread"]))
@@ -1822,7 +1898,7 @@ async def test_permanent_delete_requires_exact_physical_quiescence(db):
 async def test_soft_ended_generation_is_durable_quiescence_for_later_delete(db):
     """A same-G soft settlement permits later destruction without a live ACK."""
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
     workspace_generation = str(uuid4())
     workspace_runtime = str(uuid4())
     async with db.acquire() as conn:
@@ -1919,7 +1995,7 @@ async def test_soft_ended_generation_is_durable_quiescence_for_later_delete(db):
 async def test_permanent_sandbox_absence_accepts_orchestrator_zero_receipt(db):
     """Exact Pod absence may receipt a permanent bound sandbox retirement."""
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     workspace_generation = str(uuid4())
     workspace_runtime = str(uuid4())
     async with db.acquire() as conn:
@@ -2231,7 +2307,7 @@ async def test_nonmatching_prior_soft_outcome_cannot_be_forged(db, outcome_shape
 
 @pytest.mark.asyncio
 async def test_prior_soft_outcome_cannot_authorize_resumed_exposed_generation(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
     soft = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     await _authorize_and_ack(db, ids, soft)
     assert await db.settle_pinned_thread_retirement(
@@ -2242,7 +2318,10 @@ async def test_prior_soft_outcome_cannot_authorize_resumed_exposed_generation(db
     )
     assert await db.resume_thread(ids["thread"])
     successor, _actor = await _bind_replacement_agent(
-        db, thread_id=ids["thread"], pod_uid="successor-pod"
+        db,
+        thread_id=ids["thread"],
+        pod_uid="successor-pod",
+        pod_name=f"persistent-successor-{ids['thread'][:8]}",
     )
     permanent = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
     assert permanent["generation"] != soft["generation"]
@@ -2408,7 +2487,7 @@ async def test_pinned_delete_trigger_does_not_change_stateless_authority(db):
     ],
 )
 async def test_runtime_authority_outcomes_are_database_append_only(db, table):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
     async with db.acquire() as conn:
         if table == "thread_runtime_retirement_outcomes":
@@ -2457,7 +2536,7 @@ async def test_runtime_authority_outcomes_are_database_append_only(db, table):
 
 @pytest.mark.asyncio
 async def test_forged_conflicting_retirement_outcome_is_rejected(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     authority = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     await _authorize_and_ack(db, ids, authority)
     async with db.acquire() as conn:
@@ -2484,7 +2563,7 @@ async def test_forged_conflicting_retirement_outcome_is_rejected(db):
 
 @pytest.mark.asyncio
 async def test_abandoned_hidden_preflight_expires_without_runtime_mutation(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET control_admission_agent_id=NULL WHERE id=$1",
@@ -2527,7 +2606,7 @@ async def test_exact_agent_begin_authorizes_atomically_without_control_reopen(db
         admit_thread_control,
     )
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET control_admission_agent_id=NULL WHERE id=$1",
@@ -2591,7 +2670,7 @@ async def test_exact_agent_begin_authorizes_atomically_without_control_reopen(db
 
 @pytest.mark.asyncio
 async def test_authorize_vs_hidden_preflight_expiry_has_one_winner(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET control_admission_agent_id=NULL WHERE id=$1",
@@ -2630,7 +2709,7 @@ async def test_authorize_vs_hidden_preflight_expiry_has_one_winner(db):
 
 @pytest.mark.asyncio
 async def test_owner_preflight_cannot_forge_control_admission_reopen(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET control_admission_agent_id=NULL WHERE id=$1",
@@ -2652,7 +2731,7 @@ async def test_owner_preflight_cannot_forge_control_admission_reopen(db):
 
 @pytest.mark.asyncio
 async def test_stale_retirement_ack_cannot_certify_new_attempt(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     first = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     assert await db.abort_pinned_thread_retirement(
         ids["thread"], token=first["token"], generation=first["generation"]
@@ -2694,7 +2773,7 @@ async def test_stale_retirement_ack_cannot_certify_new_attempt(db):
 
 @pytest.mark.asyncio
 async def test_runtime_exposure_is_monotonic_within_generation(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     original = await db.get_thread(ids["thread"])
     assert original["runtime_authority_exposed"] is True
     async with db.acquire() as conn:
@@ -2996,6 +3075,9 @@ async def test_reclaimed_agent_workspace_claim_is_idempotent_retirement_replay(d
         attempt_id=attempt_id,
         pod_name=f"srw-agent-s-{attempt_id[:8]}",
         provisioner="agent",
+        # 0198 makes the create intent's namespace exact authority; this
+        # upstream test predates that keyword.
+        namespace="agents-a",
         pvc_name=claim_name,
     )
     assert intent is not None
@@ -3528,15 +3610,19 @@ async def test_failed_attach_abort_rotates_generation_and_stale_retry_preserves_
     """A proved pre-delivery A abort cannot clear the same agent rebound as B."""
     import main as orch_main
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET status='created' WHERE id=$1",
             UUID(ids["thread"]),
         )
     old_generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    warm_provisioner = _warm_rebind_provisioner(db, ids)
 
-    with patch.object(orch_main, "postgres_db", db):
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "persistent_provisioner", warm_provisioner),
+    ):
         assert (
             await orch_main._release_session_attach_binding(
                 ids["agent"],
@@ -3587,7 +3673,12 @@ async def test_failed_attach_abort_rotates_generation_and_stale_retry_preserves_
     assert str(current["runtime_attach_token"]) == b_token
     assert str(current["agent_id"]) == ids["agent"]
     assert current["runtime_authority_exposed"] is True
-    assert "agent_pod" not in _json(current["metadata"])
+    # G2 carries B's own exact warm-binding marker, never a stale G1 residue:
+    # after 0198 a bind is only legal once that marker is published.
+    successor_marker = _json(current["metadata"])["agent_pod"]
+    assert successor_marker["runtime_generation"] == successor_generation
+    assert successor_marker["protection_protocol"] == "finalizer_v1"
+    assert successor_marker["namespace"] == "agents-a"
 
 
 @pytest.mark.asyncio
@@ -3794,7 +3885,7 @@ async def test_failed_attach_abort_outcome_is_restart_safe_successor_work(db):
     """A process restart can rediscover only the exact unbound G2."""
     import main as orch_main
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET status='created' WHERE id=$1",
@@ -3827,7 +3918,12 @@ async def test_failed_attach_abort_outcome_is_restart_safe_successor_work(db):
 
     # Once another exact owner binds, the old append-only outcome remains for
     # readback but cannot keep scheduling work into that live generation.
-    with patch.object(orch_main, "postgres_db", db):
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(
+            orch_main, "persistent_provisioner", _warm_rebind_provisioner(db, ids)
+        ),
+    ):
         token = await orch_main._reserve_session_attach_binding(
             ids["agent"],
             ids["thread"],
@@ -4083,7 +4179,7 @@ async def test_pinned_event_flush_after_settlement_cannot_append_after_terminal(
     """A delayed G1 flush observes terminal authority and appends nothing."""
     import src.api.persistent_app as agent_app
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
     writer = _pinned_event_writer(db, ids, generation)
     late = agent_app._QueuedPersistentEvent(
@@ -4116,7 +4212,7 @@ async def test_pinned_event_flush_winning_before_begin_serializes_before_termina
     """The converse ordering preserves a valid pre-Begin frame exactly once."""
     import src.api.persistent_app as agent_app
 
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
     writer = _pinned_event_writer(db, ids, generation)
     assert (
@@ -4143,7 +4239,7 @@ async def test_pinned_event_flush_winning_before_begin_serializes_before_termina
 
 @pytest.mark.asyncio
 async def test_pinned_retirement_is_single_owner_retryable_and_resume_rotates(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     first, second = await asyncio.gather(
         db.begin_pinned_thread_retirement(ids["thread"], permanent=False),
         db.begin_pinned_thread_retirement(ids["thread"], permanent=False),
@@ -4179,7 +4275,7 @@ async def test_pinned_retirement_is_single_owner_retryable_and_resume_rotates(db
 
 @pytest.mark.asyncio
 async def test_pinned_retirement_disposition_is_immutable_and_enforced(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     authority = await db.begin_pinned_thread_retirement(
         ids["thread"], permanent=False, settle_status="suspended"
     )
@@ -4241,7 +4337,7 @@ async def test_pinned_retirement_disposition_is_immutable_and_enforced(db):
 
 @pytest.mark.asyncio
 async def test_direct_soft_suspension_forces_generation_and_clears_ownership(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     authority = await db.begin_pinned_thread_retirement(
         ids["thread"], permanent=False, settle_status="suspended"
     )
@@ -4544,7 +4640,7 @@ async def test_soft_end_revokes_never_delivered_reader_before_zero_stage(
 
 @pytest.mark.asyncio
 async def test_malformed_protected_marker_cannot_soft_retire_as_unprotected(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET metadata=jsonb_set(metadata, "
@@ -4561,7 +4657,7 @@ async def test_malformed_protected_marker_cannot_soft_retire_as_unprotected(db):
 
 @pytest.mark.asyncio
 async def test_pending_pinned_retirement_blocks_legacy_resume_sql(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     authority = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     async with db.acquire() as conn:
         # Model a partially completed End whose old writer has already set the
@@ -6705,7 +6801,7 @@ async def test_wake_outbox_refuses_transcript_only_then_accepts_admission(db):
 
 @pytest.mark.asyncio
 async def test_job_wake_outbox_requires_durable_provider_admission(db):
-    ids = await _seed(db)
+    ids = await _seed(db, protected_agent_pod=True)
     thread_id, agent_id, job_id = uuid4(), uuid4(), uuid4()
     async with db.acquire() as conn:
         await conn.execute(
@@ -6726,6 +6822,9 @@ async def test_job_wake_outbox_requires_durable_provider_admission(db):
         )
         attach_token = uuid4()
         async with conn.transaction():
+            # This wake fixture models a binding already live when 0198 lands;
+            # its subject is the outbox, not the pinned bind authority.
+            await conn.execute("SET LOCAL session_replication_role = 'replica'")
             await conn.execute(
                 "UPDATE threads SET agent_id=$2,control_admission_agent_id=$2,"
                 "runtime_attach_token=$3 WHERE id=$1",

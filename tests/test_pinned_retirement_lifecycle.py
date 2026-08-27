@@ -18,6 +18,9 @@ RETIREMENT_TOKEN = "33333333-3333-4333-8333-333333333333"
 CLAIM_ID = "44444444-4444-4444-8444-444444444444"
 CLAIM_ATTEMPT = "55555555-5555-4555-8555-555555555555"
 CLAIM_GENERATION = "66666666-6666-4666-8666-666666666666"
+# A pinned status write must name the exact registered process; the
+# request model refuses an agent_id without it.
+PROCESS_GENERATION = "77777777-7777-4777-8777-777777777777"
 
 
 @pytest.mark.asyncio
@@ -123,12 +126,18 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically():
         "runtime_generation": UUID(RUNTIME_GENERATION),
         "runtime_attach_token": UUID(ATTACH_TOKEN),
         "runtime_retirement_token": None,
-        "metadata": {},
+        "metadata": {"dispatch_process_generation": PROCESS_GENERATION},
         "project_id": None,
         "title": "session",
     }
+    # The endpoint reads the thread row and then the reciprocal agent row; the
+    # latter carries the exact Pod UID and registered process generation.
+    reciprocal_agent = {
+        "pod_uid": None,
+        "metadata": {"dispatch_process_generation": PROCESS_GENERATION},
+    }
     conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value=thread)
+    conn.fetchrow = AsyncMock(side_effect=[thread, reciprocal_agent, thread, thread])
     conn.fetchval = AsyncMock(return_value=1)
 
     @asynccontextmanager
@@ -142,6 +151,20 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically():
     db = MagicMock()
     db.list_legacy_pinned_agent_k8s_authority_candidates = AsyncMock(return_value=[])
     db.adopt_legacy_pinned_agent_k8s_authority = AsyncMock(return_value=False)
+    # 0198 runs the server-owned legacy/warm adoption reconciler before Begin
+    # may install T. With nothing to adopt it is a no-op, but the seams must
+    # be awaitable or Begin reports an adoption failure instead.
+    db.list_legacy_pinned_warm_binding_candidates = AsyncMock(return_value=[])
+    db.list_expired_pinned_warm_binding_protections = AsyncMock(return_value=[])
+    db.plan_pinned_warm_binding_protection = AsyncMock(return_value=None)
+    db.claim_pinned_warm_binding_effect = AsyncMock(return_value=None)
+    db.publish_pinned_warm_binding_protection = AsyncMock(return_value=None)
+    db.bind_pinned_warm_agent = AsyncMock(return_value=None)
+    db.begin_pinned_warm_binding_release = AsyncMock(return_value=None)
+    db.complete_pinned_warm_binding_release = AsyncMock(return_value=None)
+    db.abort_unmodified_pinned_warm_binding = AsyncMock(return_value=None)
+    db.get_pinned_warm_binding_protection = AsyncMock(return_value=None)
+    db.get_pinned_warm_binding_candidate = AsyncMock(return_value=None)
     db.get_thread = AsyncMock(return_value=thread)
     db.acquire = MagicMock(side_effect=acquire)
     db.begin_pinned_thread_retirement = AsyncMock(
@@ -166,6 +189,7 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically():
             main.AgentThreadStatusRequest(
                 status="ending",
                 agent_id=AGENT_ID,
+                process_generation=PROCESS_GENERATION,
                 session_runtime_generation=RUNTIME_GENERATION,
                 session_runtime_attach_token=ATTACH_TOKEN,
                 retirement_disposition="ended",
@@ -372,6 +396,20 @@ async def test_restart_reconciler_promotes_only_exact_agent_create(foreign_kind)
     db.list_pinned_agent_create_intents_for_reconcile = AsyncMock(side_effect=_list)
     db.list_legacy_pinned_agent_k8s_authority_candidates = AsyncMock(return_value=[])
     db.adopt_legacy_pinned_agent_k8s_authority = AsyncMock(return_value=False)
+    # 0198 runs the server-owned legacy/warm adoption reconciler before Begin
+    # may install T. With nothing to adopt it is a no-op, but the seams must
+    # be awaitable or Begin reports an adoption failure instead.
+    db.list_legacy_pinned_warm_binding_candidates = AsyncMock(return_value=[])
+    db.list_expired_pinned_warm_binding_protections = AsyncMock(return_value=[])
+    db.plan_pinned_warm_binding_protection = AsyncMock(return_value=None)
+    db.claim_pinned_warm_binding_effect = AsyncMock(return_value=None)
+    db.publish_pinned_warm_binding_protection = AsyncMock(return_value=None)
+    db.bind_pinned_warm_agent = AsyncMock(return_value=None)
+    db.begin_pinned_warm_binding_release = AsyncMock(return_value=None)
+    db.complete_pinned_warm_binding_release = AsyncMock(return_value=None)
+    db.abort_unmodified_pinned_warm_binding = AsyncMock(return_value=None)
+    db.get_pinned_warm_binding_protection = AsyncMock(return_value=None)
+    db.get_pinned_warm_binding_candidate = AsyncMock(return_value=None)
     db.publish_pinned_agent_workspace_claim = AsyncMock(return_value=True)
     db.publish_pinned_agent_pod_provision_intent = AsyncMock(return_value=True)
     with (
@@ -441,6 +479,20 @@ async def test_leader_adopts_exact_legacy_authority_before_create_reconcile():
     db.list_expired_pinned_warm_binding_protections = AsyncMock(return_value=[])
     db.list_legacy_pinned_agent_k8s_authority_candidates = AsyncMock(return_value=[row])
     db.adopt_legacy_pinned_agent_k8s_authority = AsyncMock(return_value=True)
+    # 0198 runs the server-owned legacy/warm adoption reconciler before Begin
+    # may install T. With nothing to adopt it is a no-op, but the seams must
+    # be awaitable or Begin reports an adoption failure instead.
+    db.list_legacy_pinned_warm_binding_candidates = AsyncMock(return_value=[])
+    db.list_expired_pinned_warm_binding_protections = AsyncMock(return_value=[])
+    db.plan_pinned_warm_binding_protection = AsyncMock(return_value=None)
+    db.claim_pinned_warm_binding_effect = AsyncMock(return_value=None)
+    db.publish_pinned_warm_binding_protection = AsyncMock(return_value=None)
+    db.bind_pinned_warm_agent = AsyncMock(return_value=None)
+    db.begin_pinned_warm_binding_release = AsyncMock(return_value=None)
+    db.complete_pinned_warm_binding_release = AsyncMock(return_value=None)
+    db.abort_unmodified_pinned_warm_binding = AsyncMock(return_value=None)
+    db.get_pinned_warm_binding_protection = AsyncMock(return_value=None)
+    db.get_pinned_warm_binding_candidate = AsyncMock(return_value=None)
 
     async def _list_create(**_kwargs):
         shutdown.set()
