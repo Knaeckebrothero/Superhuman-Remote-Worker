@@ -44386,15 +44386,10 @@ async def agent_update_thread_status(
                 local_runtime_quiesced=True,
             )
             return retired
-        if result_status == "suspended":
-            logger.info(
-                "Officer thread %s: exact-owner agent 'ended' mapped to "
-                "'suspended' (watchdog will respawn)",
-                thread_id[:8],
-            )
-        else:
-            asyncio.create_task(_suspend_thread_resources(thread_id))
-            await _conclude_conference_if_any(thread_row)
+        # Terminal exact-owner writes return through the retirement funnel
+        # above. Reaching this point means the pinned runtime only acknowledged
+        # a live presence transition; tearing down its resources here would
+        # revoke the authority that the successful status write just proved.
         return {"status": result_status}
     try:
         if body.status == "ended":
