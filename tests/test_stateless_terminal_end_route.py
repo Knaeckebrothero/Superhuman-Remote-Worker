@@ -98,7 +98,7 @@ def _in_progress_creation_thread(*, ready: bool = False) -> dict:
             "ssh_host_key_fingerprint": FINGERPRINT,
         }
     else:
-        workspace["_stateless_runtime_creation"] = {
+        workspace["_runtime_creation"] = {
             "generation": "44444444-4444-4444-8444-444444444444",
             "mode": "create",
             "attempted": True,
@@ -236,6 +236,29 @@ def _absence_thread(
     }
 
 
+def _settled_cleanup_provisioner(**extra):
+    """A permanent settled End now settles a durable 0196 cleanup intent first."""
+
+    # Use the exact class main.py compares against; a second import of the
+    # same file under a different module name would fail isinstance.
+    outcome_type = main.WorkspaceCleanupOutcome
+
+    async def _prepare(_owner, *, reclaim_shared_resources: bool, **_kwargs):
+        return {
+            "intent_generation": 1,
+            "resources_captured_at": "2026-08-27T00:00:00+00:00",
+            "reclaim_shared_resources": reclaim_shared_resources,
+        }
+
+    return SimpleNamespace(
+        prepare_workspace_cleanup_intent=AsyncMock(side_effect=_prepare),
+        reconcile_workspace_cleanup_intent=AsyncMock(
+            return_value=outcome_type("settled", 1)
+        ),
+        **extra,
+    )
+
+
 def _db_for_settled(thread: dict, *, permanent: bool) -> SimpleNamespace:
     closure = {
         "state": "settled",
@@ -263,7 +286,7 @@ def _db_for_settled(thread: dict, *, permanent: bool) -> SimpleNamespace:
 async def test_duplicate_soft_end_reuses_settled_proof_without_effects() -> None:
     thread = _settled_thread()
     db = _db_for_settled(thread, permanent=False)
-    provisioner = SimpleNamespace(release_absent_workspace=AsyncMock())
+    provisioner = _settled_cleanup_provisioner(release_absent_workspace=AsyncMock())
     snapshots = SimpleNamespace(is_available=True, delete_snapshot=AsyncMock())
 
     with (
@@ -359,7 +382,7 @@ async def test_end_holds_when_creation_continuation_leaves_restore_debt() -> Non
     in_progress = _in_progress_creation_thread()
     workspace = in_progress["metadata"]["workspace_container"]
     workspace["_snapshot_restore_required"] = True
-    workspace["_stateless_runtime_creation"]["mode"] = "restore"
+    workspace["_runtime_creation"]["mode"] = "restore"
     ready_with_restore_debt = _in_progress_creation_thread(ready=True)
     ready_with_restore_debt["metadata"]["workspace_container"][
         "_snapshot_restore_required"
@@ -553,9 +576,14 @@ async def test_exact_terminal_uid_acknowledges_then_deletes_through_finalizer_pa
         acknowledge_stateless_thread_shell_absent=AsyncMock(return_value=True),
         finish_stateless_thread_workspace_retirement=AsyncMock(return_value=True),
     )
-    provisioner = SimpleNamespace(
+    provisioner = _settled_cleanup_provisioner(
         workspace_pod_authority=AsyncMock(return_value="exact_terminal"),
         delete_workspace=AsyncMock(return_value=True),
+        delete_workspace_with_outcome=AsyncMock(
+            return_value=SimpleNamespace(
+                stale_target_settled=False, current_deleted=True
+            )
+        ),
         release_absent_workspace=AsyncMock(return_value=True),
     )
 
@@ -573,12 +601,28 @@ async def test_exact_terminal_uid_acknowledges_then_deletes_through_finalizer_pa
         terminal_token=8,
         runtime_incarnation=RUNTIME,
     )
-    provisioner.delete_workspace.assert_awaited_once()
-    assert provisioner.delete_workspace.await_args.kwargs == {
+    # Terminal deletion now runs through the durable cleanup intent and the
+    # outcome-returning delete, so the exact captured resource identities are
+    # committed before the Kubernetes effect.
+    provisioner.prepare_workspace_cleanup_intent.assert_awaited_once()
+    assert provisioner.prepare_workspace_cleanup_intent.await_args.kwargs == {
+        "expected_runtime_incarnation": RUNTIME,
+        "target_disposition": "deleted",
+        "reclaim_shared_resources": False,
+    }
+    provisioner.delete_workspace_with_outcome.assert_awaited_once()
+    deletion_kwargs = dict(provisioner.delete_workspace_with_outcome.await_args.kwargs)
+    carried_intent = deletion_kwargs.pop("cleanup_intent")
+    assert deletion_kwargs == {
         "expected_runtime_incarnation": RUNTIME,
         "wait_for_exact_absence": True,
+        "target_disposition": "deleted",
+        "reclaim_shared_resources": False,
     }
-    provisioner.release_absent_workspace.assert_awaited_once()
+    # The effect carries the exact intent that was committed first.
+    assert carried_intent["resources_captured_at"] is not None
+    assert carried_intent["reclaim_shared_resources"] is False
+    provisioner.delete_workspace.assert_not_awaited()
     db.finish_stateless_thread_workspace_retirement.assert_awaited_once_with(THREAD_ID)
 
 
@@ -586,7 +630,9 @@ async def test_exact_terminal_uid_acknowledges_then_deletes_through_finalizer_pa
 async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> None:
     thread = _settled_thread()
     db = _db_for_settled(thread, permanent=True)
-    provisioner = SimpleNamespace(release_absent_workspace=AsyncMock(return_value=True))
+    provisioner = _settled_cleanup_provisioner(
+        release_absent_workspace=AsyncMock(return_value=True)
+    )
     snapshots = SimpleNamespace(
         is_available=True,
         delete_snapshot=AsyncMock(return_value=True),
@@ -609,14 +655,19 @@ async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> No
         )
 
     assert result == {"status": "deleted"}
-    provisioner.release_absent_workspace.assert_awaited_once()
-    owner = provisioner.release_absent_workspace.await_args.args[0]
+    # Permanent reclaim now runs through the durable 0196 cleanup intent, not a
+    # bare release call: the disposition and captured resource identities are
+    # committed before any Kubernetes effect.
+    provisioner.release_absent_workspace.assert_not_awaited()
+    provisioner.prepare_workspace_cleanup_intent.assert_awaited_once()
+    owner = provisioner.prepare_workspace_cleanup_intent.await_args.args[0]
     assert (owner.kind, owner.id) == ("session", THREAD_ID)
-    assert provisioner.release_absent_workspace.await_args.kwargs == {
-        "reclaim_volume": True,
+    assert provisioner.prepare_workspace_cleanup_intent.await_args.kwargs == {
         "expected_runtime_incarnation": RUNTIME,
-        "strict": True,
+        "target_disposition": "deleted",
+        "reclaim_shared_resources": True,
     }
+    provisioner.reconcile_workspace_cleanup_intent.assert_awaited_once()
     snapshots.delete_snapshot.assert_awaited_once_with(THREAD_ID, entity_type="threads")
     db.delete_thread.assert_awaited_once_with(THREAD_ID)
 
@@ -625,7 +676,9 @@ async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> No
 async def test_snapshot_delete_failure_keeps_settled_thread_retryable() -> None:
     thread = _settled_thread()
     db = _db_for_settled(thread, permanent=True)
-    provisioner = SimpleNamespace(release_absent_workspace=AsyncMock(return_value=True))
+    provisioner = _settled_cleanup_provisioner(
+        release_absent_workspace=AsyncMock(return_value=True)
+    )
     snapshots = SimpleNamespace(
         is_available=True,
         delete_snapshot=AsyncMock(return_value=False),

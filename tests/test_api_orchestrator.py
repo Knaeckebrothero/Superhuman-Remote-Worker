@@ -6,6 +6,29 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+AGENT_ID = "11111111-1111-4111-8111-111111111111"
+PROCESS_GENERATION = "22222222-2222-4222-8222-222222222222"
+
+
+def _recipient(job_id: str) -> dict:
+    """A pinned worker mutation names the exact registered process."""
+
+    return {
+        "expected_agent_id": AGENT_ID,
+        "expected_pod_uid": None,
+        "expected_process_generation": PROCESS_GENERATION,
+        "expected_job_id": job_id,
+    }
+
+
+def _runtime_client():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        agent_id=AGENT_ID, dispatch_process_generation=PROCESS_GENERATION
+    )
+
+
 def _workspace_bundle() -> dict:
     return {
         "config_override": {
@@ -59,7 +82,7 @@ class TestJobStartEndpoint:
         # Set up mocks
         app_module._agent = mock_agent
         app_module._current_job_id = None
-        app_module._orchestrator_client = None
+        app_module._orchestrator_client = _runtime_client()
 
         # Create app without lifespan (we're mocking the agent)
         from src.api.app import create_app
@@ -92,6 +115,7 @@ class TestJobStartEndpoint:
             json={
                 "job_id": "test-job-123",
                 "description": "Test task",
+                "recipient": _recipient("test-job-123"),
                 **_workspace_bundle(),
             },
         )
@@ -108,7 +132,11 @@ class TestJobStartEndpoint:
         app_module._agent = mock_agent
         response = test_client.post(
             "/job/start",
-            json={"job_id": "old-orchestrator", "description": "old bundle"},
+            json={
+                "job_id": "old-orchestrator",
+                "description": "old bundle",
+                "recipient": _recipient("old-orchestrator"),
+            },
         )
 
         assert response.status_code == 409
@@ -129,6 +157,7 @@ class TestJobStartEndpoint:
             json={
                 "job_id": "new-job-789",
                 "description": "Another task",
+                "recipient": _recipient("new-job-789"),
                 **_workspace_bundle(),
             },
         )
@@ -169,9 +198,11 @@ class TestJobCancelEndpoint:
 
         original_agent = app_module._agent
         original_job_id = app_module._current_job_id
+        original_orchestrator = app_module._orchestrator_client
 
         app_module._agent = mock_agent
         app_module._current_job_id = None
+        app_module._orchestrator_client = _runtime_client()
 
         test_app = create_app_for_testing()
 
@@ -183,6 +214,7 @@ class TestJobCancelEndpoint:
 
         app_module._agent = original_agent
         app_module._current_job_id = original_job_id
+        app_module._orchestrator_client = original_orchestrator
 
     def test_job_cancel_no_job_returns_404(self, test_client, mock_agent):
         """Test that /job/cancel returns 404 when no job is running."""
@@ -229,9 +261,11 @@ class TestJobResumeEndpoint:
 
         original_agent = app_module._agent
         original_job_id = app_module._current_job_id
+        original_orchestrator = app_module._orchestrator_client
 
         app_module._agent = mock_agent
         app_module._current_job_id = None
+        app_module._orchestrator_client = _runtime_client()
 
         test_app = create_app_for_testing()
 
@@ -243,6 +277,7 @@ class TestJobResumeEndpoint:
 
         app_module._agent = original_agent
         app_module._current_job_id = original_job_id
+        app_module._orchestrator_client = original_orchestrator
 
     def test_job_resume_works(self, test_client, mock_agent):
         """Test that /job/resume accepts a resume request."""
@@ -256,6 +291,7 @@ class TestJobResumeEndpoint:
             json={
                 "job_id": "resume-job-123",
                 "feedback": "Please continue with step 2",
+                "recipient": _recipient("resume-job-123"),
                 **_workspace_bundle(),
             },
         )

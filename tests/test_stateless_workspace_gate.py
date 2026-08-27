@@ -210,7 +210,7 @@ def test_classifier_refuses_malformed_restore_marker(malformed):
 def test_classifier_accepts_exact_in_progress_creation_marker(status, attempted):
     metadata = _k8s_sandbox_metadata(
         status=status,
-        _stateless_runtime_creation=_creation_marker(attempted=attempted),
+        _runtime_creation=_creation_marker(attempted=attempted),
     )
 
     assert stateless_session_workspace_check(_thread(metadata)) == ("sandbox", None)
@@ -220,7 +220,7 @@ def test_classifier_accepts_restore_creation_marker_only_with_exact_restore_inte
     metadata = _k8s_sandbox_metadata(
         status="restoring",
         _snapshot_restore_required=True,
-        _stateless_runtime_creation=_creation_marker(
+        _runtime_creation=_creation_marker(
             mode="restore",
             replaces_uid=SANDBOX_RUNTIME,
         ),
@@ -231,7 +231,7 @@ def test_classifier_accepts_restore_creation_marker_only_with_exact_restore_inte
 
 def test_classifier_refuses_ready_credentials_while_creation_marker_remains():
     metadata = _k8s_sandbox_metadata(
-        _stateless_runtime_creation=_creation_marker(attempted=True),
+        _runtime_creation=_creation_marker(attempted=True),
     )
 
     assert stateless_session_workspace_check(_thread(metadata)) == (
@@ -272,7 +272,7 @@ def test_classifier_refuses_ready_credentials_while_creation_marker_remains():
 def test_classifier_refuses_malformed_creation_marker_at_all_statuses(marker):
     metadata = _k8s_sandbox_metadata(
         status="creating",
-        _stateless_runtime_creation=marker,
+        _runtime_creation=marker,
     )
 
     assert stateless_session_workspace_check(_thread(metadata)) == (
@@ -291,7 +291,7 @@ def test_classifier_refuses_creation_mode_restore_intent_mismatch(
     metadata = _k8s_sandbox_metadata(
         status="restoring",
         _snapshot_restore_required=restore_required,
-        _stateless_runtime_creation=_creation_marker(mode=mode),
+        _runtime_creation=_creation_marker(mode=mode),
     )
 
     assert stateless_session_workspace_check(_thread(metadata)) == (

@@ -363,7 +363,7 @@ class TestCreateThread:
             "workspace_container": {
                 "status": "pending",
                 "provisioner": "k8s",
-                "_stateless_runtime_creation": {
+                "_runtime_creation": {
                     "generation": generation,
                     "mode": "create",
                     "attempted": False,
@@ -383,7 +383,25 @@ class TestCreateThread:
         )
 
         stored = json.loads(conn.fetchrow.await_args.args[7])
-        assert stored["workspace_container"] == initial_metadata["workspace_container"]
+        # The creation generation is server-owned: a caller-supplied value is
+        # replaced with a fresh nonce in the same insert, and nothing else in
+        # the projection moves.
+        stored_workspace = stored["workspace_container"]
+        stored_marker = stored_workspace["_runtime_creation"]
+        assert stored_marker["generation"] != generation
+        assert str(UUID(stored_marker["generation"])) == stored_marker["generation"]
+        assert {k: v for k, v in stored_marker.items() if k != "generation"} == {
+            "mode": "create",
+            "attempted": False,
+            "replaces_uid": None,
+        }
+        assert {
+            k: v for k, v in stored_workspace.items() if k != "_runtime_creation"
+        } == {
+            k: v
+            for k, v in initial_metadata["workspace_container"].items()
+            if k != "_runtime_creation"
+        }
         assert stored["datasource_ids"] == []
 
     @pytest.mark.asyncio
@@ -611,6 +629,9 @@ class TestStatelessWorkspaceCreationAuthority:
             return_value={
                 "status": "created",
                 "execution_lane": "stateless",
+                # 0195/0196 canonicalise the thread's own runtime generation
+                # before any creation authority is considered.
+                "runtime_generation": self.GENERATION,
                 "metadata": {
                     "workspace_container": {
                         "status": "pending",
@@ -647,11 +668,12 @@ class TestStatelessWorkspaceCreationAuthority:
             return_value={
                 "status": "created",
                 "execution_lane": "stateless",
+                "runtime_generation": self.GENERATION,
                 "metadata": {
                     "workspace_container": {
                         "status": "pending",
                         "provisioner": "k8s",
-                        "_stateless_runtime_creation": marker,
+                        "_runtime_creation": marker,
                     }
                 },
             }
@@ -1243,7 +1265,7 @@ class TestEndThread:
     @pytest.mark.asyncio
     async def test_finish_refuses_to_erase_in_progress_creation_authority(self):
         metadata = _proven_soft_retirement_metadata(retain_runtime=False)
-        metadata["workspace_container"]["_stateless_runtime_creation"] = {
+        metadata["workspace_container"]["_runtime_creation"] = {
             "generation": "33333333-3333-4333-8333-333333333333",
             "mode": "restore",
             "attempted": True,
@@ -1307,14 +1329,20 @@ class TestEndThread:
                 {"unit_kind": "session_turn"},
             ]
         )
-        conn.fetchval = AsyncMock(side_effect=[None, "tid-1", "tid-1"])
+        # Resume rotates the generation, then binds the creation marker to that
+        # exact generation in a second statement (0195/0196).
+        resumed_generation = "33333333-3333-4333-8333-333333333333"
+        conn.fetchval = AsyncMock(
+            side_effect=[None, "tid-1", resumed_generation, "tid-1"]
+        )
         db = _make_db_with_conn(conn)
 
         assert await db.resume_thread("tid-1")
 
         stored = json.loads(conn.fetchval.await_args_list[-1].args[2])
         assert "_stateless_workspace_retirement_settled" not in stored
-        marker = stored["workspace_container"]["_stateless_runtime_creation"]
+        marker = stored["workspace_container"]["_runtime_creation"]
+        assert marker["generation"] == resumed_generation
         assert marker["mode"] == mode
         assert marker["attempted"] is False
         assert marker["replaces_uid"] is None

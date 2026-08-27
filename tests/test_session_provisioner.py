@@ -547,7 +547,7 @@ def _stateless_sandbox_thread(status: str, *, restore_required: bool = False):
             {"provisioner": "docker"}
         ),
         lambda thread: thread["metadata"]["workspace_container"].update(
-            {"_stateless_runtime_creation": None}
+            {"_runtime_creation": None}
         ),
     ],
     ids=[
@@ -685,7 +685,7 @@ async def test_stateless_create_gives_up_when_thread_ends_during_actuation():
     before_workspace = before["metadata"]["workspace_container"]
     before_workspace.pop("_runtime_incarnation")
     generation = "33333333-3333-4333-8333-333333333333"
-    before_workspace["_stateless_runtime_creation"] = {
+    before_workspace["_runtime_creation"] = {
         "generation": generation,
         "mode": "create",
         "attempted": False,

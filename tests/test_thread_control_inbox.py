@@ -29,6 +29,7 @@ THREAD_ID = UUID("11111111-aaaa-4444-8888-111111111111")
 OWNER_ID = UUID("22222222-bbbb-4444-8888-222222222222")
 PROJECT_ID = UUID("33333333-cccc-4444-8888-333333333333")
 AGENT_ID = UUID("44444444-dddd-4444-8888-444444444444")
+PROCESS_GENERATION = "99999999-9999-4999-8999-999999999999"
 REQUEST_ID = UUID("55555555-eeee-4444-8888-555555555555")
 CLIENT_REQUEST_ID = UUID("66666666-ffff-4444-8888-666666666666")
 RUNTIME_GENERATION = UUID("77777777-aaaa-4444-8888-777777777777")
@@ -606,6 +607,9 @@ async def test_exact_pinned_ended_status_refuses_successor_binding():
                 orchestrator_main.AgentThreadStatusRequest(
                     status="ended",
                     agent_id=AGENT_ID,
+                    # A pinned status write names its exact registered process;
+                    # the refusal under test is the endpoint's, not the model's.
+                    process_generation=PROCESS_GENERATION,
                 ),
             )
 
@@ -652,6 +656,7 @@ async def test_exact_pinned_live_status_refuses_stale_pre_resume_agent(status):
                 orchestrator_main.AgentThreadStatusRequest(
                     status=status,
                     agent_id=AGENT_ID,
+                    process_generation=PROCESS_GENERATION,
                 ),
             )
 

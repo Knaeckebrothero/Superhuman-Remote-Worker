@@ -57,7 +57,7 @@ def _forwarding_stateless_thread(*, ready: bool) -> dict:
             "ssh_host_key_fingerprint": "SHA256:" + ("A" * 43),
         }
     else:
-        workspace["_stateless_runtime_creation"] = {
+        workspace["_runtime_creation"] = {
             "generation": "44444444-4444-4444-8444-444444444444",
             "mode": "create",
             "attempted": True,
@@ -248,7 +248,7 @@ class TestForwardingWorkspaceAuthority:
         workspace = suspended["metadata"]["workspace_container"]
         workspace["status"] = "suspended"
         workspace["_snapshot_restore_required"] = True
-        workspace["_stateless_runtime_creation"]["mode"] = "restore"
+        workspace["_runtime_creation"]["mode"] = "restore"
         ready = _forwarding_stateless_thread(ready=True)
         db = SimpleNamespace(
             get_thread=AsyncMock(side_effect=[suspended, ready]),

@@ -931,7 +931,7 @@ class TestSessionCreateBoundary:
             "enabled": False,
             "conference": False,
         }
-        creation = initial["workspace_container"]["_stateless_runtime_creation"]
+        creation = initial["workspace_container"]["_runtime_creation"]
         assert creation["mode"] == "create"
         assert creation["attempted"] is False
         assert creation["replaces_uid"] is None

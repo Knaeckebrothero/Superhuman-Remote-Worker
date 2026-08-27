@@ -548,6 +548,24 @@ class TestOrchestratorInactiveCapabilityFence:
         db.acknowledge_pinned_thread_local_quiescence = AsyncMock(
             return_value={"version": 1}
         )
+        # 0198 runs the server-owned legacy/warm adoption reconciler before
+        # Begin may install T; with nothing to adopt it is a no-op, but its
+        # seams must be awaitable.
+        db.list_legacy_pinned_agent_k8s_authority_candidates = AsyncMock(
+            return_value=[]
+        )
+        db.adopt_legacy_pinned_agent_k8s_authority = AsyncMock(return_value=False)
+        db.list_legacy_pinned_warm_binding_candidates = AsyncMock(return_value=[])
+        db.list_expired_pinned_warm_binding_protections = AsyncMock(return_value=[])
+        db.plan_pinned_warm_binding_protection = AsyncMock(return_value=None)
+        db.claim_pinned_warm_binding_effect = AsyncMock(return_value=None)
+        db.publish_pinned_warm_binding_protection = AsyncMock(return_value=None)
+        db.bind_pinned_warm_agent = AsyncMock(return_value=None)
+        db.begin_pinned_warm_binding_release = AsyncMock(return_value=None)
+        db.complete_pinned_warm_binding_release = AsyncMock(return_value=None)
+        db.abort_unmodified_pinned_warm_binding = AsyncMock(return_value=None)
+        db.get_pinned_warm_binding_protection = AsyncMock(return_value=None)
+        db.get_pinned_warm_binding_candidate = AsyncMock(return_value=None)
         end_flow = AsyncMock(return_value={"status": "suspended"})
         with (
             patch.object(orch_main, "require_internal", AsyncMock()),
