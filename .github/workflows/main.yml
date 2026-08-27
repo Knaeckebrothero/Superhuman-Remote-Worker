@@ -876,8 +876,9 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Stage 1: heavy, stable provisioning. On main, runs on push only — PR
-  # validation re-uses the existing GHCR :latest stage1 image, which makes PRs
-  # to main much faster (only stage2 rebuilds). Cron refresh runs in
+  # validation re-uses a published stage1 image, which makes PRs to main much
+  # faster (only stage2 rebuilds). Direct develop promotions use develop's
+  # :experimental image below; other PRs use :latest. Cron refresh runs in
   # stage1-rebuild.yml so the baseline never drifts more than a week.
   # ---------------------------------------------------------------------------
   build-agent-vm-base-stage1:
@@ -1000,9 +1001,10 @@ jobs:
           printf 'Pushed stage1:\n'; printf '  %s\n' "${TAGS[@]}"
 
   # ---------------------------------------------------------------------------
-  # Stage 2: light per-commit layer. Pulls the stage1 containerDisk from GHCR
-  # (skipped on PRs — uses existing :latest), extracts the qcow2, and layers
-  # stage2 on top via stage2.pkr.hcl. ~5-10 min wall-clock.
+  # Stage 2: light per-commit layer. Pulls the stage1 containerDisk from GHCR,
+  # extracts the qcow2, and layers stage2 on top via stage2.pkr.hcl. PRs normally
+  # use :latest; a direct develop -> main promotion uses develop's :experimental
+  # base so new stage1 dependencies can pass validation before main publishes them.
   # ---------------------------------------------------------------------------
   build-agent-vm-base:
     needs: [lint, dependency-audit, test-python, test-cockpit, build-sudo-gate, resolve-version, build-agent-vm-base-stage1]
@@ -1101,8 +1103,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull stage1 containerDisk and extract qcow2
         working-directory: docker/agent-vm-base
+        env:
+          STAGE1_TAG: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'develop' && 'experimental' || 'latest' }}
         run: |
-          STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:latest" | tr '[:upper:]' '[:lower:]')
+          STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:${STAGE1_TAG}" | tr '[:upper:]' '[:lower:]')
+          echo "Using stage1 tag: ${STAGE1_TAG}"
           docker pull "$STAGE1_IMAGE"
           # FROM scratch images have no shell so a real CMD doesn't matter — we
           # never start the container, just create-then-cp.
