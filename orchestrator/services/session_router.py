@@ -432,15 +432,34 @@ class SessionRouterService:
             and labels.get("srw/managed-by") == "agent-provisioner"
             and labels.get("srw/purpose") in {"job", "session"}
         )
+        # ``srw.io/thread-id`` is the canonical full-identity label.
+        # ``srw/thread-id`` is the historical compatibility label: a dedicated
+        # Pod carries the full UUID there until this route adopts it, and the
+        # 12-character form afterwards, because the route selector needs a
+        # value inside the 63-character label limit.  Reading the full UUID
+        # back from the compatibility label after publication is what made a
+        # dedicated Pod refuse its own freshly published route.  A short
+        # compatibility value is therefore trusted only alongside an exact
+        # canonical label, so the deterministic name never stands alone as
+        # identity for a thread that merely shares its 12-character prefix.
+        canonical_thread = (
+            labels.get("srw.io/thread-id") if isinstance(labels, dict) else None
+        )
+        compatibility_thread = (
+            labels.get("srw/thread-id") if isinstance(labels, dict) else None
+        )
+        dedicated_identity = compatibility_thread == thread_id or (
+            compatibility_thread == thread_id[:12] and canonical_thread == thread_id
+        )
         dedicated = bool(
             component == "persistent-agent"
-            and labels.get("srw/thread-id") == thread_id
+            and dedicated_identity
             and pod_name == f"persistent-{thread_id[:12]}"
         )
         route_labels_match = bool(
             isinstance(labels, dict)
-            and labels.get("srw.io/thread-id") == thread_id
-            and labels.get("srw/thread-id") == thread_id[:12]
+            and canonical_thread == thread_id
+            and compatibility_thread == thread_id[:12]
             and labels.get("srw/purpose") == "session"
             and labels.get("srw.io/runtime-generation") == runtime_generation
         )

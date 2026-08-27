@@ -12,6 +12,7 @@ from orchestrator.services.session_router import (
 from src.shared.pinned_session_identity import PinnedSessionBinding
 
 THREAD_ID = "00000000-0000-4000-8000-0000000000a1"
+OTHER_THREAD_ID = "00000000-0000-4000-8000-0000000000b1"
 AGENT_ID = "00000000-0000-4000-8000-0000000000a2"
 ATTACH_TOKEN = "00000000-0000-4000-8000-0000000000a3"
 RUNTIME_GENERATION = "11111111-2222-4333-8444-555555555555"
@@ -443,3 +444,212 @@ async def test_exact_teardown_preserves_successor_generation(
     )
     k8s_core_api.delete_namespaced_service.assert_not_called()
     k8s_networking_api.delete_namespaced_ingress.assert_not_called()
+
+
+DEDICATED_POD_NAME = f"persistent-{THREAD_ID[:12]}"
+
+
+def _make_dedicated(db, k8s_core_api, *, labels=None):
+    """Reshape the shared harness into one historical dedicated session Pod.
+
+    A dedicated ``persistent-agent`` Pod predates the canonical route labels.
+    It carries the full thread UUID in the compatibility label and no
+    ``srw.io/*`` label at all until ``ensure_route`` adopts it.
+    """
+
+    db.get_pinned_session_binding.return_value = _binding(
+        agent_hostname=DEDICATED_POD_NAME
+    )
+    pod = k8s_core_api._pod
+    pod["metadata"]["name"] = DEDICATED_POD_NAME
+    pod["metadata"]["labels"] = {
+        "srw/component": "persistent-agent",
+        "srw/thread-id": THREAD_ID,
+    }
+    if labels is not None:
+        pod["metadata"]["labels"].update(labels)
+    return pod
+
+
+@pytest.mark.asyncio
+async def test_dedicated_pod_route_publication_adopts_the_historical_full_label(
+    svc, db, k8s_core_api, k8s_networking_api
+):
+    pod = _make_dedicated(db, k8s_core_api)
+
+    assert (
+        await svc.ensure_route(
+            THREAD_ID, DEDICATED_POD_NAME, POD_UID, RUNTIME_GENERATION
+        )
+        == f"/p/{THREAD_ID}"
+    )
+
+    # The post-patch validation runs against the published shape: canonical
+    # full label plus the short compatibility label.
+    assert pod["metadata"]["labels"]["srw.io/thread-id"] == THREAD_ID
+    assert pod["metadata"]["labels"]["srw/thread-id"] == THREAD_ID[:12]
+    assert pod["metadata"]["labels"]["srw.io/runtime-generation"] == RUNTIME_GENERATION
+    assert pod["metadata"]["labels"]["srw/purpose"] == "session"
+    assert k8s_core_api.read_namespaced_pod.call_count >= 2
+    service = k8s_core_api._services[f"session-{THREAD_ID}"]
+    assert service["spec"]["selector"] == {
+        "srw.io/thread-id": THREAD_ID,
+        "srw.io/runtime-generation": RUNTIME_GENERATION,
+    }
+    assert (
+        k8s_networking_api._ingresses[f"session-{THREAD_ID}"]["metadata"][
+            "ownerReferences"
+        ][0]["uid"]
+        == POD_UID
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedicated_pod_already_carrying_route_labels_revalidates(
+    svc, db, k8s_core_api, k8s_networking_api
+):
+    _make_dedicated(
+        db,
+        k8s_core_api,
+        labels={
+            "srw.io/thread-id": THREAD_ID,
+            "srw/thread-id": THREAD_ID[:12],
+            "srw/purpose": "session",
+            "srw.io/runtime-generation": RUNTIME_GENERATION,
+        },
+    )
+
+    assert (
+        await svc.ensure_route(
+            THREAD_ID, DEDICATED_POD_NAME, POD_UID, RUNTIME_GENERATION
+        )
+        == f"/p/{THREAD_ID}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "labels",
+    [
+        pytest.param({"srw/thread-id": OTHER_THREAD_ID}, id="foreign-full-label"),
+        pytest.param({"srw/thread-id": THREAD_ID[:12]}, id="short-without-canonical"),
+        pytest.param(
+            {"srw/thread-id": THREAD_ID[:12], "srw.io/thread-id": OTHER_THREAD_ID},
+            id="short-with-foreign-canonical",
+        ),
+        pytest.param({"srw/thread-id": None}, id="no-identity-label"),
+        pytest.param({"srw/component": "agent"}, id="foreign-component"),
+    ],
+)
+async def test_dedicated_pod_without_exact_identity_is_refused(
+    svc, db, k8s_core_api, k8s_networking_api, labels
+):
+    pod = _make_dedicated(db, k8s_core_api)
+    for key, value in labels.items():
+        if value is None:
+            pod["metadata"]["labels"].pop(key, None)
+        else:
+            pod["metadata"]["labels"][key] = value
+
+    with pytest.raises(SessionRouteAuthorityError):
+        await svc.ensure_route(
+            THREAD_ID, DEDICATED_POD_NAME, POD_UID, RUNTIME_GENERATION
+        )
+
+    assert k8s_core_api.create_namespaced_service.call_count == 0
+    assert k8s_networking_api.create_namespaced_ingress.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "published",
+    [
+        pytest.param({"srw.io/thread-id": OTHER_THREAD_ID}, id="wrong-canonical"),
+        pytest.param({"srw/thread-id": THREAD_ID}, id="compatibility-stayed-full"),
+        pytest.param(
+            {"srw.io/runtime-generation": OTHER_THREAD_ID}, id="wrong-generation"
+        ),
+        pytest.param({"srw/purpose": "job"}, id="wrong-purpose"),
+    ],
+)
+async def test_dedicated_route_refuses_a_post_patch_label_that_is_not_exact(
+    svc, db, k8s_core_api, k8s_networking_api, published
+):
+    pod = _make_dedicated(db, k8s_core_api)
+    original_patch = k8s_core_api.patch_namespaced_pod.side_effect
+
+    def patch_then_corrupt(**kwargs):
+        result = original_patch(**kwargs)
+        pod["metadata"]["labels"].update(published)
+        return result
+
+    k8s_core_api.patch_namespaced_pod.side_effect = patch_then_corrupt
+
+    with pytest.raises(SessionRouteAuthorityError):
+        await svc.ensure_route(
+            THREAD_ID, DEDICATED_POD_NAME, POD_UID, RUNTIME_GENERATION
+        )
+
+    assert k8s_core_api.create_namespaced_service.call_count == 0
+    assert k8s_networking_api.create_namespaced_ingress.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"uid": "pod-uid-other"}, id="foreign-uid"),
+        pytest.param({"ip": "10.0.0.9"}, id="foreign-ip"),
+        pytest.param({"namespace": "agents-old"}, id="foreign-namespace"),
+    ],
+)
+async def test_dedicated_route_keeps_the_reciprocal_identity_fences(
+    svc, db, k8s_core_api, k8s_networking_api, changes
+):
+    pod = _make_dedicated(db, k8s_core_api)
+    if "uid" in changes:
+        pod["metadata"]["uid"] = changes["uid"]
+    if "ip" in changes:
+        pod["status"]["podIP"] = changes["ip"]
+    if "namespace" in changes:
+        pod["metadata"]["namespace"] = changes["namespace"]
+
+    with pytest.raises(SessionRouteAuthorityError):
+        await svc.ensure_route(
+            THREAD_ID, DEDICATED_POD_NAME, POD_UID, RUNTIME_GENERATION
+        )
+
+    assert k8s_core_api.create_namespaced_service.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_dedicated_route_still_refuses_a_shadow_in_a_legacy_namespace(
+    svc, db, k8s_core_api, k8s_networking_api, monkeypatch
+):
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-old")
+    _make_dedicated(db, k8s_core_api)
+    name = f"session-{THREAD_ID}"
+    k8s_core_api._services[name] = {
+        "metadata": {"name": name, "namespace": "agents-old"}
+    }
+
+    with pytest.raises(SessionRouteAuthorityError, match="shadow"):
+        await svc.ensure_route(
+            THREAD_ID, DEDICATED_POD_NAME, POD_UID, RUNTIME_GENERATION
+        )
+
+    assert k8s_core_api.patch_namespaced_pod.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_managed_pool_pod_identity_is_unchanged_by_the_dedicated_repair(
+    svc, db, k8s_core_api
+):
+    # A warm-pool Pod never carries a thread-id label before publication and
+    # must still not be admitted through the dedicated identity branch.
+    k8s_core_api._pod["metadata"]["labels"]["srw/managed-by"] = "someone-else"
+
+    with pytest.raises(SessionRouteAuthorityError):
+        await svc.ensure_route(THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION)
+
+    assert k8s_core_api.create_namespaced_service.call_count == 0
