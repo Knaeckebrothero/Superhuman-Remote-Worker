@@ -3352,7 +3352,7 @@ BEGIN
                 AND (
                     local_quiescence->>'quiescence_actor' <> 'orchestrator'
                     OR local_quiescence->>'quiescence_protocol'
-                        <> 'agent_runtime_zero_v1'
+                        IS DISTINCT FROM expected_protocol
                     OR local_quiescence->>'agent_pod_name' IS DISTINCT FROM
                        retirement_context->'agent_pod'->>'pod_name'
                     OR local_quiescence->>'agent_pod_uid' IS DISTINCT FROM
