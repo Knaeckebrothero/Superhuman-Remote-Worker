@@ -14,7 +14,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from orchestrator.security import crypto
+from security import crypto
 from orchestrator.services.managed_repository_authority import (
     ManagedRepositoryAuthorityError,
     _deploy_keypair,
