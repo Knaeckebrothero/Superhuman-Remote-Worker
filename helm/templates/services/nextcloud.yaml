@@ -363,7 +363,8 @@ spec:
             - -c
             - /opt/srw-protected-effect/nginx.conf
           ports:
-            - name: protected-effect
+            # Kubernetes IANA service/port names are capped at 15 characters.
+            - name: effect-http
               containerPort: 8080
               protocol: TCP
           volumeMounts:
@@ -436,7 +437,7 @@ spec:
   ports:
     - name: http
       port: 80
-      targetPort: protected-effect
+      targetPort: effect-http
       protocol: TCP
   selector:
     {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}

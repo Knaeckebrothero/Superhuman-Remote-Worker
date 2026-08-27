@@ -162,6 +162,10 @@ def test_enabled_lane_binds_one_config_to_server_client_and_bundle() -> None:
     }
     fpm = containers["nextcloud-protected-effect-fpm"]
     nginx = containers["nextcloud-protected-effect-nginx"]
+    assert nginx["ports"] == [
+        {"name": "effect-http", "containerPort": 8080, "protocol": "TCP"}
+    ]
+    assert len(nginx["ports"][0]["name"]) <= 15
     fpm_env = {entry["name"]: entry for entry in fpm["env"]}
     assert fpm_env["NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256"]["value"] == digest
     assert (
@@ -200,7 +204,7 @@ def test_enabled_lane_binds_one_config_to_server_client_and_bundle() -> None:
         {
             "name": "http",
             "port": 80,
-            "targetPort": "protected-effect",
+            "targetPort": "effect-http",
             "protocol": "TCP",
         }
     ]
