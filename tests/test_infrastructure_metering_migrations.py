@@ -286,7 +286,13 @@ APP_NOTIFICATIONS_CUTOVER_MIGRATION = (
 # Unified notification feed (slice 3: the cutover backfill) — the head after
 # the 0184-0190 managed-repository / stateless-input lane and the slice-1/2
 # feed tables; bump when the next lands.
-APP_CURRENT_MIGRATION_HEAD = APP_NOTIFICATIONS_CUTOVER_MIGRATION
+APP_PINNED_RECYCLE_AUTHORITY_MIGRATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0198_pinned_agent_recycle_authority.sql"
+)
+# The head pin moves with every new migration; it is what proves the
+# snapshot artifacts are not mistaken for the migration contract.
+APP_CURRENT_MIGRATION_HEAD = APP_PINNED_RECYCLE_AUTHORITY_MIGRATION
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
