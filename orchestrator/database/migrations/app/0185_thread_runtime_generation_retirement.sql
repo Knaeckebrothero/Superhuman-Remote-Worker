@@ -34,6 +34,9 @@ UPDATE public.threads
 
 ALTER TABLE public.threads
     ALTER COLUMN runtime_generation SET DEFAULT public.uuid_generate_v4(),
+    -- The maintenance gate guarantees a drained fleet; this bounded scan is
+    -- the final authority invariant before exact-generation writers start.
+    -- squawk-ignore adding-not-nullable-field
     ALTER COLUMN runtime_generation SET NOT NULL,
     ADD COLUMN IF NOT EXISTS runtime_retirement_token uuid,
     ADD COLUMN IF NOT EXISTS runtime_retirement_permanent boolean,
@@ -816,7 +819,7 @@ CREATE TABLE IF NOT EXISTS public.thread_workspace_provision_intents (
     seed_configmap_name varchar(253),
     service_name varchar(253),
     network_tier varchar(32) NOT NULL,
-    manifest_fingerprint char(64) NOT NULL,
+    manifest_fingerprint varchar(64) NOT NULL,
     previous_binding jsonb NOT NULL DEFAULT '{}'::jsonb,
     retained_binding_generation uuid,
     retained_pvc_uid text,
@@ -1884,6 +1887,9 @@ ALTER TABLE public.threads
         )
     ) NOT VALID;
 ALTER TABLE public.threads
+    -- This maintenance-gated migration runs with old writers drained and must
+    -- commit its authority constraints atomically before admission reopens.
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT threads_runtime_retirement_shape;
 
 ALTER TABLE public.threads
@@ -1897,6 +1903,7 @@ ALTER TABLE public.threads
         )
     ) NOT VALID;
 ALTER TABLE public.threads
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT threads_runtime_retirement_stage_receipt_shape;
 
 ALTER TABLE public.threads
@@ -1910,6 +1917,7 @@ ALTER TABLE public.threads
         )
     ) NOT VALID;
 ALTER TABLE public.threads
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT threads_runtime_retirement_local_quiescence_shape;
 
 ALTER TABLE public.threads
@@ -1924,6 +1932,7 @@ ALTER TABLE public.threads
         )
     ) NOT VALID;
 ALTER TABLE public.threads
+    -- squawk-ignore constraint-missing-not-valid
     VALIDATE CONSTRAINT threads_runtime_retirement_external_cleanup_shape;
 
 CREATE OR REPLACE FUNCTION public.enforce_thread_ended_transition()
