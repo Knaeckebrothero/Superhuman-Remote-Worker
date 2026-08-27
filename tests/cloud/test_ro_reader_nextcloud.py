@@ -83,6 +83,7 @@ class FakeNcOcs:
         self.files: dict[str, bytes] = {}
         self.requests: list[httpx.Request] = []
         self.delete_group_response: httpx.Response | None = None
+        self.delete_user_response: httpx.Response | None = None
 
     def _ocs(self, statuscode: int, extra: dict | None = None) -> httpx.Response:
         body = {"ocs": {"meta": {"status": "ok", "statuscode": statuscode}}}
@@ -112,6 +113,8 @@ class FakeNcOcs:
 
         m = re.fullmatch(r"/ocs/v2\.php/cloud/users/([^/]+)", path)
         if m and method == "DELETE":
+            if self.delete_user_response is not None:
+                return self.delete_user_response
             self.users.pop(m.group(1), None)
             return self._ocs(100)
         if m and method == "PUT":
@@ -359,6 +362,30 @@ async def test_revoke_does_not_treat_http_200_ocs_failure_as_deleted(
     assert plan.group_id in fake.groups
     assert plan.group_id in fake.folder_group_perms[FOLDER_ID]
     assert plan.reader_id in fake.users
+
+
+@pytest.mark.asyncio
+async def test_revoke_accepts_nextcloud_31_absent_group_and_user() -> None:
+    backend, fake = _backend_with_ocs_fake()
+    plan = _plan()
+    absent = httpx.Response(
+        400,
+        json={
+            "ocs": {
+                "meta": {
+                    "status": "failure",
+                    "statuscode": 101,
+                    "message": "not found",
+                }
+            }
+        },
+    )
+    fake.delete_group_response = absent
+    fake.delete_user_response = absent
+
+    # The signed create may fail before either identity exists. Cleanup must
+    # still settle the exact attempt instead of wedging it in revoking.
+    await backend.revoke_protected_reader_attempt(plan)
 
 
 @pytest.mark.asyncio
