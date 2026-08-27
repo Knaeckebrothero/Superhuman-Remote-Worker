@@ -2055,7 +2055,7 @@ async def test_response_lost_agent_create_uses_retained_pod_and_pvc_fences(
 
 @pytest.mark.asyncio
 async def test_reclaimed_agent_workspace_claim_is_idempotent_retirement_replay(db):
-    """Exact post-horizon fence GC remains complete while Begin is pending."""
+    """Exact post-horizon fence GC remains complete through physical CAS."""
 
     ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
     async with db.acquire() as conn:
@@ -2103,6 +2103,25 @@ async def test_reclaimed_agent_workspace_claim_is_idempotent_retirement_replay(d
         **revoke,
         fence_pvc_uid="fence-pvc-uid",
     )
+    pod_revoke = {
+        "expected_runtime_generation": retirement["generation"],
+        "expected_retirement_token": retirement["token"],
+        "expected_attempt_id": attempt_id,
+        "expected_pod_name": f"srw-agent-s-{attempt_id[:8]}",
+    }
+    assert await db.revoke_pinned_agent_pod_provision_intent(
+        ids["thread"], **pod_revoke
+    )
+    assert await db.fence_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        **pod_revoke,
+        fence_pod_uid="pod-fence-uid",
+    )
+    assert await db.acknowledge_pinned_agent_pod_provision_intent_zero(
+        ids["thread"],
+        **pod_revoke,
+        observed_pod_uid="pod-fence-uid",
+    )
     async with db.acquire() as conn:
         # Build the post-GC fixture without spending the production ten-minute
         # request horizon. Other tests exercise the real fenced -> reclaimed
@@ -2116,6 +2135,11 @@ async def test_reclaimed_agent_workspace_claim_is_idempotent_retirement_replay(d
                 UUID(claim_id),
             )
     assert await db.revoke_pinned_agent_workspace_claim(ids["thread"], **revoke)
+    assert await db.clear_pinned_retirement_physical_runtime_endpoint(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+    )
 
 
 @pytest.mark.asyncio
