@@ -1395,14 +1395,26 @@ async def test_flag_on_pinned_cancel_linearizes_before_agent_post_and_prunes_aft
                 "pod_ip": "127.0.0.1",
                 "pod_port": 8000,
                 "status": "working",
+                "current_job_id": JOB_ID,
+                "metadata": {
+                    "dispatch_process_generation": (
+                        "33333333-3333-4333-8333-333333333333"
+                    )
+                },
             }
         ),
     )
+    ready_response = MagicMock(status_code=200)
+    ready_response.json.return_value = {
+        "ready": True,
+        "capabilities": {"pinned_recipient_binding": True},
+    }
     response = MagicMock(status_code=200)
     response.json.return_value = {"graceful": True}
     client = MagicMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=ready_response)
     client.post = AsyncMock(
         side_effect=lambda *_a, **_k: order.append("post") or response
     )

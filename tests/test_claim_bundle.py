@@ -92,10 +92,40 @@ class MultiJobFakeDB(FakeDB):
         super().__init__(run_queue_row=run_queue_row, thread=None, job=None)
         self.jobs = {str(job["id"]): deepcopy(job) for job in jobs}
         self.adoption_calls = []
+        self.adoption_reservations = []
+        self._adoption_reservation_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 
     async def get_job(self, jid):
         job = self.jobs.get(str(jid))
         return deepcopy(job) if job is not None else None
+
+    async def reserve_managed_repository_workspace_creation(self, owner_id, **kwargs):
+        self.adoption_reservations.append(("reserve", str(owner_id), deepcopy(kwargs)))
+        return {
+            "id": self._adoption_reservation_id,
+            "reservation_generation": 1,
+            "claim_token": 1,
+        }
+
+    async def authorize_managed_repository_workspace_creation_runtime(
+        self, owner_id, **kwargs
+    ):
+        self.adoption_reservations.append(
+            ("authorize", str(owner_id), deepcopy(kwargs))
+        )
+        return True
+
+    async def abort_managed_repository_workspace_creation_reservation(
+        self, owner_id, **kwargs
+    ):
+        self.adoption_reservations.append(("abort", str(owner_id), deepcopy(kwargs)))
+        return True
+
+    async def settle_managed_repository_workspace_creation_reservation(
+        self, owner_id, **kwargs
+    ):
+        self.adoption_reservations.append(("settle", str(owner_id), deepcopy(kwargs)))
+        return True
 
     async def adopt_legacy_k8s_job_workspace_runtime(self, job_id, **kwargs):
         self.adoption_calls.append((str(job_id), deepcopy(kwargs)))
