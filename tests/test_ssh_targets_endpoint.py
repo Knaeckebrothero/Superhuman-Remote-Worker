@@ -69,6 +69,42 @@ def test_never_provisioned_is_absence_of_status_not_absence_of_key():
     assert resolve_workspace_state(_thread(), {}) == "never_provisioned"
 
 
+def test_failed_is_not_reported_as_never_provisioned():
+    """`failed` is a real status container_provisioner writes (PVC creation
+    failure, provisioning error) and is in the spec's §7.1 set. The gateway
+    prints this state as the user-facing reason, so collapsing it into
+    "never provisioned" sends the operator after the wrong problem — the same
+    defect ``stale_binding`` was added to fix."""
+    assert (
+        resolve_workspace_state(
+            _thread(), {"workspace_container": {"status": "failed"}}
+        )
+        == "failed"
+    )
+
+
+def test_deleted_is_not_reported_as_never_provisioned():
+    """`deleted` means the workspace existed and was torn down. "Never
+    provisioned" is a materially different message."""
+    assert (
+        resolve_workspace_state(
+            _thread(), {"workspace_container": {"status": "deleted"}}
+        )
+        == "deleted"
+    )
+
+
+def test_an_unknown_status_still_falls_through():
+    """The fallthrough survives, now covering only statuses this module has
+    never heard of — a guess, where the branches above are facts."""
+    assert (
+        resolve_workspace_state(
+            _thread(), {"workspace_container": {"status": "quantum"}}
+        )
+        == "never_provisioned"
+    )
+
+
 def test_reclaimed_is_distinct_from_suspended():
     assert (
         resolve_workspace_state(
@@ -392,6 +428,93 @@ async def test_vm_tier_state_from_json_string_metadata(internal, monkeypatch):
     )
     assert result["state"] == "vm_unsupported"
     assert result["pod_ip"] is None
+
+
+def _both_ready_stale_backend_metadata():
+    """The shape where the tier guard and the endpoint resolver disagree.
+
+    ``vm.status`` and ``workspace_container.status`` are BOTH "ready" and the
+    declared backend is still a non-VM one. That is not contrived:
+    upgrade-to-VM provisions ``metadata.vm`` without rewriting
+    ``config_override.workspace.backend``, which
+    ``_thread_is_vm_tier``'s own docstring records, so an upgraded session
+    declares ``sandbox`` forever. ``_thread_is_vm_tier`` reads the declared
+    backend once a container status is present and answers "pod tier", while
+    ``resolve_remote_workspace_target`` prefers the VM context whenever its
+    status is ready and answers with the VM's endpoint.
+    """
+    generation = "11111111-1111-1111-1111-111111111111"
+    endpoint = {
+        "_canvas_workspace_generation": generation,
+        "status": "ready",
+    }
+    return {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "_workspace_binding": {
+            "kind": "remote",
+            "generation": generation,
+            "backing_id": "k8s-pvc:ns:abc",
+            "ssh_host_key_fingerprint": "SHA256:" + "C" * 43,
+        },
+        "workspace_container": dict(endpoint, ssh_host="pod.svc", ssh_port=22),
+        "vm": dict(endpoint, ssh_host="10.9.9.9", ssh_port=2200),
+    }
+
+
+def test_the_resolver_really_would_hand_back_the_vm_endpoint():
+    """Negative control for the test below. Without this, that test could pass
+    because the metadata never resolved at all rather than because the
+    endpoint refused a VM target it genuinely could have returned."""
+    from services.canvas_ssh import (
+        bound_workspace_generation,
+        resolve_remote_workspace_target,
+    )
+    from services.workspace_suspension import _thread_is_vm_tier
+
+    metadata = _both_ready_stale_backend_metadata()
+    thread = _thread(status="active", metadata=metadata)
+
+    # The v1 guard says "not VM tier" ...
+    assert not _thread_is_vm_tier(
+        metadata, metadata["workspace_container"], metadata["vm"]
+    )
+    # ... while the resolver hands back the VM's host and port.
+    target = resolve_remote_workspace_target(thread, bound_workspace_generation(thread))
+    assert (target.host, target.port) == ("10.9.9.9", 2200)
+
+
+@pytest.mark.asyncio
+async def test_vm_endpoint_is_refused_even_when_the_guard_passes(internal, monkeypatch):
+    """Final review, Important 4: v1 does not support VM workspaces, so a
+    thread that slips past ``_thread_is_vm_tier`` must still not be handed the
+    VM's host and port. Nothing is mocked below ``get_thread`` — the real
+    parser, the real guard and the real resolver all run."""
+
+    async def _thread_id(handle):
+        return THREAD
+
+    async def _user(fp):
+        return {"id": USER}
+
+    async def _access(user, db, entity_id):
+        return True
+
+    async def _get_thread(tid):
+        return _thread(
+            status="active", metadata=json.dumps(_both_ready_stale_backend_metadata())
+        )
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
+    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
+
+    result = await main.get_ssh_target(
+        request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
+    )
+    assert result["state"] == "vm_unsupported"
+    assert result["pod_ip"] is None
+    assert result["pod_port"] is None
 
 
 @pytest.mark.asyncio

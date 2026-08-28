@@ -123,6 +123,31 @@ class RemoteWorkspaceTarget:
         )
 
 
+def remote_target_is_vm_backed(thread: dict[str, Any]) -> bool:
+    """Whether :func:`resolve_remote_workspace_target` resolves the VM endpoint.
+
+    The endpoint-selection rule below prefers ``metadata.vm`` whenever its
+    status is ``ready``, *regardless* of ``workspace_container``. That is one
+    definition, exported so a caller which must refuse a VM-backed target can
+    ask the resolver's own question instead of re-deriving it from tier
+    signals that disagree.
+
+    They do disagree, and it is not hypothetical.
+    ``workspace_suspension._thread_is_vm_tier`` reads the declared backend
+    (``config_override.workspace.backend``) whenever a container status is
+    also present, and upgrade-to-VM provisions ``metadata.vm`` WITHOUT
+    rewriting that backend — so a thread with both contexts ``ready`` and a
+    stale ``sandbox``/``virtual`` backend reads as pod-tier there while this
+    resolver hands back the VM's host and port.
+
+    Takes the thread, not pre-parsed metadata, so it parses the row exactly
+    the way the resolver does: a caller passing its own separately-parsed
+    metadata is how the two would drift apart again.
+    """
+    vm_context = workspace_metadata(thread).get("vm") or {}
+    return isinstance(vm_context, dict) and vm_context.get("status") == "ready"
+
+
 def resolve_remote_workspace_target(
     thread: dict[str, Any], expected_generation: UUID
 ) -> RemoteWorkspaceTarget:
@@ -162,13 +187,11 @@ def resolve_remote_workspace_target(
             "The workspace has no provisioner-pinned SSH identity",
         )
 
+    # One definition of "the VM wins", shared with callers that must refuse a
+    # VM-backed target — see remote_target_is_vm_backed above.
     vm_context = metadata.get("vm") or {}
     workspace_context = metadata.get("workspace_container") or {}
-    context = (
-        vm_context
-        if isinstance(vm_context, dict) and vm_context.get("status") == "ready"
-        else workspace_context
-    )
+    context = vm_context if remote_target_is_vm_backed(thread) else workspace_context
     if not isinstance(context, dict) or context.get("status") != "ready":
         raise CanvasSSHError(409, "workspace_unavailable", "Workspace is not active")
     if context.get(CANVAS_WORKSPACE_GENERATION_KEY) != str(expected_generation):
@@ -797,6 +820,7 @@ __all__ = [
     "RemoteWorkspaceTarget",
     "asyncssh",
     "bound_workspace_generation",
+    "remote_target_is_vm_backed",
     "require_same_remote_workspace",
     "resolve_remote_workspace_target",
     "workspace_metadata",

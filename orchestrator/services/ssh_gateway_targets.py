@@ -26,6 +26,15 @@ STATE_RESTORING = "restoring"
 STATE_ENDED = "ended"
 STATE_NEVER_PROVISIONED = "never_provisioned"
 STATE_VM_UNSUPPORTED = "vm_unsupported"
+# Both are real, currently-written workspace_container statuses
+# (container_provisioner.py writes "failed" on PVC/provision failure and
+# "deleted" on teardown) and both are in the spec's §7.1 status set. They used
+# to fall through to STATE_NEVER_PROVISIONED, which the gateway prints as the
+# user-facing reason — telling someone their workspace was never provisioned
+# when it in fact failed, or was deleted, sends them after the wrong problem.
+# Exactly the defect STATE_STALE_BINDING was added for, eleven lines down.
+STATE_FAILED = "failed"
+STATE_DELETED = "deleted"
 # Not returned by resolve_workspace_state() itself — the endpoint reports
 # this when workspace_container.status IS "ready" (genuinely provisioned)
 # but resolve_remote_workspace_target() raises CanvasSSHError: a missing/
@@ -68,4 +77,12 @@ def resolve_workspace_state(thread: dict[str, Any], metadata: dict[str, Any]) ->
         return STATE_RESTORING
     if status == "ready":
         return STATE_LIVE
+    if status == "failed":
+        return STATE_FAILED
+    if status == "deleted":
+        return STATE_DELETED
+    # Everything in the spec's §7.1 status set is now matched above, so this
+    # is reached only by a status this module has never heard of. Reporting
+    # "never provisioned" for an unknown value is the conservative choice —
+    # it refuses — but it is a guess, not a fact, unlike the branches above.
     return STATE_NEVER_PROVISIONED

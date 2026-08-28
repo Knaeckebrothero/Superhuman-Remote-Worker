@@ -480,6 +480,7 @@ from services.canvas_ssh import (  # noqa: E402
     CanvasSSHError,
     RemoteWorkspaceTarget,
     bound_workspace_generation,
+    remote_target_is_vm_backed,
     resolve_remote_workspace_target,
 )
 from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
@@ -63094,6 +63095,19 @@ async def get_ssh_target(
         # PROVISIONED would send an operator after the wrong problem.
         logger.info("ssh-target unresolvable for %s: %s", thread_id, exc)
         return _ssh_target_response(thread_id, user, STATE_STALE_BINDING)
+
+    # The guard above and the resolver disagree about what "VM tier" means,
+    # and the disagreement hands out the wrong host. _thread_is_vm_tier reads
+    # the DECLARED backend once a container status is present, while
+    # resolve_remote_workspace_target prefers metadata.vm whenever its status
+    # is "ready" regardless of workspace_container. Upgrade-to-VM writes
+    # metadata.vm without rewriting config_override.workspace.backend (that
+    # method's own docstring says so), so a thread with both contexts ready
+    # and a stale non-VM backend passes the guard and is then handed the VM's
+    # host and port — which v1 must refuse. Ask the resolver's own question,
+    # after the fact, rather than re-deriving the tier a third way.
+    if remote_target_is_vm_backed(thread):
+        return _ssh_target_response(thread_id, user, STATE_VM_UNSUPPORTED)
 
     return _ssh_target_response(thread_id, user, STATE_LIVE, target)
 
