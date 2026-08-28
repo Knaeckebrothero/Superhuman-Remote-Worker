@@ -12377,6 +12377,22 @@ async def _recover_captured_sandbox_process_zero(
         binding = captured_binding
         if not isinstance(workspace, Mapping) or not isinstance(binding, Mapping):
             return False
+        if not workspace and not binding:
+            receipt = await postgres_db.acknowledge_pinned_thread_local_quiescence(
+                thread_id,
+                expected_runtime_generation=generation,
+                expected_retirement_token=token,
+                expected_agent_id=str(context.get("agent_id") or ""),
+                expected_attach_token=str(context.get("runtime_attach_token") or ""),
+                expected_settle_status=str(context.get("settle_status") or ""),
+                expected_quiescence_protocol="agent_runtime_zero_v1",
+                expected_workspace_generation=None,
+                expected_workspace_runtime_incarnation=None,
+                quiescence_actor="orchestrator",
+                expected_agent_pod_uid=next(iter(captured_pods))[1],
+                require_zero_admission=True,
+            )
+            return receipt is not None
         workspace_generation = str(binding.get("generation") or "")
         runtime_incarnation = str(
             (
@@ -12502,6 +12518,31 @@ async def _recover_captured_sandbox_process_zero(
             quiescence_actor="orchestrator",
         )
         return receipt is not None
+
+
+async def _complete_retiring_soft_warm_binding_release(
+    retirement: Mapping[str, Any],
+) -> bool:
+    """Finish the durable finalizer release started by soft settlement."""
+
+    if bool(retirement.get("permanent")):
+        return True
+    context = retirement.get("context")
+    context = {} if context is None else context
+    marker = context.get("agent_pod") if isinstance(context, Mapping) else None
+    protection_id = (
+        str(marker.get("warm_binding_protection") or "")
+        if isinstance(marker, Mapping)
+        else ""
+    )
+    if not protection_id:
+        return True
+    return await release_pinned_warm_binding_protection(
+        postgres_db,
+        protection_id=protection_id,
+        agent_provisioner=agent_provisioner,
+        persistent_provisioner=persistent_provisioner,
+    )
 
 
 async def _cleanup_pinned_thread_retirement(
@@ -54413,14 +54454,26 @@ async def _end_thread_flow(
                         expected_runtime_retirement_token=str(retirement["token"]),
                         expected_runtime_generation=str(retirement["generation"]),
                     )
-                elif not await postgres_db.settle_pinned_thread_retirement(
-                    thread_id,
-                    token=str(retirement["token"]),
-                    generation=str(retirement["generation"]),
-                    final_status=settle_status,
-                    staged_event=staged_event,
-                ):
-                    raise RuntimeError("Pinned retirement settlement CAS failed")
+                else:
+                    settled = await postgres_db.settle_pinned_thread_retirement(
+                        thread_id,
+                        token=str(retirement["token"]),
+                        generation=str(retirement["generation"]),
+                        final_status=settle_status,
+                        staged_event=staged_event,
+                    )
+                    if not settled:
+                        raise RuntimeError("Pinned retirement settlement CAS failed")
+                    if not await _complete_retiring_soft_warm_binding_release(
+                        retirement
+                    ):
+                        # Settlement already moved the exact receipt to
+                        # ``releasing``. The leader can retry that durable
+                        # finalizer obligation, but this request must not claim
+                        # the warm pool slot is available yet.
+                        raise RuntimeError(
+                            "Pinned retirement warm release remains retryable"
+                        )
             except HTTPException:
                 raise
             except Exception as exc:

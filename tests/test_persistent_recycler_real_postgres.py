@@ -6058,6 +6058,96 @@ async def test_warm_attach_patch_response_loss_binds_exact_marker(db, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
+    db, monkeypatch
+):
+    import main as orch_main
+
+    ids = await _seed_warm_pool_binding(db, bound=False)
+    api = StatefulPinnedK8sApi()
+    _install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = _production_warm_provisioner(db, api)
+    delete_exact = provisioner.delete_agent_pod_exact
+
+    async def _delete_and_finish(*args, **kwargs):
+        deleted = await delete_exact(*args, **kwargs)
+        api.mark_terminal("agents-a", ids["pod_name"])
+        return deleted
+
+    provisioner.delete_agent_pod_exact = _delete_and_finish
+    reserved = await reserve_pinned_warm_agent_binding(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        thread_id=ids["thread"],
+        agent_id=ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    assert reserved.bound
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created',metadata=jsonb_set(metadata,"
+            "'{config_override,workspace,backend}',to_jsonb('sandbox'::text),true) "
+            "WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"],
+        permanent=False,
+        expected_runtime_generation=ids["runtime_generation"],
+        expected_agent_id=ids["agent"],
+        expected_attach_token=str(reserved.attach_token),
+    )
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=ids["runtime_generation"],
+        settle_status="ended",
+    )
+    authority = {
+        "generation": ids["runtime_generation"],
+        "token": retirement["token"],
+        "permanent": False,
+        "context": retirement["context"],
+    }
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "agent_provisioner", provisioner),
+    ):
+        assert await orch_main._recover_captured_sandbox_process_zero(authority)
+        assert await db.settle_pinned_thread_retirement(
+            ids["thread"],
+            token=retirement["token"],
+            generation=ids["runtime_generation"],
+            final_status="ended",
+        )
+        assert await orch_main._complete_retiring_soft_warm_binding_release(authority)
+    current = await db.get_thread(ids["thread"])
+    assert current["status"] == "ended"
+    assert current["agent_id"] is None
+    async with db.acquire() as conn:
+        warm = await conn.fetchrow(
+            "SELECT status,release_outcome FROM "
+            "thread_agent_warm_binding_protections "
+            "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid",
+            UUID(ids["thread"]),
+            UUID(ids["runtime_generation"]),
+        )
+        agent = await conn.fetchrow(
+            "SELECT status::text AS status,thread_id FROM agents WHERE id=$1::uuid",
+            UUID(ids["agent"]),
+        )
+    assert dict(warm) == {
+        "status": "released",
+        "release_outcome": "exact_absent_v1",
+    }
+    assert dict(agent) == {"status": "offline", "thread_id": None}
+    assert ("agents-a", ids["pod_name"]) not in api.pods
+
+
+@pytest.mark.asyncio
 async def test_crash_after_warm_finalizer_patch_is_released_by_leader(db, monkeypatch):
     """A finalizer committed before DB publication remains owned and retryable."""
 

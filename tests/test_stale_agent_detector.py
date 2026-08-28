@@ -156,6 +156,85 @@ async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod(
 
 
 @pytest.mark.asyncio
+async def test_soft_retirement_recovers_never_delivered_warm_runtime():
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+    generation = "11111111-1111-4111-8111-111111111111"
+    token = "22222222-2222-4222-8222-222222222222"
+    agent_id = "33333333-3333-4333-8333-333333333333"
+    attach_token = "44444444-4444-4444-8444-444444444444"
+    context = {
+        "thread_id": thread_id,
+        "generation": generation,
+        "entry_status": "created",
+        "settle_status": "ended",
+        "runtime_authority_exposed": True,
+        "agent_id": agent_id,
+        "runtime_attach_token": attach_token,
+        "agent": {"hostname": "warm-agent", "pod_uid": "warm-pod-uid"},
+        "agent_pod": {
+            "pod_name": "warm-agent",
+            "pod_uid": "warm-pod-uid",
+            "namespace": "agents-a",
+            "protection_protocol": "finalizer_v1",
+            "warm_binding_protection": "55555555-5555-4555-8555-555555555555",
+        },
+        "workspace_backend": "sandbox",
+        "workspace_container": None,
+        "workspace_binding": None,
+    }
+    retirement = {
+        "generation": generation,
+        "token": token,
+        "permanent": False,
+        "context": context,
+    }
+    current = {
+        "status": "created",
+        "runtime_generation": generation,
+        "runtime_retirement_token": token,
+        "runtime_retirement_local_quiescence": None,
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=current)
+    db.acknowledge_pinned_thread_local_quiescence = AsyncMock(
+        return_value={"version": 1}
+    )
+
+    @asynccontextmanager
+    async def lifecycle_lock(_thread_id):
+        yield True
+
+    db.try_thread_advisory_lock = MagicMock(side_effect=lifecycle_lock)
+    provisioner = MagicMock(is_available=True)
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    provisioner.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "agent_provisioner", provisioner),
+    ):
+        assert await main._recover_captured_sandbox_process_zero(retirement)
+
+    db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
+        thread_id,
+        expected_runtime_generation=generation,
+        expected_retirement_token=token,
+        expected_agent_id=agent_id,
+        expected_attach_token=attach_token,
+        expected_settle_status="ended",
+        expected_quiescence_protocol="agent_runtime_zero_v1",
+        expected_workspace_generation=None,
+        expected_workspace_runtime_incarnation=None,
+        quiescence_actor="orchestrator",
+        expected_agent_pod_uid="warm-pod-uid",
+        require_zero_admission=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_detector_retries_durable_attach_abort_after_request_task_failure():
     """The leader/startup sweep owns G2 even if the request-local task dies."""
 

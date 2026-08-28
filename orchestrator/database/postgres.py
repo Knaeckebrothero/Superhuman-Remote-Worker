@@ -33475,7 +33475,7 @@ class PostgresDB:
                 retirement = await conn.fetchrow(
                     "SELECT runtime_retirement_context, "
                     "runtime_retirement_stage_receipt, "
-                    "runtime_retirement_local_quiescence FROM threads "
+                    "runtime_retirement_local_quiescence, metadata FROM threads "
                     "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
                     "AND runtime_retirement_token=$3::uuid "
                     "AND runtime_retirement_authorized_at IS NOT NULL "
@@ -33490,6 +33490,7 @@ class PostgresDB:
                 context = {} if context is None else context
                 receipt = retirement["runtime_retirement_stage_receipt"]
                 local_quiescence = retirement["runtime_retirement_local_quiescence"]
+                metadata = retirement["metadata"]
                 if isinstance(context, str):
                     try:
                         context = json.loads(context)
@@ -33500,7 +33501,14 @@ class PostgresDB:
                         receipt = json.loads(receipt)
                     except (TypeError, ValueError):
                         return False
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return False
                 if not isinstance(context, dict):
+                    return False
+                if not isinstance(metadata, dict):
                     return False
                 if str(context.get("settle_status") or "") != final_status:
                     return False
@@ -33741,6 +33749,45 @@ class PostgresDB:
                 agent_id = (
                     context.get("agent_id") if isinstance(context, dict) else None
                 )
+                warm_release_id: UUID | None = None
+                captured_agent_pod = context.get("agent_pod")
+                warm_marker = (
+                    captured_agent_pod.get("warm_binding_protection")
+                    if isinstance(captured_agent_pod, dict)
+                    else None
+                )
+                if warm_marker:
+                    try:
+                        warm_release_id = UUID(str(warm_marker))
+                    except (TypeError, ValueError):
+                        return False
+                    if not (
+                        isinstance(local_quiescence, dict)
+                        and local_quiescence.get("quiescence_actor")
+                        in {"agent", "orchestrator"}
+                        and metadata.get("agent_pod") == captured_agent_pod
+                    ):
+                        return False
+                    warm = await conn.fetchrow(
+                        "SELECT * FROM thread_agent_warm_binding_protections "
+                        "WHERE protection_id=$1::uuid FOR UPDATE",
+                        warm_release_id,
+                    )
+                    if not (
+                        warm is not None
+                        and str(warm["status"] or "") == "bound"
+                        and str(warm["source"] or "") == "attach"
+                        and str(warm["thread_id"]) == str(parsed_thread_id)
+                        and str(warm["runtime_generation"]) == str(parsed_generation)
+                        and str(warm["runtime_attach_token"])
+                        == str(context.get("runtime_attach_token") or "")
+                        and str(warm["agent_id"]) == str(context.get("agent_id") or "")
+                        and str(warm["pod_name"])
+                        == str(captured_agent_pod.get("pod_name") or "")
+                        and str(warm["pod_uid"])
+                        == str(captured_agent_pod.get("pod_uid") or "")
+                    ):
+                        return False
                 outcome_inserted = await conn.execute(
                     """
                     INSERT INTO thread_runtime_retirement_outcomes (
@@ -33767,10 +33814,11 @@ class PostgresDB:
                     )
                 if agent_id:
                     await conn.execute(
-                        "UPDATE agents SET thread_id=NULL, status='offline' "
+                        "UPDATE agents SET thread_id=NULL, status=$3 "
                         "WHERE id=$1::uuid AND thread_id=$2::uuid",
                         agent_id,
                         parsed_thread_id,
+                        "draining" if warm_release_id is not None else "offline",
                     )
                 row = await conn.fetchval(
                     """
@@ -33811,6 +33859,18 @@ class PostgresDB:
                     raise RuntimeError(
                         "pinned retirement settlement lost exact authority"
                     )
+                if warm_release_id is not None:
+                    warm_changed = await conn.execute(
+                        "UPDATE thread_agent_warm_binding_protections SET "
+                        "status='releasing',"
+                        "release_started_at=transaction_timestamp() "
+                        "WHERE protection_id=$1::uuid AND status='bound'",
+                        warm_release_id,
+                    )
+                    if warm_changed != "UPDATE 1":
+                        raise RuntimeError(
+                            "pinned retirement warm release CAS lost exact authority"
+                        )
                 if row is not None:
                     from src.shared.event_journal import append_system_frame
 
