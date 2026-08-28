@@ -92,6 +92,7 @@ def test_pinned_binding_freezes_full_route_target_without_repr_secret() -> None:
         POD_UID,
         "10.42.0.17",
         8001,
+        "provisioned",
     )
     assert ATTACH_TOKEN not in repr(binding)
     assert _binding(agent_status="working").target_key == binding.target_key
@@ -118,6 +119,7 @@ def test_pinned_binding_freezes_full_route_target_without_repr_secret() -> None:
         ("pod_port", 0),
         ("pod_port", 65_536),
         ("agent_status", ""),
+        ("pod_authority_kind", "foreign"),
     ],
 )
 def test_pinned_binding_rejects_malformed_joined_coordinates(
