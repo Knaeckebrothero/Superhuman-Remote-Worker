@@ -19393,6 +19393,25 @@ COMMENT ON TABLE public.user_expert_defaults IS 'Optional user-owned default exp
 
 
 --
+-- Name: user_ssh_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_ssh_keys (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    name text NOT NULL,
+    key_type text NOT NULL,
+    public_key text NOT NULL,
+    fingerprint_sha256 text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone,
+    disabled_at timestamp with time zone,
+    CONSTRAINT user_ssh_keys_fingerprint_shape CHECK ((fingerprint_sha256 ~ '^SHA256:[A-Za-z0-9+/]{43}$'::text)),
+    CONSTRAINT user_ssh_keys_name_present CHECK ((length(btrim(name)) > 0))
+);
+
+
+--
 -- Name: users; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -21570,6 +21589,22 @@ ALTER TABLE ONLY public.user_expert_defaults
 
 
 --
+-- Name: user_ssh_keys user_ssh_keys_fingerprint_sha256_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_ssh_keys
+    ADD CONSTRAINT user_ssh_keys_fingerprint_sha256_key UNIQUE (fingerprint_sha256);
+
+
+--
+-- Name: user_ssh_keys user_ssh_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_ssh_keys
+    ADD CONSTRAINT user_ssh_keys_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -22833,6 +22868,13 @@ CREATE INDEX idx_user_api_keys_user ON public.user_api_keys USING btree (user_id
 --
 
 CREATE INDEX idx_user_expert_defaults_expert ON public.user_expert_defaults USING btree (expert_id);
+
+
+--
+-- Name: idx_user_ssh_keys_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_user_ssh_keys_user ON public.user_ssh_keys USING btree (user_id);
 
 
 --
@@ -26399,6 +26441,14 @@ ALTER TABLE ONLY public.user_expert_defaults
 
 ALTER TABLE ONLY public.user_expert_defaults
     ADD CONSTRAINT user_expert_defaults_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_ssh_keys user_ssh_keys_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_ssh_keys
+    ADD CONSTRAINT user_ssh_keys_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 
 --

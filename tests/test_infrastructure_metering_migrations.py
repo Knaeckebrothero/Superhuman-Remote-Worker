@@ -297,7 +297,8 @@ APP_PINNED_RECYCLE_AUTHORITY_MIGRATION = (
     ROOT
     / "orchestrator/database/migrations/app/0200_pinned_agent_recycle_authority.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_PINNED_RECYCLE_AUTHORITY_MIGRATION
+APP_USER_SSH_KEYS = ROOT / "orchestrator/database/migrations/app/0201_user_ssh_keys.sql"
+APP_CURRENT_MIGRATION_HEAD = APP_USER_SSH_KEYS
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
