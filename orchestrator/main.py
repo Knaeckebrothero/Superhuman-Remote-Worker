@@ -62661,28 +62661,53 @@ async def rotate_api_key(request: Request, token_id: str) -> dict[str, Any]:
 
 
 class SshKeyCreate(BaseModel):
-    name: str
-    public_key: str
+    name: str = Field(..., min_length=1, max_length=100, description="Display name")
+    public_key: str = Field(..., min_length=1, max_length=8192)
     challenge: str
-    signature: str
+    signature: str = Field(..., min_length=1, max_length=8192)
 
 
 _SSH_CHALLENGE_TTL_SECONDS = 300
 _SSH_CHALLENGE_VERSION = "srw-ssh1"
 
 
+_SSH_CHALLENGE_IDENTITY_MAX_LEN = 255
+
+
 def _mint_ssh_key_challenge(
-    user_id: str, *, now: float | None = None
+    user_id: str, identity: str | None = None, *, now: float | None = None
 ) -> tuple[str, float]:
     """Mint a possession challenge bound to ``user_id``.
 
     Returns ``(token, expires_at_unix_ts)``. The token is the exact string
     the caller signs with ``ssh-keygen -Y sign``, so its wire format —
-    version tag, nonce, user id, expiry and an HMAC-SHA256 signature, all
-    dot-joined — is deliberately restricted to printable ASCII with no
-    whitespace: ``secrets.token_urlsafe`` output, a hyphenated UUID, decimal
-    digits and a hex digest, none of which can contain a literal ``.``, so
-    splitting on it in ``_verify_ssh_key_challenge`` is unambiguous.
+    version tag, nonce, user id, expiry, a human-readable identity label and
+    an HMAC-SHA256 signature, colon-joined — is deliberately restricted to
+    printable ASCII with no whitespace. The separator is ``:``, not ``.``:
+    emails contain dots, and a dot-separated identity would make the field
+    split in ``_verify_ssh_key_challenge`` ambiguous. ``identity`` may itself
+    contain colons (an email never does, but nothing here depends on that);
+    parsing uses ``rsplit``/``split`` with explicit counts so the identity
+    field absorbs anything after its position instead of being cut short.
+
+    ``identity`` (pass ``preferred_username`` or ``email``; the caller
+    chooses) exists so a signer who actually reads what ``ssh-keygen -Y
+    sign`` is about to sign can see whose account the token binds — a bare
+    UUID gives a phishing target no such visibility (Mallory mints a
+    challenge for her own account, gets Victoria to sign *that* token via a
+    page imitating the registration flow, then posts Victoria's public key
+    with her own token and Victoria's signature: every check passes and the
+    row lands on Mallory's account). The label is covered by the HMAC below
+    (so it can't be swapped after minting without invalidating the token)
+    but is DISPLAY-ONLY: authorization in ``_verify_ssh_key_challenge`` is
+    decided entirely by ``user_id``, never by ``identity`` — flipping the
+    label to name a different account does not move who the token
+    authenticates as. Sanitized here — non-empty, ASCII, no whitespace,
+    bounded length — with a fall back to the raw user id, since a
+    malicious or malformed label must not be able to break the token's
+    single-line-printable-ASCII contract (that contract is what lets
+    ``_verify_ssh_key_challenge`` use ``str.isascii()`` as its first,
+    cheap line of defense).
 
     Not single-use, deliberately (ruling F24). A nonce store would give
     literal single-use, but that isn't the property this token needs:
@@ -62698,18 +62723,38 @@ def _mint_ssh_key_challenge(
     this back into a stateful nonce store: every orchestrator replica shares
     SESSION_JWT_SECRET via one Kubernetes Secret, but replicas do not share
     memory, which is the whole reason this token is stateless.
+
+    Fails closed: raises if SESSION_JWT_SECRET is empty rather than signing
+    with a well-known-empty key. Both HTTP callers in this file already
+    guard this before calling in (and keep their own 503), but the
+    precondition lives here too, on the reusable unit itself, since the
+    ssh-gateway is expected to call this directly, outside any HTTP
+    request/response cycle where a 503 would even make sense.
     """
+    if not _session_jwt_secret:
+        raise RuntimeError(
+            "SESSION_JWT_SECRET is empty; refusing to mint a forgeable SSH "
+            "possession challenge."
+        )
     if now is None:
         now = time.time()
+    label = (identity or "").strip()
+    if (
+        not label
+        or len(label) > _SSH_CHALLENGE_IDENTITY_MAX_LEN
+        or not label.isascii()
+        or any(ch.isspace() for ch in label)
+    ):
+        label = user_id
     expires_at = now + _SSH_CHALLENGE_TTL_SECONDS
     nonce = secrets.token_urlsafe(24)
-    payload = f"{_SSH_CHALLENGE_VERSION}.{nonce}.{user_id}.{int(expires_at)}"
+    head = f"{_SSH_CHALLENGE_VERSION}:{nonce}:{user_id}:{int(expires_at)}:{label}"
     signature = hmac.new(
         _session_jwt_secret.encode("utf-8"),
-        payload.encode("utf-8"),
+        head.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    return f"{payload}.{signature}", expires_at
+    return f"{head}:{signature}", expires_at
 
 
 def _verify_ssh_key_challenge(
@@ -62717,23 +62762,46 @@ def _verify_ssh_key_challenge(
 ) -> bool:
     """True iff ``token`` was minted by us, for ``user_id``, and is unexpired.
 
-    Check order is deliberate and load-bearing: the HMAC must be verified
-    before any field the token carries (expiry, embedded user id) is
-    trusted, because until the MAC checks out those fields are
-    attacker-controlled input, not fact.
+    Check order is deliberate and load-bearing:
+
+    1. ``token.isascii()``. ``hmac.compare_digest`` raises ``TypeError`` on
+       a non-ASCII ``str`` argument — reachable pre-authentication, since
+       the raw signature field is compared before its validity is known —
+       so a body like ``{"challenge": "srw-ssh1:...:é", ...}`` would
+       otherwise turn a 400 into an unhandled 500 an authenticated caller
+       could loop. A lone UTF-16 surrogate (reachable via ``json.loads`` on
+       a hostile body) isn't even ``str``-comparable by ``compare_digest``
+       and raises ``UnicodeEncodeError`` on ``.encode()`` instead, so this
+       must be a rejection, not a switch to byte comparison.
+    2. SESSION_JWT_SECRET must be configured — verifying against an empty
+       key would accept a forgery anyone can compute.
+    3. The token parses into the expected fields at all.
+    4. The HMAC, via ``hmac.compare_digest``, before any field the token
+       carries (expiry, embedded user id, identity) is trusted — until the
+       MAC checks out those fields are attacker-controlled input, not fact.
+    5. Expiry.
+    6. The embedded user id against the authenticated caller, also via
+       ``hmac.compare_digest``. The identity label is parsed out (it has to
+       be, to locate the other fields) but never compared against
+       anything: it is a MAC-covered, display-only annotation, not an
+       authorization input — only ``user_id`` decides who a token is for.
     """
+    if not token.isascii():
+        return False
+    if not _session_jwt_secret:
+        return False
     if now is None:
         now = time.time()
-    parts = token.split(".")
-    if len(parts) != 5:
+    try:
+        head, signature = token.rsplit(":", 1)
+        version, nonce, token_user_id, expires_at_raw, _identity = head.split(":", 4)
+    except ValueError:
         return False
-    version, nonce, token_user_id, expires_at_raw, signature = parts
     if version != _SSH_CHALLENGE_VERSION:
         return False
-    payload = f"{version}.{nonce}.{token_user_id}.{expires_at_raw}"
     expected_signature = hmac.new(
         _session_jwt_secret.encode("utf-8"),
-        payload.encode("utf-8"),
+        head.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
     if not hmac.compare_digest(expected_signature, signature):
@@ -62779,7 +62847,8 @@ async def create_ssh_key_challenge(request: Request) -> dict[str, Any]:
             status_code=503,
             detail="SSH key registration is temporarily unavailable.",
         )
-    token, expires_at = _mint_ssh_key_challenge(str(user["id"]))
+    identity = user.get("preferred_username") or user.get("email")
+    token, expires_at = _mint_ssh_key_challenge(str(user["id"]), identity)
     return {
         "challenge": token,
         "namespace": SIGNATURE_NAMESPACE,
@@ -62861,7 +62930,14 @@ async def list_ssh_keys(request: Request) -> list[dict[str, Any]]:
 async def delete_ssh_key(request: Request, key_id: str) -> dict[str, str]:
     """Remove one of the current user's keys."""
     user = await require_approved_user(request, postgres_db)
-    if not await postgres_db.delete_user_ssh_key(key_id, str(user["id"])):
+    try:
+        deleted = await postgres_db.delete_user_ssh_key(key_id, str(user["id"]))
+    except ValueError:
+        # key_id isn't a well-formed UUID — the store's UUID(key_id) raises.
+        # Same "no such key" outcome as a well-formed id matching no row;
+        # not a 500.
+        deleted = False
+    if not deleted:
         raise HTTPException(status_code=404, detail="Key not found")
     return {"status": "deleted"}
 
