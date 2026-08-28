@@ -176,6 +176,41 @@ async def test_delete_reports_miss():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(
+            lambda db: db.create_user_ssh_key(
+                user_id="nope",
+                name="laptop",
+                key_type="ssh-ed25519",
+                public_key="ssh-ed25519 AAAA",
+                fingerprint_sha256="SHA256:" + "A" * 43,
+            ),
+            id="create",
+        ),
+        pytest.param(lambda db: db.list_user_ssh_keys("nope"), id="list"),
+        pytest.param(lambda db: db.delete_user_ssh_key(KEY_ID, "nope"), id="delete"),
+        pytest.param(lambda db: db.mark_ssh_key_used("nope"), id="mark_used"),
+    ],
+)
+async def test_ids_are_parsed_before_a_connection_is_acquired(call):
+    """One contract across every method on this table.
+
+    ``record_ssh_attachment``/``close_ssh_attachment`` already assert in their
+    docstrings that "a malformed id has no business checking one out of the
+    pool" and have tests pinning it; these three parsed INSIDE ``acquire()``
+    until the final review (Minor 3). Two sibling methods on one table with
+    opposite contracts is a trap this codebase has already been bitten by.
+    """
+    conn = FakeConn()
+    with pytest.raises(ValueError):
+        await call(_db(conn))
+    assert conn.calls == []
+    assert conn.acquired == 0
+
+
+@pytest.mark.asyncio
 async def test_resolve_ignores_disabled_keys():
     """A miss — disabled key, unapproved account, or unknown fingerprint — is
     one statement, not two. Regression guard: the bump must not fire on a miss."""

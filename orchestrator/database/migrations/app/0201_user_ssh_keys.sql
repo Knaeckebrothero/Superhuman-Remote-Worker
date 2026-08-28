@@ -27,6 +27,14 @@ CREATE TABLE IF NOT EXISTS public.user_ssh_keys (
     fingerprint_sha256  text NOT NULL,
     created_at          timestamptz NOT NULL DEFAULT now(),
     last_used_at        timestamptz,
+    -- REVOCATION IS DELETE. Nothing writes this column: no endpoint sets it,
+    -- there is no disable endpoint in v1, and DELETE /api/ssh-keys/{id} is
+    -- the only way a user takes a key out of service. It is read, though --
+    -- resolve_user_by_ssh_fingerprint filters on `disabled_at IS NULL` and
+    -- the API serializes it as `disabled` -- so it is a working kill switch
+    -- the moment something writes it, which is why it stays. Read any
+    -- reasoning elsewhere about a "soft revoke" (0204's ssh_key_id comment)
+    -- as describing DELETE, not this column.
     disabled_at         timestamptz,
     -- Global, not per-user. A public key identifies exactly one account, so
     -- the gateway can map a presented fingerprint to one user with no ambiguity.

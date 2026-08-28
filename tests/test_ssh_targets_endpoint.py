@@ -228,6 +228,56 @@ async def test_unknown_handle_and_unauthorized_are_identical(internal, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_unknown_key_is_the_same_404_as_the_other_two(internal, monkeypatch):
+    """The third state this module's docstring says must be indistinguishable.
+
+    ``test_unknown_handle_and_unauthorized_are_identical`` covers unknown
+    handle and not-yours; an unknown or unapproved KEY was named as a case
+    that must match byte for byte and was never asserted. It is the one an
+    attacker probes first — the fingerprint is the field they control most
+    freely, they can enumerate published keys, and it is the branch that
+    would most plausibly grow its own message ("key not registered") in a
+    future edit while the handle branches stayed opaque.
+
+    ``resolve_user_by_ssh_fingerprint`` returns None for all of: no such
+    fingerprint, a key whose ``disabled_at`` is set, and a key on an
+    unapproved/deactivated account.
+    """
+
+    async def _thread_ok(handle):
+        return THREAD
+
+    async def _no_user(fp):
+        return None
+
+    async def _access(user, db, entity_id):
+        raise AssertionError("authorization must not run without an identity")
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_ok)
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _no_user)
+    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
+
+    with pytest.raises(HTTPException) as unknown_key:
+        await main.get_ssh_target(
+            request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
+        )
+
+    # Compare against a genuinely different failure resolved the same request,
+    # rather than against a hardcoded string that could drift with the handler.
+    async def _no_thread(handle):
+        return None
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread)
+    with pytest.raises(HTTPException) as unknown_handle:
+        await main.get_ssh_target(
+            request=object(), handle="s-aaaaaaaa", fingerprint=FINGERPRINT
+        )
+
+    assert unknown_key.value.status_code == unknown_handle.value.status_code == 404
+    assert unknown_key.value.detail == unknown_handle.value.detail
+
+
+@pytest.mark.asyncio
 async def test_unknown_handle_still_reaches_the_fingerprint_resolver(
     internal, monkeypatch
 ):

@@ -8,9 +8,22 @@
 --               enforcement triggers are installed. threads is hot and
 --               trigger-heavy, so ordinary writes to it can queue briefly;
 --               reads are unaffected. The CREATE TABLE is retried up to 10
---               times with a 1s backoff on lock_timeout, mirroring 0202:
---               an unretried 2s timeout would abort the whole transactional
---               pass and fail boot.
+--               times with a 1s backoff on lock_timeout, mirroring 0202.
+--               The retry is a CONTENTION mitigation for a hot referenced
+--               table, NOT a correctness requirement of the pattern -- read
+--               it as "threads is busy enough to be worth retrying", not as
+--               "0201 is missing a retry". Creating a table with an FK and
+--               letting lock_timeout alone bound the wait is ordinary here:
+--               sibling 0201 does exactly that against public.users, and
+--               0119/0127 wrap no retry around their own CREATE TABLE
+--               ... REFERENCES threads (they take the lock up front
+--               instead). What differs between those files is the write rate
+--               of the REFERENCED table -- threads is written on every turn,
+--               users is not written per request -- not the consequence of a
+--               timeout, which is identical for every file in the pass:
+--               migrate.py runs the entire transactional pass inside one
+--               transaction, so any statement error aborts all of it and
+--               fails boot.
 -- transactional: yes
 -- rollout:      Written only by the ssh-gateway; inert until it ships.
 
@@ -22,9 +35,10 @@ SET LOCAL timezone                            = 'UTC';
 
 -- Installing the FK to threads takes SHARE ROW EXCLUSIVE on it (see -- locks:
 -- above), which conflicts with the ROW EXCLUSIVE ordinary writes hold.
--- threads is hot, so a straight CREATE TABLE can lose the race against
--- lock_timeout; retry it exactly like 0202 retries its ALTER TABLE, rather
--- than letting one timeout abort the whole transactional migration pass.
+-- threads is hot, so a straight CREATE TABLE can plausibly lose the race
+-- against lock_timeout; retry it exactly like 0202 retries its ALTER TABLE.
+-- The header explains why this is a judgement about *threads* specifically
+-- and not a rule that every CREATE TABLE ... REFERENCES needs a retry.
 -- Each failed attempt is caught by this block's own implicit savepoint, so
 -- a partially-installed table from a failed attempt is rolled back before
 -- the next CREATE TABLE IF NOT EXISTS is tried -- it never sees a

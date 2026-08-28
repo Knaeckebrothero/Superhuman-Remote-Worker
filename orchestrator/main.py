@@ -62728,6 +62728,17 @@ def _mint_ssh_key_challenge(
     ``_verify_ssh_key_challenge`` use ``str.isascii()`` as its first,
     cheap line of defense).
 
+    **The label's anti-phishing property has one undocumented dependency:
+    ``preferred_username`` and ``email`` are unique per Keycloak realm.** The
+    mitigation is "the signer recognises the name as their own and not
+    someone else's", which only works while a label names exactly one
+    account. A deployment that ever admits duplicate usernames — a second
+    identity provider federated in, a realm merge, a source change to a
+    non-unique field like ``display_name`` — reverts this to a bare UUID's
+    worth of protection, silently: no test here can see it, because every
+    test constructs its own label. If the label source changes, re-derive
+    that uniqueness claim first.
+
     Not single-use, deliberately (ruling F24). A nonce store would give
     literal single-use, but that isn't the property this token needs:
     binding it to the caller's user id is what carries the actual security
@@ -63000,7 +63011,17 @@ def _ssh_target_response(
     target: RemoteWorkspaceTarget | None = None,
 ) -> dict[str, Any]:
     """The one response shape every ``get_ssh_target`` branch returns, so a
-    new field can't be added to three branches out of four."""
+    new field can't be added to three branches out of four.
+
+    ``pod_ip`` is a misnomer kept on purpose. The value is
+    ``RemoteWorkspaceTarget.host``, which comes from ``workspace_container.
+    ssh_host`` — a Kubernetes Service DNS name, not a pod IP. Dialing a pod IP
+    was an explicitly rejected earlier design (it breaks the moment the pod is
+    recreated, and the provisioner's attested identity is bound to the
+    Service). The name stays because the gateway plan already reads this
+    field by it; do not "fix" it into something that suggests the gateway
+    should resolve or trust an IP.
+    """
     return {
         "thread_id": thread_id,
         "user_id": str(user["id"]),

@@ -41058,7 +41058,12 @@ class PostgresDB:
             return dict(row)
 
     async def list_user_ssh_keys(self, user_id: str) -> List[Dict[str, Any]]:
-        """The user's registered keys. Never returns other users' rows."""
+        """The user's registered keys. Never returns other users' rows.
+
+        The id is parsed before a connection is acquired — one contract for
+        all five methods on this table, see ``close_ssh_attachment``.
+        """
+        user_uuid = UUID(user_id)
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -41068,17 +41073,26 @@ class PostgresDB:
                 WHERE user_id = $1
                 ORDER BY created_at DESC
                 """,
-                UUID(user_id),
+                user_uuid,
             )
             return [dict(r) for r in rows]
 
     async def delete_user_ssh_key(self, key_id: str, user_id: str) -> bool:
-        """Delete one key. Scoped by user_id so an id alone is not authority."""
+        """Delete one key. Scoped by user_id so an id alone is not authority.
+
+        This is the ONLY revocation path this feature has: nothing writes
+        ``disabled_at`` and there is no disable endpoint (see migration 0201).
+
+        Ids are parsed before a connection is acquired — one contract for all
+        five methods on this table, see ``close_ssh_attachment``.
+        """
+        key_uuid = UUID(key_id)
+        user_uuid = UUID(user_id)
         async with self.acquire() as conn:
             result = await conn.execute(
                 "DELETE FROM user_ssh_keys WHERE id = $1 AND user_id = $2",
-                UUID(key_id),
-                UUID(user_id),
+                key_uuid,
+                user_uuid,
             )
             return result == "DELETE 1"
 
@@ -41218,7 +41232,17 @@ class PostgresDB:
         Ids are parsed before a connection is acquired, so a malformed one
         never checks a connection out of the pool — same contract as
         close_ssh_attachment.
+
+        ``handle`` gets the same treatment. It lands in a ``NOT NULL text``
+        column with no CHECK behind it, and the handle charset is a security
+        boundary elsewhere in this file — ``get_thread_id_by_ssh_handle``
+        guards it defensively rather than trusting its callers, on the stated
+        grounds that the boundary must not depend on every future caller
+        remembering to pre-validate. An audit row is exactly where a
+        malformed handle would be believed later.
         """
+        if not is_valid_handle(handle):
+            raise ValueError(f"invalid ssh handle: {handle!r}")
         thread_uuid = UUID(thread_id)
         user_uuid = UUID(user_id)
         key_uuid = UUID(ssh_key_id) if ssh_key_id else None
@@ -41241,8 +41265,14 @@ class PostgresDB:
 
     async def close_ssh_attachment(
         self, attachment_id: str, channels: List[str]
-    ) -> None:
+    ) -> int:
         """Stamp detach time and the channel types the session actually opened.
+
+        Returns the number of rows updated: 1 for a normal close, 0 for an
+        unknown id OR an attachment already closed — ``WHERE detached_at IS
+        NULL`` makes both silent no-ops otherwise, and the gateway's detach
+        handler has to tell "done" from "nothing happened" to know whether a
+        double-detach or a lost row needs logging.
 
         attachment_id is parsed with UUID() to match record_ssh_attachment,
         which wraps every id it binds. asyncpg would accept a bare string, but
@@ -41255,7 +41285,7 @@ class PostgresDB:
         """
         attachment_uuid = UUID(attachment_id)
         async with self.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 """
                 UPDATE ssh_attachments
                 SET detached_at = now(), channels = $2
@@ -41264,6 +41294,10 @@ class PostgresDB:
                 attachment_uuid,
                 list(channels),
             )
+        # House pattern for a command tag, matching postgres.py:21410.
+        if result and result.startswith("UPDATE "):
+            return int(result.split()[1])
+        return 0
 
     # =========================================================================
     # PROJECT API KEY OPERATIONS

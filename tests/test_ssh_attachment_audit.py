@@ -53,8 +53,9 @@ def test_survives_key_deletion():
 
 
 class FakeConn:
-    def __init__(self, fetchval=None):
+    def __init__(self, fetchval=None, execute="UPDATE 1"):
         self._fetchval = fetchval
+        self._execute = execute
         self.calls = []
         # Count of times a connection was actually checked out, separate from
         # `calls`: proves "no connection taken", not just "no statement
@@ -68,7 +69,7 @@ class FakeConn:
 
     async def execute(self, sql, *args):
         self.calls.append((sql, args))
-        return "UPDATE 1"
+        return self._execute
 
 
 class FakeAcquire:
@@ -121,6 +122,31 @@ async def test_close_sets_detached_at_and_channels():
 
 
 @pytest.mark.asyncio
+async def test_close_reports_one_row_for_a_normal_close():
+    """``WHERE detached_at IS NULL`` makes an already-closed or unknown id a
+    silent no-op, so the row count is the only thing that tells the gateway's
+    detach handler "closed" from "nothing happened"."""
+    conn = FakeConn(execute="UPDATE 1")
+    assert (
+        await _db(conn).close_ssh_attachment(
+            "00000000-0000-0000-0000-0000000000a1", ["session"]
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_reports_zero_for_an_already_closed_or_unknown_id():
+    conn = FakeConn(execute="UPDATE 0")
+    assert (
+        await _db(conn).close_ssh_attachment(
+            "00000000-0000-0000-0000-0000000000a1", ["session"]
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
 async def test_close_rejects_a_malformed_attachment_id():
     conn = FakeConn()
     with pytest.raises(ValueError):
@@ -143,6 +169,40 @@ async def test_record_rejects_a_malformed_thread_id_before_acquiring():
             ssh_key_id=None,
             client_ip="203.0.113.7",
             handle="s-7f3a91c2",
+        )
+    assert conn.calls == []
+    assert conn.acquired == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handle",
+    [
+        "s-abc\nProxyCommand x",  # config injection, the charset's whole point
+        "s-TOOLONGHANDLE",
+        "s-abcdefgi",  # 'i' is not in the Crockford-minus-ambiguous alphabet
+        "",
+        "root",
+    ],
+)
+async def test_record_rejects_a_malformed_handle_before_acquiring(handle):
+    """``handle`` lands in a ``NOT NULL text`` column with no CHECK behind it.
+
+    The charset is a security boundary (it is written verbatim into a user's
+    ``~/.ssh/config``) and ``get_thread_id_by_ssh_handle`` already guards it
+    defensively rather than trusting callers — on the stated grounds that the
+    boundary must not depend on every future caller remembering to
+    pre-validate. An audit row is exactly where a malformed handle would be
+    believed later.
+    """
+    conn = FakeConn()
+    with pytest.raises(ValueError):
+        await _db(conn).record_ssh_attachment(
+            thread_id="00000000-0000-0000-0000-000000000002",
+            user_id="00000000-0000-0000-0000-000000000001",
+            ssh_key_id=None,
+            client_ip="203.0.113.7",
+            handle=handle,
         )
     assert conn.calls == []
     assert conn.acquired == 0
