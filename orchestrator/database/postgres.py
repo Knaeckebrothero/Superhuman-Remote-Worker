@@ -13,6 +13,7 @@ This is the canonical database layer for the orchestrator.
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -41096,6 +41097,30 @@ class PostgresDB:
     # SSH ATTACHMENT AUDIT OPERATIONS
     # =========================================================================
 
+    @staticmethod
+    def _normalized_ssh_client_ip(client_ip: Optional[str]) -> Optional[str]:
+        """Validate a peer address before it reaches the inet column.
+
+        asyncpg's own inet codec tries ipaddress.ip_address() then
+        ip_interface() and propagates whatever that raises. A unix-socket
+        path, a bare hostname, an address:port pair, or an empty string all
+        fail both, which would turn a successful SSH attach into a failed
+        audit write. An audit row missing client_ip beats no row at all, so
+        an unparseable value is stored as NULL instead of raised.
+
+        A scope id parses fine here (ipaddress accepts "fe80::1%eth0"), but
+        Postgres's inet type carries no zone/interface field, so asyncpg's
+        binary encoder drops it on the wire regardless of what we do here —
+        the row ends up with plain "fe80::1".
+        """
+        if not client_ip:
+            return None
+        try:
+            ipaddress.ip_address(client_ip)
+        except ValueError:
+            return None
+        return client_ip
+
     async def record_ssh_attachment(
         self,
         thread_id: str,
@@ -41104,7 +41129,16 @@ class PostgresDB:
         client_ip: Optional[str],
         handle: str,
     ) -> str:
-        """Open an attach record. Returns its id for the matching close."""
+        """Open an attach record. Returns its id for the matching close.
+
+        Ids are parsed before a connection is acquired, so a malformed one
+        never checks a connection out of the pool — same contract as
+        close_ssh_attachment.
+        """
+        thread_uuid = UUID(thread_id)
+        user_uuid = UUID(user_id)
+        key_uuid = UUID(ssh_key_id) if ssh_key_id else None
+        normalized_ip = self._normalized_ssh_client_ip(client_ip)
         async with self.acquire() as conn:
             value = await conn.fetchval(
                 """
@@ -41113,11 +41147,11 @@ class PostgresDB:
                 VALUES ($1, $2, $3, $4, $5::inet)
                 RETURNING id
                 """,
-                UUID(thread_id),
-                UUID(user_id),
-                UUID(ssh_key_id) if ssh_key_id else None,
+                thread_uuid,
+                user_uuid,
+                key_uuid,
                 handle,
-                client_ip,
+                normalized_ip,
             )
             return str(value)
 
@@ -41131,7 +41165,11 @@ class PostgresDB:
         two sibling methods on one table with opposite contracts — one
         rejecting a malformed id at the boundary, the other forwarding it to
         the driver — is the trap this codebase has already been bitten by.
+
+        The parse happens before a connection is acquired: a malformed id has
+        no business checking one out of the pool.
         """
+        attachment_uuid = UUID(attachment_id)
         async with self.acquire() as conn:
             await conn.execute(
                 """
@@ -41139,7 +41177,7 @@ class PostgresDB:
                 SET detached_at = now(), channels = $2
                 WHERE id = $1 AND detached_at IS NULL
                 """,
-                UUID(attachment_id),
+                attachment_uuid,
                 list(channels),
             )
 
