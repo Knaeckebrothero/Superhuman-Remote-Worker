@@ -1,5 +1,6 @@
 # tests/test_ssh_attachment_audit.py
 import pathlib
+from uuid import UUID
 
 import pytest
 
@@ -74,7 +75,7 @@ def _db(conn):
 
 @pytest.mark.asyncio
 async def test_record_returns_an_id():
-    conn = FakeConn(fetchval="a1")
+    conn = FakeConn(fetchval=UUID("00000000-0000-0000-0000-0000000000a1"))
     got = await _db(conn).record_ssh_attachment(
         thread_id="00000000-0000-0000-0000-000000000002",
         user_id="00000000-0000-0000-0000-000000000001",
@@ -82,13 +83,25 @@ async def test_record_returns_an_id():
         client_ip="203.0.113.7",
         handle="s-7f3a91c2",
     )
-    assert got == "a1"
+    assert got == "00000000-0000-0000-0000-0000000000a1"
 
 
 @pytest.mark.asyncio
 async def test_close_sets_detached_at_and_channels():
     conn = FakeConn()
-    await _db(conn).close_ssh_attachment("a1", ["session", "sftp"])
+    attachment_id = "00000000-0000-0000-0000-0000000000a1"
+    await _db(conn).close_ssh_attachment(attachment_id, ["session", "sftp"])
     sql, args = conn.calls[0]
     assert "detached_at" in sql
     assert "session" in args[1]
+    # Bound as a UUID, not the raw string, so a malformed id fails here rather
+    # than reaching the driver — same contract as record_ssh_attachment.
+    assert args[0] == UUID(attachment_id)
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_a_malformed_attachment_id():
+    conn = FakeConn()
+    with pytest.raises(ValueError):
+        await _db(conn).close_ssh_attachment("a1", ["session"])
+    assert conn.calls == []

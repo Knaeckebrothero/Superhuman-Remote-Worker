@@ -41126,10 +41126,11 @@ class PostgresDB:
     ) -> None:
         """Stamp detach time and the channel types the session actually opened.
 
-        attachment_id is passed through as a string rather than pre-parsed
-        with UUID(): asyncpg's uuid codec accepts a plain str for a $n it
-        infers as uuid from the prepared statement, same as record_ssh_attachment's
-        `RETURNING id` -> str(value) round-trip that produced this value.
+        attachment_id is parsed with UUID() to match record_ssh_attachment,
+        which wraps every id it binds. asyncpg would accept a bare string, but
+        two sibling methods on one table with opposite contracts — one
+        rejecting a malformed id at the boundary, the other forwarding it to
+        the driver — is the trap this codebase has already been bitten by.
         """
         async with self.acquire() as conn:
             await conn.execute(
@@ -41138,7 +41139,7 @@ class PostgresDB:
                 SET detached_at = now(), channels = $2
                 WHERE id = $1 AND detached_at IS NULL
                 """,
-                attachment_id,
+                UUID(attachment_id),
                 list(channels),
             )
 
