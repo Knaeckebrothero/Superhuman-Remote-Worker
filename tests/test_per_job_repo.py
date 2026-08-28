@@ -184,6 +184,7 @@ class TestDeleteJobGiteaCleanup:
             patch(f"{MODULE}.gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
+            mock_db.get_job = AsyncMock(return_value=job)
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
@@ -221,6 +222,7 @@ class TestDeleteJobGiteaCleanup:
             patch(f"{MODULE}.gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
+            mock_db.get_job = AsyncMock(return_value=job)
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
@@ -251,6 +253,7 @@ class TestDeleteJobGiteaCleanup:
             patch(f"{MODULE}.gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
+            mock_db.get_job = AsyncMock(return_value=job)
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
@@ -288,6 +291,7 @@ class TestDeleteJobGiteaCleanup:
             patch(f"{MODULE}.gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
+            mock_db.get_job = AsyncMock(return_value=job)
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
@@ -313,6 +317,7 @@ class TestDeleteJobGiteaCleanup:
             patch(f"{MODULE}.gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
+            mock_db.get_job = AsyncMock(return_value=job)
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.job_has_durable_ticket_claim = AsyncMock(return_value=False)
