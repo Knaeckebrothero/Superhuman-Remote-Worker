@@ -112,6 +112,13 @@ WORKFLOWS: dict[str, Policy] = {
     "stage1-rebuild.yml": Policy(
         triggers=frozenset({"schedule", "workflow_dispatch"}),
     ),
+    "application-e2e.yml": Policy(
+        triggers=frozenset({"schedule", "workflow_dispatch"}),
+        why=(
+            "the full-stack observation builds an isolated k3d cluster and is "
+            "restricted to trusted scheduled/manual events"
+        ),
+    ),
     "postgres-operand-check.yml": Policy(
         triggers=frozenset({"schedule", "workflow_dispatch"}),
         hosted_only=True,
