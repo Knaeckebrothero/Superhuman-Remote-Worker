@@ -1,0 +1,143 @@
+name: application-e2e-observation
+
+# Phase-B observation lane for the first full-stack Cockpit journey. This is a
+# standalone scheduled/manual workflow: it deliberately does not extend the
+# fast test-cockpit job or gate pushes/releases until the documented bake window
+# is complete.
+
+on:
+  schedule:
+    # Daily, away from the top-of-hour scheduler spike and the Monday 06:00 UTC
+    # stage1 rebuild. GitHub schedules always use the default branch's workflow.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  APP_E2E_STATE_DIR: ${{ github.workspace }}/cockpit/test-results/application-e2e-ci-${{ github.run_id }}-${{ github.run_attempt }}
+  K3D_VERSION: v5.8.3
+  K3D_LINUX_AMD64_SHA256: dbaa79a76ace7f4ca230a1ff41dc7d8a5036a8ad0309e9c54f9bf3836dbe853e
+
+jobs:
+  application-e2e:
+    name: application E2E observation
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk space on hosted fallback
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/share/chromium \
+            /usr/share/swift /usr/local/julia* /opt/hostedtoolcache
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.5
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Install pinned k3d
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64" || {
+            echo "::error::The pinned application-E2E runner currently supports linux/amd64 only"
+            exit 1
+          }
+          target="${RUNNER_TEMP}/k3d"
+          curl --fail --silent --show-error --location \
+            "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64" \
+            --output "${target}"
+          echo "${K3D_LINUX_AMD64_SHA256}  ${target}" | sha256sum --check --strict
+          sudo install -m 0755 "${target}" /usr/local/bin/k3d
+
+      - name: Verify E2E host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker version --format 'Docker server {{.Server.Version}}'
+          k3d version
+          kubectl version --client
+          helm version --short
+          python --version
+          command -v ssh-keygen
+          test ! -e "${APP_E2E_STATE_DIR}"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)" || {
+            echo "::error::Application E2E requires a clean checkout"
+            exit 1
+          }
+
+      - name: Run fresh-cluster golden journey
+        id: journey
+        shell: bash
+        env:
+          CI: "1"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set +e
+          # Leave time inside the 45-minute job bound for SIGINT-driven exact
+          # cleanup, independent teardown proof, summaries, and artifact upload.
+          timeout --foreground --signal=INT --kill-after=4m 38m \
+            ./scripts/e2e-app.sh run
+          exit_code=$?
+          set -e
+          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+          if [ "${exit_code}" -eq 124 ] || [ "${exit_code}" -eq 137 ]; then
+            echo "::error::Application E2E exceeded its bounded lifecycle timeout"
+          fi
+          exit "${exit_code}"
+
+      - name: Verify teardown and publish observation summary
+        id: finalize
+        if: always()
+        shell: bash
+        env:
+          E2E_EXIT_CODE: ${{ steps.journey.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          python -m tests.e2e.app.ci_finalize \
+            --state-root "${APP_E2E_STATE_DIR}" \
+            --e2e-exit-code "${E2E_EXIT_CODE:-1}"
+
+      - name: Upload sanitized E2E metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-e2e-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            ${{ env.APP_E2E_STATE_DIR }}/*/ledger.json
+            ${{ env.APP_E2E_STATE_DIR }}/*/readiness.json
+            ${{ env.APP_E2E_STATE_DIR }}/*/cleanup.json
+            ${{ env.APP_E2E_STATE_DIR }}/*/playwright-output.txt
+            ${{ env.APP_E2E_STATE_DIR }}/*/browser/browser-resources.json
+            ${{ env.APP_E2E_STATE_DIR }}/*/diagnostics/**
+
+      - name: Upload browser evidence after proven teardown
+        if: ${{ always() && steps.finalize.outputs.teardown_proven == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-e2e-browser-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            ${{ env.APP_E2E_STATE_DIR }}/*/browser/playwright-report/**
+            ${{ env.APP_E2E_STATE_DIR }}/*/browser/artifacts/**
