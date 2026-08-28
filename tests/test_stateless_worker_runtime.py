@@ -233,6 +233,7 @@ def test_worker_bundle_rejects_missing_or_malformed_workspace_authority(
 
 def test_agent_worker_authority_maps_all_remote_backend_fields():
     metadata = {
+        "workspace_provisioner": "k8s",
         "workspace_generation": WORKSPACE_GENERATION,
         "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
         "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
@@ -246,6 +247,7 @@ def test_agent_worker_authority_maps_all_remote_backend_fields():
         "expected_host_key_fingerprint": WORKSPACE_FINGERPRINT,
         "workspace_owner_kind": "job",
         "workspace_owner_id": "33333333-3333-4333-8333-333333333333",
+        "require_host_key_fingerprint": True,
     }
     assert _stateless_worker_remote_authority({}, None) == {}
 
@@ -262,6 +264,7 @@ def test_agent_worker_authority_maps_all_remote_backend_fields():
 )
 def test_agent_worker_authority_fails_closed_on_incomplete_or_non_job_owner(mutation):
     metadata = {
+        "workspace_provisioner": "k8s",
         "workspace_generation": WORKSPACE_GENERATION,
         "workspace_runtime_incarnation": WORKSPACE_RUNTIME,
         "workspace_ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
