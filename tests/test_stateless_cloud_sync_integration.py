@@ -969,26 +969,49 @@ async def test_internal_workspace_nonready_claim_restarts_reconcile_without_endp
 
 
 @pytest.mark.asyncio
-async def test_internal_workspace_pinned_sandbox_keeps_historical_ready_contract():
+async def test_internal_workspace_pinned_sandbox_requires_exact_live_authority():
     import orchestrator.main as orch_main
 
     thread = _stateless_sandbox_thread()
     thread["execution_lane"] = "pinned"
     probe = AsyncMock(side_effect=AssertionError("pinned route must not attest UID"))
+    attestation = orch_main.WorkspaceRuntimeAttestation(
+        backing_id="k8s-pvc:agent-workspaces:pvc-uid",
+        workspace_generation=WORKSPACE_GENERATION,
+        runtime_incarnation=WORKSPACE_RUNTIME_INCARNATION,
+        ssh_host_key_fingerprint=WORKSPACE_SSH_HOST_KEY_FINGERPRINT,
+        host="ws-thread-111111111111.agent-workspaces.svc.cluster.local",
+        pod_ip="10.42.0.25",
+        port=30022,
+    )
+    attest = AsyncMock(return_value=attestation)
     schedule = MagicMock()
     with (
         patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
+        patch.object(
+            orch_main.container_provisioner,
+            "attest_workspace_runtime",
+            attest,
+        ),
         patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
     ):
         response = await _internal_workspace_response_for_lite_thread(thread)
 
     probe.assert_not_awaited()
+    assert attest.await_count == 2
+    assert all(
+        call.args == (orch_main.WorkspaceOwner.session(THREAD_ID),)
+        for call in attest.await_args_list
+    )
     schedule.assert_not_called()
     assert response["status"] == "ready"
     assert response["pod_ip"] == "10.42.0.25"
     assert response["workspace_generation"] == WORKSPACE_GENERATION
     assert response["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
-    assert response["workspace_ssh_host_key_fingerprint"] is None
+    assert (
+        response["workspace_ssh_host_key_fingerprint"]
+        == WORKSPACE_SSH_HOST_KEY_FINGERPRINT
+    )
 
 
 @pytest.mark.asyncio
