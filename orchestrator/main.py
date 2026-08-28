@@ -10,6 +10,7 @@ Or from orchestrator directory:
 import asyncio
 import copy
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -127,6 +128,7 @@ from database.postgres import (  # noqa: E402
     DatasourcePolicyValidationError,
     DatasourceScopeAuthorizationError,
     OfficerPostLifecycleConflict,
+    SshKeyAlreadyRegistered,
     _completion_control_active_sql,
     _completion_control_owned_active_sql,
     project_officer_harvested_state,
@@ -459,6 +461,12 @@ from services.email_datasource import (  # noqa: E402
 from services import discovery as discovery_service  # noqa: E402
 from services import family_matcher  # noqa: E402
 from services import readiness as readiness_service  # noqa: E402
+from services.ssh_public_keys import (  # noqa: E402
+    SIGNATURE_NAMESPACE,
+    SshKeyRejected,
+    parse_public_key,
+    verify_possession,
+)
 from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
 
 # Registry helpers live in src/ and stay there — the orchestrator imports
@@ -62630,6 +62638,232 @@ async def rotate_api_key(request: Request, token_id: str) -> dict[str, Any]:
     result = _serialize_api_key_row(row)
     result["token"] = token
     return result
+
+
+# =============================================================================
+# SSH Key Endpoints — possession-verified public key registration
+# =============================================================================
+#
+# Registration requires proving possession: without it, anyone could claim a
+# public key they merely read (e.g. published at github.com/<user>.keys), and
+# because fingerprints are globally unique that would deny the rightful owner
+# the ability to register their own key.
+#
+# The possession challenge is a STATELESS, HMAC-signed token, not a lookup in
+# an in-process dict. The orchestrator runs multiple replicas behind one
+# Service with no session affinity (deployment/values-experimental.yaml
+# `orchestrator.replicas: 2` on dev, deliberately — it's where the HA posture
+# gets exercised), so the pod that issues a challenge is frequently not the
+# pod that redeems it. An in-process store would reject roughly half of all
+# registrations with "unknown challenge" — a coin flip, not a rare race. See
+# ruling F24 in
+# .superpowers/sdd/2026-08-28-workspace-ssh-access-foundation/progress.md.
+
+
+class SshKeyCreate(BaseModel):
+    name: str
+    public_key: str
+    challenge: str
+    signature: str
+
+
+_SSH_CHALLENGE_TTL_SECONDS = 300
+_SSH_CHALLENGE_VERSION = "srw-ssh1"
+
+
+def _mint_ssh_key_challenge(
+    user_id: str, *, now: float | None = None
+) -> tuple[str, float]:
+    """Mint a possession challenge bound to ``user_id``.
+
+    Returns ``(token, expires_at_unix_ts)``. The token is the exact string
+    the caller signs with ``ssh-keygen -Y sign``, so its wire format —
+    version tag, nonce, user id, expiry and an HMAC-SHA256 signature, all
+    dot-joined — is deliberately restricted to printable ASCII with no
+    whitespace: ``secrets.token_urlsafe`` output, a hyphenated UUID, decimal
+    digits and a hex digest, none of which can contain a literal ``.``, so
+    splitting on it in ``_verify_ssh_key_challenge`` is unambiguous.
+
+    Not single-use, deliberately (ruling F24). A nonce store would give
+    literal single-use, but that isn't the property this token needs:
+    binding it to the caller's user id is what carries the actual security
+    guarantee. The attack single-use would prevent is replaying a captured
+    (challenge, signature) pair to register someone else's public key under
+    the attacker's account — the lockout risk this whole possession check
+    exists to prevent, since SSH key fingerprints are globally unique. A
+    token minted for user A can never redeem for user B (checked in
+    ``_verify_ssh_key_challenge``), and a user replaying their own token just
+    re-registers their own key, which the fingerprint's uniqueness
+    constraint already rejects (409, see ``create_ssh_key``). Do not "fix"
+    this back into a stateful nonce store: every orchestrator replica shares
+    SESSION_JWT_SECRET via one Kubernetes Secret, but replicas do not share
+    memory, which is the whole reason this token is stateless.
+    """
+    if now is None:
+        now = time.time()
+    expires_at = now + _SSH_CHALLENGE_TTL_SECONDS
+    nonce = secrets.token_urlsafe(24)
+    payload = f"{_SSH_CHALLENGE_VERSION}.{nonce}.{user_id}.{int(expires_at)}"
+    signature = hmac.new(
+        _session_jwt_secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{signature}", expires_at
+
+
+def _verify_ssh_key_challenge(
+    token: str, user_id: str, *, now: float | None = None
+) -> bool:
+    """True iff ``token`` was minted by us, for ``user_id``, and is unexpired.
+
+    Check order is deliberate and load-bearing: the HMAC must be verified
+    before any field the token carries (expiry, embedded user id) is
+    trusted, because until the MAC checks out those fields are
+    attacker-controlled input, not fact.
+    """
+    if now is None:
+        now = time.time()
+    parts = token.split(".")
+    if len(parts) != 5:
+        return False
+    version, nonce, token_user_id, expires_at_raw, signature = parts
+    if version != _SSH_CHALLENGE_VERSION:
+        return False
+    payload = f"{version}.{nonce}.{token_user_id}.{expires_at_raw}"
+    expected_signature = hmac.new(
+        _session_jwt_secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        return False
+    try:
+        expires_at = float(expires_at_raw)
+    except ValueError:
+        return False
+    if expires_at <= now:
+        return False
+    return hmac.compare_digest(token_user_id, str(user_id))
+
+
+def _serialize_ssh_key_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "name": row["name"],
+        "key_type": row["key_type"],
+        "fingerprint": row["fingerprint_sha256"],
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "last_used_at": (
+            row["last_used_at"].isoformat() if row.get("last_used_at") else None
+        ),
+        "disabled": row.get("disabled_at") is not None,
+    }
+
+
+@app.post("/api/ssh-keys/challenge")
+async def create_ssh_key_challenge(request: Request) -> dict[str, Any]:
+    """Issue a nonce the caller must sign with the private half of the key they
+    are registering.
+
+    Without proof of possession, anyone could claim a public key they merely
+    read — and since fingerprints are globally unique, that denies the
+    rightful owner the ability to register their own key.
+    """
+    user = await require_approved_user(request, postgres_db)
+    if not _session_jwt_secret:
+        # Fail closed: an empty secret is a well-known HMAC key, so every
+        # replica would sign forgeable tokens. main.py:1403 only logs a
+        # warning for this today — do not rely on that here.
+        raise HTTPException(
+            status_code=503,
+            detail="SSH key registration is temporarily unavailable.",
+        )
+    token, expires_at = _mint_ssh_key_challenge(str(user["id"]))
+    return {
+        "challenge": token,
+        "namespace": SIGNATURE_NAMESPACE,
+        "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+    }
+
+
+@app.post("/api/ssh-keys")
+async def create_ssh_key(request: Request, body: SshKeyCreate) -> dict[str, Any]:
+    """Register an SSH public key after verifying possession."""
+    user = await require_approved_user(request, postgres_db)
+
+    if not _session_jwt_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="SSH key registration is temporarily unavailable.",
+        )
+    if not _verify_ssh_key_challenge(body.challenge, str(user["id"])):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Challenge is unknown, expired, or was issued to a "
+                "different account. Request a new one."
+            ),
+        )
+
+    try:
+        parsed = parse_public_key(body.public_key)
+    except SshKeyRejected as exc:
+        raise HTTPException(status_code=400, detail=exc.reason) from exc
+
+    if not verify_possession(
+        parsed.public_key,
+        SIGNATURE_NAMESPACE,
+        body.challenge.encode("utf-8"),
+        body.signature,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Could not verify possession of this key. Sign the challenge "
+                "with the matching private key and paste the signature."
+            ),
+        )
+
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Give the key a name.")
+
+    try:
+        row = await postgres_db.create_user_ssh_key(
+            user_id=str(user["id"]),
+            name=name,
+            key_type=parsed.key_type,
+            public_key=parsed.public_key,
+            fingerprint_sha256=parsed.fingerprint_sha256,
+        )
+    except SshKeyAlreadyRegistered as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This key is already registered, possibly on another account. "
+                "Register a different key, or contact support to have the "
+                "existing registration released."
+            ),
+        ) from exc
+    return _serialize_ssh_key_row(row)
+
+
+@app.get("/api/ssh-keys")
+async def list_ssh_keys(request: Request) -> list[dict[str, Any]]:
+    """The current user's registered SSH public keys."""
+    user = await require_approved_user(request, postgres_db)
+    rows = await postgres_db.list_user_ssh_keys(str(user["id"]))
+    return [_serialize_ssh_key_row(r) for r in rows]
+
+
+@app.delete("/api/ssh-keys/{key_id}")
+async def delete_ssh_key(request: Request, key_id: str) -> dict[str, str]:
+    """Remove one of the current user's keys."""
+    user = await require_approved_user(request, postgres_db)
+    if not await postgres_db.delete_user_ssh_key(key_id, str(user["id"])):
+        raise HTTPException(status_code=404, detail="Key not found")
+    return {"status": "deleted"}
 
 
 # =============================================================================
