@@ -467,6 +467,13 @@ from services.ssh_public_keys import (  # noqa: E402
     parse_public_key,
     verify_possession,
 )
+from services.ssh_gateway_targets import resolve_workspace_state  # noqa: E402
+from services.ssh_handles import is_valid_handle  # noqa: E402
+from services.canvas_ssh import (  # noqa: E402
+    CanvasSSHError,
+    bound_workspace_generation,
+    resolve_remote_workspace_target,
+)
 from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
 
 # Registry helpers live in src/ and stay there — the orchestrator imports
@@ -622,6 +629,7 @@ from services.lifecycle import (  # noqa: E402
 )
 from services.workspace_suspension import (  # noqa: E402
     WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY,
+    _thread_is_vm_tier,
     workspace_suspension_service,
 )
 from services.snapshot_service import snapshot_service  # noqa: E402
@@ -62943,6 +62951,91 @@ async def delete_ssh_key(request: Request, key_id: str) -> dict[str, str]:
     if not deleted:
         raise HTTPException(status_code=404, detail="Key not found")
     return {"status": "deleted"}
+
+
+@app.get("/api/internal/ssh-targets/{handle}")
+async def get_ssh_target(
+    request: Request, handle: str, fingerprint: str
+) -> dict[str, Any]:
+    """Resolve an SSH handle plus a presented key fingerprint to a workspace
+    target. **Internal** — requires ``X-Internal-Key``.
+
+    The gateway sends the FINGERPRINT, never a user id: it holds no database
+    credentials, and this codebase does not accept an internal key plus an
+    asserted user identity. Key-to-user mapping stays here so disabled_at,
+    approval and last_used_at are enforced server-side.
+
+    Unknown handle, unknown key and unauthorized all return an identical 404.
+    A resolvable-but-not-live workspace returns 200 with a non-live ``state``
+    and ``pod_ip: None``, so the gateway can print a readable reason.
+    """
+    await require_internal(request)
+
+    if not is_valid_handle(handle):
+        raise HTTPException(status_code=404, detail="No such workspace")
+
+    opaque = HTTPException(status_code=404, detail="No such workspace")
+
+    thread_id = await postgres_db.get_thread_id_by_ssh_handle(handle)
+    if not thread_id:
+        raise opaque
+    user = await postgres_db.resolve_user_by_ssh_fingerprint(fingerprint)
+    if not user:
+        raise opaque
+    if not await user_can_access_ide_entity(user, postgres_db, thread_id):
+        raise opaque
+
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise opaque
+    metadata = thread_metadata_object(thread)
+
+    ws_ctx = metadata.get("workspace_container") or {}
+    vm_ctx = metadata.get("vm") or {}
+    if _thread_is_vm_tier(metadata, ws_ctx, vm_ctx):
+        return {
+            "thread_id": thread_id,
+            "user_id": str(user["id"]),
+            "pod_ip": None,
+            "pod_port": None,
+            "host_key_fingerprint": None,
+            "state": "vm_unsupported",
+        }
+
+    state = resolve_workspace_state(thread, metadata)
+    if state != "live":
+        return {
+            "thread_id": thread_id,
+            "user_id": str(user["id"]),
+            "pod_ip": None,
+            "pod_port": None,
+            "host_key_fingerprint": None,
+            "state": state,
+        }
+
+    try:
+        target = resolve_remote_workspace_target(
+            thread, bound_workspace_generation(thread)
+        )
+    except CanvasSSHError as exc:
+        logger.info("ssh-target unresolvable for %s: %s", thread_id, exc)
+        return {
+            "thread_id": thread_id,
+            "user_id": str(user["id"]),
+            "pod_ip": None,
+            "pod_port": None,
+            "host_key_fingerprint": None,
+            "state": "never_provisioned",
+        }
+
+    return {
+        "thread_id": thread_id,
+        "user_id": str(user["id"]),
+        "pod_ip": target.host,
+        "pod_port": target.port,
+        "host_key_fingerprint": target.fingerprint,
+        "state": "live",
+    }
 
 
 # =============================================================================
