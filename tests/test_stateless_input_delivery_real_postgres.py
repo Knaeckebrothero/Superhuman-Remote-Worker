@@ -126,6 +126,11 @@ async def _seed_pinned_thread(db: PostgresDB) -> tuple[UUID, UUID, UUID]:
     user_id = uuid4()
     thread_id = uuid4()
     agent_id = uuid4()
+    provision_attempt = uuid4()
+    runtime_attach_token = uuid4()
+    pod_name = "pinned-input-pod"
+    pod_uid = "pod-pinned"
+    namespace = "agents-a"
     async with db.acquire() as conn:
         await conn.execute(
             "INSERT INTO users (id,display_name,email) "
@@ -141,18 +146,52 @@ async def _seed_pinned_thread(db: PostgresDB) -> tuple[UUID, UUID, UUID]:
             user_id,
             json.dumps({"config_override": {"officer": {"enabled": True}}}),
         )
+        runtime_generation = await conn.fetchval(
+            "SELECT runtime_generation FROM threads WHERE id=$1",
+            thread_id,
+        )
+
+    reserved = await db.reserve_pinned_agent_pod_provision_intent(
+        str(thread_id),
+        expected_runtime_generation=str(runtime_generation),
+        attempt_id=str(provision_attempt),
+        pod_name=pod_name,
+        provisioner="persistent",
+        namespace=namespace,
+    )
+    assert reserved is not None
+    assert await db.publish_pinned_agent_pod_provision_intent(
+        str(thread_id),
+        expected_runtime_generation=str(runtime_generation),
+        attempt_id=str(provision_attempt),
+        pod_name=pod_name,
+        pod_uid=pod_uid,
+        namespace=namespace,
+    )
+
+    async with db.acquire() as conn:
         await conn.execute(
             "INSERT INTO agents "
             "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,"
-            "thread_id,last_heartbeat) "
-            "VALUES ($1,'default','pinned-input-pod','127.0.0.1','pod-pinned',"
-            "'session','persistent',$2,now())",
+            "last_heartbeat) "
+            "VALUES ($1,'default',$2,'127.0.0.1',$3,'session','persistent',now())",
             agent_id,
-            thread_id,
+            pod_name,
+            pod_uid,
         )
-        await conn.execute(
-            "UPDATE threads SET agent_id=$2 WHERE id=$1", thread_id, agent_id
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE threads SET agent_id=$2,control_admission_agent_id=$2,"
+                "runtime_attach_token=$3 WHERE id=$1",
+                thread_id,
+                agent_id,
+                runtime_attach_token,
+            )
+            await conn.execute(
+                "UPDATE agents SET thread_id=$2 WHERE id=$1",
+                agent_id,
+                thread_id,
+            )
     return user_id, thread_id, agent_id
 
 
@@ -586,7 +625,7 @@ async def test_terminal_pinned_replay_survives_change_to_stateless(db):
                 turn_number=1,
             )
         await conn.execute(
-            "UPDATE threads SET execution_lane='stateless', agent_id=NULL WHERE id=$1",
+            "UPDATE threads SET execution_lane='stateless' WHERE id=$1",
             thread_id,
         )
 
