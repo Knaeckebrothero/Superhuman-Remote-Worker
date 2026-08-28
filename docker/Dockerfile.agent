@@ -50,7 +50,7 @@ FROM python:3.11-slim
 ARG SRW_SOURCE_REVISION=""
 ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
 ARG SRW_RELEASE_VERSION=""
-ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
 
 LABEL maintainer="SRW Team"
 LABEL description="Universal Agent for document processing and requirement validation"

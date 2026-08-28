@@ -71,9 +71,7 @@ if _transport == "http":
         except ImportError:
             from oauth_bridge import SRWOAuthProxy  # type: ignore[no-redef]
 
-        _base_url = os.environ.get(
-            "MCP_BASE_URL", "https://mcp.superhuman-remote-worker.com"
-        )
+        _base_url = os.environ.get("MCP_BASE_URL", "http://localhost:8055")
         _auth = SRWOAuthProxy(
             config_url=os.environ.get(
                 "MCP_OIDC_CONFIG_URL",

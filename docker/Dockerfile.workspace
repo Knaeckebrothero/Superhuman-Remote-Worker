@@ -13,7 +13,7 @@ FROM ubuntu:24.04
 ARG SRW_SOURCE_REVISION=""
 ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
 ARG SRW_RELEASE_VERSION=""
-ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
 ARG DEBIAN_FRONTEND=noninteractive
 ARG CODE_SERVER_VERSION=4.100.3
 ARG NODE_MAJOR=22

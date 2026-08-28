@@ -3,7 +3,7 @@ FROM python:3.12-slim
 ARG SRW_SOURCE_REVISION=""
 ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
 ARG SRW_RELEASE_VERSION=""
-ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
 
 LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
 LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"

@@ -3090,7 +3090,7 @@ vmController:
 # =============================================================================
 # Logging
 # =============================================================================
-logLevel: "DEBUG"
+logLevel: "INFO"
 # Log output format: "json" (structured, for the Alloy -> Loki pipeline) or
 # "text" (human-readable). See knowledge-base/knowledge/features/centralized_logging.md.
 logFormat: "json"

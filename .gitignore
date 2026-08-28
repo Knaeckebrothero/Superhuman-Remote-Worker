@@ -241,3 +241,8 @@ HomeLab/
 knowledge-base/
 knowledge-history/
 srw-cloud/
+
+# Release-transition scaffolding — working docs, never published.
+# Both describe the history-rewrite plan and where credentials used to live.
+RECLONE-INSTRUCTIONS.md
+release_transition_checklist.md

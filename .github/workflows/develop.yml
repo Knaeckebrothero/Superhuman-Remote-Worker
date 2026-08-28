@@ -41,9 +41,9 @@ env:
   # but GHCR rejects uppercase image paths. docker/metadata-action handles
   # this for production tags; YAML expressions can't lowercase, so we hardcode.
   # Update this if the repo is renamed.
-  REPO_LOWER: knaeckebrothero/uni-projekt-graph-rag
+  REPO_LOWER: knaeckebrothero/superhuman-remote-worker
   SRW_SOURCE_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
-  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs
+  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
   SRW_RELEASE_VERSION: 0.0.0-dev.sha-${{ github.sha }}
 
 jobs:

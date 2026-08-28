@@ -20,17 +20,12 @@ from src.utils.ssh_key import (
 )
 
 
-# A real ed25519 key with no passphrase, comment "test-fixture@srw".
-# Used as a known-good baseline for round-trip tests.
-VALID_ED25519 = (
-    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
-    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n"
-    "QyNTUxOQAAACAK89GbliOywfgVW2OxznwGs84eJxJE4IZ9+Eu8mrO1RwAAAJhvDkS7bw5E\n"
-    "uwAAAAtzc2gtZWQyNTUxOQAAACAK89GbliOywfgVW2OxznwGs84eJxJE4IZ9+Eu8mrO1Rw\n"
-    "AAAEB93iLMaUtuQZDbUIaCFdgKNO0trRtioluKbeoG6OSjkwrz0ZuWI7LB+BVbY7HOfAaz\n"
-    "zh4nEkTghn34S7yas7VHAAAAEHRlc3QtZml4dHVyZUBzcncBAgMEBQ==\n"
-    "-----END OPENSSH PRIVATE KEY-----\n"
-)
+# Generated fresh at import rather than hardcoded: a committed private key
+# — even a purpose-built fixture — trips GitHub secret scanning and push
+# protection, and draws "private key in repo" reports on a public repo.
+# ``private_key`` already arrives normalized with a trailing newline, so the
+# round-trip identity these tests assert holds exactly as before.
+VALID_ED25519 = generate_ed25519_keypair("test-fixture@srw").private_key
 
 
 class TestNormalize:
