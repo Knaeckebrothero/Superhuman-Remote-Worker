@@ -108,10 +108,14 @@ async def test_delete_reports_miss():
 
 @pytest.mark.asyncio
 async def test_resolve_ignores_disabled_keys():
+    """A miss — disabled key, unapproved account, or unknown fingerprint — is
+    one statement, not two. Regression guard: the bump must not fire on a miss."""
     conn = FakeConn(fetchrow=None)
     assert await _db(conn).resolve_user_by_ssh_fingerprint("SHA256:" + "A" * 43) is None
+    assert len(conn.calls) == 1
     sql, _ = conn.calls[0]
     assert "disabled_at IS NULL" in sql
+    assert "is_approved" in sql
 
 
 @pytest.mark.asyncio
@@ -119,4 +123,19 @@ async def test_resolve_bumps_last_used():
     conn = FakeConn(fetchrow={"id": "u1", "is_approved": True})
     user = await _db(conn).resolve_user_by_ssh_fingerprint("SHA256:" + "A" * 43)
     assert user["id"] == "u1"
-    assert any("last_used_at" in sql for sql, _ in conn.calls)
+    assert len(conn.calls) == 1
+    sql, _ = conn.calls[0]
+    assert "last_used_at" in sql
+
+
+@pytest.mark.asyncio
+async def test_resolve_does_not_overfetch_columns():
+    """Regression guard for the old ``SELECT u.*``: JSONB columns (settings,
+    cloud_identity) come back from asyncpg as unparsed strings, so this
+    network-facing identity lookup must keep using an explicit column list."""
+    conn = FakeConn(fetchrow={"id": "u1"})
+    await _db(conn).resolve_user_by_ssh_fingerprint("SHA256:" + "A" * 43)
+    sql, _ = conn.calls[0]
+    assert "u.*" not in sql
+    assert "settings" not in sql
+    assert "cloud_identity" not in sql

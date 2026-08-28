@@ -40968,30 +40968,47 @@ class PostgresDB:
     ) -> Optional[Dict[str, Any]]:
         """Map a presented key fingerprint to its owning user.
 
-        Enabled keys only. This is the ssh-gateway's identity lookup, which is
-        why it lives here and not in the gateway: the gateway holds no database
-        credentials, and an internal key plus an asserted user_id is explicitly
-        not accepted anywhere in this codebase.
+        Enabled keys belonging to APPROVED accounts only — an unapproved or
+        deactivated account resolves to None even with a valid registered key.
+
+        This is the ssh-gateway's identity lookup, which is why it lives here
+        and not in the gateway: the gateway holds no database credentials, and
+        an internal key plus an asserted user_id is explicitly not accepted
+        anywhere in this codebase.
         """
         async with self.acquire() as conn:
+            # One statement, deliberately. Three reasons:
+            #  * An explicit column list, mirroring get_user (postgres.py:34419),
+            #    keeps unparsed JSONB (settings, cloud_identity) out of a value
+            #    that flows to a network-facing gateway.
+            #  * Folding the last_used_at bump into the same statement means a
+            #    failed bump can no longer discard an already-successful resolution
+            #    and deny a legitimate key holder.
+            #  * The is_approved check lives here because there is exactly one
+            #    caller and a future one must not be able to forget it. An
+            #    unapproved account resolves to None, which the gateway endpoint
+            #    renders as the same opaque 404 as an unknown handle.
             row = await conn.fetchrow(
                 """
-                SELECT u.*
-                FROM user_ssh_keys k
-                JOIN users u ON u.id = k.user_id
-                WHERE k.fingerprint_sha256 = $1
-                  AND k.disabled_at IS NULL
+                WITH bumped AS (
+                    UPDATE user_ssh_keys k
+                    SET last_used_at = now()
+                    WHERE k.fingerprint_sha256 = $1
+                      AND k.disabled_at IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM users u
+                          WHERE u.id = k.user_id AND u.is_approved
+                      )
+                    RETURNING k.user_id
+                )
+                SELECT u.id, u.display_name, u.email, u.is_admin, u.is_approved,
+                       u.preferred_username, u.default_project_id, u.created_at
+                FROM users u
+                JOIN bumped b ON b.user_id = u.id
                 """,
                 fingerprint,
             )
-            if row is None:
-                return None
-            await conn.execute(
-                "UPDATE user_ssh_keys SET last_used_at = now() "
-                "WHERE fingerprint_sha256 = $1",
-                fingerprint,
-            )
-            return dict(row)
+            return dict(row) if row else None
 
     # =========================================================================
     # PROJECT API KEY OPERATIONS
