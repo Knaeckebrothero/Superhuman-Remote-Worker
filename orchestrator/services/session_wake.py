@@ -1171,23 +1171,14 @@ def _officer_hold(thread: dict[str, Any]) -> dict[str, Any]:
 async def deliver_officer_note(db: Any, thread: dict[str, Any], text: str) -> str:
     """Deliver one Legate note to an officer. Returns how it landed.
 
-    ``'live'`` — it reached the pod's input queue, which wakes him before his
-    timer (centurion.md §4). ``'queued'`` — no live loop took it, so it is a
-    durable ``legate`` outbox row the drain delivers at the next wake.
-    ``'held'`` — it is queued behind a hold and will not arrive until that
-    hold lifts.
+    ``'queued'`` means the durable ``legate`` outbox owns the note and its
+    delivery identity. The drain persists it for the exact current runtime to
+    claim; a recyclable Pod IP is never treated as recipient authority.
+    ``'held'`` means the same durable note is fenced behind the current hold.
 
-    Holds are not all alike, and the difference is visible in the row. A
-    CONFERENCE hold carries the conference ``thread_id``: the meeting is the
-    single writer (centurion.md §2), so the note is queued without a live
-    attempt and arrives with the brief wake. A MAINTENANCE hold carries no
-    ``thread_id`` — the Legate stood him down himself and the hold notice
-    promises "Legate messages still reach you", so the live path stays open
-    (the same rule ``_inject_officer_notice`` states).
-
-    The return value is the caller's honesty contract — a note reported as
-    delivered when it only reached a table is worse than an error. Each note
-    carries a fresh ``dedup_key`` so notes never coalesce with each other.
+    The return value is the caller's honesty contract — durable acceptance is
+    not reported as provider admission. Each note carries a fresh
+    ``dedup_key`` so notes never coalesce with each other.
     """
     hold = _officer_hold(thread)
     delivery_id = str(uuid4())

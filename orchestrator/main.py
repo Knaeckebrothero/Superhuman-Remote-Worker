@@ -46546,11 +46546,10 @@ async def send_project_officer_note(
     hold/release. The reply, if he has one, arrives in his log or as a page;
     this endpoint deliberately has no ask-and-wait leg.
 
-    The response states which of the three deliveries happened rather than a
-    bare 200: ``live`` reached his input queue, ``queued`` is a durable wake
-    row he reads at ``next_wake_at``, and ``held`` is queued behind a hold
-    that must lift first. A note reported as sent when it only reached a
-    table would be worse than an error.
+    The response states which durable acceptance happened rather than a bare
+    200: ``queued`` is a wake row whose stable identity is claimed by the
+    exact current runtime, and ``held`` is fenced behind a hold that must lift
+    first. Durable acceptance is never reported as provider admission.
     """
     user, _project = await require_project_owner(
         request, postgres_db, project_id, allow_archived=False

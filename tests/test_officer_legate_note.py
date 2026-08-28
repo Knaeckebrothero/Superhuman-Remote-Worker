@@ -3,9 +3,9 @@
 A note is direction from the Legate reaching an officer from outside the
 cockpit. Two properties are load-bearing and each has a test here:
 
-* The caller is always told which of the three deliveries happened (live
-  inject, durable queue, deferred under a conference hold). A note reported as
-  "sent" when it only reached a table is worse than an error.
+* The caller is always told whether the durable note is runnable now or held.
+  A note reported as consumed before its exact runtime admits it is worse than
+  an explicit queued result.
 * A note never coalesces with another note. The wake outbox dedups on
   (thread, source, dedup_key) while pending, so every note carries a fresh key
   — two directives in one minute are two directives.
@@ -20,7 +20,6 @@ from uuid import UUID
 import pytest
 
 from services import session_wake
-from src.shared.pinned_session_identity import PinnedSessionBinding
 
 THREAD_ID = "6ce5bc4c-0000-4000-8000-000000000001"
 AGENT_ID = "f898a7dd-0000-4000-8000-000000000002"
@@ -35,35 +34,6 @@ NOTE = "[Legate note — Legate via MCP, 2026-08-17 09:00 UTC]\n\nStop the theme
 # deliberately carries no thread_id (main.py hold_project_officer).
 CONFERENCE_HOLD = {"thread_id": "conf-1", "kind": "conference"}
 MAINTENANCE_HOLD = {"kind": "maintenance", "note": "migrating the cluster"}
-
-
-class _FakeResponse:
-    def __init__(self, status_code: int, text: str = ""):
-        self.status_code = status_code
-        self.text = text
-
-    def json(self):
-        if self.status_code in {200, 202}:
-            return {"delivery_state": "admitted"}
-        return {}
-
-
-class _FakeAsyncClient:
-    posts: list = []
-    next_status = 200
-
-    def __init__(self, *a, **kw):
-        pass
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    async def post(self, url, json=None, headers=None):
-        _FakeAsyncClient.posts.append((url, json))
-        return _FakeResponse(_FakeAsyncClient.next_status)
 
 
 def _thread(*, hold: dict | None = None, agent_id: str | None = AGENT_ID) -> dict:
@@ -85,71 +55,27 @@ def _thread(*, hold: dict | None = None, agent_id: str | None = AGENT_ID) -> dic
     }
 
 
-def _agent(**over) -> dict:
-    a = {
-        "id": AGENT_ID,
-        "thread_id": THREAD_ID,
-        "status": "session",
-        "pod_ip": "10.1.2.3",
-        "pod_port": 8001,
-        "hostname": "srw-officer-agent",
-        "pod_uid": POD_UID,
-    }
-    a.update(over)
-    return a
-
-
-def _binding(agent: dict | None) -> PinnedSessionBinding | None:
-    if agent is None:
-        return None
-    return PinnedSessionBinding(
-        thread_id=THREAD_ID,
-        runtime_generation=RUNTIME_GENERATION,
-        agent_id=AGENT_ID,
-        runtime_attach_token=ATTACH_TOKEN,
-        agent_hostname=str(agent["hostname"]),
-        pod_namespace="srw",
-        pod_uid=str(agent["pod_uid"]),
-        pod_ip=str(agent["pod_ip"]),
-        pod_port=int(agent["pod_port"]),
-        agent_status=str(agent["status"]),
-    )
-
-
-def _db(*, agent=None) -> SimpleNamespace:
+def _db() -> SimpleNamespace:
     return SimpleNamespace(
-        get_agent=AsyncMock(return_value=agent),
-        get_pinned_session_binding=AsyncMock(return_value=_binding(agent)),
         enqueue_session_wake_event=AsyncMock(return_value=True),
         save_thread_message=AsyncMock(),
     )
 
 
-@pytest.fixture(autouse=True)
-def _reset_http(monkeypatch):
-    _FakeAsyncClient.posts = []
-    _FakeAsyncClient.next_status = 200
-    monkeypatch.setattr(session_wake.httpx, "AsyncClient", _FakeAsyncClient)
-    monkeypatch.setattr(session_wake, "probe_ready", AsyncMock(return_value=True))
-
-
 @pytest.mark.asyncio
-async def test_a_live_officer_receives_the_note_on_his_input_queue():
-    db = _db(agent=_agent())
+async def test_an_attached_officer_receives_the_note_through_the_durable_outbox():
+    db = _db()
 
-    assert await session_wake.deliver_officer_note(db, _thread(), NOTE) == "live"
+    assert await session_wake.deliver_officer_note(db, _thread(), NOTE) == "queued"
 
-    url, body = _FakeAsyncClient.posts[0]
-    assert url == "http://10.1.2.3:8001/api/input"
-    assert body["content"] == NOTE
-    assert body["role"] == "event"
-    UUID(body["delivery_id"])
-    db.enqueue_session_wake_event.assert_not_awaited()
+    kwargs = db.enqueue_session_wake_event.await_args.kwargs
+    assert kwargs["payload"]["message"] == NOTE
+    UUID(kwargs["payload"]["_delivery_id"])
 
 
 @pytest.mark.asyncio
 async def test_a_note_with_no_live_pod_is_queued_verbatim_for_the_next_wake():
-    db = _db(agent=None)
+    db = _db()
 
     assert await session_wake.deliver_officer_note(db, _thread(), NOTE) == "queued"
 
@@ -161,37 +87,33 @@ async def test_a_note_with_no_live_pod_is_queued_verbatim_for_the_next_wake():
 
 
 @pytest.mark.asyncio
-async def test_refused_live_note_queues_the_same_delivery_identity():
-    db = _db(agent=_agent())
-    _FakeAsyncClient.next_status = 503
+async def test_the_outbox_owns_the_delivery_identity_before_runtime_admission():
+    db = _db()
 
     assert await session_wake.deliver_officer_note(db, _thread(), NOTE) == "queued"
 
-    posted_id = _FakeAsyncClient.posts[0][1]["delivery_id"]
     queued_id = db.enqueue_session_wake_event.await_args.kwargs["payload"][
         "_delivery_id"
     ]
-    assert queued_id == posted_id
     UUID(queued_id)
 
 
 @pytest.mark.asyncio
 async def test_a_note_under_a_conference_hold_queues_without_injecting():
     """The conference is the single writer; the note waits for the brief wake."""
-    db = _db(agent=_agent())
+    db = _db()
 
     assert (
         await session_wake.deliver_officer_note(db, _thread(hold=CONFERENCE_HOLD), NOTE)
         == "held"
     )
 
-    assert _FakeAsyncClient.posts == []
     db.enqueue_session_wake_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_two_queued_notes_never_coalesce():
-    db = _db(agent=None)
+    db = _db()
 
     await session_wake.deliver_officer_note(db, _thread(), "first")
     await session_wake.deliver_officer_note(db, _thread(), "second")
@@ -204,10 +126,9 @@ async def test_two_queued_notes_never_coalesce():
 
 
 @pytest.mark.asyncio
-async def test_a_rejected_live_inject_falls_back_to_the_durable_queue():
-    """A pod that is up but has no loop attached answers 503; the note survives."""
-    db = _db(agent=_agent())
-    _FakeAsyncClient.next_status = 503
+async def test_an_attached_runtime_never_bypasses_the_durable_queue():
+    """A recyclable Pod coordinate is never treated as recipient authority."""
+    db = _db()
 
     assert await session_wake.deliver_officer_note(db, _thread(), NOTE) == "queued"
 
@@ -215,23 +136,22 @@ async def test_a_rejected_live_inject_falls_back_to_the_durable_queue():
 
 
 @pytest.mark.asyncio
-async def test_a_maintenance_hold_still_lets_the_legate_through():
-    """He was stood down BY the Legate; the note is how the Legate redirects him."""
-    db = _db(agent=_agent())
+async def test_a_maintenance_hold_defers_the_note_until_release():
+    db = _db()
 
     assert (
         await session_wake.deliver_officer_note(
             db, _thread(hold=MAINTENANCE_HOLD), NOTE
         )
-        == "live"
+        == "held"
     )
-    assert _FakeAsyncClient.posts
+    db.enqueue_session_wake_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_a_held_officer_with_no_live_pod_is_reported_held_not_queued():
     """The drain skips held threads, so 'queued' would overpromise delivery."""
-    db = _db(agent=None)
+    db = _db()
 
     assert (
         await session_wake.deliver_officer_note(
@@ -371,14 +291,13 @@ def test_the_legate_routes_are_wired():
 
 
 @pytest.mark.asyncio
-async def test_a_live_attempt_that_raises_still_queues_the_note(monkeypatch):
-    """The transport is allowed to fail; losing the Legate's words is not."""
-    db = _db(agent=_agent())
-    monkeypatch.setattr(
-        session_wake, "probe_ready", AsyncMock(side_effect=RuntimeError("pod gone"))
-    )
+async def test_a_detached_thread_still_keeps_the_note():
+    db = _db()
 
-    assert await session_wake.deliver_officer_note(db, _thread(), NOTE) == "queued"
+    assert (
+        await session_wake.deliver_officer_note(db, _thread(agent_id=None), NOTE)
+        == "queued"
+    )
     db.enqueue_session_wake_event.assert_awaited_once()
 
 
