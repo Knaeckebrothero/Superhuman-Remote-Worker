@@ -41093,6 +41093,56 @@ class PostgresDB:
             return dict(row) if row else None
 
     # =========================================================================
+    # SSH ATTACHMENT AUDIT OPERATIONS
+    # =========================================================================
+
+    async def record_ssh_attachment(
+        self,
+        thread_id: str,
+        user_id: str,
+        ssh_key_id: Optional[str],
+        client_ip: Optional[str],
+        handle: str,
+    ) -> str:
+        """Open an attach record. Returns its id for the matching close."""
+        async with self.acquire() as conn:
+            value = await conn.fetchval(
+                """
+                INSERT INTO ssh_attachments
+                    (thread_id, user_id, ssh_key_id, handle, client_ip)
+                VALUES ($1, $2, $3, $4, $5::inet)
+                RETURNING id
+                """,
+                UUID(thread_id),
+                UUID(user_id),
+                UUID(ssh_key_id) if ssh_key_id else None,
+                handle,
+                client_ip,
+            )
+            return str(value)
+
+    async def close_ssh_attachment(
+        self, attachment_id: str, channels: List[str]
+    ) -> None:
+        """Stamp detach time and the channel types the session actually opened.
+
+        attachment_id is passed through as a string rather than pre-parsed
+        with UUID(): asyncpg's uuid codec accepts a plain str for a $n it
+        infers as uuid from the prepared statement, same as record_ssh_attachment's
+        `RETURNING id` -> str(value) round-trip that produced this value.
+        """
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE ssh_attachments
+                SET detached_at = now(), channels = $2
+                WHERE id = $1 AND detached_at IS NULL
+                """,
+                attachment_id,
+                list(channels),
+            )
+
+    # =========================================================================
     # PROJECT API KEY OPERATIONS
     # =========================================================================
 

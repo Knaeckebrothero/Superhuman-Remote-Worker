@@ -17549,6 +17549,23 @@ COMMENT ON COLUMN public.srw_sessions.last_seen_at IS 'Idle timeout anchor: vali
 
 
 --
+-- Name: ssh_attachments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ssh_attachments (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    thread_id uuid NOT NULL,
+    user_id uuid,
+    ssh_key_id uuid,
+    handle text NOT NULL,
+    client_ip inet,
+    channels text[] DEFAULT '{}'::text[] NOT NULL,
+    attached_at timestamp with time zone DEFAULT now() NOT NULL,
+    detached_at timestamp with time zone
+);
+
+
+--
 -- Name: storage_asset_coverage_gaps; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -20902,6 +20919,14 @@ ALTER TABLE ONLY public.srw_sessions
 
 
 --
+-- Name: ssh_attachments ssh_attachments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ssh_attachments
+    ADD CONSTRAINT ssh_attachments_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: storage_asset_coverage_gaps storage_asset_coverage_gaps_no_overlap; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -22568,6 +22593,20 @@ CREATE INDEX idx_srw_sessions_kc_sid ON public.srw_sessions USING btree (kc_sid)
 --
 
 CREATE INDEX idx_srw_sessions_user_active ON public.srw_sessions USING btree (user_id) WHERE (revoked_at IS NULL);
+
+
+--
+-- Name: idx_ssh_attachments_thread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ssh_attachments_thread ON public.ssh_attachments USING btree (thread_id, attached_at DESC);
+
+
+--
+-- Name: idx_ssh_attachments_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ssh_attachments_user ON public.ssh_attachments USING btree (user_id, attached_at DESC);
 
 
 --
@@ -26041,6 +26080,30 @@ ALTER TABLE ONLY public.skills
 
 ALTER TABLE ONLY public.srw_sessions
     ADD CONSTRAINT srw_sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: ssh_attachments ssh_attachments_ssh_key_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ssh_attachments
+    ADD CONSTRAINT ssh_attachments_ssh_key_id_fkey FOREIGN KEY (ssh_key_id) REFERENCES public.user_ssh_keys(id) ON DELETE SET NULL;
+
+
+--
+-- Name: ssh_attachments ssh_attachments_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ssh_attachments
+    ADD CONSTRAINT ssh_attachments_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: ssh_attachments ssh_attachments_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ssh_attachments
+    ADD CONSTRAINT ssh_attachments_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --
