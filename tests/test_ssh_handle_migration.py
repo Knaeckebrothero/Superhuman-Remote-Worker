@@ -37,7 +37,11 @@ def test_column_is_nullable_with_no_backfill():
     would rewrite every row of a hot table."""
     sql = _statements(COLUMN)
     assert "ADD COLUMN IF NOT EXISTS ssh_handle text" in sql
-    assert "NOT NULL" not in sql.split("ADD COLUMN")[1].split(";")[0]
+    # Whole-file, not just the ADD COLUMN clause: a later `ALTER COLUMN
+    # ssh_handle SET NOT NULL` in a separate statement is exactly what this
+    # test exists to catch. Comment-stripping alone keeps prose from tripping
+    # it, so there is no reason to narrow the span further.
+    assert "NOT NULL" not in sql
     assert "UPDATE threads" not in sql
     assert "UPDATE public.threads" not in sql
 
