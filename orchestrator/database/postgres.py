@@ -866,6 +866,11 @@ class OfficerPostLifecycleConflict(RuntimeError):
         self.detail = detail
 
 
+class SshKeyAlreadyRegistered(Exception):
+    """The fingerprint is already claimed. Globally unique by design — see
+    migration 0189."""
+
+
 def _uuid_list(values: list[str] | tuple[str, ...] | None) -> list[UUID]:
     """Parse and de-duplicate UUID strings while preserving request order.
 
@@ -40894,6 +40899,106 @@ class PostgresDB:
                 provider,
             )
             return result == "DELETE 1"
+
+    # =========================================================================
+    # USER SSH KEY OPERATIONS
+    # =========================================================================
+
+    async def create_user_ssh_key(
+        self,
+        user_id: str,
+        name: str,
+        key_type: str,
+        public_key: str,
+        fingerprint_sha256: str,
+    ) -> Dict[str, Any]:
+        """Register one SSH public key for a user.
+
+        Raises SshKeyAlreadyRegistered when the fingerprint is taken, including
+        by another account — the constraint is global so a presented key maps
+        to exactly one user.
+        """
+        async with self.acquire() as conn:
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO user_ssh_keys
+                        (user_id, name, key_type, public_key, fingerprint_sha256)
+                    VALUES ($1, $2, $3, $4, $5)
+                    RETURNING id, name, key_type, fingerprint_sha256,
+                              created_at, last_used_at, disabled_at
+                    """,
+                    UUID(user_id),
+                    name,
+                    key_type,
+                    public_key,
+                    fingerprint_sha256,
+                )
+            except asyncpg.UniqueViolationError as exc:
+                raise SshKeyAlreadyRegistered(fingerprint_sha256) from exc
+            return dict(row)
+
+    async def list_user_ssh_keys(self, user_id: str) -> List[Dict[str, Any]]:
+        """The user's registered keys. Never returns other users' rows."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, name, key_type, fingerprint_sha256,
+                       created_at, last_used_at, disabled_at
+                FROM user_ssh_keys
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                """,
+                UUID(user_id),
+            )
+            return [dict(r) for r in rows]
+
+    async def delete_user_ssh_key(self, key_id: str, user_id: str) -> bool:
+        """Delete one key. Scoped by user_id so an id alone is not authority.
+
+        Unlike create/list above, the ids are passed through as-is rather than
+        pre-parsed with ``UUID()``: asyncpg's uuid codec validates and encodes
+        a plain string directly against the column's ``uuid`` type, so the
+        extra parse buys nothing here beyond raising the same ValueError one
+        frame earlier.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM user_ssh_keys WHERE id = $1 AND user_id = $2",
+                key_id,
+                user_id,
+            )
+            return result == "DELETE 1"
+
+    async def resolve_user_by_ssh_fingerprint(
+        self, fingerprint: str
+    ) -> Optional[Dict[str, Any]]:
+        """Map a presented key fingerprint to its owning user.
+
+        Enabled keys only. This is the ssh-gateway's identity lookup, which is
+        why it lives here and not in the gateway: the gateway holds no database
+        credentials, and an internal key plus an asserted user_id is explicitly
+        not accepted anywhere in this codebase.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT u.*
+                FROM user_ssh_keys k
+                JOIN users u ON u.id = k.user_id
+                WHERE k.fingerprint_sha256 = $1
+                  AND k.disabled_at IS NULL
+                """,
+                fingerprint,
+            )
+            if row is None:
+                return None
+            await conn.execute(
+                "UPDATE user_ssh_keys SET last_used_at = now() "
+                "WHERE fingerprint_sha256 = $1",
+                fingerprint,
+            )
+            return dict(row)
 
     # =========================================================================
     # PROJECT API KEY OPERATIONS
