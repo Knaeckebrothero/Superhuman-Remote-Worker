@@ -31,6 +31,7 @@ def _db(thread):
 def _provisioner(*, available=True, delete_result=True, delete_exc=None):
     return SimpleNamespace(
         is_available=available,
+        lifecycle_available=available,
         delete_thread_vm=AsyncMock(return_value=delete_result, side_effect=delete_exc),
     )
 
