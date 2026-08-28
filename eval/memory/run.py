@@ -6,7 +6,7 @@
         --limit 20 --init-db
 
 Environment (see eval/memory/README.md):
-    EVAL_VECTOR_DSN   pgvector DSN (default: dev-compose, db srw_eval)
+    EVAL_VECTOR_DSN   pgvector DSN (default: localhost:5433, db srw_eval)
     EMBEDDING_*       real embedding endpoint (required)
     <arm api_key_env> auxiliary-LLM key for seam-mode arms
 

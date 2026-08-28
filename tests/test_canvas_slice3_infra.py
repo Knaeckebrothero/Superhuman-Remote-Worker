@@ -109,24 +109,6 @@ def test_canvas_live_preview_gate_reaches_orchestrator_and_agent_config() -> Non
         assert '"envFrom"' in source
         assert '"configMapRef"' in source
 
-    compose_value = "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
-    compose_denylist = "${CANVAS_LIVE_PREVIEW_DENIED_PORTS:-}"
-    for relative_path in ("docker-compose.yaml", "docker-compose.local.yaml"):
-        compose = yaml.safe_load((ROOT / relative_path).read_text())
-        services = compose["services"]
-        assert (
-            services["orchestrator"]["environment"]["CANVAS_LIVE_PREVIEW_ENABLED"]
-            == compose_value
-        )
-        assert (
-            services["agent"]["environment"]["CANVAS_LIVE_PREVIEW_ENABLED"]
-            == compose_value
-        )
-        assert (
-            services["orchestrator"]["environment"]["CANVAS_LIVE_PREVIEW_DENIED_PORTS"]
-            == compose_denylist
-        )
-
 
 def test_public_examples_keep_live_preview_disabled() -> None:
     env_example = (ROOT / ".env.example").read_text()
@@ -228,55 +210,6 @@ def test_canvas_viewer_chart_values_are_default_off_and_fail_closed() -> None:
     assert viewer_schema["properties"]["networkPolicy"]["additionalProperties"] is False
     non_empty = schema["definitions"]["nonEmptyLabelSelector"]
     assert len(non_empty["allOf"][1]["anyOf"]) == 2
-
-
-def test_canvas_gateway_compose_contract_is_profiled_internal_and_healthy() -> None:
-    for relative_path in ("docker-compose.yaml", "docker-compose.local.yaml"):
-        compose = yaml.safe_load((ROOT / relative_path).read_text())
-        role = compose["services"]["canvas-gateway-role"]
-        gateway = compose["services"]["canvas-gateway"]
-
-        assert role["profiles"] == ["canvas-viewer"]
-        assert role["restart"] == "no"
-        assert role["depends_on"]["orchestrator"] == {"condition": "service_healthy"}
-        assert role["command"][:2] == ["sh", "-ec"]
-        assert "CANVAS_VIEWER_POSTGRES_PASSWORD" in role["command"][2]
-        assert "--file /etc/srw-canvas-db/provision.sql" in role["command"][2]
-        assert any(
-            "canvas-viewer-role.sql:/etc/srw-canvas-db/provision.sql:ro" in mount
-            for mount in role["volumes"]
-        )
-
-        assert gateway["profiles"] == ["canvas-viewer"]
-        assert "ports" not in gateway
-        assert gateway["expose"] == ["8086"]
-        assert gateway["command"] == CANVAS_GATEWAY_COMMAND
-        assert gateway["environment"]["CANVAS_LIVE_PREVIEW_ENABLED"].endswith(
-            ":-false}"
-        )
-        assert gateway["environment"]["CANVAS_VIEWER_ENABLED"].endswith(":-false}")
-        gateway_environment = gateway["environment"]
-        assert {
-            "CANVAS_VIEWER_POSTGRES_USER",
-            "CANVAS_VIEWER_POSTGRES_PASSWORD",
-            "CANVAS_VIEWER_POSTGRES_HOST",
-            "CANVAS_VIEWER_POSTGRES_PORT",
-            "CANVAS_VIEWER_POSTGRES_DB",
-            "CANVAS_VIEWER_POSTGRES_MIN_CONNECTIONS",
-            "CANVAS_VIEWER_POSTGRES_MAX_CONNECTIONS",
-        } <= gateway_environment.keys()
-        assert "DATABASE_URL" not in gateway_environment
-        assert "POSTGRES_USER" not in gateway_environment
-        assert "POSTGRES_PASSWORD" not in gateway_environment
-        assert gateway["depends_on"]["canvas-gateway-role"] == {
-            "condition": "service_completed_successfully"
-        }
-
-        healthcheck = gateway["healthcheck"]
-        assert healthcheck["test"][:3] == ["CMD", "python", "-c"]
-        assert "127.0.0.1" in healthcheck["test"][3]
-        assert "8086" in healthcheck["test"][3]
-        assert "/api/health" not in healthcheck["test"][3]
 
 
 def test_canvas_gateway_templates_default_dark_with_optional_ingress() -> None:

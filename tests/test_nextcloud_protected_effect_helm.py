@@ -109,9 +109,7 @@ def test_enabled_lane_binds_one_config_to_server_client_and_bundle() -> None:
     config = json.loads(config_json)
     digest = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
     assert app_config["data"]["NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256"] == digest
-    compose = (ROOT / "docker-compose.dev.yaml").read_text()
     env_example = (ROOT / ".env.example").read_text()
-    assert "${NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256:-" + digest + "}" in compose
     assert f"# NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256={digest}" in env_example
     assert set(config) == {
         "version",

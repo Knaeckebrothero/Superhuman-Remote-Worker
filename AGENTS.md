@@ -87,14 +87,15 @@ Two rules that matter when adding notes:
 
 ## Common Commands
 
-Python setup and local services:
+Python setup and local services (databases come from the cluster — SRW deploys
+to Kubernetes only; see README.md → Local Kubernetes Setup):
 
 ```bash
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
-podman-compose -f docker-compose.dev.yaml up -d
+scripts/port-forward-dbs.sh    # KUBE_CONTEXT=k3d-srw KUBE_NAMESPACE=srw for k3d
 python init.py
 ```
 

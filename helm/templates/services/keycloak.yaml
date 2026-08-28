@@ -799,8 +799,7 @@ spec:
                     # subsequent pod start the realm already exists, so any
                     # secret rotation in Vault/ESO must be propagated via
                     # kcadm here. The hook also ensures the OpenCloud client
-                    # set + groups exist (idempotent, mirrors
-                    # setup-opencloud-client.sh).
+                    # set + groups exist (idempotent).
                     KC="/opt/keycloak/bin/kcadm.sh"
                     until (echo > /dev/tcp/localhost/9000) 2>/dev/null; do sleep 3; done
                     $KC config credentials --server http://localhost:8080 \
@@ -962,7 +961,7 @@ spec:
                       -s "offlineSessionIdleTimeout={{ .Values.keycloak.session.offlineSessionIdleTimeout }}" 2>/dev/null
                     {{- if .Values.opencloud.enabled }}
                     # --- Ensure OpenCloud clients + group ---
-                    # Idempotent: creates only if missing. Mirrors setup-opencloud-client.sh.
+                    # Idempotent: creates only if missing.
                     # Helm-gated on opencloud.enabled: the runtime `-n` guard alone was
                     # not enough, because OPENCLOUD_KEYCLOAK_CLIENT_SECRET outlives the
                     # backend in Vault. A cluster migrated off OpenCloud would otherwise

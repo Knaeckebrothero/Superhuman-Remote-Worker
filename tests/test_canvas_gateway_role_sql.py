@@ -59,15 +59,11 @@ def test_canvas_gateway_role_script_grants_only_the_gateway_write_surface() -> N
     assert "system_api_keys" not in source
 
 
-def test_canvas_gateway_role_script_is_packaged_once_for_helm_and_compose() -> None:
+def test_canvas_gateway_role_script_is_packaged_for_helm() -> None:
     helm_job = (
         ROOT / "helm/templates/canvas-gateway/database-role-job.yaml"
     ).read_text()
     assert '.Files.Get "files/canvas-viewer-role.sql"' in helm_job
-
-    for relative_path in ("docker-compose.yaml", "docker-compose.local.yaml"):
-        compose = (ROOT / relative_path).read_text()
-        assert compose.count("./helm/files/canvas-viewer-role.sql:") == 1
 
 
 def test_canvas_gateway_operator_script_keeps_secrets_out_of_argv_and_output() -> None:

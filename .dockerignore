@@ -103,6 +103,4 @@ logs/
 Thumbs.db
 
 # Docker files (don't need to copy themselves)
-docker-compose*.yml
-docker-compose*.yaml
 .dockerignore

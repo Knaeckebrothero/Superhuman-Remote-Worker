@@ -32,7 +32,8 @@ VECTOR_MIGRATIONS_DIR = (
     REPO_ROOT / "orchestrator" / "database" / "migrations" / "vector"
 )
 
-#: docker-compose.dev.yaml postgres-vector, eval-dedicated database name.
+#: Cluster pgvector reached over `scripts/port-forward-dbs.sh` (VECTOR_PG_PORT),
+#: eval-dedicated database name. Override with EVAL_VECTOR_DSN.
 DEFAULT_DSN = "postgresql://srw:srw_password@localhost:5433/srw_eval"
 
 _EVAL_NS = uuid.uuid5(uuid.NAMESPACE_URL, "srw://eval/memory")
@@ -65,8 +66,8 @@ async def ensure_database(dsn: str) -> None:
     """Create the eval database (and the vector extension) if missing.
 
     Connects to the server's maintenance database with the same
-    credentials; the dev-compose bootstrap user is superuser, so both
-    CREATE DATABASE and CREATE EXTENSION are available.
+    credentials, so the DSN's role must be allowed to CREATE DATABASE and
+    CREATE EXTENSION (use the pgvector cluster's superuser/owner role).
     """
     import asyncpg
 

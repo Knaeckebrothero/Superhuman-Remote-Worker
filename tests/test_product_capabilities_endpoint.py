@@ -435,7 +435,6 @@ def test_operator_rollout_gate_is_wired_default_off_in_deployments():
     deployment = (
         _ROOT / "helm" / "templates" / "orchestrator" / "deployment.yaml"
     ).read_text(encoding="utf-8")
-    compose = (_ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
     env_example = (_ROOT / ".env.example").read_text(encoding="utf-8")
 
     assert 'productCapabilitiesEndpointEnabled: "false"' in values
@@ -443,8 +442,4 @@ def test_operator_rollout_gate_is_wired_default_off_in_deployments():
     assert ".Values.agent.productCapabilitiesEndpointEnabled" in configmap
     assert "- name: PRODUCT_CAPABILITIES_ENDPOINT_ENABLED" in deployment
     assert "key: PRODUCT_CAPABILITIES_ENDPOINT_ENABLED" in deployment
-    assert (
-        "PRODUCT_CAPABILITIES_ENDPOINT_ENABLED: "
-        '"${PRODUCT_CAPABILITIES_ENDPOINT_ENABLED:-false}"'
-    ) in compose
     assert "PRODUCT_CAPABILITIES_ENDPOINT_ENABLED=false" in env_example

@@ -616,10 +616,14 @@ def test_helm_rejects_tags_and_short_values_in_digest_and_revision_fields():
     )
 
 
-def test_compose_provenance_is_explicit_and_empty_by_default():
-    compose = (_ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
+def test_env_example_provenance_is_explicit_and_empty_by_default():
+    """The public env template must document the variable and ship it EMPTY.
+
+    Provenance is an attestation: a non-empty default would advertise a
+    source revision / image digest the running artifact does not actually
+    carry. The chart-side wiring is covered by the two helm tests above.
+    """
     environment = (_ROOT / ".env.example").read_text(encoding="utf-8")
 
-    assert compose.count("\n      SRW_DEPLOYMENT_PROVENANCE_JSON:") == 2
-    assert "SRW_DEPLOYMENT_PROVENANCE_JSON=" in environment
-    assert "Ordinary local/tag-only Compose runs should leave this empty" in environment
+    assert "SRW_DEPLOYMENT_PROVENANCE_JSON=\n" in environment
+    assert "leave this empty" in environment

@@ -18,11 +18,7 @@ Re-running is safe: folder creation tolerates duplicates, and a fixture is
 skipped when a message with its Message-ID already exists in the target
 folder, so the seed converges instead of piling up copies.
 
-Usage (dev compose — IMAP is published on localhost:3143):
-
-    python scripts/seed_greenmail.py
-
-Against k3d, port-forward the Service first:
+Usage — port-forward the GreenMail Service, then seed over localhost:3143:
 
     kubectl --context=k3d-srw -n srw port-forward svc/srw-greenmail 3143:3143 &
     python scripts/seed_greenmail.py
@@ -175,8 +171,8 @@ def main() -> None:
     except (imaplib.IMAP4.error, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         print(
-            "hint: is GreenMail running? "
-            "(podman-compose -f docker-compose.dev.yaml up -d greenmail)",
+            "hint: is GreenMail running and port-forwarded? "
+            "(kubectl -n srw port-forward svc/srw-greenmail 3143:3143)",
             file=sys.stderr,
         )
         sys.exit(1)

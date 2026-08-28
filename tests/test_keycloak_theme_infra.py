@@ -306,6 +306,43 @@ def _render_theme_configmap_data() -> dict[str, str]:
     return _render_theme_docs()[0]
 
 
+@functools.lru_cache(maxsize=1)
+def _render_realm() -> dict:
+    """The realm JSON the Keycloak container imports, as a parsed object.
+
+    Same reasoning as _render_theme_docs: the realm is Helm-templated inside
+    a ConfigMap, so only the rendered output is the artifact under test.
+    """
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "srw",
+            str(ROOT / "helm"),
+            "-f",
+            str(ROOT / "helm/ci/test-values.yaml"),
+            "--set",
+            "keycloak.enabled=true",
+            "--set",
+            "keycloak.internal=true",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"helm template failed:\n{result.stderr}"
+
+    for doc in yaml.safe_load_all(result.stdout):
+        if not doc:
+            continue
+        if doc.get("kind") != "ConfigMap":
+            continue
+        if not doc.get("metadata", {}).get("name", "").endswith("-keycloak-realm"):
+            continue
+        return json.loads((doc.get("data") or {})["srw-realm.json"])
+    raise AssertionError("no keycloak-realm ConfigMap in the render")
+
+
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
 def test_configmap_keys_have_no_slashes() -> None:
     """A real API server rejects a ConfigMap key containing '/'. Assert on the
@@ -363,23 +400,14 @@ def test_pod_template_has_a_theme_checksum_annotation() -> None:
     assert "keycloak-theme-configmap.yaml" in kc
 
 
-def test_compose_bind_mounts_the_same_source() -> None:
-    compose = (ROOT / "docker-compose.yaml").read_text()
-    assert "./helm/keycloak-theme/srw:/opt/keycloak/themes/srw" in compose
-
-
-def test_both_realms_use_the_srw_login_theme() -> None:
+def test_realm_import_uses_the_srw_login_theme() -> None:
     assert '"loginTheme": "srw"' in KC.read_text()
-    export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
-    assert export["loginTheme"] == "srw"
 
 
 def test_display_name_html_carries_the_logo_hook() -> None:
     """--keycloak-logo-url only renders if displayNameHtml provides
     .kc-logo-text for the stylesheet to turn into a background image."""
     assert "kc-logo-text" in KC.read_text()
-    export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
-    assert "kc-logo-text" in export["displayNameHtml"]
 
 
 def test_email_theme_parents_base_not_keycloak() -> None:
@@ -472,10 +500,28 @@ def test_email_wrapper_never_uses_text_muted() -> None:
     )
 
 
-def test_both_realms_use_the_srw_email_theme() -> None:
+def test_realm_import_uses_the_srw_email_theme() -> None:
     assert '"emailTheme": "srw"' in KC.read_text()
-    export = json.loads((ROOT / "docker/keycloak/realm-export.json").read_text())
-    assert export["emailTheme"] == "srw"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
+def test_rendered_realm_selects_both_themes_and_the_logo_hook() -> None:
+    """The three assertions above read the TEMPLATE; this one reads what
+    Keycloak actually imports.
+
+    The realm lives inside a Helm-templated ConfigMap, so a raw substring
+    match cannot tell a live JSON value from one stranded inside a
+    `{{- if }}` that never renders, and cannot prove the block is still
+    parseable JSON at all. Parsing the rendered `srw-realm.json` does both.
+    This replaced a second copy of the realm that used to ship as
+    docker/keycloak/realm-export.json for the Compose stack (retired with
+    Compose itself) -- that file seeded a `test`/`test` admin user with a
+    non-temporary password, so the chart's realm is now the only realm.
+    """
+    realm = _render_realm()
+    assert realm["loginTheme"] == "srw"
+    assert realm["emailTheme"] == "srw"
+    assert "kc-logo-text" in realm["displayNameHtml"]
 
 
 HELPERS = ROOT / "helm/templates/_helpers.tpl"

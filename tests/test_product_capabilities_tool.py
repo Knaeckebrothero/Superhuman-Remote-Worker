@@ -1004,14 +1004,9 @@ def test_operator_canary_gate_is_wired_default_off_for_agent_deployments():
     configmap = (_ROOT / "helm" / "templates" / "configmap.yaml").read_text(
         encoding="utf-8"
     )
-    compose = (_ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
     env_example = (_ROOT / ".env.example").read_text(encoding="utf-8")
 
     assert 'productCapabilitiesToolEnabled: "false"' in values
     assert "PRODUCT_CAPABILITIES_TOOL_ENABLED:" in configmap
     assert ".Values.agent.productCapabilitiesToolEnabled" in configmap
-    assert (
-        "PRODUCT_CAPABILITIES_TOOL_ENABLED: "
-        '"${PRODUCT_CAPABILITIES_TOOL_ENABLED:-false}"'
-    ) in compose
     assert "PRODUCT_CAPABILITIES_TOOL_ENABLED=false" in env_example

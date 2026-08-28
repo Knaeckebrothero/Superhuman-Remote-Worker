@@ -46,9 +46,9 @@ aggregates (they return with the end-task slice).
 #    https://github.com/xiaowu0162/LongMemEval (HF: xiaowu0162/longmemeval)
 #    Put longmemeval_s.json under eval/memory/data/.
 
-# 2. A pgvector server. Dev-compose:
-podman-compose -f docker-compose.dev.yaml up -d postgres-vector
-export EVAL_VECTOR_DSN='postgresql://srw:srw_password@localhost:5433/srw_eval'
+# 2. A pgvector server. Tunnel the cluster's pgvector to localhost:5433:
+scripts/port-forward-dbs.sh &
+export EVAL_VECTOR_DSN='postgresql://<user>:<password>@localhost:5433/srw_eval'
 # (defaults to exactly that DSN; the runner creates the srw_eval database
 #  and applies migrations/vector/ with --init-db)
 

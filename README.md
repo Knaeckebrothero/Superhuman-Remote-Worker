@@ -112,7 +112,6 @@ Each agent is a general-purpose LangGraph worker that can:
 ## Table of Contents
 
 - [Quick Start](#quick-start)
-- [Docker Compose Deployment](#docker-compose-deployment)
 - [Local Kubernetes Setup (k3d)](#local-kubernetes-setup-k3d)
 - [Development Setup](#development-setup)
 - [Architecture](#architecture)
@@ -121,130 +120,50 @@ Each agent is a general-purpose LangGraph worker that can:
 
 ### Which path should I use?
 
+SRW deploys to Kubernetes, and only to Kubernetes — the Helm chart in
+[`helm/`](helm/) is the single deployment artifact for every environment
+(production, homelab, and your laptop). Dynamic agent scaling is the product:
+the orchestrator provisions agent pods, workspace pods and PVCs on demand
+through the Kubernetes API, so a single-node cluster is the smallest sensible
+target. [k3d](https://k3d.io) turns any one machine into that cluster.
+
 | Goal | Path |
 |------|------|
-| Iterate on Python code (orchestrator, agent) as fast as possible | [Development Setup](#development-setup) — services run natively on the host with `uvicorn --reload` / `npm start` |
-| Run the full stack without Kubernetes (smaller deployments, no k8s API) | [Docker Compose Deployment](#docker-compose-deployment) |
-| Reproduce the production Helm chart locally to test K8s-specific code paths (provisioners, ingress, cert-manager, OIDC, etc.) | [Local Kubernetes Setup (k3d)](#local-kubernetes-setup-k3d) |
+| Run the system, on one machine or a hundred | [Local Kubernetes Setup (k3d)](#local-kubernetes-setup-k3d), then the same chart on a real cluster |
+| Iterate on Python code with the fastest possible edit-to-effect | [Fast inner loop with Tilt](#fast-inner-loop-with-tilt-recommended) — live-syncs source into the running pods |
+| Run tests, lint and one-off scripts on your host | [Development Setup](#development-setup) |
 
 ## Quick Start
 
 ```bash
-# Clone and set up
+# Clone
 git clone <repo-url>
 cd Superhuman-Remote-Worker
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env  # Add your API keys
 
-# Start databases + workspace containers
-podman-compose -f docker-compose.dev.yaml up -d
-python init.py
+# Bring up a local k3d cluster (cert-manager, namespace, local registry)
+./scripts/local-dev-up.sh
 
-# Start the orchestrator (terminal 1)
-uvicorn orchestrator.main:app --reload --port 8085
+# Session-router JWT secret (without it sessions never connect)
+kubectl --context=k3d-srw -n srw create secret generic srw-session-jwt \
+  --from-literal=jwt-secret="$(openssl rand -base64 48 | tr -d '\n' | head -c 64)"
 
-# Start the agent server (terminal 2) — --loop keeps it alive between jobs
-python agent.py --port 8001 --loop
+# Fill in at least one LLM key, then install the chart
+cp deployment/values-local.yaml.example deployment/values-local.yaml
+$EDITOR deployment/values-local.yaml
+helm repo add collabora https://collaboraonline.github.io/online --force-update
+helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts --force-update
+helm dependency build ./helm
+helm install srw ./helm -n srw --kube-context=k3d-srw -f deployment/values-local.yaml
 
-# Submit a job via the Cockpit UI (http://localhost:4200) or the orchestrator REST API
+# Log in at https://localhost/ as test / test and create a job
 ```
 
-## Docker Compose Deployment
-
-Deploy the complete system using containers. This is the simplest deployment option — no Kubernetes required. The orchestrator auto-detects the environment and uses static workspace pools instead of dynamic pod provisioning. See [`knowledge-base/knowledge/docker_compose_mode.md`](knowledge-base/knowledge/docker_compose_mode.md) for architecture details.
-
-For Kubernetes deployment (recommended for production), see [`knowledge-base/knowledge/deployment.md`](knowledge-base/knowledge/deployment.md) and the `deployment/` or `deployment-local/` directories.
-
-### 1. Clone and Configure
-
-```bash
-git clone <repo-url>
-cd Superhuman-Remote-Worker
-cp .env.example .env
-```
-
-### 2. Edit Environment Variables
-
-Edit `.env` with your configuration:
-
-**Required:**
-- `OPENAI_API_KEY` — LLM API key (or compatible provider)
-- `LLM_BASE_URL` — Custom endpoint URL (if using self-hosted models)
-
-**Optional:**
-- `ANTHROPIC_API_KEY` — For Claude models
-- `GOOGLE_API_KEY` — For Gemini models
-- `TAVILY_API_KEY` — For web search
-- `KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD` — SSO admin (default: admin/admin)
-- `SMTP_HOST` / `SMTP_USER` / `SMTP_PASSWORD` — Email notifications via SMTP
-- `SLACK_WEBHOOK_URL` — Slack notifications
-- `DISCORD_WEBHOOK_URL` — Discord notifications
-- `NTFY_URL` / `NTFY_TOPIC` / `NTFY_TOKEN` — ntfy push notifications
-- `LOG_LEVEL` — DEBUG, INFO, WARNING, ERROR (default: INFO)
-
-Edit `docker/keycloak/realm-export.json` for OIDC client secrets if needed (see the example file for details).
-
-### 3. Start All Services
-
-```bash
-podman-compose up -d
-```
-
-This starts:
-- **PostgreSQL** — Job tracking and data storage (+ SSO databases for Keycloak/Nextcloud)
-- **PostgreSQL (Vector)** — Citations, embeddings, knowledge index (pgvector)
-- **Neo4j** — Graph database for project knowledge base
-- **Keycloak** — SSO identity provider (OIDC for all services)
-- **Gitea** — Git server for agent workspace repositories (Keycloak OIDC login)
-- **Nextcloud** — Cloud storage / WebDAV datasource
-- **VPN Sidecars** — Three VPN services routing LLM, research, and workstation traffic through the university network
-- **Orchestrator** — Backend API for job management and agent coordination
-- **Agent** — Worker instances (defaults to 2 replicas via `AGENT_REPLICAS`)
-- **Workspace containers** — Static pool of 5 isolated workspace containers (SSH access), auto-provisioned by the orchestrator
-- **MCP Server** — Claude Code integration (port 8055)
-- **Cockpit** — Web UI for job management and monitoring
-- **NATS** — Messaging for VM lifecycle and agent communication
-- **MinIO** — S3-compatible object storage for VM snapshots and IDE sessions
-- **pgAdmin** — Database admin UI
-- **Dozzle** — Container log viewer
-
-### 4. Access Services
-
-| Service | URL |
-|---------|-----|
-| Cockpit (Web UI) | http://localhost:4000 |
-| Keycloak SSO | http://localhost:8180 |
-| Orchestrator API | http://localhost:8085 |
-| Gitea | http://localhost:3000 |
-| Nextcloud | http://localhost:8800 |
-| MCP Server | http://localhost:8055 |
-| pgAdmin | http://localhost:5050 |
-| MinIO Console | http://localhost:9001 |
-| Dozzle (logs) | http://localhost:9999 |
-
-### 5. Common Operations
-
-```bash
-# View logs
-podman-compose logs -f
-podman-compose logs -f agent
-
-# Scale workers
-podman-compose up -d --scale agent=4
-
-# Stop all services
-podman-compose down
-
-# Stop and remove all data
-podman-compose down -v
-```
-
-For local builds (no GHCR access), use `docker-compose.local.yaml` instead — it builds all custom images from source.
+Full prerequisites, the two k3d-specific traps, and the smoke-test checklist
+are in [Local Kubernetes Setup (k3d)](#local-kubernetes-setup-k3d) below.
 
 ## Local Kubernetes Setup (k3d)
 
-Runs the **production Helm chart** on a local [k3d](https://k3d.io) cluster — k3s in Docker. Use this when you need to test K8s-specific code paths (workspace pod provisioning, ingress routing, cert-manager + OIDC, the Keycloak realm/client flow, etc.). The cluster can be started and stopped like any Docker container, so it doesn't consume resources when you're not working.
+Runs the **production Helm chart** on a local [k3d](https://k3d.io) cluster — k3s in Docker. This is the same chart and the same code paths as a real deployment (workspace pod provisioning, ingress routing, cert-manager + OIDC, the Keycloak realm/client flow), scaled down to one machine. The cluster can be started and stopped like any Docker container, so it doesn't consume resources when you're not working.
 
 ### Prerequisites
 
@@ -561,7 +480,10 @@ k3d cluster delete srw                     # destroy the whole cluster (includin
 
 ## Development Setup
 
-Run databases in containers while developing locally with Python.
+Running the Python tooling on your host — tests, lint, `init.py`, one-off
+scripts, or an orchestrator/agent under a debugger — against the databases of
+a cluster you already have up. This is not a way to run the system; the
+cluster from the previous section is a prerequisite.
 
 ### 1. Set Up Python Environment
 
@@ -585,10 +507,22 @@ cp .env.example .env
 # Edit .env with your API credentials
 ```
 
-### 3. Start Databases
+### 3. Reach the Databases
+
+Every database Service is ClusterIP. Tunnel them to localhost (app DB on
+5432, pgvector on 5433, audit on 5434) and point `DATABASE_URL` /
+`VECTOR_DB_URL` at the tunnels:
 
 ```bash
-podman-compose -f docker-compose.dev.yaml up -d
+scripts/port-forward-dbs.sh                       # Ctrl-C to stop
+KUBE_CONTEXT=k3d-srw KUBE_NAMESPACE=srw scripts/port-forward-dbs.sh
+```
+
+Read the credentials out of the cluster Secret rather than guessing them:
+
+```bash
+kubectl --context=k3d-srw -n srw get secret srw \
+  -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d; echo
 ```
 
 ### 4. Initialize
@@ -624,10 +558,10 @@ LOG_LEVEL=DEBUG python agent.py --port 8001 --loop
 ```
 
 Why `--loop`: without it the agent process exits after the first job, which
-is fine in K8s (pod restart) but kills the dev loop on bare metal or Docker
-Compose. Jobs, documents, descriptions, git URLs, feedback, and freeze
-approvals are all submitted to the orchestrator (REST API or Cockpit UI)
-and dispatched to the running agent — not passed as CLI flags.
+is fine in Kubernetes (the pod restarts) but kills the dev loop when you run
+the agent by hand. Jobs, documents, descriptions, git URLs, feedback, and
+freeze approvals are all submitted to the orchestrator (REST API or Cockpit
+UI) and dispatched to the running agent — not passed as CLI flags.
 
 The workspace always lives in an SSH-accessible container or VM; the agent
 process never operates on its own filesystem. The orchestrator injects the

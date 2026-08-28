@@ -140,23 +140,26 @@ pip install -r requirements.txt
 python run.py
 ```
 
-**Docker:**
+**On the cluster (k3d):** the MCP server runs as its own Deployment. Reach it
+over HTTP by port-forwarding the Service:
+
 ```bash
-podman-compose -f docker-compose.dev.yaml up -d orchestrator-mcp
-docker exec -i srw-orchestrator-mcp-dev python run.py
+kubectl --context=k3d-srw -n srw port-forward svc/srw-mcp 8055:8055
 ```
 
 ### Claude Code Configuration
 
 The project includes `.mcp.json` with the MCP server configuration. Claude Code will prompt you to enable it.
 
-For containerized setup, create or update `.mcp.json`:
+To point Claude Code at a cluster-hosted MCP server, create or update
+`.mcp.json` with its HTTP endpoint and a token minted in the cockpit:
 ```json
 {
   "mcpServers": {
     "orchestrator": {
-      "command": "docker",
-      "args": ["exec", "-i", "srw-orchestrator-mcp-dev", "python", "run.py"]
+      "type": "http",
+      "url": "http://localhost:8055/mcp",
+      "headers": { "Authorization": "Bearer srw_..." }
     }
   }
 }

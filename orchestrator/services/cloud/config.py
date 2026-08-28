@@ -135,9 +135,8 @@ def _detect_legacy_nextcloud_mode() -> bool:
     have to add ``MAIN_CLOUD_BACKEND=nextcloud`` to their ``.env``
     unless they explicitly want to migrate.
 
-    ``NEXTCLOUD_PORT`` alone does not count as "legacy" since it may be
-    set by the compose stack even on an OpenCloud-primary deployment
-    that still keeps the Nextcloud profile available.
+    ``NEXTCLOUD_PORT`` alone does not count as "legacy" since a
+    deployment may publish the port even while OpenCloud is primary.
     """
     if os.getenv("MAIN_CLOUD_BACKEND"):
         return False
@@ -290,11 +289,11 @@ def load_main_cloud_config(
             }
         }
     elif backend_id == "opencloud":
-        # Defaults match the bundled docker-compose dev stack so a fresh
-        # .env "just works" out of the box. Production deployments override
-        # via Helm secrets / Vault — same convention as the Nextcloud branch
-        # above. The client_secret default matches the value created by
-        # docker/keycloak/setup-opencloud-client.sh.
+        # Defaults target a locally reachable OpenCloud (host-published
+        # ports) so a fresh .env "just works" for host-side development.
+        # Real deployments override every value via Helm secrets / Vault —
+        # same convention as the Nextcloud branch above. The client_secret
+        # default matches the placeholder the Keycloak realm ships with.
         oc_base_url = _ov("base_url") or _pick(
             "MAIN_CLOUD_URL", "OPENCLOUD_URL", default="http://localhost:9200"
         )

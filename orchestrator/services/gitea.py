@@ -34,8 +34,11 @@ class GiteaClient:
         GITEA_URL: Browser-facing base URL (e.g. https://git.localhost).
             Used only as a fallback for the API base; may resolve to
             loopback and be unreachable from inside the cluster.
-        GITEA_ADMIN_USER: Admin username to create/use
-        GITEA_ADMIN_PASSWORD: Admin password
+        GITEA_ADMIN_USER: Admin username to create/use (default: ``srw``)
+        GITEA_ADMIN_PASSWORD: Admin password. No default — it must come from
+            the deployment's secret. A build-time fallback would ship a
+            known credential that silently becomes the real admin password
+            of any install that forgets to set one.
     """
 
     def __init__(self) -> None:
@@ -49,7 +52,7 @@ class GiteaClient:
             os.environ.get("GITEA_INTERNAL_URL") or os.environ.get("GITEA_URL", "")
         ).rstrip("/")
         self._user = os.environ.get("GITEA_ADMIN_USER", "srw")
-        self._password = os.environ.get("GITEA_ADMIN_PASSWORD", "srw_gitea")
+        self._password = os.environ.get("GITEA_ADMIN_PASSWORD", "")
         self._initialized = False
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -93,6 +96,13 @@ class GiteaClient:
         if not self.is_configured:
             logger.info(
                 "Gitea not configured (GITEA_URL not set), workspace delivery disabled"
+            )
+            return False
+
+        if not self._password:
+            logger.warning(
+                "Gitea configured but GITEA_ADMIN_PASSWORD is empty — "
+                "workspace delivery disabled. Set it from the deployment secret."
             )
             return False
 

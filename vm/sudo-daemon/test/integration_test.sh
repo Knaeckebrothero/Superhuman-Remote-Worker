@@ -165,7 +165,8 @@ async def check():
 asyncio.run(check())
 " 2>/dev/null; then
     echo -e "${RED}ERROR: Cannot connect to NATS at $NATS_URL${NC}"
-    echo "Run with --http-only, or start NATS: podman-compose -f docker-compose.dev.yaml up -d nats"
+    echo "Run with --http-only, or port-forward the cluster NATS:"
+    echo "  kubectl --context=k3d-srw -n srw port-forward svc/srw-nats 4222:4222"
     FAIL=$((FAIL + 1))
     exit 1
 fi

@@ -808,18 +808,6 @@ class TestConfigFiles:
         assert "ADMIN_DISPLAY_NAME" in content
         assert "ADMIN_PASSWORD" in content
 
-    def test_docker_compose_has_admin_vars(self):
-        content = self._read_file("docker-compose.yaml")
-        assert "ADMIN_EMAIL" in content
-        assert "ADMIN_DISPLAY_NAME" in content
-        assert "ADMIN_PASSWORD" in content
-
-    def test_docker_compose_local_has_admin_vars(self):
-        content = self._read_file("docker-compose.local.yaml")
-        assert "ADMIN_EMAIL" in content
-        assert "ADMIN_DISPLAY_NAME" in content
-        assert "ADMIN_PASSWORD" in content
-
     @pytest.mark.skipif(
         not os.path.isdir(
             os.path.join(

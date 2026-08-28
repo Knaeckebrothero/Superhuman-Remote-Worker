@@ -22,7 +22,7 @@ COPY src/shared/ ./src/shared/
 COPY orchestrator/security/__init__.py ./security/__init__.py
 COPY orchestrator/security/anti_framing.py ./security/anti_framing.py
 
-# Default API URL (overridden in docker-compose)
+# Default API URL (overridden by the Helm chart's COCKPIT_API_URL)
 ENV COCKPIT_API_URL=http://localhost:8085
 
 # Run as non-root user

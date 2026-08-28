@@ -3651,39 +3651,31 @@ def test_canvas_session_create_override_is_closed() -> None:
     }
 
 
-def test_compose_internal_key_is_required_and_reaches_agents() -> None:
-    import yaml
+def test_chart_internal_key_is_generated_and_reaches_agents() -> None:
+    """MCP_INTERNAL_KEY must be minted, never defaulted to a known literal.
 
-    for filename in ("docker-compose.yaml", "docker-compose.local.yaml"):
-        source = Path(filename).read_text()
-        rendered = source.replace(
-            "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}",
-            "test-random-secret",
-        )
-        compose = yaml.safe_load(rendered)
-        for service in ("orchestrator", "agent", "mcp"):
-            assert (
-                compose["services"][service]["environment"]["MCP_INTERNAL_KEY"]
-                == "test-random-secret"
-            )
-        orchestrator = compose["services"]["orchestrator"]
-        assert ":30022" in orchestrator["environment"]["WORKSPACE_HOSTS"]
-        assert orchestrator["environment"]["SSH_KEY_PATH"] == (
-            "/run/secrets/ssh/id_ed25519"
-        )
-        assert "ssh_keys:/run/secrets/ssh:ro" in orchestrator["volumes"]
-        assert (
-            orchestrator["depends_on"]["ssh-keygen"]["condition"]
-            == "service_completed_successfully"
-        )
-        for index in range(1, 6):
-            health = compose["services"][f"workspace-{index}"]["healthcheck"]["test"]
-            assert "30022" in " ".join(health)
-        assert "dev-internal-key" not in source
+    The key authenticates delegated internal calls between the orchestrator,
+    the MCP server, and provisioned agents. A hardcoded fallback anywhere in
+    the chart would be a shared secret published in the repository, so the
+    Secret template generates a random one when none is supplied (and
+    preserves an already-installed value so a `helm upgrade` does not rotate
+    it out from under running pods).
+    """
+    root = Path(__file__).resolve().parents[1]
+    secret = (root / "helm/templates/secret.yaml").read_text()
 
-    dev_source = Path("docker-compose.dev.yaml").read_text()
-    assert "dev-internal-key" not in dev_source
-    assert "${MCP_INTERNAL_KEY:?" in dev_source
-    for index in range(1, 4):
-        assert f"${{WORKSPACE_{index}_SSH_PORT:-220{index}}}:30022" in dev_source
-    assert dev_source.count("/dev/tcp/localhost/30022") >= 3
+    assert "randAlphaNum 48" in secret
+    assert "MCP_INTERNAL_KEY: {{ $internalKey | quote }}" in secret
+
+    for relative_path in (
+        "helm/templates/orchestrator/deployment.yaml",
+        "helm/templates/mcp/deployment.yaml",
+        "helm/templates/agent/stateless-deployment.yaml",
+    ):
+        source = (root / relative_path).read_text()
+        assert "- name: MCP_INTERNAL_KEY" in source, relative_path
+        assert "key: MCP_INTERNAL_KEY" in source, relative_path
+        assert 'include "srw.secretName"' in source, relative_path
+
+    for path in (root / "helm").rglob("*.yaml"):
+        assert "dev-internal-key" not in path.read_text(), path

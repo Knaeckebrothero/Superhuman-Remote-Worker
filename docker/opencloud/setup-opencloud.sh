@@ -46,7 +46,7 @@ fi
 log "Reminder: the orchestrator expects a Keycloak client named"
 log "  '${OPENCLOUD_KEYCLOAK_CLIENT_ID:-opencloud-orchestrator}'"
 log "with serviceAccountsEnabled=true and the 'opencloud-admin' role assigned."
-log "Seed this via docker/keycloak/setup-opencloud-client.sh or manually in the"
+log "The chart's Keycloak bootstrap hook seeds this; otherwise create it in the"
 log "Keycloak admin UI. See knowledge-base/knowledge/operations/opencloud-bootstrap.md §2."
 
 log "Pre-start hook complete"
