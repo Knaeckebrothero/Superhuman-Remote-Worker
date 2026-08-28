@@ -462,6 +462,13 @@ def db(monkeypatch):
     db.enqueue_session_wake_event = AsyncMock(return_value=True)
     db.confirm_project_officer_incarnation = AsyncMock(return_value=True)
     db.get_thread = AsyncMock(return_value=None)
+    # The lifecycle fake has no legacy Kubernetes rows. Keep the rollout
+    # reconciler's async inventory boundary explicit: a bare MagicMock would
+    # manufacture awaitable-looking methods and turn "no candidates" into a
+    # false adoption failure before the test reaches its Officer handoff.
+    db.list_legacy_pinned_warm_binding_candidates = AsyncMock(return_value=[])
+    db.list_expired_pinned_warm_binding_protections = AsyncMock(return_value=[])
+    db.list_legacy_pinned_agent_k8s_authority_candidates = AsyncMock(return_value=[])
     # Commissioning is gated on unattended_operations; these tests are about
     # lifecycle mechanics, so the grant is held. TestCommissionCapabilityGate
     # below flips it to False and asserts the refusal.
