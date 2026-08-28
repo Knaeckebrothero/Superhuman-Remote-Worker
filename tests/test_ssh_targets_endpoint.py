@@ -22,10 +22,14 @@ into a routable workspace target. It is the seam plan 1's design rests on:
   case this must get right, not an edge case.
 """
 
+import json
+from uuid import UUID
+
 import pytest
 from fastapi import HTTPException
 
 import main
+from services.canvas_ssh import RemoteWorkspaceTarget
 from services.ssh_gateway_targets import resolve_workspace_state
 from tests._route_inventory import mounted_routes
 
@@ -148,12 +152,23 @@ async def test_requires_internal_key(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unknown_handle_and_unauthorized_are_identical(internal, monkeypatch):
-    """Anti-enumeration: an attacker must not learn which handles exist."""
+    """Anti-enumeration: an attacker must not learn which handles exist.
+
+    ``resolve_user_by_ssh_fingerprint`` is patched up front and reused for
+    both calls (fix round 1 / Important 1): the handler now calls it
+    unconditionally, even on an unknown handle, so leaving it unpatched for
+    the first call would hit a real, unconnected DB pool here instead of
+    exercising the anti-enumeration property this test is named for.
+    """
 
     async def _no_thread(handle):
         return None
 
+    async def _user(fp):
+        return {"id": "00000000-0000-0000-0000-000000000009"}
+
     monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread)
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
     with pytest.raises(HTTPException) as unknown:
         await main.get_ssh_target(
             request=object(), handle="s-aaaaaaaa", fingerprint=FINGERPRINT
@@ -162,14 +177,10 @@ async def test_unknown_handle_and_unauthorized_are_identical(internal, monkeypat
     async def _thread_ok(handle):
         return THREAD
 
-    async def _user(fp):
-        return {"id": "00000000-0000-0000-0000-000000000009"}
-
     async def _no_access(user, db, entity_id):
         return False
 
     monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_ok)
-    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
     monkeypatch.setattr(main, "user_can_access_ide_entity", _no_access)
     with pytest.raises(HTTPException) as denied:
         await main.get_ssh_target(
@@ -178,6 +189,42 @@ async def test_unknown_handle_and_unauthorized_are_identical(internal, monkeypat
 
     assert unknown.value.status_code == denied.value.status_code == 404
     assert unknown.value.detail == denied.value.detail
+
+
+@pytest.mark.asyncio
+async def test_unknown_handle_still_reaches_the_fingerprint_resolver(
+    internal, monkeypatch
+):
+    """Regression pin for Important 1 (fix round 1): resolve_user_by_ssh_
+    fingerprint bumps user_ssh_keys.last_used_at as a side effect (it is a
+    ``WITH bumped AS (UPDATE ... RETURNING)`` CTE, not a plain read), and the
+    caller can read their own last_used_at back through GET /api/ssh-keys.
+    If the handle lookup short-circuited before this call, a probing
+    approved user could tell "handle exists, not mine" apart from "handle
+    does not exist" by watching whether their own key's last_used_at moved —
+    defeating the opaque-404 contract even though the HTTP responses are
+    byte-for-byte identical. Assert on the call, not on the clock: the
+    resolver must run even when the handle is already known to be unknown.
+    """
+
+    called_with = []
+
+    async def _no_thread(handle):
+        return None
+
+    async def _user(fp):
+        called_with.append(fp)
+        return {"id": USER}
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _no_thread)
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
+
+    with pytest.raises(HTTPException):
+        await main.get_ssh_target(
+            request=object(), handle="s-aaaaaaaa", fingerprint=FINGERPRINT
+        )
+
+    assert called_with == [FINGERPRINT]
 
 
 @pytest.mark.asyncio
@@ -196,6 +243,31 @@ async def test_rejects_a_malformed_handle_before_touching_the_database(
         await main.get_ssh_target(
             request=object(), handle="s-abc\nProxyCommand x", fingerprint=FINGERPRINT
         )
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_missing_fingerprint_is_opaque_404_not_a_422(internal, monkeypatch):
+    """Fix round 1 / Minor 6: ``fingerprint`` became an Optional query param
+    so a request omitting it still reaches ``require_internal`` first — a
+    required param would make FastAPI 422 before any auth check runs,
+    disclosing the route and its parameter name to an unauthenticated
+    caller. A missing fingerprint must fail the same opaque way as any other
+    malformed input, before touching the database.
+    """
+    called = False
+
+    async def _tripwire(handle):
+        nonlocal called
+        called = True
+        return None
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _tripwire)
+    with pytest.raises(HTTPException) as excinfo:
+        await main.get_ssh_target(
+            request=object(), handle="s-7f3a91c2", fingerprint=None
+        )
+    assert excinfo.value.status_code == 404
     assert called is False
 
 
@@ -232,10 +304,149 @@ async def test_non_live_state_returns_200_with_no_pod_ip(internal, monkeypatch):
     assert result["pod_ip"] is None
 
 
+@pytest.mark.asyncio
+async def test_live_state_maps_target_fields(internal, monkeypatch):
+    """Important 2 (fix round 1): the one branch that hands out a routable
+    target had zero coverage. Stubs the canvas_ssh resolver rather than
+    constructing a real ``_workspace_binding`` — that resolver's own
+    behavior is covered by test_canvas_ssh_transport.py; this pins the
+    endpoint's field mapping (``pod_ip``/``pod_port``/``host_key_fingerprint``
+    <- target.host/.port/.fingerprint), which nothing else exercises.
+    """
+
+    async def _thread_id(handle):
+        return THREAD
+
+    async def _user(fp):
+        return {"id": USER}
+
+    async def _access(user, db, entity_id):
+        return True
+
+    async def _get_thread(tid):
+        return _thread(
+            status="active", metadata={"workspace_container": {"status": "ready"}}
+        )
+
+    generation = UUID("11111111-1111-1111-1111-111111111111")
+
+    def _generation(thread):
+        return generation
+
+    def _target(thread, expected_generation):
+        return RemoteWorkspaceTarget(
+            thread_id=THREAD,
+            generation=expected_generation,
+            host="10.0.0.5",
+            port=2222,
+            fingerprint="SHA256:" + "B" * 43,
+        )
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
+    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
+    monkeypatch.setattr(main, "bound_workspace_generation", _generation)
+    monkeypatch.setattr(main, "resolve_remote_workspace_target", _target)
+
+    result = await main.get_ssh_target(
+        request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
+    )
+    assert result["state"] == "live"
+    assert result["pod_ip"] == "10.0.0.5"
+    assert result["pod_port"] == 2222
+    assert result["host_key_fingerprint"] == "SHA256:" + "B" * 43
+
+
+@pytest.mark.asyncio
+async def test_vm_tier_state_from_json_string_metadata(internal, monkeypatch):
+    """Important 2 (fix round 1): exercises the real JSONB-as-str seam end
+    to end. asyncpg returns ``threads.metadata`` as a JSON string, not a
+    dict; this passes one, does NOT monkeypatch ``thread_metadata_object``
+    (unlike the other tests here), and lets the real parser and the real
+    ``_thread_is_vm_tier`` run against the result — both were previously
+    only exercised through a mocked ``thread_metadata_object``.
+    """
+
+    async def _thread_id(handle):
+        return THREAD
+
+    async def _user(fp):
+        return {"id": USER}
+
+    async def _access(user, db, entity_id):
+        return True
+
+    metadata_json = json.dumps({"vm": {"status": "ready"}})
+
+    async def _get_thread(tid):
+        return _thread(status="active", metadata=metadata_json)
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
+    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
+
+    result = await main.get_ssh_target(
+        request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
+    )
+    assert result["state"] == "vm_unsupported"
+    assert result["pod_ip"] is None
+
+
+@pytest.mark.asyncio
+async def test_stale_binding_state_on_canvas_ssh_error(internal, monkeypatch):
+    """Important 2 + Minor 3 (fix round 1): a workspace_container that IS
+    ready but carries no provisioner-attested ``_workspace_binding`` must
+    report ``stale_binding``, not ``never_provisioned`` — the workspace
+    really is provisioned, just not SSH-attested. Runs the real
+    ``bound_workspace_generation``/``resolve_remote_workspace_target``
+    (neither mocked): with no ``_workspace_binding`` in metadata,
+    ``bound_workspace_generation`` itself raises ``CanvasSSHError`` while
+    being evaluated as that call's argument, which the endpoint's ``try``
+    still catches.
+    """
+
+    async def _thread_id(handle):
+        return THREAD
+
+    async def _user(fp):
+        return {"id": USER}
+
+    async def _access(user, db, entity_id):
+        return True
+
+    async def _get_thread(tid):
+        return _thread(
+            status="active", metadata={"workspace_container": {"status": "ready"}}
+        )
+
+    monkeypatch.setattr(main.postgres_db, "get_thread_id_by_ssh_handle", _thread_id)
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user)
+    monkeypatch.setattr(main, "user_can_access_ide_entity", _access)
+    monkeypatch.setattr(main.postgres_db, "get_thread", _get_thread)
+
+    result = await main.get_ssh_target(
+        request=object(), handle="s-7f3a91c2", fingerprint=FINGERPRINT
+    )
+    assert result["state"] == "stale_binding"
+    assert result["pod_ip"] is None
+
+
 def test_endpoint_does_not_use_the_restoring_resolver():
     """_resolve_thread_for_forwarding restores suspended workspaces as a side
     effect. Using it here would silently implement wake-on-connect, which the
-    design rules out."""
+    design rules out.
+
+    Scope note (fix round 1 / Minor 7): this inspects only
+    ``get_ssh_target``'s own source, not transitively through the helpers it
+    calls (``resolve_workspace_state``, ``_thread_is_vm_tier``,
+    ``resolve_remote_workspace_target``, ...). A prohibited helper
+    introduced one level down would not trip this guard — it was checked by
+    hand against current source when this endpoint was written and is clean
+    today, but a future change to those helpers is outside what this test
+    can see.
+    """
     import inspect
 
     source = inspect.getsource(main.get_ssh_target)

@@ -26,6 +26,15 @@ STATE_RESTORING = "restoring"
 STATE_ENDED = "ended"
 STATE_NEVER_PROVISIONED = "never_provisioned"
 STATE_VM_UNSUPPORTED = "vm_unsupported"
+# Not returned by resolve_workspace_state() itself — the endpoint reports
+# this when workspace_container.status IS "ready" (genuinely provisioned)
+# but resolve_remote_workspace_target() raises CanvasSSHError: a missing/
+# unattested _workspace_binding, a stale generation, or a malformed SSH
+# identity. Collapsing that into STATE_NEVER_PROVISIONED would send an
+# operator after the wrong problem — the workspace exists, its SSH
+# attestation doesn't. Defined here (not inline in main.py) so it shares
+# the same import/reuse path as the other STATE_* constants.
+STATE_STALE_BINDING = "stale_binding"
 
 
 def resolve_workspace_state(thread: dict[str, Any], metadata: dict[str, Any]) -> str:

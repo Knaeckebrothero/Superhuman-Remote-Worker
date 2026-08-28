@@ -467,10 +467,16 @@ from services.ssh_public_keys import (  # noqa: E402
     parse_public_key,
     verify_possession,
 )
-from services.ssh_gateway_targets import resolve_workspace_state  # noqa: E402
+from services.ssh_gateway_targets import (  # noqa: E402
+    STATE_LIVE,
+    STATE_STALE_BINDING,
+    STATE_VM_UNSUPPORTED,
+    resolve_workspace_state,
+)
 from services.ssh_handles import is_valid_handle  # noqa: E402
 from services.canvas_ssh import (  # noqa: E402
     CanvasSSHError,
+    RemoteWorkspaceTarget,
     bound_workspace_generation,
     resolve_remote_workspace_target,
 )
@@ -62953,9 +62959,27 @@ async def delete_ssh_key(request: Request, key_id: str) -> dict[str, str]:
     return {"status": "deleted"}
 
 
+def _ssh_target_response(
+    thread_id: str,
+    user: dict[str, Any],
+    state: str,
+    target: RemoteWorkspaceTarget | None = None,
+) -> dict[str, Any]:
+    """The one response shape every ``get_ssh_target`` branch returns, so a
+    new field can't be added to three branches out of four."""
+    return {
+        "thread_id": thread_id,
+        "user_id": str(user["id"]),
+        "pod_ip": target.host if target else None,
+        "pod_port": target.port if target else None,
+        "host_key_fingerprint": target.fingerprint if target else None,
+        "state": state,
+    }
+
+
 @app.get("/api/internal/ssh-targets/{handle}")
 async def get_ssh_target(
-    request: Request, handle: str, fingerprint: str
+    request: Request, handle: str, fingerprint: str | None = None
 ) -> dict[str, Any]:
     """Resolve an SSH handle plus a presented key fingerprint to a workspace
     target. **Internal** — requires ``X-Internal-Key``.
@@ -62968,19 +62992,31 @@ async def get_ssh_target(
     Unknown handle, unknown key and unauthorized all return an identical 404.
     A resolvable-but-not-live workspace returns 200 with a non-live ``state``
     and ``pod_ip: None``, so the gateway can print a readable reason.
+
+    ``fingerprint`` is Optional so a request that omits it still reaches
+    ``require_internal`` first: a required query param would make FastAPI
+    422 before any auth check runs, disclosing the route and its parameter
+    name to an unauthenticated caller.
     """
     await require_internal(request)
 
-    if not is_valid_handle(handle):
-        raise HTTPException(status_code=404, detail="No such workspace")
-
     opaque = HTTPException(status_code=404, detail="No such workspace")
 
-    thread_id = await postgres_db.get_thread_id_by_ssh_handle(handle)
-    if not thread_id:
+    if not fingerprint or not is_valid_handle(handle):
         raise opaque
+
+    # Both lookups run unconditionally, even when the handle is already
+    # known to be unknown. resolve_user_by_ssh_fingerprint is not a read —
+    # it bumps user_ssh_keys.last_used_at (postgres.py's UPDATE ... RETURNING
+    # CTE), and the caller can read their own last_used_at back through GET
+    # /api/ssh-keys. Short-circuiting on thread_id would turn "did my key's
+    # last_used_at just move?" into a confirmation oracle letting an
+    # approved user tell "handle exists, not mine" apart from "handle does
+    # not exist" despite the two 404 bodies matching byte-for-byte. It also
+    # removes the round-trip timing asymmetry between the two failure paths.
+    thread_id = await postgres_db.get_thread_id_by_ssh_handle(handle)
     user = await postgres_db.resolve_user_by_ssh_fingerprint(fingerprint)
-    if not user:
+    if not thread_id or not user:
         raise opaque
     if not await user_can_access_ide_entity(user, postgres_db, thread_id):
         raise opaque
@@ -62993,49 +63029,27 @@ async def get_ssh_target(
     ws_ctx = metadata.get("workspace_container") or {}
     vm_ctx = metadata.get("vm") or {}
     if _thread_is_vm_tier(metadata, ws_ctx, vm_ctx):
-        return {
-            "thread_id": thread_id,
-            "user_id": str(user["id"]),
-            "pod_ip": None,
-            "pod_port": None,
-            "host_key_fingerprint": None,
-            "state": "vm_unsupported",
-        }
+        return _ssh_target_response(thread_id, user, STATE_VM_UNSUPPORTED)
 
     state = resolve_workspace_state(thread, metadata)
-    if state != "live":
-        return {
-            "thread_id": thread_id,
-            "user_id": str(user["id"]),
-            "pod_ip": None,
-            "pod_port": None,
-            "host_key_fingerprint": None,
-            "state": state,
-        }
+    if state != STATE_LIVE:
+        return _ssh_target_response(thread_id, user, state)
 
     try:
         target = resolve_remote_workspace_target(
             thread, bound_workspace_generation(thread)
         )
     except CanvasSSHError as exc:
+        # workspace_container.status IS "ready" here — resolve_workspace_
+        # state already proved that via STATE_LIVE above — so this is a
+        # provisioned workspace with an unusable SSH attestation (missing/
+        # stale _workspace_binding, bad host key), not an absent workspace.
+        # STATE_STALE_BINDING says so; folding it into STATE_NEVER_
+        # PROVISIONED would send an operator after the wrong problem.
         logger.info("ssh-target unresolvable for %s: %s", thread_id, exc)
-        return {
-            "thread_id": thread_id,
-            "user_id": str(user["id"]),
-            "pod_ip": None,
-            "pod_port": None,
-            "host_key_fingerprint": None,
-            "state": "never_provisioned",
-        }
+        return _ssh_target_response(thread_id, user, STATE_STALE_BINDING)
 
-    return {
-        "thread_id": thread_id,
-        "user_id": str(user["id"]),
-        "pod_ip": target.host,
-        "pod_port": target.port,
-        "host_key_fingerprint": target.fingerprint,
-        "state": "live",
-    }
+    return _ssh_target_response(thread_id, user, STATE_LIVE, target)
 
 
 # =============================================================================
