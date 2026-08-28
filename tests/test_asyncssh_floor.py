@@ -19,7 +19,12 @@ MINIMUM = (2, 24, 0)
 
 
 def _parse(spec: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in spec.split("."))
+    # Zero-pad to three components. Without this, `asyncssh>=2.24` — a fully
+    # compliant pin, and the two-component style already used by Jinja2 and
+    # cryptography in these same files — parses to (2, 24), which Python ranks
+    # BELOW (2, 24, 0) because a shorter tuple loses on an equal prefix.
+    parts = tuple(int(part) for part in spec.split("."))
+    return parts + (0,) * (3 - len(parts))
 
 
 @pytest.mark.parametrize("path", REQUIREMENTS, ids=lambda p: p.name)
@@ -36,3 +41,12 @@ def test_asyncssh_floor_covers_cve_2026_62949(path):
         assert _parse(match.group(1)) >= MINIMUM, (
             f"{pin} permits versions vulnerable to CVE-2026-62949"
         )
+
+
+@pytest.mark.parametrize(
+    "spec,expected",
+    [("2.24", True), ("2.24.0", True), ("2.24.1", True), ("3.0", True),
+     ("2.23.1", False), ("2.21.0", False), ("2.9", False)],
+)
+def test_version_comparison_handles_short_and_long_pins(spec, expected):
+    assert (_parse(spec) >= MINIMUM) is expected
