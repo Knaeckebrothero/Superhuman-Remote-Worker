@@ -297,24 +297,12 @@ async def test_vm_retirement_claim_and_receipt_gate_terminal_transition(
             f"UPDATE {table} SET {column} = jsonb_set({column}, "
             "'{vm,status}', '\"deleted\"'::jsonb) WHERE id = $1"
         )
-        if owner_kind == "job":
-            with pytest.raises(asyncpg.CheckViolationError):
-                await conn.execute(terminal_vm_write, owner_id)
-        else:
-            # 0195 hands a *pinned* thread's runtime evidence to the
-            # 0185/0198 lane, so the generic process-zero trigger does not
-            # fire here. That lane's `threads_ended_runtime_authority` covers
-            # agent_id/attach token/agent_pod but NOT the `vm` projection, so
-            # this raw terminal write is currently accepted. Recorded as an
-            # open gap in the vault issue note rather than closed here: the
-            # fix is a pinned-lane fence, and restoring the generic one costs
-            # seven live proofs in `test_persistent_recycler_real_postgres`.
+        with pytest.raises(asyncpg.CheckViolationError) as refused:
             await conn.execute(terminal_vm_write, owner_id)
-            await conn.execute(
-                f"UPDATE {table} SET {column} = jsonb_set({column}, "
-                "'{vm,status}', '\"ready\"'::jsonb) WHERE id = $1",
-                owner_id,
-            )
+        assert (
+            refused.value.constraint_name
+            == "managed_repository_vm_process_zero_required"
+        )
 
     assert await db.claim_managed_repository_workspace_retirement(
         str(owner_id),

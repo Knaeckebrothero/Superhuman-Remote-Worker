@@ -177,10 +177,13 @@ def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
         "_orchestrator_client",
         SimpleNamespace(agent_id=str(uuid4())),
     )
-    runtime_generation = str(uuid4())
-    monkeypatch.setattr(persistent_app, "_input_runtime_generation", runtime_generation)
+    process_generation = str(uuid4())
+    session_generation = str(uuid4())
     monkeypatch.setattr(
-        persistent_app, "_session_runtime_generation", runtime_generation
+        persistent_app, "_input_runtime_generation", process_generation
+    )
+    monkeypatch.setattr(
+        persistent_app, "_session_runtime_generation", session_generation
     )
     monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", str(uuid4()))
     monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", False)
@@ -911,7 +914,7 @@ async def test_authorized_retirement_fences_provider_and_tool_before_effect(
         thread_id=persistent_app._thread_id,
         agent_id=persistent_app._orchestrator_client.agent_id,
         pod_uid="pod-uid-test",
-        runtime_generation=persistent_app._input_runtime_generation,
+        session_runtime_generation=persistent_app._session_runtime_generation,
         runtime_attach_token=persistent_app._session_runtime_attach_token,
     )
 

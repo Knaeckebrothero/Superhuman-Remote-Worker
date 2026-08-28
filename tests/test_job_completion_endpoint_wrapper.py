@@ -1702,13 +1702,13 @@ async def test_legacy_drain_stall_counter_keeps_best_effort_false_write(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("authority", "expected_delete_calls"),
-    [("exact_live", 1), ("exact_absent", 0), ("replacement", 0)],
+    ("cleanup_state", "expected_result"),
+    [("settled", True), ("superseded", True), ("retryable", False)],
 )
-async def test_durable_recovery_delete_uses_exact_pod_authority(
+async def test_durable_recovery_delete_uses_exact_cleanup_intent(
     monkeypatch: pytest.MonkeyPatch,
-    authority: str,
-    expected_delete_calls: int,
+    cleanup_state: str,
+    expected_result: bool,
 ) -> None:
     runtime_uid = "55555555-5555-4555-8555-555555555555"
     job = _route_job()
@@ -1727,15 +1727,23 @@ async def test_durable_recovery_delete_uses_exact_pod_authority(
         terminal_effects=AsyncMock(return_value={"actions": []}),
         workspace_cleanup=AsyncMock(return_value=[]),
     )
-    authority_probe = AsyncMock(return_value=authority)
-    pod_delete = AsyncMock(return_value=True)
-    monkeypatch.setattr(
-        main.container_provisioner, "workspace_pod_authority", authority_probe
+    prepare_cleanup = AsyncMock(return_value={"intent_generation": 7})
+    reconcile_cleanup = AsyncMock(
+        return_value=main.WorkspaceCleanupOutcome(cleanup_state, 7)
     )
-    monkeypatch.setattr(main.container_provisioner, "delete_workspace", pod_delete)
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "prepare_workspace_cleanup_intent",
+        prepare_cleanup,
+    )
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "reconcile_workspace_cleanup_intent",
+        reconcile_cleanup,
+    )
 
     async def recovery(_job, job_id, _error, *, delete_workspace, **_kwargs):
-        assert await delete_workspace(job_id) is True
+        assert await delete_workspace(job_id) is expected_result
         return {
             "status": "handled",
             "job_id": job_id,
@@ -1759,21 +1767,21 @@ async def test_durable_recovery_delete_uses_exact_pod_authority(
     )
 
     assert result["actions"] == ["workspace recovery tested"]
-    authority_probe.assert_awaited_once_with(
+    prepare_cleanup.assert_awaited_once_with(
         main.WorkspaceOwner.job(JOB_ID),
         expected_runtime_incarnation=runtime_uid,
+        target_disposition="deleted",
+        reclaim_shared_resources=False,
     )
-    assert pod_delete.await_count == expected_delete_calls
-    if expected_delete_calls:
-        pod_delete.assert_awaited_once_with(
-            main.WorkspaceOwner.job(JOB_ID),
-            expected_runtime_incarnation=runtime_uid,
-            wait_for_exact_absence=True,
-        )
+    reconcile_cleanup.assert_awaited_once_with(
+        main.WorkspaceOwner.job(JOB_ID),
+        expected_runtime_incarnation=runtime_uid,
+        intent_generation=7,
+    )
 
 
 @pytest.mark.asyncio
-async def test_legacy_recovery_delete_keeps_name_based_best_effort_contract(
+async def test_recovery_delete_without_runtime_identity_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job = _route_job()
@@ -1785,15 +1793,21 @@ async def test_legacy_recovery_delete_keeps_name_based_best_effort_contract(
         terminal_effects=AsyncMock(return_value={"actions": []}),
         workspace_cleanup=AsyncMock(return_value=[]),
     )
-    authority_probe = AsyncMock()
-    pod_delete = AsyncMock(return_value=False)
+    prepare_cleanup = AsyncMock()
+    reconcile_cleanup = AsyncMock()
     monkeypatch.setattr(
-        main.container_provisioner, "workspace_pod_authority", authority_probe
+        main.container_provisioner,
+        "prepare_workspace_cleanup_intent",
+        prepare_cleanup,
     )
-    monkeypatch.setattr(main.container_provisioner, "delete_workspace", pod_delete)
+    monkeypatch.setattr(
+        main.container_provisioner,
+        "reconcile_workspace_cleanup_intent",
+        reconcile_cleanup,
+    )
 
     async def recovery(_job, job_id, _error, *, delete_workspace, **_kwargs):
-        # Legacy recovery historically ignores a best-effort False result.
+        # A deterministic Pod name is not authority to delete a replacement.
         assert await delete_workspace(job_id) is False
         return {
             "status": "handled",
@@ -1821,8 +1835,8 @@ async def test_legacy_recovery_delete_keeps_name_based_best_effort_contract(
         "new_status": "paused",
         "actions": ["workspace recovery tested"],
     }
-    authority_probe.assert_not_awaited()
-    pod_delete.assert_awaited_once_with(main.WorkspaceOwner.job(JOB_ID))
+    prepare_cleanup.assert_not_awaited()
+    reconcile_cleanup.assert_not_awaited()
 
 
 @pytest.mark.asyncio

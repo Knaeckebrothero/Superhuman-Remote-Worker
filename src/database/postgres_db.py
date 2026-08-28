@@ -1360,6 +1360,7 @@ class PostgresDB:
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
+        session_runtime_generation: str,
         runtime_attach_token: str,
     ) -> Dict[str, Any]:
         """Persist and claim one pinned input in a parent-first transaction."""
@@ -1379,6 +1380,7 @@ class PostgresDB:
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
+                    session_runtime_generation=session_runtime_generation,
                     runtime_attach_token=runtime_attach_token,
                 )
 
@@ -1389,6 +1391,7 @@ class PostgresDB:
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
+        session_runtime_generation: str,
         runtime_attach_token: str,
     ) -> List[Dict[str, Any]]:
         """Reclaim persisted but unadmitted input after attach/restart."""
@@ -1403,6 +1406,7 @@ class PostgresDB:
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
+                    session_runtime_generation=session_runtime_generation,
                     runtime_attach_token=runtime_attach_token,
                 )
 
@@ -1414,6 +1418,7 @@ class PostgresDB:
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
+        session_runtime_generation: str,
         runtime_attach_token: str,
         claim_generation: int,
     ) -> bool:
@@ -1429,7 +1434,7 @@ class PostgresDB:
                     thread_id=thread_id,
                     agent_id=agent_id,
                     pod_uid=pod_uid,
-                    runtime_generation=runtime_generation,
+                    session_runtime_generation=session_runtime_generation,
                     runtime_attach_token=runtime_attach_token,
                 )
                 return await mark_input_delivery_queued(
@@ -1438,6 +1443,7 @@ class PostgresDB:
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
+                    session_runtime_generation=session_runtime_generation,
                     runtime_attach_token=runtime_attach_token,
                     claim_generation=claim_generation,
                 )
@@ -1450,6 +1456,7 @@ class PostgresDB:
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
+        session_runtime_generation: str,
         runtime_attach_token: str,
         claim_generation: int,
         transition: str,
@@ -1468,7 +1475,7 @@ class PostgresDB:
                     thread_id=thread_id,
                     agent_id=agent_id,
                     pod_uid=pod_uid,
-                    runtime_generation=runtime_generation,
+                    session_runtime_generation=session_runtime_generation,
                     runtime_attach_token=runtime_attach_token,
                 )
                 return await transition_input_delivery(
@@ -1477,6 +1484,7 @@ class PostgresDB:
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
+                    session_runtime_generation=session_runtime_generation,
                     runtime_attach_token=runtime_attach_token,
                     claim_generation=claim_generation,
                     transition=transition,
@@ -1490,7 +1498,7 @@ class PostgresDB:
         thread_id: str,
         agent_id: str,
         pod_uid: str,
-        runtime_generation: str,
+        session_runtime_generation: str,
         runtime_attach_token: str,
     ) -> bool:
         """Prove the exact pinned runtime is still allowed external effects.
@@ -1514,7 +1522,7 @@ class PostgresDB:
                         thread_id=thread_id,
                         agent_id=agent_id,
                         pod_uid=pod_uid,
-                        runtime_generation=runtime_generation,
+                        session_runtime_generation=session_runtime_generation,
                         runtime_attach_token=runtime_attach_token,
                     )
             return True

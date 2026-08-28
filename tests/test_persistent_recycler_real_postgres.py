@@ -1973,6 +1973,7 @@ async def test_soft_ended_generation_is_durable_quiescence_for_later_delete(db):
     )
     cleared = _json((await db.get_thread(ids["thread"]))["metadata"])
     assert "_workspace_binding" not in cleared
+    assert "vm" not in cleared
     assert cleared["workspace_container"]["_runtime_incarnation"] is None
     await db.delete_thread(
         ids["thread"],
@@ -2663,7 +2664,7 @@ async def test_exact_agent_begin_authorizes_atomically_without_control_reopen(db
                     thread_id=ids["thread"],
                     agent_id=ids["agent"],
                     pod_uid="old-pod",
-                    runtime_generation=authority["generation"],
+                    session_runtime_generation=authority["generation"],
                     runtime_attach_token=ids["attach_token"],
                 )
 
@@ -3603,6 +3604,172 @@ async def test_pinned_vm_provision_cas_loses_after_retirement_begin(db):
         provision_context=context,
     )
     assert "vm" not in _json((await db.get_thread(ids["thread"]))["metadata"])
+
+
+@pytest.mark.asyncio
+async def test_pinned_vm_permanent_clear_requires_process_zero_receipt(db):
+    """A pinned VM projection clears only behind its exact durable receipt."""
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    generation = str(uuid4())
+    vm_uid = str(uuid4())
+    rootdisk_uid = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata=jsonb_set(jsonb_set(metadata,"
+            "'{config_override,workspace,backend}', '\"vm\"'::jsonb, true),"
+            "'{vm}', $2::jsonb, true) WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "provision_generation": generation,
+                    "identity_provision_generation": generation,
+                    "identity_authenticated": True,
+                    "vm_uid": vm_uid,
+                    "_runtime_incarnation": vm_uid,
+                    "rootdisk_pvc_uid": rootdisk_uid,
+                }
+            ),
+        )
+
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError) as refused:
+        await db.clear_pinned_retirement_physical_runtime_endpoint(
+            ids["thread"],
+            runtime_generation=retirement["generation"],
+            retirement_token=retirement["token"],
+            completed_external_cleanup_protocol="workspace_actuator_zero_v1",
+        )
+    assert (
+        refused.value.constraint_name == "managed_repository_vm_process_zero_required"
+    )
+
+    assert await db.record_managed_repository_workspace_process_zero(
+        ids["thread"],
+        owner_kind="thread",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=generation,
+    )
+    assert await db.merge_thread_vm_context_if_provision_generation(
+        ids["thread"], generation, {"status": "deleted"}
+    )
+    assert await db.clear_pinned_retirement_physical_runtime_endpoint(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+        completed_external_cleanup_protocol="workspace_actuator_zero_v1",
+    )
+    cleared = _json((await db.get_thread(ids["thread"]))["metadata"])
+    assert "vm" not in cleared
+
+    await db.delete_thread(
+        ids["thread"],
+        expected_runtime_retirement_token=retirement["token"],
+        expected_runtime_generation=retirement["generation"],
+    )
+    assert await db.get_thread(ids["thread"]) is None
+
+
+@pytest.mark.asyncio
+async def test_pinned_vm_retirement_uses_credential_process_zero_release(db):
+    """The pinned End actuator must use release, never controller-only delete."""
+
+    import main as orch_main
+    from orchestrator.services.vm_provisioner import VMTeardownResult
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    generation = str(uuid4())
+    vm_uid = str(uuid4())
+    rootdisk_uid = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata=jsonb_set(jsonb_set(metadata,"
+            "'{config_override,workspace,backend}', '\"vm\"'::jsonb, true),"
+            "'{vm}', $2::jsonb, true) WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "provision_generation": generation,
+                    "identity_provision_generation": generation,
+                    "identity_authenticated": True,
+                    "vm_uid": vm_uid,
+                    "_runtime_incarnation": vm_uid,
+                    "rootdisk_pvc_uid": rootdisk_uid,
+                }
+            ),
+        )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+
+    async def release_vm(
+        thread_id,
+        identity,
+        *,
+        ssh_host,
+        ssh_port,
+        purge_disk,
+        entity_type,
+        capture_snapshot,
+    ):
+        assert thread_id == ids["thread"]
+        assert identity.provision_generation == generation
+        assert identity.vm_uid == vm_uid
+        assert identity.rootdisk_pvc_uid == rootdisk_uid
+        assert ssh_host is None and ssh_port is None
+        assert purge_disk is True
+        assert entity_type == "thread"
+        assert capture_snapshot is False
+        assert await db.record_managed_repository_workspace_process_zero(
+            ids["thread"],
+            owner_kind="thread",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=generation,
+        )
+        assert await db.merge_thread_vm_context_if_provision_generation(
+            ids["thread"], generation, {"status": "deleted"}
+        )
+        return VMTeardownResult("completed", True)
+
+    provisioner = MagicMock()
+    provisioner.lifecycle_available = True
+    provisioner.release_vm_captured = AsyncMock(side_effect=release_vm)
+    provisioner.delete_vm_captured = AsyncMock(
+        side_effect=AssertionError("controller-only VM delete is not process-zero")
+    )
+    with (
+        patch.object(orch_main, "postgres_db", db),
+        patch.object(orch_main, "vm_provisioner", provisioner),
+    ):
+        await orch_main._cleanup_pinned_thread_retirement(
+            retirement, cleanup_agent_pod=False
+        )
+
+    provisioner.release_vm_captured.assert_awaited_once()
+    provisioner.delete_vm_captured.assert_not_awaited()
+    current = await db.get_thread(ids["thread"])
+    assert "vm" not in _json(current["metadata"])
+    assert await db.pinned_retirement_external_cleanup_complete(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+    )
 
 
 @pytest.mark.asyncio
@@ -7016,7 +7183,7 @@ async def test_replacement_binding_steals_once_and_old_agent_cannot_mutate(db):
                     thread_id=ids["thread"],
                     agent_id=ids["agent"],
                     pod_uid="old-pod",
-                    runtime_generation=old_runtime,
+                    session_runtime_generation=old_runtime,
                     runtime_attach_token=old_attach_token,
                 )
 

@@ -11626,23 +11626,14 @@ class PostgresDB:
                         _DOCKER_WORKSPACE_LEASE_KEY: None,
                     }
                 )
-                cleared_vm = dict(current_vm)
-                cleared_vm.update(
-                    {
-                        "status": "deleted",
-                        "provision_generation": None,
-                        "identity_provision_generation": None,
-                        "vm_uid": None,
-                        "_runtime_incarnation": None,
-                        "rootdisk_pvc_uid": None,
-                        "ssh_host": None,
-                        "ssh_port": None,
-                        "_canvas_workspace_generation": None,
-                    }
-                )
                 updated_metadata = dict(metadata)
                 updated_metadata["workspace_container"] = cleared_workspace
-                updated_metadata["vm"] = cleared_vm
+                # The exact VM generation remains in the immutable retirement
+                # context and process-zero ledger.  Once its external actuator
+                # has proved absence, remove the active projection completely:
+                # a markerless ``status=deleted`` tombstone would have no
+                # generation with which a later DELETE could prove authority.
+                updated_metadata.pop("vm", None)
                 # A permanent retirement has already reclaimed the captured
                 # PVC/backing.  Leaving this private binding behind would let a
                 # DELETE orphan storage and makes markerless legacy absence

@@ -1767,6 +1767,7 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
             )
             runtime_generation = runtime_identity["runtime_generation"]
             runtime_attach_token = runtime_identity["runtime_attach_token"]
+            process_generation = uuid4()
             owned = await input_delivery.persist_input_delivery(
                 conn,
                 thread_id=ids["thread_id"],
@@ -1777,7 +1778,8 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
                 turn_number=None,
                 agent_id=ids["agent_id"],
                 pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=runtime_attach_token,
             )
             assert await input_delivery.mark_input_delivery_queued(
@@ -1785,7 +1787,8 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
                 delivery_id=delivery_id,
                 agent_id=ids["agent_id"],
                 pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=runtime_attach_token,
                 claim_generation=int(owned["claim_generation"]),
             )
@@ -1794,7 +1797,8 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
                 delivery_id=delivery_id,
                 agent_id=ids["agent_id"],
                 pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=runtime_attach_token,
                 claim_generation=int(owned["claim_generation"]),
                 transition="admitted",
@@ -1808,7 +1812,8 @@ async def test_verification_maintenance_failure_pages_once_and_recovers_wake(db)
                 delivery_id=delivery_id,
                 agent_id=ids["agent_id"],
                 pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=runtime_attach_token,
                 claim_generation=int(owned["claim_generation"]),
                 transition="settled",

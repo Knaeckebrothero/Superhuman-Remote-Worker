@@ -153,11 +153,10 @@ BEGIN
     new_workspace := COALESCE(new_state->'workspace_container', '{}'::JSONB);
 
     -- Origin migration 0185/0198 is the authority for a *pinned* thread's
-    -- Kubernetes agent runtime and for its VM evidence on an ended thread, so
-    -- those scopes are handed over here.  A pinned thread's *Docker* workspace
-    -- lease has no such owner: 0191 fenced it for every lane and nothing in
-    -- the pinned lane replaced that, so a blanket early return would silently
-    -- drop process-zero for every pinned Docker workspace.
+    -- Kubernetes agent runtime, so that scope is handed over here.  It does
+    -- not protect metadata.vm or a Docker workspace lease: both remain under
+    -- the generic process-zero ledger for every lane.  A blanket pinned-lane
+    -- return would let an ended thread discard either runtime without proof.
     IF pinned_thread
        AND old_workspace->>'provisioner' IS DISTINCT FROM 'docker'
        AND new_workspace->>'provisioner' IS DISTINCT FROM 'docker' THEN
@@ -420,10 +419,6 @@ BEGIN
 
     old_vm := COALESCE(old_state->'vm', '{}'::JSONB);
     new_vm := COALESCE(new_state->'vm', '{}'::JSONB);
-    IF pinned_thread THEN
-        old_vm := '{}'::JSONB;
-        new_vm := '{}'::JSONB;
-    END IF;
     inherited_scope := declared_inherited
         AND old_vm <> '{}'::JSONB
         AND (
@@ -639,4 +634,3 @@ BEFORE INSERT ON public.threads
 FOR EACH ROW EXECUTE FUNCTION public.prevent_process_zero_owner_resurrection();
 
 COMMIT;
-

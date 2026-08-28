@@ -554,15 +554,23 @@ async def test_terminal_pinned_replay_survives_change_to_stateless(db):
     assigned = await db.assign_session_wake_delivery_groups([wake[0]["id"]])
     delivery_id = UUID(str(assigned[0]["delivery_id"]))
     first = await _persist_event(db, thread_id, delivery_id, "pinned wake")
-    runtime_generation = uuid4()
+    process_generation = uuid4()
     async with db.acquire() as conn:
         async with conn.transaction():
+            runtime_identity = await conn.fetchrow(
+                "UPDATE threads SET runtime_attach_token=COALESCE("
+                "runtime_attach_token,gen_random_uuid()) WHERE id=$1 "
+                "RETURNING runtime_generation,runtime_attach_token",
+                thread_id,
+            )
             rows = await claim_pending_input_deliveries(
                 conn,
                 thread_id=thread_id,
                 agent_id=agent_id,
                 pod_uid="pod-pinned",
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_identity["runtime_generation"],
+                runtime_attach_token=runtime_identity["runtime_attach_token"],
             )
             assert len(rows) == 1
             assert await transition_input_delivery(
@@ -570,7 +578,9 @@ async def test_terminal_pinned_replay_survives_change_to_stateless(db):
                 delivery_id=delivery_id,
                 agent_id=agent_id,
                 pod_uid="pod-pinned",
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_identity["runtime_generation"],
+                runtime_attach_token=runtime_identity["runtime_attach_token"],
                 claim_generation=rows[0]["claim_generation"],
                 transition="admitted",
                 turn_number=1,

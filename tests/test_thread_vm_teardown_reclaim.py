@@ -36,6 +36,7 @@ async def _cleanup_thread(status):
     identity = object()
     vm_provisioner = SimpleNamespace(
         is_available=True,
+        lifecycle_available=True,
         capture_vm_teardown_identity=AsyncMock(return_value=identity),
         release_vm_captured=AsyncMock(
             return_value=SimpleNamespace(disposition="completed")
@@ -106,6 +107,7 @@ class TestThreadVmReleasedOnTeardown:
         identity = object()
         vm_provisioner = SimpleNamespace(
             is_available=True,
+            lifecycle_available=True,
             capture_vm_teardown_identity=AsyncMock(return_value=identity),
             release_vm_captured=AsyncMock(
                 return_value=SimpleNamespace(disposition="retry_pending")
@@ -140,6 +142,7 @@ async def _cleanup_job(status):
     identity = object()
     vm_provisioner = SimpleNamespace(
         is_available=True,
+        lifecycle_available=True,
         capture_vm_teardown_identity=AsyncMock(return_value=identity),
         release_vm_captured=AsyncMock(
             return_value=SimpleNamespace(disposition="completed")

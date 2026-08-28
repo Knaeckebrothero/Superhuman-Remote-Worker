@@ -45,14 +45,14 @@ async def lock_runtime_authority(
     thread_id: str | UUID,
     agent_id: str | UUID,
     pod_uid: str,
-    runtime_generation: str | UUID,
+    session_runtime_generation: str | UUID,
     runtime_attach_token: str | UUID,
 ) -> dict[str, Any]:
     """Lock and prove exact reciprocal thread/agent/pod authority."""
 
     thread_uuid = UUID(str(thread_id))
     agent_uuid = UUID(str(agent_id))
-    runtime_uuid = UUID(str(runtime_generation))
+    runtime_uuid = UUID(str(session_runtime_generation))
     attach_uuid = UUID(str(runtime_attach_token))
     pod = str(pod_uid or "").strip()
     if not pod:
@@ -152,6 +152,7 @@ async def persist_input_delivery(
     agent_id: str | UUID | None = None,
     pod_uid: str | None = None,
     runtime_generation: str | UUID | None = None,
+    session_runtime_generation: str | UUID | None = None,
     runtime_attach_token: str | UUID | None = None,
 ) -> dict[str, Any]:
     """Atomically persist one transcript row and optionally claim execution.
@@ -165,7 +166,14 @@ async def persist_input_delivery(
     thread_uuid = UUID(str(thread_id))
     row_id = message_row_id(delivery_uuid)
     source_value = str(source or "unknown")[:80]
-    identity = (agent_id, pod_uid, runtime_generation, runtime_attach_token)
+    session_runtime_generation = session_runtime_generation or runtime_generation
+    identity = (
+        agent_id,
+        pod_uid,
+        runtime_generation,
+        session_runtime_generation,
+        runtime_attach_token,
+    )
     has_identity = all(value is not None for value in identity)
     if any(value is not None for value in identity) and not has_identity:
         raise InputDeliveryAuthorityLost("incomplete runtime identity")
@@ -258,7 +266,7 @@ async def persist_input_delivery(
             thread_id=thread_uuid,
             agent_id=str(agent_id),
             pod_uid=str(pod_uid),
-            runtime_generation=str(runtime_generation),
+            session_runtime_generation=str(session_runtime_generation),
             runtime_attach_token=str(runtime_attach_token),
         )
 
@@ -677,6 +685,7 @@ async def claim_pending_input_deliveries(
     agent_id: str | UUID,
     pod_uid: str,
     runtime_generation: str | UUID,
+    session_runtime_generation: str | UUID | None = None,
     runtime_attach_token: str | UUID,
 ) -> list[dict[str, Any]]:
     """Claim every persisted/unadmitted input for one attached runtime."""
@@ -685,12 +694,13 @@ async def claim_pending_input_deliveries(
     agent_uuid = UUID(str(agent_id))
     runtime_uuid = UUID(str(runtime_generation))
     attach_uuid = UUID(str(runtime_attach_token))
+    session_runtime = session_runtime_generation or runtime_generation
     await lock_runtime_authority(
         conn,
         thread_id=thread_uuid,
         agent_id=agent_uuid,
         pod_uid=pod_uid,
-        runtime_generation=runtime_uuid,
+        session_runtime_generation=session_runtime,
         runtime_attach_token=attach_uuid,
     )
     rows = await conn.fetch(
@@ -752,9 +762,11 @@ async def mark_input_delivery_queued(
     agent_id: str | UUID,
     pod_uid: str,
     runtime_generation: str | UUID,
+    session_runtime_generation: str | UUID | None = None,
     runtime_attach_token: str | UUID,
     claim_generation: int,
 ) -> bool:
+    session_runtime = session_runtime_generation or runtime_generation
     row = await conn.fetchrow(
         """
         UPDATE thread_input_deliveries delivery
@@ -783,7 +795,7 @@ async def mark_input_delivery_queued(
         UUID(str(agent_id)),
         str(pod_uid),
         UUID(str(runtime_generation)),
-        UUID(str(runtime_generation)),
+        UUID(str(session_runtime)),
         UUID(str(runtime_attach_token)),
     )
     return row is not None
@@ -796,6 +808,7 @@ async def transition_input_delivery(
     agent_id: str | UUID,
     pod_uid: str,
     runtime_generation: str | UUID,
+    session_runtime_generation: str | UUID | None = None,
     runtime_attach_token: str | UUID,
     claim_generation: int,
     transition: str,
@@ -804,6 +817,7 @@ async def transition_input_delivery(
 ) -> bool:
     """CAS one exact owner through admitted, settled, deferred, or cancelled."""
 
+    session_runtime = session_runtime_generation or runtime_generation
     if transition == "admitted":
         states = ("owned", "queued")
         assignments = (
@@ -881,7 +895,7 @@ async def transition_input_delivery(
         turn_number,
         reason,
         UUID(str(runtime_generation)),
-        UUID(str(runtime_generation)),
+        UUID(str(session_runtime)),
         UUID(str(runtime_attach_token)),
     )
     return row is not None

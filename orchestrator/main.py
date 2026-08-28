@@ -12511,17 +12511,24 @@ async def _cleanup_pinned_thread_retirement(
             or (permanent and not rootdisk_uid)
         ):
             raise RuntimeError("exact VM cleanup authority is incomplete")
-        vm_result = await vm_provisioner.delete_vm_captured(
+        vm_result = await vm_provisioner.release_vm_captured(
             thread_id,
             VMTeardownIdentity(
                 provision_generation=provision_generation,
                 vm_uid=vm_uid,
                 rootdisk_pvc_uid=rootdisk_uid or None,
+                ssh_host=vm.get("ssh_host"),
+                ssh_port=vm.get("ssh_port"),
+                ssh_host_key_fingerprint=vm.get("ssh_host_key_fingerprint"),
+                credential_runtime_started=vm.get("credential_runtime_started"),
             ),
+            ssh_host=vm.get("ssh_host"),
+            ssh_port=vm.get("ssh_port"),
             purge_disk=permanent,
             entity_type="thread",
+            capture_snapshot=False,
         )
-        if not vm_result.completed:
+        if vm_result.disposition != "completed":
             raise RuntimeError("exact VM cleanup is retryable")
         completed_quiescence_protocol = "workspace_actuator_zero_v1"
         completed_external_cleanup_protocol = "workspace_actuator_zero_v1"

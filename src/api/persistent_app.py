@@ -6258,12 +6258,17 @@ async def _loop_runtime_effect_authority_current() -> bool:
     if session is None or session.postgres_conn is None or thread_id is None:
         return False
     try:
-        agent_id, pod_uid, generation, attach_token = _pinned_input_runtime_identity()
+        agent_id, pod_uid, _process_generation, attach_token = (
+            _pinned_input_runtime_identity()
+        )
+        session_generation = str(_session_runtime_generation or "").strip()
+        if not session_generation:
+            return False
         current = await session.postgres_conn.verify_pinned_runtime_effect_authority(
             thread_id=str(thread_id),
             agent_id=agent_id,
             pod_uid=pod_uid,
-            runtime_generation=generation,
+            session_runtime_generation=session_generation,
             runtime_attach_token=attach_token,
         )
     except Exception as exc:
@@ -6276,7 +6281,7 @@ async def _loop_runtime_effect_authority_current() -> bool:
         current is True
         and session is _session
         and str(thread_id) == str(_thread_id)
-        and generation == _input_runtime_generation
+        and _process_generation == _input_runtime_generation
         and attach_token == _session_runtime_attach_token
         and not _runtime_admission_closed()
         and _protected_cloud_runtime_ready()
@@ -6324,6 +6329,7 @@ async def _transition_claimed_input(
             agent_id=agent_id,
             pod_uid=pod_uid,
             runtime_generation=runtime_generation,
+            session_runtime_generation=str(_session_runtime_generation or ""),
             runtime_attach_token=runtime_attach_token,
             claim_generation=claim_generation,
             transition=transition,
@@ -6370,6 +6376,7 @@ async def _queue_claimed_input(row: dict[str, Any]) -> bool:
         agent_id=agent_id,
         pod_uid=pod_uid,
         runtime_generation=runtime_generation,
+        session_runtime_generation=str(_session_runtime_generation or ""),
         runtime_attach_token=runtime_attach_token,
         claim_generation=claim_generation,
     )
@@ -6425,6 +6432,7 @@ async def _reclaim_pending_pinned_inputs_locked() -> set[tuple[str, int]]:
         agent_id=agent_id,
         pod_uid=pod_uid,
         runtime_generation=runtime_generation,
+        session_runtime_generation=str(_session_runtime_generation or ""),
         runtime_attach_token=runtime_attach_token,
     )
     queued: set[tuple[str, int]] = set()
@@ -6545,6 +6553,7 @@ async def _accept_user_input(
                 agent_id=agent_id,
                 pod_uid=pod_uid,
                 runtime_generation=runtime_generation,
+                session_runtime_generation=str(_session_runtime_generation or ""),
                 runtime_attach_token=runtime_attach_token,
             ),
             timeout=5.0,
@@ -10942,6 +10951,9 @@ async def _loop_defer_and_requeue_input_delivery(
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
+                    session_runtime_generation=str(
+                        _session_runtime_generation or ""
+                    ),
                     runtime_attach_token=runtime_attach_token,
                 ),
                 timeout=5.0,
@@ -10955,6 +10967,7 @@ async def _loop_defer_and_requeue_input_delivery(
                 agent_id=agent_id,
                 pod_uid=pod_uid,
                 runtime_generation=runtime_generation,
+                session_runtime_generation=str(_session_runtime_generation or ""),
                 runtime_attach_token=runtime_attach_token,
                 claim_generation=next_generation,
             )

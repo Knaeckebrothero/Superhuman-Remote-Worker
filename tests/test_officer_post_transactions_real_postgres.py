@@ -1664,6 +1664,7 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 "SELECT runtime_generation FROM threads WHERE id=$1 FOR UPDATE",
                 UUID(seed["thread_id"]),
             )
+            process_generation = uuid4()
             # A pinned binding already live when 0198 landed; the subject here
             # is Officer Post transaction behaviour, not the bind authority.
             await conn.execute("SET LOCAL session_replication_role = 'replica'")
@@ -1689,7 +1690,8 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 turn_number=1,
                 agent_id=agent_id,
                 pod_uid="bp10-pod",
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=attach_token,
             )
             assert await mark_input_delivery_queued(
@@ -1697,7 +1699,8 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 delivery_id=assigned[0]["delivery_id"],
                 agent_id=agent_id,
                 pod_uid="bp10-pod",
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=attach_token,
                 claim_generation=int(delivery["claim_generation"]),
             )
@@ -1706,7 +1709,8 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 delivery_id=assigned[0]["delivery_id"],
                 agent_id=agent_id,
                 pod_uid="bp10-pod",
-                runtime_generation=runtime_generation,
+                runtime_generation=process_generation,
+                session_runtime_generation=runtime_generation,
                 runtime_attach_token=attach_token,
                 claim_generation=int(delivery["claim_generation"]),
                 transition="admitted",
