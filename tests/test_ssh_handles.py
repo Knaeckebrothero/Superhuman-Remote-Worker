@@ -230,6 +230,21 @@ async def test_ensure_thread_ssh_handle_malformed_id_is_none_not_valueerror():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", [12345, None, object()])
+async def test_ensure_thread_ssh_handle_non_string_id_is_none_not_attributeerror(
+    bad_id,
+):
+    """get_thread() guards UUID(str(thread_id)), not UUID(thread_id), so it
+    tolerates any input type. Matching only its except-tuple would still let a
+    non-string id raise AttributeError past the guard — unreachable while this
+    method has no production caller, but Task 9 adds one."""
+    conn = _FakeConn([])  # must never be touched
+    assert await _db(conn).ensure_thread_ssh_handle(bad_id) is None
+    assert conn.fetchval_calls == []
+    assert conn.transaction_entries == 0
+
+
+@pytest.mark.asyncio
 async def test_get_thread_id_by_ssh_handle_resolves_a_known_handle():
     conn = _FakeConn([THREAD_ID])
     result = await _db(conn).get_thread_id_by_ssh_handle(mint_ssh_handle())

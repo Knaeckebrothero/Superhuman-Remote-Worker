@@ -29215,7 +29215,7 @@ class PostgresDB:
         minted", which is its own trap even at this probability.
         """
         try:
-            thread_uuid = UUID(thread_id)
+            thread_uuid = UUID(str(thread_id))
         except (ValueError, TypeError):
             return None
         async with self.acquire() as conn:
