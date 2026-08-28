@@ -133,6 +133,18 @@ async def _legacy_writes(conn):
             await conn.execute(f"ALTER TABLE {table} ENABLE TRIGGER {trigger}")
 
 
+@asynccontextmanager
+async def _pre_0196_thread_workspace_insert(conn):
+    """Seed the exact UID-less runtime shape accepted before migration 0196."""
+
+    trigger = "trg_threads_require_workspace_creation_reservation_on_insert"
+    await conn.execute(f"ALTER TABLE threads DISABLE TRIGGER {trigger}")
+    try:
+        yield
+    finally:
+        await conn.execute(f"ALTER TABLE threads ENABLE TRIGGER {trigger}")
+
+
 async def _force_reconciliation_due(db: PostgresDB) -> None:
     async with db.acquire() as conn:
         await conn.execute(
@@ -1326,7 +1338,7 @@ async def test_permanent_thread_retirement_after_activation_revokes_key(db):
             "INSERT INTO projects (id, name) VALUES ($1, 'thread retirement race')",
             project_id,
         )
-        async with _legacy_writes(conn):
+        async with _legacy_writes(conn), _pre_0196_thread_workspace_insert(conn):
             await conn.execute(
                 "INSERT INTO threads (id, title, project_id, status, "
                 "execution_lane, metadata) VALUES "
@@ -1422,7 +1434,7 @@ async def test_concurrent_officer_bind_and_thread_key_revoke_have_two_safe_outco
                 project_id,
                 f"officer bind race {label}",
             )
-            async with _legacy_writes(conn):
+            async with _legacy_writes(conn), _pre_0196_thread_workspace_insert(conn):
                 await conn.execute(
                     "INSERT INTO threads (id, title, project_id, status, "
                     "execution_lane, metadata) VALUES "
