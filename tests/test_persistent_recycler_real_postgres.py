@@ -6085,10 +6085,16 @@ async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
         expected_runtime_generation=ids["runtime_generation"],
     )
     assert reserved.bound
+    virtual_binding = await db.bind_thread_workspace_backing(
+        ids["thread"],
+        backing_kind="virtual",
+        backing_id=f"rclone:{'a' * 64}",
+    )
+    assert virtual_binding is not None
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET status='created',metadata=jsonb_set(metadata,"
-            "'{config_override,workspace,backend}',to_jsonb('sandbox'::text),true) "
+            "'{config_override,workspace,backend}',to_jsonb('virtual'::text),true) "
             "WHERE id=$1::uuid",
             UUID(ids["thread"]),
         )

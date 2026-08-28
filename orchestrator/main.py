@@ -12260,10 +12260,46 @@ async def _reconcile_workspace_provision_intent_for_retirement(
     return True
 
 
+def _captured_virtual_binding_agent_zero_only(
+    context: Mapping[str, Any],
+    workspace: Mapping[str, Any],
+    binding: Mapping[str, Any],
+) -> bool:
+    """Return whether the captured virtual backing owns no process runtime."""
+
+    if str(context.get("workspace_backend") or "") != "virtual":
+        return False
+    raw_generation = str(binding.get("generation") or "")
+    try:
+        canonical_generation = str(UUID(raw_generation))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        not workspace
+        and context.get("vm") in (None, {})
+        and context.get("workspace_provision_intent") in (None, {})
+        and set(binding)
+        == {
+            "generation",
+            "kind",
+            "backing_id",
+            "ssh_host_key_fingerprint",
+        }
+        and binding.get("kind") == "virtual"
+        and re.fullmatch(
+            r"rclone:[0-9a-f]{64}",
+            str(binding.get("backing_id") or ""),
+        )
+        is not None
+        and canonical_generation == raw_generation
+        and binding.get("ssh_host_key_fingerprint") is None
+    )
+
+
 async def _recover_captured_sandbox_process_zero(
     retirement: Mapping[str, Any],
 ) -> bool:
-    """Mint a crash-recovery zero proof for one exact sandbox incarnation.
+    """Mint a crash-recovery zero proof for one exact runtime incarnation.
 
     The agent process is stopped and proven absent *before* the workspace is
     contacted, so cached SSH credentials cannot reconnect behind the zero
@@ -12294,7 +12330,19 @@ async def _recover_captured_sandbox_process_zero(
                 and await _recover_agent_pod_provision_intent_zero(retirement, current)
             )
 
-    if str(context.get("workspace_backend") or "sandbox") != "sandbox":
+    captured_workspace = context.get("workspace_container")
+    captured_binding = context.get("workspace_binding")
+    captured_workspace = {} if captured_workspace is None else captured_workspace
+    captured_binding = {} if captured_binding is None else captured_binding
+    if not isinstance(captured_workspace, Mapping) or not isinstance(
+        captured_binding, Mapping
+    ):
+        return False
+    workspace_backend = str(context.get("workspace_backend") or "sandbox")
+    virtual_binding_agent_zero_only = _captured_virtual_binding_agent_zero_only(
+        context, captured_workspace, captured_binding
+    )
+    if workspace_backend != "sandbox" and not virtual_binding_agent_zero_only:
         return False
     captured_pods = _captured_retirement_agent_pods(retirement)
     if not captured_pods or any(
@@ -12315,14 +12363,6 @@ async def _recover_captured_sandbox_process_zero(
                 and await _recover_pre_registration_agent_pod_zero(retirement, current)
             )
 
-    captured_workspace = context.get("workspace_container")
-    captured_binding = context.get("workspace_binding")
-    captured_workspace = {} if captured_workspace is None else captured_workspace
-    captured_binding = {} if captured_binding is None else captured_binding
-    if not isinstance(captured_workspace, Mapping) or not isinstance(
-        captured_binding, Mapping
-    ):
-        return False
     captured_docker_lease = str(
         captured_workspace.get("_docker_workspace_lease_id") or ""
     )
@@ -12377,7 +12417,7 @@ async def _recover_captured_sandbox_process_zero(
         binding = captured_binding
         if not isinstance(workspace, Mapping) or not isinstance(binding, Mapping):
             return False
-        if not workspace and not binding:
+        if not workspace and (not binding or virtual_binding_agent_zero_only):
             receipt = await postgres_db.acknowledge_pinned_thread_local_quiescence(
                 thread_id,
                 expected_runtime_generation=generation,

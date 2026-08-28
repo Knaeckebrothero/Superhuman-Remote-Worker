@@ -178,9 +178,14 @@ async def test_soft_retirement_recovers_never_delivered_warm_runtime():
             "protection_protocol": "finalizer_v1",
             "warm_binding_protection": "55555555-5555-4555-8555-555555555555",
         },
-        "workspace_backend": "sandbox",
+        "workspace_backend": "virtual",
         "workspace_container": None,
-        "workspace_binding": None,
+        "workspace_binding": {
+            "generation": "66666666-6666-4666-8666-666666666666",
+            "kind": "virtual",
+            "backing_id": f"rclone:{'a' * 64}",
+            "ssh_host_key_fingerprint": None,
+        },
     }
     retirement = {
         "generation": generation,
@@ -231,6 +236,47 @@ async def test_soft_retirement_recovers_never_delivered_warm_runtime():
         quiescence_actor="orchestrator",
         expected_agent_pod_uid="warm-pod-uid",
         require_zero_admission=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("context_patch", "workspace_patch", "binding_patch"),
+    [
+        ({"workspace_backend": "sandbox"}, {}, {}),
+        ({"vm": {"status": "ready"}}, {}, {}),
+        ({}, {"status": "ready"}, {}),
+        ({}, {}, {"backing_id": "rclone:not-a-digest"}),
+        ({}, {}, {"ssh_host_key_fingerprint": "SHA256:unexpected"}),
+        ({}, {}, {"unexpected": "field"}),
+    ],
+)
+def test_virtual_binding_agent_zero_requires_exact_nonphysical_shape(
+    context_patch, workspace_patch, binding_patch
+):
+    context = {"workspace_backend": "virtual", **context_patch}
+    workspace = {**workspace_patch}
+    binding = {
+        "generation": "66666666-6666-4666-8666-666666666666",
+        "kind": "virtual",
+        "backing_id": f"rclone:{'a' * 64}",
+        "ssh_host_key_fingerprint": None,
+        **binding_patch,
+    }
+    assert not main._captured_virtual_binding_agent_zero_only(
+        context, workspace, binding
+    )
+
+
+def test_virtual_binding_agent_zero_accepts_exact_project_cloud_shape():
+    assert main._captured_virtual_binding_agent_zero_only(
+        {"workspace_backend": "virtual"},
+        {},
+        {
+            "generation": "66666666-6666-4666-8666-666666666666",
+            "kind": "virtual",
+            "backing_id": f"rclone:{'a' * 64}",
+            "ssh_host_key_fingerprint": None,
+        },
     )
 
 
