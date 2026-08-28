@@ -75,6 +75,12 @@ async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod(
         "agent_id": agent_id,
         "runtime_attach_token": attach_token,
         "agent": {"hostname": "agent-retired", "pod_uid": "agent-pod-uid"},
+        "agent_pod": {
+            "pod_name": "agent-retired",
+            "pod_uid": "agent-pod-uid",
+            "namespace": "agents-a",
+            "protection_protocol": "finalizer_v1",
+        },
         "workspace_backend": "sandbox",
         "workspace_container": {
             "status": workspace_status,
@@ -113,7 +119,10 @@ async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod(
     db.try_thread_advisory_lock = MagicMock(side_effect=lifecycle_lock)
     agent_provisioner = MagicMock(is_available=True)
     agent_provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
-    agent_provisioner.agent_pod_authority = AsyncMock(return_value="exact_absent")
+    agent_provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    agent_provisioner.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
     container_provisioner = MagicMock(is_available=True)
     container_provisioner.workspace_pod_authority = AsyncMock(
         return_value=workspace_authority
