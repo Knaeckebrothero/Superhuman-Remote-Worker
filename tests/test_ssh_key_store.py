@@ -7,7 +7,12 @@ where the bugs live. Real SQL execution is covered by the k3d gate in plan 3.
 
 import pytest
 
-from database.postgres import PostgresDB, SshKeyAlreadyRegistered
+from database.postgres import (
+    MAX_SSH_KEYS_PER_USER,
+    PostgresDB,
+    SshKeyAlreadyRegistered,
+    SshKeyLimitReached,
+)
 
 KEY_ID = "00000000-0000-0000-0000-0000000000aa"
 USER_ID = "00000000-0000-0000-0000-000000000001"
@@ -85,6 +90,64 @@ async def test_create_translates_unique_violation():
             public_key="ssh-ed25519 AAAA...",
             fingerprint_sha256="SHA256:" + "A" * 43,
         )
+
+
+class CappedConn(FakeConn):
+    """Evaluates the guarded INSERT's ``count(*) < $6`` the way Postgres will.
+
+    The cap lives inside the statement (no separate ``SELECT count(*)``, so
+    there is no window for a concurrent replica to widen), which means no
+    Python branch decides it and a plain FakeConn cannot exercise the
+    boundary. This one reads the bound limit out of the arguments and returns
+    a row only while the user is under it — the same predicate, evaluated
+    here instead of in the server.
+    """
+
+    def __init__(self, existing: int):
+        super().__init__()
+        self.existing = existing
+
+    async def fetchrow(self, sql, *args):
+        self.calls.append((sql, args))
+        assert "count(*)" in sql, "the cap must be carried by the statement"
+        return {"id": "k1", "name": "laptop"} if self.existing < args[5] else None
+
+
+async def _create(db):
+    return await db.create_user_ssh_key(
+        user_id=USER_ID,
+        name="laptop",
+        key_type="ssh-ed25519",
+        public_key="ssh-ed25519 AAAA... me@host",
+        fingerprint_sha256="SHA256:" + "A" * 43,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_tenth_key_is_accepted():
+    """Boundary, low side. Spec §4.1 caps at 10 per user, so a user holding 9
+    must still be able to register."""
+    conn = CappedConn(existing=MAX_SSH_KEYS_PER_USER - 1)
+    assert (await _create(_db(conn)))["id"] == "k1"
+
+
+@pytest.mark.asyncio
+async def test_the_eleventh_key_is_refused():
+    """Boundary, high side. Each key is an independent shell credential once
+    the gateway ships, so an unbounded set is an unbounded credential set."""
+    conn = CappedConn(existing=MAX_SSH_KEYS_PER_USER)
+    with pytest.raises(SshKeyLimitReached) as excinfo:
+        await _create(_db(conn))
+    assert excinfo.value.limit == MAX_SSH_KEYS_PER_USER
+
+
+@pytest.mark.asyncio
+async def test_the_cap_constant_is_what_gets_bound():
+    """A literal in the SQL would drift from the constant the API reports."""
+    conn = CappedConn(existing=0)
+    await _create(_db(conn))
+    _, args = conn.calls[0]
+    assert args[5] == MAX_SSH_KEYS_PER_USER
 
 
 @pytest.mark.asyncio

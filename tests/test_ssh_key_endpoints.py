@@ -360,6 +360,47 @@ async def test_duplicate_fingerprint_is_409_with_a_recovery_path(
 
 
 @pytest.mark.asyncio
+async def test_key_cap_is_409_naming_the_cap(approved_user, monkeypatch):
+    """Spec §4.1 caps registrations at ``MAX_SSH_KEYS_PER_USER``.
+
+    Also 409, like the duplicate above, but a different recovery path — this
+    one the user can fix alone, which is why the number has to be in the
+    message. The store raises; this pins the translation.
+    """
+    from database.postgres import MAX_SSH_KEYS_PER_USER, SshKeyLimitReached
+
+    challenge = await main.create_ssh_key_challenge(request=object())
+    monkeypatch.setattr(
+        main,
+        "parse_public_key",
+        lambda text: _Body(
+            key_type="ssh-ed25519",
+            public_key=text,
+            fingerprint_sha256="SHA256:" + "B" * 43,
+            comment="",
+        ),
+    )
+    monkeypatch.setattr(main, "verify_possession", lambda *a, **k: True)
+
+    async def _capped(**kwargs):
+        raise SshKeyLimitReached(MAX_SSH_KEYS_PER_USER)
+
+    monkeypatch.setattr(main.postgres_db, "create_user_ssh_key", _capped)
+    body = _Body(
+        name="laptop",
+        public_key="ssh-ed25519 AAAA",
+        challenge=challenge["challenge"],
+        signature="x",
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        await main.create_ssh_key(request=object(), body=body)
+    assert excinfo.value.status_code == 409
+    assert str(MAX_SSH_KEYS_PER_USER) in excinfo.value.detail
+    # Not the duplicate-fingerprint message, which points at support.
+    assert "support" not in excinfo.value.detail.lower()
+
+
+@pytest.mark.asyncio
 async def test_delete_reports_miss(approved_user, monkeypatch):
     async def _delete(key_id, user_id):
         return False
@@ -368,6 +409,87 @@ async def test_delete_reports_miss(approved_user, monkeypatch):
     with pytest.raises(HTTPException) as excinfo:
         await main.delete_ssh_key(request=object(), key_id="k1")
     assert excinfo.value.status_code == 404
+
+
+# =============================================================================
+# Final review, Important 6 — a project-scoped MCP token must not mint or
+# revoke a personal SSH credential.
+# =============================================================================
+
+
+@pytest.fixture
+def project_scoped_user(monkeypatch):
+    """An approved user authenticated by a legacy ``project:<uuid>``-scoped
+    MCP token. ``user_can_access_job_or_thread`` denies this principal every
+    thread — the IDE included — via ``_scope_permits_personal``."""
+    user = {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "is_approved": True,
+        "scopes": ["project:11111111-1111-1111-1111-111111111111"],
+    }
+
+    async def _require(request, db):
+        return user
+
+    async def _no_audit(**kwargs):
+        return None
+
+    monkeypatch.setattr(main, "require_approved_user", _require)
+    monkeypatch.setattr(main.postgres_db, "record_security_event", _no_audit)
+    return user
+
+
+def test_the_scope_helper_actually_denies_this_principal(project_scoped_user):
+    """Guards the fixture, not the endpoint: if the scope field were named
+    something ``_scope_project_id`` does not read, the two tests below would
+    pass for the wrong reason — the principal would simply be unscoped.
+    """
+    from security import access
+
+    assert access._scope_project_id(project_scoped_user) is not None
+    assert not access._scope_permits_personal(project_scoped_user)
+
+
+@pytest.mark.asyncio
+async def test_project_scoped_token_cannot_register_a_key(
+    project_scoped_user, monkeypatch
+):
+    """Registration composes with resolution into something neither is alone:
+    an SSH key authenticates by fingerprint, so the token's scope is gone by
+    the time authorization runs. The gate therefore has to be at minting."""
+
+    def _tripwire(*a, **k):
+        raise AssertionError("must refuse before parsing the key")
+
+    monkeypatch.setattr(main, "parse_public_key", _tripwire)
+    body = _Body(
+        name="laptop",
+        public_key="ssh-ed25519 AAAA",
+        challenge="whatever",
+        signature="x",
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        await main.create_ssh_key(request=object(), body=body)
+    assert excinfo.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_project_scoped_token_cannot_delete_a_key(
+    project_scoped_user, monkeypatch
+):
+    """Deletion is the only revocation this feature has, so leaving it open
+    while gating create would let a project-scoped token strip its owner's
+    access."""
+
+    async def _tripwire(key_id, user_id):
+        raise AssertionError("must refuse before reaching the store")
+
+    monkeypatch.setattr(main.postgres_db, "delete_user_ssh_key", _tripwire)
+    with pytest.raises(HTTPException) as excinfo:
+        await main.delete_ssh_key(
+            request=object(), key_id="00000000-0000-0000-0000-0000000000aa"
+        )
+    assert excinfo.value.status_code == 403
 
 
 # =============================================================================

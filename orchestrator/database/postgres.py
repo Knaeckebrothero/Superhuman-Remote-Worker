@@ -868,9 +868,30 @@ class OfficerPostLifecycleConflict(RuntimeError):
         self.detail = detail
 
 
+#: Spec §4.1 "Cap 10 keys per user". Enforced in
+#: :meth:`PostgresDB.create_user_ssh_key`, not left to the UI: once the
+#: ssh-gateway ships every registered key is an independent shell credential,
+#: so an unbounded set is an unbounded credential set.
+MAX_SSH_KEYS_PER_USER = 10
+
+
 class SshKeyAlreadyRegistered(Exception):
     """The fingerprint is already claimed. Globally unique by design — see
-    migration 0189."""
+    migration 0201."""
+
+
+class SshKeyLimitReached(Exception):
+    """The account already holds ``MAX_SSH_KEYS_PER_USER`` keys.
+
+    Distinct from :class:`SshKeyAlreadyRegistered` even though both surface as
+    409: the recovery paths differ (delete one of your own keys vs. this key
+    belongs to someone). ``limit`` is carried so the HTTP layer can name the
+    cap without re-importing the constant.
+    """
+
+    def __init__(self, limit: int):
+        super().__init__(f"at most {limit} SSH keys per user")
+        self.limit = limit
 
 
 def _uuid_list(values: list[str] | tuple[str, ...] | None) -> list[UUID]:
@@ -41000,25 +41021,40 @@ class PostgresDB:
         Raises SshKeyAlreadyRegistered when the fingerprint is taken, including
         by another account — the constraint is global so a presented key maps
         to exactly one user.
+
+        Raises SshKeyLimitReached past ``MAX_SSH_KEYS_PER_USER``. The cap is
+        carried by the INSERT itself rather than a preceding ``SELECT
+        count(*)``: one statement leaves no window between counting and
+        inserting for a concurrent request on another replica to widen. Over
+        the cap the ``WHERE`` matches no row, the INSERT writes nothing and
+        ``RETURNING`` yields None — which is the only way this returns None,
+        hence the unconditional raise.
         """
+        user_uuid = UUID(user_id)
         async with self.acquire() as conn:
             try:
                 row = await conn.fetchrow(
                     """
                     INSERT INTO user_ssh_keys
                         (user_id, name, key_type, public_key, fingerprint_sha256)
-                    VALUES ($1, $2, $3, $4, $5)
+                    SELECT $1::uuid, $2::text, $3::text, $4::text, $5::text
+                    WHERE (
+                        SELECT count(*) FROM user_ssh_keys WHERE user_id = $1::uuid
+                    ) < $6::bigint
                     RETURNING id, name, key_type, fingerprint_sha256,
                               created_at, last_used_at, disabled_at
                     """,
-                    UUID(user_id),
+                    user_uuid,
                     name,
                     key_type,
                     public_key,
                     fingerprint_sha256,
+                    MAX_SSH_KEYS_PER_USER,
                 )
             except asyncpg.UniqueViolationError as exc:
                 raise SshKeyAlreadyRegistered(fingerprint_sha256) from exc
+            if row is None:
+                raise SshKeyLimitReached(MAX_SSH_KEYS_PER_USER)
             return dict(row)
 
     async def list_user_ssh_keys(self, user_id: str) -> List[Dict[str, Any]]:

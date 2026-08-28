@@ -129,6 +129,7 @@ from database.postgres import (  # noqa: E402
     DatasourceScopeAuthorizationError,
     OfficerPostLifecycleConflict,
     SshKeyAlreadyRegistered,
+    SshKeyLimitReached,
     _completion_control_active_sql,
     _completion_control_owned_active_sql,
     project_officer_harvested_state,
@@ -162,6 +163,7 @@ from security.access import (  # noqa: E402
     require_internal,
     require_internal_or_job_access,
     require_job_access,
+    require_personal_scope,
     require_project_member,
     require_project_owner,
     require_sudo_request_authority,
@@ -62875,8 +62877,18 @@ async def create_ssh_key_challenge(request: Request) -> dict[str, Any]:
 
 @app.post("/api/ssh-keys")
 async def create_ssh_key(request: Request, body: SshKeyCreate) -> dict[str, Any]:
-    """Register an SSH public key after verifying possession."""
+    """Register an SSH public key after verifying possession.
+
+    Scope-gated: a ``project:<uuid>``-scoped MCP token is refused here even
+    though it authenticates a real, approved user. That token is already
+    denied every thread by ``user_can_access_job_or_thread`` — the IDE
+    included — but an SSH key authenticates by fingerprint, so resolution
+    never sees the token that registered it. Without this gate the token
+    could mint a credential opening a shell on every session its owner has,
+    and one that outlives the token: revoking the PAT does not revoke the key.
+    """
     user = await require_approved_user(request, postgres_db)
+    await require_personal_scope(request, postgres_db, user, resource_type="ssh_key")
 
     if not _session_jwt_secret:
         raise HTTPException(
@@ -62932,6 +62944,17 @@ async def create_ssh_key(request: Request, body: SshKeyCreate) -> dict[str, Any]
                 "existing registration released."
             ),
         ) from exc
+    except SshKeyLimitReached as exc:
+        # Also 409, but a different recovery path from the duplicate above:
+        # this one you can fix yourself. Name the cap — a refusal that does
+        # not say what the limit is reads as a bug.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"You already have the maximum of {exc.limit} registered SSH "
+                "keys. Delete one before adding another."
+            ),
+        ) from exc
     return _serialize_ssh_key_row(row)
 
 
@@ -62945,8 +62968,18 @@ async def list_ssh_keys(request: Request) -> list[dict[str, Any]]:
 
 @app.delete("/api/ssh-keys/{key_id}")
 async def delete_ssh_key(request: Request, key_id: str) -> dict[str, str]:
-    """Remove one of the current user's keys."""
+    """Remove one of the current user's keys.
+
+    Scope-gated for the same reason as ``create_ssh_key``: a project-scoped
+    MCP token has no business reaching a personal credential, in either
+    direction. Revocation is the only control a user has over a key (there is
+    no disable endpoint), so leaving delete open while gating create would let
+    a project-scoped token strip its owner's access.
+    """
     user = await require_approved_user(request, postgres_db)
+    await require_personal_scope(
+        request, postgres_db, user, resource_type="ssh_key", resource_id=key_id
+    )
     try:
         deleted = await postgres_db.delete_user_ssh_key(key_id, str(user["id"]))
     except ValueError:

@@ -407,6 +407,41 @@ def _scope_permits_personal(user: dict[str, Any]) -> bool:
     return _scope_project_id(user) is None
 
 
+async def require_personal_scope(
+    request: Any,
+    db,
+    user: dict[str, Any],
+    *,
+    resource_type: str,
+    resource_id: str | None = None,
+) -> None:
+    """Refuse a ``project:<uuid>``-scoped MCP token on a personal resource.
+
+    The public form of :func:`_scope_permits_personal`, matching how
+    :func:`require_thread_owner` and :func:`user_can_access_job_or_thread`
+    already apply it: log the denial and raise 403, in one expression so no
+    call site can do one without the other.
+
+    Exists because scope has to be checked where a personal credential is
+    *minted*, not only where one is used. SSH keys are the case that forced
+    it: ``user_can_access_job_or_thread`` denies a project-scoped token every
+    thread — including the IDE — but the SSH key it registers authenticates by
+    fingerprint, so by the time authorization runs the token's scope is gone.
+    Registration therefore had to be gated itself, or a project-scoped token
+    could mint a credential opening a shell on every session its owner has.
+    """
+    if _scope_permits_personal(user):
+        return
+    raise await _denied(
+        request,
+        db,
+        user,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        detail="Access denied by MCP token scope",
+    )
+
+
 # =============================================================================
 # Visibility — set-shaped + SQL-shaped
 # =============================================================================
