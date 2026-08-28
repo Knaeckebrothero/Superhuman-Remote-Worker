@@ -1095,17 +1095,6 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
     through_0184 = tmp_path / "through-0184"
     through_0184.mkdir()
-    # This test's own assertions stop at 0192 (the constraint-validation
-    # migration that adopts 0191's NOT VALID checks); nothing later is under
-    # test. Bound the racing migration_task to exactly that span instead of
-    # the live, ever-growing migrations directory: update_task is a real
-    # concurrent client write left unawaited while migration_task keeps
-    # running, and an unrelated later migration that also takes a
-    # table-level lock on threads (e.g. a future ALTER TABLE ADD COLUMN) can
-    # then race update_task's still-committing transaction for reasons that
-    # have nothing to do with what this test verifies.
-    through_0192 = tmp_path / "through-0192"
-    through_0192.mkdir()
     blocker = updater = observer = None
     migration_task = update_task = None
     try:
@@ -1114,11 +1103,6 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
                 break
             (through_0184 / path.name).write_bytes(path.read_bytes())
         await run_migrations(pool, through_0184)
-
-        for path in discover(ROOT / "orchestrator/database/migrations/app"):
-            if path.name > APP_STATELESS_INPUT_DELIVERY_VALIDATION.name:
-                break
-            (through_0192 / path.name).write_bytes(path.read_bytes())
 
         thread_id = uuid4()
         delivery_id = uuid4()
@@ -1196,7 +1180,9 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
         await blocker.execute(
             "LOCK TABLE thread_input_deliveries IN ACCESS EXCLUSIVE MODE"
         )
-        migration_task = asyncio.create_task(run_migrations(pool, through_0192))
+        migration_task = asyncio.create_task(
+            run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        )
 
         for _ in range(100):
             migration_holds_thread = await observer.fetchval(
