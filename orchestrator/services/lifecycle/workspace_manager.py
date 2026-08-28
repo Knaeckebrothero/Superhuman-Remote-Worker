@@ -829,6 +829,7 @@ class WorkspaceInstanceManager:
 
         return bool(
             source in {"reap", "snapshot"}
+            and await self.is_reapable(inst)
             and inst.metadata.get("pod_ip")
             and self._snapshot is not None
             and getattr(self._snapshot, "is_available", False)
