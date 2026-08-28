@@ -9,6 +9,9 @@ import pytest
 
 from database.postgres import PostgresDB, SshKeyAlreadyRegistered
 
+KEY_ID = "00000000-0000-0000-0000-0000000000aa"
+USER_ID = "00000000-0000-0000-0000-000000000001"
+
 
 class FakeConn:
     def __init__(self, *, fetchrow=None, fetch=None, execute=None, raises=None):
@@ -91,7 +94,7 @@ async def test_list_is_scoped_to_the_user():
 async def test_delete_is_scoped_to_the_user():
     """Deleting by id alone would let anyone remove anyone's key."""
     conn = FakeConn(execute="DELETE 1")
-    assert await _db(conn).delete_user_ssh_key("k1", "u1") is True
+    assert await _db(conn).delete_user_ssh_key(KEY_ID, USER_ID) is True
     sql, args = conn.calls[0]
     assert "user_id = $2" in sql
     assert len(args) == 2
@@ -100,7 +103,7 @@ async def test_delete_is_scoped_to_the_user():
 @pytest.mark.asyncio
 async def test_delete_reports_miss():
     conn = FakeConn(execute="DELETE 0")
-    assert await _db(conn).delete_user_ssh_key("k1", "u1") is False
+    assert await _db(conn).delete_user_ssh_key(KEY_ID, USER_ID) is False
 
 
 @pytest.mark.asyncio

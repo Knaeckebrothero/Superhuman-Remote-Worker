@@ -40954,19 +40954,12 @@ class PostgresDB:
             return [dict(r) for r in rows]
 
     async def delete_user_ssh_key(self, key_id: str, user_id: str) -> bool:
-        """Delete one key. Scoped by user_id so an id alone is not authority.
-
-        Unlike create/list above, the ids are passed through as-is rather than
-        pre-parsed with ``UUID()``: asyncpg's uuid codec validates and encodes
-        a plain string directly against the column's ``uuid`` type, so the
-        extra parse buys nothing here beyond raising the same ValueError one
-        frame earlier.
-        """
+        """Delete one key. Scoped by user_id so an id alone is not authority."""
         async with self.acquire() as conn:
             result = await conn.execute(
                 "DELETE FROM user_ssh_keys WHERE id = $1 AND user_id = $2",
-                key_id,
-                user_id,
+                UUID(key_id),
+                UUID(user_id),
             )
             return result == "DELETE 1"
 
