@@ -25,6 +25,18 @@ licenses come straight from `cockpit/package-lock.json` (no install, network, or
 node_modules needed). Pass --pip-json / --npm-lock-json to feed pre-captured JSON
 instead (used by the unit tests).
 
+Because the Python side reads *installed* metadata, a requirements file that was
+never installed is invisible to both the gate and the inventory. Install all
+three runtime requirements files (root + orchestrator + orchestrator/mcp) before
+running, and keep the CI install steps naming all three.
+
+Exit codes:
+  0  clean
+  1  policy failure — a denied (or, under --strict, unknown) license is present
+  2  collector failure — the inventory could not be built, so nothing is known.
+     Callers that tolerate 1 (e.g. the develop `license-inventory` job, which
+     lets the blocking dependency-audit job own policy) must still fail on 2.
+
 Policy is data, not code — tune ALLOW_TOKENS / WEAK_TOKENS / DENY_TOKENS and the
 per-package OVERRIDES below. Mirrors the explicit, override-able style of the
 pip-audit ignore list and the npm-audit gate in .github/workflows/.
@@ -55,7 +67,11 @@ COCKPIT_DIR = REPO_ROOT / "cockpit"
 DENY_TOKENS = (
     "agpl", "affero",
     "sspl", "server side public",
-    "business source", "busl", "bsl-1", "bsl 1",
+    # Business Source License: "BUSL-1.1" is the current SPDX id, "BSL 1.1" the
+    # old spelling. Match the *version* — a bare "bsl-1" also matches BSL-1.0,
+    # which is the Boost Software License, a permissive MIT-alike (it reaches us
+    # via torch's "... AND BSL-1.0 AND MIT" expression).
+    "business source", "busl", "bsl-1.1", "bsl 1.1",
     "commons clause",
     "elastic license", "elastic-2", "elastic 2",
     "prosperity", "polyform",
@@ -72,7 +88,9 @@ WEAK_TOKENS = (
 ALLOW_TOKENS = (
     "mit", "bsd", "apache", "isc",
     "python software foundation", "psf", "python-2.0",
-    "zlib", "0bsd", "unlicense", "wtfpl", "boost",
+    # "bsl-1.0" is the SPDX id of the Boost Software License (permissive) —
+    # not to be confused with the Business Source License, denied above.
+    "zlib", "0bsd", "unlicense", "wtfpl", "boost", "bsl-1.0",
     "hpnd", "historical permission",
     "public domain", "cc0", "cc-0",
     "blueoak", "blue oak",
@@ -87,9 +105,25 @@ OVERRIDES: dict[str, str] = {
     "cryptography": "ALLOW",
     # PSF/HPND-style; occasionally reported UNKNOWN by older metadata.
     "pillow": "ALLOW",
+    # No License field and no license classifier in its metadata, so it reports
+    # UNKNOWN — but the wheel ships LICENSE.txt: "The MIT License (MIT),
+    # Copyright (c) 2015 Ankush Shah" (github.com/ankushshah89/python-docx2txt).
+    "docx2txt": "ALLOW",
     # Example of an UNKNOWN-but-verified entry; remove once metadata improves:
     # "somepkg": "ALLOW",  # verified MIT at <url>
 }
+
+# Exit codes. 0 = clean, 1 = policy failure (a denied/unknown license was
+# found — the inventory itself is trustworthy), 2 = the inventory could not be
+# built at all. Callers must distinguish these: a policy failure is a real
+# finding, a collector failure means we know nothing and must not publish.
+EXIT_POLICY_FAILURE = 1
+EXIT_COLLECTOR_FAILURE = 2
+
+
+class CollectorError(RuntimeError):
+    """A dependency collector could not produce a trustworthy inventory."""
+
 
 CATEGORY_DENY = "DENY"
 CATEGORY_WEAK = "WEAK"
@@ -114,6 +148,12 @@ def classify(license_str: str, pkg_name: str) -> str:
     # operator; the lowercase "-or-later" suffix on a single license won't match.
     if " OR " in raw and any(t in s for t in ALLOW_TOKENS):
         return CATEGORY_ALLOW
+    # Same rule one rung down the permissiveness ladder: if no operand is
+    # permissive but one is weak-copyleft, we take that one, so the pair is
+    # WEAK — not DENY on the strength of its other operand. Live case:
+    # asyncssh's "EPL-2.0 OR GPL-2.0-or-later" (we take EPL-2.0).
+    if " OR " in raw and any(t in s for t in WEAK_TOKENS):
+        return CATEGORY_WEAK
 
     # AGPL / LGPL contain "gpl" — test them before plain GPL.
     if "agpl" in s or "affero" in s:
@@ -150,28 +190,54 @@ class Dep:
 # --- Collectors -------------------------------------------------------------
 
 
-def _run(cmd: list[str], cwd: Path | None = None) -> str:
-    proc = subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True, check=False
-    )
+def _run(cmd: list[str], cwd: Path | None = None, required: bool = False) -> str:
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, check=False
+        )
+    except OSError as e:  # not installed / not executable
+        sys.stderr.write(f"::error::cannot run `{cmd[0]}`: {e}\n")
+        if required:
+            raise CollectorError(f"{cmd[0]} is not installed or not runnable") from e
+        return ""
     if proc.returncode != 0:
+        sev = "::error::" if required else "::warning::"
         sys.stderr.write(
-            f"::warning::`{' '.join(cmd)}` exited {proc.returncode}: "
+            f"{sev}`{' '.join(cmd)}` exited {proc.returncode}: "
             f"{proc.stderr.strip()[:500]}\n"
         )
+        if required:
+            raise CollectorError(
+                f"{cmd[0]} failed (exit {proc.returncode}) — see stderr above"
+            )
     return proc.stdout
 
 
 def collect_python(pip_json: str | None) -> list[Dep]:
+    """Bundled Python deps from installed metadata (or pre-captured JSON).
+
+    An empty result here is treated as a hard failure, not an empty set: this
+    collector only ever runs against an environment that has just had the
+    runtime requirements installed into it, so "zero packages" always means the
+    collector broke, never that nothing is bundled. Returning [] quietly is how
+    a *silently empty* inventory — and a license gate scanning zero Python
+    packages, which is how an AGPL dependency shipped unnoticed — happened.
+    """
     if pip_json is not None:
         raw = pip_json
     else:
         raw = _run([
             "pip-licenses", "--from=mixed", "--format=json",
-            "--with-urls", "--with-notice-file", "--no-license-path",
-        ])
+            "--with-urls", "--with-license-file", "--with-notice-file",
+            "--no-license-path",
+        ], required=True)
     if not raw.strip():
-        return []
+        raise CollectorError(
+            "pip-licenses produced no output — cannot certify the Python "
+            "dependency set. Install it and the runtime requirements first: "
+            "pip install pip-licenses -r requirements.txt "
+            "-r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt"
+        )
     deps = []
     for row in json.loads(raw):
         deps.append(Dep(
@@ -183,7 +249,13 @@ def collect_python(pip_json: str | None) -> list[Dep]:
             ecosystem="py",
         ))
     # Drop our own package and pip-licenses' "UNKNOWN" sentinel rows for noise.
-    return [d for d in deps if d.name.lower() not in ("pip-licenses",)]
+    deps = [d for d in deps if d.name.lower() not in ("pip-licenses",)]
+    if not deps:
+        raise CollectorError(
+            "pip-licenses returned zero packages — the Python environment has "
+            "no runtime dependencies installed, so nothing can be certified."
+        )
+    return deps
 
 
 def collect_npm(lock_json: str | None = None) -> list[Dep]:
@@ -283,7 +355,7 @@ def report(deps: list[Dep], strict: bool) -> int:
         print("\nLicense policy check FAILED. Resolve by removing the dependency, "
               "replacing it, or — if the classification is wrong — adding a justified "
               "entry to OVERRIDES in scripts/check_licenses.py.")
-        return 1
+        return EXIT_POLICY_FAILURE
     print("\nLicense policy check passed.")
     return 0
 
@@ -332,7 +404,12 @@ def write_doc(doc_path: Path, py: list[Dep], js: list[Dep]) -> None:
     inject(doc_path, "backend-inventory", _inventory_table(py))
     inject(doc_path, "backend-notices", _notices(py))
     inject(doc_path, "frontend-inventory", _inventory_table(js))
-    print(f"Regenerated {doc_path.relative_to(REPO_ROOT)}")
+    resolved = doc_path.resolve()
+    try:
+        shown = resolved.relative_to(REPO_ROOT)
+    except ValueError:  # --write pointed outside the repo
+        shown = resolved
+    print(f"Regenerated {shown}")
 
 
 # --- Entry point ------------------------------------------------------------
@@ -356,11 +433,21 @@ def main(argv: list[str] | None = None) -> int:
     def _read(p):
         return Path(p).read_text(encoding="utf-8") if p else None
 
-    py = [] if args.no_python else collect_python(_read(args.pip_json))
-    js = [] if args.no_js else collect_npm(_read(args.npm_lock_json))
+    try:
+        py = [] if args.no_python else collect_python(_read(args.pip_json))
+        js = [] if args.no_js else collect_npm(_read(args.npm_lock_json))
+    except CollectorError as e:
+        # Never fall through to "0 denied licenses found, all clear" — an
+        # inventory we could not build is not an inventory that is clean.
+        sys.stderr.write(f"::error::{e}\n")
+        return EXIT_COLLECTOR_FAILURE
+
     deps = py + js
     if not deps:
-        sys.stderr.write("::warning::no dependencies collected — nothing to check\n")
+        sys.stderr.write(
+            "::error::no dependencies collected — nothing to check. This is a "
+            "collector failure, not a clean result.\n")
+        return EXIT_COLLECTOR_FAILURE
 
     if args.write:
         write_doc(Path(args.write), py, js)

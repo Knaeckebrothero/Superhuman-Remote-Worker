@@ -97,7 +97,10 @@ nats-py>=2.9.0
 # DST-aware next-fire-time computation against IANA-named timezones.
 croniter>=2.0.0
 # Runtime deps of the citation_engine package (src/citation_engine/).
-# Its other deps (beautifulsoup4, langchain-openai/-core, langgraph, tiktoken,
-# httpx, psycopg2-binary, docx2txt, pydantic) are already pinned above.
-pymupdf>=1.23.0
+# Its other deps (pypdf, beautifulsoup4, langchain-openai/-core, langgraph,
+# tiktoken, httpx, psycopg2-binary, docx2txt, pydantic) are already pinned
+# above. PDF text extraction deliberately uses pypdf (line 1, BSD-3-Clause),
+# NOT PyMuPDF/fitz: PyMuPDF is AGPL-3.0-or-Artifex-commercial and must never
+# re-enter the bundled set of an FSL-1.1-ALv2 product — scripts/check_licenses.py
+# denies it.
 requests>=2.31.0

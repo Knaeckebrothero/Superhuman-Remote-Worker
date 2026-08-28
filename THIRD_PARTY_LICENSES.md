@@ -42,33 +42,40 @@ Software. This file discharges that obligation for every bundled dependency.
 ## Components with NOTICE-file obligations (Apache-2.0 §4(d))
 
 Apache-2.0 requires that, where a dependency provides a `NOTICE` file, its contents be
-reproduced in our distribution. The generator surfaces the authoritative set via
-`--with-notice-file`; paste each one verbatim under [Backend NOTICE files](#backend-notice-files).
-Known NOTICE-bearing dependencies we ship include:
+reproduced in our distribution. The generator collects them via `--with-notice-file`
+and reproduces them verbatim under [Backend NOTICE files](#backend-notice-files) — that
+section is generated, not hand-maintained.
 
-- `neo4j` (Neo4j Python driver) — Apache-2.0
-- `pymongo`, `motor` — Apache-2.0
-- `boto3` (and `botocore`) — Apache-2.0
-- `kubernetes` (Python client) — Apache-2.0
-- `aiohttp`, `opentelemetry-api`, `tenacity`, `sentence-transformers` — Apache-2.0
+At the current pins, nine bundled packages actually ship a `NOTICE`: `aiofiles`,
+`boto3`, `botocore`, `langdetect`, `neo4j`, `propcache`, `s3transfer`,
+`sentence-transformers`, `yarl`.
 
-> Treat this list as a review aid, not the source of truth — `--with-notice-file`
-> output is authoritative.
+> Being Apache-2.0 is **not** the same as shipping a NOTICE — §4(d) only bites where
+> the dependency actually provides one. `aiohttp`, `kubernetes`, `motor`, `opentelemetry-api`,
+> `pymongo` and `tenacity` are Apache-2.0 but ship no `NOTICE` in their wheels; `torch`
+> ships a `licenses/` tree (LICENSE + `third_party/`) rather than a NOTICE. The generated
+> section below is the source of truth — re-read it after every dependency bump.
 
 ---
 
-## Weak-copyleft (LGPL) dependencies — know these
+## Weak-copyleft dependencies — know these
 
-These are **not** permissive. They are fine to bundle in MIT/proprietary software
-**because we use them as unmodified, dynamically-importable libraries** (the LGPL's
-relink/replace condition is satisfied by Python's import model). Do **not** vendor a
-*modified* copy without releasing those modifications. Flag both to counsel before
-the on-prem launch:
+These are **not** permissive. They are fine to bundle in a source-available/proprietary
+product **because we use them as unmodified, dynamically-importable libraries** (the
+LGPL's relink/replace condition is satisfied by Python's import model; MPL-2.0 and
+EPL-2.0 are file-level and only reach files we would have modified). Do **not** vendor a
+*modified* copy without releasing those modifications. Flag all of these to counsel
+before the on-prem launch:
 
 | Component | License | Notes |
 |---|---|---|
-| `psycopg` (psycopg3) / `psycopg2-binary` | LGPL-3.0 | PostgreSQL driver. `psycopg2-binary` also bundles `libpq` (PostgreSQL License, permissive). Used via public API only. |
+| `psycopg` (psycopg3) + `psycopg-binary` / `psycopg-pool` / `psycopg2-binary` | LGPL-3.0 | PostgreSQL driver. `psycopg2-binary`/`psycopg-binary` also bundle `libpq` (PostgreSQL License, permissive). Used via public API only. |
 | `paramiko` | LGPL-2.1-or-later | SSH/SFTP client for the remote workspace backend. Used via public API only. |
+| `asyncssh` | EPL-2.0 **OR** GPL-2.0-or-later | Dual-licensed; **we take the EPL-2.0 option** — the GPL operand never binds us. Host-key-pinned SFTP for the Dynamic Canvas workspace gateway. Used unmodified. |
+| `jwcrypto` | LGPL-3.0-or-later | JOSE/JWT crypto, pulled in by `python-keycloak`. Used via public API only. |
+| `certifi` | MPL-2.0 | CA bundle. File-level copyleft over a data file we never modify. |
+| `tqdm` | MPL-2.0 AND MIT | Progress bars, transitive via `sentence-transformers`/`huggingface-hub`. Unmodified. |
+| `orjson` | MPL-2.0 AND (Apache-2.0 OR MIT) | JSON codec, transitive via the LangChain stack. Unmodified. |
 
 ---
 
@@ -87,18 +94,29 @@ python scripts/check_licenses.py --check
 python scripts/check_licenses.py --write
 ```
 
-To run it locally: backend licenses are read from installed package metadata, so
-install the Python deps first (ideally inside the built orchestrator image to match
-what ships). The frontend inventory is read directly from `cockpit/package-lock.json`
-— no `npm install` needed.
+To run it locally: backend licenses are read from **installed package metadata**, so a
+requirements file you did not install is invisible to both the gate and the inventory.
+Install all three runtime files, and install CPU-only PyTorch first exactly as
+`docker/Dockerfile.agent` does — otherwise `sentence-transformers → torch` drags in ~18
+proprietary `nvidia-*`/`cuda-*` CUDA wheels that the shipped image never contains, and
+the gate fails on packages we do not convey. The frontend inventory is read directly
+from `cockpit/package-lock.json` — no `npm install` needed.
 
 ```bash
-pip install pip-licenses -r requirements.txt -r orchestrator/requirements.txt
+pip install pip-licenses
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # matches the agent image
+pip install -r requirements.txt \
+            -r orchestrator/requirements.txt \
+            -r orchestrator/mcp/requirements.txt
 python scripts/check_licenses.py --write   # gate + regenerate
 ```
 
+Exit codes: `0` clean, `1` policy failure (a denied license — a real finding), `2`
+generation failure (the inventory could not be built, so nothing is known). A caller
+that tolerates `1` must still fail on `2`.
+
 > Policy lives in `scripts/check_licenses.py` (ALLOW / WEAK / DENY token lists +
-> per-package `OVERRIDES`). A new dependency under GPL/AGPL/SSPL/BSL — or any
+> per-package `OVERRIDES`). A new dependency under GPL/AGPL/SSPL/BUSL — or any
 > UNKNOWN license under `--strict` — fails the gate.
 
 ---
@@ -108,12 +126,397 @@ python scripts/check_licenses.py --write   # gate + regenerate
 <!-- BEGIN: backend-inventory -->
 | Package | Version | License | Category |
 |---|---|---|---|
+| [aiofile](https://github.com/mosquito/aiofile) | 3.12.3 | Apache Software License | ALLOW |
+| [aiofiles](https://github.com/Tinche/aiofiles) | 25.1.0 | Apache Software License | ALLOW |
+| [aiohappyeyeballs](https://github.com/aio-libs/aiohappyeyeballs) | 2.7.1 | Python Software Foundation License | ALLOW |
+| [aiohttp](https://github.com/aio-libs/aiohttp) | 3.14.3 | Apache-2.0 AND MIT | ALLOW |
+| [aiohttp_socks](https://github.com/romis2012/aiohttp-socks) | 0.12.0 | Apache-2.0 | ALLOW |
+| [aiosignal](https://gitter.im/aio-libs/Lobby) | 1.4.0 | Apache Software License | ALLOW |
+| [aiosmtplib](https://aiosmtplib.readthedocs.io/en/stable/) | 5.1.2 | MIT | ALLOW |
+| [aiosqlite](https://aiosqlite.omnilib.dev) | 0.22.1 | MIT License | ALLOW |
+| [altair](https://github.com/vega/altair) | 6.2.2 | BSD License | ALLOW |
+| [annotated-doc](https://github.com/fastapi/annotated-doc) | 0.0.5 | MIT | ALLOW |
+| [annotated-types](https://github.com/annotated-types/annotated-types) | 0.8.0 | MIT License | ALLOW |
+| [anthropic](https://github.com/anthropics/anthropic-sdk-python) | 1.2.0 | MIT License | ALLOW |
+| [anyio](https://github.com/agronholm/anyio) | 4.14.2 | MIT | ALLOW |
+| [argon2-cffi](https://argon2-cffi.readthedocs.io/) | 25.1.0 | MIT | ALLOW |
+| [argon2-cffi-bindings](https://tidelift.com/?utm_source=lifter&utm_medium=referral&utm_campaign=hynek) | 26.1.0 | MIT | ALLOW |
+| [arxiv](https://github.com/lukasschwab/arxiv.py) | 4.0.1 | MIT License | ALLOW |
+| [asyncpg](https://github.com/MagicStack/asyncpg) | 0.31.0 | Apache-2.0 | ALLOW |
+| [asyncssh](http://asyncssh.timeheart.net) | 2.24.0 | EPL-2.0 OR GPL-2.0-or-later | WEAK |
+| [attrs](https://www.attrs.org/) | 26.1.0 | MIT | ALLOW |
+| [Authlib](https://github.com/authlib/authlib) | 1.7.2 | BSD License | ALLOW |
+| [bcrypt](https://github.com/pyca/bcrypt/) | 5.0.0 | Apache Software License | ALLOW |
+| [beartype](https://beartype.readthedocs.io) | 0.22.9 | MIT License | ALLOW |
+| [beautifulsoup4](https://www.crummy.com/software/BeautifulSoup/bs4/) | 4.15.0 | MIT License | ALLOW |
+| [blinker](https://github.com/pallets-eco/blinker/) | 1.9.0 | MIT License | ALLOW |
+| [boto3](https://github.com/boto/boto3) | 1.43.82 | Apache-2.0 | ALLOW |
+| botocore | 1.43.82 | Apache-2.0 | ALLOW |
+| [cachetools](https://github.com/tkem/cachetools/) | 7.1.7 | MIT | ALLOW |
+| [caio](https://github.com/mosquito/caio/) | 0.12.2 | Apache-2.0 | ALLOW |
+| [certifi](https://github.com/certifi/python-certifi) | 2026.7.22 | Mozilla Public License 2.0 (MPL 2.0) | WEAK |
+| [cffi](https://github.com/python-cffi/cffi) | 2.1.1 | MIT-0 | ALLOW |
+| [charset-normalizer](https://github.com/jawah/charset_normalizer/blob/master/CHANGELOG.md) | 3.5.1 | MIT | ALLOW |
+| [claude-agent-sdk](https://github.com/anthropics/claude-agent-sdk-python) | 0.2.147 | MIT License | ALLOW |
+| [click](https://github.com/pallets/click/) | 8.5.0 | BSD-3-Clause | ALLOW |
+| [croniter](https://github.com/pallets-eco/croniter) | 6.2.4 | MIT License | ALLOW |
+| [cryptography](https://github.com/pyca/cryptography) | 50.0.1 | Apache-2.0 OR BSD-3-Clause | ALLOW |
+| [cyclopts](https://github.com/BrianPugh/cyclopts) | 4.23.3 | Apache Software License | ALLOW |
+| [deprecation](https://github.com/briancurtin/deprecation) | 2.1.0 | Apache Software License | ALLOW |
+| distro | 1.9.0 | Apache Software License | ALLOW |
+| [dnspython](https://www.dnspython.org) | 2.8.0 | ISC License (ISCL) | ALLOW |
+| [docstring_parser](https://github.com/rr-/docstring_parser) | 0.18.0 | MIT License | ALLOW |
+| docx2txt | 0.9 | UNKNOWN | ALLOW |
+| durationpy | 0.11 | MIT | ALLOW |
+| email-reply-parser | 0.5.12 | MIT | ALLOW |
+| email-validator | 2.3.0 | The Unlicense (Unlicense) | ALLOW |
+| [et_xmlfile](https://foss.heptapod.net/openpyxl/et_xmlfile) | 2.0.0 | MIT License | ALLOW |
+| [exceptiongroup](https://github.com/agronholm/exceptiongroup) | 1.3.1 | MIT License | ALLOW |
+| [fastapi](https://github.com/fastapi/fastapi) | 0.141.1 | MIT | ALLOW |
+| [fastmcp](https://gofastmcp.com) | 3.4.4 | Apache Software License | ALLOW |
+| [fastmcp-slim](https://gofastmcp.com) | 3.4.4 | Apache Software License | ALLOW |
+| [filelock](https://github.com/tox-dev/py-filelock) | 3.32.4 | MIT License | ALLOW |
+| filetype | 1.2.0 | MIT License | ALLOW |
+| [frozenlist](https://matrix.to/#/#aio-libs:matrix.org) | 1.8.0 | Apache-2.0 | ALLOW |
+| [fsspec](https://github.com/fsspec/filesystem_spec) | 2026.7.0 | BSD-3-Clause | ALLOW |
+| google-auth | 2.57.0 | Apache Software License | ALLOW |
+| [google-genai](https://github.com/googleapis/python-genai) | 2.20.0 | Apache-2.0 | ALLOW |
+| [greenlet](https://greenlet.readthedocs.io) | 3.5.5 | MIT AND PSF-2.0 | ALLOW |
+| griffelib | 2.2.0 | ISC | ALLOW |
+| [groq](https://github.com/groq/groq-python) | 0.37.1 | Apache Software License | ALLOW |
+| h11 | 0.16.0 | MIT License | ALLOW |
+| [hf-xet](https://github.com/huggingface/xet-core) | 1.6.0 | Apache Software License | ALLOW |
+| [httpcore](https://www.encode.io/httpcore/) | 1.0.9 | BSD License | ALLOW |
+| [httpcore2](https://github.com/pydantic/httpx2) | 2.12.0 | BSD License | ALLOW |
+| [httptools](https://github.com/MagicStack/httptools) | 0.8.0 | MIT | ALLOW |
+| [httpx](https://github.com/encode/httpx) | 0.28.1 | BSD License | ALLOW |
+| [httpx-sse](https://github.com/florimondmanca/httpx-sse) | 0.4.3 | MIT | ALLOW |
+| [httpx2](https://github.com/pydantic/httpx2) | 2.12.0 | BSD License | ALLOW |
+| huggingface_hub | 1.29.0 | Apache Software License | ALLOW |
+| [idna](https://github.com/kjd/idna) | 3.19 | BSD-3-Clause | ALLOW |
+| imap-tools | 1.15.0 | Apache Software License | ALLOW |
+| [invoke](https://github.com/pyinvoke/invoke) | 3.0.3 | BSD-2-Clause | ALLOW |
+| [itsdangerous](https://github.com/pallets/itsdangerous/) | 2.2.0 | BSD License | ALLOW |
+| jaraco.classes | 3.4.0 | MIT License | ALLOW |
+| [jaraco.context](https://github.com/jaraco/jaraco.context) | 6.1.2 | MIT | ALLOW |
+| [jaraco.functools](https://github.com/jaraco/jaraco.functools) | 4.6.0 | MIT | ALLOW |
+| [jeepney](https://gitlab.com/takluyver/jeepney) | 0.9.0 | MIT | ALLOW |
+| [Jinja2](https://github.com/pallets/jinja/) | 3.1.6 | BSD License | ALLOW |
+| jiter | 0.16.0 | MIT | ALLOW |
+| jmespath | 1.1.0 | MIT License | ALLOW |
+| [joblib](https://joblib.readthedocs.io) | 1.5.3 | BSD-3-Clause | ALLOW |
+| [joserfc](https://github.com/authlib/joserfc) | 1.7.4 | BSD License | ALLOW |
+| [jsonpatch](https://github.com/stefankoegl/python-json-patch.git) | 1.33 | BSD License | ALLOW |
+| jsonpointer | 3.1.1 | BSD License | ALLOW |
+| [jsonref](https://github.com/gazpachoking/jsonref) | 1.1.0 | MIT | ALLOW |
+| [jsonschema](https://github.com/python-jsonschema/jsonschema) | 4.26.0 | MIT | ALLOW |
+| [jsonschema-path](https://github.com/p1c2u/jsonschema-path) | 0.5.0 | Apache Software License | ALLOW |
+| [jsonschema-specifications](https://github.com/python-jsonschema/jsonschema-specifications) | 2025.9.1 | MIT | ALLOW |
+| [jwcrypto](https://github.com/latchset/jwcrypto) | 1.5.9 | LGPL-3.0-or-later | WEAK |
+| [keyring](https://github.com/jaraco/keyring) | 25.7.0 | MIT | ALLOW |
+| kubernetes | 35.0.0 | Apache Software License | ALLOW |
+| [langchain](https://docs.langchain.com/) | 1.3.14 | MIT License | ALLOW |
+| [langchain-anthropic](https://docs.langchain.com/oss/python/integrations/providers/anthropic) | 1.7.0 | MIT License | ALLOW |
+| [langchain-classic](https://docs.langchain.com/) | 1.0.8 | MIT License | ALLOW |
+| [langchain-community](https://docs.langchain.com/) | 0.4.2 | MIT | ALLOW |
+| [langchain-core](https://docs.langchain.com/) | 1.6.1 | MIT License | ALLOW |
+| [langchain-google-genai](https://docs.langchain.com/oss/python/integrations/providers/google) | 4.3.7 | MIT | ALLOW |
+| [langchain-groq](https://docs.langchain.com/oss/python/integrations/providers/groq) | 1.1.3 | MIT License | ALLOW |
+| [langchain-mcp-adapters](https://www.github.com/langchain-ai/langchain-mcp-adapters) | 0.1.14 | MIT | ALLOW |
+| [langchain-openai](https://docs.langchain.com/oss/python/integrations/providers/openai) | 1.6.0 | MIT License | ALLOW |
+| langchain-postgres | 0.0.17 | MIT | ALLOW |
+| [langchain-protocol](https://github.com/langchain-ai/agent-protocol/tree/main/streaming) | 0.0.19 | MIT License | ALLOW |
+| [langchain-tavily](https://github.com/tavily-ai/langchain-tavily) | 0.2.18 | MIT License | ALLOW |
+| [langchain-text-splitters](https://docs.langchain.com/) | 1.1.2 | MIT License | ALLOW |
+| langdetect | 1.0.9 | Apache Software License | ALLOW |
+| [langgraph](https://docs.langchain.com/oss/python/langgraph/overview) | 1.2.10 | MIT | ALLOW |
+| [langgraph-checkpoint](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint) | 4.1.1 | MIT | ALLOW |
+| [langgraph-checkpoint-postgres](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres) | 3.1.1 | MIT | ALLOW |
+| [langgraph-checkpoint-sqlite](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-sqlite) | 3.1.1 | MIT | ALLOW |
+| [langgraph-prebuilt](https://github.com/langchain-ai/langgraph/tree/main/libs/prebuilt) | 1.1.0 | MIT | ALLOW |
+| [langgraph-sdk](https://github.com/langchain-ai/langgraph/tree/main/libs/sdk-py) | 0.4.4 | MIT | ALLOW |
+| [langsmith](https://smith.langchain.com/) | 0.11.2 | MIT | ALLOW |
+| [lxml](https://github.com/lxml/lxml) | 6.1.2 | BSD-3-Clause | ALLOW |
+| [markdown-it-py](https://github.com/executablebooks/markdown-it-py) | 4.2.0 | MIT License | ALLOW |
+| [MarkupSafe](https://github.com/pallets/markupsafe/) | 3.0.3 | BSD-3-Clause | ALLOW |
+| [mcp](https://modelcontextprotocol.io) | 1.29.0 | MIT License | ALLOW |
+| [mdurl](https://github.com/executablebooks/mdurl) | 0.1.2 | MIT License | ALLOW |
+| [more-itertools](https://github.com/more-itertools/more-itertools) | 11.1.0 | MIT | ALLOW |
+| [motor](https://www.mongodb.org) | 3.7.1 | Apache Software License | ALLOW |
+| [mpmath](https://github.com/fredrik-johansson/mpmath) | 1.3.0 | BSD License | ALLOW |
+| [multidict](https://matrix.to/#/#aio-libs:matrix.org) | 6.7.1 | Apache License 2.0 | ALLOW |
+| [narwhals](https://github.com/narwhals-dev/narwhals) | 2.25.0 | MIT | ALLOW |
+| [nats-py](https://github.com/nats-io/nats.py) | 2.15.0 | Apache-2.0 | ALLOW |
+| [neo4j](https://neo4j.com/) | 6.3.0 | Apache-2.0 AND Python-2.0 | ALLOW |
+| [networkx](https://networkx.org/) | 3.6.1 | BSD-3-Clause | ALLOW |
+| [numpy](https://numpy.org) | 2.5.2 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | ALLOW |
+| oauthlib | 3.3.1 | BSD-3-Clause | ALLOW |
+| [openai](https://github.com/openai/openai-python) | 3.5.0 | Apache Software License | ALLOW |
+| [openapi-pydantic](https://github.com/mike-oakley/openapi-pydantic) | 0.5.1 | MIT License | ALLOW |
+| [openpyxl](https://foss.heptapod.net/openpyxl/openpyxl) | 3.1.5 | MIT License | ALLOW |
+| [opentelemetry-api](https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-api) | 1.44.0 | Apache-2.0 | ALLOW |
+| [orjson](https://github.com/ijl/orjson) | 3.12.0 | Apache Software License; MIT License; Mozilla Public License 2.0 (MPL 2.0) | WEAK |
+| [ormsgpack](https://github.com/ormsgpack/ormsgpack) | 1.12.2 | Apache Software License; MIT License | ALLOW |
+| [packaging](https://github.com/pypa/packaging) | 26.3 | Apache-2.0 OR BSD-2-Clause | ALLOW |
+| [pandas](https://pandas.pydata.org) | 3.0.5 | BSD License | ALLOW |
+| [paramiko](https://github.com/paramiko/paramiko) | 5.0.0 | LGPL-2.1 | WEAK |
+| [pathable](https://github.com/p1c2u/pathable) | 0.6.0 | Apache Software License | ALLOW |
+| pdf2image | 1.17.0 | MIT License | ALLOW |
+| [pdfminer.six](https://github.com/pdfminer/pdfminer.six) | 20260107 | MIT | ALLOW |
+| pdfplumber | 0.11.10 | MIT License | ALLOW |
+| [pgvector](https://github.com/pgvector/pgvector-python) | 0.3.6 | MIT | ALLOW |
+| [pillow](https://python-pillow.github.io) | 12.3.0 | MIT-CMU | ALLOW |
+| [platformdirs](https://github.com/tox-dev/platformdirs) | 4.11.5 | MIT License | ALLOW |
+| [propcache](https://matrix.to/#/#aio-libs:matrix.org) | 0.5.2 | Apache Software License | ALLOW |
+| protobuf | 7.36.0 | 3-Clause BSD License | ALLOW |
+| psutil | 7.2.2 | BSD-3-Clause | ALLOW |
+| [psycopg](https://psycopg.org/) | 3.3.4 | LGPL-3.0-only | WEAK |
+| [psycopg-binary](https://psycopg.org/) | 3.3.4 | LGPL-3.0-only | WEAK |
+| [psycopg-pool](https://psycopg.org/) | 3.3.1 | LGPL-3.0-only | WEAK |
+| [psycopg2-binary](https://psycopg.org/) | 2.9.12 | GNU Library or Lesser General Public License (LGPL) | WEAK |
+| py-key-value-aio | 0.4.5 | Apache-2.0 | ALLOW |
+| [pyarrow](https://arrow.apache.org/) | 25.0.1 | Apache-2.0 | ALLOW |
+| [pyasn1](https://github.com/pyasn1/pyasn1) | 0.6.4 | BSD-2-Clause | ALLOW |
+| [pyasn1_modules](https://github.com/pyasn1/pyasn1-modules) | 0.4.2 | BSD License | ALLOW |
+| [pycparser](https://github.com/eliben/pycparser) | 3.0 | BSD-3-Clause | ALLOW |
+| [pydantic](https://github.com/pydantic/pydantic) | 2.13.4 | MIT | ALLOW |
+| [pydantic-settings](https://github.com/pydantic/pydantic-settings) | 2.15.0 | MIT License | ALLOW |
+| [pydantic_core](https://github.com/pydantic) | 2.46.4 | MIT | ALLOW |
+| pydeck | 0.9.3 | Apache License 2.0 | ALLOW |
+| [Pygments](https://pygments.org) | 2.21.0 | BSD-2-Clause | ALLOW |
+| [PyJWT](https://github.com/jpadilla/pyjwt) | 2.13.0 | MIT | ALLOW |
+| [pymongo](https://www.mongodb.org) | 4.17.0 | Apache-2.0 | ALLOW |
+| [PyNaCl](https://github.com/pyca/pynacl) | 1.6.2 | Apache Software License | ALLOW |
+| [pypdf](https://github.com/py-pdf/pypdf) | 6.16.2 | BSD-3-Clause | ALLOW |
+| [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) | 5.13.0 | BSD-3-Clause, Apache-2.0, dependency licenses | ALLOW |
+| [pyperclip](https://github.com/asweigart/pyperclip) | 1.11.0 | BSD License | ALLOW |
+| [python-dateutil](https://github.com/dateutil/dateutil) | 2.9.0.post0 | BSD License; Apache Software License | ALLOW |
+| [python-docx](https://github.com/python-openxml/python-docx) | 1.2.0 | MIT License | ALLOW |
+| [python-dotenv](https://github.com/theskumar/python-dotenv) | 1.2.3 | BSD-3-Clause | ALLOW |
+| [python-keycloak](https://raw.githubusercontent.com/marcospereirampj/python-keycloak/master/CHANGELOG.md) | 7.1.1 | MIT License | ALLOW |
+| python-magic | 0.4.27 | MIT License | ALLOW |
+| [python-multipart](https://github.com/Kludex/python-multipart) | 0.0.32 | Apache Software License | ALLOW |
+| [python-pptx](https://github.com/scanny/python-pptx) | 1.0.2 | MIT License | ALLOW |
+| [python-socks](https://github.com/romis2012/python-socks) | 3.0.0 | Apache-2.0 | ALLOW |
+| [pytz](https://github.com/stub42/pytz.git) | 2026.3.post1 | MIT License | ALLOW |
+| [PyYAML](https://github.com/yaml/pyyaml) | 6.0.3 | MIT License | ALLOW |
+| [referencing](https://github.com/python-jsonschema/referencing) | 0.37.0 | MIT | ALLOW |
+| [regex](https://github.com/mrabarnett/mrab-regex) | 2026.7.19 | Apache-2.0 AND CNRI-Python | ALLOW |
+| [requests](https://github.com/psf/requests) | 2.34.2 | Apache Software License | ALLOW |
+| requests-oauthlib | 2.0.0 | BSD License | ALLOW |
+| [requests-toolbelt](https://github.com/requests/toolbelt) | 1.0.0 | Apache Software License | ALLOW |
+| [rich](https://github.com/Textualize/rich) | 15.0.0 | MIT License | ALLOW |
+| [rich-rst](https://github.com/wasi-master/rich-rst) | 2.1.0 | MIT | ALLOW |
+| [rpds-py](https://github.com/crate-py/rpds) | 2026.6.3 | MIT | ALLOW |
+| s3transfer | 0.19.2 | Apache Software License | ALLOW |
+| [safetensors](https://github.com/huggingface/safetensors) | 0.8.0 | Apache Software License | ALLOW |
+| [scikit-learn](https://scikit-learn.org) | 1.9.0 | BSD-3-Clause | ALLOW |
+| [scipy](https://scipy.org/) | 1.18.1 | BSD License | ALLOW |
+| [SecretStorage](https://github.com/mitya57/secretstorage) | 3.5.0 | BSD-3-Clause | ALLOW |
+| [sentence-transformers](https://www.SBERT.net) | 6.0.0 | Apache-2.0 | ALLOW |
+| [setuptools](https://github.com/pypa/setuptools) | 84.0.0 | MIT | ALLOW |
+| shellingham | 1.5.4 | ISC License (ISCL) | ALLOW |
+| six | 1.17.0 | MIT License | ALLOW |
+| [sniffio](https://github.com/python-trio/sniffio) | 1.3.1 | MIT License; Apache Software License | ALLOW |
+| [soupsieve](https://github.com/facelessuser/soupsieve) | 2.9.2 | MIT License | ALLOW |
+| [SQLAlchemy](https://docs.sqlalchemy.org) | 2.0.52 | MIT | ALLOW |
+| sqlite-vec | 0.1.9 | MIT License, Apache License, Version 2.0 | ALLOW |
+| [sse-starlette](https://github.com/sysid/sse-starlette) | 3.4.8 | BSD-3-Clause | ALLOW |
+| [starlette](https://github.com/Kludex/starlette) | 1.6.0 | BSD-3-Clause | ALLOW |
+| [streamlit](https://streamlit.io) | 1.62.0 | Apache-2.0 | ALLOW |
+| [sympy](https://github.com/sympy/sympy) | 1.14.0 | BSD License | ALLOW |
+| tenacity | 9.1.4 | Apache Software License | ALLOW |
+| threadpoolctl | 3.6.0 | BSD License | ALLOW |
+| [tiktoken](https://github.com/openai/tiktoken) | 0.14.0 | MIT License Copyright (c) 2022 OpenAI, Shantanu Jain Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. | ALLOW |
+| [tokenizers](https://github.com/huggingface/tokenizers) | 0.23.1 | Apache Software License | ALLOW |
+| toml | 0.10.2 | MIT License | ALLOW |
+| [torch](https://pytorch.org) | 2.13.0+cpu | Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT | ALLOW |
+| [tqdm](https://tqdm.github.io) | 4.70.0 | MPL-2.0 AND MIT | WEAK |
+| transformers | 5.16.1 | Apache 2.0 License | ALLOW |
+| triton | 3.7.1 | MIT License | ALLOW |
+| [truststore](https://github.com/sethmlarson/truststore) | 0.10.4 | MIT | ALLOW |
+| [typer](https://github.com/fastapi/typer) | 0.27.2 | MIT | ALLOW |
+| [typing-inspection](https://github.com/pydantic/typing-inspection) | 0.4.4 | MIT | ALLOW |
+| [typing_extensions](https://github.com/python/typing_extensions) | 4.16.0 | PSF-2.0 | ALLOW |
+| [uncalled-for](https://github.com/chrisguidry/uncalled-for) | 0.4.0 | MIT License | ALLOW |
+| [urllib3](https://github.com/urllib3/urllib3/blob/main/CHANGES.rst) | 2.7.0 | MIT | ALLOW |
+| [uuid_utils](https://github.com/aminalaee/uuid-utils) | 0.17.0 | BSD-3-Clause | ALLOW |
+| [uvicorn](https://uvicorn.dev/) | 0.52.4 | BSD-3-Clause | ALLOW |
+| [uvloop](https://github.com/MagicStack/uvloop) | 0.22.1 | Apache Software License; MIT License | ALLOW |
+| [watchdog](https://github.com/gorakhargosh/watchdog/) | 6.0.0 | Apache Software License | ALLOW |
+| [watchfiles](https://github.com/samuelcolvin/watchfiles) | 1.2.0 | MIT License | ALLOW |
+| [webdavclient3](https://github.com/ezhov-evgeny/webdav-client-python-3) | 3.14.7 | MIT | ALLOW |
+| [websocket-client](https://github.com/websocket-client/websocket-client/) | 1.9.0 | Apache Software License | ALLOW |
+| [websockets](https://github.com/python-websockets/websockets) | 16.1.1 | BSD-3-Clause | ALLOW |
+| xlsxwriter | 3.2.9 | BSD License | ALLOW |
+| xxhash | 4.0.1 | BSD-2-Clause | ALLOW |
+| [yarl](https://matrix.to/#/#aio-libs:matrix.org) | 1.24.5 | Apache-2.0 | ALLOW |
+| [zstandard](https://github.com/indygreg/python-zstandard) | 0.25.0 | BSD-3-Clause | ALLOW |
 <!-- END: backend-inventory -->
 
 ### Backend NOTICE files
 
 <!-- BEGIN: backend-notices -->
-_No bundled dependency ships a NOTICE file._
+### aiofiles 25.1.0
+
+```
+Asyncio support for files
+Copyright 2016 Tin Tvrtkovic
+```
+
+### boto3 1.43.82
+
+```
+boto3
+Copyright 2013-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+```
+
+### botocore 1.43.82
+
+```
+Botocore
+Copyright 2012-2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+----
+
+Botocore includes vendorized parts of the requests python library for backwards compatibility.
+
+Requests License
+================
+
+Copyright 2013 Kenneth Reitz
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+Botocore includes vendorized parts of the urllib3 library for backwards compatibility.
+
+Urllib3 License
+===============
+
+This is the MIT license: http://www.opensource.org/licenses/mit-license.php
+
+Copyright 2008-2011 Andrey Petrov and contributors (see CONTRIBUTORS.txt),
+Modifications copyright 2012 Kenneth Reitz.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this
+software and associated documentation files (the "Software"), to deal in the Software
+without restriction, including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons
+to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+Bundle of CA Root Certificates
+==============================
+
+***** BEGIN LICENSE BLOCK *****
+This Source Code Form is subject to the terms of the
+Mozilla Public License, v. 2.0. If a copy of the MPL
+was not distributed with this file, You can obtain
+one at http://mozilla.org/MPL/2.0/.
+
+***** END LICENSE BLOCK *****
+```
+
+### langdetect 1.0.9
+
+```
+language-detection license
+==========================
+
+    Copyright (c) 2010-2014 Cybozu Labs, Inc. All rights reserved.
+
+    Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+```
+
+### neo4j 6.3.0
+
+```
+Neo4j
+Copyright (c) Neo4j Sweden AB (referred to in this notice as "Neo4j") [https://neo4j.com]
+
+This product includes software ("Software") developed by Neo4j
+```
+
+### propcache 0.5.2
+
+```
+Copyright 2016-2021, Andrew Svetlov and aio-libs team
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+```
+
+### s3transfer 0.19.2
+
+```
+s3transfer
+Copyright 2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+```
+
+### sentence-transformers 6.0.0
+
+```
+-------------------------------------------------------------------------------
+Sentence Transformers
+
+Copyright 2019-2025
+Ubiquitous Knowledge Processing (UKP) Lab
+Technische Universität Darmstadt
+
+Copyright 2025-present
+Hugging Face, Inc.
+-------------------------------------------------------------------------------
+```
+
+### yarl 1.24.5
+
+```
+Copyright 2016-2021, Andrew Svetlov and aio-libs team
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+```
 <!-- END: backend-notices -->
 
 ---

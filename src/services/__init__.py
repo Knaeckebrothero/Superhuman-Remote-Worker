@@ -1,6 +1,6 @@
 # Services package - helper services for the agent
 #
-# Lazy-loaded to avoid pulling in heavy dependencies (openai, pymupdf, etc.)
+# Lazy-loaded to avoid pulling in heavy dependencies (openai, pypdf, etc.)
 # when only a specific service submodule is needed.
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {

@@ -250,6 +250,16 @@ jobs:
         run: uv pip install --system --upgrade 'pip>=26.1'
       - name: Install pip-audit
         run: uv pip install --system pip-audit
+      # Mirror docker/Dockerfile.agent: the shipped agent image installs
+      # CPU-only PyTorch BEFORE requirements.txt, so the ~18 proprietary
+      # nvidia-*/cuda-* CUDA wheels that a bare `pip install -r
+      # requirements.txt` drags in via sentence-transformers -> torch are never
+      # conveyed. Install them here and this job audits (and license-gates) a
+      # dependency set that does not match the artifact we ship.
+      - name: Install CPU-only PyTorch (matches the agent image)
+        run: >-
+          uv pip install --system torch
+          --index-url https://download.pytorch.org/whl/cpu
       - name: Install Python dependencies
         run: uv pip install --system -r requirements.txt
       - name: Audit Python dependencies
@@ -386,8 +396,18 @@ jobs:
       # this already-required job so it gates every build without per-job edits.
       # Source of truth: scripts/check_licenses.py.
       - name: Install license tooling + full bundled dep set
+        # Name all three runtime requirements files. pip-licenses reads
+        # *installed* metadata, so a file nobody installed is invisible to the
+        # gate; the root requirements.txt (the agent image's dep set, where the
+        # AGPL pymupdf lived) reached this env only as a side effect of the
+        # pip-audit step above, which is not a dependency worth relying on.
+        # The gate's actual blind spot was in scripts/check_licenses.py: its
+        # pip-licenses call passed --no-license-path/--with-notice-file without
+        # --with-license-file, so pip-licenses exited 2, the collector returned
+        # [], and the gate scanned ZERO Python packages while reporting a pass.
         run: >-
           uv pip install --system pip-licenses
+          -r requirements.txt
           -r orchestrator/requirements.txt
           -r orchestrator/mcp/requirements.txt
       - name: Check third-party licenses
@@ -417,6 +437,13 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+      # Same reason as in dependency-audit: without this, the generated
+      # inventory attributes ~18 proprietary nvidia-*/cuda-* CUDA wheels that
+      # the agent image never installs. See docker/Dockerfile.agent.
+      - name: Install CPU-only PyTorch (matches the agent image)
+        run: >-
+          uv pip install --system torch
+          --index-url https://download.pytorch.org/whl/cpu
       - name: Install dependencies + license tooling
         # No Node step / npm ci: backend needs the installed Python deps for
         # pip-licenses; the frontend inventory is read from package-lock.json.
@@ -426,9 +453,22 @@ jobs:
           -r orchestrator/requirements.txt
           -r orchestrator/mcp/requirements.txt
       - name: Regenerate THIRD_PARTY_LICENSES.md
-        # --write also runs the gate; never block the docs commit here (the
-        # dependency-audit job blocks the build), so swallow a nonzero exit.
-        run: python scripts/check_licenses.py --write || true
+        # --write also runs the gate. A *policy* failure (exit 1, a denied
+        # license) must not block the docs commit — the dependency-audit job is
+        # the blocking gate for that. A *generation* failure (exit 2: the
+        # collector produced nothing, e.g. pip-licenses itself errored) MUST
+        # fail here: swallowing it is how an empty backend inventory got
+        # committed as authoritative for months.
+        run: |
+          set +e
+          python scripts/check_licenses.py --write
+          status=$?
+          set -e
+          if [ "$status" -ge 2 ]; then
+            echo "::error::license inventory generation failed (exit $status)"
+            exit "$status"
+          fi
+          echo "Inventory regenerated (gate exit $status)."
       - name: Commit if changed
         run: |
           if git diff --quiet THIRD_PARTY_LICENSES.md; then

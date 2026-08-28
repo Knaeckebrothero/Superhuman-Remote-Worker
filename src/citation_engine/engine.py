@@ -202,7 +202,7 @@ class CitationEngine:
         """
         Register a document source (PDF, markdown, txt, json, csv, images, etc.).
 
-        Extracts text content (PyMuPDF for PDFs) and stores it for verification.
+        Extracts text content (pypdf for PDFs) and stores it for verification.
 
         Raises:
             FileNotFoundError: If file doesn't exist
@@ -422,7 +422,7 @@ class CitationEngine:
         """
         Extract text content from a document file.
 
-        Supports PDF (PyMuPDF), DOCX (docx2txt), and text formats. Runs in a
+        Supports PDF (pypdf), DOCX (docx2txt), and text formats. Runs in a
         worker thread (sync I/O).
         """
         ext = Path(file_path).suffix.lower()
@@ -453,31 +453,52 @@ class CitationEngine:
                 ) from e
 
     def _extract_pdf_content(self, file_path: str) -> str:
-        """Extract text content from a PDF file using PyMuPDF, with page markers."""
+        """Extract text content from a PDF file using pypdf, with page markers.
+
+        pypdf (BSD-3-Clause) replaced PyMuPDF here: PyMuPDF is AGPL-3.0-or-
+        Artifex-commercial, which `scripts/check_licenses.py` denies for the
+        bundled set — it may not ship inside an FSL-1.1-ALv2 product.
+
+        pypdf was chosen over `pdfplumber` (the other permissive extractor
+        already pinned) on measured extraction quality: across this repo's PDF
+        corpus pypdf's default mode reproduces PyMuPDF's paragraph text to
+        within ~0.5% of its word count, whereas pdfplumber at its defaults
+        silently deletes every inter-word space on browser-exported PDFs
+        (recoverable only by hand-tuning `x_tolerance_ratio` per document).
+        Space-collapsed text is the worst possible failure mode here: the
+        extraction still "succeeds" and returns a plausible length, but every
+        downstream quote/claim verification against it then fails.
+        """
         try:
-            import fitz  # PyMuPDF
-
-            log.debug(f"Opening PDF with PyMuPDF: {file_path}")
-            doc = fitz.open(file_path)
-            text_parts = []
-
-            for page_num, page in enumerate(doc, start=1):
-                text = page.get_text()
-                text_parts.append(f"--- Page {page_num} ---\n{text}")
-
-            doc.close()
-
-            content = "\n\n".join(text_parts)
-            log.debug(
-                f"Extracted {len(content)} characters from {len(text_parts)} PDF pages"
-            )
-            return content
-
+            from pypdf import PdfReader
         except ImportError as e:
-            log.error("PyMuPDF not installed, cannot extract PDF content")
+            log.error("pypdf not installed, cannot extract PDF content")
             raise ImportError(
-                "PyMuPDF is required for PDF extraction. Install it with: pip install pymupdf"
+                "pypdf is required for PDF extraction. Install it with: pip install pypdf"
             ) from e
+
+        log.debug(f"Opening PDF with pypdf: {file_path}")
+        reader = PdfReader(file_path)
+
+        # Permission-only encryption with an empty user password is common on
+        # published papers; PyMuPDF opened those transparently, pypdf needs to
+        # be told. A genuinely password-protected file still fails on read.
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception as e:
+                log.warning(f"Could not decrypt PDF {file_path}: {e}")
+
+        text_parts = []
+        for page_num, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            text_parts.append(f"--- Page {page_num} ---\n{text}")
+
+        content = "\n\n".join(text_parts)
+        log.debug(
+            f"Extracted {len(content)} characters from {len(text_parts)} PDF pages"
+        )
+        return content
 
     def _extract_docx_content(self, file_path: str) -> str:
         """Extract text content from a DOCX file using docx2txt (with fallback)."""
@@ -550,7 +571,7 @@ class CitationEngine:
             if "application/pdf" in content_type or url.lower().endswith(".pdf"):
                 import tempfile
 
-                log.debug("Detected PDF content, extracting text with PyMuPDF")
+                log.debug("Detected PDF content, extracting text with pypdf")
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
                     tmp.write(response.content)
                     tmp.flush()

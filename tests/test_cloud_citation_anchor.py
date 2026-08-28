@@ -213,7 +213,7 @@ async def test_get_or_register_doc_source_no_anchor_passes_none():
 async def test_get_or_register_doc_source_materializes_remote_file(tmp_path):
     """A workspace path that is not present on the agent's local fs (remote
     backend) must be downloaded via ``workspace.local_copy`` before the engine —
-    which does local ``os.path.exists``/``fitz.open`` I/O — registers it.
+    which does local ``os.path.exists``/``pypdf`` I/O — registers it.
 
     Regression for the persistent-session bug where every ``cite_document`` fell
     back to stub mode because the file lived on a separate workspace pod.
