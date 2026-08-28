@@ -26,6 +26,7 @@ import io
 import json
 import tarfile
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -173,10 +174,21 @@ def _thread_mounts_row(*, mountpoint="MyProject", cloud_handle="proj-1") -> dict
 def _snapshot_service(blobs: dict[str, bytes] | None = None):
     svc = MagicMock()
 
-    async def _get_blob(key):
-        return (blobs or {}).get(key)
+    async def _get_blob(key, *, max_bytes=None):
+        blob = (blobs or {}).get(key)
+        if blob is not None and max_bytes is not None and len(blob) > max_bytes:
+            return None
+        return blob
+
+    async def _download_blob_file(key, local_path, *, max_bytes):
+        blob = (blobs or {}).get(key)
+        if blob is None or len(blob) > max_bytes:
+            return False
+        Path(local_path).write_bytes(blob)
+        return True
 
     svc.get_blob = AsyncMock(side_effect=_get_blob)
+    svc.download_blob_file = AsyncMock(side_effect=_download_blob_file)
     return svc
 
 

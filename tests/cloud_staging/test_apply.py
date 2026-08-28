@@ -20,6 +20,7 @@ import hashlib
 import io
 import json
 import tarfile
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -137,14 +138,25 @@ def _snapshot_service(blobs: dict[str, bytes] | None = None):
     svc = MagicMock()
     store = dict(blobs or {})
 
-    async def _get_blob(key):
-        return store.get(key)
+    async def _get_blob(key, *, max_bytes=None):
+        blob = store.get(key)
+        if blob is not None and max_bytes is not None and len(blob) > max_bytes:
+            return None
+        return blob
 
     async def _delete_blob(key):
         store.pop(key, None)
         return True
 
+    async def _download_blob_file(key, local_path, *, max_bytes):
+        blob = store.get(key)
+        if blob is None or len(blob) > max_bytes:
+            return False
+        Path(local_path).write_bytes(blob)
+        return True
+
     svc.get_blob = AsyncMock(side_effect=_get_blob)
+    svc.download_blob_file = AsyncMock(side_effect=_download_blob_file)
     svc.delete_blob = AsyncMock(side_effect=_delete_blob)
     return svc
 
