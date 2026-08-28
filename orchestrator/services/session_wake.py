@@ -64,7 +64,13 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
+from services.session_lifecycle import probe_ready
+from services.session_runtime_admission import (
+    thread_requests_protected_cloud,
+    thread_runtime_authority,
+)
 from src.shared.job_outcome import effective_job_status
+from src.shared.pinned_session_identity import PinnedSessionBinding
 from services.usage_ledger import llm_tokens_from_rows
 
 logger = logging.getLogger(__name__)
@@ -426,6 +432,52 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
         text,
         delivery_id=delivery_id,
     )
+
+
+async def _resolve_live_agent(
+    db: Any, thread: dict[str, Any]
+) -> Optional[PinnedSessionBinding]:
+    """Return the exact ready binding serving one pinned thread, if any.
+
+    Wakes themselves always enter the durable inbox. The Officer watchdog uses
+    this read-only probe only to distinguish a healthy sleeping runtime from a
+    missing one, so the network check is fenced by binding reads on both sides.
+    """
+
+    runtime_authority = thread_runtime_authority(thread)
+    if runtime_authority is None:
+        return None
+    try:
+        binding = await db.get_pinned_session_binding(
+            runtime_authority.thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+        )
+    except Exception:
+        return None
+    if binding is None or binding.agent_status not in ("ready", "working", "session"):
+        return None
+    if not await probe_ready(
+        binding.pod_ip,
+        binding.pod_port,
+        required_capability="durable_input_delivery",
+        require_protected_cloud=thread_requests_protected_cloud(thread),
+        expected_session_identity_fingerprint=binding.session_identity_fingerprint,
+    ):
+        return None
+    try:
+        current = await db.get_pinned_session_binding(
+            runtime_authority.thread_id,
+            expected_runtime_generation=runtime_authority.generation,
+        )
+    except Exception:
+        return None
+    if (
+        current is None
+        or current.target_key != binding.target_key
+        or current.agent_status not in ("ready", "working", "session")
+    ):
+        return None
+    return current
 
 
 # --------------------------------------------------------------------------

@@ -243,6 +243,7 @@ async def ensure_session_workspace(
             requires_runtime_attestation=requires_runtime_attestation,
             lifecycle_lock_held=_workspace_lifecycle_lock_held,
         ),
+        pinned_runtime_lock_held=_pinned_runtime_lock_held,
     )
 
     if pinned_authority is not None:

@@ -290,9 +290,14 @@ APP_PINNED_RECYCLE_AUTHORITY_MIGRATION = (
     ROOT
     / "orchestrator/database/migrations/app/0198_pinned_agent_recycle_authority.sql"
 )
-# The head pin moves with every new migration; it is what proves the
-# snapshot artifacts are not mistaken for the migration contract.
-APP_CURRENT_MIGRATION_HEAD = APP_PINNED_RECYCLE_AUTHORITY_MIGRATION
+APP_PRE_REGISTRATION_SANDBOX_ZERO = (
+    ROOT / "orchestrator/database/migrations/app/0199_pre_registration_sandbox_zero.sql"
+)
+APP_PRE_REGISTRATION_DELETE_SANDBOX_ZERO = (
+    ROOT
+    / "orchestrator/database/migrations/app/0200_pre_registration_delete_sandbox_zero.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_PRE_REGISTRATION_DELETE_SANDBOX_ZERO
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -1455,6 +1460,40 @@ async def test_0185_refuses_numbered_pending_history_on_stateless_thread(
             await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
         finally:
             await admin.close()
+
+
+def test_0199_pre_registration_sandbox_zero_is_bounded_and_forward_only() -> None:
+    raw = APP_PRE_REGISTRATION_SANDBOX_ZERO.read_text()
+    sql = _compact(raw)
+
+    assert "-- migration:     0199_pre_registration_sandbox_zero.sql" in raw
+    assert "-- depends-on:    0198_pinned_agent_recycle_authority.sql" in raw
+    assert "-- expected:      < 1s. Replace one trigger function" in raw
+    assert "-- locks:         Brief function-catalog lock" in raw
+    assert "-- transactional: yes" in raw
+    assert "pg_get_functiondef" in sql
+    assert "occurrence_count <> 1" in sql
+    assert "'sandbox_actuator_zero_v1'" in sql
+    assert "EXECUTE patched_definition" in sql
+    assert "0185_thread_runtime_generation_retirement.sql" not in sql
+
+
+def test_0200_pre_registration_delete_sandbox_zero_is_bounded_and_forward_only() -> (
+    None
+):
+    raw = APP_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.read_text()
+    sql = _compact(raw)
+
+    assert "-- migration:     0200_pre_registration_delete_sandbox_zero.sql" in raw
+    assert "-- depends-on:    0199_pre_registration_sandbox_zero.sql" in raw
+    assert "-- expected:      < 1s. Replace one trigger function" in raw
+    assert "-- locks:         Brief function-catalog lock" in raw
+    assert "-- transactional: yes" in raw
+    assert "enforce_pinned_thread_delete_authority" in sql
+    assert "occurrence_count <> 1" in sql
+    assert "IS DISTINCT FROM expected_protocol" in sql
+    assert "EXECUTE patched_definition" in sql
+    assert "0185_thread_runtime_generation_retirement.sql" not in sql
 
 
 def test_0177_is_bounded_thread_only_and_keeps_0176_immutable() -> None:

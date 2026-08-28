@@ -12,11 +12,13 @@ name: db-migrations
 #
 # Runs four jobs in parallel:
 #   1. squawk      — static lint of the migrations ADDED/MODIFIED by this push
-#                    or PR (lock safety, missing NOT VALID, non-concurrent
-#                    indexes, etc.). It never re-lints the frozen, already-
-#                    applied history: those files can't be edited (the runner's
-#                    checksum guard rejects drift), so their findings are
-#                    unactionable and would keep the job permanently red.
+#                    or ordinary PR (lock safety, missing NOT VALID,
+#                    non-concurrent indexes, etc.). A develop-to-main release
+#                    promotion trusts develop's admission gates instead of
+#                    re-linting its frozen, already-applied history: those files
+#                    can't be edited (the runner's checksum guard rejects
+#                    drift), so their findings are unactionable and would keep
+#                    the promotion permanently red.
 #   2. dry-run     — dry-run every migration, then really apply the app chain
 #                    and exercise the Canvas viewer credential lifecycle on a
 #                    fresh pgvector/pgvector:pg15 service container (transactional
@@ -96,6 +98,20 @@ jobs:
           SQUAWK_VERSION: v2.59.0
         run: |
           set -euo pipefail
+
+          # A release PR from develop to main contains every migration since
+          # main's previous release snapshot. Develop is the migration admission
+          # branch, and that accumulated history is checksum-locked after
+          # application. Re-linting it makes old, unactionable warnings block
+          # promotion. The other jobs in this workflow still replay the complete
+          # chain, regenerate all schema artifacts, and enforce unique prefixes
+          # on this PR.
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+             && [ "${{ github.base_ref }}" = "main" ] \
+             && [ "${{ github.head_ref }}" = "develop" ]; then
+            echo "Develop-to-main promotion: relying on develop admission gates; skipping immutable-history re-lint."
+            exit 0
+          fi
 
           # Diff base: the PR's base, or the previous tip of the pushed branch.
           if [ "${{ github.event_name }}" = "pull_request" ]; then

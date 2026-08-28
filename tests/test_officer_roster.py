@@ -28,6 +28,7 @@ THREAD_A = str(uuid4())
 
 
 def _row(**over) -> dict:
+    today = datetime.now(timezone.utc).date().isoformat()
     row = {
         "project_id": PROJECT_A,
         "project_name": "Better Resavio",
@@ -39,6 +40,10 @@ def _row(**over) -> dict:
             "config_override": {
                 "llm": {"model": "gpt-5.6-sol"},
                 "officer": {"enabled": True, "auto_pull": False},
+            },
+            "officer_state": {
+                "pages": {"date": today, "count": 2},
+                "digest": [{"subject": "s"}, {"subject": "t"}],
             },
         },
         "next_wake_at": datetime(2026, 8, 17, 9, 30, tzinfo=timezone.utc),

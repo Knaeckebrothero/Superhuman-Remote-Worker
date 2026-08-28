@@ -179,9 +179,7 @@ def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
     )
     process_generation = str(uuid4())
     session_generation = str(uuid4())
-    monkeypatch.setattr(
-        persistent_app, "_input_runtime_generation", process_generation
-    )
+    monkeypatch.setattr(persistent_app, "_input_runtime_generation", process_generation)
     monkeypatch.setattr(
         persistent_app, "_session_runtime_generation", session_generation
     )
@@ -2442,10 +2440,10 @@ async def test_callback_absence_preserves_ordinary_persistent_behavior():
 
 
 @pytest.mark.asyncio
-async def test_terminating_wake_rejection_and_response_loss_retry_once(
+async def test_deferred_durable_wake_retry_settles_once(
     monkeypatch,
 ):
-    """A 503/lost response leaves the durable row claimable with one id."""
+    """Persistence without admission defers one stable identity until settled."""
 
     thread_id = str(uuid4())
     event_id = 41
@@ -2477,15 +2475,23 @@ async def test_terminating_wake_rejection_and_response_loss_retry_once(
         finish_session_wake_events=AsyncMock(),
         release_session_wake_events=AsyncMock(),
         defer_session_wake_events=AsyncMock(),
+        defer_session_wake_events_for_input=AsyncMock(),
+        persist_thread_input_delivery=AsyncMock(
+            side_effect=[
+                {
+                    "thread_id": thread_id,
+                    "state": "persisted",
+                    "transcript_inserted": True,
+                },
+                {
+                    "thread_id": thread_id,
+                    "state": "settled",
+                    "transcript_inserted": False,
+                },
+            ]
+        ),
         merge_thread_officer_state=AsyncMock(),
     )
-    monkeypatch.setattr(
-        session_wake,
-        "_resolve_live_agent",
-        AsyncMock(return_value={"pod_ip": "127.0.0.1", "pod_port": 8001}),
-    )
-    inject = AsyncMock(side_effect=[False, True])
-    monkeypatch.setattr(session_wake, "_inject_live", inject)
     monkeypatch.setattr(
         session_wake,
         "_officer_ceiling_deferral",
@@ -2498,14 +2504,16 @@ async def test_terminating_wake_rejection_and_response_loss_retry_once(
     )
 
     assert await session_wake.drain_pending_event_wakes(db) == 0
-    db.release_session_wake_events.assert_awaited_once_with(
-        [event_id], max_attempts=session_wake._OFFICER_MAX_ATTEMPTS
-    )
+    assert db.defer_session_wake_events_for_input.await_args.args[0] == [event_id]
+    db.release_session_wake_events.assert_not_awaited()
     db.finish_session_wake_events.assert_not_awaited()
 
     assert await session_wake.drain_pending_event_wakes(db) == 1
     db.finish_session_wake_events.assert_awaited_once_with([event_id])
-    assert [call.kwargs["delivery_id"] for call in inject.await_args_list] == [
+    assert [
+        call.kwargs["delivery_id"]
+        for call in db.persist_thread_input_delivery.await_args_list
+    ] == [
         delivery_id,
         delivery_id,
     ]

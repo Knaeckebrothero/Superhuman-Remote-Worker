@@ -383,8 +383,9 @@ _TERMINATION_QUEUE_SENTINEL = INTERRUPT_SENTINEL
 _runtime_authorization_admission_open: bool = False
 
 # One process incarnation inside one pod. Kubernetes may restart a container
-# without changing the pod UID; a new value lets that successor reclaim input
-# that existed only in the predecessor's RAM queue. Reset on every attach.
+# without changing the pod UID; this value lets the successor reclaim work
+# that existed only in the predecessor's RAM queue. The separate session
+# generation fences the durable thread binding. Reset on every attach.
 _input_runtime_generation: Optional[str] = None
 _queued_input_claims: set[tuple[str, int]] = set()
 # Serializes durable reclaim with local queue/priority publication. In
@@ -10951,9 +10952,7 @@ async def _loop_defer_and_requeue_input_delivery(
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
-                    session_runtime_generation=str(
-                        _session_runtime_generation or ""
-                    ),
+                    session_runtime_generation=str(_session_runtime_generation or ""),
                     runtime_attach_token=runtime_attach_token,
                 ),
                 timeout=5.0,

@@ -54,6 +54,47 @@ async def test_failed_session_workspace_is_recreated():
 
 
 @pytest.mark.asyncio
+async def test_pinned_workspace_create_reuses_outer_runtime_lock():
+    """The pinned ensure owns the thread lock across its authority re-read.
+
+    Its lifecycle delegate must not try to acquire the same non-reentrant
+    advisory lock again while creating a missing workspace.
+    """
+
+    class _LockingDB:
+        def __init__(self):
+            self.lock_entries = 0
+
+        async def get_thread(self, _thread_id):
+            return _pinned_thread(PINNED_THREAD_ID, workspace_status="deleted")
+
+        @asynccontextmanager
+        async def thread_advisory_lock(self, _thread_id):
+            self.lock_entries += 1
+            if self.lock_entries > 1:
+                raise AssertionError("pinned workspace ensure reacquired its own lock")
+            yield True
+
+    db = _LockingDB()
+    provisioner = AsyncMock()
+    provisioner.create_pinned_thread_workspace = AsyncMock(return_value=True)
+
+    result = await ensure_session_workspace(
+        PINNED_THREAD_ID,
+        db=db,
+        provisioner=provisioner,
+        suspension=AsyncMock(),
+    )
+
+    assert result is not None and result.outcome == EnsureOutcome.PENDING
+    assert db.lock_entries == 1
+    provisioner.create_pinned_thread_workspace.assert_awaited_once_with(
+        PINNED_THREAD_ID,
+        runtime_lock_held=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_ensure_skips_ended_thread():
     db = AsyncMock()
     db.get_thread = AsyncMock(
