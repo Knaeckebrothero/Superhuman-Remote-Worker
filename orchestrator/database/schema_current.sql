@@ -22812,7 +22812,7 @@ CREATE INDEX idx_threads_project ON public.threads USING btree (project_id);
 -- Name: idx_threads_ssh_handle; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX idx_threads_ssh_handle ON public.threads USING btree (ssh_handle);
+CREATE UNIQUE INDEX idx_threads_ssh_handle ON public.threads USING btree (ssh_handle) WHERE (ssh_handle IS NOT NULL);
 
 
 --

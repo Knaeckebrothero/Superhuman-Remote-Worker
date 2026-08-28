@@ -1180,6 +1180,14 @@ async def test_0185_serializes_real_predecessor_rows_with_lane_changes(
         await blocker.execute(
             "LOCK TABLE thread_input_deliveries IN ACCESS EXCLUSIVE MODE"
         )
+        # LOAD-BEARING: replay the LIVE migrations directory, not a bounded
+        # copy. This test seeds threads rows and then replays a real upgrade
+        # span, which is the only condition in the suite that reproduces a
+        # migration whose DDL collides with deferred trigger events queued by
+        # an earlier migration in the same transactional pass (they share one
+        # transaction). 0202 hit exactly that and would have shipped a boot
+        # hard-fail had this replay been narrowed to dodge it. Narrowing it
+        # again removes the coverage; fix the migration instead.
         migration_task = asyncio.create_task(
             run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
         )
