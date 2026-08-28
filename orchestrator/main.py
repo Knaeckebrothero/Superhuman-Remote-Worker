@@ -14686,6 +14686,13 @@ class AgentRegistrationResponse(BaseModel):
 
     agent_id: str
     heartbeat_interval_seconds: int
+    dispatch_process_generation: str = Field(
+        ...,
+        description=(
+            "Server-minted exact process generation required on every pinned "
+            "job mutation"
+        ),
+    )
     pinned_runtime_generation_contract: int = 1
     session_runtime_generation: str | None = None
     session_runtime_attach_token: str | None = Field(

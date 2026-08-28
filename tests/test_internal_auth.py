@@ -282,7 +282,11 @@ class TestPureInternalEndpoints:
         )
         db = MagicMock()
         db.register_agent = AsyncMock(
-            return_value={"agent_id": "agent-new", "heartbeat_interval_seconds": 20}
+            return_value={
+                "agent_id": "agent-new",
+                "heartbeat_interval_seconds": 20,
+                "dispatch_process_generation": "process-new",
+            }
         )
         db.fetchrow = AsyncMock(return_value=None)
         db.get_thread = AsyncMock(
@@ -309,6 +313,8 @@ class TestPureInternalEndpoints:
             response = await orch_main.register_agent(MagicMock(), reg)
 
         assert response.agent_id == "agent-new"
+        assert response.dispatch_process_generation == "process-new"
+        assert response.model_dump()["dispatch_process_generation"] == "process-new"
         assert response.runtime_actor is None
         assert (
             db.register_agent.await_args.kwargs["completion_commands_enabled"]
@@ -397,6 +403,7 @@ class TestPureInternalEndpoints:
             return_value={
                 "agent_id": "agent-winner",
                 "heartbeat_interval_seconds": 20,
+                "dispatch_process_generation": "process-winner",
             }
         )
         db.fetchrow = AsyncMock(return_value=None)
@@ -464,6 +471,7 @@ class TestPureInternalEndpoints:
             return_value={
                 "agent_id": "agent-owner",
                 "heartbeat_interval_seconds": 20,
+                "dispatch_process_generation": "process-owner",
             }
         )
         db.fetchrow = AsyncMock(return_value=None)
@@ -517,6 +525,7 @@ class TestPureInternalEndpoints:
             return_value={
                 "agent_id": "agent-fresh",
                 "heartbeat_interval_seconds": 20,
+                "dispatch_process_generation": "process-fresh",
             }
         )
         db.fetchrow = AsyncMock(return_value=None)
