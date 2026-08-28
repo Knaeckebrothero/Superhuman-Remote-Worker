@@ -245,9 +245,13 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: cockpit/package-lock.json
-      - name: Upgrade pip
-        # CVE-2026-6357: pip < 26.1 runs self-update import after wheel install
-        run: uv pip install --system --upgrade 'pip>=26.1'
+      - name: Upgrade packaging toolchain
+        # CVE-2026-6357: pip < 26.1 runs self-update import after wheel install.
+        # setup-python currently carries setuptools 78.1.0; upgrade it before
+        # auditing so the runner itself is not the only vulnerable package.
+        run: >-
+          uv pip install --system --upgrade
+          'pip>=26.1' 'setuptools>=83.0.0'
       - name: Install pip-audit
         run: uv pip install --system pip-audit
       # Mirror docker/Dockerfile.agent: the shipped agent image installs
@@ -416,9 +420,10 @@ jobs:
         run: python scripts/check_licenses.py --check
 
   # ---------------------------------------------------------------------------
-  # Regenerate THIRD_PARTY_LICENSES.md and auto-commit on develop (mirrors the
-  # lint job's ruff auto-format-and-commit). Non-blocking — the dependency-audit
-  # job is the blocking gate. Push-only; PRs are covered by that gate.
+  # Regenerate THIRD_PARTY_LICENSES.md as a reviewable observation artifact.
+  # Branch protection requires changes through a PR, so CI must never try to
+  # push this generated documentation directly to develop. The dependency-
+  # audit job above remains the blocking policy gate.
   # ---------------------------------------------------------------------------
   license-inventory:
     needs: [lint]
@@ -426,11 +431,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: develop
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -469,17 +472,26 @@ jobs:
             exit "$status"
           fi
           echo "Inventory regenerated (gate exit $status)."
-      - name: Commit if changed
+      - name: Record inventory drift
+        id: inventory
         run: |
           if git diff --quiet THIRD_PARTY_LICENSES.md; then
             echo "THIRD_PARTY_LICENSES.md unchanged"
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add THIRD_PARTY_LICENSES.md
-          git commit -m "docs: regenerate THIRD_PARTY_LICENSES.md [skip ci]"
-          git push
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          git diff --binary -- THIRD_PARTY_LICENSES.md > THIRD_PARTY_LICENSES.patch
+          echo "::warning::THIRD_PARTY_LICENSES.md drifted; download the generated inventory artifact and review it through a PR"
+      - name: Upload generated license inventory
+        if: steps.inventory.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: third-party-license-inventory-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          path: |
+            THIRD_PARTY_LICENSES.md
+            THIRD_PARTY_LICENSES.patch
 
   # ---------------------------------------------------------------------------
   # Detect which components changed — build jobs only run when needed

@@ -206,9 +206,13 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: cockpit/package-lock.json
-      - name: Upgrade pip
-        # CVE-2026-6357: pip < 26.1 runs self-update import after wheel install
-        run: uv pip install --system --upgrade 'pip>=26.1'
+      - name: Upgrade packaging toolchain
+        # CVE-2026-6357: pip < 26.1 runs self-update import after wheel install.
+        # setup-python currently carries setuptools 78.1.0; upgrade it before
+        # auditing so the runner itself is not the only vulnerable package.
+        run: >-
+          uv pip install --system --upgrade
+          'pip>=26.1' 'setuptools>=83.0.0'
       - name: Install pip-audit
         run: uv pip install --system pip-audit
       # Mirror docker/Dockerfile.agent: the shipped agent image installs

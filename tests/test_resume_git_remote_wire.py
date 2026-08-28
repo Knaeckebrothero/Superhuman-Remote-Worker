@@ -12,6 +12,7 @@ pattern from tests/test_dual_app_stop_reset.py).
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -21,6 +22,19 @@ import src.api.dual_app as dual_app
 from orchestrator.services.config_resolver import resolve_config
 from src.api.models import JobResumeRequest
 from src.core.loader import get_all_tool_names, load_config_from_resolved
+
+
+AGENT_ID = "11111111-1111-4111-8111-111111111111"
+PROCESS_GENERATION = "22222222-2222-4222-8222-222222222222"
+
+
+def _recipient(job_id: str) -> dict[str, str | None]:
+    return {
+        "expected_agent_id": AGENT_ID,
+        "expected_pod_uid": None,
+        "expected_process_generation": PROCESS_GENERATION,
+        "expected_job_id": job_id,
+    }
 
 
 def _empty_async_gen():
@@ -37,8 +51,17 @@ def _wire_idle_agent(monkeypatch):
     agent.process_job = AsyncMock(return_value=_empty_async_gen())
     monkeypatch.setattr(dual_app, "_agent", agent)
     monkeypatch.setattr(dual_app, "_pod_state", dual_app.PodState.IDLE)
+    monkeypatch.setattr(dual_app, "_current_job_id", None)
+    monkeypatch.setattr(dual_app, "_current_job_task", None)
     monkeypatch.setattr(dual_app, "_shutdown_requested", False)
-    monkeypatch.setattr(dual_app, "_orchestrator_client", None)
+    monkeypatch.setattr(
+        dual_app,
+        "_orchestrator_client",
+        SimpleNamespace(
+            agent_id=AGENT_ID,
+            dispatch_process_generation=PROCESS_GENERATION,
+        ),
+    )
     monkeypatch.setattr(dual_app, "_reset_to_idle", AsyncMock())
     # Keep the post-completion exit scheduler out of the test process.
     monkeypatch.setattr(dual_app, "_should_loop", lambda: True)
@@ -167,6 +190,7 @@ async def test_resume_endpoint_forwards_git_remote_into_metadata(monkeypatch):
             git_remote_url="http://srw-gitea:3000/srw/job-j1.git",
             config_override=_sandbox_config(),
             workspace_runtime=_sandbox_runtime(),
+            recipient=_recipient("j1"),
         )
     )
     await dual_app._current_job_task
@@ -189,6 +213,7 @@ async def test_resume_endpoint_omits_git_remote_when_not_sent(monkeypatch):
             previous_status="paused",
             config_override=_sandbox_config(),
             workspace_runtime=_sandbox_runtime(),
+            recipient=_recipient("j2"),
         )
     )
     await dual_app._current_job_task
@@ -213,6 +238,7 @@ async def test_dual_resume_endpoint_hydrates_non_default_expert_tools(monkeypatc
             previous_status="processing",
             resolved_config=blob,
             workspace_runtime=_sandbox_runtime(),
+            recipient=_recipient("j3"),
         )
     )
     await dual_app._current_job_task
@@ -233,8 +259,16 @@ async def test_primary_resume_endpoint_hydrates_non_default_expert_tools(monkeyp
     agent.process_job = AsyncMock(return_value=_empty_async_gen())
     monkeypatch.setattr(primary_app, "_agent", agent)
     monkeypatch.setattr(primary_app, "_current_job_id", None)
+    monkeypatch.setattr(primary_app, "_current_job_task", None)
     monkeypatch.setattr(primary_app, "_shutdown_requested", False)
-    monkeypatch.setattr(primary_app, "_orchestrator_client", None)
+    monkeypatch.setattr(
+        primary_app,
+        "_orchestrator_client",
+        SimpleNamespace(
+            agent_id=AGENT_ID,
+            dispatch_process_generation=PROCESS_GENERATION,
+        ),
+    )
     monkeypatch.setattr(primary_app, "_setup_job_file_logging", MagicMock())
     monkeypatch.setattr(primary_app, "_cleanup_job_file_handler", MagicMock())
     primary_app._stop_requested.clear()
@@ -250,6 +284,7 @@ async def test_primary_resume_endpoint_hydrates_non_default_expert_tools(monkeyp
             previous_status="processing",
             resolved_config=blob,
             workspace_runtime=_sandbox_runtime(),
+            recipient=_recipient("j4"),
         ),
         MagicMock(),
     )
