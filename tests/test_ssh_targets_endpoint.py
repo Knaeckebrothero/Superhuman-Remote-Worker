@@ -281,16 +281,24 @@ async def test_unknown_key_is_the_same_404_as_the_other_two(internal, monkeypatc
 async def test_unknown_handle_still_reaches_the_fingerprint_resolver(
     internal, monkeypatch
 ):
-    """Regression pin for Important 1 (fix round 1): resolve_user_by_ssh_
-    fingerprint bumps user_ssh_keys.last_used_at as a side effect (it is a
-    ``WITH bumped AS (UPDATE ... RETURNING)`` CTE, not a plain read), and the
-    caller can read their own last_used_at back through GET /api/ssh-keys.
-    If the handle lookup short-circuited before this call, a probing
-    approved user could tell "handle exists, not mine" apart from "handle
-    does not exist" by watching whether their own key's last_used_at moved —
-    defeating the opaque-404 contract even though the HTTP responses are
-    byte-for-byte identical. Assert on the call, not on the clock: the
-    resolver must run even when the handle is already known to be unknown.
+    """The resolver must run even for a handle already known to be unknown.
+
+    HISTORY: this pin was written when resolve_user_by_ssh_fingerprint was a
+    ``WITH bumped AS (UPDATE ... RETURNING)`` CTE. Short-circuiting before it
+    then leaked handle existence, because a probing user could read their own
+    last_used_at back through GET /api/ssh-keys and watch whether it moved —
+    telling "exists, not mine" from "does not exist" through a side channel,
+    while the HTTP responses stayed byte-for-byte identical.
+
+    That CTE is GONE: the final review found that a write on the resolution
+    path is reachable by any X-Internal-Key holder and, in the gateway plan,
+    fires before key.verify. Resolution is now a pure read and the bump lives
+    in mark_ssh_key_used. Do not restore the old rationale from git history.
+
+    The assertion still earns its place for two reasons that outlive the CTE:
+    both failure paths must issue the same round trips, and calling the
+    resolver unconditionally is what makes re-introducing a write on this
+    path a visible change rather than a silent regression.
     """
 
     called_with = []

@@ -62972,8 +62972,21 @@ async def create_ssh_key(request: Request, body: SshKeyCreate) -> dict[str, Any]
 
 @app.get("/api/ssh-keys")
 async def list_ssh_keys(request: Request) -> list[dict[str, Any]]:
-    """The current user's registered SSH public keys."""
+    """The current user's registered SSH public keys.
+
+    Scope-gated like its create/delete siblings. The delta a project-scoped
+    MCP token gains here is only read access — names, fingerprints and
+    last_used_at, with no id it can act on, since delete is gated too. It is
+    gated anyway because ``_scope_permits_personal`` says such a token
+    "shouldn't be able to read or mutate" a personal resource, and
+    ``user_can_access_job_or_thread`` enforces exactly that for reads. Leaving
+    one of the three open would make this helper's own call sites disagree
+    with the contract they cite.
+    """
     user = await require_approved_user(request, postgres_db)
+    await require_personal_scope(
+        request, postgres_db, user, resource_type="ssh_key", resource_id=None
+    )
     rows = await postgres_db.list_user_ssh_keys(str(user["id"]))
     return [_serialize_ssh_key_row(r) for r in rows]
 

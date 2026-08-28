@@ -474,6 +474,23 @@ async def test_project_scoped_token_cannot_register_a_key(
 
 
 @pytest.mark.asyncio
+async def test_project_scoped_token_cannot_list_keys(project_scoped_user, monkeypatch):
+    """Listing is read-only and leaks no id the token could act on, so this is
+    the weakest of the three gates. It exists for contract consistency:
+    _scope_permits_personal's own docstring says such a token "shouldn't be
+    able to read or mutate" a personal resource, and leaving one of the three
+    call sites open would make them disagree with the helper they cite."""
+
+    async def _tripwire(user_id):
+        raise AssertionError("must refuse before reaching the store")
+
+    monkeypatch.setattr(main.postgres_db, "list_user_ssh_keys", _tripwire)
+    with pytest.raises(HTTPException) as excinfo:
+        await main.list_ssh_keys(request=object())
+    assert excinfo.value.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_project_scoped_token_cannot_delete_a_key(
     project_scoped_user, monkeypatch
 ):

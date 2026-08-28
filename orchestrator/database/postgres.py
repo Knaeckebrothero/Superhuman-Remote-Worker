@@ -41164,7 +41164,7 @@ class PostgresDB:
             )
             return dict(row) if row else None
 
-    async def mark_ssh_key_used(self, key_id: str) -> None:
+    async def mark_ssh_key_used(self, key_id: str, fingerprint_sha256: str) -> None:
         """Stamp ``last_used_at`` on one key. **Proof-of-possession only.**
 
         The ssh-gateway must call this ONLY after ``key.verify`` has
@@ -41180,6 +41180,12 @@ class PostgresDB:
 
         Uncalled on this branch — the gateway is a later plan.
 
+        The fingerprint is a second predicate rather than a convenience: it
+        binds the write to the key that was actually presented, so the
+        proof-of-possession invariant above is carried by the statement
+        instead of by this docstring. A caller holding only an id it did not
+        resolve cannot stamp a row.
+
         The id is parsed before a connection is acquired, so a malformed one
         never checks a connection out of the pool — same contract as
         ``record_ssh_attachment``/``close_ssh_attachment``.
@@ -41187,8 +41193,10 @@ class PostgresDB:
         key_uuid = UUID(key_id)
         async with self.acquire() as conn:
             await conn.execute(
-                "UPDATE user_ssh_keys SET last_used_at = now() WHERE id = $1",
+                "UPDATE user_ssh_keys SET last_used_at = now() "
+                "WHERE id = $1 AND fingerprint_sha256 = $2",
                 key_uuid,
+                fingerprint_sha256,
             )
 
     # =========================================================================

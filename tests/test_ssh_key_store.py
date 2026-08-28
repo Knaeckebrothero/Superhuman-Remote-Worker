@@ -16,6 +16,7 @@ from database.postgres import (
 
 KEY_ID = "00000000-0000-0000-0000-0000000000aa"
 USER_ID = "00000000-0000-0000-0000-000000000001"
+FINGERPRINT = "SHA256:" + "A" * 43
 
 
 class FakeConn:
@@ -191,7 +192,9 @@ async def test_delete_reports_miss():
         ),
         pytest.param(lambda db: db.list_user_ssh_keys("nope"), id="list"),
         pytest.param(lambda db: db.delete_user_ssh_key(KEY_ID, "nope"), id="delete"),
-        pytest.param(lambda db: db.mark_ssh_key_used("nope"), id="mark_used"),
+        pytest.param(
+            lambda db: db.mark_ssh_key_used("nope", FINGERPRINT), id="mark_used"
+        ),
     ],
 )
 async def test_ids_are_parsed_before_a_connection_is_acquired(call):
@@ -282,20 +285,24 @@ async def test_mark_ssh_key_used_issues_the_update():
     uncalled on this branch: the gateway must call it only after
     ``key.verify`` succeeds."""
     conn = FakeConn(execute="UPDATE 1")
-    await _db(conn).mark_ssh_key_used(KEY_ID)
+    await _db(conn).mark_ssh_key_used(KEY_ID, FINGERPRINT)
     sql, args = conn.calls[0]
     assert "UPDATE user_ssh_keys" in sql
     assert "last_used_at = now()" in sql
+    # The fingerprint is a second predicate, not decoration: it binds the write
+    # to the key actually presented, so proof-of-possession is carried by the
+    # statement rather than by the docstring. Without it, any id would stamp.
+    assert "fingerprint_sha256 = $2" in sql
     from uuid import UUID
 
-    assert args == (UUID(KEY_ID),)
+    assert args == (UUID(KEY_ID), FINGERPRINT)
 
 
 @pytest.mark.asyncio
 async def test_mark_ssh_key_used_rejects_a_malformed_id_before_acquiring():
     conn = FakeConn()
     with pytest.raises(ValueError):
-        await _db(conn).mark_ssh_key_used("nope")
+        await _db(conn).mark_ssh_key_used("nope", FINGERPRINT)
     assert conn.calls == []
     assert conn.acquired == 0
 
