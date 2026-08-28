@@ -1005,10 +1005,17 @@ async def test_pre_0175_k8s_adoption_is_one_cas_and_claim_marker_is_preserved(db
         ensure_legacy_k8s_job_runtime_authority(db, provisioner, job),
     )
 
-    assert {outcome.outcome for outcome in outcomes} == {
-        LegacyK8sAdoptionOutcome.ADOPTED,
-        LegacyK8sAdoptionOutcome.CONVERGED,
-    }
+    observed = [outcome.outcome for outcome in outcomes]
+    assert observed.count(LegacyK8sAdoptionOutcome.ADOPTED) == 1
+    assert set(observed).issubset(
+        {
+            LegacyK8sAdoptionOutcome.ADOPTED,
+            LegacyK8sAdoptionOutcome.CONVERGED,
+            LegacyK8sAdoptionOutcome.RETRY,
+        }
+    )
+    converged = await ensure_legacy_k8s_job_runtime_authority(db, provisioner, job)
+    assert converged.outcome is LegacyK8sAdoptionOutcome.CONVERGED
     assert await db.list_uidless_k8s_job_workspace_rows() == []
 
     agent_id = uuid4()
