@@ -45,8 +45,15 @@ def test_asyncssh_floor_covers_cve_2026_62949(path):
 
 @pytest.mark.parametrize(
     "spec,expected",
-    [("2.24", True), ("2.24.0", True), ("2.24.1", True), ("3.0", True),
-     ("2.23.1", False), ("2.21.0", False), ("2.9", False)],
+    [
+        ("2.24", True),
+        ("2.24.0", True),
+        ("2.24.1", True),
+        ("3.0", True),
+        ("2.23.1", False),
+        ("2.21.0", False),
+        ("2.9", False),
+    ],
 )
 def test_version_comparison_handles_short_and_long_pins(spec, expected):
     assert (_parse(spec) >= MINIMUM) is expected

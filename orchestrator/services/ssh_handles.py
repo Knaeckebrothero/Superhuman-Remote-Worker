@@ -16,12 +16,25 @@ import secrets
 _ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz"
 _LENGTH = 8
 
-HANDLE_PATTERN = re.compile(r"^s-[0-9abcdefghjkmnpqrstvwxyz]{8}$")
+# Derived from _ALPHABET/_LENGTH rather than spelled out separately: a
+# hand-copied second charset here could drift from the minter's and still
+# agree in every test until the day it accepts a character the minter never
+# emits. Anchored with \Z, not $ — re's $ matches immediately before a
+# trailing newline, so a $-anchored pattern's .match()/.search() would accept
+# a handle with "\n" appended (fullmatch is unaffected). \Z has no such
+# exception, so this stays safe under match/search/fullmatch alike — load-
+# bearing because HANDLE_PATTERN is exported and used directly, not only
+# through is_valid_handle's fullmatch.
+HANDLE_PATTERN = re.compile(rf"^s-[{re.escape(_ALPHABET)}]{{{_LENGTH}}}\Z")
 
 
 def mint_ssh_handle() -> str:
-    """A fresh handle. 32**8 ≈ 1.1e12 values; collisions are handled by the
-    unique constraint plus a retry at the call site."""
+    """A fresh handle. 32**8 ≈ 1.1e12 values, so a same-candidate collision is
+    exceedingly unlikely — but the two call sites treat one differently: the
+    ``create_thread`` INSERT relies on the unique index alone and lets a
+    collision fail the insert outright, while the lazy backfill
+    (``PostgresDB.ensure_thread_ssh_handle``) retries on the unique
+    constraint instead."""
     return "s-" + "".join(secrets.choice(_ALPHABET) for _ in range(_LENGTH))
 
 

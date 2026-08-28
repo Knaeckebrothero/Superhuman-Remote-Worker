@@ -302,8 +302,7 @@ APP_THREADS_SSH_HANDLE = (
     ROOT / "orchestrator/database/migrations/app/0202_threads_ssh_handle.sql"
 )
 APP_THREADS_SSH_HANDLE_IDX = (
-    ROOT
-    / "orchestrator/database/migrations/app/0203_threads_ssh_handle_idx.notx.sql"
+    ROOT / "orchestrator/database/migrations/app/0203_threads_ssh_handle_idx.notx.sql"
 )
 APP_CURRENT_MIGRATION_HEAD = APP_THREADS_SSH_HANDLE_IDX
 AUDIT_EXPANSION = (

@@ -81,7 +81,7 @@ from services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
 from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
-from services.ssh_handles import mint_ssh_handle
+from services.ssh_handles import is_valid_handle, mint_ssh_handle
 
 logger = logging.getLogger(__name__)
 
@@ -29193,37 +29193,73 @@ class PostgresDB:
         UPDATE over every historical row buys nothing for sessions nobody will
         attach to. Retries on the unique constraint, which is the only way two
         concurrent readers can collide.
+
+        ``thread_id`` is guarded the same way as the neighboring
+        :meth:`get_thread`: a malformed id resolves to None rather than
+        raising ValueError out of the UUID bind.
+
+        Each attempt's UPDATE runs inside its own savepoint
+        (``conn.transaction()``, which asyncpg maps to a nested SAVEPOINT
+        rather than a new top-level transaction). :meth:`acquire` sometimes
+        hands back the *caller's* enclosing :meth:`transaction_scope`
+        connection instead of a fresh pooled one; without a savepoint here, a
+        UniqueViolationError would abort that whole enclosing transaction
+        instead of just this attempt, and the retry's next query would raise
+        InFailedSQLTransactionError on an already-doomed connection. Outside
+        a scope this is just a cheap explicit transaction.
+
+        Raises RuntimeError if all 5 attempts collide — independent draws
+        from a ~1.1e12 keyspace colliding five times running is astronomically
+        unlikely, but returning None there would collapse a third meaning
+        onto a sentinel that already means "no such thread" and "not yet
+        minted", which is its own trap even at this probability.
         """
+        try:
+            thread_uuid = UUID(thread_id)
+        except (ValueError, TypeError):
+            return None
         async with self.acquire() as conn:
             existing = await conn.fetchval(
-                "SELECT ssh_handle FROM threads WHERE id = $1", UUID(thread_id)
+                "SELECT ssh_handle FROM threads WHERE id = $1", thread_uuid
             )
             if existing:
                 return existing
             for _ in range(5):
                 candidate = mint_ssh_handle()
                 try:
-                    updated = await conn.fetchval(
-                        """
-                        UPDATE threads SET ssh_handle = $2
-                        WHERE id = $1 AND ssh_handle IS NULL
-                        RETURNING ssh_handle
-                        """,
-                        UUID(thread_id),
-                        candidate,
-                    )
+                    async with conn.transaction():
+                        updated = await conn.fetchval(
+                            """
+                            UPDATE threads SET ssh_handle = $2
+                            WHERE id = $1 AND ssh_handle IS NULL
+                            RETURNING ssh_handle
+                            """,
+                            thread_uuid,
+                            candidate,
+                        )
                 except asyncpg.UniqueViolationError:
                     continue
                 if updated:
                     return updated
                 return await conn.fetchval(
-                    "SELECT ssh_handle FROM threads WHERE id = $1", UUID(thread_id)
+                    "SELECT ssh_handle FROM threads WHERE id = $1", thread_uuid
                 )
-        return None
+        raise RuntimeError(
+            f"ensure_thread_ssh_handle: exhausted 5 attempts for thread {thread_id}"
+        )
 
     async def get_thread_id_by_ssh_handle(self, handle: str) -> Optional[str]:
         """Resolve a handle to a thread id. Returns None for unknown handles —
-        callers must render that identically to 'not yours' (anti-enumeration)."""
+        callers must render that identically to 'not yours' (anti-enumeration).
+
+        Guards the handle's shape before querying: the module's charset is a
+        security boundary ("validate on output, not only at mint"), so this
+        boundary should not depend on every future caller remembering to
+        pre-validate, and rejecting early also short-circuits enumeration
+        probes before they reach the database.
+        """
+        if not is_valid_handle(handle):
+            return None
         async with self.acquire() as conn:
             value = await conn.fetchval(
                 "SELECT id FROM threads WHERE ssh_handle = $1", handle

@@ -4,7 +4,10 @@ from orchestrator.database.migrate import discover
 
 MIGRATIONS = (
     pathlib.Path(__file__).resolve().parents[1]
-    / "orchestrator" / "database" / "migrations" / "app"
+    / "orchestrator"
+    / "database"
+    / "migrations"
+    / "app"
 )
 
 COLUMN = "0202_threads_ssh_handle.sql"
