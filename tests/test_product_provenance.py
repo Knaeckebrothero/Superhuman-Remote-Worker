@@ -253,6 +253,8 @@ async def test_agent_registration_persists_full_provenance_beside_legacy_short_s
     sql, *parameters = connection.fetchrow.call_args.args
     assert "INSERT INTO agents" in sql
     metadata = json.loads(parameters[7])
+    process_generation = metadata.pop("dispatch_process_generation")
+    assert str(UUID(process_generation)) == process_generation
     assert metadata == {
         "build_sha": _AGENT_REVISION[:7],
         "product_provenance": provenance,
