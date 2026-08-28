@@ -2,7 +2,12 @@
 -- description:   User-registered SSH public keys for workspace SSH access.
 -- depends-on:    0200_pinned_agent_recycle_authority.sql
 -- expected:     One new table plus a lookup index. No writes to existing rows.
--- locks:        ACCESS EXCLUSIVE on the new table only.
+-- locks:        ACCESS EXCLUSIVE on the new table, plus a brief
+--               SHARE ROW EXCLUSIVE on public.users while the FK enforcement
+--               trigger is installed on the referenced side. That conflicts
+--               with the ROW EXCLUSIVE taken by ordinary writes to users, so
+--               user writes can queue briefly; reads are unaffected and
+--               lock_timeout bounds the wait.
 -- transactional: yes
 -- rollout:      Inert until the ssh-gateway ships; the table is only read by
 --               the internal ssh-targets endpoint and cockpit key CRUD.
