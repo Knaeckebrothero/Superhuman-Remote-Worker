@@ -27,6 +27,7 @@ These tests exercise the real functions with a mocked ``postgres_db``.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -230,26 +231,52 @@ class TestContainerInheritance:
             pod_ip=old_runtime["pod_ip"],
             port=old_runtime["port"],
         )
-        adopted = {
-            **parent,
-            "context": {
-                "workspace_container": {
-                    **old_runtime,
-                    "_runtime_incarnation": attestation.runtime_incarnation,
-                    "_legacy_k8s_runtime_adoption": {
-                        "version": 1,
-                        "runtime_incarnation": attestation.runtime_incarnation,
-                        "workspace_generation": attestation.workspace_generation,
-                        "ssh_host_key_fingerprint": (
-                            attestation.ssh_host_key_fingerprint
-                        ),
-                    },
-                }
-            },
-        }
-        get_job = AsyncMock(side_effect=[parent, parent, adopted])
+        state = {"row": deepcopy(parent)}
+
+        async def _get_job(_job_id):
+            return deepcopy(state["row"])
+
+        async def _adopt(_job_id, **kwargs):
+            current_workspace = state["row"]["context"]["workspace_container"]
+            if current_workspace != kwargs["expected_workspace"]:
+                return False
+            state["row"]["context"]["workspace_container"] = deepcopy(
+                kwargs["adopted_workspace"]
+            )
+            return True
+
+        get_job = AsyncMock(side_effect=_get_job)
         monkeypatch.setattr(main.postgres_db, "get_job", get_job)
-        cas = AsyncMock(return_value=True)
+        reserve = AsyncMock(
+            return_value={
+                "id": "44444444-4444-4444-8444-444444444444",
+                "reservation_generation": 1,
+                "claim_token": 1,
+            }
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "reserve_managed_repository_workspace_creation",
+            reserve,
+        )
+        authorize = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            main.postgres_db,
+            "authorize_managed_repository_workspace_creation_runtime",
+            authorize,
+        )
+        settle = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            main.postgres_db,
+            "settle_managed_repository_workspace_creation_reservation",
+            settle,
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "abort_managed_repository_workspace_creation_reservation",
+            AsyncMock(return_value=True),
+        )
+        cas = AsyncMock(side_effect=_adopt)
         monkeypatch.setattr(
             main.postgres_db, "adopt_legacy_k8s_job_workspace_runtime", cas
         )
@@ -271,6 +298,9 @@ class TestContainerInheritance:
         assert attest.await_count == 3
         assert all(call.args[0].id == parent_id for call in attest.await_args_list)
         cas.assert_awaited_once()
+        reserve.assert_awaited_once()
+        authorize.assert_awaited_once()
+        settle.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_flag_only_child_overlays_parent_ready_container(self, patch_get_job):
