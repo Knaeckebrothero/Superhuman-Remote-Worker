@@ -47,7 +47,11 @@ paramiko>=3.4.0
 # Dynamic Canvas workspace-file gateway. AsyncSSH provides the bounded,
 # host-key-pinned SFTP client; python-magic + libmagic and Pillow validate the
 # bytes before the Cockpit is allowed to select a renderer.
-asyncssh>=2.21.0
+# Floor is CVE-2026-62949 (GHSA-rw4j-r22c-9gc3): asyncssh <=2.23.1 can be wedged
+# by a channel-open carrying maximum packet size 0 — an infinite synchronous
+# loop that freezes the whole asyncio event loop. Fixed in 2.24.0. This binds
+# canvas-gateway and ssh-gateway, both of which face untrusted peers.
+asyncssh>=2.24.0
 python-magic>=0.4.27
 Pillow>=10.4.0
 # Remote-image fetch pipeline (services/remote_image.py) — needs aiohttp's
