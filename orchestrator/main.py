@@ -62663,7 +62663,9 @@ async def rotate_api_key(request: Request, token_id: str) -> dict[str, Any]:
 class SshKeyCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, description="Display name")
     public_key: str = Field(..., min_length=1, max_length=8192)
-    challenge: str
+    # Capped like its siblings: `challenge` is the field that reaches hmac.new()
+    # over the full head and .encode("utf-8"). A minted token is ~120 bytes.
+    challenge: str = Field(..., min_length=1, max_length=1024)
     signature: str = Field(..., min_length=1, max_length=8192)
 
 
@@ -62743,6 +62745,7 @@ def _mint_ssh_key_challenge(
         not label
         or len(label) > _SSH_CHALLENGE_IDENTITY_MAX_LEN
         or not label.isascii()
+        or not label.isprintable()
         or any(ch.isspace() for ch in label)
     ):
         label = user_id

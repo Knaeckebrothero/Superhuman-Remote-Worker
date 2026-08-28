@@ -584,8 +584,20 @@ def test_verify_ssh_key_challenge_rejects_lone_surrogate():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_challenge",
+    [
+        "srw-ssh1:a:b:c:d:\u00e9",
+        # A lone surrogate is the case that pins the ORDER, not just the guard:
+        # it encodes to UTF-8 with a UnicodeEncodeError rather than succeeding,
+        # so this input fails only if verification runs BEFORE
+        # body.challenge.encode("utf-8"). The `\u00e9` case above passes either
+        # way, because it encodes cleanly.
+        "srw-ssh1:a:b:c:d:\udcff",
+    ],
+)
 async def test_non_ascii_challenge_is_rejected_not_raised_through_endpoint(
-    approved_user, monkeypatch
+    approved_user, monkeypatch, bad_challenge
 ):
     """End-to-end: a non-ASCII challenge in the request body must come back
     as a 4xx HTTPException, never an unhandled exception an authenticated
@@ -604,7 +616,7 @@ async def test_non_ascii_challenge_is_rejected_not_raised_through_endpoint(
     body = _Body(
         name="laptop",
         public_key="ssh-ed25519 AAAA",
-        challenge="srw-ssh1:a:b:c:d:\u00e9",
+        challenge=bad_challenge,
         signature="sig",
     )
     with pytest.raises(HTTPException) as excinfo:
@@ -660,6 +672,30 @@ def test_overlong_identity_falls_back_to_user_id():
     long_label = "x" * (main._SSH_CHALLENGE_IDENTITY_MAX_LEN + 1)
     token, _ = main._mint_ssh_key_challenge("user-a-id", long_label)
     assert long_label not in token
+    assert "user-a-id" in token.split(":")
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "vict\x1b[2Kmallory@srw.works",  # ESC: rewrites the line as it renders
+        "alice\x08\x08\x08\x08\x08mallory",  # backspaces: erases what precedes
+        "alice\x00mallory",  # NUL: truncates in C-string consumers
+        "alice\x7f",  # DEL
+    ],
+)
+def test_control_character_identity_falls_back_to_user_id(label):
+    """A control character is ASCII and is not whitespace, so it slipped past
+    the other three guards. It defeats the exact property the identity clause
+    exists to provide: a signer inspecting the token to see whose account it
+    binds can have that display rewritten by terminal escapes, putting them
+    back in the phished state the label was added to prevent. The MAC covering
+    the label does not help — the label is authentic, it just does not render
+    as what it is.
+    """
+    token, _ = main._mint_ssh_key_challenge("user-a-id", label)
+    assert label not in token
+    assert token.isprintable()
     assert "user-a-id" in token.split(":")
 
 
