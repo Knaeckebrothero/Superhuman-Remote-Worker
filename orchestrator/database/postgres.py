@@ -81,6 +81,7 @@ from services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
 from services.cloud_staging.source_identity import ProtectedMountSourceIdentity
+from services.ssh_handles import mint_ssh_handle
 
 logger = logging.getLogger(__name__)
 
@@ -28988,9 +28989,9 @@ class PostgresDB:
                     INSERT INTO threads (
                         user_id, project_id, config_name, permission_mode,
                         narration_mode, title, metadata, execution_lane,
-                        runtime_generation
+                        runtime_generation, ssh_handle
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)
                     RETURNING id
                     """,
                     user_id,
@@ -29002,6 +29003,7 @@ class PostgresDB:
                     json.dumps(metadata),
                     execution_lane,
                     created_runtime_generation,
+                    mint_ssh_handle(),
                 )
                 if initial_event is not None:
                     await conn.execute(
@@ -29183,6 +29185,50 @@ class PostgresDB:
                 thread_id,
             )
         return dict(row) if row else None
+
+    async def ensure_thread_ssh_handle(self, thread_id: str) -> Optional[str]:
+        """Return this thread's SSH handle, minting one if it predates 0202.
+
+        Lazy rather than a migration-time backfill: threads is hot, and an
+        UPDATE over every historical row buys nothing for sessions nobody will
+        attach to. Retries on the unique constraint, which is the only way two
+        concurrent readers can collide.
+        """
+        async with self.acquire() as conn:
+            existing = await conn.fetchval(
+                "SELECT ssh_handle FROM threads WHERE id = $1", UUID(thread_id)
+            )
+            if existing:
+                return existing
+            for _ in range(5):
+                candidate = mint_ssh_handle()
+                try:
+                    updated = await conn.fetchval(
+                        """
+                        UPDATE threads SET ssh_handle = $2
+                        WHERE id = $1 AND ssh_handle IS NULL
+                        RETURNING ssh_handle
+                        """,
+                        UUID(thread_id),
+                        candidate,
+                    )
+                except asyncpg.UniqueViolationError:
+                    continue
+                if updated:
+                    return updated
+                return await conn.fetchval(
+                    "SELECT ssh_handle FROM threads WHERE id = $1", UUID(thread_id)
+                )
+        return None
+
+    async def get_thread_id_by_ssh_handle(self, handle: str) -> Optional[str]:
+        """Resolve a handle to a thread id. Returns None for unknown handles —
+        callers must render that identically to 'not yours' (anti-enumeration)."""
+        async with self.acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT id FROM threads WHERE ssh_handle = $1", handle
+            )
+            return str(value) if value else None
 
     async def list_threads(
         self,
