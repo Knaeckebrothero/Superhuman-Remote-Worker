@@ -391,14 +391,15 @@ class TestContainerProvisionerInit:
 
     def test_not_available_without_k8s(self):
         """Provisioner reports unavailable when kubernetes is not installed."""
-        with patch.dict("sys.modules", {"kubernetes": None, "kubernetes.client": None}):
-            # Re-import to pick up mocked modules
-            import importlib
-            from orchestrator.services import container_provisioner as mod
+        from orchestrator.services import container_provisioner as mod
 
-            importlib.reload(mod)
-
+        # Keep the missing-client simulation scoped. Reloading this shared
+        # module changes the identity of WorkspaceRuntimeAuthorityError while
+        # modules such as vm_provisioner still retain the prior class object,
+        # making later exception assertions depend on xdist file order.
+        with patch.object(mod, "K8S_AVAILABLE", False):
             provisioner = mod.ContainerProvisioner()
+            provisioner.connect(MagicMock())
             assert provisioner.is_available is False
 
     def test_default_env_values(self):
