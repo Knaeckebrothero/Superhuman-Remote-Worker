@@ -37083,11 +37083,11 @@ class PostgresDB:
         one PostgreSQL snapshot; callers compare ``target_key`` after each
         await and re-gate the returned agent status for their operation.
 
-        A dedicated Pod marker is supplemental physical authority.  When it
-        exists it must name this exact agent, generation, and durable
-        provision attempt.  0200 warm bindings carry an exact protection
-        receipt instead; marker-free pool bindings are rollout candidates and
-        cannot cross this credential-delivery boundary.
+        A provisioned Pod marker must name this exact agent, generation, and
+        durable provision attempt.  0200 warm bindings instead carry an exact
+        bound protection receipt; its distinct authority kind lets callers
+        attest the pool Pod's job labels and protection finalizer without
+        pretending it was created as a dedicated session Pod.
         """
 
         try:
@@ -37108,7 +37108,26 @@ class PostgresDB:
                        a.pod_uid,
                        a.pod_ip,
                        a.pod_port,
-                       a.status AS agent_status
+                       a.status AS agent_status,
+                       CASE WHEN EXISTS (
+                           SELECT 1
+                             FROM thread_agent_warm_binding_protections warm_kind
+                            WHERE warm_kind.protection_id::text =
+                                  t.metadata->'agent_pod'
+                                      ->>'warm_binding_protection'
+                              AND warm_kind.thread_id = t.id
+                              AND warm_kind.runtime_generation =
+                                  t.runtime_generation
+                              AND warm_kind.runtime_attach_token =
+                                  t.runtime_attach_token
+                              AND warm_kind.agent_id = a.id
+                              AND warm_kind.status = 'bound'
+                              AND warm_kind.namespace =
+                                  t.metadata->'agent_pod'->>'namespace'
+                              AND warm_kind.pod_name = a.hostname
+                              AND warm_kind.pod_uid = a.pod_uid
+                       ) THEN 'warm_pool' ELSE 'provisioned' END
+                           AS pod_authority_kind
                   FROM threads AS t
                   JOIN agents AS a
                     ON a.id = t.agent_id

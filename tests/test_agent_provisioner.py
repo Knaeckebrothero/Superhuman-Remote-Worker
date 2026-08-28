@@ -9,13 +9,17 @@ Covers the new pool management and reservation-aware provisioning:
 """
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
 
 from orchestrator.services.agent_provisioner import AgentProvisioner
-from orchestrator.services.pinned_k8s_effect import K8S_MUTATION_REQUEST_TIMEOUT
+from orchestrator.services.pinned_k8s_effect import (
+    K8S_MUTATION_REQUEST_TIMEOUT,
+    PINNED_AUTHORITY_FINALIZER,
+)
 
 
 # =============================================================================
@@ -179,6 +183,132 @@ def _make_pod(
 async def _fake_to_thread(fn, *args, **kwargs):
     """Execute a function synchronously (replaces asyncio.to_thread in tests)."""
     return fn(*args, **kwargs)
+
+
+def _ready_recipient_pod(
+    *,
+    purpose: str,
+    thread_id: str | None = None,
+    runtime_generation: str | None = None,
+    finalizers: list[str] | None = None,
+) -> SimpleNamespace:
+    labels = {
+        "srw/component": "agent",
+        "srw/managed-by": "agent-provisioner",
+        "srw/purpose": purpose,
+    }
+    if thread_id is not None:
+        labels["srw.io/thread-id"] = thread_id
+    if runtime_generation is not None:
+        labels["srw.io/runtime-generation"] = runtime_generation
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            name="agent-a",
+            namespace="test-ns",
+            uid="pod-a",
+            deletion_timestamp=None,
+            labels=labels,
+            finalizers=list(finalizers or []),
+        ),
+        status=SimpleNamespace(
+            phase="Running",
+            pod_ip="10.42.0.17",
+            container_statuses=[SimpleNamespace(name="agent", ready=True)],
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_session_recipient_accepts_exact_provisioned_session_pod():
+    provisioner, _ = _make_provisioner()
+    generation = "22222222-2222-4222-8222-222222222222"
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    provisioner._core_api.read_namespaced_pod.return_value = _ready_recipient_pod(
+        purpose="session",
+        thread_id=thread_id,
+        runtime_generation=generation,
+    )
+
+    assert await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="provisioned",
+        namespace="test-ns",
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_session_recipient_accepts_only_protected_warm_pool_pod():
+    provisioner, _ = _make_provisioner()
+    generation = "22222222-2222-4222-8222-222222222222"
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    pod = _ready_recipient_pod(
+        purpose="job",
+        finalizers=[PINNED_AUTHORITY_FINALIZER],
+    )
+    provisioner._core_api.read_namespaced_pod.return_value = pod
+
+    assert await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="warm_pool",
+        namespace="test-ns",
+    )
+
+    pod.metadata.finalizers = []
+    assert not await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="warm_pool",
+        namespace="test-ns",
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_session_recipient_never_crosses_authority_shapes():
+    provisioner, _ = _make_provisioner()
+    generation = "22222222-2222-4222-8222-222222222222"
+    thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    warm_pod = _ready_recipient_pod(
+        purpose="job",
+        finalizers=[PINNED_AUTHORITY_FINALIZER],
+    )
+    provisioner._core_api.read_namespaced_pod.return_value = warm_pod
+    assert not await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="provisioned",
+        namespace="test-ns",
+    )
+
+    session_pod = _ready_recipient_pod(
+        purpose="session",
+        thread_id=thread_id,
+        runtime_generation=generation,
+        finalizers=[PINNED_AUTHORITY_FINALIZER],
+    )
+    provisioner._core_api.read_namespaced_pod.return_value = session_pod
+    assert not await provisioner.attest_pinned_session_recipient(
+        "agent-a",
+        thread_id=thread_id,
+        expected_runtime_generation=generation,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="warm_pool",
+        namespace="test-ns",
+    )
 
 
 # =============================================================================

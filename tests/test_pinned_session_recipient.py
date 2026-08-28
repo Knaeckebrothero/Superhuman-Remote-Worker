@@ -17,7 +17,7 @@ FINGERPRINT = "sha256:" + ("a" * 64)
 PROCESS_GENERATION = "process-a"
 
 
-def _binding() -> PinnedSessionBinding:
+def _binding(*, pod_authority_kind: str = "provisioned") -> PinnedSessionBinding:
     return PinnedSessionBinding(
         thread_id=THREAD_ID,
         runtime_generation=GENERATION,
@@ -29,6 +29,7 @@ def _binding() -> PinnedSessionBinding:
         pod_ip="10.42.0.17",
         pod_port=8001,
         agent_status="session",
+        pod_authority_kind=pod_authority_kind,
     )
 
 
@@ -45,6 +46,28 @@ def _recipient(*, process_generation=PROCESS_GENERATION, pod_uid="pod-a"):
         "expected_pod_uid": pod_uid,
         "expected_process_generation": process_generation,
     }
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_attests_receipt_backed_warm_pool_shape(monkeypatch):
+    from orchestrator import main
+
+    binding = _binding(pod_authority_kind="warm_pool")
+    attest = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.agent_provisioner, "attest_pinned_session_recipient", attest
+    )
+
+    assert await main._attest_pinned_session_mutation_pod(binding=binding)
+    attest.assert_awaited_once_with(
+        binding.agent_hostname,
+        thread_id=THREAD_ID,
+        expected_runtime_generation=GENERATION,
+        expected_pod_uid="pod-a",
+        expected_pod_ip="10.42.0.17",
+        authority_kind="warm_pool",
+        namespace="srw",
+    )
 
 
 @pytest.mark.asyncio

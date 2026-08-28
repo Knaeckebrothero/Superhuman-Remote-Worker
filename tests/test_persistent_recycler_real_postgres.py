@@ -6051,6 +6051,7 @@ async def test_warm_attach_patch_response_loss_binds_exact_marker(db, monkeypatc
     assert binding.pod_namespace == "agents-a"
     assert binding.agent_id == ids["agent"]
     assert binding.pod_uid == ids["pod_uid"]
+    assert binding.pod_authority_kind == "warm_pool"
     assert api.mutation_timeouts and all(
         timeout is not None for timeout in api.mutation_timeouts
     )

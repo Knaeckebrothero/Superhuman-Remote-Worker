@@ -52,6 +52,7 @@ class PinnedSessionBinding:
     pod_ip: str
     pod_port: int
     agent_status: str
+    pod_authority_kind: str = "provisioned"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "thread_id", _canonical_uuid(self.thread_id))
@@ -77,6 +78,8 @@ class PinnedSessionBinding:
                 attribute,
                 _required_text(getattr(self, attribute), field=attribute),
             )
+        if self.pod_authority_kind not in {"provisioned", "warm_pool"}:
+            raise ValueError("pod_authority_kind must be provisioned or warm_pool")
         if isinstance(self.pod_port, bool) or not isinstance(self.pod_port, int):
             raise ValueError("pod_port must be an integer")
         if self.pod_port < 1 or self.pod_port > 65_535:
@@ -98,6 +101,7 @@ class PinnedSessionBinding:
             pod_ip=row.get("pod_ip"),
             pod_port=8001 if port is None else port,
             agent_status=row.get("agent_status"),
+            pod_authority_kind=row.get("pod_authority_kind") or "provisioned",
         )
 
     @property
@@ -114,7 +118,9 @@ class PinnedSessionBinding:
         return fingerprint
 
     @property
-    def target_key(self) -> tuple[str, str, str, str, str, str, str, str, int]:
+    def target_key(
+        self,
+    ) -> tuple[str, str, str, str, str, str, str, str, int, str]:
         """All immutable DB/routing coordinates compared after every await."""
 
         return (
@@ -127,6 +133,7 @@ class PinnedSessionBinding:
             self.pod_uid,
             self.pod_ip,
             self.pod_port,
+            self.pod_authority_kind,
         )
 
 

@@ -896,27 +896,38 @@ class AgentProvisioner:
         pod_name: str,
         *,
         thread_id: str,
+        expected_runtime_generation: str,
         expected_pod_uid: str,
         expected_pod_ip: str,
+        authority_kind: str = "provisioned",
         namespace: str | None = None,
     ) -> bool:
-        """Freshly attest one exact, ready session Pod before mutation I/O."""
+        """Freshly attest one exact, ready pinned-session Pod before I/O.
+
+        Provisioned session Pods carry the thread/generation labels from their
+        creation intent.  A warm-pool Pod deliberately retains its job labels;
+        its session authority instead comes from the exact bound protection
+        receipt already selected by PostgreSQL plus the finalizer checked here.
+        """
 
         name = str(pod_name or "").strip()
         tid = str(thread_id or "").strip()
+        generation = str(expected_runtime_generation or "").strip()
         expected_uid = str(expected_pod_uid or "").strip()
         expected_ip = str(expected_pod_ip or "").strip()
         captured_namespace = str(namespace or self._namespace).strip()
+        kind = str(authority_kind or "").strip()
         if not all(
             (
                 self._k8s_available,
                 name,
                 tid,
+                generation,
                 expected_uid,
                 expected_ip,
                 captured_namespace,
             )
-        ):
+        ) or kind not in {"provisioned", "warm_pool"}:
             return False
         try:
             pod = await run_bounded_k8s_call(
@@ -931,6 +942,18 @@ class AgentProvisioner:
         metadata = getattr(pod, "metadata", None)
         status = getattr(pod, "status", None)
         labels = dict(getattr(metadata, "labels", None) or {})
+        finalizers = {
+            str(value) for value in getattr(metadata, "finalizers", None) or []
+        }
+        provisioned_identity = bool(
+            labels.get("srw/purpose") == "session"
+            and labels.get("srw.io/thread-id") == tid
+            and labels.get("srw.io/runtime-generation") == generation
+        )
+        warm_identity = bool(
+            labels.get("srw/purpose") == "job"
+            and PINNED_AUTHORITY_FINALIZER in finalizers
+        )
         if (
             str(getattr(metadata, "name", "") or "") != name
             or str(getattr(metadata, "namespace", "") or captured_namespace)
@@ -941,8 +964,8 @@ class AgentProvisioner:
             or str(getattr(status, "pod_ip", "") or "") != expected_ip
             or labels.get("srw/component") != "agent"
             or labels.get("srw/managed-by") != "agent-provisioner"
-            or labels.get("srw/purpose") != "session"
-            or labels.get("srw.io/thread-id") != tid
+            or (kind == "provisioned" and not provisioned_identity)
+            or (kind == "warm_pool" and not warm_identity)
         ):
             return False
 

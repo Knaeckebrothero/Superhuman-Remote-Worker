@@ -7641,8 +7641,10 @@ async def _attest_pinned_session_mutation_pod(
     return await agent_provisioner.attest_pinned_session_recipient(
         binding.agent_hostname,
         thread_id=binding.thread_id,
+        expected_runtime_generation=binding.runtime_generation,
         expected_pod_uid=binding.pod_uid,
         expected_pod_ip=binding.pod_ip,
+        authority_kind=binding.pod_authority_kind,
         namespace=binding.pod_namespace,
     )
 
