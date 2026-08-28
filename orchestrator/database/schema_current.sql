@@ -18930,6 +18930,7 @@ CREATE TABLE public.threads (
     runtime_attach_token uuid,
     runtime_attach_abort_receipt jsonb,
     main_cloud_backend_instance_id uuid,
+    ssh_handle text,
     CONSTRAINT threads_runtime_retirement_external_cleanup_shape CHECK (((runtime_retirement_external_cleanup IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent = true) AND (jsonb_typeof(runtime_retirement_external_cleanup) = 'object'::text)))),
     CONSTRAINT threads_runtime_retirement_local_quiescence_shape CHECK (((runtime_retirement_local_quiescence IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_local_quiescence) = 'object'::text)))),
     CONSTRAINT threads_runtime_retirement_shape CHECK ((((runtime_retirement_token IS NULL) AND (runtime_retirement_permanent IS NULL) AND (runtime_retirement_started_at IS NULL) AND (runtime_retirement_authorized_at IS NULL) AND (runtime_retirement_context IS NULL)) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent IS NOT NULL) AND (runtime_retirement_started_at IS NOT NULL) AND (jsonb_typeof(runtime_retirement_context) = 'object'::text)))),
@@ -22805,6 +22806,13 @@ CREATE INDEX idx_threads_awaiting_user_since ON public.threads USING btree (awai
 --
 
 CREATE INDEX idx_threads_project ON public.threads USING btree (project_id);
+
+
+--
+-- Name: idx_threads_ssh_handle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_threads_ssh_handle ON public.threads USING btree (ssh_handle);
 
 
 --
