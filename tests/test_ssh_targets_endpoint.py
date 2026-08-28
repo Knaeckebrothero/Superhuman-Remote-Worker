@@ -458,6 +458,27 @@ def test_endpoint_does_not_use_the_restoring_resolver():
         assert forbidden not in source, f"{forbidden} must not be used here"
 
 
+def test_endpoint_does_not_mark_a_key_used():
+    """Resolution is not proof of possession.
+
+    ``resolve_user_by_ssh_fingerprint`` was split into a pure read plus
+    ``mark_ssh_key_used`` (final review, Important 1) precisely so that
+    offering a fingerprint stops being a write. Calling the bump from here
+    would put it straight back: every agent pod holds ``X-Internal-Key``, and
+    fingerprints come off ``github.com/<user>.keys``, so the write would be
+    attacker-controlled and ``last_used_at`` — the field a user checks to
+    notice a stolen key — would stop meaning anything. The gateway calls the
+    bump itself, after ``key.verify``.
+
+    Matches the CALL form, not the bare name: the endpoint's docstring names
+    the method in order to prohibit it.
+    """
+    import inspect
+
+    source = inspect.getsource(main.get_ssh_target)
+    assert "mark_ssh_key_used(" not in source
+
+
 def test_ssh_target_route_is_mounted():
     """Every test above calls the handler directly, so none of them prove
     FastAPI actually serves this path at this method — a typo'd decorator

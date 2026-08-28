@@ -62986,8 +62986,15 @@ async def get_ssh_target(
 
     The gateway sends the FINGERPRINT, never a user id: it holds no database
     credentials, and this codebase does not accept an internal key plus an
-    asserted user identity. Key-to-user mapping stays here so disabled_at,
-    approval and last_used_at are enforced server-side.
+    asserted user identity. Key-to-user mapping stays here so disabled_at and
+    approval are enforced server-side.
+
+    **Resolution here is not proof of possession**, so this endpoint must
+    never call ``mark_ssh_key_used``: the caller has offered a fingerprint,
+    not a signature. Every agent pod holds ``X-Internal-Key``, and
+    fingerprints are derivable from published public keys, so a write on this
+    path would be attacker-controlled. The gateway bumps ``last_used_at``
+    itself, after ``key.verify`` succeeds.
 
     Unknown handle, unknown key and unauthorized all return an identical 404.
     A resolvable-but-not-live workspace returns 200 with a non-live ``state``
@@ -63006,14 +63013,20 @@ async def get_ssh_target(
         raise opaque
 
     # Both lookups run unconditionally, even when the handle is already
-    # known to be unknown. resolve_user_by_ssh_fingerprint is not a read —
-    # it bumps user_ssh_keys.last_used_at (postgres.py's UPDATE ... RETURNING
-    # CTE), and the caller can read their own last_used_at back through GET
-    # /api/ssh-keys. Short-circuiting on thread_id would turn "did my key's
-    # last_used_at just move?" into a confirmation oracle letting an
-    # approved user tell "handle exists, not mine" apart from "handle does
-    # not exist" despite the two 404 bodies matching byte-for-byte. It also
-    # removes the round-trip timing asymmetry between the two failure paths.
+    # known to be unknown. The original reason — resolve_user_by_ssh_
+    # fingerprint bumped user_ssh_keys.last_used_at, which the caller could
+    # read back through GET /api/ssh-keys, turning "did my key's last_used_at
+    # just move?" into a confirmation oracle — is gone: that resolver is now a
+    # pure read (see its docstring). Keep the unconditional call anyway. It
+    # costs one indexed lookup on an already-failing request, it keeps the two
+    # 404 paths issuing the same number of round trips, and it means
+    # re-introducing any write inside the resolver cannot silently re-open the
+    # oracle from here. Pinned by test_unknown_handle_still_reaches_the_
+    # fingerprint_resolver.
+    #
+    # Note the timing argument is a bonus, not the boundary: the not-yours
+    # path still does more work (get_thread plus user_can_access_ide_entity's
+    # own get_job/get_thread) than the unknown-handle path.
     thread_id = await postgres_db.get_thread_id_by_ssh_handle(handle)
     user = await postgres_db.resolve_user_by_ssh_fingerprint(fingerprint)
     if not thread_id or not user:

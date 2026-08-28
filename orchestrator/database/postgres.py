@@ -41049,7 +41049,7 @@ class PostgresDB:
     async def resolve_user_by_ssh_fingerprint(
         self, fingerprint: str
     ) -> Optional[Dict[str, Any]]:
-        """Map a presented key fingerprint to its owning user.
+        """Map a presented key fingerprint to its owning user. **Pure read.**
 
         Enabled keys belonging to APPROVED accounts only — an unapproved or
         deactivated account resolves to None even with a valid registered key.
@@ -41058,40 +41058,88 @@ class PostgresDB:
         and not in the gateway: the gateway holds no database credentials, and
         an internal key plus an asserted user_id is explicitly not accepted
         anywhere in this codebase.
+
+        **This must never write.** It used to fold a ``last_used_at`` bump in
+        as a ``WITH bumped AS (UPDATE ... RETURNING)`` CTE, which made
+        *resolving an identity* a write, with two consequences:
+
+        * Any ``X-Internal-Key`` holder — which is every agent pod — could
+          stamp ``now()`` into any user's key row through ``GET
+          /api/internal/ssh-targets/<handle>?fingerprint=...``. Fingerprints
+          are derivable from public keys (``github.com/<user>.keys``), so
+          choosing the victim row needs no secret.
+        * asyncssh calls the server's ``validate_public_key`` during the
+          ``publickey`` *query* phase, before any signature exists
+          (asyncssh 2.24.0 ``auth.py:795``; ``connection.py:6211-6217`` runs
+          the server callback ahead of ``key.verify``). The gateway plan puts
+          this lookup in exactly that callback, so the bump would fire for
+          anyone who merely *offers* a public key.
+
+        ``last_used_at`` is what the UI surfaces as "last used" and the field
+        a user checks to notice a stolen key, so an attacker-writable value
+        destroys the only detection signal on this surface. The bump lives in
+        :meth:`mark_ssh_key_used`, which the gateway calls only after
+        ``key.verify`` succeeds. The original reason the two were fused — a
+        failed bump must not discard a successful resolution — is satisfied
+        by the caller wrapping that call in ``try``/``except``, which is
+        where it belonged.
+
+        Returns the owning user's columns plus ``ssh_key_id`` (the matched
+        ``user_ssh_keys.id``) so a caller that later proves possession can
+        mark it used without a second fingerprint lookup. ``id`` remains the
+        USER id — every consumer (``user_can_access_ide_entity``,
+        ``_ssh_target_response``) reads it as such.
         """
         async with self.acquire() as conn:
-            # One statement, deliberately. Three reasons:
+            # One statement, deliberately. Two reasons:
             #  * An explicit column list, mirroring get_user (postgres.py:34419),
             #    keeps unparsed JSONB (settings, cloud_identity) out of a value
             #    that flows to a network-facing gateway.
-            #  * Folding the last_used_at bump into the same statement means a
-            #    failed bump can no longer discard an already-successful resolution
-            #    and deny a legitimate key holder.
             #  * The is_approved check lives here because there is exactly one
             #    caller and a future one must not be able to forget it. An
             #    unapproved account resolves to None, which the gateway endpoint
             #    renders as the same opaque 404 as an unknown handle.
             row = await conn.fetchrow(
                 """
-                WITH bumped AS (
-                    UPDATE user_ssh_keys k
-                    SET last_used_at = now()
-                    WHERE k.fingerprint_sha256 = $1
-                      AND k.disabled_at IS NULL
-                      AND EXISTS (
-                          SELECT 1 FROM users u
-                          WHERE u.id = k.user_id AND u.is_approved
-                      )
-                    RETURNING k.user_id
-                )
-                SELECT u.id, u.display_name, u.email, u.is_admin, u.is_approved,
+                SELECT k.id AS ssh_key_id,
+                       u.id, u.display_name, u.email, u.is_admin, u.is_approved,
                        u.preferred_username, u.default_project_id, u.created_at
-                FROM users u
-                JOIN bumped b ON b.user_id = u.id
+                FROM user_ssh_keys k
+                JOIN users u ON u.id = k.user_id
+                WHERE k.fingerprint_sha256 = $1
+                  AND k.disabled_at IS NULL
+                  AND u.is_approved
                 """,
                 fingerprint,
             )
             return dict(row) if row else None
+
+    async def mark_ssh_key_used(self, key_id: str) -> None:
+        """Stamp ``last_used_at`` on one key. **Proof-of-possession only.**
+
+        The ssh-gateway must call this ONLY after ``key.verify`` has
+        succeeded — never from ``validate_public_key``, which asyncssh runs
+        during the ``publickey`` query phase before any signature exists, and
+        never from ``GET /api/internal/ssh-targets/...``, where resolving a
+        fingerprint is not proof that the caller holds the private half.
+        See :meth:`resolve_user_by_ssh_fingerprint` for why an
+        attacker-writable ``last_used_at`` is the whole problem.
+
+        Wrap the call in ``try``/``except`` at the call site: a failed bump
+        must not discard an authentication that already succeeded.
+
+        Uncalled on this branch — the gateway is a later plan.
+
+        The id is parsed before a connection is acquired, so a malformed one
+        never checks a connection out of the pool — same contract as
+        ``record_ssh_attachment``/``close_ssh_attachment``.
+        """
+        key_uuid = UUID(key_id)
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_ssh_keys SET last_used_at = now() WHERE id = $1",
+                key_uuid,
+            )
 
     # =========================================================================
     # SSH ATTACHMENT AUDIT OPERATIONS
