@@ -386,17 +386,17 @@ async def run():
             orphan_migration = await db.fetchval(
                 "SELECT success FROM schema_migrations "
                 "WHERE filename = "
-                "'0191_managed_repository_process_zero_authority.sql'"
+                "'0193_managed_repository_process_zero_authority.sql'"
             )
             stale_runtime_migration = await db.fetchval(
                 "SELECT success FROM schema_migrations "
                 "WHERE filename = "
-                "'0195_non_pinned_workspace_process_zero.sql'"
+                "'0197_non_pinned_workspace_process_zero.sql'"
             )
             lifecycle_migration = await db.fetchval(
                 "SELECT success FROM schema_migrations "
                 "WHERE filename = "
-                "'0196_non_pinned_workspace_lifecycle_authority.sql'"
+                "'0198_non_pinned_workspace_lifecycle_authority.sql'"
             )
             dirty_migrations = await db.fetchval(
                 "SELECT count(*) FROM schema_migrations WHERE success = FALSE"
@@ -1880,11 +1880,11 @@ class ManagedRepositoryResidueGate:
             "assert hasattr(PostgresDB, "
             "'record_stale_managed_repository_workspace_process_zero')\n"
             "assert pathlib.Path('/app/database/migrations/app/"
-            "0191_managed_repository_process_zero_authority.sql').is_file()\n"
+            "0193_managed_repository_process_zero_authority.sql').is_file()\n"
             "assert pathlib.Path('/app/database/migrations/app/"
-            "0195_non_pinned_workspace_process_zero.sql').is_file()\n"
+            "0197_non_pinned_workspace_process_zero.sql').is_file()\n"
             "assert pathlib.Path('/app/database/migrations/app/"
-            "0196_non_pinned_workspace_lifecycle_authority.sql').is_file()\n"
+            "0198_non_pinned_workspace_lifecycle_authority.sql').is_file()\n"
         ).encode()
         for pod_name in self.orchestrator_pods:
             self.runner.run(

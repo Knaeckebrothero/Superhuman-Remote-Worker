@@ -471,7 +471,7 @@ async def test_stateless_active_marker_blocks_bypassed_queue_claim(pg):
             "RETURNING id"
         )
         # A ready Kubernetes projection with no Pod UID is previous-release
-        # data; 0196 fences a writer that publishes one today. The subject here
+        # data; 0198 fences a writer that publishes one today. The subject here
         # is control-plane claim ordering above such a row, so seed it the way
         # the migration met it.
         await seed_previous_release_row(

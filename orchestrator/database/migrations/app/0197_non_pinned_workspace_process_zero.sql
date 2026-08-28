@@ -1,11 +1,10 @@
--- migration:     0191_managed_repository_process_zero_authority.sql
--- description:   Persist exact workspace process-zero observations outside
---                caller-writable job and thread JSON.
--- depends-on:    0190_stateless_input_delivery_validate.sql
--- expected:      < 1s. One empty table plus two JSON guard triggers; no
---                historical scan or row rewrite.
--- locks:         Brief SHARE ROW EXCLUSIVE locks on jobs and threads for
---                trigger installation; ACCESS EXCLUSIVE only on new objects.
+-- migration:     0197_non_pinned_workspace_process_zero.sql
+-- description:   Consolidate non-pinned process-zero authority and absorbing
+--                runtime retirement on the integrated lifecycle base.
+-- depends-on:    0196_notifications_cutover.sql
+-- expected:      < 1s. Replaces one non-pinned trigger function and installs
+--                two INSERT guards; no row scan or rewrite.
+-- locks:         Function-catalog lock only; installed row triggers remain.
 -- transactional: yes
 
 BEGIN;
@@ -14,90 +13,74 @@ SET LOCAL statement_timeout                   = '15min';
 SET LOCAL idle_in_transaction_session_timeout = '5min';
 SET LOCAL timezone                            = 'UTC';
 
-CREATE TABLE public.managed_repository_process_zero_receipts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    owner_kind TEXT NOT NULL,
-    owner_id UUID NOT NULL,
-    scope TEXT NOT NULL,
-    provisioner TEXT NOT NULL,
-    runtime_incarnation TEXT NOT NULL,
-    observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT managed_repository_process_zero_identity_unique
-        UNIQUE (owner_kind, owner_id, scope, runtime_incarnation),
-    CONSTRAINT managed_repository_process_zero_owner_kind_check
-        CHECK (owner_kind IN ('job', 'thread')),
-    CONSTRAINT managed_repository_process_zero_scope_check
-        CHECK (scope IN (
-            'workspace_container',
-            'vm',
-            'ide',
-            'ide_local',
-            'stateless_workspace',
-            'docker_workspace'
-        )),
-    CONSTRAINT managed_repository_process_zero_provisioner_check
-        CHECK (
-            (scope = 'workspace_container' AND provisioner = 'k8s')
-            OR (scope = 'vm' AND provisioner = 'vm')
-            OR (scope = 'ide' AND provisioner = 'k8s')
-            OR (scope = 'ide_local' AND provisioner = 'docker')
-            OR (scope = 'stateless_workspace' AND provisioner = 'k8s')
-            OR (scope = 'docker_workspace' AND provisioner = 'docker')
-        ),
-    CONSTRAINT managed_repository_process_zero_runtime_check
-        CHECK (
-            (
-                scope <> 'ide_local'
-                AND runtime_incarnation ~
-                    '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-            )
-            OR (
-                scope = 'ide_local'
-                AND runtime_incarnation ~ '^[0-9a-f]{64}$'
-            )
-        )
-);
-
-COMMENT ON TABLE public.managed_repository_process_zero_receipts IS
-    'Server-owned exact-runtime evidence that managed repository ssh-agent processes reached zero before destructive workspace teardown.';
-
-CREATE FUNCTION public.managed_repository_process_zero_receipt_exists(
+-- One `adopt` generation may put back exactly what it found.  Adoption
+-- creates no Pod: it publishes the UID of a Pod the previous release already
+-- made.  When the confirmation read after persistence no longer matches, that
+-- tentative stamp must be withdrawable, or the row keeps a durable claim on a
+-- Pod that was never ours and no later path can clear it -- process-zero
+-- cannot receipt a runtime this replica never created.  Nothing but the three
+-- stamped keys and the adoption marker may move, so this is a withdrawal of
+-- authority and never a route to a different runtime identity.
+CREATE FUNCTION public.managed_repo_adoption_reversal_authorized_now(
     requested_owner_kind TEXT,
     requested_owner_id UUID,
     requested_scope TEXT,
-    requested_provisioner TEXT,
-    requested_runtime TEXT
+    requested_runtime TEXT,
+    requested_old_state JSONB,
+    requested_new_state JSONB
 )
-RETURNS BOOLEAN
-LANGUAGE plpgsql
-STABLE
-AS $$
+RETURNS BOOLEAN LANGUAGE plpgsql STABLE AS $adoption_reversal$
+DECLARE
+    state_key TEXT := CASE WHEN requested_scope = 'ide'
+        THEN 'ide_session' ELSE 'workspace_container' END;
+    authorized BOOLEAN;
 BEGIN
-    IF requested_runtime IS NULL
-       OR (
-           requested_scope = 'ide_local'
-           AND requested_runtime !~ '^[0-9a-f]{64}$'
-       )
-       OR (
-           requested_scope <> 'ide_local'
-           AND requested_runtime !~
-              '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-       ) THEN
+    -- The reservation ledger arrives one migration later.  A plpgsql body is
+    -- not planned until the statement runs, so this guard keeps the function
+    -- installable here and fail-closed in the window before 0198.
+    IF to_regclass(
+        'public.managed_repository_workspace_creation_reservations'
+    ) IS NULL THEN
         RETURN FALSE;
     END IF;
-    RETURN EXISTS (
+    SELECT EXISTS (
         SELECT 1
-          FROM public.managed_repository_process_zero_receipts AS receipt
-         WHERE receipt.owner_kind = requested_owner_kind
-           AND receipt.owner_id = requested_owner_id
-           AND receipt.scope = requested_scope
-           AND receipt.provisioner = requested_provisioner
-           AND receipt.runtime_incarnation = requested_runtime
-    );
+          FROM public.managed_repository_workspace_creation_reservations
+               AS reservation
+         WHERE reservation.owner_kind = requested_owner_kind
+           AND reservation.owner_id = requested_owner_id
+           AND reservation.scope = requested_scope
+           AND reservation.operation_kind = 'adopt'
+           AND reservation.runtime_incarnation::TEXT = requested_runtime
+           AND reservation.phase = 'runtime_bound'
+           AND reservation.settled_at IS NULL
+           AND reservation.expires_at > now()
+           AND reservation.cancel_requested_at IS NULL
+           AND reservation.external_mutation_started_at IS NULL
+           AND requested_old_state #>> ARRAY[
+                   state_key, '_creation_reservation_id'
+               ] = reservation.id::TEXT
+           AND requested_old_state #>> ARRAY[
+                   state_key, '_creation_claim_token'
+               ] = reservation.claim_token::TEXT
+           AND (requested_new_state #> ARRAY[state_key]) = (
+                   (requested_old_state #> ARRAY[state_key]) - ARRAY[
+                       '_runtime_incarnation',
+                       '_creation_reservation_id',
+                       '_creation_claim_token',
+                       '_legacy_k8s_runtime_adoption',
+                       -- Conversion also retires the previous release's
+                       -- create marker; a withdrawal puts back the same
+                       -- projection minus that marker, never a different one.
+                       '_stateless_runtime_creation'
+                   ]
+               )
+    ) INTO authorized;
+    RETURN COALESCE(authorized, FALSE);
 END;
-$$;
+$adoption_reversal$;
 
-CREATE FUNCTION public.enforce_managed_repository_process_zero_transition()
+CREATE OR REPLACE FUNCTION public.enforce_managed_repository_process_zero_transition()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
@@ -122,6 +105,7 @@ DECLARE
     declared_inherited BOOLEAN := FALSE;
     inherited_scope BOOLEAN := FALSE;
     destructive_transition BOOLEAN;
+    pinned_thread BOOLEAN := FALSE;
 BEGIN
     IF TG_TABLE_NAME = 'jobs' THEN
         source_kind := 'job';
@@ -156,6 +140,7 @@ BEGIN
             parent_ide := COALESCE(parent_state->'ide_session', '{}'::JSONB);
         END IF;
     ELSE
+        pinned_thread := OLD.execution_lane = 'pinned';
         source_kind := 'thread';
         source_id := OLD.id;
         old_state := COALESCE(OLD.metadata, '{}'::JSONB);
@@ -166,6 +151,18 @@ BEGIN
 
     old_workspace := COALESCE(old_state->'workspace_container', '{}'::JSONB);
     new_workspace := COALESCE(new_state->'workspace_container', '{}'::JSONB);
+
+    -- Origin migration 0185/0200 is the authority for a *pinned* thread's
+    -- Kubernetes agent runtime, so that scope is handed over here.  It does
+    -- not protect metadata.vm or a Docker workspace lease: both remain under
+    -- the generic process-zero ledger for every lane.  A blanket pinned-lane
+    -- return would let an ended thread discard either runtime without proof.
+    IF pinned_thread
+       AND old_workspace->>'provisioner' IS DISTINCT FROM 'docker'
+       AND new_workspace->>'provisioner' IS DISTINCT FROM 'docker' THEN
+        old_workspace := '{}'::JSONB;
+        new_workspace := '{}'::JSONB;
+    END IF;
     inherited_scope := declared_inherited
         AND old_workspace <> '{}'::JSONB
         AND old_workspace->>'provisioner' = parent_workspace->>'provisioner'
@@ -206,6 +203,31 @@ BEGIN
     END IF;
     IF old_workspace->>'provisioner' = 'k8s' THEN
         runtime_id := old_workspace->>'_runtime_incarnation';
+        IF runtime_id IS NULL
+           AND source_kind = 'thread'
+           AND OLD.status::TEXT = 'ended'
+           AND old_state->'_stateless_workspace_retirement_pending' = 'true'::JSONB
+           AND old_state #> '{_stateless_claim_retirement,permanent}' = 'true'::JSONB
+           AND old_state #> '{_stateless_claim_retirement,claimant_quiesced}' = 'true'::JSONB
+           AND (
+               old_state #> '{_stateless_claim_retirement,resident_cleanup_required}'
+                   = 'false'::JSONB
+               OR old_state #> '{_stateless_claim_retirement,residents_retired}'
+                   = 'true'::JSONB
+           )
+           AND (
+               old_state #> '{_stateless_claim_retirement,shell_retirement_required}'
+                   = 'false'::JSONB
+               OR old_state #> '{_stateless_claim_retirement,remote_retired}'
+                   = 'true'::JSONB
+           )
+           AND old_workspace->>'status' IN ('deleted', 'released')
+        THEN
+            runtime_id := NULLIF(
+                old_state #>> '{_stateless_claim_retirement,runtime_incarnation}',
+                ''
+            );
+        END IF;
         receipt_ok := runtime_id IS NOT NULL AND (
             public.managed_repository_process_zero_receipt_exists(
                 source_kind, source_id, 'workspace_container', 'k8s', runtime_id
@@ -234,7 +256,20 @@ BEGIN
         END IF;
         destructive_transition := (
             TG_OP = 'DELETE'
-            OR new_workspace->>'_runtime_incarnation' IS DISTINCT FROM runtime_id
+            OR (
+                runtime_id IS NOT NULL
+                AND new_workspace->>'_runtime_incarnation'
+                    IS DISTINCT FROM runtime_id
+            )
+            OR (
+                runtime_id IS NULL
+                AND old_workspace <> '{}'::JSONB
+                AND (
+                    new_workspace = '{}'::JSONB
+                    OR new_workspace->>'provisioner'
+                        IS DISTINCT FROM old_workspace->>'provisioner'
+                )
+            )
             OR (
                 new_workspace->>'status' IN (
                     'deleted', 'suspended', 'released', 'quarantined'
@@ -250,7 +285,16 @@ BEGIN
                 CONSTRAINT = 'managed_repository_workspace_runtime_identity_required',
                 MESSAGE = 'Workspace runtime identity is required before destructive teardown';
         ELSIF destructive_transition AND runtime_id IS NOT NULL THEN
-            IF NOT receipt_ok THEN
+            -- An adoption withdrawing its own unconfirmed stamp is not a
+            -- teardown.  It never created this Pod, so no process-zero
+            -- receipt can exist and none is owed.  The predicate admits only
+            -- the exact reverse of that one stamp under the same live adopt
+            -- generation; nothing else may move with it.
+            IF NOT receipt_ok
+               AND NOT public.managed_repo_adoption_reversal_authorized_now(
+                   source_kind, source_id, 'workspace_container', runtime_id,
+                   old_state, new_state
+               ) THEN
                 RAISE EXCEPTION USING
                     ERRCODE = '23514',
                     CONSTRAINT = 'managed_repository_workspace_process_zero_required',
@@ -279,8 +323,20 @@ BEGIN
         END IF;
         destructive_transition := (
             TG_OP = 'DELETE'
-            OR new_workspace->>'_docker_workspace_lease_id'
-                IS DISTINCT FROM runtime_id
+            OR (
+                runtime_id IS NOT NULL
+                AND new_workspace->>'_docker_workspace_lease_id'
+                    IS DISTINCT FROM runtime_id
+            )
+            OR (
+                runtime_id IS NULL
+                AND old_workspace <> '{}'::JSONB
+                AND (
+                    new_workspace = '{}'::JSONB
+                    OR new_workspace->>'provisioner'
+                        IS DISTINCT FROM old_workspace->>'provisioner'
+                )
+            )
             OR (
                 new_workspace->>'status' = 'released'
                 AND new_workspace->>'status' IS DISTINCT FROM old_workspace->>'status'
@@ -403,7 +459,15 @@ BEGIN
     END IF;
     destructive_transition := (
         TG_OP = 'DELETE'
-        OR new_vm->>'provision_generation' IS DISTINCT FROM runtime_id
+        OR (
+            runtime_id IS NOT NULL
+            AND new_vm->>'provision_generation' IS DISTINCT FROM runtime_id
+        )
+        OR (
+            runtime_id IS NULL
+            AND old_vm <> '{}'::JSONB
+            AND new_vm = '{}'::JSONB
+        )
         OR (
             new_vm->>'status' IN (
                 'aborted', 'deleted', 'suspended', 'released'
@@ -481,9 +545,22 @@ BEGIN
         END IF;
         destructive_transition := (
             TG_OP = 'DELETE'
-            OR new_ide->>'_runtime_incarnation' IS DISTINCT FROM runtime_id
-            OR new_ide->>'container_id'
-                IS DISTINCT FROM old_ide->>'container_id'
+            OR (
+                runtime_id IS NOT NULL
+                AND new_ide->>'_runtime_incarnation'
+                    IS DISTINCT FROM runtime_id
+            )
+            OR (
+                old_ide->>'container_id' IS NOT NULL
+                AND new_ide->>'container_id'
+                    IS DISTINCT FROM old_ide->>'container_id'
+            )
+            OR (
+                runtime_id IS NULL
+                AND old_ide->>'container_id' IS NULL
+                AND old_ide <> '{}'::JSONB
+                AND new_ide = '{}'::JSONB
+            )
             OR (
                 new_ide->>'status' IN ('expired', 'deleted')
                 AND new_ide->>'status' IS DISTINCT FROM old_ide->>'status'
@@ -517,114 +594,43 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION public.enforce_docker_workspace_reuse_process_zero()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    IF (
-        NEW.status = 'released'
-        AND NEW.status IS DISTINCT FROM OLD.status
-    ) OR (
-        NEW.status = 'quarantined'
-        AND NEW.quarantine_reason =
-            'container_recreation_required_process_zero'
-        AND (
-            NEW.status IS DISTINCT FROM OLD.status
-            OR NEW.quarantine_reason IS DISTINCT FROM OLD.quarantine_reason
-        )
-    ) THEN
-        IF OLD.owner_kind IS NULL
-           OR OLD.owner_id IS NULL
-           OR OLD.lease_id IS NULL
-           OR NOT public.managed_repository_process_zero_receipt_exists(
-               OLD.owner_kind,
-               OLD.owner_id,
-               'docker_workspace',
-               'docker',
-               OLD.lease_id::TEXT
-           ) THEN
-            RAISE EXCEPTION USING
-                ERRCODE = '23514',
-                CONSTRAINT = 'docker_workspace_reuse_requires_process_zero',
-                MESSAGE = 'Docker workspace reuse requires process-zero authority';
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$$;
 
-CREATE FUNCTION public.reject_managed_repository_process_zero_json()
+SET LOCAL idle_in_transaction_session_timeout = '5min';
+SET LOCAL timezone                            = 'UTC';
+
+CREATE OR REPLACE FUNCTION public.prevent_process_zero_owner_resurrection()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    source_kind TEXT;
 BEGIN
-    IF TG_TABLE_NAME = 'jobs' THEN
-        IF NEW.context ? '_managed_repository_process_zero'
-           AND (
-               TG_OP = 'INSERT'
-               OR NOT (OLD.context ? '_managed_repository_process_zero')
-               OR OLD.context->'_managed_repository_process_zero'
-                  IS DISTINCT FROM
-                  NEW.context->'_managed_repository_process_zero'
-           ) THEN
-            RAISE EXCEPTION USING
-                ERRCODE = '23514',
-                CONSTRAINT = 'managed_repository_process_zero_is_server_owned',
-                MESSAGE = 'Managed repository process-zero evidence is server-owned';
-        END IF;
-    ELSIF (
-        NEW.metadata ? '_managed_repository_process_zero'
-        AND (
-            TG_OP = 'INSERT'
-            OR NOT (OLD.metadata ? '_managed_repository_process_zero')
-            OR OLD.metadata->'_managed_repository_process_zero'
-               IS DISTINCT FROM
-               NEW.metadata->'_managed_repository_process_zero'
-        )
-    ) OR (
-        NEW.metadata ? '_stateless_workspace_process_zero_observation'
-        AND (
-            TG_OP = 'INSERT'
-            OR NOT (OLD.metadata ? '_stateless_workspace_process_zero_observation')
-            OR OLD.metadata->'_stateless_workspace_process_zero_observation'
-               IS DISTINCT FROM
-               NEW.metadata->'_stateless_workspace_process_zero_observation'
-        )
+    source_kind := CASE WHEN TG_TABLE_NAME = 'jobs' THEN 'job' ELSE 'thread' END;
+    IF EXISTS (
+        SELECT 1
+          FROM public.managed_repository_process_zero_receipts AS receipt
+         WHERE receipt.owner_kind = source_kind
+           AND receipt.owner_id = NEW.id
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '23514',
-            CONSTRAINT = 'managed_repository_process_zero_is_server_owned',
-            MESSAGE = 'Managed repository process-zero evidence is server-owned';
+            CONSTRAINT = 'managed_repository_process_zero_owner_resurrection',
+            MESSAGE = 'A process-zero workspace owner UUID cannot be reused';
     END IF;
     RETURN NEW;
 END;
 $$;
 
-CREATE TRIGGER trg_jobs_reject_managed_repository_process_zero_json
-BEFORE INSERT OR UPDATE OF context ON public.jobs
-FOR EACH ROW
-EXECUTE FUNCTION public.reject_managed_repository_process_zero_json();
+DROP TRIGGER IF EXISTS trg_jobs_process_zero_owner_resurrection
+    ON public.jobs;
+CREATE TRIGGER trg_jobs_process_zero_owner_resurrection
+BEFORE INSERT ON public.jobs
+FOR EACH ROW EXECUTE FUNCTION public.prevent_process_zero_owner_resurrection();
 
-CREATE TRIGGER trg_threads_reject_managed_repository_process_zero_json
-BEFORE INSERT OR UPDATE OF metadata ON public.threads
-FOR EACH ROW
-EXECUTE FUNCTION public.reject_managed_repository_process_zero_json();
-
-CREATE TRIGGER trg_jobs_enforce_managed_repository_process_zero
-BEFORE UPDATE OF context OR DELETE ON public.jobs
-FOR EACH ROW
-EXECUTE FUNCTION public.enforce_managed_repository_process_zero_transition();
-
-CREATE TRIGGER trg_threads_enforce_managed_repository_process_zero
-BEFORE UPDATE OF metadata OR DELETE ON public.threads
-FOR EACH ROW
-EXECUTE FUNCTION public.enforce_managed_repository_process_zero_transition();
-
-CREATE TRIGGER trg_docker_workspace_reuse_requires_process_zero
-BEFORE UPDATE OF status, owner_kind, owner_id, lease_id, quarantine_reason
-ON public.docker_workspace_leases
-FOR EACH ROW
-EXECUTE FUNCTION public.enforce_docker_workspace_reuse_process_zero();
+DROP TRIGGER IF EXISTS trg_threads_process_zero_owner_resurrection
+    ON public.threads;
+CREATE TRIGGER trg_threads_process_zero_owner_resurrection
+BEFORE INSERT ON public.threads
+FOR EACH ROW EXECUTE FUNCTION public.prevent_process_zero_owner_resurrection();
 
 COMMIT;

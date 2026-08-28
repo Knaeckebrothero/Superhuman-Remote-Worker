@@ -87,7 +87,7 @@ def _adopted_k8s_runtime(attestation, *, status: str = "ready") -> dict:
 
 
 class _LegacyAdoptionDB:
-    """The owner rows plus the exact slice of the 0196 ledger adoption uses.
+    """The owner rows plus the exact slice of the 0198 ledger adoption uses.
 
     Adoption has no authorised transition into the new protocol without a
     durable `adopt` generation, so a double that omitted the ledger would let

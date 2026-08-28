@@ -242,10 +242,10 @@ class StatelessWakeGate:
                 "SELECT filename, success FROM schema_migrations "
                 "WHERE filename = ANY($1::text[]) ORDER BY filename",
                 [
-                    "0189_stateless_input_deliveries.sql",
-                    "0190_stateless_input_delivery_validate.sql",
-                    "0195_non_pinned_workspace_process_zero.sql",
-                    "0196_non_pinned_workspace_lifecycle_authority.sql",
+                    "0191_stateless_input_deliveries.sql",
+                    "0192_stateless_input_delivery_validate.sql",
+                    "0197_non_pinned_workspace_process_zero.sql",
+                    "0198_non_pinned_workspace_lifecycle_authority.sql",
                 ],
             )
             dirty_migrations = await conn.fetchval(
@@ -292,14 +292,14 @@ class StatelessWakeGate:
             str(row["filename"]): bool(row["success"]) for row in migrations
         }
         expected_migrations = {
-            "0189_stateless_input_deliveries.sql": True,
-            "0190_stateless_input_delivery_validate.sql": True,
-            "0195_non_pinned_workspace_process_zero.sql": True,
-            "0196_non_pinned_workspace_lifecycle_authority.sql": True,
+            "0191_stateless_input_deliveries.sql": True,
+            "0192_stateless_input_delivery_validate.sql": True,
+            "0197_non_pinned_workspace_process_zero.sql": True,
+            "0198_non_pinned_workspace_lifecycle_authority.sql": True,
         }
         if migration_map != expected_migrations:
             raise GateError(
-                "migration_unavailable", "0189/0190/0195/0196 are not cleanly applied"
+                "migration_unavailable", "0191/0192/0197/0198 are not cleanly applied"
             )
         if int(dirty_migrations or 0) != 0:
             raise GateError("dirty_migration", "a failed migration row is present")

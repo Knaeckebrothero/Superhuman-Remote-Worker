@@ -867,7 +867,7 @@ async def test_legacy_workspace_claim_is_conservative_and_fenced(db):
     assert marker["assigned_backend"] == "sandbox"
 
 
-# 0195/0196 fence a *writer* that publishes Kubernetes runtime authority with
+# 0197/0198 fence a *writer* that publishes Kubernetes runtime authority with
 # no durable reservation behind it.  Rows written by the previous release were
 # never subject to that fence -- the trigger did not exist yet.  Reproducing
 # that ordering means seeding with the exact named trigger absent and then
@@ -881,7 +881,7 @@ async def test_legacy_workspace_claim_is_conservative_and_fenced(db):
 async def _merge_previous_release_workspace(db, job_id, payload):
     """Land a workspace_container callback the way the previous release did.
 
-    0196 now requires exact creation-reservation authority behind any Pod UID
+    0198 now requires exact creation-reservation authority behind any Pod UID
     a writer publishes.  The tier-resolution and stateless-admission proofs
     below are about what the *reader* concludes from such a projection, not
     about how it came to exist, so they install it as a pre-tranche writer.
@@ -1067,7 +1067,7 @@ async def test_pre_0175_adoption_cas_yields_to_concurrent_tier_transition(db):
     vm_generation = str(uuid4())
     async with db.acquire() as conn:
         # The racing writer is the previous release's tier transition: it
-        # abandons a UID-less Kubernetes projection wholesale, which 0196 now
+        # abandons a UID-less Kubernetes projection wholesale, which 0198 now
         # governs.  The subject here is the adoption CAS yielding to it, so
         # seed it the way the migration met such a writer.
         await _seed_previous_release_row(
@@ -1672,7 +1672,7 @@ async def test_bp10_delivery_updates_the_same_durable_episode(db):
                 UUID(seed["thread_id"]),
             )
             process_generation = uuid4()
-            # A pinned binding already live when 0198 landed; the subject here
+            # A pinned binding already live when 0200 landed; the subject here
             # is Officer Post transaction behaviour, not the bind authority.
             await conn.execute("SET LOCAL session_replication_role = 'replica'")
             await conn.execute(

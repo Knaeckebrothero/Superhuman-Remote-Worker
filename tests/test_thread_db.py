@@ -727,7 +727,7 @@ class TestStatelessWorkspaceCreationAuthority:
             return_value={
                 "status": "created",
                 "execution_lane": "stateless",
-                # 0195/0196 canonicalise the thread's own runtime generation
+                # 0197/0198 canonicalise the thread's own runtime generation
                 # before any creation authority is considered.
                 "runtime_generation": self.GENERATION,
                 "metadata": {
@@ -1428,7 +1428,7 @@ class TestEndThread:
             ]
         )
         # Resume rotates the generation, then binds the creation marker to that
-        # exact generation in a second statement (0195/0196).
+        # exact generation in a second statement (0197/0198).
         resumed_generation = "33333333-3333-4333-8333-333333333333"
         conn.fetchval = AsyncMock(
             side_effect=[None, "tid-1", resumed_generation, "tid-1"]

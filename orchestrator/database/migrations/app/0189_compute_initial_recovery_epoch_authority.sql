@@ -1,7 +1,7 @@
--- migration:     0187_compute_initial_recovery_epoch_authority.sql
+-- migration:     0189_compute_initial_recovery_epoch_authority.sql
 -- description:   Permit initial Slice 3 compute authority on a recovered
 --                current epoch only when its coverage reaches the boundary.
--- depends-on:    0186_protected_cloud_instance_authority.sql
+-- depends-on:    0188_pre_registration_delete_sandbox_zero.sql
 -- expected:      < 10s. Replaces one trigger function without rewriting data.
 -- locks:         Brief SHARE ROW EXCLUSIVE lock on compute epoch authorities.
 -- transactional: yes

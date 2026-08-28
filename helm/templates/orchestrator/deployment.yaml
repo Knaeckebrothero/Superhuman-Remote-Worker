@@ -40,7 +40,7 @@ spec:
         checksum/officer-auto-pull-release: {{ dict "officerAutoPullReleaseEnabled" (.Values.orchestrator.officerAutoPullReleaseEnabled | default false) | toJson | sha256sum | quote }}
         checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
         checksum/workspace-lifecycle-protocol-cutover: {{ dict "enabled" $workspaceLifecycleCutover | toJson | sha256sum | quote }}
-        checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0195" | toString | sha256sum | quote }}
+        checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString | sha256sum | quote }}
         checksum/vm-remote-operation-protocol: {{ dict "enabled" $vmRemoteProtocol | toJson | sha256sum | quote }}
     spec:
       serviceAccountName: {{ include "srw.orchestratorServiceAccountName" . }}

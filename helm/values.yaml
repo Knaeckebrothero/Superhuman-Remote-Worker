@@ -145,7 +145,7 @@ orchestrator:
   # generation admitted before the flag closes may finish without stranding
   # its process-zero/maintenance fence.
   workspaceCleanupReconciliationEnabled: false
-  # -- One-release coordinated cutover for the 0195/0196 workspace lifecycle
+  # -- One-release coordinated cutover for the 0197/0198 workspace lifecycle
   # authority epoch. Keep true while advancing the ServiceAccount generation:
   # the namespace RoleBinding revokes the predecessor account and Recreate
   # terminates every old orchestrator before the new owner starts. Automatic
@@ -155,14 +155,14 @@ orchestrator:
   # revoke a request the API server already accepted. Set false only on a later
   # all-new-version rollout after the cutover and residue gates.
   workspaceLifecycleProtocolCutoverEnabled: true
-  # -- Kubernetes mutation authority epoch for the 0195/0196 non-pinned
+  # -- Kubernetes mutation authority epoch for the 0197/0198 non-pinned
   # workspace lifecycle protocol. The RoleBinding names only this generation's
   # ServiceAccount, so predecessor Pods lose create/delete authority before
   # replacement code can mutate the same deterministic resources.
-  workspaceLifecycleServiceAccountGeneration: "0195"
+  workspaceLifecycleServiceAccountGeneration: "0197"
   # -- Enable exact, renewable v1 receipts for orchestrator-originated VM
   # SSH/SFTP. Enabling switches the orchestrator to Recreate so no pre-v1
-  # replica overlaps activation. Keep false until migration 0197 is present;
+  # replica overlaps activation. Keep false until migration 0199 is present;
   # after activation never roll back to an image without v1 support. The dark
   # value intentionally retains same-cluster TCP/22 for existing/read-only VM
   # paths; mutation admission is fenced by the application + database gate.
@@ -482,7 +482,7 @@ agent:
   # cutover rather than a mixed-version reader-first rollout, so this remains
   # true after the cutover and must never be disabled while 0185 is installed.
   requirePinnedStatusIdentity: "true"
-  # -- Explicit prior namespaces searched while 0198 adopts pre-finalizer
+  # -- Explicit prior namespaces searched while 0200 adopts pre-finalizer
   # pinned Pods/PVCs. The active namespace is always this Helm release's
   # namespace and must not be listed. Keep only namespaces that may still hold
   # live 0185 agent authority; remove each entry after adoption has converged.

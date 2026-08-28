@@ -1,12 +1,12 @@
--- migration:     0199_pre_registration_sandbox_zero.sql
+-- migration:     0187_pre_registration_sandbox_zero.sql
 -- description:   Permit one combined orchestrator sandbox-zero receipt when
 --                a never-attached pinned generation captured both an agent
 --                Pod marker and a physical workspace.
--- depends-on:    0198_pinned_agent_recycle_authority.sql
+-- depends-on:    0186_protected_cloud_instance_authority.sql
 -- expected:      < 1s. Replace one trigger function; no row rewrite.
 -- locks:         Brief function-catalog lock; no table lock or validation scan.
 -- transactional: yes
--- rollout:       Backward compatible with 0198 writers. The new application
+-- rollout:       Backward compatible with 0185 writers. The new application
 --                branch is served only after startup migrations complete.
 
 BEGIN;

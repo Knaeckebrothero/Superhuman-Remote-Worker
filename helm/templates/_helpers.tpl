@@ -30,7 +30,7 @@ can own workspace lifecycle mutations. Reserve the suffix length explicitly:
 long release names must not truncate the authority epoch away.
 */}}
 {{- define "srw.orchestratorServiceAccountName" -}}
-{{- $epoch := .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0195" | toString -}}
+{{- $epoch := .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString -}}
 {{- $base := include "srw.fullname" . | trunc 43 | trimSuffix "-" -}}
 {{- printf "%s-ows%s" $base $epoch | trunc 63 | trimSuffix "-" -}}
 {{- end }}

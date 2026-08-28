@@ -237,7 +237,7 @@ def _absence_thread(
 
 
 def _settled_cleanup_provisioner(**extra):
-    """A permanent settled End now settles a durable 0196 cleanup intent first."""
+    """A permanent settled End now settles a durable 0198 cleanup intent first."""
 
     # Use the exact class main.py compares against; a second import of the
     # same file under a different module name would fail isinstance.
@@ -655,7 +655,7 @@ async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete() -> No
         )
 
     assert result == {"status": "deleted"}
-    # Permanent reclaim now runs through the durable 0196 cleanup intent, not a
+    # Permanent reclaim now runs through the durable 0198 cleanup intent, not a
     # bare release call: the disposition and captured resource identities are
     # committed before any Kubernetes effect.
     provisioner.release_absent_workspace.assert_not_awaited()

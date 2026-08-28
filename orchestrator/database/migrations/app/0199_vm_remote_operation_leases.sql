@@ -1,7 +1,7 @@
--- migration:     0197_vm_remote_operation_leases.sql
+-- migration:     0199_vm_remote_operation_leases.sql
 -- description:   Persist exact VM remote-I/O leases and fence lifecycle
 --                replacement while an admitted operation is in flight.
--- depends-on:    0196_non_pinned_workspace_lifecycle_authority.sql
+-- depends-on:    0198_non_pinned_workspace_lifecycle_authority.sql
 -- expected:      < 5s. Two empty/singleton authority tables plus four owner
 --                triggers; no historical scan or owner-row rewrite.
 -- locks:         Brief SHARE ROW EXCLUSIVE locks on jobs and threads for

@@ -1,11 +1,11 @@
--- migration:     0200_pre_registration_delete_sandbox_zero.sql
+-- migration:     0188_pre_registration_delete_sandbox_zero.sql
 -- description:   Admit the combined sandbox-zero receipt at the final pinned
 --                DELETE fence for a never-attached generation.
--- depends-on:    0199_pre_registration_sandbox_zero.sql
+-- depends-on:    0187_pre_registration_sandbox_zero.sql
 -- expected:      < 1s. Replace one trigger function; no row rewrite.
 -- locks:         Brief function-catalog lock; no table lock or validation scan.
 -- transactional: yes
--- rollout:       Backward compatible with 0199 writers. The new application
+-- rollout:       Backward compatible with 0185 writers. The new application
 --                branch is served only after startup migrations complete.
 
 BEGIN;

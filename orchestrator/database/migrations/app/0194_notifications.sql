@@ -1,9 +1,9 @@
--- migration:     0192_notifications.sql
+-- migration:     0194_notifications.sql
 -- description:   Durable per-recipient notification feed plus a per-channel
 --                delivery ledger — the source of truth every channel delivers
 --                FROM (knowledge-base/knowledge/features/unified_notification_system.md
 --                §3-4, decisions D2/D3/D10). Slice 1 of three: new tables only.
--- depends-on:    0191_managed_repository_process_zero_authority.sql
+-- depends-on:    0193_managed_repository_process_zero_authority.sql
 -- expected:      < 5s. Two new empty tables; no existing table is touched.
 -- locks:         none on existing tables.
 -- transactional: yes

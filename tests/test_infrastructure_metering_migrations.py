@@ -255,49 +255,49 @@ APP_PROTECTED_CLOUD_INSTANCE_AUTHORITY = (
     ROOT
     / "orchestrator/database/migrations/app/0186_protected_cloud_instance_authority.sql"
 )
+APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO = (
+    ROOT / "orchestrator/database/migrations/app/0187_pre_registration_sandbox_zero.sql"
+)
+APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO = (
+    ROOT
+    / "orchestrator/database/migrations/app/0188_pre_registration_delete_sandbox_zero.sql"
+)
 APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY = (
     ROOT
-    / "orchestrator/database/migrations/app/0187_compute_initial_recovery_epoch_authority.sql"
+    / "orchestrator/database/migrations/app/0189_compute_initial_recovery_epoch_authority.sql"
 )
 APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0188_managed_repository_legacy_reconciliation.sql"
+    / "orchestrator/database/migrations/app/0190_managed_repository_legacy_reconciliation.sql"
 )
 APP_STATELESS_INPUT_DELIVERIES = (
-    ROOT / "orchestrator/database/migrations/app/0189_stateless_input_deliveries.sql"
+    ROOT / "orchestrator/database/migrations/app/0191_stateless_input_deliveries.sql"
 )
 APP_STATELESS_INPUT_DELIVERY_VALIDATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0190_stateless_input_delivery_validate.sql"
+    / "orchestrator/database/migrations/app/0192_stateless_input_delivery_validate.sql"
 )
 APP_MANAGED_REPOSITORY_PROCESS_ZERO_AUTHORITY = (
     ROOT
-    / "orchestrator/database/migrations/app/0191_managed_repository_process_zero_authority.sql"
+    / "orchestrator/database/migrations/app/0193_managed_repository_process_zero_authority.sql"
 )
 APP_NOTIFICATIONS_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0192_notifications.sql"
+    ROOT / "orchestrator/database/migrations/app/0194_notifications.sql"
 )
 APP_NOTIFICATION_STEPS_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0193_notification_steps.sql"
+    ROOT / "orchestrator/database/migrations/app/0195_notification_steps.sql"
 )
 APP_NOTIFICATIONS_CUTOVER_MIGRATION = (
-    ROOT / "orchestrator/database/migrations/app/0194_notifications_cutover.sql"
+    ROOT / "orchestrator/database/migrations/app/0196_notifications_cutover.sql"
 )
 # Unified notification feed (slice 3: the cutover backfill) — the head after
-# the 0184-0190 managed-repository / stateless-input lane and the slice-1/2
+# the 0184-0192 managed-repository / stateless-input lane and the slice-1/2
 # feed tables; bump when the next lands.
 APP_PINNED_RECYCLE_AUTHORITY_MIGRATION = (
     ROOT
-    / "orchestrator/database/migrations/app/0198_pinned_agent_recycle_authority.sql"
+    / "orchestrator/database/migrations/app/0200_pinned_agent_recycle_authority.sql"
 )
-APP_PRE_REGISTRATION_SANDBOX_ZERO = (
-    ROOT / "orchestrator/database/migrations/app/0199_pre_registration_sandbox_zero.sql"
-)
-APP_PRE_REGISTRATION_DELETE_SANDBOX_ZERO = (
-    ROOT
-    / "orchestrator/database/migrations/app/0200_pre_registration_delete_sandbox_zero.sql"
-)
-APP_CURRENT_MIGRATION_HEAD = APP_PRE_REGISTRATION_DELETE_SANDBOX_ZERO
+APP_CURRENT_MIGRATION_HEAD = APP_PINNED_RECYCLE_AUTHORITY_MIGRATION
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -1016,7 +1016,7 @@ def test_managed_repository_legacy_reconciliation_migration_is_additive() -> Non
     raw = APP_MANAGED_REPOSITORY_LEGACY_RECONCILIATION.read_text()
     sql = _compact(raw)
 
-    assert "depends-on:    0187_compute_initial_recovery_epoch_authority.sql" in raw
+    assert "depends-on:    0189_compute_initial_recovery_epoch_authority.sql" in raw
     assert "transactional: yes" in raw
     assert "SET LOCAL lock_timeout = '2s'" in sql
     assert "CREATE TABLE public.managed_repository_legacy_reconciliations" in sql
@@ -1033,7 +1033,7 @@ def test_stateless_input_delivery_migration_fences_lane_and_old_claims() -> None
     raw = APP_STATELESS_INPUT_DELIVERIES.read_text()
     sql = _compact(raw)
 
-    assert "depends-on:    0188_managed_repository_legacy_reconciliation.sql" in raw
+    assert "depends-on:    0190_managed_repository_legacy_reconciliation.sql" in raw
     assert "transactional: yes" in raw
     assert "SET LOCAL lock_timeout = '2s'" in sql
     thread_lock = "LOCK TABLE public.threads IN SHARE ROW EXCLUSIVE MODE"
@@ -1063,7 +1063,7 @@ def test_stateless_input_delivery_migration_fences_lane_and_old_claims() -> None
     assert "stateless_input_delivery_requires_admission" in sql
 
     validation = _compact(APP_STATELESS_INPUT_DELIVERY_VALIDATION.read_text())
-    assert "depends-on:    0189_stateless_input_deliveries.sql" in (
+    assert "depends-on:    0191_stateless_input_deliveries.sql" in (
         APP_STATELESS_INPUT_DELIVERY_VALIDATION.read_text()
     )
     assert validation.count("VALIDATE CONSTRAINT thread_input_deliveries_") == 3
@@ -1356,7 +1356,7 @@ async def test_0185_refuses_claimed_pending_history_on_stateless_thread(
 
         with pytest.raises(
             asyncpg.CheckViolationError,
-            match="Pre-0189 stateless input history is ambiguous",
+            match="Pre-0191 stateless input history is ambiguous",
         ):
             await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
 
@@ -1442,7 +1442,7 @@ async def test_0185_refuses_numbered_pending_history_on_stateless_thread(
 
         with pytest.raises(
             asyncpg.CheckViolationError,
-            match="Pre-0189 stateless input history is ambiguous",
+            match="Pre-0191 stateless input history is ambiguous",
         ):
             await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
 
@@ -1462,38 +1462,96 @@ async def test_0185_refuses_numbered_pending_history_on_stateless_thread(
             await admin.close()
 
 
-def test_0199_pre_registration_sandbox_zero_is_bounded_and_forward_only() -> None:
-    raw = APP_PRE_REGISTRATION_SANDBOX_ZERO.read_text()
-    sql = _compact(raw)
+def test_deployed_pre_registration_migration_history_is_immutable() -> None:
+    assert hashlib.sha256(
+        APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO.read_bytes()
+    ).hexdigest() == (
+        "433c41d5e575d8d9da93dde29218a24bd7d3fb57c99e99e9dedcd46d35f22de2"
+    )
+    assert hashlib.sha256(
+        APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.read_bytes()
+    ).hexdigest() == (
+        "6f0ed6731a055d9795ef69e07147a7c8931efeff77ef6b25e7f38808b540bb7d"
+    )
+    assert (
+        "-- depends-on:    0186_protected_cloud_instance_authority.sql"
+        in APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO.read_text()
+    )
+    assert (
+        "-- depends-on:    0187_pre_registration_sandbox_zero.sql"
+        in APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.read_text()
+    )
 
-    assert "-- migration:     0199_pre_registration_sandbox_zero.sql" in raw
-    assert "-- depends-on:    0198_pinned_agent_recycle_authority.sql" in raw
-    assert "-- expected:      < 1s. Replace one trigger function" in raw
-    assert "-- locks:         Brief function-catalog lock" in raw
-    assert "-- transactional: yes" in raw
-    assert "pg_get_functiondef" in sql
-    assert "occurrence_count <> 1" in sql
-    assert "'sandbox_actuator_zero_v1'" in sql
-    assert "EXECUTE patched_definition" in sql
-    assert "0185_thread_runtime_generation_retirement.sql" not in sql
 
+@pytest.mark.asyncio
+async def test_deployed_0188_history_upgrades_to_current_head(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """The exact main-dev ledger advances without renaming applied files."""
 
-def test_0200_pre_registration_delete_sandbox_zero_is_bounded_and_forward_only() -> (
-    None
-):
-    raw = APP_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.read_text()
-    sql = _compact(raw)
+    dbname = f"deployed_0188_upgrade_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
 
-    assert "-- migration:     0200_pre_registration_delete_sandbox_zero.sql" in raw
-    assert "-- depends-on:    0199_pre_registration_sandbox_zero.sql" in raw
-    assert "-- expected:      < 1s. Replace one trigger function" in raw
-    assert "-- locks:         Brief function-catalog lock" in raw
-    assert "-- transactional: yes" in raw
-    assert "enforce_pinned_thread_delete_authority" in sql
-    assert "occurrence_count <> 1" in sql
-    assert "IS DISTINCT FROM expected_protocol" in sql
-    assert "EXECUTE patched_definition" in sql
-    assert "0185_thread_runtime_generation_retirement.sql" not in sql
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    deployed = tmp_path / "deployed-through-0188"
+    deployed.mkdir()
+    try:
+        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+            if path.name > APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.name:
+                break
+            (deployed / path.name).write_bytes(path.read_bytes())
+
+        await run_migrations(pool, deployed)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT filename, checksum FROM schema_migrations "
+                "WHERE filename IN ($1,$2) ORDER BY filename",
+                APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO.name,
+                APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.name,
+            )
+            assert [(row["filename"], row["checksum"]) for row in rows] == [
+                (
+                    APP_DEPLOYED_PRE_REGISTRATION_SANDBOX_ZERO.name,
+                    "433c41d5e575d8d9da93dde29218a24bd7d3fb57c99e99e9dedcd46d35f22de2",
+                ),
+                (
+                    APP_DEPLOYED_PRE_REGISTRATION_DELETE_SANDBOX_ZERO.name,
+                    "6f0ed6731a055d9795ef69e07147a7c8931efeff77ef6b25e7f38808b540bb7d",
+                ),
+            ]
+
+        await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT success FROM schema_migrations WHERE filename=$1",
+                APP_CURRENT_MIGRATION_HEAD.name,
+            )
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE success=FALSE)"
+            )
+            ended_definition = await conn.fetchval(
+                "SELECT pg_get_functiondef("
+                "'public.enforce_thread_ended_transition()'::regprocedure)"
+            )
+            delete_definition = await conn.fetchval(
+                "SELECT pg_get_functiondef("
+                "'public.enforce_pinned_thread_delete_authority()'::regprocedure)"
+            )
+            assert "sandbox_actuator_zero_v1" in ended_definition
+            assert "IS DISTINCT FROM expected_protocol" in delete_definition
+    finally:
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
 
 
 def test_0177_is_bounded_thread_only_and_keeps_0176_immutable() -> None:
@@ -1866,7 +1924,7 @@ def test_initial_compute_authority_accepts_only_proven_recovery_coverage() -> No
     raw = APP_COMPUTE_INITIAL_RECOVERY_AUTHORITY.read_text()
     sql = _compact(raw)
 
-    assert "depends-on:    0186_protected_cloud_instance_authority.sql" in raw
+    assert "depends-on:    0188_pre_registration_delete_sandbox_zero.sql" in raw
     assert (
         "CREATE OR REPLACE FUNCTION public."
         "protect_compute_metering_epoch_authority()" in sql

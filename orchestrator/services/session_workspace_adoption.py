@@ -5,7 +5,7 @@ previous release published ready Kubernetes *session* workspaces without the
 Pod UID that now forms execution authority, and named its one-shot create
 marker differently.  Neither is evidence that the same Pod still exists, so
 the pure resolver keeps rejecting those rows and this service is the sole
-bridge: it opens an exact ``adopt`` generation on the 0196 reservation ledger,
+bridge: it opens an exact ``adopt`` generation on the 0198 reservation ledger,
 proves the Pod against Kubernetes twice, publishes that observed UID onto the
 generation, and only then CASes the exact owner snapshot.
 
@@ -73,7 +73,7 @@ def _workspace(thread: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def legacy_k8s_thread_runtime_adoption_candidate(thread: Mapping[str, Any]) -> bool:
-    """Whether ``thread`` has the exact genuine pre-0195 ready session shape."""
+    """Whether ``thread`` has the exact genuine pre-0197 ready session shape."""
 
     if str(thread.get("execution_lane") or "") != "stateless":
         return False

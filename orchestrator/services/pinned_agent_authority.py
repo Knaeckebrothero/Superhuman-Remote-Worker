@@ -1,4 +1,4 @@
-"""Rollout reconciliation for pre-0198 pinned Kubernetes authority.
+"""Rollout reconciliation for pre-0200 pinned Kubernetes authority.
 
 0185 persisted exact create attempts and object UIDs but did not persist the
 Kubernetes namespace or protect objects with an SRW finalizer.  This module is
@@ -155,7 +155,7 @@ async def reconcile_pinned_warm_binding_protections(
     thread_id: str | None = None,
     limit: int = 50,
 ) -> LegacyPinnedAuthorityReconcileResult:
-    """Settle expired attach plans and pre-0198 reciprocal warm bindings."""
+    """Settle expired attach plans and pre-0200 reciprocal warm bindings."""
 
     list_legacy = getattr(db, "list_legacy_pinned_warm_binding_candidates", None)
     list_pending = getattr(db, "list_expired_pinned_warm_binding_protections", None)
@@ -321,7 +321,7 @@ async def reconcile_pinned_warm_binding_protections(
                     continue
                 status = "protected"
             elif source == "legacy_binding":
-                # The reciprocal pre-0198 binding is itself durable ownership,
+                # The reciprocal pre-0200 binding is itself durable ownership,
                 # so its reconciler can retry protection at the current exact
                 # UID/resourceVersion without manufacturing an orphan owner.
                 evidence = await protect(row)

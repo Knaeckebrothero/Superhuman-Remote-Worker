@@ -48290,7 +48290,7 @@ async def agent_abort_thread_vm_upgrade(
         # An accepted/absent control-plane response is not process-zero for a
         # partitioned guest. Preserve the exact generation and retry handle;
         # marking it aborted would hide a potentially credential-capable VM
-        # from both the lifecycle owner and migration 0187.
+        # from both the lifecycle owner and migration 0189.
         raise HTTPException(
             status_code=503,
             detail={

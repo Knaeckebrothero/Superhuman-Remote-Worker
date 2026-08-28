@@ -1004,7 +1004,7 @@ class AgentProvisioner:
     async def protect_legacy_pinned_agent_authority(
         self, authority: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Grandfather one exact pre-0198 session Pod/PVC tuple."""
+        """Grandfather one exact pre-0200 session Pod/PVC tuple."""
 
         if not self._k8s_available or self._core_api is None:
             return None

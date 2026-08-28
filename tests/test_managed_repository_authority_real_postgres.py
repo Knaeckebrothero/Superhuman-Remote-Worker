@@ -280,7 +280,7 @@ async def test_legacy_thread_can_detach_but_cannot_reattach_before_adoption(db):
             "'persistent')",
             old_agent_id,
         )
-        # A pinned thread that was already attached when 0198 landed. Its
+        # A pinned thread that was already attached when 0200 landed. Its
         # planned -> protected bind edge did not exist when this row was
         # written, and the subject here is repository authority above it.
         async with previous_release_writer(
@@ -373,7 +373,7 @@ async def test_legacy_thread_can_detach_but_cannot_reattach_before_adoption(db):
         db, _gitea(probe=True), await db.get_thread(thread_id)
     )
     async with db.acquire() as conn:
-        # 0176's repository fence is the subject; 0198's separate pinned
+        # 0176's repository fence is the subject; 0200's separate pinned
         # protection edge has its own proofs and is not what this rebind is
         # demonstrating.
         async with previous_release_writer(
@@ -1386,7 +1386,7 @@ async def test_previous_release_thread_write_is_stripped_and_attach_fenced(db):
     assert adopted_workspace["git_remote_url"] == clean_url
     assert "_managed_repository_authority_pending" not in adopted_workspace
     async with db.acquire() as conn:
-        # 0176's repository fence is the subject; 0198's separate pinned
+        # 0176's repository fence is the subject; 0200's separate pinned
         # protection edge has its own proofs and is not what this bind is
         # demonstrating.
         async with previous_release_writer(

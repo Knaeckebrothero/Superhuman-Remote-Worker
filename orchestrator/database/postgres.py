@@ -4528,7 +4528,7 @@ class PostgresDB:
     async def managed_repository_workspace_cleanup_activation_inventory(
         self,
     ) -> dict[str, int | bool]:
-        """Return a credential-free, fail-closed 0195 activation inventory."""
+        """Return a credential-free, fail-closed 0197 activation inventory."""
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -9753,7 +9753,7 @@ class PostgresDB:
         expected_workspace: Mapping[str, Any],
         adopted_workspace: Mapping[str, Any],
     ) -> bool:
-        """CAS one live-attested pre-0195 Kubernetes session runtime.
+        """CAS one live-attested pre-0197 Kubernetes session runtime.
 
         The thread twin of the job CAS.  Kubernetes supplies the provenance;
         PostgreSQL only proves that the status, lane, runtime generation and
@@ -9801,7 +9801,7 @@ class PostgresDB:
         return row is not None
 
     async def list_uidless_k8s_thread_workspace_rows(self) -> list[dict[str, Any]]:
-        """Read-only rollout inventory for genuine pre-0195 session contexts."""
+        """Read-only rollout inventory for genuine pre-0197 session contexts."""
 
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -12886,7 +12886,7 @@ class PostgresDB:
         The provisioner authenticates the terminal Pod's immutable UID and
         owner labels before this method is called. This transaction then locks
         the surviving owner and requires it to point at a structurally valid,
-        different Kubernetes runtime. Migration 0195 serializes on the same
+        different Kubernetes runtime. Migration 0197 serializes on the same
         row and permanently prevents rebinding the owner to the retired UID.
         """
 
@@ -13299,7 +13299,7 @@ class PostgresDB:
                 # for.  It recognises only what the previous release could
                 # genuinely have written: a ready Kubernetes workspace with no
                 # Pod UID and no reservation keys at all.  Anything a
-                # post-0196 writer produced carries one of those keys, so an
+                # post-0198 writer produced carries one of those keys, so an
                 # `adopt` generation can never be pointed at current
                 # authority, and the reservation it opens still proves nothing
                 # by itself -- the Pod UID is published only from an external
@@ -13338,7 +13338,7 @@ class PostgresDB:
                         # A thread cleanup with target=deleted intentionally
                         # clears its retired Pod UID.  That projection is not
                         # an empty historical slot: only the exact atomically
-                        # settled 0195 generation may reopen it for a reserved
+                        # settled 0197 generation may reopen it for a reserved
                         # successor.  Stamp-less/non-settled deleted states
                         # remain fail closed over deterministic resource names.
                         uidless_settled_cleanup = bool(
@@ -30579,7 +30579,7 @@ class PostgresDB:
     async def list_legacy_pinned_warm_binding_candidates(
         self, *, thread_id: str | None = None, limit: int = 50
     ) -> list[dict[str, Any]]:
-        """List pre-0198 reciprocal pool bindings that lack K8s coordinates."""
+        """List pre-0200 reciprocal pool bindings that lack K8s coordinates."""
 
         bounded = max(1, min(int(limit), 500))
         try:
@@ -37085,7 +37085,7 @@ class PostgresDB:
 
         A dedicated Pod marker is supplemental physical authority.  When it
         exists it must name this exact agent, generation, and durable
-        provision attempt.  0198 warm bindings carry an exact protection
+        provision attempt.  0200 warm bindings carry an exact protection
         receipt instead; marker-free pool bindings are rollout candidates and
         cannot cross this credential-delivery boundary.
         """

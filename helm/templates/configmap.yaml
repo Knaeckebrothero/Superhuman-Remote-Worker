@@ -462,7 +462,7 @@ data:
   # Exact-owner lifecycle CAS. Migration 0185 uses a drained maintenance
   # cutover, so every post-cutover pinned runtime must carry this identity.
   REQUIRE_PINNED_STATUS_IDENTITY: {{ .Values.agent.requirePinnedStatusIdentity | default "true" | quote }}
-  # 0198 never guesses where a historical NULL-namespace authority lives.
+  # 0200 never guesses where a historical NULL-namespace authority lives.
   # The active Release.Namespace is searched automatically; this is the
   # bounded, operator-owned set of prior namespaces retained for adoption.
   PINNED_LEGACY_AGENT_NAMESPACES: {{ .Values.agent.pinnedLegacyNamespaces | default list | uniq | join "," | quote }}

@@ -27,14 +27,14 @@ PROCESS_ZERO_MIGRATION = (
     / "database"
     / "migrations"
     / "app"
-    / "0191_managed_repository_process_zero_authority.sql"
+    / "0193_managed_repository_process_zero_authority.sql"
 )
 
 
 async def _execute_pre_0195(conn, query: str, *args):
     """Seed a previous-release row without teaching production a bypass.
 
-    0195/0196 fence a raw owner INSERT/UPDATE that already carries a
+    0197/0198 fence a raw owner INSERT/UPDATE that already carries a
     Kubernetes runtime projection. These fixtures deliberately install such a
     row to prove the *process-zero* boundary above it, so they seed the way
     the migration encounters existing data -- with only those named fences
@@ -230,7 +230,7 @@ async def test_managed_repository_process_zero_uses_server_owned_exact_ledger(
             == 1
         )
         # Swapping a live runtime identity under a recorded receipt is what
-        # 0196 now forbids outright. The subject here is the *ledger* going
+        # 0198 now forbids outright. The subject here is the *ledger* going
         # stale, so reproduce the previous release's writer rather than
         # re-testing the rebind fence that has its own proofs.
         await _execute_pre_0195(

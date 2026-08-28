@@ -1,7 +1,7 @@
--- migration:     0196_non_pinned_workspace_lifecycle_authority.sql
+-- migration:     0198_non_pinned_workspace_lifecycle_authority.sql
 -- description:   Persist exact non-pinned workspace creation, restore, and
 --                cleanup generations with crash-safe external-effect receipts.
--- depends-on:    0195_non_pinned_workspace_process_zero.sql
+-- depends-on:    0197_non_pinned_workspace_process_zero.sql
 -- expected:      < 5s. Empty ledgers, functions, and row triggers only; no
 --                historical scan or owner-row rewrite.
 -- locks:         Brief SHARE ROW EXCLUSIVE locks on jobs and threads for

@@ -1,4 +1,4 @@
--- migration:     0194_notifications_cutover.sql
+-- migration:     0196_notifications_cutover.sql
 -- description:   Slice 3 of the unified notification system (knowledge-base/
 --                knowledge/features/unified_notification_system.md §6): the
 --                cockpit now reads ONLY the feed, so the items the legacy
@@ -7,7 +7,7 @@
 --                recent unanswered agent messages. The two retired stores are
 --                commented as such; they are NOT dropped here (a later
 --                migration, once the rollout has proven out).
--- depends-on:    0193_notification_steps.sql
+-- depends-on:    0195_notification_steps.sql
 -- expected:      < 5s. Three bounded INSERT … SELECT statements (open items
 --                only); no existing table is altered.
 -- locks:         none beyond row inserts into notifications.
@@ -191,10 +191,10 @@ WHERE m.direction = 'outbound'
 ON CONFLICT (id) DO NOTHING;
 
 COMMENT ON TABLE public.notification_queue IS
-    'RETIRED (0193, unified notification system slice 3): the quiet-hours digest queue. '
+    'RETIRED (0195, unified notification system slice 3): the quiet-hours digest queue. '
     'Deferred delivery is a notification_steps row now. Kept until a later DROP.';
 COMMENT ON TABLE public.thread_notifications IS
-    'RETIRED (0193, unified notification system slice 3): the headless permission-email '
+    'RETIRED (0195, unified notification system slice 3): the headless permission-email '
     'audit table. Deliveries are notification_deliveries rows now. Kept until a later DROP.';
 
 COMMIT;

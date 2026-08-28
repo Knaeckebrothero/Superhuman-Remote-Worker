@@ -1,7 +1,7 @@
--- migration:     0189_stateless_input_deliveries.sql
+-- migration:     0191_stateless_input_deliveries.sql
 -- description:   Admit durable event input on stateless session turns with
 --                exact queue-lease fencing.
--- depends-on:    0188_managed_repository_legacy_reconciliation.sql
+-- depends-on:    0190_managed_repository_legacy_reconciliation.sql
 -- expected:      < 1s. Adds nullable provenance columns, adopts only genuine
 --                unclaimed/unadmitted stateless wake rows, assigns those old
 --                NULL-turn inputs fresh executable turn identities, and
@@ -74,7 +74,7 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '23514',
             CONSTRAINT = 'stateless_input_delivery_history_ambiguous',
-            MESSAGE = 'Pre-0189 stateless input history is ambiguous',
+            MESSAGE = 'Pre-0191 stateless input history is ambiguous',
             DETAIL = format(
                 '%s pending row(s) retain claimed or unsupported pinned authority',
                 ambiguous_count

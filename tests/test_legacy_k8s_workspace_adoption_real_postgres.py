@@ -1,10 +1,10 @@
 """Real-PostgreSQL proof for the bounded legacy Kubernetes adoption bridge.
 
-Migrations 0195-0198 give every Kubernetes workspace runtime a durable
+Migrations 0197-0200 give every Kubernetes workspace runtime a durable
 reservation and an exact Pod UID.  Rows the previous release wrote have
 neither: a ready endpoint and, for a session, a create marker under its older
 name.  This module proves the one path that converts such a row -- an `adopt`
-generation on the 0196 reservation ledger, published only from an external
+generation on the 0198 reservation ledger, published only from an external
 Kubernetes attestation -- and proves that everything else about it stays fail
 closed.
 """
@@ -524,7 +524,7 @@ async def test_job_and_session_adoption_share_one_ledger_contract(db):
     """The job bridge writes the same generation shape as the session one."""
 
     job = await db.create_job(
-        description="pre-0195 Kubernetes job runtime",
+        description="pre-0197 Kubernetes job runtime",
         config_override={"workspace": {"backend": "sandbox"}},
     )
     async with db.acquire() as conn:

@@ -115,10 +115,10 @@ for pod_ref in "${orchestrators[@]}"; do
     kubectl --context="$EXPECTED_CONTEXT" -n "$NAMESPACE" \
         exec "$pod_ref" -c orchestrator -- sh -ceu '
             test -f /app/operator_cli/stateless_wake_acceptance.py
-            test -f /app/database/migrations/app/0189_stateless_input_deliveries.sql
-            test -f /app/database/migrations/app/0190_stateless_input_delivery_validate.sql
-            test -f /app/database/migrations/app/0195_non_pinned_workspace_process_zero.sql
-            test -f /app/database/migrations/app/0196_non_pinned_workspace_lifecycle_authority.sql
+            test -f /app/database/migrations/app/0191_stateless_input_deliveries.sql
+            test -f /app/database/migrations/app/0192_stateless_input_delivery_validate.sql
+            test -f /app/database/migrations/app/0197_non_pinned_workspace_process_zero.sql
+            test -f /app/database/migrations/app/0198_non_pinned_workspace_lifecycle_authority.sql
             test "$WORKSPACE_CLEANUP_RECONCILIATION_ENABLED" = false
             test "$WORKSPACE_REATTACH_FRESH_FALLBACK" = false
             test "$OFFICER_AUTO_PULL_RELEASE_ENABLED" = false

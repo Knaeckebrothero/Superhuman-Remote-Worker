@@ -63,7 +63,7 @@ def _orchestrator_env(deployment: dict) -> dict:
 
 def test_runtime_authority_migration_defaults_to_rolling_refusal() -> None:
     # Recreate is the chart default, but it comes from the independent
-    # 0195/0196 ServiceAccount cutover flag -- not from acknowledging the
+    # 0197/0198 ServiceAccount cutover flag -- not from acknowledging the
     # runtime-authority migration. Both halves matter: with every cutover flag
     # off the orchestrator is back on RollingUpdate, and an unacknowledged
     # migration gate stays empty either way, so a rolling rollout can never

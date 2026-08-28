@@ -28,8 +28,8 @@ NON_PINNED_LIFECYCLE_MIGRATIONS = tuple(
     / "app"
     / filename
     for filename in (
-        "0195_non_pinned_workspace_process_zero.sql",
-        "0196_non_pinned_workspace_lifecycle_authority.sql",
+        "0197_non_pinned_workspace_process_zero.sql",
+        "0198_non_pinned_workspace_lifecycle_authority.sql",
     )
 )
 
@@ -923,7 +923,7 @@ async def test_workspace_settlement_is_idempotent_but_rejects_successor(db):
         "pod_ip": "10.42.0.91",
     }
     async with db.acquire() as conn:
-        # This models a successor published before 0195 installed its raw
+        # This models a successor published before 0197 installed its raw
         # writer fence.  New writers must use a reservation and an ended
         # thread cannot reserve one, but the old cleanup replay still needs to
         # reject a genuine historical successor without mutating it.

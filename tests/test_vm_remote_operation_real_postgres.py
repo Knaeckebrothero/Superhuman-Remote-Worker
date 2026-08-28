@@ -19,7 +19,7 @@ from src.shared.workspace_contract import workspace_contract_authority_identity
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_FILE = ROOT / "orchestrator/database/schema_current.sql"
 MIGRATION = ROOT / (
-    "orchestrator/database/migrations/app/0197_vm_remote_operation_leases.sql"
+    "orchestrator/database/migrations/app/0199_vm_remote_operation_leases.sql"
 )
 FINGERPRINT = "SHA256:" + "A" * 43
 
@@ -57,7 +57,7 @@ async def db(pg_dsn, _schema_applied):
             "TRUNCATE vm_remote_operation_leases, jobs, threads, users CASCADE"
         )
         # schema_current.sql is intentionally schema-only, while migration
-        # 0197 seeds this singleton. Mirror that seed for snapshot-based tests.
+        # 0199 seeds this singleton. Mirror that seed for snapshot-based tests.
         await conn.execute(
             "INSERT INTO vm_remote_operation_protocol_gate ("
             "singleton, protocol_version, activated_at, activated_by) "
@@ -474,9 +474,9 @@ async def test_active_lease_blocks_owner_delete_then_settlement_reopens(db, owne
     cleanup_trigger = f"trg_{table}_c_require_workspace_cleanup_before_delete"
 
     async with db.acquire() as conn:
-        # Isolate the 0197 veto from 0195's independent terminal workspace
+        # Isolate the 0199 veto from 0197's independent terminal workspace
         # cleanup contract when that sibling migration is present. This test
-        # also runs against the schema snapshot plus 0197 alone.
+        # also runs against the schema snapshot plus 0199 alone.
         cleanup_trigger_present = await conn.fetchval(
             "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid=$1::regclass "
             "AND tgname=$2 AND NOT tgisinternal)",

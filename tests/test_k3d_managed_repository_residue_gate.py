@@ -240,9 +240,9 @@ def test_controller_fixture_has_no_post_or_auto_pull_mutation() -> None:
     program = gate.controller_program()
     assert "managed_repository_process_zero_receipts" in program
     assert "_release_process_zero_finalizer" in program
-    assert "0191_managed_repository_process_zero_authority.sql" in program
-    assert "0195_non_pinned_workspace_process_zero.sql" in program
-    assert "0196_non_pinned_workspace_lifecycle_authority.sql" in program
+    assert "0193_managed_repository_process_zero_authority.sql" in program
+    assert "0197_non_pinned_workspace_process_zero.sql" in program
+    assert "0198_non_pinned_workspace_lifecycle_authority.sql" in program
     assert "stale_managed_repository_workspace_process_zero_is_current" in program
     assert "_managed_repository_process_zero_replay_is_current" in program
     assert 'mode == "finalizer-release-lost"' in program
@@ -583,7 +583,7 @@ def test_artifact_preflight_checks_agent_code_and_workspace_binaries() -> None:
     for agent in calls[2:4]:
         assert agent[0][2:4] == ["-c", "agent"]
         assert b"9>&-" in (agent[1] or b"")
-    assert b"/app/database/migrations/app/0195_" in (calls[0][1] or b"")
+    assert b"/app/database/migrations/app/0197_" in (calls[0][1] or b"")
     assert b"record_managed_repository_workspace_creation_resource" in (
         calls[0][1] or b""
     )

@@ -329,7 +329,7 @@ async def ensure_legacy_k8s_job_runtime_authority(
     # reservation and needs no adoption marker. Leaving the predecessor's
     # marker there would make every later pre-network check re-attest a Pod
     # that is gone and refuse delivery for good, so retire it -- the marker is
-    # not part of the 0196 authority envelope, and nothing else moves.
+    # not part of the 0198 authority envelope, and nothing else moves.
     current_runtime = workspace.get("_runtime_incarnation")
     if (
         isinstance(marker, Mapping)
@@ -388,7 +388,7 @@ async def ensure_legacy_k8s_job_runtime_authority(
         )
 
     # Open the exact durable generation the create fence asks for *before*
-    # the owner row is stamped.  0196 authorises a new Pod UID only against a
+    # the owner row is stamped.  0198 authorises a new Pod UID only against a
     # runtime-bound reservation, so an adoption that skipped this would have
     # to be waved through by the trigger -- which would equally wave through
     # any writer that invented a UID.  The reservation is refused outright

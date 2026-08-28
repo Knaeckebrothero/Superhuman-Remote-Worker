@@ -758,7 +758,7 @@ class WorkspaceSuspensionService:
         if is_kubernetes_capture_context(ctx) or not vm_ctx:
             # Temporary containment: a stale Kubernetes endpoint (including a
             # stable Service whose selector now names successor B) is not
-            # capture authority for predecessor A.  Migration 0195 cleanup
+            # capture authority for predecessor A.  Migration 0197 cleanup
             # intents start at process-zero teardown and therefore cannot make
             # the preceding snapshot/profile reads crash-safe.  Refuse before
             # resolving/dialing any endpoint or mutating owner state; a future

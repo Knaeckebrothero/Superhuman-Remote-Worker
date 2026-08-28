@@ -1,6 +1,6 @@
 """Install rows the previous release wrote, the way the migrations met them.
 
-Migrations 0195-0198 fence a *writer* that publishes Kubernetes or pinned
+Migrations 0197-0200 fence a *writer* that publishes Kubernetes or pinned
 runtime authority with no durable reservation, protection or receipt behind
 it.  Rows written before those migrations were never subject to that fence:
 the triggers did not exist when the rows were written.  A real-PostgreSQL
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-# 0196 owner-envelope + creation-reservation authority, and the 0191/0195
+# 0198 owner-envelope + creation-reservation authority, and the 0193/0197
 # process-zero transition fence they build on.
 JOB_RUNTIME_AUTHORITY_TRIGGERS = (
     "trg_jobs_require_workspace_creation_reservation_on_insert",
@@ -32,7 +32,7 @@ THREAD_RUNTIME_AUTHORITY_TRIGGERS = (
     "trg_threads_d_validate_workspace_authority_envelope",
     "trg_threads_enforce_managed_repository_process_zero",
 )
-# 0198's planned -> protected pinned bind edge.
+# 0200's planned -> protected pinned bind edge.
 PINNED_BINDING_AUTHORITY_TRIGGERS = ("zzz_threads_pinned_warm_binding_authority",)
 
 _DEFAULT = {

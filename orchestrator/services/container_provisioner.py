@@ -3818,7 +3818,7 @@ class ContainerProvisioner:
         # The typed cleanup reconciler owns every external mutation and checks
         # the exact claim immediately before Pod/finalizer/seed operations.
         # Keeping terminal recreation on that one path prevents a second,
-        # subtly weaker delete protocol from bypassing migration 0195.
+        # subtly weaker delete protocol from bypassing migration 0197.
         return await self._clear_prepared_terminal_workspace_runtime(
             owner,
             generation=generation,
@@ -5133,7 +5133,7 @@ class ContainerProvisioner:
 
         A committed finalizer patch can lose its response and leave a later
         cleanup attempt observing only Pod 404. Normal receipts remain valid
-        while the owner points at that runtime. Migration 0195 additionally
+        while the owner points at that runtime. Migration 0197 additionally
         permits an exact stale receipt while the locked owner points at a
         different, structurally valid Kubernetes runtime. Do not probe a
         dynamically fabricated stale method on test doubles: production
@@ -6112,7 +6112,7 @@ class ContainerProvisioner:
         *,
         limit: int,
     ) -> None:
-        """Discover retained exact terminal Pods missing a 0195 intent.
+        """Discover retained exact terminal Pods missing a 0197 intent.
 
         Only an absent owner or an owner already naming a different valid
         runtime is eligible.  Current runtimes—including unresolved terminal
@@ -7078,7 +7078,7 @@ class ContainerProvisioner:
         # This operation owns only the exact Pod and its Pod-owned seed. Durable
         # context and shared PVC/Service settlement belong to the caller's
         # lifecycle-authorized release step. Keeping ``retiring_process_zero``
-        # here lets migration 0195 fence every replacement bind until that step
+        # here lets migration 0197 fence every replacement bind until that step
         # has succeeded.
         return _CURRENT_RUNTIME_DELETED
 

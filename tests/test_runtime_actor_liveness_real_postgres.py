@@ -151,9 +151,9 @@ async def _seed_officer(db: PostgresDB) -> dict[str, str]:
             UUID(ids["agent_id"]),
             ids["pod_uid"],
         )
-        # These fixtures model a pinned binding already live when 0198 lands;
+        # These fixtures model a pinned binding already live when 0200 lands;
         # their subject is runtime-actor liveness, not the bind authority,
-        # which has its own suites. Only 0198's named bind edge is stood down
+        # which has its own suites. Only 0200's named bind edge is stood down
         # -- never every trigger and foreign key in the statement.
         async with previous_release_writer(
             conn, "threads", *PINNED_BINDING_AUTHORITY_TRIGGERS
@@ -162,7 +162,7 @@ async def _seed_officer(db: PostgresDB) -> dict[str, str]:
                 await conn.execute(
                     "UPDATE threads SET agent_id = $2, "
                     "control_admission_agent_id = $2, runtime_attach_token = $3, "
-                    # An already-adopted 0198 binding: Begin refuses a bound
+                    # An already-adopted 0200 binding: Begin refuses a bound
                     # pinned thread whose Pod marker is absent
                     # (`agent_warm_binding_adoption_required`), and legacy
                     # adoption has its own suites.
@@ -224,7 +224,7 @@ async def _replace_officer_binding(db: PostgresDB, ids: dict[str, str]) -> str:
             UUID(successor),
         )
         async with conn.transaction():
-            # These fixtures model a pinned binding already live when 0198
+            # These fixtures model a pinned binding already live when 0200
             # lands; their subject is runtime-actor liveness, not the bind
             # authority, which has its own suites.
             await conn.execute("SET LOCAL session_replication_role = 'replica'")

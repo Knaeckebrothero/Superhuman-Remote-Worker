@@ -1,4 +1,4 @@
-"""Unified notification feed against a real PostgreSQL (migration 0191).
+"""Unified notification feed against a real PostgreSQL (migration 0193).
 
 Mocked ``conn.execute`` cannot catch what these are for: the idempotent
 insert racing itself, the partial-unique claim index, keyset pagination with
@@ -439,7 +439,7 @@ async def _steps(db, nid):
 
 
 class TestSteps:
-    """Migration 0192: the deferred-step table under the sweeper's access
+    """Migration 0194: the deferred-step table under the sweeper's access
     pattern — claim under contention, lease expiry, cancel-on-resolve in the
     same statement, defer/retry releasing the claim."""
 
@@ -771,13 +771,13 @@ class TestStepsEndToEnd:
 
 
 class TestCutoverBackfill:
-    """Migration 0193: the items the legacy joins derived on read become feed
+    """Migration 0195: the items the legacy joins derived on read become feed
     rows, minted with the same uuid5 the orchestrator uses, with the same
     action shapes the catalog serialises, and only for OPEN items."""
 
     MIGRATION = (
         Path(__file__).resolve().parents[1]
-        / "orchestrator/database/migrations/app/0194_notifications_cutover.sql"
+        / "orchestrator/database/migrations/app/0196_notifications_cutover.sql"
     )
 
     async def _seed(self, db):
@@ -914,4 +914,4 @@ class TestCutoverBackfill:
             comment = await conn.fetchval(
                 "SELECT obj_description('public.notification_queue'::regclass)"
             )
-        assert comment and comment.startswith("RETIRED (0193")
+        assert comment and comment.startswith("RETIRED (0195")

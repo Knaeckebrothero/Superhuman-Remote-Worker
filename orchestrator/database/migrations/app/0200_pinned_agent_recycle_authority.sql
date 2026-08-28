@@ -1,7 +1,7 @@
--- migration:     0198_pinned_agent_recycle_authority.sql
+-- migration:     0200_pinned_agent_recycle_authority.sql
 -- description:   Add exact Kubernetes namespace/finalizer coordinates and
 --                append-only persistent-agent Pod recycle handoffs.
--- depends-on:    0197_vm_remote_operation_leases.sql
+-- depends-on:    0199_vm_remote_operation_leases.sql
 -- expected:      < 5s. Two nullable legacy columns, two empty authority
 --                ledgers, and row triggers; no historical scan or rewrite.
 -- locks:         Brief ACCESS EXCLUSIVE locks on the two 0185 pinned-agent

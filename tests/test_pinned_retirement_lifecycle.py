@@ -151,7 +151,7 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically():
     db = MagicMock()
     db.list_legacy_pinned_agent_k8s_authority_candidates = AsyncMock(return_value=[])
     db.adopt_legacy_pinned_agent_k8s_authority = AsyncMock(return_value=False)
-    # 0198 runs the server-owned legacy/warm adoption reconciler before Begin
+    # 0200 runs the server-owned legacy/warm adoption reconciler before Begin
     # may install T. With nothing to adopt it is a no-op, but the seams must
     # be awaitable or Begin reports an adoption failure instead.
     db.list_legacy_pinned_warm_binding_candidates = AsyncMock(return_value=[])
@@ -396,7 +396,7 @@ async def test_restart_reconciler_promotes_only_exact_agent_create(foreign_kind)
     db.list_pinned_agent_create_intents_for_reconcile = AsyncMock(side_effect=_list)
     db.list_legacy_pinned_agent_k8s_authority_candidates = AsyncMock(return_value=[])
     db.adopt_legacy_pinned_agent_k8s_authority = AsyncMock(return_value=False)
-    # 0198 runs the server-owned legacy/warm adoption reconciler before Begin
+    # 0200 runs the server-owned legacy/warm adoption reconciler before Begin
     # may install T. With nothing to adopt it is a no-op, but the seams must
     # be awaitable or Begin reports an adoption failure instead.
     db.list_legacy_pinned_warm_binding_candidates = AsyncMock(return_value=[])
@@ -479,7 +479,7 @@ async def test_leader_adopts_exact_legacy_authority_before_create_reconcile():
     db.list_expired_pinned_warm_binding_protections = AsyncMock(return_value=[])
     db.list_legacy_pinned_agent_k8s_authority_candidates = AsyncMock(return_value=[row])
     db.adopt_legacy_pinned_agent_k8s_authority = AsyncMock(return_value=True)
-    # 0198 runs the server-owned legacy/warm adoption reconciler before Begin
+    # 0200 runs the server-owned legacy/warm adoption reconciler before Begin
     # may install T. With nothing to adopt it is a no-op, but the seams must
     # be awaitable or Begin reports an adoption failure instead.
     db.list_legacy_pinned_warm_binding_candidates = AsyncMock(return_value=[])

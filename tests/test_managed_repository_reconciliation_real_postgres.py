@@ -135,7 +135,7 @@ async def _legacy_writes(conn):
 
 @asynccontextmanager
 async def _pre_0196_thread_workspace_insert(conn):
-    """Seed the exact UID-less runtime shape accepted before migration 0196."""
+    """Seed the exact UID-less runtime shape accepted before migration 0198."""
 
     trigger = "trg_threads_require_workspace_creation_reservation_on_insert"
     await conn.execute(f"ALTER TABLE threads DISABLE TRIGGER {trigger}")

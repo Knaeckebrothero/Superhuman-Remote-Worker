@@ -20,10 +20,10 @@ UIDs.
   selected Pod, and one actual image digest per component. The wrapper checks
   symbols inside every running container. A successful rollout or tag alone is
   not evidence.
-- Migrations `0189_stateless_input_deliveries.sql`,
-  `0190_stateless_input_delivery_validate.sql`,
-  `0195_non_pinned_workspace_process_zero.sql`, and
-  `0196_non_pinned_workspace_lifecycle_authority.sql` must be successful, with
+- Migrations `0191_stateless_input_deliveries.sql`,
+  `0192_stateless_input_delivery_validate.sql`,
+  `0197_non_pinned_workspace_process_zero.sql`, and
+  `0198_non_pinned_workspace_lifecycle_authority.sql` must be successful, with
   all constraints validated and trigger fences present. The migration ledger
   must have no `success=false` row. Later additive migrations are allowed.
 - At least two stateless executor Pods must be Ready. No unrelated queued or

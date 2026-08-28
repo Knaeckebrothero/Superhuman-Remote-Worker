@@ -1,7 +1,7 @@
--- migration:     0190_stateless_input_delivery_validate.sql
+-- migration:     0192_stateless_input_delivery_validate.sql
 -- description:   Validate the lane and owner constraints installed NOT VALID
 --                by 0185 after its rollout-serialized historical backfill.
--- depends-on:    0189_stateless_input_deliveries.sql
+-- depends-on:    0191_stateless_input_deliveries.sql
 -- expected:      < 1s. Three scans of the bounded input-delivery ledger. The
 --                preceding migration already rewrote every genuine historical
 --                row from its locked owning-thread lane. A failure therefore

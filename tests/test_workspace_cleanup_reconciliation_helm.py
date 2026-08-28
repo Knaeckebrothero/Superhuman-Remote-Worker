@@ -68,7 +68,7 @@ def test_workspace_cleanup_reconciliation_defaults_false() -> None:
     assert values["orchestrator"]["workspaceCleanupReconciliationEnabled"] is False
     assert values["orchestrator"]["workspaceLifecycleProtocolCutoverEnabled"] is True
     assert (
-        values["orchestrator"]["workspaceLifecycleServiceAccountGeneration"] == "0195"
+        values["orchestrator"]["workspaceLifecycleServiceAccountGeneration"] == "0197"
     )
     assert values["workspace"]["freshFallback"] is False
 
@@ -110,10 +110,10 @@ def test_workspace_cleanup_reconciliation_checksum_does_not_require_reloader() -
 
 def test_workspace_lifecycle_epoch_revokes_predecessor_service_account() -> None:
     old_documents = _render_documents(
-        "--set", "orchestrator.workspaceLifecycleServiceAccountGeneration=0194"
+        "--set", "orchestrator.workspaceLifecycleServiceAccountGeneration=0196"
     )
     current_documents = _render_documents(
-        "--set", "orchestrator.workspaceLifecycleServiceAccountGeneration=0195"
+        "--set", "orchestrator.workspaceLifecycleServiceAccountGeneration=0197"
     )
 
     def authority(documents: list[dict]) -> tuple[str, list[str], dict]:
@@ -204,7 +204,7 @@ def test_recreate_composes_with_vm_protocol() -> None:
     assert deployment["spec"]["strategy"]["type"] == "Recreate"
 
 
-@pytest.mark.parametrize("invalid", ["bad epoch", "bad/epoch", ".0195", "x" * 17])
+@pytest.mark.parametrize("invalid", ["bad epoch", "bad/epoch", ".0197", "x" * 17])
 def test_workspace_lifecycle_epoch_rejects_invalid_service_account_values(
     invalid: str,
 ) -> None:
@@ -253,5 +253,5 @@ def test_long_release_name_retains_epoch_suffix() -> None:
         for doc in documents
         if doc.get("kind") == "ServiceAccount" and "-ows" in doc["metadata"]["name"]
     )
-    assert account.endswith("-ows0195")
+    assert account.endswith("-ows0197")
     assert len(account) <= 63

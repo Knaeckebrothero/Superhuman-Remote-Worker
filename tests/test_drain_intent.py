@@ -548,7 +548,7 @@ class TestOrchestratorInactiveCapabilityFence:
         db.acknowledge_pinned_thread_local_quiescence = AsyncMock(
             return_value={"version": 1}
         )
-        # 0198 runs the server-owned legacy/warm adoption reconciler before
+        # 0200 runs the server-owned legacy/warm adoption reconciler before
         # Begin may install T; with nothing to adopt it is a no-op, but its
         # seams must be awaitable.
         db.list_legacy_pinned_agent_k8s_authority_candidates = AsyncMock(

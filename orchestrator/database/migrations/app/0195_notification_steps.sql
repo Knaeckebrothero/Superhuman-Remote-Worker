@@ -1,10 +1,10 @@
--- migration:     0193_notification_steps.sql
+-- migration:     0195_notification_steps.sql
 -- description:   Pending channel steps for the unified notification feed — the
 --                escalate-on-timeout engine's work table (knowledge-base/knowledge/
 --                features/unified_notification_system.md D5/D6/D8). A delay is not
 --                its own row: it is the ``due_at`` of the channel step that follows
 --                it. Slice 2 of three: one new table only.
--- depends-on:    0192_notifications.sql
+-- depends-on:    0194_notifications.sql
 -- expected:      < 5s. One new empty table; no existing table is touched.
 -- locks:         none on existing tables (the FK takes SHARE ROW EXCLUSIVE on
 --                notifications, which is empty-or-tiny and has no writers yet).

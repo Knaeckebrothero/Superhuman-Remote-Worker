@@ -1,7 +1,7 @@
--- migration:     0188_managed_repository_legacy_reconciliation.sql
+-- migration:     0190_managed_repository_legacy_reconciliation.sql
 -- description:   Add restart-safe intents for reconciling legacy managed
 --                repository URLs without rewriting historical rows.
--- depends-on:    0187_compute_initial_recovery_epoch_authority.sql
+-- depends-on:    0189_compute_initial_recovery_epoch_authority.sql
 -- expected:      < 1s. Two empty tables, one sequence, two indexes, and three
 --                fail-closed/audit triggers; no
 --                historical row scan or rewrite.

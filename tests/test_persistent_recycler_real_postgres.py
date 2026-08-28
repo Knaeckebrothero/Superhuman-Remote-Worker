@@ -71,7 +71,7 @@ PINNED_RECYCLE_MIGRATION = (
     / "database"
     / "migrations"
     / "app"
-    / "0198_pinned_agent_recycle_authority.sql"
+    / "0200_pinned_agent_recycle_authority.sql"
 )
 NON_PINNED_LIFECYCLE_MIGRATIONS = tuple(
     Path(__file__).resolve().parents[1]
@@ -81,8 +81,8 @@ NON_PINNED_LIFECYCLE_MIGRATIONS = tuple(
     / "app"
     / name
     for name in (
-        "0195_non_pinned_workspace_process_zero.sql",
-        "0196_non_pinned_workspace_lifecycle_authority.sql",
+        "0197_non_pinned_workspace_process_zero.sql",
+        "0198_non_pinned_workspace_lifecycle_authority.sql",
     )
 )
 
@@ -613,7 +613,7 @@ async def _seed(
     }
     if publish_agent_pod and not protected_agent_pod:
         # Historical 0185 fixture used by retirement tests. It deliberately
-        # has no 0198 namespace/finalizer claim and therefore cannot enter the
+        # has no 0200 namespace/finalizer claim and therefore cannot enter the
         # new recycle protocol.
         metadata["agent_pod"] = {
             "pod_name": f"persistent-{ids['thread'][:12]}",
@@ -711,7 +711,7 @@ async def _seed(
             )
             async with conn.transaction():
                 if not protected_agent_pod:
-                    # Seed a pre-0198 reciprocal row; post-0198 direct binds
+                    # Seed a pre-0200 reciprocal row; post-0200 direct binds
                     # must carry either create-intent or warm-protection proof.
                     await conn.execute("SET LOCAL session_replication_role = 'replica'")
                 await conn.execute(
@@ -738,7 +738,7 @@ async def _seed(
 async def _seed_legacy_0185_authority(
     db: PostgresDB, *, bind_agent: bool = True, published: bool = True
 ) -> dict[str, str]:
-    """Install an exact open 0185 shape that predates migration 0198."""
+    """Install an exact open 0185 shape that predates migration 0200."""
 
     if bind_agent and not published:
         raise ValueError("a planned legacy intent cannot already bind an agent")
@@ -763,7 +763,7 @@ async def _seed_legacy_0185_authority(
     )
     async with db.acquire() as conn:
         async with conn.transaction():
-            # These are not post-0198 writes: seed the already-committed 0185
+            # These are not post-0200 writes: seed the already-committed 0185
             # rows exactly as the migration encounters them at deployment.
             await conn.execute("SET LOCAL session_replication_role = 'replica'")
             if published:
@@ -838,7 +838,7 @@ async def _seed_legacy_0185_authority(
                 pod_name,
             )
             async with conn.transaction():
-                # This helper models a binding already live when 0198 lands.
+                # This helper models a binding already live when 0200 lands.
                 await conn.execute("SET LOCAL session_replication_role = 'replica'")
                 await conn.execute(
                     "UPDATE threads SET agent_id=$2::uuid,"
@@ -868,7 +868,7 @@ async def _seed_legacy_0185_authority(
 
 
 async def _seed_warm_pool_binding(db: PostgresDB, *, bound: bool) -> dict[str, str]:
-    """Seed a dual-agent pool Pod, optionally already bound before 0198."""
+    """Seed a dual-agent pool Pod, optionally already bound before 0200."""
 
     ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
     ids["pod_name"] = f"srw-agent-j-{ids['agent'][:8]}"
@@ -939,7 +939,7 @@ def _production_warm_provisioner(
 def _warm_rebind_provisioner(
     db: PostgresDB, ids: dict[str, str], *, namespace: str = "agents-a"
 ) -> PersistentProvisioner:
-    """Wire the exact live pool Pod a post-0198 warm re-attach must protect."""
+    """Wire the exact live pool Pod a post-0200 warm re-attach must protect."""
 
     api = StatefulPinnedK8sApi()
     api.install_old_pod(
@@ -1415,13 +1415,13 @@ async def _bind_replacement_agent(
     namespace: str = "agents-a",
     pod_name: str | None = None,
 ) -> tuple[str, runtime_actor.RuntimeActorContext]:
-    """Bind a successor agent the way the provisioner does after 0198.
+    """Bind a successor agent the way the provisioner does after 0200.
 
     A pinned bind may not be a raw write: the exact Pod must first publish a
     create intent so ``metadata.agent_pod`` carries the namespace and
     finalizer protocol that both the row trigger and Begin require.  When the
     current generation cannot mint a fresh intent (the recycle protocol
-    already owns it), fall back to the pre-0198 reciprocal shape so those
+    already owns it), fall back to the pre-0200 reciprocal shape so those
     tests keep exercising their own subject.
     """
 
@@ -3629,7 +3629,7 @@ async def test_reclaimed_agent_workspace_claim_is_idempotent_retirement_replay(d
         attempt_id=attempt_id,
         pod_name=f"srw-agent-s-{attempt_id[:8]}",
         provisioner="agent",
-        # 0198 makes the create intent's namespace exact authority; this
+        # 0200 makes the create intent's namespace exact authority; this
         # upstream test predates that keyword.
         namespace="agents-a",
         pvc_name=claim_name,
@@ -3838,7 +3838,7 @@ async def test_pinned_k8s_coordinates_are_required_and_immutable(db):
 
 @pytest.mark.asyncio
 async def test_legacy_null_namespace_intent_is_not_adopted(db):
-    """A pre-0198 row remains visible for fencing but is never guessed current."""
+    """A pre-0200 row remains visible for fencing but is never guessed current."""
 
     ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
     generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
@@ -4394,7 +4394,7 @@ async def test_failed_attach_abort_rotates_generation_and_stale_retry_preserves_
     assert str(current["agent_id"]) == ids["agent"]
     assert current["runtime_authority_exposed"] is True
     # G2 carries B's own exact warm-binding marker, never a stale G1 residue:
-    # after 0198 a bind is only legal once that marker is published.
+    # after 0200 a bind is only legal once that marker is published.
     successor_marker = _json(current["metadata"])["agent_pod"]
     assert successor_marker["runtime_generation"] == successor_generation
     assert successor_marker["protection_protocol"] == "finalizer_v1"
@@ -5843,7 +5843,7 @@ async def test_legacy_0185_planned_response_loss_is_adopted_by_leader(db, monkey
 
 @pytest.mark.asyncio
 async def test_legacy_0185_live_authority_is_adopted_before_first_end(db, monkeypatch):
-    """A deployed pinned session reaches 0198 without freezing NULL authority."""
+    """A deployed pinned session reaches 0200 without freezing NULL authority."""
 
     import main as orch_main
 
@@ -6675,7 +6675,7 @@ async def test_production_recycler_recovers_lost_create_in_captured_namespace(db
     provisioner._db = db
     provisioner._core_api = api
     provisioner._k8s_available = True
-    # Prove lifecycle effects use the namespace captured by 0198, not the
+    # Prove lifecycle effects use the namespace captured by 0200, not the
     # current deployment default after a namespace move.
     provisioner._namespace = "wrong-current-namespace"
     provisioner._agent_image = "example.test/agent:sha-new-build"
@@ -7895,7 +7895,7 @@ async def test_job_wake_outbox_requires_durable_provider_admission(db):
         )
         attach_token = uuid4()
         async with conn.transaction():
-            # This wake fixture models a binding already live when 0198 lands;
+            # This wake fixture models a binding already live when 0200 lands;
             # its subject is the outbox, not the pinned bind authority.
             await conn.execute("SET LOCAL session_replication_role = 'replica'")
             await conn.execute(

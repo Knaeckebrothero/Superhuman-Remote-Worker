@@ -175,10 +175,10 @@ def test_host_wrapper_has_context_artifact_and_confirmation_fences():
     assert 'EXPECTED_CONTEXT="k3d-srw"' in wrapper
     assert "kubectl config current-context" in wrapper
     assert "stateless_wake_acceptance.py" in wrapper
-    assert "0189_stateless_input_deliveries.sql" in wrapper
-    assert "0190_stateless_input_delivery_validate.sql" in wrapper
-    assert "0195_non_pinned_workspace_process_zero.sql" in wrapper
-    assert "0196_non_pinned_workspace_lifecycle_authority.sql" in wrapper
+    assert "0191_stateless_input_deliveries.sql" in wrapper
+    assert "0192_stateless_input_delivery_validate.sql" in wrapper
+    assert "0197_non_pinned_workspace_process_zero.sql" in wrapper
+    assert "0198_non_pinned_workspace_lifecycle_authority.sql" in wrapper
     assert "require_deployment_converged" in wrapper
     assert "WORKSPACE_CLEANUP_RECONCILIATION_ENABLED" in wrapper
     assert "WORKSPACE_REATTACH_FRESH_FALLBACK" in wrapper

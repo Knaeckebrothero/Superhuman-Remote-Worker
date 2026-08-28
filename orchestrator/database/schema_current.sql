@@ -2560,7 +2560,7 @@ BEGIN
     old_workspace := COALESCE(old_state->'workspace_container', '{}'::JSONB);
     new_workspace := COALESCE(new_state->'workspace_container', '{}'::JSONB);
 
-    -- Origin migration 0185/0198 is the authority for a *pinned* thread's
+    -- Origin migration 0185/0200 is the authority for a *pinned* thread's
     -- Kubernetes agent runtime, so that scope is handed over here.  It does
     -- not protect metadata.vm or a Docker workspace lease: both remain under
     -- the generic process-zero ledger for every lane.  A blanket pinned-lane
@@ -7189,7 +7189,7 @@ DECLARE
 BEGIN
     -- The reservation ledger arrives one migration later.  A plpgsql body is
     -- not planned until the statement runs, so this guard keeps the function
-    -- installable here and fail-closed in the window before 0196.
+    -- installable here and fail-closed in the window before 0198.
     IF to_regclass(
         'public.managed_repository_workspace_creation_reservations'
     ) IS NULL THEN
@@ -15951,7 +15951,7 @@ CREATE TABLE public.notification_queue (
 -- Name: TABLE notification_queue; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.notification_queue IS 'RETIRED (0193, unified notification system slice 3): the quiet-hours digest queue. Deferred delivery is a notification_steps row now. Kept until a later DROP.';
+COMMENT ON TABLE public.notification_queue IS 'RETIRED (0195, unified notification system slice 3): the quiet-hours digest queue. Deferred delivery is a notification_steps row now. Kept until a later DROP.';
 
 
 --
@@ -18609,7 +18609,7 @@ CREATE TABLE public.thread_notifications (
 -- Name: TABLE thread_notifications; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.thread_notifications IS 'RETIRED (0193, unified notification system slice 3): the headless permission-email audit table. Deliveries are notification_deliveries rows now. Kept until a later DROP.';
+COMMENT ON TABLE public.thread_notifications IS 'RETIRED (0195, unified notification system slice 3): the headless permission-email audit table. Deliveries are notification_deliveries rows now. Kept until a later DROP.';
 
 
 --
