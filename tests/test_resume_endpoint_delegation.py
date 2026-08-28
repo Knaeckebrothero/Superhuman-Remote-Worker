@@ -211,6 +211,39 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
     monkeypatch.setattr(main.postgres_db, "update_job_status", AsyncMock())
     monkeypatch.setattr(main.postgres_db, "heartbeat", AsyncMock())
     monkeypatch.setattr(
+        main.container_provisioner,
+        "attest_workspace_runtime",
+        AsyncMock(
+            return_value=main.WorkspaceRuntimeAttestation(
+                backing_id="k8s-pvc:agent-workspaces:workspace-pvc",
+                workspace_generation="22222222-2222-4222-8222-222222222222",
+                runtime_incarnation=WORKSPACE_RUNTIME,
+                ssh_host_key_fingerprint="SHA256:resume-workspace",
+                host="workspace-job.svc.cluster.local",
+                pod_ip="10.42.0.17",
+                port=30022,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_pinned_k8s_job_workspace_authority_is_current",
+        AsyncMock(return_value=True),
+    )
+    recipient = main.PinnedJobRecipient(
+        expected_agent_id=AGENT_ID,
+        expected_pod_uid=None,
+        expected_process_generation="55555555-5555-4555-8555-555555555555",
+        expected_job_id=JOB_ID,
+    )
+    monkeypatch.setattr(
+        main,
+        "_prepare_pinned_job_mutation_target",
+        AsyncMock(
+            return_value=main._PinnedJobMutationTarget(_agent(), recipient),
+        ),
+    )
+    monkeypatch.setattr(
         main.postgres_db,
         "managed_repository_authorities_are_current",
         AsyncMock(return_value=True),
