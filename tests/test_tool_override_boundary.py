@@ -1092,6 +1092,83 @@ class TestSessionCreateBoundary:
         pinned_provision.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_explicit_post_commission_uses_dedicated_lifecycle_substrate(
+        self, session_create_env, monkeypatch
+    ):
+        """A background Officer must be born on the Pod its recycler owns.
+
+        Ordinary pinned sessions may use the warm-pool fast path. A durable
+        Post commission may not: the Officer lifecycle scanner intentionally
+        owns only finalizer-protected ``persistent-agent`` Pods, so a warm
+        binding would be held as ``unsupported_pod_authority`` on its first
+        reconciliation pass.
+        """
+        import asyncio
+
+        main, db, _, _ = session_create_env
+        db.get_officer_thread_for_project = AsyncMock(return_value=None)
+        db.get_user_role_in_project = AsyncMock(return_value="owner")
+        db.register_project_officer_thread = AsyncMock(
+            return_value={
+                "commission_continuity": {"brief_enqueued": True},
+            }
+        )
+        dedicated_create = AsyncMock(
+            return_value=SimpleNamespace(
+                usable=True,
+                status=SimpleNamespace(value="created"),
+                failure_class=None,
+            )
+        )
+        monkeypatch.setattr(
+            main,
+            "persistent_provisioner",
+            SimpleNamespace(is_available=True, create_agent_pod=dedicated_create),
+        )
+        monkeypatch.setattr(
+            main,
+            "agent_provisioner",
+            SimpleNamespace(is_available=True, in_cluster=True),
+        )
+        monkeypatch.setattr(main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+        monkeypatch.setattr(
+            main, "ensure_virtual_thread_workspace_binding", AsyncMock()
+        )
+        warm_provision = AsyncMock()
+        request = main.ThreadCreateRequest(
+            title="commissioned officer",
+            project_id=SESSION_THREAD_ID,
+            config_name="centurion",
+            config_override={"workspace": {"backend": "virtual"}},
+        )
+        request._officer_post_config_snapshot = {
+            "officer": {
+                "enabled": True,
+                "auto_pull": True,
+                "slots": {
+                    "test": {
+                        "count": 0,
+                        "category": "tester",
+                        "model": "MiniMax-M3",
+                        "backend": "sandbox",
+                    }
+                },
+            },
+            "workspace": {"backend": "virtual"},
+        }
+
+        with patch("services.provision_or_assign.provision_or_assign", warm_provision):
+            await main.create_thread(request, MagicMock())
+            await asyncio.sleep(0)
+
+        dedicated_create.assert_awaited_once_with(
+            SESSION_THREAD_ID,
+            config_name="centurion",
+            expected_runtime_generation=SESSION_RUNTIME_GENERATION,
+        )
+        warm_provision.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_explicit_default_request_materializes_policy_selection(
         self, session_create_env
     ):

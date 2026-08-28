@@ -49878,6 +49878,9 @@ async def create_thread(
         _officer_requested = (config_override.get("officer") or {}).get(
             "enabled"
         ) is True
+        _explicit_officer_commission = (
+            request_body._officer_post_config_snapshot is not None
+        )
         if _officer_requested and primary_project_id:
             if not await _can_manage_project_officer(user, primary_project_id):
                 raise HTTPException(
@@ -50114,9 +50117,6 @@ async def create_thread(
         # thread it minted is stood down so the JSONB-predicate machinery
         # (wake claim, watchdog) never sees two live officers.
         if _officer_requested and primary_project_id:
-            _explicit_officer_commission = (
-                request_body._officer_post_config_snapshot is not None
-            )
             _registered = await postgres_db.register_project_officer_thread(
                 primary_project_id,
                 str(thread_id),
@@ -50516,6 +50516,35 @@ async def create_thread(
                 "(workspace_backend=%s); dedicated agent provisioning skipped",
                 thread_id,
                 thread_backend,
+            )
+        elif _explicit_officer_commission and persistent_provisioner.is_available:
+            # The interim Officer lifecycle owner deliberately manages only
+            # finalizer-protected dedicated persistent Pods.  Sending an
+            # explicit Post commission through ``provision_or_assign`` may
+            # bind a generic warm-pool Pod instead; the Officer can run, but
+            # the lifecycle scanner cannot observe/recycle that shape and
+            # therefore installs a permanent ``unsupported_pod_authority``
+            # hold on its next pass.  Commission directly onto the substrate
+            # whose exact Pod/PVC UID and provision attempt the recycler owns.
+            # Ordinary pinned sessions retain the warm-pool fast path below.
+            async def _provision_commissioned_officer() -> None:
+                result = await persistent_provisioner.create_agent_pod(
+                    thread_id,
+                    config_name=config_name,
+                    expected_runtime_generation=created_runtime_authority.generation,
+                )
+                if not result.usable:
+                    logger.warning(
+                        "Commissioned Officer %s: dedicated persistent "
+                        "provisioning is %s (%s)",
+                        thread_id,
+                        result.status.value,
+                        result.failure_class or "no-detail",
+                    )
+
+            asyncio.create_task(
+                _provision_commissioned_officer(),
+                name=f"commission-officer-pod-{thread_id[:8]}",
             )
         elif use_k8s_agent:
             # Kubernetes mode: create agent pod on demand, with pool fallback
