@@ -25,10 +25,10 @@ from main import list_officers
 PROJECT_A = str(uuid4())
 PROJECT_B = str(uuid4())
 THREAD_A = str(uuid4())
-TODAY = datetime.now(timezone.utc).date().isoformat()
 
 
 def _row(**over) -> dict:
+    today = datetime.now(timezone.utc).date().isoformat()
     row = {
         "project_id": PROJECT_A,
         "project_name": "Better Resavio",
@@ -40,7 +40,7 @@ def _row(**over) -> dict:
                 "officer": {"enabled": True, "auto_pull": False},
             },
             "officer_state": {
-                "pages": {"date": TODAY, "count": 2},
+                "pages": {"date": today, "count": 2},
                 "digest": [{"subject": "s"}, {"subject": "t"}],
             },
         },
