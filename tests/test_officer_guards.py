@@ -231,6 +231,7 @@ class TestDrainBrake:
             persist_thread_input_delivery=AsyncMock(
                 return_value={
                     "delivery_id": delivery_id,
+                    "thread_id": THREAD_ID,
                     "state": delivery_state,
                 }
             ),
