@@ -193,13 +193,29 @@ async def test_the_query_phase_performs_no_write_and_no_outbound_call():
     signal on this surface. This test is what stops that being quietly
     reintroduced one layer up.
 
-    Three assertions rather than one, because the defect has three shapes:
-    a direct await is impossible here (the callback is sync), so it would
-    arrive as a synchronous call, as a ``self._schedule(...)`` (the module
-    already has that helper, which is what makes the edit plausible), or as
-    a bare ``ensure_future``. The recorder catches the first, the task-set
-    comparisons catch the other two -- and the ``sleep(0)`` between them is
-    what gives a scheduled coroutine the chance to run and be caught.
+    Three assertions rather than one, because the defect has more than one
+    shape. The callback is synchronous, so a plain ``await`` is not
+    available; a real edit would either drive the write to completion some
+    other way, or schedule it -- via ``self._schedule(...)`` (the module
+    already has that helper, which is what makes the edit plausible) or a
+    bare ``ensure_future``. The recorder catches anything that actually
+    RUNS; the two task-set comparisons catch a scheduled write even before
+    it runs; and the ``sleep(0)`` between them is what gives a scheduled
+    coroutine the chance to start and be caught by the recorder as well.
+
+    One shape is caught by NOTHING here, and that is correct rather than a
+    hole: a bare ``bump(fingerprint)`` with neither ``await`` nor a
+    schedule just builds a coroutine object that is never driven. Its body
+    never executes, so it performs no write and is not the defect this test
+    exists to catch -- it is a ``RuntimeWarning: coroutine ... was never
+    awaited``, which pytest surfaces on its own. An earlier version of this
+    docstring claimed the recorder caught it; it does not, because there is
+    nothing to catch.
+
+    ``test_auth_completed_bumps_last_used_at`` is the other half of the
+    pair: this test proves the bump does not happen in the query phase,
+    that one proves it does happen after ``key.verify``. Neither alone
+    distinguishes "correctly placed" from "absent".
     """
     calls = []
 
@@ -953,3 +969,111 @@ def test_a_missing_limiter_refuses_the_channel_rather_than_uncapping_it():
 
     assert excinfo.value.code == OPEN_ADMINISTRATIVELY_PROHIBITED
     assert mod.MISCONFIGURED_MESSAGE in excinfo.value.reason
+
+
+# --- fix round 2: the attach-slot leak -----------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audit_outcome", ["unwired", "fails", "succeeds"])
+async def test_a_peer_lost_during_resolve_never_leaks_an_attach_slot(audit_outcome):
+    """``try_attach`` charges the workspace cap inside the resolve lock, but
+    ``connection_lost`` can fire while ``resolve`` is still awaiting -- and
+    it then finds ``_attached_workspace`` still ``None`` and detaches
+    nothing. Only the re-check after the audit write can give that charge
+    back.
+
+    All three audit outcomes are parametrized because the leak was NOT
+    uniform: ``_open_attachment_record`` returned early both when no
+    ``record_attach`` was bound and when the write raised, and each early
+    return skipped the release. Only the "succeeds" leg reached it. That
+    made this look like a rare corner, and it is not -- ``_attachments``
+    only ever climbs, ``max_attachments_per_workspace`` defaults to 4, and
+    four leaks make the workspace refuse SSH until the gateway pod
+    restarts. The two triggers also correlate: a degraded orchestrator
+    makes both the lost peer and the failed audit write likelier at once.
+
+    The ``asyncio.Event`` is what puts ``connection_lost`` strictly inside
+    the resolve window rather than hoping the scheduler lands there.
+    """
+    release = asyncio.Event()
+    closed = []
+
+    async def _resolve(handle, fingerprint):
+        await release.wait()
+        return _target()
+
+    async def _record_fails(fingerprint, handle, client_ip):
+        raise RuntimeError("orchestrator is down")
+
+    async def _record_ok(fingerprint, handle, client_ip):
+        return "att-1"
+
+    async def _close(attachment_id, fingerprint, channels):
+        closed.append(attachment_id)
+        return 1
+
+    record = {
+        "unwired": None,
+        "fails": _record_fails,
+        "succeeds": _record_ok,
+    }[audit_outcome]
+
+    limiter = _limiter()
+    server = _authenticated(
+        GatewaySSHServer(
+            _context(
+                limiter=limiter,
+                resolve=_resolve,
+                record_attach=record,
+                close_attach=_close,
+            ),
+            CLIENT_IP,
+        )
+    )
+
+    attaching = asyncio.ensure_future(server._attached_target())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # The peer vanishes while resolve is still in flight: nothing is charged
+    # yet, so connection_lost has nothing to give back.
+    server.connection_lost(None)
+    assert limiter._attachments == {}
+
+    release.set()
+    await attaching
+    await _drain_background_tasks()
+
+    assert limiter._attachments == {}
+    # Only the leg that actually opened a row has one to close.
+    assert closed == (["att-1"] if audit_outcome == "succeeds" else [])
+
+
+@pytest.mark.asyncio
+async def test_a_live_connection_keeps_its_attach_slot_after_a_failed_audit_write():
+    """The negative half of the test above: the release is conditional on
+    the peer being GONE. A failed audit write on a live connection must not
+    hand the workspace slot back while the session is still using it --
+    otherwise the cap would be trivially bypassable by a client that can
+    make the audit write fail."""
+
+    async def _resolve(handle, fingerprint):
+        return _target()
+
+    async def _record(fingerprint, handle, client_ip):
+        raise RuntimeError("orchestrator is down")
+
+    limiter = _limiter()
+    server = _authenticated(
+        GatewaySSHServer(
+            _context(limiter=limiter, resolve=_resolve, record_attach=_record),
+            CLIENT_IP,
+        )
+    )
+
+    await server._attached_target()
+    assert limiter._attachments == {"t1": 1}
+
+    server.connection_lost(None)
+    assert limiter._attachments == {}

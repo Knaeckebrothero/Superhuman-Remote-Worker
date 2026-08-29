@@ -108,8 +108,14 @@ _BACKGROUND_TASKS: set[asyncio.Task] = set()
 DRAIN_TIMEOUT_SECONDS = 5.0
 
 
-async def drain_background_tasks(timeout: float | None = DRAIN_TIMEOUT_SECONDS) -> int:
+async def drain_background_tasks(timeout: float = DRAIN_TIMEOUT_SECONDS) -> int:
     """Await in-flight audit closes, returning how many did NOT settle.
+
+    ``timeout`` is a required-in-practice ``float``, deliberately NOT
+    ``Optional``: ``asyncio.wait(timeout=None)`` waits forever, which is the
+    exact opposite of what a shutdown drain is for -- one wedged audit POST
+    would hang the whole termination until Kubernetes SIGKILLs the pod.
+    Nothing may pass ``None`` here.
 
     Task 8's shutdown should call this. ``connection_lost`` schedules the
     attachment close rather than awaiting it (the callback is synchronous),
@@ -587,24 +593,47 @@ class GatewaySSHServer(asyncssh.SSHServer):
             self._attached_workspace = target.thread_id
             self._target = target
 
-        await self._open_attachment_record()
+        try:
+            await self._open_attachment_record()
+        finally:
+            # THE CHARGE ABOVE MUST NOT OUTLIVE A PEER THAT IS ALREADY GONE,
+            # whatever happened to the audit row. ``connection_lost`` can
+            # fire while ``resolve`` is still awaiting, and it then finds
+            # ``_attached_workspace`` still None and detaches nothing -- so
+            # this is the only place the charge can be given back.
+            #
+            # It is a ``finally``, not a line after the call, because
+            # ``_open_attachment_record`` has early returns (no
+            # ``record_attach`` bound at all, and the audit write failing),
+            # and each of those used to skip the release and leak a slot
+            # permanently. ``_attachments`` only ever climbs, and the
+            # default cap is 4, so four such leaks make the workspace
+            # refuse SSH until the gateway pod restarts. Worse, the two
+            # triggering conditions CORRELATE: a degraded orchestrator makes
+            # both the lost peer and the failed audit write likelier at the
+            # same moment.
+            if self._connection_closed:
+                self._release_attachment()
         return self._target
 
     async def _open_attachment_record(self) -> None:
-        """Open the audit row, and close it again if we already lost the peer.
+        """Open the audit row. Opening it is ALL this does.
 
-        ``connection_lost`` is synchronous and reads ``_attachment_id``
-        directly, so a connection lost while this POST is in flight sees
-        ``None`` and schedules no close -- the row is then written after the
-        close and stays open forever. The ``_connection_closed`` re-check
-        below is what closes that window.
+        It deliberately owns no lifecycle: its caller's ``finally`` re-checks
+        ``_connection_closed`` on every path out of here, which is what
+        releases both the workspace charge and this row if the peer went
+        away meanwhile. That re-check used to live at the bottom of this
+        method, where the two early returns below skipped it -- one place
+        that always runs beats three places that must each remember to.
 
-        Note it is NOT closed by moving this call inside ``_resolve_lock``,
-        which was the first suggestion: ``connection_lost`` never takes that
-        lock, so the same in-flight POST loses the same race one line
-        earlier. The race is between an await and a synchronous callback,
-        not between two awaits, and only re-checking after the await can see
-        it.
+        Why a re-check at all: ``connection_lost`` is synchronous and reads
+        ``_attachment_id`` directly, so a peer lost while this POST is in
+        flight sees ``None`` and schedules no close, leaving the row open
+        forever. Note this is NOT fixed by moving the call inside
+        ``_resolve_lock`` -- ``connection_lost`` never takes that lock, so
+        the same in-flight POST loses the same race one line earlier. The
+        race is between an await and a synchronous callback, not between two
+        awaits, and only re-checking after the await can see it.
         """
         record = self._context.record_attach
         if record is None:
@@ -620,12 +649,6 @@ class GatewaySSHServer(asyncssh.SSHServer):
                 "ssh gateway: no audit row opened for this attachment",
                 exc_info=True,
             )
-            return
-        if self._connection_closed:
-            # _release_attachment already swapped _attached_workspace to
-            # None, so this cannot double-detach; it only picks up the id
-            # that arrived too late for it.
-            self._release_attachment()
 
     async def _upstream(self):
         """Resolve, attach, and connect.
