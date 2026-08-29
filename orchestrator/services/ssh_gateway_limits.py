@@ -23,6 +23,14 @@ never come back, that grows forever. Every store here is a plain ``dict``
 ``_reap_expired_front`` relies on -- see its docstring), and every
 mutating method deletes a key the instant its count or window empties,
 and never creates one for an admission it refused.
+
+One method creates an entry on a refusal by design:
+``note_handshake_refusal`` exists to meter handshakes the gateway turned
+away before admission (a bad Origin, a bad token), which were otherwise
+unmetered entirely. It still cannot grow without bound -- it stops
+appending once the source is over its rate, so a source holds at most
+``preauth_rate_per_minute`` timestamps, exactly as an admitting one does,
+and the entry ages out through the same reap.
 """
 
 from __future__ import annotations
@@ -92,29 +100,22 @@ class GatewayLimiter:
         gateway-wide concurrent pre-auth count. A refusal at any gate
         leaves no bookkeeping behind for an unrecognized client_ip.
 
-        A refused attempt is never appended to its source's rate window.
-        This is deliberate -- a refusal must not burn a legitimate
-        client's own future admission budget -- but it also means a
-        connect-and-drop source that never holds a pre-auth slot is never
-        slowed by any gate here: the rate gate never records it, and the
-        concurrency gates only bind on connections that stay open. That
-        traffic shape is exactly what made the reap cost in
-        `_reap_expired_front` worth keeping cheap; see its docstring.
+        An attempt refused BY THIS METHOD is never appended to its
+        source's rate window. This is deliberate -- a refusal must not
+        burn a legitimate client's own future admission budget -- but it
+        also means a connect-and-drop source that never holds a pre-auth
+        slot is never slowed by any gate here: the rate gate never
+        records it, and the concurrency gates only bind on connections
+        that stay open. That traffic shape is exactly what made the reap
+        cost in `_reap_expired_front` worth keeping cheap; see its
+        docstring.
+
+        A handshake refused EARLIER, before it ever reached this method,
+        is a different case and is metered: see
+        ``note_handshake_refusal``, which shares this one window.
         """
         now = self._time_fn()
-
-        # Trim only THIS source's own expired timestamps first. Bounded by
-        # preauth_rate_per_minute (a small constant, e.g. 60), not by how
-        # many other sources are tracked -- cheap no matter what
-        # _reap_expired_front below costs.
-        window = self._recent.get(client_ip)
-        if window is not None:
-            while window and now - window[0] > 60.0:
-                window.popleft()
-            if not window:
-                del self._recent[client_ip]
-                window = None
-
+        window = self._trim_window(client_ip, now)
         self._reap_expired_front(now)
 
         rate_count = len(window) if window is not None else 0
@@ -125,15 +126,72 @@ class GatewayLimiter:
         if self._preauth_total >= self._max_preauth:
             return False
 
-        if window is None:
-            window = self._recent[client_ip] = deque()
-        window.append(now)
-        self._recent.move_to_end(client_ip)
+        self._record_attempt(client_ip, window, now)
         self._preauth_by_source[client_ip] = (
             self._preauth_by_source.get(client_ip, 0) + 1
         )
         self._preauth_total += 1
         return True
+
+    def note_handshake_refusal(self, client_ip: str) -> bool:
+        """Meter one handshake this gateway refused before it was admitted.
+
+        Returns True while the source is still inside its 60-second budget,
+        False once it is over -- a signal to log loudly, not a second
+        refusal, since the caller has already refused.
+
+        THIS CHARGES THE RATE WINDOW AND NOTHING ELSE, and the omission is
+        the whole design (Task 8 review, finding 5). A pre-auth slot charged
+        here would never be released -- the connection it belongs to was
+        refused and will never reach a release path -- so a flood of
+        bad-Origin handshakes would drain the GLOBAL pool and lock out every
+        legitimate user. That self-inflicted denial is strictly worse than
+        the metering gap this closes, so a flooding source burns only its
+        own per-source rate budget.
+
+        Deliberately shares ONE window with ``try_admit`` rather than
+        keeping a second counter: two budgets would let a source double its
+        effective rate by alternating refused and accepted handshakes.
+
+        Over budget, the attempt is NOT appended. That bound is load-bearing
+        rather than tidy: this is called on attacker-controlled, entirely
+        unauthenticated traffic, so an unconditional append would let one
+        source grow a deque as fast as it can open sockets. Capped at
+        ``preauth_rate_per_minute`` entries per source, which is the same
+        ceiling an admitting source has.
+        """
+        now = self._time_fn()
+        window = self._trim_window(client_ip, now)
+        self._reap_expired_front(now)
+
+        if window is not None and len(window) >= self._rate:
+            return False
+        self._record_attempt(client_ip, window, now)
+        return True
+
+    def _trim_window(self, client_ip: str, now: float) -> "deque[float] | None":
+        """Drop this source's expired timestamps; forget it if none remain.
+
+        Trims only THIS source's window. Bounded by preauth_rate_per_minute
+        (a small constant, e.g. 60), not by how many other sources are
+        tracked -- cheap no matter what _reap_expired_front costs.
+        """
+        window = self._recent.get(client_ip)
+        if window is None:
+            return None
+        while window and now - window[0] > 60.0:
+            window.popleft()
+        if not window:
+            del self._recent[client_ip]
+            return None
+        return window
+
+    def _record_attempt(self, client_ip: str, window, now: float) -> None:
+        """Stamp one attempt into this source's window, keeping it newest-last."""
+        if window is None:
+            window = self._recent[client_ip] = deque()
+        window.append(now)
+        self._recent.move_to_end(client_ip)
 
     def release(self, client_ip: str) -> None:
         """Release one pre-auth slot previously admitted for client_ip.

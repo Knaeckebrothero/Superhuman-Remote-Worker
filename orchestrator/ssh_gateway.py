@@ -47,6 +47,13 @@ client is bucketed under the ingress pod's own IP and the whole fleet shares
 16 slots. Task 11 must set that variable, and raise these caps if sessions,
 rather than handshakes, are what needs bounding.
 
+That variable stopped being advisory when refused handshakes started being
+metered (``_refuse_handshake``): refusals share the source's 60-second rate
+window, so with every WSS client bucketed under one ingress IP, an
+unauthenticated flood from anywhere burns the budget everyone else is
+admitted from. Bucketed by real client address, it burns only the flooder's
+own.
+
 The credential the USER presents is NOT ``MCP_INTERNAL_KEY``. See
 ``services/ssh_gateway_token.py`` for the full account (ruling G38); in short,
 that value is the platform's service-to-service key for ~50
@@ -65,6 +72,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import functools
 import ipaddress
 import logging
@@ -119,6 +127,19 @@ PUMP_CHUNK_BYTES = 65536
 # kernel queue is never the thing that refuses a burst -- GatewayLimiter is,
 # and it can say so.
 TCP_LISTEN_BACKLOG = 128
+
+# accept() errors that mean THE LISTENING SOCKET is gone, not that one
+# connection failed. Everything else is survivable and must not end the loop.
+_FATAL_ACCEPT_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
+
+# ...and the subset that means "the process is out of resources", where
+# retrying immediately just burns CPU. asyncio's own accept loop pauses
+# ACCEPT_RETRY_DELAY = 1s on exactly these; half that keeps a recovered
+# gateway responsive without spinning.
+_RESOURCE_ACCEPT_ERRNOS = frozenset(
+    {errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM}
+)
+ACCEPT_RETRY_DELAY_SECONDS = 0.5
 
 
 def origin_allowed(origin: Optional[str], allowed: Sequence[str]) -> bool:
@@ -213,20 +234,25 @@ async def attach_endpoint(websocket) -> None:
     """Pump one authenticated WebSocket into an SSH server on a socketpair."""
     state = websocket.app.state
     config = state.config
+    source = client_ip(websocket, config.trusted_proxies)
 
     if not origin_allowed(websocket.headers.get("origin"), config.allowed_origins):
-        await websocket.close(code=WS_ORIGIN_REFUSED)
+        await _refuse_handshake(websocket, state, source, WS_ORIGIN_REFUSED, "origin")
         return
 
     principal = None
     if config.require_wss_token:
         principal = attach_principal(websocket, config)
         if principal is None:
-            await websocket.close(code=WS_TOKEN_REFUSED)
+            await _refuse_handshake(
+                websocket, state, source, WS_TOKEN_REFUSED, "attach token"
+            )
             return
 
-    source = client_ip(websocket, config.trusted_proxies)
     if not state.limiter.try_admit(source):
+        # NOT re-metered: try_admit already charged this source's own rate
+        # window on its way to refusing, and counting it twice would halve
+        # the effective budget of a client that is merely at its limit.
         await websocket.close(code=WS_RATE_REFUSED)
         return
 
@@ -240,6 +266,33 @@ async def attach_endpoint(websocket) -> None:
         await _attach_over_socketpair(websocket, state, source)
     finally:
         state.limiter.release(source)
+
+
+async def _refuse_handshake(websocket, state, source: str, code: int, why: str) -> None:
+    """Close a handshake we turned away, and meter it against its source.
+
+    Before this, Origin and token refusals returned ahead of ``try_admit``, so
+    an unauthenticated handshake flood was not metered at all -- only a client
+    that got PAST both checks was ever rate limited, the inverse of the usual
+    ordering (review finding 5).
+
+    It charges the per-source RATE window and deliberately not a concurrency
+    slot: a slot charged here belongs to a connection that was refused and
+    will never reach a release path, so a bad-Origin flood would drain the
+    global pool and lock every legitimate user out -- a self-inflicted denial
+    strictly worse than the gap it closes. Over budget therefore changes the
+    log level and nothing else; the handshake was already refused.
+    """
+    within_budget = state.limiter.note_handshake_refusal(source)
+    if within_budget:
+        logger.info("ssh gateway: refused wss handshake from %s (%s)", source, why)
+    else:
+        logger.warning(
+            "ssh gateway: %s over its handshake budget, still refusing (%s)",
+            source,
+            why,
+        )
+    await websocket.close(code=code)
 
 
 async def _attach_over_socketpair(websocket, state, source: str) -> None:
@@ -269,6 +322,13 @@ async def _attach_over_socketpair(websocket, state, source: str) -> None:
         for sock in (srv_sock, ws_sock):
             with contextlib.suppress(OSError):
                 sock.close()
+        # Close it ourselves rather than letting the ASGI server tear it down
+        # on return: the client otherwise observes an abnormal close. Errors
+        # are expected here (the peer is usually gone already, and Starlette
+        # raises on a socket that has finished closing) and carry nothing the
+        # operator can act on.
+        with contextlib.suppress(Exception):
+            await websocket.close()
 
 
 def _completed_connection(result, source: str):
@@ -367,73 +427,150 @@ class SshTcpListener:
         self._state = state
         self._accept_task: Optional[asyncio.Task] = None
         self._connections: set[asyncio.Task] = set()
+        self._serving = False
+        self._closing = False
 
     @property
     def port(self) -> int:
         return self._sock.getsockname()[1]
 
     def start(self) -> None:
+        self._serving = True
         self._accept_task = asyncio.create_task(self._accept_forever())
 
+    def is_serving(self) -> bool:
+        """True only while the accept loop is actually alive.
+
+        ``healthz`` reads this. Before it existed, an accept loop that died
+        left ``/healthz`` returning ok forever, so Kubernetes kept the pod
+        Ready with a dead port 2222 and nothing anywhere said so.
+        """
+        return (
+            self._serving
+            and self._accept_task is not None
+            and not self._accept_task.done()
+        )
+
     async def _accept_forever(self) -> None:
+        """Accept until told to stop, surviving anything survivable.
+
+        ONE OSError USED TO END THIS LOOP FOR GOOD. EMFILE/ENFILE/ENOBUFS
+        under fd pressure and a transient ECONNABORTED all arrive here, and
+        asyncio's own ``_accept_connection`` -- the battle-tested loop this
+        raw one replaced -- logs and continues on exactly those, pausing
+        ``ACCEPT_RETRY_DELAY`` (1s there) when the cause is exhaustion rather
+        than one bad connection. Doing otherwise produced the worst failure
+        shape available in an orchestrated environment: a healthy-looking pod
+        with SSH silently gone (review finding 1).
+
+        Whatever does end this loop, ``is_serving()`` goes false in the
+        ``finally`` and ``/healthz`` starts failing, so the pod stops
+        advertising a port it is not serving.
+        """
         loop = asyncio.get_running_loop()
-        while True:
-            try:
-                sock, address = await loop.sock_accept(self._sock)
-            except asyncio.CancelledError:
-                raise
-            except OSError:
-                # The listening socket was closed under us: shutdown, not an
-                # error worth a stack trace.
-                logger.info("ssh gateway: tcp listener stopped accepting")
-                return
-            source = address[0] if address else "unknown"
-            if not self._state.limiter.try_admit(source):
-                # Closed before a single SSH byte is written. asyncssh ships
-                # no MaxStartups at all (measured: 1000 silent pre-auth
-                # connections accepted in 0.3s), which is why this gate is
-                # ahead of run_server rather than inside it.
-                logger.info("ssh gateway: refused tcp connection from %s", source)
-                with contextlib.suppress(OSError):
-                    sock.close()
-                continue
+        try:
+            while True:
+                try:
+                    sock, address = await loop.sock_accept(self._sock)
+                except asyncio.CancelledError:
+                    raise
+                except OSError as exc:
+                    if self._closing or exc.errno in _FATAL_ACCEPT_ERRNOS:
+                        # The listening socket was closed under us: shutdown,
+                        # not an error worth a stack trace.
+                        logger.info("ssh gateway: tcp listener stopped accepting")
+                        return
+                    logger.warning(
+                        "ssh gateway: transient accept error on port %d (%s); "
+                        "still listening",
+                        self.port,
+                        exc,
+                    )
+                    if exc.errno in _RESOURCE_ACCEPT_ERRNOS:
+                        # Spinning on EMFILE just burns CPU while the fds are
+                        # still gone; give the process a moment to recover.
+                        await asyncio.sleep(ACCEPT_RETRY_DELAY_SECONDS)
+                    continue
+                except Exception:
+                    # Nothing above covers this, so the loop is over -- but it
+                    # ends LOUDLY and with the health check going down, not in
+                    # silence (review finding 3).
+                    logger.exception(
+                        "ssh gateway: tcp accept loop failed; port %d is no "
+                        "longer being served",
+                        self.port,
+                    )
+                    return
+
+                source = address[0] if address else "unknown"
+                if not self._state.limiter.try_admit(source):
+                    # Closed before a single SSH byte is written. asyncssh
+                    # ships no MaxStartups at all (measured: 1000 silent
+                    # pre-auth connections accepted in 0.3s), which is why
+                    # this gate is ahead of run_server rather than inside it.
+                    logger.info("ssh gateway: refused tcp connection from %s", source)
+                    with contextlib.suppress(OSError):
+                        sock.close()
+                    continue
+                self._spawn(sock, source)
+        finally:
+            self._serving = False
+
+    def _spawn(self, sock: socket.socket, source: str) -> asyncio.Task:
+        """Serve one admitted socket, releasing its slot exactly once.
+
+        THE RELEASE IS A DONE CALLBACK, not a ``finally`` inside ``_serve``: a
+        task cancelled before its first scheduling never executes a line of
+        its coroutine, so an inner ``finally`` never runs and that slot leaks
+        (review finding 4 -- shutdown-only, but this seam has leaked three
+        times on this plan and uniformity is the point). A done callback runs
+        exactly once for every task, including one cancelled before it starts.
+        """
+        try:
             task = asyncio.create_task(self._serve(sock, source))
-            self._connections.add(task)
-            task.add_done_callback(self._connections.discard)
+        except BaseException:
+            # The slot was charged by the caller and nothing else can give it
+            # back if the task never exists.
+            self._state.limiter.release(source)
+            with contextlib.suppress(OSError):
+                sock.close()
+            raise
+        self._connections.add(task)
+        task.add_done_callback(self._connections.discard)
+        task.add_done_callback(functools.partial(self._release_slot, source))
+        return task
+
+    def _release_slot(self, source: str, _task: asyncio.Task) -> None:
+        self._state.limiter.release(source)
 
     async def _serve(self, sock: socket.socket, source: str) -> None:
+        """Speak SSH on one accepted socket. Owns the socket, not the slot."""
         try:
-            try:
-                connection = await _run_ssh_on_socket(sock, self._state, source)
-            except asyncio.CancelledError:
-                with contextlib.suppress(OSError):
-                    sock.close()
-                raise
-            except Exception as exc:
-                # Never authenticated: a scan, a login_timeout, a client that
-                # hung up. asyncssh's own teardown aborts the connection when
-                # it got that far, but a failure BEFORE the transport exists
-                # leaves this socket to us.
-                logger.info(
-                    "ssh gateway: tcp connection from %s ended without "
-                    "authenticating: %s",
-                    source,
-                    exc,
-                )
-                with contextlib.suppress(OSError):
-                    sock.close()
-                return
-            try:
-                await connection.wait_closed()
-            finally:
-                connection.abort()
+            connection = await _run_ssh_on_socket(sock, self._state, source)
+        except asyncio.CancelledError:
+            with contextlib.suppress(OSError):
+                sock.close()
+            raise
+        except Exception as exc:
+            # Never authenticated: a scan, a login_timeout, a client that hung
+            # up. asyncssh's own teardown aborts the connection when it got
+            # that far, but a failure BEFORE the transport exists leaves this
+            # socket to us.
+            logger.info(
+                "ssh gateway: tcp connection from %s ended without authenticating: %s",
+                source,
+                exc,
+            )
+            with contextlib.suppress(OSError):
+                sock.close()
+            return
+        try:
+            await connection.wait_closed()
         finally:
-            # The single release for this connection, covering every path out
-            # of the block above: refused auth, login_timeout, a normal
-            # logout, and cancellation at shutdown.
-            self._state.limiter.release(source)
+            connection.abort()
 
     async def close(self) -> None:
+        self._closing = True
         if self._accept_task is not None:
             self._accept_task.cancel()
             await asyncio.gather(self._accept_task, return_exceptions=True)
@@ -489,6 +626,20 @@ async def lifespan(app):
 
 
 async def healthz(request):
+    """Liveness/readiness — and it must fail when the SSH listener is down.
+
+    The route this process exists to serve is port 2222, not this one. A
+    gateway whose accept loop has died answers here perfectly well, which is
+    exactly the failure that must not be hidden: Kubernetes would keep the pod
+    Ready, restart nothing, and SSH would simply be gone with no signal
+    (review finding 1). Also reports down before startup and during shutdown,
+    which is correct in both cases.
+    """
+    listener = getattr(request.app.state, "ssh_listener", None)
+    if listener is None or not listener.is_serving():
+        return JSONResponse(
+            {"status": "degraded", "ssh_listener": "down"}, status_code=503
+        )
     return JSONResponse({"status": "ok"})
 
 

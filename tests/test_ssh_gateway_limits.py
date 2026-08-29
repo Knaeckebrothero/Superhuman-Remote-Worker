@@ -339,3 +339,71 @@ def test_an_unmatched_release_cannot_forge_a_global_preauth_slot():
         limiter.release("9.9.9.9")  # never admitted; must be a no-op
 
     assert limiter.try_admit("4.4.4.4") is False  # still full
+
+
+# -- Fix round 1 (Task 8 review, finding 5): unauthenticated handshake
+#    refusals were not metered at all -- only a client that got past the
+#    Origin check and the bearer token was ever rate limited. ----------
+
+
+def test_a_refused_handshake_is_metered_against_the_rate_window():
+    clock = FakeClock(start=0.0)
+    limiter = _limiter(preauth_rate_per_minute=2, time_fn=clock)
+    assert limiter.note_handshake_refusal("9.9.9.9") is True
+    assert limiter.note_handshake_refusal("9.9.9.9") is True
+    assert limiter.note_handshake_refusal("9.9.9.9") is False
+
+
+def test_a_refused_handshake_charges_no_concurrency_slot():
+    """The constraint that shapes this whole method (review finding 5).
+
+    A refusal must not take a pre-auth slot: a slot charged for a handshake
+    that never opened would never be released, so a flood of bad-origin
+    requests would exhaust the GLOBAL pool and lock out every legitimate
+    user -- a self-inflicted denial strictly worse than the metering gap it
+    was meant to close. The flooding source burns its own 60-second rate
+    budget and nothing else.
+    """
+    clock = FakeClock(start=0.0)
+    limiter = _limiter(
+        max_preauth_connections=3, preauth_rate_per_minute=50, time_fn=clock
+    )
+    for _ in range(40):
+        limiter.note_handshake_refusal("6.6.6.6")
+
+    # The global pool is untouched: another source still gets every slot.
+    assert [limiter.try_admit("7.7.7.7") for _ in range(3)] == [True, True, True]
+
+
+def test_refusals_beyond_the_rate_do_not_grow_the_window():
+    """Bounded memory. An attacker-driven append-per-refusal would let one
+    source grow a deque as fast as it can open sockets; over budget, the
+    refusal is counted by being refused, not by being stored."""
+    clock = FakeClock(start=0.0)
+    limiter = _limiter(preauth_rate_per_minute=3, time_fn=clock)
+    for _ in range(500):
+        limiter.note_handshake_refusal("5.5.5.5")
+    assert len(limiter._recent["5.5.5.5"]) == 3
+
+
+def test_refusal_entries_age_out_and_leave_no_tracked_source():
+    """Same lifecycle as an admission's entry: nothing accumulates for a
+    scan source that never comes back."""
+    clock = FakeClock(start=0.0)
+    limiter = _limiter(preauth_rate_per_minute=2, time_fn=clock)
+    limiter.note_handshake_refusal("4.4.4.4")
+    assert "4.4.4.4" in limiter._recent
+
+    clock.advance(61.0)
+    limiter.note_handshake_refusal("3.3.3.3")
+    assert "4.4.4.4" not in limiter._recent
+
+
+def test_refusals_and_admissions_share_one_rate_budget():
+    """One window per source, not two: otherwise a flood could double its
+    effective rate by alternating refused and accepted handshakes."""
+    clock = FakeClock(start=0.0)
+    limiter = _limiter(preauth_rate_per_minute=2, time_fn=clock)
+    assert limiter.note_handshake_refusal("2.2.2.2") is True
+    assert limiter.try_admit("2.2.2.2") is True
+    assert limiter.try_admit("2.2.2.2") is False

@@ -20,8 +20,10 @@ including the one where ``accept()`` raises.
 """
 
 import asyncio
+import errno
 import socket
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 from starlette.datastructures import Address, Headers
@@ -250,6 +252,9 @@ async def test_the_happy_path_speaks_ssh_and_releases_exactly_once(app):
     assert ws.accepted is True
     assert app.state.limiter.admits == ["203.0.113.9"]
     assert app.state.limiter.releases == ["203.0.113.9"]
+    # Closed by us, not left for the ASGI server to tear down -- a client
+    # otherwise observes an abnormal close rather than a clean one.
+    assert ws.closed_code is not None
 
 
 @pytest.mark.asyncio
@@ -364,6 +369,152 @@ async def test_shutdown_drains_the_audit_background_tasks(app, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Fix round 1 (review findings 1, 3, 4, 5, 6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_transient_accept_error_does_not_kill_the_listener(app, monkeypatch):
+    """EMFILE must not be terminal.
+
+    The worst failure shape in an orchestrated environment: one OSError from
+    ``sock_accept`` used to end the accept loop for good, while ``/healthz``
+    kept returning ok -- so Kubernetes never restarted the pod and SSH was
+    simply gone with no signal. asyncio's own ``_accept_connection`` (the loop
+    this raw one replaced) logs and continues on exactly EMFILE/ENFILE/
+    ENOBUFS/ENOMEM; the regression came from replacing a battle-tested loop
+    with a bare one.
+    """
+    loop = asyncio.get_running_loop()
+    real_accept = loop.sock_accept
+    calls = {"n": 0}
+
+    async def flaky(sock):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return await real_accept(sock)
+
+    monkeypatch.setattr(loop, "sock_accept", flaky)
+
+    async with ssh_gateway.lifespan(app):
+        listener = app.state.ssh_listener
+        reader, writer = await asyncio.open_connection("127.0.0.1", listener.port)
+        try:
+            writer.write(b"SSH-2.0-TestClient\r\n")
+            await writer.drain()
+            banner = await asyncio.wait_for(reader.read(128), timeout=5)
+            assert banner.startswith(b"SSH-2.0-"), banner
+            assert calls["n"] >= 2  # the EMFILE really was raised and survived
+            assert listener.is_serving() is True
+        finally:
+            writer.close()
+
+
+@pytest.mark.asyncio
+async def test_health_reports_down_once_the_accept_loop_dies(app, monkeypatch):
+    """If the listener does die, it must stop passing its health check.
+
+    Covers the unexpected-exception path too (finding 3): whatever ends the
+    loop, the pod must stop advertising itself as Ready with a dead 2222.
+    """
+    loop = asyncio.get_running_loop()
+
+    async def fatal(sock):
+        raise RuntimeError("something no OSError handler covers")
+
+    monkeypatch.setattr(loop, "sock_accept", fatal)
+
+    async with ssh_gateway.lifespan(app):
+        listener = app.state.ssh_listener
+        for _ in range(100):
+            if not listener.is_serving():
+                break
+            await asyncio.sleep(0.01)
+        assert listener.is_serving() is False
+        response = await ssh_gateway.healthz(_request(app))
+        assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_health_is_ok_while_the_listener_serves(app):
+    """The negative control for the test above: a healthy gateway says so."""
+    async with ssh_gateway.lifespan(app):
+        response = await ssh_gateway.healthz(_request(app))
+        assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_connection_task_cancelled_before_it_runs_still_releases(app):
+    """The slot is released from the task's done callback, not from a
+    ``finally`` inside the coroutine: a task cancelled before its first
+    scheduling never executes a line of its body, so an inner ``finally``
+    never runs and the slot leaks. Shutdown-only, but the seam stays uniform.
+    """
+    async with ssh_gateway.lifespan(app):
+        listener = app.state.ssh_listener
+        left, right = socket.socketpair()
+        try:
+            task = listener._spawn(right, "198.51.100.5")
+            task.cancel()  # before the event loop ever schedules it
+            await asyncio.gather(task, return_exceptions=True)
+            assert app.state.limiter.releases == ["198.51.100.5"]
+        finally:
+            left.close()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_origin_is_metered_against_the_source(app):
+    """Unauthenticated handshake floods were not metered at all: only a
+    client that got PAST the Origin check and the bearer token was ever rate
+    limited (finding 5). The meter charges the rate window only -- charging a
+    concurrency slot for a handshake that never opened would never be
+    released, and a bad-origin flood would lock out everyone."""
+    ws = _ws({"origin": "https://evil.example"}, app=app)
+    await ssh_gateway.attach_endpoint(ws)
+    assert app.state.limiter.refusals == ["203.0.113.9"]
+    assert app.state.limiter.admits == []
+    assert app.state.limiter.releases == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_token_is_metered_against_the_source(app):
+    """The token path matters more than the Origin path: it is the one that
+    runs an HMAC per attempt."""
+    ws = _ws({"origin": "https://cockpit.srw.works"}, app=app)
+    await ssh_gateway.attach_endpoint(ws)
+    assert app.state.limiter.refusals == ["203.0.113.9"]
+    assert app.state.limiter.admits == []
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_over_budget_is_still_refused_not_admitted(app):
+    """Over-budget only changes the log line: the handshake was already
+    refused, and the meter must never turn into a second admission path."""
+    app.state.limiter.note_handshake_refusal = lambda ip: False
+    ws = _ws({"origin": "https://evil.example"}, app=app)
+    await ssh_gateway.attach_endpoint(ws)
+    assert ws.closed_code == ssh_gateway.WS_ORIGIN_REFUSED
+    assert ws.accepted is False
+    assert app.state.limiter.admits == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_handshake_closes_the_socket_without_metering_a_slot(app):
+    """Rate-limit refusals (past origin and token) are NOT re-metered: they
+    were already counted by ``try_admit``'s own window."""
+    app.state.limiter.allow = False
+    ws = _authorized_ws(app)
+    await ssh_gateway.attach_endpoint(ws)
+    assert app.state.limiter.refusals == []
+    assert ws.closed_code == ssh_gateway.WS_RATE_REFUSED
+
+
+def _request(app):
+    return SimpleNamespace(app=app)
+
+
+# ---------------------------------------------------------------------------
 # wiring
 # ---------------------------------------------------------------------------
 
@@ -459,6 +610,11 @@ class RecordingLimiter:
         self.allow = True
         self.admits = []
         self.releases = []
+        self.refusals = []
+
+    def note_handshake_refusal(self, client_ip_value):
+        self.refusals.append(client_ip_value)
+        return True
 
     def try_admit(self, client_ip_value):
         if not self.allow:

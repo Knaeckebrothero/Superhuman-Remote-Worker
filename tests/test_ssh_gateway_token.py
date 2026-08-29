@@ -26,6 +26,8 @@ minted with the same key, so only the version clause inside the MAC'd head
 keeps them apart.
 """
 
+import hashlib
+import hmac
 import time
 
 import pytest
@@ -54,10 +56,53 @@ def test_the_token_names_its_version_so_it_can_never_be_a_challenge():
     Both tokens are HMACs under SESSION_JWT_SECRET. If the version clause
     were outside the MAC (or absent), a registration challenge minted for
     Mallory would verify here as an attach token and vice versa.
+
+    Pinned against ``main._SSH_CHALLENGE_VERSION`` itself, not against the
+    literal ``"srw-ssh1"``: a literal only notices this module changing, and
+    would sit silent if the *challenge* were renamed onto our string. Either
+    side moving onto the other is the collision that matters.
     """
+    import main
+
     token, _ = mint_attach_token(USER, SECRET)
     assert token.startswith(ATTACH_TOKEN_VERSION + ":")
-    assert ATTACH_TOKEN_VERSION != "srw-ssh1"
+    assert ATTACH_TOKEN_VERSION != main._SSH_CHALLENGE_VERSION
+
+
+def test_a_challenge_versioned_head_is_refused_by_the_version_check_itself():
+    """The designed barrier, exercised on its own.
+
+    This is the test the end-to-end pair below could not be: a real
+    registration challenge is ALSO refused incidentally, because its fifth
+    (identity) clause leaves ``expires_at_raw`` as ``"<int>:<label>"`` and
+    ``float()`` refuses it. That accident meant the cross-protocol test kept
+    passing with ``ATTACH_TOKEN_VERSION`` set to the challenge's own version
+    -- it proved the property while proving nothing about the check that is
+    supposed to carry it (review finding 2; the eighth test on this plan to
+    assert less than it claimed).
+
+    So: same secret, same clause COUNT as an attach token, correct MAC over
+    the whole head. Everything is valid except the version. If the version
+    check is removed, or if the two versions ever collide, this authenticates
+    -- and returns a user id.
+    """
+    import main
+
+    expires = int(time.time() + 300)
+
+    def _signed(version):
+        head = f"{version}:nonce123:{USER}:{expires}"
+        signature = hmac.new(
+            SECRET.encode("utf-8"), head.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        return f"{head}:{signature}"
+
+    # Control: identical in every respect but the version clause. If this one
+    # did not verify, the assertion below would pass for the wrong reason --
+    # which is the exact failure this test was written to replace.
+    assert verify_attach_token(_signed(ATTACH_TOKEN_VERSION), SECRET) == USER
+
+    assert verify_attach_token(_signed(main._SSH_CHALLENGE_VERSION), SECRET) is None
 
 
 def test_an_ssh_key_registration_challenge_is_not_an_attach_token():
@@ -66,6 +111,11 @@ def test_an_ssh_key_registration_challenge_is_not_an_attach_token():
     ``main._mint_ssh_key_challenge`` signs with the same key. Its token must
     not open the gateway, or every user who ever requested a key-registration
     challenge holds a gateway credential they were never issued.
+
+    Note this passes for TWO reasons (see the version-check test above for the
+    one that is designed): the version clause refuses it, and behind that the
+    challenge's fifth clause makes the expiry unparseable. Do not treat a pass
+    here as evidence about the version check.
     """
     import main
 
