@@ -312,3 +312,45 @@ class TestTodoListFooter:
             assert "todo_complete" in footer, family
             # ...and explicitly disclaims being a tool list.
             assert "not a tool list" in footer, family
+
+
+# =============================================================================
+# phase_gate_* — the per-call phase gate's rejection (U2 WP3)
+# =============================================================================
+
+
+class TestPhaseGateNudges:
+    """The rejection a phase-illegal call gets back names the tool's phase, the
+    current phase and what advances the job — never a list of other tools
+    (same rule as the todo-list footer, same failure mode if broken)."""
+
+    def test_no_family_enumerates_tool_surface(self):
+        from src.core.loader import _load_guardrails_matrix
+
+        matrix = _load_guardrails_matrix(None)
+        for family in sorted(matrix):
+            tactical = format_nudge(
+                "phase_gate_strategic_tool_in_tactical",
+                family=family,
+                tool="x_tool",
+                phase_number=4,
+            )
+            strategic = format_nudge(
+                "phase_gate_tactical_tool_in_strategic",
+                family=family,
+                tool="x_tool",
+                phase_number=3,
+            )
+            for text in (tactical, strategic):
+                assert text.startswith("Error: 'x_tool' is a "), family
+                assert "Tools available" not in text, family
+            assert "strategic-phase tool" in tactical and "(phase 4)" in tactical
+            assert "tactical-phase tool" in strategic and "(phase 3)" in strategic
+            # The tactical-phase rejection names no other tool at all; the
+            # strategic one names only the tool that stages the work.
+            assert "request_replan" not in tactical, family
+            assert "next_phase_todos" not in tactical, family
+            assert "next_phase_todos" in strategic, family
+            assert "job_complete" not in strategic, family
+            note = format_nudge("phase_gate_batch_note", family=family)
+            assert note == "Other calls in this batch were executed normally.", family

@@ -74,6 +74,13 @@ _FAMILY_MODELS = {
 #: Either spelling of the block, per template style (XML vs markdown headings).
 _PHASE_MODEL_MARKERS = ("<phase_model>", "# Phase Model")
 _PHASE_DIRECTIVE_MARKERS = ("<phase_directive>", "# Phase Directive", "phase directive")
+#: WP3: one tool binding for every phase — the per-call gate is what the model
+#: is told about, in every family's template.
+_PER_CALL_GATE_SENTENCE = (
+    "Some tools belong to one phase only and say so in their description; "
+    "calling one outside its phase returns an error for that call without "
+    "affecting the other calls in the batch."
+)
 
 
 def _worker_experts() -> list[tuple[str, Path]]:
@@ -169,6 +176,7 @@ def test_system_prompt_renders_phase_agnostic(name, leaf, family):
     assert not any(m in prompt for m in _PHASE_DIRECTIVE_MARKERS), label
     assert "phase instructions" in prompt, label
     assert "[PHASE_TRANSITION]" in prompt, label
+    assert prompt.count(_PER_CALL_GATE_SENTENCE) == 1, label
     # The datasource block is a shell feature; it must follow the grant.
     with_ds = get_system_prompt(cfg, model=model, tool_names=tools)
     assert ("datasource_access" in with_ds) is False  # no cli datasources bound here
@@ -324,6 +332,7 @@ def test_legacy_prompt_mode_renders_the_swap_on_the_shipped_templates(family):
     for label, prompt in (("strategic", strategic), ("tactical", tactical)):
         _assert_clean(prompt, f"legacy {family} {label}")
         assert not any(m in prompt for m in _PHASE_MODEL_MARKERS), label
+        assert _PER_CALL_GATE_SENTENCE not in prompt, label  # batch gate in arm A
         assert "<phase_directive>" in prompt or "# Phase Directive" in prompt, label
     assert "You are in STRATEGIC mode." in strategic
     assert "You are in TACTICAL mode." in tactical
@@ -355,3 +364,21 @@ def test_frozen_pre_u2_template_keeps_the_swap_for_an_in_flight_job():
     # The phase-agnostic entry point on the same template renders the slot empty.
     agnostic = get_system_prompt(cfg, tool_names=[])
     assert "{prompt_content}" not in agnostic and "TAC" not in agnostic
+
+
+def test_every_worker_template_states_the_per_call_gate_once():
+    """All nine worker templates carry the WP3 sentence exactly once, inside
+    the skills branch (the legacy branch has no such sentence)."""
+    templates = [
+        f
+        for f in sorted(_CONFIG.glob("prompts/systemprompt*.txt"))
+        if "interactive" not in f.name
+    ]
+    assert len(templates) == 9, [f.name for f in templates]
+    for template in templates:
+        text = template.read_text(encoding="utf-8")
+        assert text.count(_PER_CALL_GATE_SENTENCE) == 1, template.name
+        legacy_branch = text[
+            text.index("{% if legacy_phase_prompt") : text.index("{% else")
+        ]
+        assert _PER_CALL_GATE_SENTENCE not in legacy_branch, template.name

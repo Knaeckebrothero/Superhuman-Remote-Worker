@@ -16,7 +16,7 @@ Usage:
 
 import functools
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .canvas import create_canvas_tools, get_canvas_metadata
 from .citation import create_citation_tools, get_citation_metadata
@@ -298,6 +298,33 @@ def expand_tool_wildcards(tool_names: List[str]) -> List[str]:
         if name not in expanded:
             expanded.append(name)
     return expanded
+
+
+#: Prefix a single-phase tool's description carries when every tool is bound
+#: at once (U2 skills mode): the bound schema no longer filters by phase, so
+#: the description states the phase generically — never a list of the other
+#: tools (models read such lists as exhaustive; see the todo_list_footer
+#: comment in config/guardrails/default.yaml). Both-phase tools carry none.
+PHASE_DESCRIPTION_PREFIXES: Dict[str, str] = {
+    "strategic": "[strategic-phase tool] ",
+    "tactical": "[tactical-phase tool] ",
+}
+
+
+def single_phase_of(tool_name: str) -> Optional[str]:
+    """The one phase a registered tool is declared for, else ``None``.
+
+    ``None`` for tools available in both phases and for names without a
+    registry entry (dynamic/test tools carry no phase restriction).
+    """
+    meta = TOOL_REGISTRY.get(tool_name)
+    if not meta:
+        return None
+    phases = set(meta.get("phases", ["strategic", "tactical"]))
+    if len(phases) != 1:
+        return None
+    (phase,) = phases
+    return phase if phase in PHASE_DESCRIPTION_PREFIXES else None
 
 
 def filter_tools_by_phase(tool_names: List[str], phase: str) -> List[str]:

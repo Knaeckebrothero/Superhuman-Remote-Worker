@@ -38,6 +38,7 @@ from .core.loader import (
     resolve_config_path,
     resolve_model_settings,
     supports_parallel_tool_calls,
+    uses_legacy_phase_prompt,
 )
 from .core.loader import get_project_root
 from .core.phase_snapshot import PhaseSnapshotManager
@@ -57,7 +58,10 @@ from .graph import (
 from .managers import TodoManager
 from .shared.job_freeze_types import AUTO_CONTINUE_FREEZE_TYPES
 from .tools import ToolContext, load_tools, apply_instruction_enforcement
-from .tools.description_manager import apply_description_overrides
+from .tools.description_manager import (
+    apply_description_overrides,
+    apply_phase_description_prefixes,
+)
 from .utils.db_url import (
     checkpointer_backend,
     resolve_checkpoint_url,
@@ -1052,8 +1056,7 @@ class UniversalAgent:
 
             # Build graph for this job
             self._graph = build_phase_alternation_graph(
-                strategic_llm_with_tools=self._strategic_llm_with_tools,
-                tactical_llm_with_tools=self._tactical_llm_with_tools,
+                **self._graph_llm_bindings(),
                 tools=self._tools,
                 config=self.config,
                 workspace=self._workspace_manager,
@@ -2620,8 +2623,7 @@ class UniversalAgent:
         #    checkpointer, so the re-invoke resumes from the local checkpoint.
         snapshot_manager = PhaseSnapshotManager(job_id, workspace_backend=new_backend)
         self._graph = build_phase_alternation_graph(
-            strategic_llm_with_tools=self._strategic_llm_with_tools,
-            tactical_llm_with_tools=self._tactical_llm_with_tools,
+            **self._graph_llm_bindings(),
             tools=self._tools,
             config=self.config,
             workspace=self._workspace_manager,
@@ -4303,63 +4305,108 @@ class UniversalAgent:
         # Apply instruction file enforcement wrappers (before_tool triggers)
         self._tools = apply_instruction_enforcement(self._tools, context)
 
-        # Configure parallel tool calls from config (defaults to False to prevent
-        # overwhelming the agent loop with 20+ simultaneous tool calls).
-        # parallel_tool_calls is an OpenAI Chat Completions param — suppressed
-        # for providers/models that reject it (Google GenAI's GenerateContentConfig,
-        # OpenAI o-series). One model runs every phase (U1), so a single gate
-        # serves both phase bindings.
-        llm_cfg = self.config.llm
-        bind_kwargs = {}
-        if supports_parallel_tool_calls(llm_cfg.provider, llm_cfg.model):
-            bind_kwargs["parallel_tool_calls"] = llm_cfg.parallel_tool_calls
-        strategic_bind_kwargs = bind_kwargs
-        tactical_bind_kwargs = bind_kwargs
-
-        # Phase-filter tools: each LLM only sees tools declared for its phase.
-        # The ToolNode keeps the full list (LLM schema binding is primary enforcement).
-        from .tools.registry import filter_tools_by_phase
-
-        strategic_names = set(
-            filter_tools_by_phase([t.name for t in self._tools], "strategic")
-        )
-        tactical_names = set(
-            filter_tools_by_phase([t.name for t in self._tools], "tactical")
-        )
-        strategic_tools = [t for t in self._tools if t.name in strategic_names]
-        tactical_tools = [t for t in self._tools if t.name in tactical_names]
-
-        # Inject family-specific Examples blocks into tool descriptions before
-        # binding. This is where the model first sees the tool catalog and
-        # decides on a wire format — see knowledge-base/knowledge/design/guardrails_matrix.md.
-        from src.services.guardrails import apply_guardrails_to_tools
-
-        strategic_tools = apply_guardrails_to_tools(
-            strategic_tools, model=self.config.llm.model
-        )
-        tactical_tools = apply_guardrails_to_tools(
-            tactical_tools, model=self.config.llm.model
-        )
-
-        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(
-            strategic_tools, **strategic_bind_kwargs
-        )
-        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(
-            tactical_tools, **tactical_bind_kwargs
-        )
-
-        # Keep _llm_with_tools for backwards compatibility
-        self._llm_with_tools = self._strategic_llm_with_tools
-
-        logger.info(
-            f"Loaded {len(self._tools)} tools "
-            f"(strategic: {len(strategic_tools)}, tactical: {len(tactical_tools)})"
-        )
+        # Bind the tools to the job's LLM (one binding for every phase in
+        # skills mode; the legacy phase-filtered pair in legacy prompt mode).
+        self._bind_job_tools()
 
         # Auto-register input documents as CitationEngine sources (background)
         self._doc_registration_task = asyncio.create_task(
             self._register_initial_documents_background(context)
         )
+
+    def _bind_job_tools(self) -> None:
+        """Bind the loaded tools to the job's LLM.
+
+        Skills mode (U2, the default): ONE binding carries the union of both
+        phases' tools — ``_llm_with_tools`` — and the two phase attributes
+        alias it (their readers keep working for one release). The phase is
+        enforced per call by the runtime gate in the graph, and single-phase
+        tools state their phase in the bound description
+        (``apply_phase_description_prefixes``, applied to the bound copies
+        like the guardrail Examples — the ToolNode's tool objects and the
+        full-description originals stay untouched). Legacy prompt mode (the
+        bench's "current" arm; deleted in WP6) keeps today's phase-filtered
+        pair and untouched descriptions, so arm A is honest.
+        """
+        # parallel_tool_calls is an OpenAI Chat Completions param — suppressed
+        # for providers/models that reject it (Google GenAI's
+        # GenerateContentConfig, OpenAI o-series). Defaults to False so a
+        # weak model cannot flood the loop with 20+ simultaneous calls. One
+        # model runs every phase (U1), so the gate is applied once.
+        llm_cfg = self.config.llm
+        bind_kwargs: Dict[str, Any] = {}
+        if supports_parallel_tool_calls(llm_cfg.provider, llm_cfg.model):
+            bind_kwargs["parallel_tool_calls"] = llm_cfg.parallel_tool_calls
+
+        # Family-specific Examples blocks go into the descriptions before
+        # binding: this is where the model first sees the tool catalog and
+        # decides on a wire format — knowledge-base/knowledge/design/guardrails_matrix.md.
+        from src.services.guardrails import apply_guardrails_to_tools
+        from .tools.registry import filter_tools_by_phase
+
+        all_names = [t.name for t in self._tools]
+        strategic_names = set(filter_tools_by_phase(all_names, "strategic"))
+        tactical_names = set(filter_tools_by_phase(all_names, "tactical"))
+
+        if uses_legacy_phase_prompt(self.config):
+            # Phase-filter tools: each binding only sees tools declared for
+            # its phase; the ToolNode keeps the full list and its batch-level
+            # gate is the backup.
+            strategic_tools = apply_guardrails_to_tools(
+                [t for t in self._tools if t.name in strategic_names],
+                model=llm_cfg.model,
+            )
+            tactical_tools = apply_guardrails_to_tools(
+                [t for t in self._tools if t.name in tactical_names],
+                model=llm_cfg.model,
+            )
+            self._strategic_llm_with_tools = self._strategic_llm.bind_tools(
+                strategic_tools, **bind_kwargs
+            )
+            self._tactical_llm_with_tools = self._tactical_llm.bind_tools(
+                tactical_tools, **bind_kwargs
+            )
+            # Keep _llm_with_tools for backwards compatibility
+            self._llm_with_tools = self._strategic_llm_with_tools
+            logger.info(
+                f"Loaded {len(self._tools)} tools (legacy prompt mode — "
+                f"strategic: {len(strategic_tools)}, tactical: {len(tactical_tools)})"
+            )
+            return
+
+        union = strategic_names | tactical_names
+        dropped = [n for n in all_names if n not in union]
+        if dropped:
+            # Same as before: a tool without registry phases was never bound.
+            logger.debug(f"Tools without a registry phase are not bound: {dropped}")
+        bound_tools = apply_phase_description_prefixes(
+            [t for t in self._tools if t.name in union]
+        )
+        bound_tools = apply_guardrails_to_tools(bound_tools, model=llm_cfg.model)
+        self._llm_with_tools = self._llm.bind_tools(bound_tools, **bind_kwargs)
+        self._strategic_llm_with_tools = self._llm_with_tools
+        self._tactical_llm_with_tools = self._llm_with_tools
+        logger.info(
+            f"Loaded {len(self._tools)} tools, bound once for every phase "
+            f"({len(bound_tools)} in the schema: "
+            f"{len(strategic_names - tactical_names)} strategic-only, "
+            f"{len(tactical_names - strategic_names)} tactical-only, "
+            f"{len(strategic_names & tactical_names)} both)"
+        )
+
+    def _graph_llm_bindings(self) -> Dict[str, Any]:
+        """The tool binding(s) handed to ``build_phase_alternation_graph``.
+
+        One binding for every phase in skills mode; legacy prompt mode's
+        phase-filtered pair goes through the factory's deprecated aliases
+        (deleted together in WP6).
+        """
+        if self._strategic_llm_with_tools is self._tactical_llm_with_tools:
+            return {"llm_with_tools": self._llm_with_tools}
+        return {
+            "strategic_llm_with_tools": self._strategic_llm_with_tools,
+            "tactical_llm_with_tools": self._tactical_llm_with_tools,
+        }
 
     def _setup_job_knowledge(
         self, context: ToolContext, project_id: Optional[str]

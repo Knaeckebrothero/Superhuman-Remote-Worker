@@ -5,12 +5,14 @@ LLM-dependent nodes are tested with mocks or integration tests.
 """
 
 import inspect
+import warnings
 
 import pytest
 import tempfile
 import sys
 import yaml
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 from uuid import UUID
 
@@ -43,6 +45,8 @@ from src.graph import (  # noqa: E402
     get_managers_from_workspace,
     worker_batch_boundary_updates,
 )
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage  # noqa: E402
+from src.core.loader import LimitsConfig  # noqa: E402
 from src.core.phase import (  # noqa: E402
     get_initial_strategic_todos,
     get_transition_strategic_todos,
@@ -2310,3 +2314,242 @@ class TestEnsureWithinLimits:
 
         # Should return same messages since there's nothing to summarize
         assert result == messages
+
+
+# =============================================================================
+# Per-call phase gate (U2 WP3) and the one-binding execute node
+# =============================================================================
+
+
+def _gate_config(**limits):
+    """What create_audited_tool_node reads; skills mode unless phase_settings
+    says legacy."""
+    return SimpleNamespace(
+        agent_id="gate-agent",
+        limits=LimitsConfig(**limits),
+        llm=SimpleNamespace(model=None),
+        phase_settings=None,
+    )
+
+
+def _named_tool(name):
+    fake = MagicMock()
+    fake.name = name
+    return fake
+
+
+def _gate_state(calls, is_strategic=False, phase_number=4):
+    return {
+        "messages": [AIMessage(content="", tool_calls=calls)],
+        "job_id": "gate-job",
+        "iteration": 1,
+        "is_strategic_phase": is_strategic,
+        "phase_number": phase_number,
+        "metadata": {},
+    }
+
+
+class TestPerCallPhaseGate:
+    """One tool binding for every phase (skills mode): the audited tool node
+    decides per call. Legacy prompt mode keeps the batch-level gate."""
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_runs_the_legal_call_and_rejects_the_illegal_one(
+        self,
+    ):
+        auditor = MagicMock()
+        auditor.audit_tool_call.side_effect = lambda **kw: f"doc-{kw['call_id']}"
+        with (
+            patch("src.graph.ToolNode") as MockToolNode,
+            patch("src.graph.get_archiver", return_value=auditor),
+        ):
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        ToolMessage(content="body", tool_call_id="c1", name="read_file")
+                    ]
+                }
+            )
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node(
+                [_named_tool("read_file"), _named_tool("job_complete")],
+                _gate_config(max_tool_calls_per_job=2),
+            )
+            result = await audited(
+                _gate_state(
+                    [
+                        {"name": "read_file", "id": "c1", "args": {"path": "a"}},
+                        {"name": "job_complete", "id": "c2", "args": {}},
+                    ]
+                )
+            )
+
+            # The legal call executed — the ToolNode saw only it — and the
+            # illegal one is an error ToolMessage in its original position.
+            mock_tn.ainvoke.assert_awaited_once()
+            seen = mock_tn.ainvoke.await_args.args[0]["messages"][-1]
+            assert [c["name"] for c in seen.tool_calls] == ["read_file"]
+            msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+            assert [m.tool_call_id for m in msgs] == ["c1", "c2"]
+            assert msgs[0].content == "body"
+            assert msgs[1].content == (
+                "Error: 'job_complete' is a strategic-phase tool; you are in the "
+                "tactical phase (phase 4). Finish or replan the current todos — it "
+                "becomes available at the next strategic phase. Other calls in "
+                "this batch were executed normally."
+            )
+
+            # Both calls are in the audit; the rejection is a recorded failure.
+            assert [
+                c.kwargs["call_id"] for c in auditor.audit_tool_call.call_args_list
+            ] == ["c1", "c2"]
+            updates = {
+                c.kwargs["audit_doc_id"]: c.kwargs
+                for c in auditor.update_tool_result.call_args_list
+            }
+            assert updates["doc-c1"]["success"] is True
+            assert updates["doc-c2"]["success"] is False
+            assert updates["doc-c2"]["error"].startswith(
+                "Error: 'job_complete' is a strategic-phase tool"
+            )
+
+            # The budget counted both: the cap of 2 trips on the next call.
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        ToolMessage(content="body", tool_call_id="c3", name="read_file")
+                    ]
+                }
+            )
+            frozen = await audited(
+                _gate_state([{"name": "read_file", "id": "c3", "args": {}}])
+            )
+            assert frozen["freeze_data"]["freeze_type"] == "budget_exceeded"
+            assert frozen["freeze_data"]["tool_calls_this_job"] == 3
+
+    @pytest.mark.asyncio
+    async def test_stuck_detection_progress_counts_only_the_executed_call(self):
+        def nudges(result):
+            return [
+                m
+                for m in result.get("messages", [])
+                if isinstance(m, SystemMessage) and "OBSERVATION" in m.content
+            ]
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node(
+                [_named_tool("write_file"), _named_tool("job_complete")],
+                _gate_config(progress_stall_threshold=2),
+            )
+            # Two rejected calls are two calls without progress: the stall nudge.
+            for call_id in ("c1", "c2"):
+                result = await audited(
+                    _gate_state([{"name": "job_complete", "id": call_id, "args": {}}])
+                )
+            assert nudges(result)
+            mock_tn.ainvoke.assert_not_called()
+
+            # A legal write_file next to a rejected call is progress: reset.
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        ToolMessage(
+                            content="written", tool_call_id="c3", name="write_file"
+                        )
+                    ]
+                }
+            )
+            result = await audited(
+                _gate_state(
+                    [
+                        {"name": "write_file", "id": "c3", "args": {"path": "p"}},
+                        {"name": "job_complete", "id": "c4", "args": {}},
+                    ]
+                )
+            )
+            assert not nudges(result)
+            result = await audited(
+                _gate_state([{"name": "job_complete", "id": "c5", "args": {}}])
+            )
+            assert not nudges(result)  # one call since the write, below 2
+
+    @pytest.mark.asyncio
+    async def test_legacy_prompt_mode_keeps_the_batch_level_gate(self):
+        cfg = _gate_config()
+        cfg.phase_settings = SimpleNamespace(prompt_mode="legacy")
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node(
+                [_named_tool("read_file"), _named_tool("job_complete")], cfg
+            )
+            result = await audited(
+                _gate_state(
+                    [
+                        {"name": "read_file", "id": "c1", "args": {"path": "a"}},
+                        {"name": "job_complete", "id": "c2", "args": {}},
+                    ]
+                )
+            )
+            by_id = {m.tool_call_id: m.content for m in result["messages"]}
+            assert by_id["c2"] == (
+                "Error: 'job_complete' is not available in the tactical phase. "
+                "Use tools appropriate for this phase."
+            )
+            assert by_id["c1"].startswith(
+                "Not executed: 'read_file' IS available in the tactical phase"
+            )
+            mock_tn.ainvoke.assert_not_called()
+
+
+class TestExecuteNodeBindings:
+    """``create_execute_node(llm_with_tools=...)`` is the primary shape; the
+    strategic/tactical pair is a deprecated alias (legacy prompt mode)."""
+
+    @staticmethod
+    def _kwargs():
+        return dict(
+            todo_manager=MagicMock(),
+            memory_manager=MagicMock(),
+            workspace_manager=MagicMock(),
+            config=MagicMock(),
+            context_mgr=MagicMock(),
+            retry_manager=MagicMock(),
+            auxiliary_llm=None,
+            summarization_prompt="",
+        )
+
+    def test_one_binding_is_the_primary_argument(self):
+        from src.graph import create_execute_node
+
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            node = create_execute_node(llm_with_tools=MagicMock(), **self._kwargs())
+        assert callable(node)
+        assert not [w for w in seen if "llm_with_tools" in str(w.message)]
+
+    def test_two_binding_kwargs_still_accepted_with_deprecation(self):
+        from src.graph import create_execute_node
+
+        with pytest.warns(DeprecationWarning, match="pass llm_with_tools="):
+            node = create_execute_node(
+                strategic_llm_with_tools=MagicMock(),
+                tactical_llm_with_tools=MagicMock(),
+                **self._kwargs(),
+            )
+        assert callable(node)
+
+    def test_both_shapes_at_once_or_neither_is_a_type_error(self):
+        from src.graph import create_execute_node
+
+        with pytest.raises(TypeError, match="not both"):
+            create_execute_node(
+                llm_with_tools=MagicMock(),
+                strategic_llm_with_tools=MagicMock(),
+                **self._kwargs(),
+            )
+        with pytest.raises(TypeError, match="llm_with_tools"):
+            create_execute_node(**self._kwargs())

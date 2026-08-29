@@ -10,7 +10,7 @@ Handles:
 import logging
 from typing import Any, Dict, List, Optional
 
-from .registry import TOOL_REGISTRY
+from .registry import PHASE_DESCRIPTION_PREFIXES, TOOL_REGISTRY, single_phase_of
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +287,36 @@ def apply_description_overrides(tools: List[Any]) -> List[Any]:
     manager = _get_manager()
     manager.extract_docstrings(tools)  # Cache docstrings first
     return manager.apply_overrides(tools)
+
+
+def apply_phase_description_prefixes(tools: List[Any]) -> List[Any]:
+    """Prefix single-phase tools' descriptions with their phase (U2).
+
+    With one tool binding for every phase the schema no longer says which
+    phase a tool belongs to, so ``[strategic-phase tool] `` /
+    ``[tactical-phase tool] `` (``PHASE_DESCRIPTION_PREFIXES``, from the
+    registry's ``phases`` metadata) is put in front of the description at
+    bind time. Both-phase and unregistered tools are returned as they are; a
+    description that already carries its prefix is left alone, so the call is
+    idempotent after ``apply_description_overrides`` and the guardrail
+    Examples injection. Returns copies — the loaded tool objects (the
+    ToolNode's, and the full-description originals behind ``tools/<name>.md``)
+    are never mutated.
+    """
+    manager = _get_manager()
+    out: List[Any] = []
+    for tool in tools:
+        phase = single_phase_of(getattr(tool, "name", "") or "")
+        description = getattr(tool, "description", None)
+        if phase is None or not isinstance(description, str):
+            out.append(tool)
+            continue
+        prefix = PHASE_DESCRIPTION_PREFIXES[phase]
+        if description.startswith(prefix):
+            out.append(tool)
+            continue
+        out.append(manager._copy_with_description(tool, prefix + description))
+    return out
 
 
 def get_deferred_tools() -> List[str]:

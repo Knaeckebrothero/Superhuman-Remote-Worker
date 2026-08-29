@@ -49,6 +49,10 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     },
     "phase_transition_tactical_to_strategic": {"phase_number"},
     "act_ratio_nudge": {"count"},
+    # src/graph.py audited_tools — the per-call phase gate (U2)
+    "phase_gate_strategic_tool_in_tactical": {"tool", "phase_number"},
+    "phase_gate_tactical_tool_in_strategic": {"tool", "phase_number"},
+    "phase_gate_batch_note": set(),
     # src/managers/todo.py
     "todo_list_footer": set(),
     # src/services/recall_store.py

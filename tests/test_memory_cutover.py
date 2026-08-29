@@ -15,6 +15,7 @@ the *wiring* that slice 5 added to production code:
   compaction keeps stripping injected pairs after the cutover.
 """
 
+import warnings
 import asyncio
 import uuid
 from pathlib import Path
@@ -272,14 +273,50 @@ class TestWorkerConstruction:
         from src.graph import build_phase_alternation_graph
 
         return build_phase_alternation_graph(
-            strategic_llm_with_tools=MagicMock(),
-            tactical_llm_with_tools=MagicMock(),
+            llm_with_tools=MagicMock(),
             tools=[],
             config=config,
             workspace=workspace_manager,
             todo_manager=TodoManager(workspace_manager),
             tool_context=tool_context,
         )
+
+    def test_one_binding_builds_without_a_deprecation_warning(
+        self, worker_config, workspace_manager
+    ):
+        worker_config.memory.manager_enabled = False
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            self._build(worker_config, workspace_manager, None)
+        assert not [w for w in seen if "llm_with_tools" in str(w.message)]
+
+    def test_deprecated_binding_pair_still_builds_with_one_warning(
+        self, worker_config, workspace_manager
+    ):
+        """Legacy prompt mode hands the phase-filtered pair through the
+        deprecated aliases; the graph factory warns once (not again from the
+        execute node it builds)."""
+        from src.graph import build_phase_alternation_graph
+
+        worker_config.memory.manager_enabled = False
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            build_phase_alternation_graph(
+                strategic_llm_with_tools=MagicMock(),
+                tactical_llm_with_tools=MagicMock(),
+                tools=[],
+                config=worker_config,
+                workspace=workspace_manager,
+                todo_manager=TodoManager(workspace_manager),
+            )
+        ours = [
+            w
+            for w in seen
+            if issubclass(w.category, DeprecationWarning)
+            and "pass llm_with_tools=" in str(w.message)
+        ]
+        assert len(ours) == 1
+        assert "build_phase_alternation_graph(" in str(ours[0].message)
 
     def test_flag_on_constructs_with_worker_runtime(
         self, worker_config, workspace_manager
@@ -418,8 +455,7 @@ def _make_execute_node(config, workspace_manager, todo_manager, ctx, service, mg
     from src.graph import create_execute_node
 
     return create_execute_node(
-        strategic_llm_with_tools=MagicMock(),
-        tactical_llm_with_tools=mgr["llm"],
+        llm_with_tools=mgr["llm"],
         todo_manager=todo_manager,
         memory_manager=MagicMock(),  # vestigial workspace.md manager
         workspace_manager=workspace_manager,

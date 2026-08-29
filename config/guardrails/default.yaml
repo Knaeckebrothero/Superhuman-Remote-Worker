@@ -277,6 +277,21 @@ nudges:
   phase_transition_tactical_to_strategic: |-
     [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}. Review what was accomplished, update plan.md and record key learnings, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool.
 
+  # Sites: src/graph.py audited_tools — the per-call phase gate (U2). One tool
+  # binding serves every phase, so this is what a phase-illegal call gets
+  # back while the batch's legal calls run. Name the tool's phase, the
+  # current phase and what advances the job; NEVER enumerate the tool
+  # surface (see todo_list_footer below for why).
+  # Placeholders: {tool}, {phase_number}
+  phase_gate_strategic_tool_in_tactical: |-
+    Error: '{tool}' is a strategic-phase tool; you are in the tactical phase (phase {phase_number}). Finish or replan the current todos — it becomes available at the next strategic phase.
+
+  phase_gate_tactical_tool_in_strategic: |-
+    Error: '{tool}' is a tactical-phase tool; you are in the strategic phase (phase {phase_number}). Stage that work as a todo with `next_phase_todos` — it becomes available in the next tactical phase.
+
+  # Appended to the rejection when the batch also carried phase-legal calls.
+  phase_gate_batch_note: "Other calls in this batch were executed normally."
+
   # ----- src/managers/todo.py -----
 
   # Sites: src/managers/todo.py:416 (todo-list footer)

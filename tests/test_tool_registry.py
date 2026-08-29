@@ -11,8 +11,18 @@ import pytest
 
 from src.core.loader import InstructionFileEntry
 from src.tools.context import ToolContext
+from langchain_core.tools import StructuredTool
+
+from src.core.workspace import WorkspaceManager
+from src.services.guardrails import apply_guardrails_to_tools
+from src.tools.description_manager import (
+    apply_description_overrides,
+    apply_phase_description_prefixes,
+)
 from src.tools.registry import (
+    PHASE_DESCRIPTION_PREFIXES,
     TOOL_REGISTRY,
+    single_phase_of,
     get_available_tools,
     get_tools_by_category,
     get_categories,
@@ -723,3 +733,102 @@ class TestLoadToolsDatasourceWarnings:
         ctx = ToolContext(workspace_manager=ws)
         result = load_tools(["git_log"], ctx)
         assert result == []
+
+
+# =============================================================================
+# Phase-stated descriptions (U2 WP3)
+# =============================================================================
+
+
+class TestPhaseDescriptionPrefixes:
+    """With one tool binding for every phase, a single-phase tool's bound
+    description starts with ``[strategic-phase tool] `` / ``[tactical-phase
+    tool] `` (from the registry's ``phases``); both-phase tools carry none."""
+
+    def test_single_phase_of(self):
+        assert single_phase_of("job_complete") == "strategic"
+        assert single_phase_of("next_phase_todos") == "strategic"
+        assert single_phase_of("request_replan") == "tactical"
+        assert single_phase_of("web_search") == "tactical"
+        assert single_phase_of("read_file") is None
+        assert single_phase_of("todo_complete") is None
+        assert single_phase_of("nonexistent_tool_xyz") is None
+
+    def test_single_phase_descriptions_state_their_phase(self):
+        """Every registered single-phase tool gets its prefix, every both-phase
+        tool is returned untouched, and the originals are never mutated."""
+        tools = [
+            StructuredTool.from_function(
+                func=lambda: None, name=name, description=f"Desc of {name}."
+            )
+            for name in TOOL_REGISTRY
+        ]
+        bound = apply_phase_description_prefixes(tools)
+        assert [t.name for t in bound] == [t.name for t in tools]
+
+        prefixed = {"strategic": 0, "tactical": 0}
+        for original, tool in zip(tools, bound):
+            phase = single_phase_of(tool.name)
+            if phase is None:
+                assert tool is original
+                assert tool.description == f"Desc of {tool.name}."
+                continue
+            prefixed[phase] += 1
+            assert tool.description == (
+                PHASE_DESCRIPTION_PREFIXES[phase] + f"Desc of {tool.name}."
+            )
+            assert original.description == f"Desc of {tool.name}."
+        assert prefixed["strategic"] >= 4  # job_complete, next_phase_todos, verdicts
+        assert prefixed["tactical"] >= 20  # research, browser, db, email, ...
+
+    def test_prefix_is_idempotent(self):
+        tools = [
+            StructuredTool.from_function(
+                func=lambda: None, name=name, description=f"Desc of {name}."
+            )
+            for name in ("job_complete", "request_replan", "read_file")
+        ]
+        once = apply_phase_description_prefixes(tools)
+        twice = apply_phase_description_prefixes(once)
+        assert [t.description for t in twice] == [t.description for t in once]
+        assert all(t.description.count("-phase tool] ") <= 1 for t in twice)
+
+    def test_prefix_appears_once_across_overrides_and_guardrails(self, tmp_path):
+        """The bind-time pipeline on real tools: overrides → prefix →
+        family Examples injection → (defensively) prefix again."""
+        from tests._fs_backend import FilesystemTestBackend
+
+        ws = WorkspaceManager(
+            job_id="prefix-job",
+            base_path=tmp_path,
+            backend=FilesystemTestBackend(tmp_path),
+        )
+        ws.initialize()
+        names = [
+            "job_complete",
+            "request_replan",
+            "next_phase_todos",
+            "todo_complete",
+            "read_file",
+        ]
+        from src.managers import TodoManager
+
+        tools = load_tools(
+            names, ToolContext(workspace_manager=ws, todo_manager=TodoManager(ws))
+        )
+        originals = {t.name: t.description for t in tools}
+
+        bound = apply_phase_description_prefixes(apply_description_overrides(tools))
+        bound = apply_guardrails_to_tools(bound, model="gemma-4-moe")
+        bound = apply_phase_description_prefixes(bound)
+
+        for tool in bound:
+            phase = single_phase_of(tool.name)
+            count = tool.description.count("-phase tool] ")
+            if phase is None:
+                assert count == 0, tool.name
+            else:
+                assert count == 1, tool.name
+                assert tool.description.startswith(PHASE_DESCRIPTION_PREFIXES[phase])
+        # The loaded objects (what the ToolNode runs) keep their descriptions.
+        assert {t.name: t.description for t in tools} == originals

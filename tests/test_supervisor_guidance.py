@@ -608,8 +608,7 @@ class TestExecuteRendersGuidance:
         context_mgr.clear_old_tool_results.side_effect = lambda msgs: msgs
 
         return create_execute_node(
-            strategic_llm_with_tools=llm,
-            tactical_llm_with_tools=llm,
+            llm_with_tools=llm,
             todo_manager=todo_manager,
             memory_manager=MagicMock(),
             workspace_manager=workspace_manager,

@@ -49,6 +49,7 @@ import math
 import re
 import asyncio
 import time
+import warnings
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Literal, Optional
 from uuid import UUID, uuid4
@@ -725,9 +726,66 @@ def create_init_strategic_todos_node(
 # =============================================================================
 
 
+def _resolve_phase_bindings(
+    llm_with_tools: Optional[BaseChatModel],
+    strategic_llm_with_tools: Optional[BaseChatModel],
+    tactical_llm_with_tools: Optional[BaseChatModel],
+    *,
+    caller: str,
+) -> Dict[str, BaseChatModel]:
+    """``{"strategic": llm, "tactical": llm}`` from a graph factory's arguments.
+
+    ``llm_with_tools`` is the one binding for every phase (U2). The
+    ``strategic_llm_with_tools`` / ``tactical_llm_with_tools`` pair is the
+    deprecated alias legacy prompt mode still uses for its phase-filtered
+    bindings: it warns (the pattern the old ``llm_with_tools`` alias used)
+    and is deleted with the mode in WP6.
+    """
+    pair = (strategic_llm_with_tools, tactical_llm_with_tools)
+    if llm_with_tools is not None:
+        if any(llm is not None for llm in pair):
+            raise TypeError(
+                f"{caller}() takes llm_with_tools or the deprecated "
+                "strategic_llm_with_tools/tactical_llm_with_tools pair, not both"
+            )
+        return {"strategic": llm_with_tools, "tactical": llm_with_tools}
+    if all(llm is None for llm in pair):
+        raise TypeError(f"{caller}() missing required argument: 'llm_with_tools'")
+    warnings.warn(
+        f"{caller}(strategic_llm_with_tools=..., tactical_llm_with_tools=...) is "
+        "deprecated; pass llm_with_tools= (one binding for every phase)",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    strategic = (
+        strategic_llm_with_tools
+        if strategic_llm_with_tools is not None
+        else tactical_llm_with_tools
+    )
+    tactical = (
+        tactical_llm_with_tools
+        if tactical_llm_with_tools is not None
+        else strategic_llm_with_tools
+    )
+    return {"strategic": strategic, "tactical": tactical}
+
+
+def _per_binding(
+    phase_llms: Dict[str, BaseChatModel], extract: Callable[[BaseChatModel], Any]
+) -> Dict[str, Any]:
+    """``{phase: extract(binding)}``, extracting once per distinct binding."""
+    memo: Dict[int, Any] = {}
+    out: Dict[str, Any] = {}
+    for phase, llm in phase_llms.items():
+        if id(llm) not in memo:
+            memo[id(llm)] = extract(llm)
+        out[phase] = memo[id(llm)]
+    return out
+
+
 def create_execute_node(
-    strategic_llm_with_tools: BaseChatModel,
-    tactical_llm_with_tools: BaseChatModel,
+    llm_with_tools: Optional[BaseChatModel] = None,
+    *,
     todo_manager: TodoManager,
     memory_manager: MemoryManager,
     workspace_manager: WorkspaceManager,
@@ -741,15 +799,21 @@ def create_execute_node(
     tool_context: Optional[ToolContext] = None,
     tool_names: Optional[List[str]] = None,
     memory_service: Optional[Any] = None,
+    # Deprecated aliases: legacy prompt mode's phase-filtered pair (U2 WP6
+    # deletes them with the mode).
+    strategic_llm_with_tools: Optional[BaseChatModel] = None,
+    tactical_llm_with_tools: Optional[BaseChatModel] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create the execute node with phase-specific LLM selection.
+    """Create the execute node.
 
-    This is the main ReAct execution node that processes todos.
-    Selects strategic or tactical LLM based on current phase.
+    This is the main ReAct execution node that processes todos. One tool
+    binding serves every phase (U2): the phase is enforced per call by the
+    runtime gate in ``create_audited_tool_node`` and single-phase tools state
+    their phase in their description. Legacy prompt mode still hands the
+    phase-filtered pair through the deprecated aliases.
 
     Args:
-        strategic_llm_with_tools: LLM for strategic (planning) phases
-        tactical_llm_with_tools: LLM for tactical (execution) phases
+        llm_with_tools: The job's LLM with every loaded tool bound
         todo_manager: TodoManager for task tracking
         memory_manager: MemoryManager (legacy; workspace.md no longer used)
         workspace_manager: WorkspaceManager for file operations
@@ -765,7 +829,15 @@ def create_execute_node(
             bound, replaces the direct-store memory read/write paths in
             this node (memory overhaul Phase 1 cutover); None keeps the
             legacy paths.
+        strategic_llm_with_tools: Deprecated alias — pass ``llm_with_tools``.
+        tactical_llm_with_tools: Deprecated alias — pass ``llm_with_tools``.
     """
+    phase_llms = _resolve_phase_bindings(
+        llm_with_tools,
+        strategic_llm_with_tools,
+        tactical_llm_with_tools,
+        caller="create_execute_node",
+    )
 
     # Extract tool schemas from bound LLMs once at creation time for archiving
     def _extract_tool_schemas(
@@ -776,8 +848,7 @@ def create_execute_node(
             return bound_llm.kwargs.get("tools")
         return None
 
-    strategic_tool_schemas = _extract_tool_schemas(strategic_llm_with_tools)
-    tactical_tool_schemas = _extract_tool_schemas(tactical_llm_with_tools)
+    phase_tool_schemas = _per_binding(phase_llms, _extract_tool_schemas)
 
     # Extract model kwargs (temperature, etc.) for archiving
     def _extract_model_kwargs(bound_llm: BaseChatModel) -> Dict[str, Any]:
@@ -797,8 +868,7 @@ def create_execute_node(
                         kwargs[attr] = val
         return kwargs
 
-    strategic_model_kwargs = _extract_model_kwargs(strategic_llm_with_tools)
-    tactical_model_kwargs = _extract_model_kwargs(tactical_llm_with_tools)
+    phase_model_kwargs = _per_binding(phase_llms, _extract_model_kwargs)
 
     # Track consecutive tool_use_failed errors (mutable container for closure access)
     _tool_use_failed_streak = [0]
@@ -831,10 +901,9 @@ def create_execute_node(
         phase_name = "strategic" if is_strategic else "tactical"
         turn_count = state.get("turn_count", 0)
 
-        # Select LLM based on current phase
-        llm_with_tools = (
-            strategic_llm_with_tools if is_strategic else tactical_llm_with_tools
-        )
+        # One binding serves every phase (U2); legacy prompt mode's
+        # phase-filtered pair is still keyed by phase here.
+        llm_with_tools = phase_llms[phase_name]
 
         # Update tool context for phase-aware behavior (e.g., multimodal override)
         if tool_context is not None:
@@ -1619,7 +1688,7 @@ def create_execute_node(
         llm_audit_id = None
         phase_str = "strategic" if is_strategic else "tactical"
         phase_model = config.llm.model
-        model_kwargs = strategic_model_kwargs if is_strategic else tactical_model_kwargs
+        model_kwargs = phase_model_kwargs[phase_str]
         if auditor:
             llm_audit_id = auditor.audit_llm_call(
                 job_id=job_id,
@@ -2101,11 +2170,7 @@ def create_execute_node(
                 # Archive full LLM request/response to llm_requests collection
                 request_id = None
                 if auditor:
-                    current_tool_schemas = (
-                        strategic_tool_schemas
-                        if is_strategic
-                        else tactical_tool_schemas
-                    )
+                    current_tool_schemas = phase_tool_schemas[phase_str]
                     request_id = auditor.archive(
                         job_id=job_id,
                         agent_type=config.agent_id,
@@ -4598,6 +4663,49 @@ def create_route_after_transition(
 # =============================================================================
 
 
+def _state_with_legal_calls(
+    state: Dict[str, Any], messages: List[Any], rejected_idx: set
+) -> Dict[str, Any]:
+    """The ToolNode input for a partially rejected batch: the same state with
+    its last AIMessage replaced by a copy carrying only the phase-legal calls
+    (by position — ``tool_calls_info`` mirrors ``tool_calls`` 1:1)."""
+    last_msg = messages[-1]
+    legal_tool_calls = [
+        tc for i, tc in enumerate(last_msg.tool_calls) if i not in rejected_idx
+    ]
+    ai_copy = last_msg.model_copy(update={"tool_calls": legal_tool_calls})
+    return {**state, "messages": list(messages[:-1]) + [ai_copy]}
+
+
+def _merge_phase_rejections(
+    executed: List[Any],
+    tool_calls_info: List[dict],
+    rejected_idx: set,
+    make_rejection: Callable[[dict], ToolMessage],
+) -> List[Any]:
+    """One ToolMessage per call, in the batch's original order: the ToolNode's
+    results for the legal calls, synthesised errors for the rejected ones (a
+    partially executed batch still answers every call id — LangGraph needs
+    that). Whatever else the ToolNode returned follows."""
+    by_call_id: Dict[str, List[Any]] = {}
+    others: List[Any] = []
+    for msg in executed:
+        if isinstance(msg, ToolMessage):
+            by_call_id.setdefault(getattr(msg, "tool_call_id", ""), []).append(msg)
+        else:
+            others.append(msg)
+    merged: List[Any] = []
+    for i, tc in enumerate(tool_calls_info):
+        if i in rejected_idx:
+            merged.append(make_rejection(tc))
+            continue
+        queue = by_call_id.get(tc["call_id"])
+        if queue:
+            merged.append(queue.pop(0))
+    leftovers = [msg for queue in by_call_id.values() for msg in queue]
+    return merged + leftovers + others
+
+
 def create_audited_tool_node(
     tools: List[Any],
     config: AgentConfig,
@@ -4614,6 +4722,8 @@ def create_audited_tool_node(
     - Category failure tracking → category-wide masking
     - Hard budget caps per phase
     - Tool-not-found enrichment with actionable guidance
+    - Per-call phase gate (U2): a phase-illegal call gets an error ToolMessage
+      and an audited rejection while the batch's legal calls execute
 
     See knowledge-base/knowledge/features/stuck_agent_recovery.md for full design rationale.
 
@@ -4790,8 +4900,12 @@ def create_audited_tool_node(
         backend.disconnect()
         backend.connect()
 
-    # Build phase-allowed tool sets for defense-in-depth validation.
-    # Primary enforcement is LLM schema binding; this catches hallucinated calls.
+    # Phase gate. With one tool binding for every phase (U2 skills mode) this
+    # runtime gate IS the enforcement: it decides per call, executes the
+    # phase-legal calls of a batch and answers each illegal one with an error
+    # ToolMessage. Legacy prompt mode (the bench's "current" arm) keeps the
+    # phase-filtered bindings, where the gate is the backup layer that rejects
+    # a whole batch on a hallucinated call.
     from .tools.registry import (
         filter_tools_by_phase as _filter_phase,
         TOOL_REGISTRY as _TOOL_REG,
@@ -4805,6 +4919,23 @@ def create_audited_tool_node(
     # Only gate tools that have phase metadata in the registry.
     # Unregistered tools (dynamic, test) have no phase restriction.
     _phase_gated_names = set(n for n in _all_tool_names if n in _TOOL_REG)
+    _legacy_batch_gate = uses_legacy_phase_prompt(config)
+
+    def _phase_rejection_text(
+        tool_name: str, phase_str: str, phase_number: int, others_executed: bool
+    ) -> str:
+        """The per-call rejection: names the tool's phase and the current one
+        and what advances the job — never the tool surface."""
+        other = "strategic" if phase_str == "tactical" else "tactical"
+        text = format_nudge(
+            f"phase_gate_{other}_tool_in_{phase_str}",
+            model=config.llm.model,
+            tool=tool_name,
+            phase_number=phase_number,
+        )
+        if others_executed:
+            text += " " + format_nudge("phase_gate_batch_note", model=config.llm.model)
+        return text
 
     async def audited_tools(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute tools with audit logging and stuck detection."""
@@ -4860,21 +4991,28 @@ def create_audited_tool_node(
                         }
                     )
 
-        # Defense-in-depth: reject tool calls not declared for the current phase.
-        # LLM schema binding is the primary gate; this catches hallucinated calls.
-        # ToolNode can't selectively skip calls, so if any call violates the
-        # phase gate we reject the entire batch — but only the violating calls
-        # get the "not available" error. Co-batched phase-legal calls get an
-        # honest "not executed, re-issue" message: telling a legal tool it is
-        # phase-illegal teaches the model its tool surface is unreliable
-        # (proven "stale palette" belief spiral, job edd06963).
+        # Phase gate: split the batch into the calls declared for the current
+        # phase and the rest (by position — call ids may be empty).
         allowed = _phase_allowed.get(phase_str, set())
-        phase_violations = [
-            tc
-            for tc in tool_calls_info
+        rejected_idx = {
+            i
+            for i, tc in enumerate(tool_calls_info)
             if tc["name"] in _phase_gated_names and tc["name"] not in allowed
+        }
+        phase_violations = [tool_calls_info[i] for i in sorted(rejected_idx)]
+        legal_calls = [
+            tc for i, tc in enumerate(tool_calls_info) if i not in rejected_idx
         ]
-        if phase_violations:
+        rejected_call_ids = {tc["call_id"] for tc in phase_violations}
+        if phase_violations and _legacy_batch_gate:
+            # Legacy prompt mode: the phase-filtered bindings are the primary
+            # gate and this only catches hallucinated calls. ToolNode can't
+            # selectively skip calls, so the entire batch is rejected — but
+            # only the violating calls get the "not available" error.
+            # Co-batched phase-legal calls get an honest "not executed,
+            # re-issue" message: telling a legal tool it is phase-illegal
+            # teaches the model its tool surface is unreliable (proven
+            # "stale palette" belief spiral, job edd06963).
             violated_names = [tc["name"] for tc in phase_violations]
             logger.warning(
                 f"[{job_id}] Phase gate: {violated_names} not available "
@@ -4909,6 +5047,12 @@ def create_audited_tool_node(
                     for tc in tool_calls_info  # respond to ALL calls so LangGraph is happy
                 ]
             }
+        if phase_violations:
+            logger.warning(
+                f"[{job_id}] Phase gate: {[tc['name'] for tc in phase_violations]} "
+                f"not available in the {phase_str} phase — rejected per call, "
+                f"{len(legal_calls)} legal call(s) executed"
+            )
 
         # Phase change: reset all detection state
         if phase_number != _last_phase_number[0]:
@@ -5026,19 +5170,32 @@ def create_audited_tool_node(
                 if doc_id:
                     audit_ids[tc_info["call_id"]] = doc_id
 
-        # Execute all tools (loop detection is advisory, never blocks execution)
+        # Execute the phase-legal calls (loop detection is advisory, never
+        # blocks execution). Rejected calls never reach the ToolNode: it runs
+        # on a copy of the AIMessage carrying only the legal calls, and the
+        # rejected ones are answered after execution, in their original
+        # positions. Same batch timeout / watchdog semantics as before.
         start_time = time.time()
-        batch_timeout = _get_batch_tool_timeout(tool_calls_info)
-        executed_tool_batch = len(tool_calls_info) > 0
+        batch_timeout = _get_batch_tool_timeout(legal_calls)
+        executed_tool_batch = len(legal_calls) > 0
+        result: Dict[str, Any] = {"messages": []}
+        timed_out = False
         try:
-            result = await asyncio.wait_for(
-                tool_node.ainvoke(state), timeout=batch_timeout
-            )
-            _TOOL_TIMEOUT_RETRIES[0] = 0
+            if legal_calls:
+                result = await asyncio.wait_for(
+                    tool_node.ainvoke(
+                        _state_with_legal_calls(state, messages, rejected_idx)
+                        if phase_violations
+                        else state
+                    ),
+                    timeout=batch_timeout,
+                )
+                _TOOL_TIMEOUT_RETRIES[0] = 0
         except asyncio.TimeoutError:
+            timed_out = True
             logger.warning(
                 f"[{job_id}] Tool batch timed out after {batch_timeout}s "
-                f"across {len(tool_calls_info)} calls"
+                f"across {len(legal_calls)} calls"
             )
             # A delegation-only batch (spawn_subagent fan-out) runs in-process
             # LLM loops, not workspace SSH ops — its latency says nothing about
@@ -5047,12 +5204,12 @@ def create_audited_tool_node(
             # a slow fan-out (job 472ea457). Return timeout ToolMessages and
             # let the LLM adapt; the SSH wedge watchdog stays armed for every
             # other category.
-            delegation_only = bool(tool_calls_info) and all(
-                _get_tool_category(tc["name"]) == "delegation" for tc in tool_calls_info
+            delegation_only = bool(legal_calls) and all(
+                _get_tool_category(tc["name"]) == "delegation" for tc in legal_calls
             )
             if delegation_only:
                 result = _build_timeout_error_result(
-                    tool_calls_info,
+                    legal_calls,
                     batch_timeout,
                     hint=(
                         "The subagent batch was cancelled for exceeding its "
@@ -5079,8 +5236,25 @@ def create_audited_tool_node(
                         f"Tool batch timeout recovery failed: {e}"
                     )
 
-                result = _build_timeout_error_result(tool_calls_info, batch_timeout)
+                result = _build_timeout_error_result(legal_calls, batch_timeout)
         execution_time_ms = int((time.time() - start_time) * 1000)
+
+        if phase_violations:
+            result["messages"] = _merge_phase_rejections(
+                result.get("messages", []),
+                tool_calls_info,
+                rejected_idx,
+                lambda tc: ToolMessage(
+                    content=_phase_rejection_text(
+                        tc["name"],
+                        phase_str,
+                        phase_number,
+                        bool(legal_calls) and not timed_out,
+                    ),
+                    tool_call_id=tc["call_id"],
+                    name=tc["name"],
+                ),
+            )
 
         # Heartbeat visibility marker:
         # each completed tool batch increments a monotonic counter so the
@@ -5153,9 +5327,12 @@ def create_audited_tool_node(
                         "tool_not_found_suffix", model=config.llm.model
                     )
 
-        # Track category failures for logging
+        # Track category failures for logging (a phase rejection is not a
+        # tool failure — the tool never ran)
         if "messages" in result:
             for msg in result["messages"]:
+                if getattr(msg, "tool_call_id", None) in rejected_call_ids:
+                    continue
                 if isinstance(msg, ToolMessage) and _is_tool_error(msg.content or ""):
                     tool_name = None
                     for tc in tool_calls_info:
@@ -5174,15 +5351,16 @@ def create_audited_tool_node(
                                     f"'{category}': {_category_failures[category]}"
                                 )
 
-        # Progress tracking
+        # Progress tracking. Only an executed call can make progress; a
+        # rejected call is a call without progress (and in the budget).
         progress_made = False
-        executed_names = {tc["name"] for tc in tool_calls_info}
+        executed_names = {tc["name"] for tc in legal_calls}
         if executed_names & PROGRESS_TOOLS:
             for msg in result.get("messages", []):
                 if isinstance(msg, ToolMessage) and not _is_tool_error(
                     msg.content or ""
                 ):
-                    for tc in tool_calls_info:
+                    for tc in legal_calls:
                         if (
                             tc["call_id"] == getattr(msg, "tool_call_id", "")
                             and tc["name"] in PROGRESS_TOOLS
@@ -5199,7 +5377,7 @@ def create_audited_tool_node(
             _calls_since_progress[0] += len(tool_calls_info)
 
         # request_replan is a deliberate re-plan: reset loop detection state
-        if "request_replan" in {tc["name"] for tc in tool_calls_info}:
+        if "request_replan" in {tc["name"] for tc in legal_calls}:
             for msg in result.get("messages", []):
                 if (
                     isinstance(msg, ToolMessage)
@@ -5207,7 +5385,7 @@ def create_audited_tool_node(
                     and any(
                         tc["name"] == "request_replan"
                         and tc["call_id"] == msg.tool_call_id
-                        for tc in tool_calls_info
+                        for tc in legal_calls
                     )
                 ):
                     _tool_call_history.clear()
@@ -5254,10 +5432,8 @@ def create_audited_tool_node(
         # any concrete action resets. At threshold, inject the one-line nudge
         # and re-arm the counter.
         if _ACT_RATIO_THRESHOLD > 0 and executed_tool_batch:
-            if all(
-                _is_process_action(tc["name"], tc["args"]) for tc in tool_calls_info
-            ):
-                _process_only_streak[0] += len(tool_calls_info)
+            if all(_is_process_action(tc["name"], tc["args"]) for tc in legal_calls):
+                _process_only_streak[0] += len(legal_calls)
             else:
                 _process_only_streak[0] = 0
             if _process_only_streak[0] >= _ACT_RATIO_THRESHOLD:
@@ -5424,8 +5600,8 @@ def _decision_state_mirror(job_id: str) -> Dict[str, Any]:
 
 
 def build_phase_alternation_graph(
-    strategic_llm_with_tools: BaseChatModel,
-    tactical_llm_with_tools: BaseChatModel,
+    llm_with_tools: Optional[BaseChatModel] = None,
+    *,
     tools: List[Any],
     config: AgentConfig,
     workspace: WorkspaceManager,
@@ -5436,8 +5612,10 @@ def build_phase_alternation_graph(
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
     tool_context: Optional[ToolContext] = None,
     postgres_db: Optional[Any] = None,
-    # Backwards compatibility
-    llm_with_tools: Optional[BaseChatModel] = None,
+    # Deprecated aliases: legacy prompt mode's phase-filtered pair (U2 WP6
+    # deletes them with the mode) and the pre-auxiliary summarization LLM.
+    strategic_llm_with_tools: Optional[BaseChatModel] = None,
+    tactical_llm_with_tools: Optional[BaseChatModel] = None,
     summarization_llm: Optional[BaseChatModel] = None,
 ) -> CompiledStateGraph:
     """Build the phase alternation graph for the Universal Agent.
@@ -5452,8 +5630,8 @@ def build_phase_alternation_graph(
     - Goal check: check_goal -> END or back to execute
 
     Args:
-        strategic_llm_with_tools: LLM with tools for strategic (planning) phases
-        tactical_llm_with_tools: LLM with tools for tactical (execution) phases
+        llm_with_tools: The job's LLM with every loaded tool bound — one
+            binding for every phase (U2)
         tools: List of tool objects
         config: Agent configuration
         workspace: WorkspaceManager instance
@@ -5466,23 +5644,18 @@ def build_phase_alternation_graph(
             When provided, enables recovery to previous phases after corruption.
         tool_context: Optional ToolContext for inline curation and memory flush.
         summarization_llm: Deprecated - use auxiliary_llm instead.
-        llm_with_tools: Deprecated - use strategic_llm_with_tools instead.
+        strategic_llm_with_tools: Deprecated alias — pass ``llm_with_tools``.
+        tactical_llm_with_tools: Deprecated alias — pass ``llm_with_tools``.
 
     Returns:
         Compiled StateGraph with checkpointing if checkpointer provided
     """
-    # Backwards compatibility: if old param used, map to new params
-    if llm_with_tools is not None and strategic_llm_with_tools is None:
-        import warnings
-
-        warnings.warn(
-            "llm_with_tools is deprecated, use strategic_llm_with_tools and "
-            "tactical_llm_with_tools instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        strategic_llm_with_tools = llm_with_tools
-        tactical_llm_with_tools = llm_with_tools
+    phase_llms = _resolve_phase_bindings(
+        llm_with_tools,
+        strategic_llm_with_tools,
+        tactical_llm_with_tools,
+        caller="build_phase_alternation_graph",
+    )
     # Create managers (todo_manager is passed in to ensure it's the same instance used by tools)
     plan_manager = PlanManager(workspace)
     memory_manager = MemoryManager(workspace)
@@ -5557,7 +5730,7 @@ def build_phase_alternation_graph(
     if auxiliary_llm is None:
         from src.services.auxiliary import AuxiliaryLLM
 
-        raw_llm = summarization_llm or strategic_llm_with_tools
+        raw_llm = summarization_llm or phase_llms["strategic"]
         aux_settings = resolve_model_settings(aux_model, config._deployment_dir)
         aux_structured_output_method = aux_settings.get(
             "structured_output_method", "json_schema"
@@ -5640,23 +5813,32 @@ def build_phase_alternation_graph(
         tool_names=_tool_names,
     )
 
-    execute = create_execute_node(
-        strategic_llm_with_tools=strategic_llm_with_tools,
-        tactical_llm_with_tools=tactical_llm_with_tools,
-        todo_manager=todo_manager,
-        memory_manager=memory_manager,
-        workspace_manager=workspace,
-        config=config,
-        context_mgr=context_mgr,
-        retry_manager=retry_manager,
-        auxiliary_llm=auxiliary_llm,
-        summarization_prompt=summarization_prompt,
-        memory_extraction_prompt=memory_extraction_prompt,
-        memory_assembler_prompt=memory_assembler_prompt,
-        tool_context=tool_context,
-        tool_names=_tool_names,
-        memory_service=memory_service,
-    )
+    if phase_llms["strategic"] is phase_llms["tactical"]:
+        binding_kwargs: Dict[str, Any] = {"llm_with_tools": phase_llms["strategic"]}
+    else:
+        # Legacy prompt mode's pair — already warned once above.
+        binding_kwargs = {
+            "strategic_llm_with_tools": phase_llms["strategic"],
+            "tactical_llm_with_tools": phase_llms["tactical"],
+        }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        execute = create_execute_node(
+            **binding_kwargs,
+            todo_manager=todo_manager,
+            memory_manager=memory_manager,
+            workspace_manager=workspace,
+            config=config,
+            context_mgr=context_mgr,
+            retry_manager=retry_manager,
+            auxiliary_llm=auxiliary_llm,
+            summarization_prompt=summarization_prompt,
+            memory_extraction_prompt=memory_extraction_prompt,
+            memory_assembler_prompt=memory_assembler_prompt,
+            tool_context=tool_context,
+            tool_names=_tool_names,
+            memory_service=memory_service,
+        )
     check_todos = create_check_todos_node(
         todo_manager, config, tool_names=_tool_names, tool_context=tool_context
     )
@@ -5834,8 +6016,7 @@ def build_nested_loop_graph(
         stacklevel=2,
     )
     return build_phase_alternation_graph(
-        strategic_llm_with_tools=llm_with_tools,
-        tactical_llm_with_tools=llm_with_tools,
+        llm_with_tools=llm_with_tools,
         tools=tools,
         config=config,
         workspace=workspace,

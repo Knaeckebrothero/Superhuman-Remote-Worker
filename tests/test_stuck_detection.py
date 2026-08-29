@@ -14,6 +14,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, AsyncMock, call, patch
 
@@ -70,6 +71,9 @@ class FakeConfig:
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     tools: FakeToolsConfig = field(default_factory=FakeToolsConfig)
     llm: FakeLLMConfig = field(default_factory=FakeLLMConfig)
+    # ``phase_settings.prompt_mode`` selects the gate: skills (default, one
+    # binding, per-call gate) or legacy (phase-filtered pair, batch gate).
+    phase_settings: Optional[object] = None
 
 
 def make_tool_call(name: str, args: dict = None, call_id: str = None):
@@ -1354,11 +1358,14 @@ class TestRequestReplanReset:
 
 
 class TestPhaseGate:
-    """Tests for the defense-in-depth phase gate in audited_tools.
+    """The runtime phase gate in audited_tools.
 
-    Primary enforcement is LLM schema binding (tested via test_tool_registry.py).
-    These tests cover the secondary gate inside audited_tools that catches
-    hallucinated tool calls not matching the current phase.
+    With one tool binding for every phase (U2 skills mode, the default) the
+    gate IS the enforcement and decides per call: the batch's phase-legal
+    calls execute, each illegal one gets an error ToolMessage naming its
+    phase. Legacy prompt mode (phase-filtered bindings) keeps the pre-U2
+    whole-batch rejection as its backup layer. The full per-call contract
+    (audit, budget, progress, order, timeout) is in tests/test_phase_gate.py.
     """
 
     @pytest.mark.asyncio
@@ -1389,7 +1396,10 @@ class TestPhaseGate:
             tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
 
             assert len(tool_msgs) == 1
-            assert "not available in the tactical phase" in tool_msgs[0].content
+            assert (
+                "'job_complete' is a strategic-phase tool; you are in the "
+                "tactical phase (phase 1)" in tool_msgs[0].content
+            )
             assert tool_msgs[0].tool_call_id == "call_jc"
 
             # ToolNode should NOT have been called
@@ -1446,7 +1456,11 @@ class TestPhaseGate:
             tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
 
             assert len(tool_msgs) == 1
-            assert "not available in the strategic phase" in tool_msgs[0].content
+            assert (
+                "'request_replan' is a tactical-phase tool; you are in the "
+                "strategic phase (phase 1)" in tool_msgs[0].content
+            )
+            assert "next_phase_todos" in tool_msgs[0].content
             mock_tn.ainvoke.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1482,14 +1496,15 @@ class TestPhaseGate:
             mock_tn.ainvoke.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_batch_rejected_when_any_call_violates(self, config):
-        """If any tool call in a batch violates phase, entire batch is rejected.
+    async def test_batch_executes_legal_calls_and_rejects_illegal_ones_per_call(
+        self, config
+    ):
+        """A mixed batch is decided per call (U2): the phase-legal call runs
+        through the ToolNode, the illegal one gets its error in place.
 
-        Only the violating call may be told it is phase-illegal. The
-        co-batched phase-legal call gets an honest "not executed, re-issue"
-        message — the old wording told legal tools they were unavailable,
-        teaching models their tool surface was unreliable (job edd06963
-        "stale palette" belief spiral).
+        Only the violating call is told it is phase-illegal — telling a legal
+        tool it is unavailable taught models their tool surface was
+        unreliable (job edd06963 "stale palette" belief spiral).
         """
         fake_read = MagicMock()
         fake_read.name = "read_file"  # both phases
@@ -1498,11 +1513,61 @@ class TestPhaseGate:
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [make_tool_result("read_file", "x-content", "call_rf")]
+                }
+            )
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node([fake_read, fake_jc], config)
 
             # Tactical phase: read_file is fine, job_complete is not
+            state = make_state(
+                [
+                    make_tool_call("read_file", {"path": "x"}, "call_rf"),
+                    make_tool_call("job_complete", {}, "call_jc"),
+                ],
+                is_strategic=False,
+            )
+            result = await audited(state)
+            msgs = result.get("messages", [])
+            tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
+
+            # One answer per call, original order kept
+            assert [m.tool_call_id for m in tool_msgs] == ["call_rf", "call_jc"]
+            assert tool_msgs[0].content == "x-content"
+            assert (
+                "'job_complete' is a strategic-phase tool; you are in the "
+                "tactical phase (phase 1)" in tool_msgs[1].content
+            )
+            assert "Other calls in this batch were executed normally." in (
+                tool_msgs[1].content
+            )
+            assert "read_file" not in tool_msgs[1].content
+
+            # The ToolNode ran once, on the legal call only
+            mock_tn.ainvoke.assert_awaited_once()
+            seen = mock_tn.ainvoke.await_args.args[0]["messages"][-1]
+            assert [c["name"] for c in seen.tool_calls] == ["read_file"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_prompt_mode_rejects_the_whole_batch(self):
+        """Legacy prompt mode (phase-filtered bindings): the batch-level gate is
+        unchanged — the violating call gets the "not available" error and the
+        co-batched legal call an honest "not executed, re-issue" message."""
+        config = FakeConfig(phase_settings=SimpleNamespace(prompt_mode="legacy"))
+        fake_read = MagicMock()
+        fake_read.name = "read_file"
+        fake_jc = MagicMock()
+        fake_jc.name = "job_complete"
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_read, fake_jc], config)
+
             state = make_state(
                 [
                     make_tool_call("read_file", {"path": "x"}, "call_rf"),
