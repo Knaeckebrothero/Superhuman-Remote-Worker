@@ -27,6 +27,10 @@ BASE_ENV = {
     "ORCHESTRATOR_URL": "http://orchestrator:8085",
     "MCP_INTERNAL_KEY": "internal",
     "SSH_GATEWAY_ALLOWED_ORIGINS": "https://cockpit.srw.works",
+    # Required since Task 8: the WSS bearer token is an HMAC under
+    # SESSION_JWT_SECRET, so load_config refuses to start without it unless
+    # SSH_GATEWAY_REQUIRE_TOKEN is explicitly "false" (ruling G38).
+    "SESSION_JWT_SECRET": "test-only-session-secret",
 }
 
 
@@ -397,3 +401,94 @@ def test_narrow_signature_algorithms_fails_loudly_if_narrowing_has_no_effect():
     when it was not."""
     with pytest.raises(AssertionError, match="had no effect"):
         narrow_signature_algorithms(_ReadOnlyAlgsKey())
+
+
+# ---------------------------------------------------------------------------
+# Task 8 additions: the user-presented attach token's key, the trusted ingress
+# hop, and the TCP listener's bind address.
+# ---------------------------------------------------------------------------
+
+
+def test_requires_the_session_secret_when_the_wss_token_is_required():
+    """Fail closed at boot, not at the first connection.
+
+    The WSS bearer token is an HMAC under SESSION_JWT_SECRET (ruling G38 --
+    it is emphatically NOT MCP_INTERNAL_KEY any more). Without the secret the
+    gateway can verify nothing, so every attach would 4401 while the process
+    looked healthy.
+    """
+    env = dict(BASE_ENV)
+    env.pop("SESSION_JWT_SECRET", None)
+    with pytest.raises(ValueError, match="SESSION_JWT_SECRET"):
+        load_config(env)
+
+
+def test_the_session_secret_is_optional_when_the_token_is_explicitly_disabled():
+    env = dict(BASE_ENV)
+    env.pop("SESSION_JWT_SECRET", None)
+    env["SSH_GATEWAY_REQUIRE_TOKEN"] = "false"
+    config = load_config(env)
+    assert config.require_wss_token is False
+    assert config.session_jwt_secret == ""
+
+
+def test_the_session_secret_is_not_stripped():
+    """The orchestrator reads SESSION_JWT_SECRET with a bare
+    ``os.environ.get`` (main.py:1417) -- unstripped. If this side stripped
+    it, a secret with a trailing newline (exactly what a YAML block scalar
+    or a hand-made Secret produces) would key two different HMACs and every
+    token minted by the orchestrator would be refused here, with no error
+    anywhere to explain it."""
+    config = load_config({**BASE_ENV, "SESSION_JWT_SECRET": "  padded \n"})
+    assert config.session_jwt_secret == "  padded \n"
+
+
+def test_session_secret_never_appears_in_repr():
+    secret = "s3ss10n-do-not-leak-4b21"
+    config = load_config({**BASE_ENV, "SESSION_JWT_SECRET": secret})
+    assert secret not in repr(config)
+    assert secret not in str(config)
+
+
+def test_trusted_proxies_default_to_nothing():
+    """No trusted hop means X-Forwarded-For is never believed -- the
+    fail-closed default. Trusting it unconditionally (the plan's original
+    _client_ip) let any client spoof a fresh source IP per connection and
+    nullify per-source rate limiting entirely."""
+    env = dict(BASE_ENV)
+    env.pop("SSH_GATEWAY_TRUSTED_PROXIES", None)
+    assert load_config(env).trusted_proxies == ()
+
+
+def test_trusted_proxies_parse_as_cidrs():
+    config = load_config(
+        {**BASE_ENV, "SSH_GATEWAY_TRUSTED_PROXIES": "10.42.0.0/16, 192.168.1.7"}
+    )
+    assert config.trusted_proxies == ("10.42.0.0/16", "192.168.1.7")
+
+
+def test_an_unparseable_trusted_proxy_fails_at_boot():
+    """A typo'd CIDR must not silently become "trust nobody" (which quietly
+    rate-limits every real client under one ingress IP) or "trust anybody"."""
+    with pytest.raises(ValueError, match="SSH_GATEWAY_TRUSTED_PROXIES"):
+        load_config({**BASE_ENV, "SSH_GATEWAY_TRUSTED_PROXIES": "10.42.0.0/33"})
+
+
+def test_ssh_listener_defaults_to_2222():
+    """Task 11 ships containerPort 2222 and Task 12's live gate is a series
+    of `ssh -p 2222` commands; the default here is what makes those real."""
+    env = dict(BASE_ENV)
+    env.pop("SSH_GATEWAY_SSH_PORT", None)
+    env.pop("SSH_GATEWAY_SSH_HOST", None)
+    config = load_config(env)
+    assert config.ssh_listen_port == 2222
+    assert config.ssh_listen_host == "0.0.0.0"
+
+
+def test_ssh_listener_port_is_overridable_and_range_checked():
+    assert load_config({**BASE_ENV, "SSH_GATEWAY_SSH_PORT": "2200"}).ssh_listen_port == (
+        2200
+    )
+    for bad in ("70000", "-1", "not-a-port"):
+        with pytest.raises(ValueError, match="SSH_GATEWAY_SSH_PORT"):
+            load_config({**BASE_ENV, "SSH_GATEWAY_SSH_PORT": bad})

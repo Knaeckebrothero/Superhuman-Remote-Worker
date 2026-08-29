@@ -39,6 +39,7 @@ comment before wiring it anywhere.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
@@ -230,6 +231,30 @@ class GatewayConfig:
     max_channels_per_connection: int = 12
     max_attachments_per_workspace: int = 4
     require_wss_token: bool = True
+    # HMAC key for the token a USER presents to the WSS front door. Emphatically
+    # NOT ``internal_key``: that one is the platform's service-to-service
+    # credential for ~50 ``require_internal`` endpoints, and the plan's original
+    # design handed it to every SSH user's laptop (ruling G38 --
+    # services/ssh_gateway_token.py's docstring has the full account). Shares
+    # ``repr=False`` with ``internal_key`` for the same reason, and shares the
+    # value with the orchestrator through one Kubernetes Secret, which is what
+    # lets a token minted by any orchestrator replica verify at the gateway with
+    # no shared state.
+    session_jwt_secret: str = field(default="", repr=False)
+    # Source addresses whose ``X-Forwarded-For`` header the gateway believes.
+    # Empty by default: without a known ingress hop the header is client-
+    # supplied fiction, and trusting it (as the plan's original ``_client_ip``
+    # did, taking its FIRST entry) lets any client mint a fresh source IP per
+    # connection and nullify per-source rate limiting entirely.
+    trusted_proxies: tuple[str, ...] = ()
+    # The raw TCP SSH listener. Task 11 ships ``containerPort: 2222`` and an
+    # optional LoadBalancer on it, and every step of Task 12's live gate is an
+    # ``ssh -p 2222`` -- so this is the port those front. 0 asks the OS for an
+    # ephemeral port, which is how tests bind without colliding; a deployment
+    # that sets 0 gets a random port and the startup log line is the only place
+    # it appears.
+    ssh_listen_host: str = "0.0.0.0"
+    ssh_listen_port: int = 2222
 
     def __post_init__(self) -> None:
         """Reject a non-positive cap rather than constructing it silently.
@@ -256,6 +281,14 @@ class GatewayConfig:
                 raise ValueError(
                     f"GatewayConfig.{field_name} must be positive, got {value}"
                 )
+        # Not in the loop above: 0 is legal here and means "ask the OS for an
+        # ephemeral port" (see the field's comment), so the check is a range,
+        # not a positivity test.
+        if not 0 <= self.ssh_listen_port <= 65535:
+            raise ValueError(
+                "GatewayConfig.ssh_listen_port must be 0..65535, got "
+                f"{self.ssh_listen_port}"
+            )
 
 
 def _require_ed25519_host_key(path: str) -> None:
@@ -349,6 +382,58 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> GatewayConfig:
             "would accept cross-site WebSocket handshakes"
         )
 
+    require_wss_token = src.get("SSH_GATEWAY_REQUIRE_TOKEN", "true").lower() != "false"
+
+    # Deliberately NOT .strip()ed, unlike every other value read here. The
+    # orchestrator that mints these tokens reads the same variable with a bare
+    # ``os.environ.get("SESSION_JWT_SECRET", "")`` (main.py:1417), so stripping
+    # on this side alone would key two different HMACs from one Secret the
+    # moment its value carries a trailing newline -- which is exactly what a
+    # YAML block scalar or a hand-rolled Secret produces. Every token would
+    # then be refused, with nothing in either log to say why. The emptiness
+    # test below still strips, because a whitespace-only secret is not a
+    # secret.
+    session_jwt_secret = src.get("SESSION_JWT_SECRET") or ""
+    if require_wss_token and not session_jwt_secret.strip():
+        raise ValueError(
+            "ssh-gateway requires SESSION_JWT_SECRET to verify the WSS attach "
+            "token minted by the orchestrator; set it, or set "
+            "SSH_GATEWAY_REQUIRE_TOKEN=false to run the WSS transport with no "
+            "user credential at all"
+        )
+
+    trusted_proxies = tuple(
+        p.strip()
+        for p in (src.get("SSH_GATEWAY_TRUSTED_PROXIES") or "").split(",")
+        if p.strip()
+    )
+    for entry in trusted_proxies:
+        try:
+            ipaddress.ip_network(entry, strict=False)
+        except ValueError as exc:
+            # A typo must not degrade silently. Left unvalidated, it would
+            # never match, every request would fall back to the ingress pod's
+            # own IP, and the whole fleet would share one rate-limit bucket.
+            raise ValueError(
+                f"SSH_GATEWAY_TRUSTED_PROXIES entry {entry!r} is not an IP "
+                "address or CIDR"
+            ) from exc
+
+    raw_port = (src.get("SSH_GATEWAY_SSH_PORT") or "").strip()
+    if raw_port:
+        try:
+            ssh_listen_port = int(raw_port)
+        except ValueError as exc:
+            raise ValueError(
+                f"SSH_GATEWAY_SSH_PORT must be an integer, got {raw_port!r}"
+            ) from exc
+        if not 0 <= ssh_listen_port <= 65535:
+            raise ValueError(
+                f"SSH_GATEWAY_SSH_PORT must be 0..65535, got {ssh_listen_port}"
+            )
+    else:
+        ssh_listen_port = 2222
+
     return GatewayConfig(
         host_key_paths=host_keys,
         user_ca_path=user_ca_path,
@@ -357,9 +442,11 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> GatewayConfig:
         ).rstrip("/"),
         internal_key=internal_key,
         allowed_origins=origins,
-        require_wss_token=(
-            src.get("SSH_GATEWAY_REQUIRE_TOKEN", "true").lower() != "false"
-        ),
+        require_wss_token=require_wss_token,
+        session_jwt_secret=session_jwt_secret,
+        trusted_proxies=trusted_proxies,
+        ssh_listen_host=(src.get("SSH_GATEWAY_SSH_HOST") or "0.0.0.0").strip(),
+        ssh_listen_port=ssh_listen_port,
     )
 
 
