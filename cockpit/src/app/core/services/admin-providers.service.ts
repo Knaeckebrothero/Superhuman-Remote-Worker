@@ -45,7 +45,10 @@ export type DefaultModelKind =
   | 'vision'
   | 'auxiliary'
   | 'whisper'
-  | 'tts';
+  | 'tts'
+  | 'search'
+  | 'fetch'
+  | 'search_fallback';
 
 export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'chat',
@@ -56,6 +59,9 @@ export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'auxiliary',
   'whisper',
   'tts',
+  'search',
+  'fetch',
+  'search_fallback',
 ];
 
 const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
@@ -67,6 +73,9 @@ const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
   auxiliary: null,
   whisper: null,
   tts: null,
+  search: null,
+  fetch: null,
+  search_fallback: null,
 };
 
 /**

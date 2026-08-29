@@ -958,6 +958,8 @@
         "title": "Default Models",
         "desc": "Which model to use when a job or tool doesn't specify one. Each kind applies to a different workload.",
         "unset": "— not set —",
+        "none": "None",
+        "sameSearchWarning": "This matches the primary search provider, so runtime failover is suppressed.",
         "emptyCatalog": "No models in the catalog yet. Add a provider key or endpoint above, then pick a default.",
         "auxiliaryGroup": "Auxiliary (helper)",
         "kind": {
@@ -969,7 +971,10 @@
           "vision": "Vision (image description)",
           "auxiliary": "Auxiliary (memory extraction / curation / titles)",
           "whisper": "Whisper (speech-to-text)",
-          "tts": "Text-to-speech"
+          "tts": "Text-to-speech",
+          "search": "Search (primary)",
+          "fetch": "Web fetch",
+          "search_fallback": "Search fallback"
         }
       }
     },

@@ -130,11 +130,12 @@ describe('AdminProvidersService', () => {
   });
 
   describe('defaults', () => {
-    it('loads all default-kind values including new embedding/vision/auxiliary slots', () => {
+    it('loads all default-kind values including search and fetch slots', () => {
       const http = {
         get: vi.fn().mockReturnValue(of({
           builder: 'gpt-4o', browser: null, citation: 'gpt-4',
           embedding: 'text-embedding-3-large', vision: null, auxiliary: 'gpt-4o-mini',
+          search: 'tavily', fetch: 'tavily', search_fallback: 'searxng',
         })),
         put: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn(),
       };
@@ -146,6 +147,9 @@ describe('AdminProvidersService', () => {
       expect(defaults.embedding).toBe('text-embedding-3-large');
       expect(defaults.auxiliary).toBe('gpt-4o-mini');
       expect(defaults.vision).toBe(null);
+      expect(defaults.search).toBe('tavily');
+      expect(defaults.fetch).toBe('tavily');
+      expect(defaults.search_fallback).toBe('searxng');
     });
 
     it('fills missing slots with null when the server omits them', () => {
@@ -160,6 +164,9 @@ describe('AdminProvidersService', () => {
       expect(service.defaults().embedding).toBeNull();
       expect(service.defaults().vision).toBeNull();
       expect(service.defaults().auxiliary).toBeNull();
+      expect(service.defaults().search).toBeNull();
+      expect(service.defaults().fetch).toBeNull();
+      expect(service.defaults().search_fallback).toBeNull();
     });
 
     it('PUTs a new embedding default', () => {
@@ -240,6 +247,20 @@ describe('AdminProvidersService', () => {
       expect(http.put).toHaveBeenCalledWith(
         expect.stringContaining('/admin/providers/defaults/chat'),
         {model: 'gpt-4o'},
+      );
+    });
+
+    it('round-trips an explicit None search fallback as an empty model', () => {
+      const http = {
+        get: vi.fn().mockReturnValue(of({})),
+        put: vi.fn().mockReturnValue(of({kind: 'search_fallback', model: null})),
+        post: vi.fn(), patch: vi.fn(), delete: vi.fn(),
+      };
+      const {service} = createService(http);
+      service.setDefault('search_fallback', '').subscribe();
+      expect(http.put).toHaveBeenCalledWith(
+        expect.stringContaining('/admin/providers/defaults/search_fallback'),
+        {model: ''},
       );
     });
   });

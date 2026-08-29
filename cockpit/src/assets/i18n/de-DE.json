@@ -958,6 +958,8 @@
         "title": "Standardmodelle",
         "desc": "Welches Modell verwendet wird, wenn ein Job oder Tool keines vorgibt. Jeder Typ trifft andere Workloads.",
         "unset": "— nicht gesetzt —",
+        "none": "Keine",
+        "sameSearchWarning": "Dies entspricht dem primären Suchanbieter; deshalb wird der Laufzeit-Fallback unterdrückt.",
         "emptyCatalog": "Der Modellkatalog ist leer. Füge oben einen Anbieter-Key oder Endpunkt hinzu, danach einen Standard auswählen.",
         "auxiliaryGroup": "Hilfsmodelle",
         "kind": {
@@ -969,7 +971,10 @@
           "vision": "Vision (Bildbeschreibung)",
           "auxiliary": "Hilfsmodell (Memory-Extraktion / Kuration / Titel)",
           "whisper": "Whisper (Spracherkennung)",
-          "tts": "Sprachsynthese"
+          "tts": "Sprachsynthese",
+          "search": "Suche (primär)",
+          "fetch": "Web-Abruf",
+          "search_fallback": "Such-Fallback"
         }
       }
     },

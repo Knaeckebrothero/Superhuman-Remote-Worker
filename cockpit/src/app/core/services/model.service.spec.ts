@@ -14,7 +14,10 @@ function createService(mockHttp?: any) {
       auxiliary_models: [{id: 'gpt-4o-mini', label: 'GPT-4o Mini', configured: true}],
       vision_models: [{id: 'gpt-4o', label: 'GPT-4o', configured: true}],
       whisper_models: [{id: 'whisper-1', label: 'Whisper v1', configured: true}],
+      tts_models: [{id: 'tts-1', label: 'TTS v1', configured: true}],
       embedding_models: [{id: 'text-embedding-3-small', label: 'TE3 Small', dimensions: 1536, configured: true}],
+      search_models: [{id: 'tavily', label: 'Tavily', configured: true}],
+      fetch_models: [{id: 'tavily', label: 'Tavily', configured: true}],
       configured_providers: ['openai'],
     })),
   };
@@ -36,7 +39,10 @@ describe('ModelService', () => {
       expect(service.auxiliaryModels()).toEqual([]);
       expect(service.visionModels()).toEqual([]);
       expect(service.whisperModels()).toEqual([]);
+      expect(service.ttsModels()).toEqual([]);
       expect(service.embeddingModels()).toEqual([]);
+      expect(service.searchModels()).toEqual([]);
+      expect(service.fetchModels()).toEqual([]);
       expect(service.providers()).toEqual([]);
       expect(service.loaded()).toBe(false);
       expect(service.loading()).toBe(false);
@@ -53,7 +59,10 @@ describe('ModelService', () => {
       expect(service.auxiliaryModels()).toHaveLength(1);
       expect(service.visionModels()).toHaveLength(1);
       expect(service.whisperModels()).toHaveLength(1);
+      expect(service.ttsModels()).toHaveLength(1);
       expect(service.embeddingModels()).toHaveLength(1);
+      expect(service.searchModels()).toHaveLength(1);
+      expect(service.fetchModels()).toHaveLength(1);
       expect(service.embeddingModels()[0].dimensions).toBe(1536);
       expect(service.providers()).toEqual(['openai']);
       expect(service.loaded()).toBe(true);
@@ -125,7 +134,10 @@ describe('ModelService', () => {
             auxiliary_models: [],
             vision_models: [],
             whisper_models: [],
+            tts_models: [],
             embedding_models: [],
+            search_models: [],
+            fetch_models: [],
             configured_providers: ['openai'],
           })),
       };
@@ -155,7 +167,10 @@ describe('ModelService', () => {
       expect(service.auxiliaryModels()).toEqual([]);
       expect(service.visionModels()).toEqual([]);
       expect(service.whisperModels()).toEqual([]);
+      expect(service.ttsModels()).toEqual([]);
       expect(service.embeddingModels()).toEqual([]);
+      expect(service.searchModels()).toEqual([]);
+      expect(service.fetchModels()).toEqual([]);
     });
   });
 });

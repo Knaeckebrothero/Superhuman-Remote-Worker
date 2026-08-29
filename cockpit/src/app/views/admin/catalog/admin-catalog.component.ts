@@ -28,6 +28,25 @@ interface ProviderOption {
   available: boolean;
 }
 
+export type ResearchOperation = 'search' | 'extract' | 'crawl' | 'map';
+
+export const RESEARCH_OPERATIONS: ResearchOperation[] = [
+  'search',
+  'extract',
+  'crawl',
+  'map',
+];
+
+/** Mirrors src/tools/research/search.ADAPTER_NAMES and each adapter's ops. */
+export const SEARCH_ADAPTER_OPTIONS: ReadonlyArray<{
+  name: string;
+  ops: readonly ResearchOperation[];
+}> = [
+  {name: 'brave', ops: ['search']},
+  {name: 'searxng', ops: ['search']},
+  {name: 'tavily', ops: RESEARCH_OPERATIONS},
+];
+
 /**
  * Well-known label for the seeded codex-proxy llm_endpoints row. The
  * orchestrator's _seed_codex_proxy_endpoint inserts a row with this label
@@ -53,6 +72,8 @@ function hintsToCapabilities(
     'vision',
     'whisper',
     'tts',
+    'search',
+    'fetch',
   ];
   const isKnown = (v: string): v is CatalogCapability =>
     known.includes(v as CatalogCapability);
@@ -379,44 +400,80 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               </app-form-field>
             </div>
 
-            <div class="form-row two-col">
-              <app-form-field label="Family">
-                <app-select
-                  [value]="formFamily()"
-                  [disabled]="creating()"
-                  (changed)="onFamilyChange($event)"
-                >
-                  @for (f of models.families(); track f) {
-                    <option [value]="f">{{ f }}</option>
-                  }
-                </app-select>
-              </app-form-field>
-              <app-form-field label="Context window (optional)">
-                <app-input
-                  type="text"
-                  list="ctx-window-presets"
-                  [value]="formContextWindowText()"
-                  [placeholder]="contextWindowPlaceholder()"
-                  [disabled]="creating()"
-                  (changed)="onContextWindowChange($event)"
-                />
-                <datalist id="ctx-window-presets">
-                  @for (p of contextWindowPresets; track p.tokens) {
-                    <option [value]="p.label" [label]="p.tokens"></option>
-                  }
-                </datalist>
-                @if (contextWindowWarning(); as warn) {
-                  <small
-                    class="field-hint field-hint--warn"
-                    [style.color]="'var(--color-warning, #b45309)'"
-                    [style.display]="'block'"
-                    [style.margin-top.px]="4"
+            @if (researchCapabilitiesSelected()) {
+              <div class="form-row two-col research-config">
+                <app-form-field label="Search/fetch adapter">
+                  <app-select
+                    [value]="formSearchProvider()"
+                    [disabled]="creating()"
+                    (changed)="onSearchProviderChange($event)"
                   >
-                    {{ warn }}
-                  </small>
-                }
-              </app-form-field>
-            </div>
+                    <option value="">Select an adapter</option>
+                    @for (adapter of searchAdapterOptions; track adapter.name) {
+                      <option [value]="adapter.name">{{ adapter.name }}</option>
+                    }
+                  </app-select>
+                </app-form-field>
+                <app-form-field label="Supported operations">
+                  <fieldset class="cap-fieldset" [disabled]="creating()">
+                    @for (op of researchOperations; track op) {
+                      <label class="cap-checkbox">
+                        <app-checkbox
+                          size="sm"
+                          [checked]="formSearchOps().includes(op)"
+                          [disabled]="!isResearchOpSupported(op)"
+                          [ariaLabel]="op"
+                          (changed)="toggleFormSearchOp(op, $event)"
+                        />
+                        <span>{{ op }}</span>
+                      </label>
+                    }
+                  </fieldset>
+                </app-form-field>
+              </div>
+              @if (researchConfigurationError(); as error) {
+                <p class="field-hint field-hint--warn">{{ error }}</p>
+              }
+            } @else {
+              <div class="form-row two-col chat-model-config">
+                <app-form-field label="Family">
+                  <app-select
+                    [value]="formFamily()"
+                    [disabled]="creating()"
+                    (changed)="onFamilyChange($event)"
+                  >
+                    @for (f of models.families(); track f) {
+                      <option [value]="f">{{ f }}</option>
+                    }
+                  </app-select>
+                </app-form-field>
+                <app-form-field label="Context window (optional)">
+                  <app-input
+                    type="text"
+                    list="ctx-window-presets"
+                    [value]="formContextWindowText()"
+                    [placeholder]="contextWindowPlaceholder()"
+                    [disabled]="creating()"
+                    (changed)="onContextWindowChange($event)"
+                  />
+                  <datalist id="ctx-window-presets">
+                    @for (p of contextWindowPresets; track p.tokens) {
+                      <option [value]="p.label" [label]="p.tokens"></option>
+                    }
+                  </datalist>
+                  @if (contextWindowWarning(); as warn) {
+                    <small
+                      class="field-hint field-hint--warn"
+                      [style.color]="'var(--color-warning, #b45309)'"
+                      [style.display]="'block'"
+                      [style.margin-top.px]="4"
+                    >
+                      {{ warn }}
+                    </small>
+                  }
+                </app-form-field>
+              </div>
+            }
 
             @if (formCapabilities().includes('tts')) {
               <div class="form-row">
@@ -886,6 +943,10 @@ export class AdminCatalogComponent implements OnInit {
   readonly formDisplayLabel = signal('');
   readonly formFamily = signal('default');
   readonly formContextWindow = signal<number | null>(null);
+  readonly formSearchProvider = signal('');
+  readonly formSearchOps = signal<ResearchOperation[]>([]);
+  readonly searchAdapterOptions = SEARCH_ADAPTER_OPTIONS;
+  readonly researchOperations = RESEARCH_OPERATIONS;
   /**
    * Preset context-window options for the combobox datalist, ascending. Values
    * are ×1024 (binary) — how context windows are actually sized (128k =
@@ -949,6 +1010,30 @@ export class AdminCatalogComponent implements OnInit {
   readonly contextWindowWarning = computed<string | null>(() =>
     reasoningStarveWarning(this.formContextWindow()),
   );
+
+  readonly researchCapabilitiesSelected = computed(() =>
+    this.formCapabilities().some((capability) =>
+      capability === 'search' || capability === 'fetch',
+    ),
+  );
+
+  readonly researchConfigurationError = computed<string | null>(() => {
+    if (!this.researchCapabilitiesSelected()) return null;
+    if (!this.formSearchProvider()) return 'Select a search/fetch adapter.';
+    const ops = this.formSearchOps();
+    if (ops.length === 0) return 'Select at least one supported operation.';
+    const capabilities = this.formCapabilities();
+    if (capabilities.includes('search') && !ops.includes('search')) {
+      return 'The search capability requires the search operation.';
+    }
+    if (
+      capabilities.includes('fetch') &&
+      !ops.some((op) => op === 'extract' || op === 'crawl' || op === 'map')
+    ) {
+      return 'The fetch capability requires extract, crawl, or map.';
+    }
+    return null;
+  });
 
   /** Voices for the current model's backend (Kokoro/OpenAI); empty when the
    *  backend isn't recognized → the form falls back to a free-text field. */
@@ -1084,7 +1169,8 @@ export class AdminCatalogComponent implements OnInit {
       !!this.formProviderKey() &&
       !!this.formModelId().trim() &&
       !!this.formDisplayLabel().trim() &&
-      !!this.formFamily().trim() &&
+      (this.researchCapabilitiesSelected() || !!this.formFamily().trim()) &&
+      !this.researchConfigurationError() &&
       this.formCapabilities().length > 0
     );
   }
@@ -1106,6 +1192,29 @@ export class AdminCatalogComponent implements OnInit {
     }
     const ordered = this.capabilities.filter((c) => current.has(c));
     this.formCapabilities.set(ordered);
+  }
+
+  onSearchProviderChange(value: string | null): void {
+    const provider = value ?? '';
+    this.formSearchProvider.set(provider);
+    const supported = new Set(
+      SEARCH_ADAPTER_OPTIONS.find((adapter) => adapter.name === provider)?.ops ?? [],
+    );
+    this.formSearchOps.update((ops) => ops.filter((op) => supported.has(op)));
+  }
+
+  isResearchOpSupported(op: ResearchOperation): boolean {
+    return !!SEARCH_ADAPTER_OPTIONS
+      .find((adapter) => adapter.name === this.formSearchProvider())
+      ?.ops.includes(op);
+  }
+
+  toggleFormSearchOp(op: ResearchOperation, checked: boolean): void {
+    if (checked && !this.isResearchOpSupported(op)) return;
+    const selected = new Set(this.formSearchOps());
+    if (checked) selected.add(op);
+    else selected.delete(op);
+    this.formSearchOps.set(RESEARCH_OPERATIONS.filter((candidate) => selected.has(candidate)));
   }
 
   onProviderKeyChange(value: string | null): void {
@@ -1155,6 +1264,11 @@ export class AdminCatalogComponent implements OnInit {
       this.formError.set('Select at least one capability.');
       return;
     }
+    const researchError = this.researchConfigurationError();
+    if (researchError) {
+      this.formError.set(researchError);
+      return;
+    }
     const voice = this.formVoice().trim();
     const pricingId = this.formPricingId().trim();
     // Both ride in the catalog row's params_json: voice is TTS-only, pricing_id
@@ -1162,6 +1276,10 @@ export class AdminCatalogComponent implements OnInit {
     const params: Record<string, unknown> = {};
     if (capabilities.includes('tts') && voice) params['voice'] = voice;
     if (pricingId) params['pricing_id'] = pricingId;
+    if (this.researchCapabilitiesSelected()) {
+      params['provider'] = this.formSearchProvider();
+      params['ops'] = this.formSearchOps();
+    }
     const paramsJson = Object.keys(params).length ? params : undefined;
     this.creating.set(true);
     this.models
@@ -1171,8 +1289,10 @@ export class AdminCatalogComponent implements OnInit {
         model_id: this.formModelId().trim(),
         display_label: this.formDisplayLabel().trim(),
         capabilities,
-        family: this.formFamily().trim(),
-        context_window: this.formContextWindow() ?? null,
+        family: this.researchCapabilitiesSelected() ? 'default' : this.formFamily().trim(),
+        context_window: this.researchCapabilitiesSelected()
+          ? null
+          : this.formContextWindow() ?? null,
         params_json: paramsJson,
       })
       .subscribe({
@@ -1183,6 +1303,8 @@ export class AdminCatalogComponent implements OnInit {
           this.formVoice.set('');
           this.formVoiceCustom.set(false);
           this.formPricingId.set('');
+          this.formSearchProvider.set('');
+          this.formSearchOps.set([]);
           this.creating.set(false);
         },
         error: (err) => {

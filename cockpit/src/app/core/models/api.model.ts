@@ -680,7 +680,9 @@ export type LlmModelCapability =
   | 'embedding'
   | 'auxiliary'
   | 'whisper'
-  | 'tts';
+  | 'tts'
+  | 'search'
+  | 'fetch';
 
 /**
  * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
@@ -790,13 +792,21 @@ export interface DiscoveryResponse {
 // =============================================================================
 
 /** Locked enum for catalog rows. Adding a capability requires schema + resolver work. */
-export type CatalogCapability = 'chat' | 'auxiliary' | 'embedding' | 'vision' | 'whisper' | 'tts';
+export type CatalogCapability =
+  | 'chat'
+  | 'auxiliary'
+  | 'embedding'
+  | 'vision'
+  | 'whisper'
+  | 'tts'
+  | 'search'
+  | 'fetch';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
 export const CATALOG_CAPABILITIES: CatalogCapability[] = [
-  'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts',
+  'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts', 'search', 'fetch',
 ];
 
 /**
