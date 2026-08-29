@@ -729,3 +729,153 @@ def test_every_catalog_key_is_handled_or_excluded_not_both():
     assert set(_NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP) <= set(CATALOG)
     for key, reason in _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP.items():
         assert reason, f"{key!r} needs a real reason, not a placeholder"
+
+
+# --- U1 WP4: roster entries are a tool / model surface of their own ----------
+#
+# A child runs with the tools its `subagents.roster.<name>` entry names, so the
+# tool gates and model_selection apply per entry — at save on the raw entries,
+# at dispatch on the materialised ones (`resolve_config` resolves the roster
+# BEFORE the PDP capture). Parent-only keys (`workspace.backend`, `autonomy`,
+# `delegation`, `tools.core`, `officer`) are pruned from every child by the
+# subagent overlay and `interactive.permission_mode` is `autonomous` on every
+# child by design, so those rules are NOT applied to entries.
+
+
+def test_roster_shell_tools_require_grant():
+    fragment = {
+        "tools": {"git": ["git_status"]},
+        "subagents": {
+            "roster": {
+                "fixer": {"tools": {"shell": ["run_command"], "git": ["git_status"]}},
+                "reader": {"tools": {"workspace": ["read_file"]}},
+            }
+        },
+    }
+
+    v = evaluate(fragment, DEFAULTS)
+
+    assert len(v) == 1
+    assert v[0].startswith("shell_tools:") and "subagents.roster.fixer" in v[0]
+    assert evaluate(fragment, {**DEFAULTS, "shell_tools": True}) == []
+
+    stripped, dropped = strip_to_grants(fragment, DEFAULTS)
+
+    assert dropped == ["shell_tools"]
+    fixer = stripped["subagents"]["roster"]["fixer"]["tools"]
+    assert "shell" not in fixer and fixer["git"] == ["git_status"]
+    assert (
+        stripped["subagents"]["roster"]["reader"]
+        == fragment["subagents"]["roster"]["reader"]
+    )
+    assert stripped["tools"] == {"git": ["git_status"]}
+    assert evaluate(stripped, DEFAULTS) == []
+
+
+@pytest.mark.parametrize(
+    ("grant_key", "tools"),
+    [
+        ("datasource_tools", {"sql": ["run_query"], "repo": ["clone_repo"]}),
+        ("browser", {"browser_direct": ["browser_navigate"]}),
+        ("catalog_authoring", {"catalog_authoring": ["create_expert"]}),
+    ],
+)
+def test_roster_tool_gates_apply_per_entry(grant_key, tools):
+    fragment = {
+        "subagents": {"roster": {"x": {"tools": {**tools, "git": ["git_log"]}}}}
+    }
+    grants = _deny_only(grant_key)
+
+    v = evaluate(fragment, grants)
+
+    assert len(v) == 1 and v[0].startswith(f"{grant_key}:")
+    assert "subagents.roster.x" in v[0]
+
+    stripped, dropped = strip_to_grants(fragment, grants)
+
+    assert dropped == [grant_key]
+    assert stripped["subagents"]["roster"]["x"]["tools"]["git"] == ["git_log"]
+    assert evaluate(stripped, grants) == []
+
+
+def test_roster_model_selection():
+    """The roster-wide `subagents.llm.model` and each entry's own pin are model
+    selections; `inherit` is the parent's (already gated) model, not one."""
+    fragment = {
+        "llm": {"model": "allowed"},
+        "subagents": {
+            "llm": {"model": "roster-wide-blocked"},
+            "roster": {
+                "pinned": {"llm": {"model": "entry-blocked"}},
+                "ok": {"llm": {"model": "allowed"}},
+                "twin": {"llm": {"model": "inherit"}},
+            },
+        },
+    }
+    grants = {**_deny_only("model_selection"), "model_selection": ["allowed"]}
+
+    v = evaluate(fragment, grants)
+
+    assert sorted(v) == [
+        "model_selection: model 'entry-blocked' is not in the permitted set",
+        "model_selection: model 'roster-wide-blocked' is not in the permitted set",
+    ]
+
+    stripped, dropped = strip_to_grants(fragment, grants)
+
+    assert dropped == ["model_selection"]
+    assert "model" not in stripped["subagents"]["llm"]
+    assert "model" not in stripped["subagents"]["roster"]["pinned"]["llm"]
+    assert stripped["subagents"]["roster"]["ok"]["llm"]["model"] == "allowed"
+    assert stripped["subagents"]["roster"]["twin"]["llm"]["model"] == "inherit"
+    assert stripped["llm"]["model"] == "allowed"
+    assert evaluate(stripped, grants) == []
+
+
+def test_resolved_roster_children_are_safe_for_a_new_principal():
+    """The dispatch shape: a materialised roster (the read-only library entry
+    and an inline child) under the safe worker base trips nothing for a
+    default-grants principal — in particular NOT `permission_mode`, which
+    every child pins to `autonomous` by design."""
+    from orchestrator.services.config_resolver import resolve_config
+
+    parent = {
+        "expert_type": "worker",
+        "name": "lead",
+        "config": {
+            "llm": {"model": "lead-model"},
+            "subagents": {
+                "roster": {
+                    "explorer": {"$ref": "subagents/explorer"},
+                    "inline": {"tools": {"workspace": ["read_file"]}},
+                }
+            },
+        },
+        "prompts": {},
+    }
+    cap: dict = {}
+    resolve_config(
+        base_config_name="worker_base",
+        expert_row=parent,
+        expert_type="worker",
+        capture=cap,
+    )
+    roster = cap["merged_fragment"]["subagents"]["roster"]
+    assert set(roster) == {"explorer", "inline"}
+    assert all(
+        e["interactive"]["permission_mode"] == "autonomous" for e in roster.values()
+    )
+    assert evaluate(cap["merged_fragment"], DEFAULTS) == []
+    # …and a child that names a shell IS caught on the materialised entry.
+    parent["config"]["subagents"]["roster"]["inline"]["tools"]["shell"] = [
+        "run_command"
+    ]
+    cap = {}
+    resolve_config(
+        base_config_name="worker_base",
+        expert_row=parent,
+        expert_type="worker",
+        capture=cap,
+    )
+    flagged = evaluate(cap["merged_fragment"], DEFAULTS)
+    assert len(flagged) == 1 and "subagents.roster.inline" in flagged[0]

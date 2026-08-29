@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 
 import orchestrator.main as orchestrator_main
 from orchestrator.main import _load_expert_detail
@@ -343,3 +344,190 @@ def test_scan_experts_lists_exactly_the_bundled_experts_with_unchanged_roles():
         assert forbidden not in listed
     assistant = next(e for e in experts if e.id == "assistant")
     assert assistant.display_name and assistant.tags and assistant.description
+
+
+# --- U1 WP4: role tags on the listing, the subagent library, the role param --
+
+
+def test_scan_experts_adds_the_role_tag():
+    """`tags ∪ {chain-root role}` on every bundled entry, once, after the
+    authored tags (an authored role tag is kept where it is)."""
+    experts = orchestrator_main._scan_experts()
+    for e in experts:
+        assert e.tags.count(e.expert_type) == 1, e.id
+    by_id = {e.id: e for e in experts}
+    config_dir = orchestrator_main._get_config_dir()
+
+    def authored(expert_id: str) -> list[str]:
+        raw = yaml.safe_load(
+            (config_dir / "experts" / expert_id / "config.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        return list(raw.get("tags") or [])
+
+    assert by_id["developer"].tags == [*authored("developer"), "worker"]
+    assert by_id["assistant"].tags == [*authored("assistant"), "session"]
+    # general-worker authors its role tag already: kept in place, not doubled.
+    assert "worker" in authored("general-worker")
+    assert by_id["general-worker"].tags == authored("general-worker")
+
+
+def test_subagent_library_is_scanned_separately_and_tagged():
+    library = orchestrator_main._scan_subagent_library()
+    ids = {e.id for e in library}
+    assert "explorer" in ids
+    assert ids.isdisjoint({e.id for e in orchestrator_main._scan_experts()})
+    explorer = next(e for e in library if e.id == "explorer")
+    assert "subagent" in explorer.tags and explorer.tags.count("subagent") == 1
+    assert explorer.expert_type == "worker"  # chain-root fallback; never lists by it
+    assert explorer.description and explorer.display_name == "Explorer"
+    # Detail lookup: bundled first, then the library, else nothing.
+    assert orchestrator_main._listed_expert("developer").expert_type == "worker"
+    assert orchestrator_main._listed_expert("explorer") is explorer or (
+        orchestrator_main._listed_expert("explorer").id == "explorer"
+    )
+    assert orchestrator_main._listed_expert("no-such-expert") is None
+
+
+class TestRoleParameter:
+    """`_load_expert_detail(role=...)` resolves an expert in another role —
+    the preview a cross-role picker needs (universal experts, D4)."""
+
+    @pytest.mark.asyncio
+    async def test_bundled_worker_resolved_in_the_session_role(self):
+        detail = await _load_expert_detail("developer", role="session")
+
+        cfg = detail["config"]
+        assert detail["resolved_role"] == "session"
+        assert "get_canvas" in cfg["tools"]["canvas"]  # the session overlay
+        assert cfg["llm"]["max_retries"] == 3
+        assert (
+            cfg["tools"]["shell"] and cfg["delegation"]["enabled"] is True
+        )  # expert wins
+        own = await _load_expert_detail("developer")
+        assert own["resolved_role"] == "worker"
+        assert own["config"]["llm"]["max_retries"] == 0
+
+    @pytest.mark.asyncio
+    async def test_session_expert_resolved_in_the_worker_role(self):
+        detail = await _load_expert_detail("assistant", role="worker")
+
+        cfg = detail["config"]
+        assert detail["resolved_role"] == "worker"
+        assert cfg["phase_settings"]["min_todos"] == 2
+        assert cfg["autonomy"] == "review"
+        assert "next_phase_todos" in cfg["tools"]["core"]
+
+    @pytest.mark.asyncio
+    async def test_role_wins_over_a_base_id(self):
+        detail = await _load_expert_detail("session_base", role="worker")
+        assert detail["config"]["agent_id"] == "worker_base"
+        assert detail["resolved_role"] == "worker"
+        detail = await _load_expert_detail("worker_base", role="subagent")
+        assert detail["config"]["agent_id"] == "subagent_base"
+        assert "autonomy" not in detail["config"]
+
+    @pytest.mark.asyncio
+    async def test_library_entry_detail_defaults_to_the_subagent_role(self):
+        detail = await _load_expert_detail("explorer")
+
+        cfg = detail["config"]
+        assert detail["resolved_role"] == "subagent"
+        assert cfg["agent_id"] == "explorer"
+        assert cfg["llm"]["model"] == "inherit"
+        assert "autonomy" not in cfg and "verification" not in cfg
+        assert "$ignore_keys" not in cfg
+        assert cfg["tools"]["workspace"] == [
+            "read_file",
+            "use_skill",
+            "list_files",
+            "search_files",
+            "file_exists",
+            "get_document_info",
+        ]
+        assert cfg["interactive"]["permission_mode"] == "autonomous"
+        assert detail["enumerate_only"] == enumerate_only_members()
+        # …and in another role on request.
+        as_worker = await _load_expert_detail("explorer", role="worker")
+        assert as_worker["resolved_role"] == "worker"
+        assert as_worker["config"]["phase_settings"]["min_todos"] == 2
+
+    @pytest.mark.asyncio
+    async def test_db_row_resolved_in_another_role_keeps_its_identity(
+        self, monkeypatch
+    ):
+        expert_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
+        monkeypatch.setattr(
+            orchestrator_main.postgres_db,
+            "get_expert_by_id",
+            AsyncMock(
+                return_value={
+                    "id": expert_id,
+                    "display_name": "Session Helper",
+                    "description": "",
+                    "icon": "smart_toy",
+                    "color": "#6B7280",
+                    "tags": ["session"],
+                    "expert_type": "session",
+                    "is_global": False,
+                    "managed_key": None,
+                    "config": {"workspace": {"backend": "sandbox"}},
+                    "prompts": {},
+                }
+            ),
+        )
+
+        detail = await _load_expert_detail(expert_id, role="worker")
+
+        assert detail["expert_type"] == "session"  # identity: the row's own role
+        assert detail["resolved_role"] == "worker"
+        assert detail["config"]["phase_settings"]["min_todos"] == 2
+        assert detail["config"]["workspace"]["backend"] == "sandbox"
+
+    @pytest.mark.asyncio
+    async def test_effective_models_read_the_roster_wide_pin(self, monkeypatch):
+        expert_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
+        monkeypatch.setattr(
+            orchestrator_main.postgres_db,
+            "get_expert_by_id",
+            AsyncMock(
+                return_value={
+                    "id": expert_id,
+                    "display_name": "Lead",
+                    "description": "",
+                    "icon": "smart_toy",
+                    "color": "#6B7280",
+                    "tags": ["worker"],
+                    "expert_type": "worker",
+                    "is_global": False,
+                    "managed_key": None,
+                    "config": {
+                        "llm": {"model": "lead-model"},
+                        "subagents": {"llm": {"model": "reader-model"}},
+                    },
+                    "prompts": {},
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            orchestrator_main.postgres_db,
+            "get_user_settings",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            orchestrator_main.postgres_db,
+            "resolve_default_for_capability",
+            AsyncMock(return_value=None),
+        )
+
+        detail = await _load_expert_detail(
+            expert_id, user_id="11111111-1111-4111-8111-111111111111"
+        )
+
+        effective = detail["effective_models"]
+        assert effective["model"] == {"model": "lead-model", "source": "expert"}
+        assert effective["subagent"] == {"model": "reader-model", "source": "expert"}
+        assert effective["strategic"] == effective["tactical"] == effective["model"]

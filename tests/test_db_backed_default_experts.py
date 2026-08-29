@@ -234,3 +234,46 @@ async def test_account_reasoning_is_a_floor_below_the_expert(monkeypatch):
     )
     assert resolved["agent"]["llm"]["model"] == "account-model"
     assert resolved["agent"]["llm"]["reasoning_level"] == "high"
+
+
+# --- U1 WP4: universal experts (D4) and role tags on the seeds ---------------
+
+
+@pytest.mark.asyncio
+async def test_explicit_cross_role_selection_is_allowed(caplog):
+    """Every expert is usable in every role: an explicit session expert picked
+    for a worker root is accepted (`resolve_config` re-roots it onto the worker
+    overlay at dispatch) and logged, never refused. Invisible stays refused;
+    the default SLOTS stay per role (checked at their endpoints)."""
+    import logging
+
+    from orchestrator.services.default_experts import ExpertSelectionError
+
+    db = SelectionDB()
+    db.explicit = {"id": "explicit", "expert_type": "session", "owner_id": "u1"}
+    with caplog.at_level(logging.INFO, logger="orchestrator.services.default_experts"):
+        chosen = await resolve_root_expert(
+            db, expert_type="worker", user_id="u1", explicit_expert_id="explicit"
+        )
+    assert chosen.source == "explicit"
+    assert chosen.expert["expert_type"] == "session"
+    assert any(
+        "session" in r.getMessage() and "worker" in r.getMessage()
+        for r in caplog.records
+    )
+    with pytest.raises(ExpertSelectionError):
+        await resolve_root_expert(
+            db, expert_type="worker", user_id="u1", explicit_expert_id="missing"
+        )
+
+
+def test_seed_bundles_carry_the_role_tag():
+    worker = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    session = load_seed_bundle(
+        ROOT / "config", directory="assistant", expert_type="session"
+    )
+    # general-worker authors its role tag already: kept in place, not doubled.
+    assert worker["tags"] == ["general", "worker", "safe-default"]
+    assert session["tags"][-1] == "session" and session["tags"].count("session") == 1

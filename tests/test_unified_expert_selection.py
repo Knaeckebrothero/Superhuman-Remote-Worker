@@ -437,6 +437,38 @@ class TestExplicitBundledExpertVersusApplicationDefault:
         assert kwargs["context"]["expert_selection"]["source"] == "explicit"
 
     @pytest.mark.asyncio
+    async def test_an_explicit_session_expert_is_accepted_for_a_job(
+        self, db, fake_request
+    ):
+        """Universal experts (U1 D4): an explicit DB expert of the OTHER role
+        is a valid selection for a job. The resolver logs instead of refusing
+        (tests/test_db_backed_default_experts.py), and the funnel persists it
+        as the `worker_base` + overlay pair — `resolve_config` re-roots the
+        session fragment onto the worker overlay at dispatch."""
+        from main import JobCreate
+        from orchestrator.services.default_experts import ExpertSelection
+
+        resolver = AsyncMock(
+            return_value=ExpertSelection(
+                expert={"id": DB_EXPERT, "expert_type": "session", "owner_id": USER_ID},
+                source="explicit",
+            )
+        )
+        kwargs = await _rest_create(
+            db,
+            fake_request,
+            JobCreate(
+                description="cross-role", project_id=PROJECT_ID, expert=DB_EXPERT
+            ),
+            resolver,
+        )
+
+        assert resolver.await_args.kwargs["expert_type"] == "worker"
+        assert kwargs["config_name"] == BASE_WORKER_CONFIG
+        assert kwargs["expert_id"] == DB_EXPERT
+        assert kwargs["context"]["expert_selection"]["source"] == "explicit"
+
+    @pytest.mark.asyncio
     async def test_an_unknown_bundled_slug_is_refused_at_creation(
         self, db, fake_request
     ):

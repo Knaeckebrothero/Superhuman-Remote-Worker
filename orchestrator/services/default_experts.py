@@ -9,6 +9,7 @@ semantics out of individual HTTP/MCP/automation entry points.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -16,7 +17,10 @@ from typing import Any, Literal
 import yaml
 
 from .grants_service import resolve_grants_for
+from src.core.expert_resolution import with_role_tag
 from src.core.loader import canonical_config_name
+
+logger = logging.getLogger(__name__)
 
 ExpertType = Literal["worker", "session"]
 
@@ -102,7 +106,9 @@ def load_seed_bundle(
         "description": str(raw.get("description") or "").strip(),
         "icon": str(raw.get("icon") or "smart_toy"),
         "color": str(raw.get("color") or "#6B7280"),
-        "tags": list(raw.get("tags") or []),
+        # tags ∪ {role}: the seeded row carries its role tag like every row
+        # written through the API (U1 B.4) — no SQL, the same pure helper.
+        "tags": with_role_tag(expert_type, raw.get("tags")),
         "expert_type": expert_type,
         "config": raw,
         "prompts": prompts,
@@ -172,8 +178,21 @@ async def validate_explicit_expert(
     if not row:
         raise ExpertSelectionError("Expert is unavailable")
     if row["expert_type"] != expert_type:
-        raise ExpertSelectionError(
-            f"A {expert_type} expert is required; selected expert is {row['expert_type']}"
+        # Universal experts (U1, D4): every expert is usable in every role —
+        # `resolve_config` re-roots the row's fragment onto the requested
+        # role's overlay (a session expert dispatched as a worker gains the
+        # phase loop's keys, and vice versa). The row's own `expert_type`
+        # stays its primary role for listings and the default slots; an
+        # explicit cross-role pick is logged, not refused. The default-slot
+        # endpoints keep their own type checks (a slot is per role).
+        logger.info(
+            "Expert %s (%s, role %s) explicitly selected for the %s role; "
+            "resolving on the %s overlay",
+            row.get("name") or expert_id,
+            expert_id,
+            row["expert_type"],
+            expert_type,
+            expert_type,
         )
     return ExpertSelection(expert=row, source="explicit")
 

@@ -19,6 +19,7 @@ from typing import Awaitable, Callable, Optional
 import yaml
 
 from src.core.loader import (
+    INHERIT_MODEL,
     ROLE_ROOTS,
     ROOT_NAMES,
     _apply_settings_matrix,
@@ -306,6 +307,14 @@ def unrouted_model_slots(blob: dict) -> list[str]:
     Conservative by design: a slot is only flagged when it carries a ``model``
     yet none of the three routing fields. A model with a ``provider`` (factory
     default base URL) or an inline ``api_key`` is considered routable.
+
+    Since U1 the model-bearing slots are ``llm``, ``llm.summarization``,
+    ``auxiliary``, the roster-wide ``subagents.llm`` and every roster entry's
+    ``llm`` (+ its ``summarization``); the message names the entry. A roster
+    entry marked ``llm._inherit_llm`` carries its parent's model NAME and is
+    credentialed by that name like any other slot, so it is checked like any
+    other slot; the bare ``inherit`` sentinel (a model-less parent) is not a
+    model and is skipped.
     """
     agent = blob.get("agent") or {}
     llm = agent.get("llm") or {}
@@ -315,7 +324,7 @@ def unrouted_model_slots(blob: dict) -> list[str]:
         if not isinstance(section, dict):
             return
         model = section.get("model")
-        if not model:
+        if not model or model == INHERIT_MODEL:
             return
         if not (
             section.get("base_url") or section.get("api_key") or section.get("provider")
@@ -326,6 +335,21 @@ def unrouted_model_slots(blob: dict) -> list[str]:
     if isinstance(llm, dict):
         _check(llm.get("summarization"), "llm.summarization")
     _check(agent.get("auxiliary"), "auxiliary")
+    subagents = agent.get("subagents")
+    if isinstance(subagents, dict):
+        _check(subagents.get("llm"), "subagents.llm")
+        roster = subagents.get("roster")
+        if isinstance(roster, dict):
+            for name, entry in roster.items():
+                if not isinstance(entry, dict):
+                    continue
+                entry_llm = entry.get("llm")
+                _check(entry_llm, f"subagents.roster.{name}.llm")
+                if isinstance(entry_llm, dict):
+                    _check(
+                        entry_llm.get("summarization"),
+                        f"subagents.roster.{name}.llm.summarization",
+                    )
     return problems
 
 
@@ -352,32 +376,61 @@ async def inject_blob_credentials(
         co["auxiliary"] = dict(agent["auxiliary"])
     if agent.get("env_keys"):
         co["env_keys"] = dict(agent["env_keys"])
+    # The roster's model slots (U1): the roster-wide ``subagents.llm`` and
+    # each entry's ``llm`` — ONLY the llm blocks, never the entries' full
+    # configs, so the injector's input stays a config_override-shaped dict
+    # and nothing but transport is merged back. An inheriting entry carries
+    # its parent's model NAME here (the resolver copied it), so it is routed
+    # by that name exactly like the top level.
+    subagents = agent.get("subagents")
+    if isinstance(subagents, dict):
+        co_sub: dict = {}
+        if isinstance(subagents.get("llm"), dict) and subagents["llm"]:
+            co_sub["llm"] = copy.deepcopy(subagents["llm"])
+        roster = subagents.get("roster")
+        if isinstance(roster, dict):
+            co_roster = {
+                name: {"llm": copy.deepcopy(entry["llm"])}
+                for name, entry in roster.items()
+                if isinstance(entry, dict) and isinstance(entry.get("llm"), dict)
+            }
+            if co_roster:
+                co_sub["roster"] = co_roster
+        if co_sub:
+            co["subagents"] = co_sub
 
     # Drop None-valued model keys so the injector's gap-fill / setdefault logic
     # treats them as absent (a serialized config carries explicit model=None /
     # base_url=None defaults that would otherwise block injection). Mirrors
     # _inject_thread_dispatch_credentials' own None-stripping.
     #
-    # This MUST reach the nested override blocks (llm.summarization today; the
-    # strategic/tactical tiers it was written for are lifted into llm.model by
-    # the loader since U1), not just the top-level section.
-    # serialize_resolved_config emits those with explicit base_url=None /
-    # provider=None leaves; a present-but-None key defeats the injector's
-    # setdefault, so endpoint-backed phase pins (e.g. codex models) shipped
-    # without transport and 401'd against api.openai.com while the base model —
-    # whose top-level None WAS stripped — worked, masking the gap (incident:
-    # job eec20eeb / "Research 01").
+    # This MUST reach the nested override blocks (llm.summarization, the
+    # roster entries' llm blocks; the strategic/tactical tiers it was written
+    # for are lifted into llm.model by the loader since U1), not just the
+    # top-level section. serialize_resolved_config emits those with explicit
+    # base_url=None / provider=None leaves; a present-but-None key defeats the
+    # injector's setdefault, so endpoint-backed phase pins (e.g. codex models)
+    # shipped without transport and 401'd against api.openai.com while the
+    # base model — whose top-level None WAS stripped — worked, masking the gap
+    # (incident: job eec20eeb / "Research 01").
     def _strip_none_keys(d: dict) -> None:
         for _k in [_k for _k, _v in d.items() if _v is None]:
             del d[_k]
 
-    for _sect in ("llm", "auxiliary"):
-        _s = co.get(_sect)
-        if isinstance(_s, dict):
-            _strip_none_keys(_s)
-            for _sub in _s.values():
+    def _strip_llm_block(block: object) -> None:
+        if isinstance(block, dict):
+            _strip_none_keys(block)
+            for _sub in block.values():
                 if isinstance(_sub, dict):
                     _strip_none_keys(_sub)
+
+    for _sect in ("llm", "auxiliary"):
+        _strip_llm_block(co.get(_sect))
+    if isinstance(co.get("subagents"), dict):
+        _strip_llm_block(co["subagents"].get("llm"))
+        for _entry in (co["subagents"].get("roster") or {}).values():
+            if isinstance(_entry, dict):
+                _strip_llm_block(_entry.get("llm"))
 
     result = await injector(co)
     if isinstance(result, dict):
@@ -388,4 +441,18 @@ async def inject_blob_credentials(
         agent["auxiliary"] = deep_merge(agent.get("auxiliary") or {}, co["auxiliary"])
     if co.get("env_keys"):
         agent.setdefault("env_keys", {}).update(co["env_keys"])
+    co_sub = co.get("subagents")
+    if isinstance(co_sub, dict) and isinstance(agent.get("subagents"), dict):
+        sub = agent["subagents"]
+        if isinstance(co_sub.get("llm"), dict):
+            sub["llm"] = deep_merge(sub.get("llm") or {}, co_sub["llm"])
+        roster = sub.get("roster")
+        for name, co_entry in (co_sub.get("roster") or {}).items():
+            entry = roster.get(name) if isinstance(roster, dict) else None
+            if (
+                isinstance(entry, dict)
+                and isinstance(co_entry, dict)
+                and isinstance(co_entry.get("llm"), dict)
+            ):
+                entry["llm"] = deep_merge(entry.get("llm") or {}, co_entry["llm"])
     return delivered

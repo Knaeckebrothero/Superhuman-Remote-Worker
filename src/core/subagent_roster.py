@@ -149,6 +149,93 @@ def _portable_dir(directory: Optional[str]) -> Optional[str]:
     return str(directory)
 
 
+def is_db_ref(ref: Any) -> bool:
+    """True when ``ref`` is a DB expert id (the only ``$ref`` kind a caller
+    must prefetch — see :func:`collect_roster_db_refs`)."""
+    return isinstance(ref, str) and bool(_UUID_RE.match(ref.strip()))
+
+
+def _raw_roster(layer: Any) -> Dict[Any, Any]:
+    """``layer["subagents"]["roster"]`` when every level is a mapping, else
+    ``{}`` — the tolerant read the prefetch / authoring helpers share."""
+    if not isinstance(layer, dict):
+        return {}
+    subagents = layer.get("subagents")
+    if not isinstance(subagents, dict):
+        return {}
+    roster = subagents.get("roster")
+    return roster if isinstance(roster, dict) else {}
+
+
+def collect_roster_db_refs(layer: Any) -> Set[str]:
+    """Every DB expert id one authored layer's ``subagents.roster`` names.
+
+    The orchestrator calls this on each layer it is about to hand to
+    ``resolve_config`` (the expert fragment, the project / request overrides)
+    and prefetches the rows into ``db_refs`` — the resolver itself never
+    touches a database. Malformed shapes yield nothing (the resolver reports
+    them; this is only the prefetch list)."""
+    out: Set[str] = set()
+    for entry in _raw_roster(layer).values():
+        if isinstance(entry, dict) and is_db_ref(entry.get("$ref")):
+            out.add(str(entry["$ref"]).strip())
+    return out
+
+
+def validate_roster_fragment(subagents: Any) -> Set[str]:
+    """Authoring-time check of a raw ``subagents`` block (expert save).
+
+    Checks what can be checked without a database: the block, its ``llm`` /
+    ``roster`` and every entry are mappings; every ``$ref`` is a non-empty
+    string; a bundled / library ref exists on disk and its ``$extends`` chain
+    is sane (the same lookup and guard the resolver uses, so "saves" and
+    "resolves" cannot disagree). Raises :class:`RosterResolutionError` (the
+    caller turns it into a 422). Returns the DB expert ids the roster names —
+    only the orchestrator can check those are visible to the author.
+
+    ``subagents.default`` naming no entry is NOT an error here, matching the
+    resolver, which only records it.
+    """
+    if not isinstance(subagents, dict):
+        raise RosterResolutionError(
+            f"subagents: expected a mapping, got {type(subagents).__name__}"
+        )
+    llm = subagents.get("llm")
+    if llm is not None and not isinstance(llm, dict):
+        raise RosterResolutionError(
+            f"subagents.llm: expected a mapping, got {type(llm).__name__}"
+        )
+    roster = subagents.get("roster")
+    if roster is None:
+        roster = {}
+    if not isinstance(roster, dict):
+        raise RosterResolutionError(
+            f"subagents.roster: expected a mapping, got {type(roster).__name__}"
+        )
+    db_refs: Set[str] = set()
+    for raw_name, raw in roster.items():
+        name = str(raw_name)
+        if not isinstance(raw, dict):
+            raise RosterResolutionError(
+                f"subagents.roster.{name}: entry must be a mapping (inline keys or "
+                f"{{$ref: <expert>}}), got {type(raw).__name__}"
+            )
+        if "$ref" not in raw:
+            continue
+        ref = raw.get("$ref")
+        if not isinstance(ref, str) or not ref.strip():
+            raise RosterResolutionError(
+                f"subagents.roster.{name}: $ref must be a non-empty string, got {ref!r}"
+            )
+        ref = ref.strip()
+        if is_db_ref(ref):
+            db_refs.add(ref)
+            continue
+        path, _kind, _directory = _locate_disk_ref(name, ref)
+        _guard_extends_chain(name, ref, path)
+    return db_refs
+
+
 def _lookup_row(db_refs: Dict[str, Any], ref: str) -> Optional[Dict[str, Any]]:
     row = db_refs.get(ref)
     if row is not None:

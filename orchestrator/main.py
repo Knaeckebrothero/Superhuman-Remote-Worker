@@ -73,7 +73,13 @@ configure_logging(
 from dataclasses import dataclass, replace  # noqa: E402
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
-from collections.abc import Awaitable, Callable, Coroutine, Mapping  # noqa: E402
+from collections.abc import (  # noqa: E402
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+)
 from typing import Any, Literal, NamedTuple, Optional  # noqa: E402
 from uuid import UUID, uuid4  # noqa: E402
 
@@ -623,12 +629,15 @@ from src.shared.expert_reference import (  # noqa: E402
     resolve_expert_selection,
 )
 from src.core.loader import (  # noqa: E402
+    INHERIT_MODEL,
     ROLE_ROOTS,
     canonical_config_name,
     chain_root,
     load_and_merge_config,
     load_role_base,
+    normalize_llm_tiers,
     prune_ignored_keys,
+    reroot_extends,
     resolve_config_path,
 )
 from services.session_router import SessionRouterService  # noqa: E402
@@ -3535,6 +3544,84 @@ async def _resolve_default_models(user_id: str | None) -> dict[str, Any]:
     return out
 
 
+async def _prefetch_roster_refs(
+    *,
+    expert_row: dict[str, Any] | None = None,
+    overrides: Iterable[dict[str, Any] | None] = (),
+    user_id: str | None = None,
+    project_ids: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """``{expert_uuid: row}`` for every DB expert a config's ``subagents.roster``
+    names by ``$ref`` — the rows ``resolve_config(db_refs=...)`` materialises
+    (``src/core/subagent_roster.py``; the resolver itself never touches the DB,
+    and matches the keys case-insensitively).
+
+    Two trust levels, by layer. A ref inside the EXPERT ROW's fragment was
+    checked against its author at save (``_require_visible_roster_refs``) and
+    the row is the authority: fetched by id. A ref inside an OVERRIDE layer
+    (the job / thread ``config_override``, a project link's override) was
+    never save-checked against any DB row, so it is fetched with the RUNNER's
+    visibility — an override cannot pull another user's private expert into
+    a job. Whatever is missing or invisible is simply absent from the map: the
+    resolver drops that entry, logs, and records ``agent._roster_warnings``;
+    dispatch never fails a job over its roster (U1 B.3).
+
+    No database call at all when no layer names a DB ref — the common case.
+    """
+    from src.core.subagent_roster import collect_roster_db_refs
+
+    expert_refs: set[str] = set()
+    if expert_row:
+        fragment = expert_row.get("config") or {}
+        if isinstance(fragment, str):
+            try:
+                fragment = json.loads(fragment)
+            except ValueError:
+                fragment = {}
+        expert_refs = collect_roster_db_refs(fragment)
+    override_refs: set[str] = set()
+    for layer in overrides:
+        override_refs |= collect_roster_db_refs(layer)
+    if not expert_refs and not override_refs:
+        return {}
+
+    db_refs: dict[str, dict[str, Any]] = {}
+    for ref in sorted(expert_refs):
+        row = await postgres_db.get_expert_by_id(ref)
+        if row:
+            db_refs[ref] = row
+        else:
+            logger.warning(
+                "Roster prefetch: expert fragment names unknown expert %s", ref
+            )
+    pending = sorted(override_refs - set(db_refs))
+    if pending:
+        is_admin = False
+        if user_id:
+            runner = await postgres_db.get_user(user_id)
+            is_admin = bool((runner or {}).get("is_admin"))
+        for ref in pending:
+            if user_id:
+                row = await postgres_db.get_expert_visible_by_id(
+                    ref,
+                    user_id=user_id,
+                    project_ids=list(project_ids or []),
+                    is_admin=is_admin,
+                )
+            else:
+                row = await postgres_db.get_expert_by_id(ref)
+            if row:
+                db_refs[ref] = row
+            else:
+                logger.warning(
+                    "Roster prefetch: override names expert %s that is unknown "
+                    "or not visible to user %s",
+                    ref,
+                    user_id,
+                )
+    return db_refs
+
+
 async def _resolve_session_account_defaults(
     user_id: str | None,
     all_user_settings: dict[str, Any] | None = None,
@@ -3720,6 +3807,12 @@ async def _resolve_session_config(
             capture=_cap,
             skills=_skills_payload,
             grant_strip=_grant_strip,
+            db_refs=await _prefetch_roster_refs(
+                expert_row=expert_row,
+                overrides=(project_overrides, request_override),
+                user_id=user_id,
+                project_ids=[project_id] if project_id else [],
+            ),
         )
         # Bound skills are delivered deterministically (instructions channel);
         # strip them from the model-invoked catalog so they aren't double-offered.
@@ -4517,6 +4610,49 @@ async def _seed_registry_model_overrides(
     return co
 
 
+def _nested_model_slots(
+    config_override: dict[str, Any],
+) -> list[tuple[str, dict[str, Any], str]]:
+    """``(label, section, capability)`` for every NESTED model slot of a
+    config_override-shaped dict — the slots the top-level ``llm`` /
+    ``auxiliary`` branches of the two credential injectors never look at.
+
+    Since U1 those are ``llm.summarization``, the roster-wide
+    ``subagents.llm`` and every roster entry's ``llm`` (+ its own
+    ``summarization``); ``llm.strategic`` / ``llm.tactical`` stay for the
+    no-blob fallback path, where a pre-U1 job override still carries them and
+    the agent lifts model + transport together at its own seam (u1_plan D.5).
+    Shared by ``_inject_dispatch_credentials`` (jobs) and
+    ``_inject_thread_dispatch_credentials`` (sessions) so the two cannot
+    drift. Only mappings are returned; the callers skip a slot with no model
+    and the ``inherit`` sentinel.
+    """
+    out: list[tuple[str, Any, str]] = []
+    llm = config_override.get("llm")
+    if isinstance(llm, dict):
+        for key in ("strategic", "tactical", "summarization"):
+            out.append((f"llm.{key}", llm.get(key), "chat"))
+    subagents = config_override.get("subagents")
+    if isinstance(subagents, dict):
+        out.append(("subagents.llm", subagents.get("llm"), "chat"))
+        roster = subagents.get("roster")
+        if isinstance(roster, dict):
+            for name, entry in roster.items():
+                if not isinstance(entry, dict):
+                    continue
+                entry_llm = entry.get("llm")
+                out.append((f"subagents.roster.{name}.llm", entry_llm, "chat"))
+                if isinstance(entry_llm, dict):
+                    out.append(
+                        (
+                            f"subagents.roster.{name}.llm.summarization",
+                            entry_llm.get("summarization"),
+                            "chat",
+                        )
+                    )
+    return [(label, sect, cap) for label, sect, cap in out if isinstance(sect, dict)]
+
+
 async def _inject_dispatch_credentials(
     job: dict[str, Any],
     config_override: dict[str, Any] | None,
@@ -4627,26 +4763,28 @@ async def _inject_dispatch_credentials(
             f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}"
         )
 
-    # Resolve credentials for any capability/phase section the job explicitly
-    # pinned a model on. The top-level branch above only inspects `llm.model`;
-    # without this loop, an override like
-    # `{"llm": {"tactical": {"model": "X"}}}` ships the model name with no
+    # Resolve credentials for every OTHER slot the job pinned a model on. The
+    # top-level branch above only inspects `llm.model`; without this loop a
+    # pinned `auxiliary`, `llm.summarization`, roster-wide `subagents.llm` or
+    # roster entry `subagents.roster.<n>.llm` ships the model name with no
     # `base_url`/`api_key`, the agent's LLM factory falls back to the parent's
-    # base_url, and X's endpoint never gets hit — producing opaque 404s when
-    # X lives behind a non-default endpoint. The user-default phase pin block
-    # further down catches the same hole for unpinned phases, so the two
-    # blocks together cover both shapes: explicit job overrides (here) and
-    # user-default fallback (below).
-    for _section_name, _parent, _capability in (
-        ("auxiliary", config_override, "auxiliary"),
-        ("strategic", llm_over, "chat"),
-        ("tactical", llm_over, "chat"),
-    ):
-        _section = _parent.get(_section_name)
+    # base_url, and the model's endpoint never gets hit — opaque 404s when it
+    # lives behind a non-default endpoint (the 2026-05-12 tactical-pin
+    # incident). A roster entry that inherits its parent's model carries the
+    # parent's model NAME here (the resolver copied it), so it is routed by
+    # that name exactly like the top level; the bare `inherit` sentinel is not
+    # a model. The legacy `llm.strategic`/`llm.tactical` blocks are kept for
+    # the no-blob fallback path only (the blob path lifts them into llm.model
+    # before injection).
+    _sections: list[tuple[str, Any, str]] = [
+        ("auxiliary", config_override.get("auxiliary"), "auxiliary")
+    ]
+    _sections.extend(_nested_model_slots(config_override))
+    for _section_name, _section, _capability in _sections:
         if not isinstance(_section, dict):
             continue
         _section_model = _section.get("model")
-        if not _section_model:
+        if not _section_model or _section_model == INHERIT_MODEL:
             continue
         await _inject_model_credentials(
             section=_section,
@@ -5259,6 +5397,14 @@ async def _build_job_start_request(
                     expert_type="worker",
                     capture=_cap,
                     skills=_skills_payload,
+                    db_refs=await _prefetch_roster_refs(
+                        expert_row=expert_row,
+                        overrides=(config_override,),
+                        user_id=str(job["user_id"]) if job.get("user_id") else None,
+                        project_ids=[str(job["project_id"])]
+                        if job.get("project_id")
+                        else [],
+                    ),
                 )
                 # Bound skills are delivered deterministically (instructions channel);
                 # strip them from the model-invoked catalog so they aren't double-offered.
@@ -5966,18 +6112,27 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                     config_override,
                     user_id=str(job["user_id"]) if job.get("user_id") else None,
                 )
+                _rexpert_row = (
+                    await postgres_db.get_expert_by_id(str(job["expert_id"]))
+                    if job.get("expert_id")
+                    else None
+                )
                 _resolved = resolve_config(
                     base_config_name=_rbase,
                     base_defaults=await _resolve_default_models(job.get("user_id")),
-                    expert_row=(
-                        await postgres_db.get_expert_by_id(str(job["expert_id"]))
-                        if job.get("expert_id")
-                        else None
-                    ),
+                    expert_row=_rexpert_row,
                     request_override=_req_override,
                     expert_type="worker",
                     capture=_rcap,
                     skills=_skills_payload,
+                    db_refs=await _prefetch_roster_refs(
+                        expert_row=_rexpert_row,
+                        overrides=(config_override,),
+                        user_id=str(job["user_id"]) if job.get("user_id") else None,
+                        project_ids=[str(job["project_id"])]
+                        if job.get("project_id")
+                        else [],
+                    ),
                 )
                 from src.core.skill_resolution import filter_bound_skills
 
@@ -13491,6 +13646,28 @@ async def _inject_thread_dispatch_credentials(
             capability="auxiliary",
         )
         config_override["auxiliary"] = aux_section
+
+    # Nested model slots (U1): `llm.summarization`, the roster-wide
+    # `subagents.llm` and every roster entry's `llm` — the same slots and the
+    # same helper as the job injector, so a session's roster children reach
+    # their endpoints too. None sentinels are stripped per slot for the same
+    # reason as the top-level sections above; an inheriting entry carries its
+    # parent's model NAME and is routed by it, the bare `inherit` sentinel is
+    # not a model.
+    for _label, _section, _capability in _nested_model_slots(config_override):
+        for _k in [_k for _k, _v in _section.items() if _v is None]:
+            del _section[_k]
+        _model = _section.get("model")
+        if not _model or _model == INHERIT_MODEL:
+            continue
+        await _inject_model_credentials(
+            section=_section,
+            model_id=_model,
+            user_id=user_id,
+            resolved_keys=resolved_keys,
+            capability=_capability,
+        )
+        logger.info("Thread dispatch: injected credentials for %s: %s", _label, _model)
 
     # Embedding capability travels as flat env vars. Source provider/model from
     # the (possibly stripped) persisted block first so re-injection on resume is
@@ -24508,17 +24685,26 @@ async def _resume_job_internal(
                 _rco = json.loads(_rco)
             _rbase = canonical_config_name(job.get("config_name") or "worker_base")
             _rcap: dict = {}
+            _rexpert_row = (
+                await postgres_db.get_expert_by_id(str(job["expert_id"]))
+                if job.get("expert_id")
+                else None
+            )
             resolve_config(
                 base_config_name=_rbase,
                 base_defaults=await _resolve_default_models(job.get("user_id")),
-                expert_row=(
-                    await postgres_db.get_expert_by_id(str(job["expert_id"]))
-                    if job.get("expert_id")
-                    else None
-                ),
+                expert_row=_rexpert_row,
                 request_override=_rco,
                 expert_type="worker",
                 capture=_rcap,
+                db_refs=await _prefetch_roster_refs(
+                    expert_row=_rexpert_row,
+                    overrides=(_rco,),
+                    user_id=str(job["user_id"]) if job.get("user_id") else None,
+                    project_ids=[str(job["project_id"])]
+                    if job.get("project_id")
+                    else [],
+                ),
             )
             await _enforce_dispatch_grants(
                 _rcap["merged_fragment"],
@@ -42808,6 +42994,7 @@ async def agent_create_thread(
             expert_row=selected_expert,
             expert_type="session",
             capture=create_capture,
+            db_refs=await _prefetch_roster_refs(expert_row=selected_expert),
         )
         effective_backend = _backend_from_override(create_capture["merged_fragment"])
         effective_narration_mode = (
@@ -49818,6 +50005,12 @@ async def create_thread(
             request_override=config_override or None,
             expert_type="session",
             capture=create_capture,
+            db_refs=await _prefetch_roster_refs(
+                expert_row=selected_expert_row,
+                overrides=(project_expert_override, config_override),
+                user_id=str(user["id"]),
+                project_ids=[primary_project_id] if primary_project_id else [],
+            ),
         )
         effective_create_config = create_capture["merged_fragment"]
 
@@ -60422,73 +60615,134 @@ def _role_base_or_empty(role: str) -> dict[str, Any]:
         return {}
 
 
+def _expert_info_from_dir(entry: Path, *, library: bool = False) -> ExpertInfo | None:
+    """One ``ExpertInfo`` from ``<entry>/config.yaml``; ``None`` for a
+    non-expert directory or an unreadable file (logged, never fatal).
+
+    The role is the chain's ROOT (expert -> ... -> role overlay), not only
+    the direct ``$extends``; a chain rooted straight on expert_base or one
+    that cannot be followed lists as a worker, as before. ``tags`` is the
+    YAML's ``tags`` ∪ {role tag} (U1 B.4): a bundled expert carries its
+    chain root's role, a subagent-library entry carries ``subagent`` — the
+    directory it lives in IS its authoring. Additive metadata the list
+    filters read alongside ``expert_type``.
+    """
+    from src.core.expert_resolution import with_role_tag
+
+    config_path = entry / "config.yaml"
+    if not entry.is_dir() or not config_path.exists():
+        return None
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f) or {}
+
+        root = chain_root(str(config_path)) or canonical_config_name(
+            str(data.get("$extends") or "worker_base")
+        )
+        expert_type: Literal["worker", "session"] = (
+            "session" if root == "session_base" else "worker"
+        )
+
+        description = str(data.get("description") or "").strip()
+        # Summarize tools if no description
+        if not description:
+            tools = data.get("tools") or {}
+            tool_categories = [k for k in tools if tools[k]]
+            description = (
+                f"Agent with {', '.join(tool_categories)} tools."
+                if tool_categories
+                else "Custom agent configuration."
+            )
+
+        return ExpertInfo(
+            id=entry.name,
+            display_name=data.get("display_name", entry.name.replace("_", " ").title()),
+            description=description,
+            icon=data.get("icon", "psychology"),
+            color=data.get("color", "#cba6f7"),
+            tags=with_role_tag(
+                "subagent" if library else expert_type, data.get("tags")
+            ),
+            expert_type=expert_type,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to parse expert config {config_path}: {e}")
+        return None
+
+
 def _scan_experts() -> list[ExpertInfo]:
     """Scan config/experts/ for expert configurations.
 
     Only ``config/experts/*/config.yaml`` is listed — the chain roots
-    (``expert_base.yaml``, ``overlays/*.yaml``) are bases, not experts, and the
+    (``expert_base.yaml``, ``overlays/*.yaml``) are bases, not experts, the
     public base ids (``worker_base`` / ``session_base``) are served by
-    ``_load_expert_detail`` by name, never listed here.
+    ``_load_expert_detail`` by name, and the subagent library
+    (``config/subagents/*``) is a separate scan (``_scan_subagent_library``)
+    that only ever lists by tag. Each entry's ``tags`` carries its role.
     """
-    config_dir = _get_config_dir()
-    experts_dir = config_dir / "experts"
-    experts: list[ExpertInfo] = []
-
+    experts_dir = _get_config_dir() / "experts"
     if not experts_dir.is_dir():
-        return experts
-
+        return []
+    experts: list[ExpertInfo] = []
     for entry in sorted(experts_dir.iterdir()):
-        config_path = entry / "config.yaml"
-        if not entry.is_dir() or not config_path.exists():
-            continue
-
-        try:
-            with open(config_path) as f:
-                data = yaml.safe_load(f) or {}
-
-            # The role is the chain's ROOT (expert -> ... -> role overlay), not
-            # only the direct $extends; a chain rooted straight on expert_base
-            # or one that cannot be followed lists as a worker, as before.
-            root = chain_root(str(config_path)) or canonical_config_name(
-                str(data.get("$extends") or "worker_base")
-            )
-            expert_type: Literal["worker", "session"] = (
-                "session" if root == "session_base" else "worker"
-            )
-
-            description = data.get("description", "").strip()
-
-            # Summarize tools if no description
-            if not description:
-                tools = data.get("tools", {})
-                tool_categories = [k for k in tools if tools[k]]
-                description = (
-                    f"Agent with {', '.join(tool_categories)} tools."
-                    if tool_categories
-                    else "Custom agent configuration."
-                )
-
-            experts.append(
-                ExpertInfo(
-                    id=entry.name,
-                    display_name=data.get(
-                        "display_name", entry.name.replace("_", " ").title()
-                    ),
-                    description=description,
-                    icon=data.get("icon", "psychology"),
-                    color=data.get("color", "#cba6f7"),
-                    tags=data.get("tags", []),
-                    expert_type=expert_type,
-                )
-            )
-        except Exception as e:
-            logger.warning(f"Failed to parse expert config {config_path}: {e}")
-
+        info = _expert_info_from_dir(entry)
+        if info is not None:
+            experts.append(info)
     return experts
+
+
+def _scan_subagent_library() -> list[ExpertInfo]:
+    """Scan config/subagents/ — the shared library of small experts a roster
+    references (``{$ref: subagents/<name>}``; universal_experts_and_subagents.md
+    §1.1). Same schema as an expert, same ``ExpertInfo``; ``tags`` always
+    carries ``subagent`` (the directory is the authoring), ``expert_type`` is
+    the chain root's role (``worker`` for a chain on ``expert_base``) and is
+    never what lists them: ``list_experts`` includes a library entry only
+    when the requested ``type`` matches one of its tags.
+    """
+    library_dir = _get_config_dir() / "subagents"
+    if not library_dir.is_dir():
+        return []
+    entries: list[ExpertInfo] = []
+    for entry in sorted(library_dir.iterdir()):
+        info = _expert_info_from_dir(entry, library=True)
+        if info is not None:
+            entries.append(info)
+    return entries
 
 
 # Cache experts at startup
 _experts_cache: list[ExpertInfo] | None = None
+_library_cache: list[ExpertInfo] | None = None
+
+
+def _listed_expert(expert_id: str) -> ExpertInfo | None:
+    """The cached listing entry for a bundled expert id, else a subagent-
+    library id — bundled wins on a name clash, exactly like a bare ``$ref``.
+    ``None`` for anything else (DB rows are looked up by UUID elsewhere)."""
+    global _experts_cache, _library_cache
+    if _experts_cache is None:
+        _experts_cache = _scan_experts()
+    info = next((e for e in _experts_cache if e.id == expert_id), None)
+    if info is not None:
+        return info
+    if _library_cache is None:
+        _library_cache = _scan_subagent_library()
+    return next((e for e in _library_cache if e.id == expert_id), None)
+
+
+def _expert_matches_type(
+    type: str | None, expert_type: str, tags: list[str] | None, *, by_role: bool
+) -> bool:
+    """The one list filter (U1 B.4): ``tags ∪ {expert_type}``. A row lists
+    under ``?type=X`` when its role is X or it carries the tag X, so a row is
+    never hidden for lacking a tag and ``?type=subagent`` lists everything
+    tagged for the subagent role. ``by_role=False`` (the subagent library)
+    matches by tag only: those entries never appear in the default listing
+    or under their fallback ``expert_type``."""
+    if type is None:
+        return by_role
+    return (by_role and expert_type == type) or type in (tags or [])
 
 
 @app.get("/api/experts")
@@ -60497,17 +60751,27 @@ async def list_experts(
 ) -> list[dict[str, Any]]:
     """List experts: bundled (disk) + DB rows visible to the caller (owned +
     project-linked + global), each tagged with ``source``. **P4e** — approved
-    users only. ``type`` narrows both DB and bundled rows to worker/session;
-    bundled type is inferred from the canonical ``$extends`` base.
+    users only.
+
+    ``type`` narrows by ROLE OR TAG (``expert_type == type or type in tags``,
+    U1 B.4) — ``?type=worker`` / ``?type=session`` list as before plus any
+    row tagged for that role; ``?type=subagent`` lists the subagent library
+    (``config/subagents/*``, ``source: library``) and every expert tagged
+    ``subagent``. Without ``type`` the listing is unchanged: bundled experts
+    + DB rows, never the library. A bundled expert's role is inferred from
+    its chain root; every entry's ``tags`` includes its role.
     """
     user = await require_approved_user(request, postgres_db)
-    global _experts_cache
+    global _experts_cache, _library_cache
     if _experts_cache is None:
         _experts_cache = _scan_experts()
+    if _library_cache is None:
+        _library_cache = _scan_subagent_library()
     # ``name`` is the slug callers use to reference an expert by name (e.g. the
-    # project loop's role_sequence). For bundled experts the id IS the slug; for
-    # DB rows it's the separate name column (id is a UUID).
-    bundled = [e for e in _experts_cache if type is None or e.expert_type == type]
+    # project loop's role_sequence, a roster ``$ref``). For bundled experts the
+    # id IS the slug; for library entries it is the unambiguous
+    # ``subagents/<id>`` spelling; for DB rows it's the separate name column
+    # (id is a UUID).
     result = [
         {
             **e.model_dump(),
@@ -60515,14 +60779,34 @@ async def list_experts(
             "storage_kind": "bundled",
             "name": e.id,
         }
-        for e in bundled
+        for e in _experts_cache
+        if _expert_matches_type(type, e.expert_type, e.tags, by_role=True)
+    ]
+    result += [
+        {
+            **e.model_dump(),
+            "source": "library",
+            "storage_kind": "library",
+            "name": f"subagents/{e.id}",
+        }
+        for e in _library_cache
+        if _expert_matches_type(type, e.expert_type, e.tags, by_role=False)
     ]
     if _is_experts_db_enabled():
         visible = await user_visible_project_ids(user, postgres_db)
         pids = [] if visible == "all" else [str(p) for p in visible]
+        # Fetched without the SQL role filter: the filter reads tags too, and
+        # a row tagged for another role must list under that role as well.
         rows = await postgres_db.list_experts_visible(
-            user_id=str(user["id"]), project_ids=pids, expert_type=type
+            user_id=str(user["id"]), project_ids=pids, expert_type=None
         )
+        rows = [
+            r
+            for r in rows
+            if _expert_matches_type(
+                type, r["expert_type"], list(r.get("tags") or []), by_role=True
+            )
+        ]
         managed_names = {r["name"] for r in rows if r.get("managed_key")}
         if managed_names:
             # Assistant/General Worker remain on disk as bootstrap templates,
@@ -60557,8 +60841,9 @@ async def reload_experts(request: Request) -> dict[str, Any]:
     """Force reload of expert configurations cache. **Admin only** (P4d) —
     reloads expert YAML from disk."""
     await _require_admin(request)
-    global _experts_cache
+    global _experts_cache, _library_cache
     _experts_cache = _scan_experts()
+    _library_cache = _scan_subagent_library()
     return {"status": "reloaded", "count": len(_experts_cache)}
 
 
@@ -60625,30 +60910,45 @@ def _effective_models_from_layers(
     expert_llm: dict[str, Any] | None,
     account_default: str | None,
     system_default: str | None,
+    expert_subagents: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Per-slot effective model + provenance for the create-form pickers.
 
-    Mirrors the dispatch precedence (most-specific wins) and the agent's
-    ``get_phase_config`` fallback (a phase pin beats the top-level model), so the
-    UI can show the model the agent will actually run when the picker is left
-    untouched. v1 layers (the project ``default_config_override`` layer is
-    deferred — it is ~always null and would need project context threaded
-    through the forms):
+    Mirrors the dispatch precedence (most-specific wins) so the UI can show
+    the model the agent will actually run when the picker is left untouched.
+    v1 layers (the project ``default_config_override`` layer is deferred — it
+    is ~always null and would need project context threaded through the
+    forms):
 
         expert pin  ->  account default_model  ->  system registry default
 
-    ``expert_llm`` is the expert's OWN llm fragment (DB overlay or bundled leaf),
-    NOT the merged config — a bundled, model-agnostic expert has ``{}`` here and
-    so resolves to the account/system default, exactly like dispatch (the bundled
-    base's placeholder model is replaced by the default floor before the expert
-    merges).
+    ``expert_llm`` is the expert's OWN llm fragment (DB overlay or bundled
+    leaf), NOT the merged config — a bundled, model-agnostic expert has ``{}``
+    here and so resolves to the account/system default, exactly like dispatch
+    (the bundled base's placeholder model is replaced by the default floor
+    before the expert merges). ``expert_subagents`` is the fragment's own
+    ``subagents`` block (the roster-wide ``subagents.llm.model`` is the
+    "subagent model" picker since U1).
 
-    Returns ``{slot: {"model": str|None, "source": str}}`` for slots
-    ``strategic`` / ``tactical`` / ``subagent`` / ``session``; ``source`` is one of ``expert`` /
-    ``account_default`` / ``system_default``. See Layer 3 in
-    knowledge-base/knowledge/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+    Since U1 an expert has ONE model (``llm.model``): the per-phase tiers are
+    gone, and a legacy fragment is read through the loader's compat mapping
+    first, so a stored ``llm.strategic`` pin surfaces as ``model`` and a stored
+    ``llm.subagent`` as the ``subagent`` slot. Returns
+    ``{slot: {"model": str|None, "source": str}}`` for slots ``model`` (the
+    expert's model), ``subagent`` (``subagents.llm.model`` when pinned to a
+    real model, else ``model`` — ``inherit`` IS the parent's model) and
+    ``session`` (= ``model``); ``strategic`` / ``tactical`` are kept equal to
+    ``model`` as DEPRECATED aliases until the cockpit reads ``model`` (U1
+    WP6, which removes them on both sides). ``source`` is one of ``expert`` /
+    ``account_default`` / ``system_default``.
     """
-    llm = expert_llm or {}
+    fragment: dict[str, Any] = {"llm": dict(expert_llm or {})}
+    if isinstance(expert_subagents, dict):
+        fragment["subagents"] = expert_subagents
+    fragment = normalize_llm_tiers(fragment, source="effective-models")
+    llm = fragment.get("llm") or {}
+    subagents = fragment.get("subagents")
+    roster_llm = subagents.get("llm") if isinstance(subagents, dict) else None
 
     def _top() -> dict[str, Any]:
         if llm.get("model"):
@@ -60658,30 +60958,26 @@ def _effective_models_from_layers(
         return {"model": system_default, "source": "system_default"}
 
     top = _top()
-
-    def _phase(name: str) -> dict[str, Any]:
-        block = llm.get(name)
-        pin = block.get("model") if isinstance(block, dict) else None
-        return {"model": pin, "source": "expert"} if pin else dict(top)
-
-    def _phase_inherit(name: str, parent: str) -> dict[str, Any]:
-        """Like ``_phase`` but an unpinned slot inherits a sibling phase's pin
-        before the top-level model — mirrors the agent's ``subagent -> tactical
-        -> base`` reader-model fallback (``_resolve_subagent_config``)."""
-        block = llm.get(name)
-        pin = block.get("model") if isinstance(block, dict) else None
-        return {"model": pin, "source": "expert"} if pin else _phase(parent)
-
+    subagent_pin = roster_llm.get("model") if isinstance(roster_llm, dict) else None
+    subagent = (
+        {"model": subagent_pin, "source": "expert"}
+        if subagent_pin and subagent_pin != INHERIT_MODEL
+        else dict(top)
+    )
     return {
-        "strategic": _phase("strategic"),
-        "tactical": _phase("tactical"),
-        "subagent": _phase_inherit("subagent", "tactical"),
+        "model": dict(top),
+        "subagent": subagent,
         "session": dict(top),
+        # Deprecated aliases (removed with the cockpit cutover, U1 WP6).
+        "strategic": dict(top),
+        "tactical": dict(top),
     }
 
 
 async def _compute_expert_effective_models(
-    expert_llm: dict[str, Any] | None, user_id: str | None
+    expert_llm: dict[str, Any] | None,
+    user_id: str | None,
+    expert_subagents: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Combine the expert's own pins with the user's account default_model and
     the system registry chat default (``resolve_default_for_capability`` — the
@@ -60691,7 +60987,9 @@ async def _compute_expert_effective_models(
         settings = await postgres_db.get_user_settings(str(user_id)) or {}
         account_default = settings.get("default_model")
     system_default = await postgres_db.resolve_default_for_capability("chat")
-    return _effective_models_from_layers(expert_llm, account_default, system_default)
+    return _effective_models_from_layers(
+        expert_llm, account_default, system_default, expert_subagents
+    )
 
 
 async def _load_expert_detail(
@@ -60700,10 +60998,20 @@ async def _load_expert_detail(
     user_id: str | None = None,
     defaults_type: Literal["worker", "session"] | None = None,
     include_account_defaults: bool = False,
+    role: str | None = None,
 ) -> dict[str, Any]:
     """Load full expert detail: merged config + instructions content. DB-backed
     experts (UUID) resolve their fragment onto the expert_type base; bundled
-    experts resolve from disk as before.
+    experts resolve from disk as before; a subagent-library id
+    (``config/subagents/<name>``) resolves on the subagent overlay.
+
+    ``role`` (``worker`` / ``session`` / ``subagent``) resolves the expert in
+    THAT role instead of its own — the same re-rooting ``resolve_config``
+    applies when a session expert is dispatched as a worker (U1 D4), so a
+    cross-role picker previews the config the job or session will actually
+    run. The served ``expert_type`` stays the expert's own role (its identity
+    and default slot); ``resolved_role`` names the role the config was
+    resolved for.
 
     When ``user_id`` is provided, attaches ``effective_models`` (per-slot model +
     provenance) so the create-form picker can show what will actually run if left
@@ -60726,14 +61034,16 @@ async def _load_expert_detail(
         row = await postgres_db.get_expert_by_id(expert_id)
         if not row:
             return {}
-        # The row's role base, fully merged (expert_base + overlay) — the same
-        # base `resolve_config` puts under a DB fragment at dispatch.
-        base = _role_base_or_empty(str(row["expert_type"]))
+        # The role base, fully merged (expert_base + overlay) — the same base
+        # `resolve_config` puts under a DB fragment at dispatch: the row's own
+        # role, or the requested one for a cross-role preview.
+        role_used = role or str(row["expert_type"])
+        base = _role_base_or_empty(role_used)
         cfg = row.get("config") or {}
         if isinstance(cfg, str):
             cfg = json.loads(cfg)
         account_layer = (
-            await _account_defaults_layer(user_id, str(row["expert_type"]))
+            await _account_defaults_layer(user_id, role_used)
             if include_account_defaults
             else {}
         )
@@ -60744,7 +61054,9 @@ async def _load_expert_detail(
         if isinstance(prompts, str):
             prompts = json.loads(prompts)
         effective = (
-            await _compute_expert_effective_models(cfg.get("llm") or {}, user_id)
+            await _compute_expert_effective_models(
+                cfg.get("llm") or {}, user_id, cfg.get("subagents")
+            )
             if user_id
             else None
         )
@@ -60782,6 +61094,7 @@ async def _load_expert_detail(
             "enumerate_only": enumerate_only_members(),
             "settings_matrix": raw_matrix,
             "effective_models": effective,
+            "resolved_role": role_used,
         }
     config_dir = _get_config_dir()
 
@@ -60801,17 +61114,16 @@ async def _load_expert_detail(
         )
         # The public base ids resolve to the role base (expert_base + overlay);
         # `agent_id` stays `worker_base` / `session_base` because the overlay
-        # declares it, so the served detail is unchanged by the split.
-        defaults = _role_base_or_empty(
-            "session" if inferred_type == "session" else "worker"
-        )
+        # declares it, so the served detail is unchanged by the split. An
+        # explicit `role` wins over the id (the roots are one thing in
+        # different roles — the same rule `resolve_config` applies).
+        role_used = role or ("session" if inferred_type == "session" else "worker")
+        defaults = _role_base_or_empty(role_used)
         # `defaults` stays the pristine framework base; the account layer is
         # merged on top only for `merged`.
         merged = _deep_merge(
             defaults,
-            await _account_defaults_layer(
-                user_id, "session" if inferred_type == "session" else "worker"
-            )
+            await _account_defaults_layer(user_id, role_used)
             if include_account_defaults
             else {},
         )
@@ -60819,8 +61131,16 @@ async def _load_expert_detail(
         # The "defaults" virtual expert is model-agnostic — no expert-level model
         # pin, so its effective model is the account/system default.
         expert_llm_leaf: dict[str, Any] = {}
+        expert_subagents: dict[str, Any] | None = None
     else:
         expert_dir = config_dir / "experts" / expert_id
+        library_entry = False
+        if not (expert_dir / "config.yaml").exists():
+            # The subagent library (config/subagents/<name>): a roster target,
+            # served by its bare name when no bundled expert shadows it — the
+            # precedence a bare `$ref` uses. Its natural role is subagent.
+            expert_dir = config_dir / "subagents" / expert_id
+            library_entry = True
         config_path = expert_dir / "config.yaml"
         if not expert_dir.is_dir() or not config_path.exists():
             return {}
@@ -60829,22 +61149,28 @@ async def _load_expert_detail(
 
         # Resolve $extends to the expert's parent chain — a role overlay on
         # expert_base for every bundled expert (another expert's chain is
-        # followed the same way). The chain ROOT names the role; an unknown
-        # parent falls back to the worker base, as before.
+        # followed the same way). The chain ROOT names the expert's own role;
+        # an unknown parent falls back to the worker base, as before. For a
+        # requested `role` (or a library entry, whose role is subagent) the
+        # link is re-rooted onto that role's overlay exactly as
+        # `resolve_config` re-roots a bundled leaf at dispatch.
         root = chain_root(str(config_path))
-        role = "session" if root == "session_base" else "worker"
+        own_role = "session" if root == "session_base" else "worker"
+        reroot_role = role or ("subagent" if library_entry else None)
+        role_used = reroot_role or own_role
         extends_name = str(expert_data.pop("$extends", "worker_base"))
-        parent_path, _ = resolve_config_path(extends_name)
+        parent_name, parent_role = reroot_extends(extends_name, reroot_role)
+        parent_path, _ = resolve_config_path(parent_name)
         if Path(parent_path).is_file():
-            defaults = load_and_merge_config(parent_path)
+            defaults = load_and_merge_config(parent_path, role=parent_role)
         else:
-            defaults = _role_base_or_empty(role)
+            defaults = _role_base_or_empty(role_used)
 
         # Account layer sits above the framework base and below the bundled
         # expert leaf — the same slot `resolve_config` gives `base_defaults`.
         base_layer = _deep_merge(
             defaults,
-            await _account_defaults_layer(user_id, role)
+            await _account_defaults_layer(user_id, role_used)
             if include_account_defaults
             else {},
         )
@@ -60853,6 +61179,7 @@ async def _load_expert_detail(
         # The expert's OWN llm fragment (leaf, pre-merge) — a model-agnostic
         # bundled expert has `llm: {}` here and resolves to the default floor.
         expert_llm_leaf = expert_data.get("llm") or {}
+        expert_subagents = expert_data.get("subagents")
 
     # Load the raw settings_matrix for the client to resolve per-model defaults.
     # Do NOT apply it to merged — the client resolves based on the user's model selection.
@@ -60896,7 +61223,9 @@ async def _load_expert_detail(
         merged.pop(key, None)
 
     effective = (
-        await _compute_expert_effective_models(expert_llm_leaf, user_id)
+        await _compute_expert_effective_models(
+            expert_llm_leaf, user_id, expert_subagents
+        )
         if user_id
         else None
     )
@@ -60906,6 +61235,7 @@ async def _load_expert_detail(
         "enumerate_only": enumerate_only_members(),
         "settings_matrix": raw_matrix,
         "effective_models": effective,
+        "resolved_role": role_used,
     }
 
 
@@ -60915,6 +61245,7 @@ async def get_expert(
     expert_id: str,
     type: Literal["worker", "session"] | None = None,
     account_defaults: bool = False,
+    role: Literal["worker", "session", "subagent"] | None = None,
 ) -> dict[str, Any]:
     """Get full expert detail including merged config and instructions content.
 
@@ -60929,6 +61260,13 @@ async def get_expert(
     Job forms pass it so what they render is what create/dispatch will resolve;
     the expert editor must NOT, or a personal preference could be saved into a
     shared expert. See ``_load_expert_detail``.
+
+    ``role`` resolves the expert in that role (a cross-role picker: a session
+    expert previewed as the worker a job will run) — see ``_load_expert_detail``.
+    ``type`` only selects the base behind the public base ids (``defaults`` /
+    ``worker_base`` / ``session_base``); ``role`` wins over it when both are
+    given. A subagent-library id (``config/subagents/<name>``, listed under
+    ``?type=subagent``) is served here too, on the subagent overlay by default.
     """
     user = await require_approved_user(request, postgres_db)
     _uid = str(user["id"])
@@ -60944,7 +61282,10 @@ async def get_expert(
         )
         detail = (
             await _load_expert_detail(
-                expert_id, user_id=_uid, include_account_defaults=account_defaults
+                expert_id,
+                user_id=_uid,
+                include_account_defaults=account_defaults,
+                role=role,
             )
             if row
             else {}
@@ -60954,11 +61295,6 @@ async def get_expert(
                 status_code=404, detail=f"Expert not found: {expert_id}"
             )
         return detail
-
-    # Verify bundled expert exists
-    global _experts_cache
-    if _experts_cache is None:
-        _experts_cache = _scan_experts()
 
     if expert_id in {
         "default",
@@ -60976,17 +61312,19 @@ async def get_expert(
             user_id=_uid,
             defaults_type=type,
             include_account_defaults=account_defaults,
+            role=role,
         )
         if not detail:
             raise HTTPException(status_code=404, detail="Defaults config not found")
         return detail
 
-    expert_info = next((e for e in _experts_cache if e.id == expert_id), None)
+    # Verify the bundled expert (or subagent-library entry) exists.
+    expert_info = _listed_expert(expert_id)
     if not expert_info:
         raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
 
     detail = await _load_expert_detail(
-        expert_id, user_id=_uid, include_account_defaults=account_defaults
+        expert_id, user_id=_uid, include_account_defaults=account_defaults, role=role
     )
     if not detail:
         raise HTTPException(
@@ -61130,12 +61468,25 @@ def _validate_expert_fragment(config: dict[str, Any]) -> dict[str, Any]:
     then made the expert unresolvable. Refusing here turns a later resolve
     failure into an immediate 400.
 
-    Returns the fragment with ``tools`` normalised to ``list[str]``, so callers
-    persist the canonical form and the save-time PDP (which reads
-    ``_truthy(tools.get(...))``, and gets ``{}`` / ``{only: []}`` backwards)
-    only ever sees a list.
+    3. **The roster** (U1 WP4) — a ``subagents`` block is checked the way the
+       resolver will read it: the shape, every ``$ref`` (a bundled / library
+       ref must exist on disk and its ``$extends`` chain must be sane; a DB
+       ref is a UUID whose visibility to the author is the async half,
+       :func:`_require_visible_roster_refs`) — 422, an authoring error like
+       the credential scan — and each entry's ``tools`` through the same
+       vocabulary gate as the top level (400). Dispatch never fails a job
+       over a roster; the save is where a broken one is refused.
+
+    Returns the fragment with ``tools`` normalised to ``list[str]`` (at the
+    top level and in every roster entry), so callers persist the canonical
+    form and the save-time PDP (which reads ``_truthy(tools.get(...))``, and
+    gets ``{}`` / ``{only: []}`` backwards) only ever sees a list.
     """
     from src.core.expert_resolution import hard_deny_scan
+    from src.core.subagent_roster import (
+        RosterResolutionError,
+        validate_roster_fragment,
+    )
 
     offending = hard_deny_scan(config)
     if offending:
@@ -61144,7 +61495,61 @@ def _validate_expert_fragment(config: dict[str, Any]) -> dict[str, Any]:
             detail="config may not set credential sections: "
             + ", ".join(sorted(offending)),
         )
-    return _with_validated_tool_overrides(config) or {}
+    validated = _with_validated_tool_overrides(config) or {}
+    subagents = validated.get("subagents")
+    if subagents is None:
+        return validated
+    try:
+        validate_roster_fragment(subagents)
+    except RosterResolutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if "roster" not in subagents:
+        return validated
+    canonical_roster: dict[str, Any] = {}
+    for name, entry in (subagents.get("roster") or {}).items():
+        try:
+            canonical_roster[str(name)] = _with_validated_tool_overrides(entry)
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=f"subagents.roster.{name}: {exc.detail}",
+            ) from exc
+    return {**validated, "subagents": {**subagents, "roster": canonical_roster}}
+
+
+async def _require_visible_roster_refs(
+    config: dict[str, Any] | None, *, user: dict[str, Any]
+) -> None:
+    """The async half of the roster ``$ref`` check (U1 B.3): every DB expert
+    a fragment's ``subagents.roster`` names must be visible to the AUTHOR
+    (owned, global, or linked to one of the author's projects) — 422
+    otherwise. A ref that passes here is materialised at dispatch by id
+    (``_prefetch_roster_refs``); one the author cannot see is refused at
+    save rather than silently dropped later. Runs on create / update /
+    import (the authored writes); no database call when the roster names no
+    DB ref."""
+    from src.core.subagent_roster import collect_roster_db_refs
+
+    refs = collect_roster_db_refs(config or {})
+    if not refs:
+        return
+    visible = await user_visible_project_ids(user, postgres_db)
+    pids = [] if visible == "all" else [str(p) for p in visible]
+    for ref in sorted(refs):
+        row = await postgres_db.get_expert_visible_by_id(
+            ref,
+            user_id=str(user["id"]),
+            project_ids=pids,
+            is_admin=bool(user.get("is_admin")),
+        )
+        if not row:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"subagents.roster: $ref {ref!r} is not an expert visible to "
+                    "you (own it, or select a global / project-linked expert)"
+                ),
+            )
 
 
 # ── Skills (Agent Skills, Slice 1) ────────────────────────────────────────
@@ -61475,6 +61880,8 @@ async def _create_forked_expert(
 ) -> dict[str, Any]:
     """Create an owned expert from a bundle dict, suffixing the name on collision
     (decision 4/27 fork-on-copy)."""
+    from src.core.expert_resolution import with_role_tag
+
     base_name = src["name"]
     name = f"{base_name}-{suffix}"[:100]
     for attempt in range(6):
@@ -61487,7 +61894,7 @@ async def _create_forked_expert(
                 description=src.get("description"),
                 icon=src.get("icon", "smart_toy"),
                 color=src.get("color", "#6B7280"),
-                tags=src.get("tags") or [],
+                tags=with_role_tag(src["expert_type"], src.get("tags")),
                 config=src.get("config") or {},
                 prompts=src.get("prompts") or {},
             )
@@ -61503,11 +61910,15 @@ async def _create_forked_expert(
 
 @app.post("/api/experts")
 async def create_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
-    """Create an owned DB expert. Slice 1: hard-deny validated, no grants yet."""
+    """Create an owned DB expert. Slice 1: hard-deny validated, no grants yet.
+    The stored ``tags`` always carry the role (``tags ∪ {expert_type}``, U1)."""
+    from src.core.expert_resolution import with_role_tag
+
     _require_experts_db()
     user = await require_approved_user(request, postgres_db)
     if body.config:
         body.config = _validate_expert_fragment(body.config)
+        await _require_visible_roster_refs(body.config, user=user)
     await _enforce_expert_save(request, body.config or {}, user=user)
     try:
         return await postgres_db.create_expert(
@@ -61518,7 +61929,7 @@ async def create_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
             description=body.description,
             icon=body.icon,
             color=body.color,
-            tags=body.tags,
+            tags=with_role_tag(body.expert_type, body.tags),
             config=body.config,
             prompts=body.prompts,
         )
@@ -61551,8 +61962,14 @@ async def update_expert(
         )
     if body.config is not None:
         body.config = _validate_expert_fragment(body.config)
+        await _require_visible_roster_refs(body.config, user=user)
     await _enforce_expert_save(request, body.config or {}, user=user)
     fields = body.model_dump(exclude_unset=True)
+    if "tags" in fields:
+        # tags ∪ {role}: the row's role tag survives every tag edit (U1 B.4).
+        from src.core.expert_resolution import with_role_tag
+
+        fields["tags"] = with_role_tag(existing["expert_type"], fields["tags"])
     updated = await postgres_db.update_expert(
         expert_id, updated_by=str(user["id"]), **fields
     )
@@ -61673,10 +62090,13 @@ async def export_expert(request: Request, expert_id: str) -> dict[str, Any]:
 async def import_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
     """Create an owned expert from a posted bundle (decision 27). Same validation
     as create; fork-on-import (name collision -> suffix)."""
+    from src.core.expert_resolution import with_role_tag
+
     _require_experts_db()
     user = await require_approved_user(request, postgres_db)
     if body.config:
         body.config = _validate_expert_fragment(body.config)
+        await _require_visible_roster_refs(body.config, user=user)
     await _enforce_expert_save(request, body.config or {}, user=user)
     name = body.name
     for attempt in range(6):
@@ -61689,7 +62109,7 @@ async def import_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
                 description=body.description,
                 icon=body.icon,
                 color=body.color,
-                tags=body.tags,
+                tags=with_role_tag(body.expert_type, body.tags),
                 config=body.config,
                 prompts=body.prompts,
             )
@@ -61889,6 +62309,16 @@ async def fork_my_expert_default(
     # result and 422s if anything survives, so an incomplete strip map can only
     # ever produce a false refusal here, never a permitted escape.
     await _enforce_expert_save_prelude(request)
+    # A default SLOT is per role, so a DB source must match it too (the
+    # bundled branch above refuses the same way) — even though an explicit
+    # cross-role pick is allowed for a root job or session since U1 (D4:
+    # `validate_explicit_expert` logs, not refuses). After the shared gates,
+    # like every other route-local check.
+    if source.get("expert_type") != expert_type:
+        raise HTTPException(status_code=422, detail="Expert type does not match")
+    from src.core.expert_resolution import with_role_tag
+
+    source["tags"] = with_role_tag(expert_type, source.get("tags"))
     source["config"], dropped = await _strip_save_grants(source["config"], user=user)
     try:
         row = await postgres_db.fork_and_set_user_expert_default(
@@ -61946,6 +62376,7 @@ async def set_application_expert_default(
         expert_row=target,
         expert_type=expert_type,
         capture=capture,
+        db_refs=await _prefetch_roster_refs(expert_row=target),
     )
     global_grants = await resolve_grants_for(postgres_db, user_id=None, project_ids=[])
     violations = evaluate(capture["merged_fragment"], global_grants)

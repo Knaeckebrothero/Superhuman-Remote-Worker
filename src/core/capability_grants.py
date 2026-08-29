@@ -178,6 +178,30 @@ def _truthy(x: Any) -> bool:
     return x not in (None, False, 0, "", [], {})
 
 
+#: The roster ``llm.model`` value meaning "the parent's model" — never a
+#: selection of its own, so the model gate skips it (the parent's pin is what
+#: gets checked). Mirrors ``src.core.loader.INHERIT_MODEL`` without importing
+#: the loader (this module stays framework-free).
+_INHERIT_MODEL = "inherit"
+
+
+def _roster_entries(fragment: dict) -> list[tuple[str, dict]]:
+    """``(name, entry)`` for every mapping under ``subagents.roster`` — the
+    raw authored entries at save time, the materialised subagent configs at
+    dispatch (``resolve_config`` resolves the roster BEFORE the capture, so
+    the PDP never sees ``{$ref: critic}``; U1 WP3). Malformed shapes yield
+    nothing: the resolver reports them, the PDP only gates what would run."""
+    subagents = fragment.get("subagents")
+    if not isinstance(subagents, dict):
+        return []
+    roster = subagents.get("roster")
+    if not isinstance(roster, dict):
+        return []
+    return [
+        (str(name), entry) for name, entry in roster.items() if isinstance(entry, dict)
+    ]
+
+
 def _fragment_models(fragment: dict) -> list[str]:
     llm = fragment.get("llm") or {}
     out = []
@@ -187,6 +211,19 @@ def _fragment_models(fragment: dict) -> list[str]:
         (llm.get("tactical") or {}).get("model"),
     ):
         if isinstance(v, str) and v:
+            out.append(v)
+    # The roster's model slots: the roster-wide ``subagents.llm.model`` and
+    # every entry's own pin. ``inherit`` is the parent's (already listed)
+    # model, not a selection.
+    subagents = fragment.get("subagents")
+    roster_llm = subagents.get("llm") if isinstance(subagents, dict) else None
+    candidates = [roster_llm.get("model")] if isinstance(roster_llm, dict) else []
+    for _name, entry in _roster_entries(fragment):
+        entry_llm = entry.get("llm")
+        if isinstance(entry_llm, dict):
+            candidates.append(entry_llm.get("model"))
+    for v in candidates:
+        if isinstance(v, str) and v and v != _INHERIT_MODEL:
             out.append(v)
     return out
 
@@ -251,6 +288,36 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
             "catalog_authoring: tools.catalog_authoring requires the "
             "catalog_authoring grant"
         )
+
+    # Roster entries (U1 WP4): a child runs with the tools its entry names,
+    # so the same tool gates apply per entry — a `$ref: critic` child must
+    # not hand a shell to a runner without shell_tools. Only the tool and
+    # model gates: `workspace.backend`, `autonomy`, `delegation` /
+    # `tools.delegation`, `tools.core` and `officer` are pruned from every
+    # entry by the subagent overlay (they never run), and
+    # `interactive.permission_mode` is `autonomous` on every child by design
+    # (a child never asks a human — the runner is that enforcement layer).
+    # Messages keep the `<grant>: ` prefix `strip_to_grants` keys off.
+    for name, entry in _roster_entries(fragment):
+        etools = entry.get("tools")
+        if not isinstance(etools, dict):
+            continue
+        at = f"subagents.roster.{name}"
+        if not grants.get("shell_tools", False) and _truthy(etools.get("shell")):
+            v.append(f"shell_tools: {at}.tools.shell requires the shell_tools grant")
+        if not grants.get("datasource_tools", True) and any(
+            _truthy(etools.get(k)) for k in _DATASOURCE_TOOL_CATEGORIES
+        ):
+            v.append(f"datasource_tools: {at} connector tools are not permitted")
+        if not grants.get("browser", True) and _truthy(etools.get("browser_direct")):
+            v.append(f"browser: {at}.tools.browser_direct is not permitted")
+        if not grants.get("catalog_authoring", False) and _truthy(
+            etools.get("catalog_authoring")
+        ):
+            v.append(
+                f"catalog_authoring: {at}.tools.catalog_authoring requires the "
+                "catalog_authoring grant"
+            )
 
     allowed = grants.get("model_selection")  # None = all
     if allowed is not None:
@@ -325,9 +392,22 @@ def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
     out = copy.deepcopy(fragment)
     flagged = {v.split(":", 1)[0] for v in evaluate(fragment, grants)}
     dropped: list[str] = []
+    # The live entry dicts inside `out` — every tool-category branch below
+    # drops from the top-level `tools` AND from each roster entry's `tools`,
+    # one-for-one with the per-entry gates in `evaluate`.
+    roster_tools = [
+        entry.get("tools")
+        for _name, entry in _roster_entries(out)
+        if isinstance(entry.get("tools"), dict)
+    ]
+
+    def _drop_tool_category(key: str) -> None:
+        _drop_key(out.get("tools"), key)
+        for etools in roster_tools:
+            _drop_key(etools, key)
 
     if "shell_tools" in flagged:
-        _drop_key(out.get("tools"), "shell")
+        _drop_tool_category("shell")
         dropped.append("shell_tools")
     if "delegation" in flagged:
         _drop_key(out.get("tools"), "delegation")
@@ -335,13 +415,13 @@ def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
         dropped.append("delegation")
     if "datasource_tools" in flagged:
         for category in _DATASOURCE_TOOL_CATEGORIES:
-            _drop_key(out.get("tools"), category)
+            _drop_tool_category(category)
         dropped.append("datasource_tools")
     if "browser" in flagged:
-        _drop_key(out.get("tools"), "browser_direct")
+        _drop_tool_category("browser_direct")
         dropped.append("browser")
     if "catalog_authoring" in flagged:
-        _drop_key(out.get("tools"), "catalog_authoring")
+        _drop_tool_category("catalog_authoring")
         dropped.append("catalog_authoring")
     if "unattended_operations" in flagged:
         _drop_key(out.get("officer"), "enabled")
@@ -351,18 +431,27 @@ def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
         dropped.append("vm_workspace")
     if "model_selection" in flagged:
         allowed = grants.get("model_selection")
+
+        def _drop_model_pin(block: Any) -> None:
+            if (
+                isinstance(block, dict)
+                and isinstance(block.get("model"), str)
+                and block["model"] != _INHERIT_MODEL
+                and block["model"] not in allowed
+            ):
+                del block["model"]
+
         llm = out.get("llm")
         if isinstance(llm, dict) and allowed is not None:
-            if isinstance(llm.get("model"), str) and llm["model"] not in allowed:
-                del llm["model"]
+            _drop_model_pin(llm)
             for tier in ("strategic", "tactical"):
-                block = llm.get(tier)
-                if (
-                    isinstance(block, dict)
-                    and isinstance(block.get("model"), str)
-                    and block["model"] not in allowed
-                ):
-                    del block["model"]
+                _drop_model_pin(llm.get(tier))
+        subagents = out.get("subagents")
+        if isinstance(subagents, dict) and allowed is not None:
+            # The roster's own slots: the roster-wide pin and each entry's.
+            _drop_model_pin(subagents.get("llm"))
+            for _name, entry in _roster_entries(out):
+                _drop_model_pin(entry.get("llm"))
         dropped.append("model_selection")
     if "autonomy_ceiling" in flagged:
         _drop_key(out, "autonomy")

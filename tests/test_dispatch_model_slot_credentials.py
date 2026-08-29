@@ -1,14 +1,21 @@
-"""Regression test for `_inject_dispatch_credentials` phase-override handling.
+"""Credential injection for every MODEL SLOT a job or session config carries.
 
-Covers the 2026-05-12 bug where a job's `config_override` of the shape
+Born as the regression test for the 2026-05-12 bug where a job's
+`config_override` of the shape
 `{"llm": {"tactical": {"model": "X"}, "strategic": {"model": "X"}}}`
 walked through dispatch with no `base_url`/`api_key` injection on the
-phase blocks. The agent's LLM factory then fell back to the parent's
-`base_url` and returned `404 Model 'X' not found` in an infinite retry
-loop.
+phase blocks — the agent's LLM factory fell back to the parent's `base_url`
+and returned `404 Model 'X' not found` in an infinite retry loop
+(knowledge-base/knowledge/issues/orchestrator_phase_override_credentials_not_injected.md).
 
-See knowledge-base/knowledge/issues/orchestrator_phase_override_credentials_not_injected.md
-for the incident write-up.
+Since U1 the per-phase tiers are gone: a legacy pin is lifted into the single
+`llm.model` on the blob path (the ordinary top-level branch routes it) and is
+still credentialed as a nested block on the no-blob fallback path, where the
+agent lifts model + transport together. The nested slots that exist now are
+`llm.summarization`, the roster-wide `subagents.llm` and every
+`subagents.roster.<n>.llm` — a roster entry inheriting its parent's model
+carries the parent's model NAME and is routed by it (`TestModelSlotCredentialInjection`,
+`TestRosterPrefetch`). See universal_experts_and_subagents.md §1.1.
 """
 
 from __future__ import annotations
@@ -918,3 +925,359 @@ class TestEmbeddingCredentialReliability:
         monkeypatch.setenv("EMBEDDING_API_KEY", "env-key")
 
         assert await main._build_kb_embedding_service() is None
+
+
+# ---------------------------------------------------------------------------
+# U1 model slots (WP4): llm.summarization, the roster-wide subagents.llm and
+# every subagents.roster.<n>.llm are model slots of their own. Same fixture as
+# the incident tests: only `gpt-5.3-codex-spark` is endpoint-backed.
+# ---------------------------------------------------------------------------
+
+_LIBRARY_REF = "subagents/explorer"
+
+
+class TestModelSlotCredentialInjection:
+    @pytest.mark.asyncio
+    async def test_subagents_llm_and_roster_pins_get_endpoint_injected(
+        self, patched_main
+    ):
+        override = {
+            "subagents": {
+                "llm": {"model": "gpt-5.3-codex-spark"},
+                "roster": {
+                    "reviewer": {"llm": {"model": "gpt-5.3-codex-spark"}},
+                    "twin": {"llm": {"model": "inherit"}},
+                },
+            }
+        }
+
+        result = await main._inject_dispatch_credentials(_job(), override)
+
+        roster_wide = result["subagents"]["llm"]
+        assert roster_wide["base_url"] == CODEX_BASE_URL
+        assert roster_wide["api_key"] == CODEX_API_KEY
+        assert roster_wide["provider"] == "openai"
+        reviewer = result["subagents"]["roster"]["reviewer"]["llm"]
+        assert reviewer["base_url"] == CODEX_BASE_URL
+        assert reviewer["api_key"] == CODEX_API_KEY
+        # The bare sentinel is not a model: left alone, nothing looked up.
+        assert result["subagents"]["roster"]["twin"]["llm"] == {"model": "inherit"}
+
+    @pytest.mark.asyncio
+    async def test_summarization_pin_gets_endpoint_injected(self, patched_main):
+        override = {"llm": {"summarization": {"model": "gpt-5.3-codex-spark"}}}
+
+        result = await main._inject_dispatch_credentials(_job(), override)
+
+        assert result["llm"]["summarization"]["base_url"] == CODEX_BASE_URL
+        assert result["llm"]["summarization"]["api_key"] == CODEX_API_KEY
+
+    @pytest.mark.asyncio
+    async def test_unknown_roster_model_warns_naming_the_entry(
+        self, patched_main, caplog
+    ):
+        override = {
+            "subagents": {"roster": {"reviewer": {"llm": {"model": "does-not-exist"}}}}
+        }
+        with caplog.at_level("WARNING", logger=main.logger.name):
+            result = await main._inject_dispatch_credentials(_job(), override)
+
+        entry = result["subagents"]["roster"]["reviewer"]["llm"]
+        assert entry["model"] == "does-not-exist"
+        assert "base_url" not in entry
+        assert any(
+            "does-not-exist" in rec.message
+            and "subagents.roster.reviewer" in rec.message
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_blob_delivery_credentials_every_roster_entry(self, patched_main):
+        """The path jobs actually use: `resolve_config` materialises the roster,
+        `inject_blob_credentials` seeds the roster llm blocks and merges the
+        transport back — for a pinned entry, an inline entry inheriting the
+        parent's model and a library `$ref` (both carry the parent's model
+        NAME + `_inherit_llm`, and are routed by that name)."""
+        from orchestrator.services.config_resolver import (
+            inject_blob_credentials,
+            resolve_config,
+            unrouted_model_slots,
+        )
+
+        parent = {
+            "expert_type": "worker",
+            "name": "lead",
+            "config": {
+                "llm": {"model": "gpt-5.3-codex-spark"},
+                "subagents": {
+                    "roster": {
+                        "explorer": {"$ref": _LIBRARY_REF},
+                        "pinned": {"llm": {"model": "gpt-5.3-codex-spark"}},
+                        "inline": {"description": "inherits the parent's model"},
+                    }
+                },
+            },
+            "prompts": {},
+        }
+        blob = resolve_config(
+            base_config_name="worker_base", expert_row=parent, expert_type="worker"
+        )
+        roster = blob["agent"]["subagents"]["roster"]
+        assert set(roster) == {"explorer", "pinned", "inline"}
+        for name in ("explorer", "inline"):
+            assert roster[name]["llm"]["model"] == "gpt-5.3-codex-spark"
+            assert roster[name]["llm"]["_inherit_llm"] is True
+        # Precondition: transport-less before injection (the base has no URL).
+        for entry in roster.values():
+            assert entry["llm"].get("base_url") is None
+            assert "api_key" not in entry["llm"]
+
+        delivered = await inject_blob_credentials(
+            blob, lambda co: main._inject_dispatch_credentials(_job(), co)
+        )
+
+        for name in ("explorer", "pinned", "inline"):
+            llm = delivered["agent"]["subagents"]["roster"][name]["llm"]
+            assert llm["base_url"] == CODEX_BASE_URL, name
+            assert llm["api_key"] == CODEX_API_KEY, name
+            assert llm["provider"] == "openai", name
+        assert delivered["agent"]["llm"]["api_key"] == CODEX_API_KEY
+        assert not [p for p in unrouted_model_slots(delivered) if "subagents" in p]
+        # The persistable blob is untouched.
+        for entry in blob["agent"]["subagents"]["roster"].values():
+            assert "api_key" not in entry["llm"]
+            assert entry["llm"].get("base_url") is None
+
+    @pytest.mark.asyncio
+    async def test_inject_blob_credentials_strips_nested_none_in_roster(self):
+        """The eec20eeb shape, on the roster: explicit None leaves inside the
+        roster llm blocks must not reach the injector (they defeat its
+        setdefault gap-fill), only the llm blocks are handed over, and only
+        they are merged back."""
+        import copy
+
+        from orchestrator.services.config_resolver import inject_blob_credentials
+
+        blob = {
+            "agent": {
+                "llm": {"model": "parent", "base_url": None},
+                "subagents": {
+                    "llm": {"model": "wide", "provider": None},
+                    "roster": {
+                        "reviewer": {
+                            "llm": {
+                                "model": "m",
+                                "base_url": None,
+                                "provider": None,
+                                "_inherit_llm": True,
+                                "summarization": {"model": "s", "base_url": None},
+                            },
+                            "tools": {"shell": ["run_command"]},
+                        }
+                    },
+                },
+            }
+        }
+        seen: dict = {}
+
+        async def injector(co):
+            seen.update(copy.deepcopy(co))
+            co["subagents"]["llm"]["base_url"] = "http://wide/v1"
+            entry_llm = co["subagents"]["roster"]["reviewer"]["llm"]
+            entry_llm["base_url"] = "http://entry/v1"
+            entry_llm["api_key"] = "sk-entry"
+            entry_llm["summarization"]["base_url"] = "http://summ/v1"
+            return co
+
+        delivered = await inject_blob_credentials(blob, injector)
+
+        assert seen["subagents"] == {
+            "llm": {"model": "wide"},
+            "roster": {
+                "reviewer": {
+                    "llm": {
+                        "model": "m",
+                        "_inherit_llm": True,
+                        "summarization": {"model": "s"},
+                    }
+                }
+            },
+        }
+        entry = delivered["agent"]["subagents"]["roster"]["reviewer"]
+        assert entry["llm"]["base_url"] == "http://entry/v1"
+        assert entry["llm"]["api_key"] == "sk-entry"
+        assert entry["llm"]["summarization"]["base_url"] == "http://summ/v1"
+        assert entry["llm"]["_inherit_llm"] is True
+        assert entry["tools"] == {"shell": ["run_command"]}  # only llm is merged back
+        assert delivered["agent"]["subagents"]["llm"]["base_url"] == "http://wide/v1"
+        # The input blob is never mutated.
+        assert "api_key" not in blob["agent"]["subagents"]["roster"]["reviewer"]["llm"]
+        assert blob["agent"]["subagents"]["llm"] == {"model": "wide", "provider": None}
+
+    def test_unrouted_model_slots_names_the_roster_entry(self):
+        from orchestrator.services.config_resolver import unrouted_model_slots
+
+        blob = {
+            "agent": {
+                "llm": {"model": "parent", "base_url": "http://p/v1"},
+                "subagents": {
+                    "llm": {"model": "wide-orphan"},
+                    "roster": {
+                        "reviewer": {
+                            "llm": {"model": "entry-orphan", "_inherit_llm": True}
+                        },
+                        "routed": {"llm": {"model": "ok", "provider": "openai"}},
+                        "unset": {"llm": {"model": "inherit"}},
+                    },
+                },
+            }
+        }
+        problems = unrouted_model_slots(blob)
+        assert "subagents.llm model 'wide-orphan'" in problems
+        assert "subagents.roster.reviewer.llm model 'entry-orphan'" in problems
+        assert not any("routed" in p or "inherit" in p for p in problems)
+
+    @pytest.mark.asyncio
+    async def test_thread_injector_mirrors_the_slots(self, patched_main):
+        """Sessions re-inject on every attach through the thread injector; the
+        same nested slots get the same transport, and a stored copy's None
+        sentinels inside a roster entry are repopulated like the top level's."""
+        co = {
+            "llm": {"model": "gpt-5.3-codex-spark"},
+            "subagents": {
+                "llm": {"model": "gpt-5.3-codex-spark", "base_url": None},
+                "roster": {
+                    "reviewer": {
+                        "llm": {
+                            "model": "gpt-5.3-codex-spark",
+                            "provider": None,
+                            "base_url": None,
+                        }
+                    },
+                    "twin": {"llm": {"model": "inherit"}},
+                },
+            },
+        }
+
+        out = await main._inject_thread_dispatch_credentials(
+            co, user_id="u", project_id="p"
+        )
+
+        assert out["subagents"]["llm"]["base_url"] == CODEX_BASE_URL
+        assert out["subagents"]["llm"]["api_key"] == CODEX_API_KEY
+        reviewer = out["subagents"]["roster"]["reviewer"]["llm"]
+        assert reviewer["base_url"] == CODEX_BASE_URL
+        assert reviewer["api_key"] == CODEX_API_KEY
+        assert reviewer["provider"] == "openai"
+        assert out["subagents"]["roster"]["twin"]["llm"] == {"model": "inherit"}
+
+
+# ---------------------------------------------------------------------------
+# The prefetch: the rows resolve_config(db_refs=...) materialises for a
+# roster's UUID `$ref`s, by layer trust (u1_plan B.3).
+# ---------------------------------------------------------------------------
+
+
+class TestRosterPrefetch:
+    EXPERT_REF = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    OVERRIDE_REF = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    HIDDEN_REF = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+
+    @pytest.mark.asyncio
+    async def test_no_db_refs_means_no_db_calls(self, monkeypatch):
+        """Disk refs and rosterless layers never touch the database — the
+        common case costs nothing (and fake DBs in other suites never see it)."""
+        never = AsyncMock(side_effect=AssertionError("must not be called"))
+        for name in ("get_expert_by_id", "get_expert_visible_by_id", "get_user"):
+            monkeypatch.setattr(main.postgres_db, name, never)
+
+        out = await main._prefetch_roster_refs(
+            expert_row={
+                "config": {"subagents": {"roster": {"e": {"$ref": _LIBRARY_REF}}}}
+            },
+            overrides=({"llm": {"model": "x"}}, None, {"subagents": "malformed"}),
+            user_id="u",
+        )
+
+        assert out == {}
+        never.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_expert_fragment_refs_are_fetched_by_id(self, monkeypatch):
+        """A ref in the expert row was checked against its author at save; the
+        row is the authority (JSONB delivered as a string is tolerated)."""
+        import json
+
+        row = {"id": self.EXPERT_REF, "name": "helper", "expert_type": "worker"}
+        monkeypatch.setattr(
+            main.postgres_db, "get_expert_by_id", AsyncMock(return_value=row)
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_expert_visible_by_id",
+            AsyncMock(side_effect=AssertionError("expert refs are fetched by id")),
+        )
+
+        out = await main._prefetch_roster_refs(
+            expert_row={
+                "config": json.dumps(
+                    {"subagents": {"roster": {"h": {"$ref": self.EXPERT_REF}}}}
+                )
+            },
+            user_id="u",
+        )
+
+        assert out == {self.EXPERT_REF: row}
+
+    @pytest.mark.asyncio
+    async def test_override_refs_use_the_runners_visibility(self, monkeypatch):
+        """A job/thread override was never save-checked: its refs resolve with
+        the runner's visibility, so an override cannot pull another user's
+        private expert into a job — the invisible one is simply absent."""
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_user",
+            AsyncMock(return_value={"id": "u", "is_admin": False}),
+        )
+
+        async def visible(ref, *, user_id, project_ids, is_admin):
+            assert (user_id, project_ids, is_admin) == ("u", ["p"], False)
+            return {"id": ref, "name": "shared"} if ref == self.OVERRIDE_REF else None
+
+        monkeypatch.setattr(
+            main.postgres_db, "get_expert_visible_by_id", AsyncMock(side_effect=visible)
+        )
+        by_id = AsyncMock(side_effect=AssertionError("override refs never bypass"))
+        monkeypatch.setattr(main.postgres_db, "get_expert_by_id", by_id)
+
+        out = await main._prefetch_roster_refs(
+            overrides=(
+                {
+                    "subagents": {
+                        "roster": {
+                            "a": {"$ref": self.OVERRIDE_REF},
+                            "b": {"$ref": self.HIDDEN_REF},
+                        }
+                    }
+                },
+            ),
+            user_id="u",
+            project_ids=["p"],
+        )
+
+        assert set(out) == {self.OVERRIDE_REF}
+        by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_override_refs_without_a_runner_fall_back_to_id(self, monkeypatch):
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_expert_by_id",
+            AsyncMock(return_value={"id": self.OVERRIDE_REF}),
+        )
+
+        out = await main._prefetch_roster_refs(
+            overrides=({"subagents": {"roster": {"a": {"$ref": self.OVERRIDE_REF}}}},)
+        )
+
+        assert set(out) == {self.OVERRIDE_REF}

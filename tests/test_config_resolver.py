@@ -438,3 +438,114 @@ def test_bundled_expert_base_layer_keeps_the_frameworks_explicit_llm_keys():
     assert blob["agent"]["llm"]["model"] == "openai/minimax-m2.7"
     assert blob["agent"]["llm"]["temperature"] == 0.0  # base-authored, kept
     assert blob["agent"]["llm"]["top_p"] == 0.95  # matrix-owned, applied
+
+
+# --- U1 WP4: the roster at dispatch — prefetched DB rows, the drop policy ---
+
+_DB_HELPER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+
+def test_roster_resolved_into_blob_with_db_ref():
+    """A UUID `$ref` is materialised from the caller's prefetched row (keys
+    matched case-insensitively): the row's fragment, prompts (inlined, fenced)
+    and tags land on the entry, parent-only keys are pruned, the entry's own
+    `inherit` still wins over the target's pin, and the PDP capture sees the
+    materialised entry — never `{$ref: <uuid>}`."""
+    helper_row = {
+        "id": _DB_HELPER,
+        "name": "db-helper",
+        "expert_type": "worker",
+        "display_name": "DB Helper",
+        "tags": ["helper", "worker"],
+        "config": {
+            "llm": {"model": "helper-model"},
+            "tools": {"workspace": ["read_file"]},
+            "autonomy": "full",
+        },
+        "prompts": {"persona": "HELPER-PERSONA"},
+    }
+    parent = {
+        "expert_type": "worker",
+        "name": "lead",
+        "config": {
+            "llm": {"model": "lead-model"},
+            "subagents": {
+                "default": "helper",
+                "roster": {
+                    "helper": {"$ref": _DB_HELPER},
+                    "twin": {"$ref": _DB_HELPER.upper(), "llm": {"model": "inherit"}},
+                },
+            },
+        },
+        "prompts": {},
+    }
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="worker_base",
+        expert_row=parent,
+        expert_type="worker",
+        capture=cap,
+        db_refs={_DB_HELPER: helper_row},
+    )
+    agent = blob["agent"]
+    roster = agent["subagents"]["roster"]
+    assert set(roster) == {"helper", "twin"}
+    helper = roster["helper"]
+    assert helper["_ref"] == _DB_HELPER
+    assert helper["_ref_kind"] == "db" and helper["_ref_name"] == "db-helper"
+    assert helper["agent_id"] == "helper" and helper["display_name"] == "DB Helper"
+    assert helper["tags"] == ["helper", "worker"]
+    assert helper["llm"]["model"] == "helper-model"
+    assert helper["tools"]["workspace"] == ["read_file"]
+    assert helper["prompts"]["persona"] == "HELPER-PERSONA"
+    assert helper["_persona_source"] == "db" and helper["_db_prompt_keys"] == [
+        "persona"
+    ]
+    assert "autonomy" not in helper  # parent-only, pruned on the subagent overlay
+    twin = roster["twin"]
+    assert twin["llm"]["model"] == "lead-model" and twin["llm"]["_inherit_llm"] is True
+    assert agent["subagents"]["default"] == "helper"
+    assert "_roster_warnings" not in agent
+    captured = cap["merged_fragment"]["subagents"]["roster"]["helper"]
+    assert captured["tools"]["workspace"] == ["read_file"] and "$ref" not in captured
+
+
+def test_unresolvable_ref_dropped_with_warning(caplog):
+    """Dispatch never fails a job over its roster: a DB ref nobody prefetched
+    and an unknown disk ref are dropped, logged, and recorded in
+    `agent._roster_warnings`; the rest of the roster and the blob survive."""
+    import logging
+
+    from src.core.loader import load_config_from_resolved
+
+    parent = {
+        "expert_type": "worker",
+        "name": "lead",
+        "config": {
+            "llm": {"model": "lead-model"},
+            "subagents": {
+                "roster": {
+                    "ghost": {"$ref": _DB_HELPER},
+                    "nope": {"$ref": "no-such-expert"},
+                    "explorer": {"$ref": "subagents/explorer"},
+                }
+            },
+        },
+        "prompts": {},
+    }
+    with caplog.at_level(logging.WARNING, logger="src.core.subagent_roster"):
+        blob = resolve_config(
+            base_config_name="worker_base",
+            expert_row=parent,
+            expert_type="worker",
+            db_refs={},  # nothing prefetched
+        )
+    agent = blob["agent"]
+    assert set(agent["subagents"]["roster"]) == {"explorer"}
+    warnings = agent["_roster_warnings"]
+    assert any("subagents.roster.ghost" in w and _DB_HELPER in w for w in warnings)
+    assert any("subagents.roster.nope" in w and "no-such-expert" in w for w in warnings)
+    assert any("subagents.roster.ghost" in r.getMessage() for r in caplog.records)
+    cfg = load_config_from_resolved(blob)
+    assert set(cfg.subagents.roster) == {"explorer"}
+    assert cfg.extra["_roster_warnings"] == warnings
