@@ -510,15 +510,21 @@ def test_every_message_is_distinct():
 
 _EXPECTED_EXIT_CODES = {
     # 75 EX_TEMPFAIL -- genuinely retryable without anything else changing.
+    # stale_binding lives here, not in the 69 group below: a resume/
+    # re-provision plausibly rewrites the binding, so it is
+    # user-recoverable the same way suspended/reclaimed are -- not the
+    # same class as failed/deleted, where retrying is pointless. (Fix
+    # round 2: this was originally mis-slotted at 69; the message text
+    # was always right, only the code was wrong.)
     "suspended": 75,
     "reclaimed": 75,
     "ending": 75,
     "restoring": 75,
+    "stale_binding": 75,
     # 69 EX_UNAVAILABLE -- broken or gone, not fixed by retrying alone.
     "failed": 69,
     "deleted": 69,
     "ended": 69,
-    "stale_binding": 69,
     "never_provisioned": 69,
     "unreachable": 69,
     # 77 EX_NOPERM -- policy refusals.

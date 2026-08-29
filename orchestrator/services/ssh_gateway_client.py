@@ -19,10 +19,14 @@ from services.ssh_handles import is_valid_handle
 
 # state -> (message shown on stderr, process exit code)
 # 75 EX_TEMPFAIL    -- genuinely retryable without anything else changing:
-#                      suspended, reclaimed, ending, restoring.
+#                      suspended, reclaimed, ending, restoring,
+#                      stale_binding (a resume/re-provision plausibly
+#                      rewrites the binding, so this is user-recoverable
+#                      the same way suspended/reclaimed are -- not the
+#                      same class as failed/deleted, where retrying is
+#                      pointless).
 # 69 EX_UNAVAILABLE -- broken or gone, not fixed by retrying alone: failed,
-#                      deleted, ended, stale_binding, never_provisioned,
-#                      unreachable.
+#                      deleted, ended, never_provisioned, unreachable.
 # 77 EX_NOPERM      -- policy refusals: denied, vm_unsupported.
 # Pinned per state, not just to "some legal code" -- an automated retry
 # wrapper keying on the exit code would otherwise loop forever against a
@@ -61,7 +65,7 @@ REFUSAL_MESSAGES: dict[str, tuple[str, int]] = {
     "stale_binding": (
         "workspace is ready but its SSH access is not valid right now - "
         "reconnect via cockpit, or start a new session if this persists",
-        69,
+        75,
     ),
     "unreachable": ("workspace is unreachable right now", 69),
     "denied": ("no such workspace, or you do not have access to it", 77),
