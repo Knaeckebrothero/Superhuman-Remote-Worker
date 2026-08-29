@@ -284,6 +284,18 @@ PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
 AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+# Certificates minted by the ssh-gateway's user CA. The gateway signs a fresh
+# key per attachment with a validity measured in minutes, so no standing
+# credential for this workspace exists anywhere outside the workspace itself.
+# The agent's own access still uses AuthorizedKeysFile above.
+TrustedUserCAKeys /etc/ssh/srw_user_ca.pub
+# Every workspace image bakes in the same Unix user (agent-host) and trusts
+# the same CA, so TrustedUserCAKeys alone would let a certificate minted for
+# ANY workspace authenticate to THIS one for its whole validity window. This
+# file (written at boot by the entrypoint from this workspace's own owner
+# id) restricts accepted certificates to the one principal the gateway
+# mints for this specific workspace, regardless of the shared login name.
+AuthorizedPrincipalsFile /etc/ssh/principals/%u
 X11Forwarding no
 PrintMotd no
 AcceptEnv LANG LC_*

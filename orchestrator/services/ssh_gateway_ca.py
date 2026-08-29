@@ -17,10 +17,16 @@ scoped single principal does not by itself restrict *which workspace* accepts
 it. Every workspace image bakes in the same Unix user
 (``docker/Dockerfile.workspace``'s ``useradd -m -s /bin/bash -u 1000
 agent-host``), and OpenSSH's ``AuthorizedPrincipalsFile`` defaults to
-``none``, so today a certificate minted for one workspace is honored by every
-workspace for the whole of its validity window. Closing that is Task 9's to
-do: per-workspace principals plus an ``AuthorizedPrincipalsFile`` that only
-the intended workspace populates. It is NOT ``source_address`` -- that option
+``none``, so absent further scoping a certificate minted for one workspace
+would be honored by every workspace for the whole of its validity window.
+Task 9 closes that: ``ssh_gateway_server.connect_upstream`` mints each
+certificate's principal from the resolved target's ``thread_id`` rather than
+a fixed value, and every workspace's ``AuthorizedPrincipalsFile``
+(``docker/Dockerfile.workspace``, populated at boot from
+``SRW_WORKSPACE_OWNER_ID`` by ``docker/workspace-entrypoint.sh``) lists only
+that workspace's own thread id, so OpenSSH matches the certificate's
+principal against that file's contents rather than against the shared login
+name. It is NOT ``source_address`` -- that option
 restricts the address the certificate's *presenter* connects from
 (``ssh-keygen(1)``: "the source addresses from which the certificate is
 considered valid"), and our presenter is the gateway, not the workspace, so

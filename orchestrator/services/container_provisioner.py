@@ -12620,8 +12620,20 @@ class ContainerProvisioner:
                                     "key": "ssh-publickey",
                                     "path": "ssh-publickey",
                                     "mode": 0o600,
-                                }
+                                },
+                                {
+                                    "key": "user-ca.pub",
+                                    "path": "user-ca.pub",
+                                    "mode": 0o644,
+                                },
                             ],
+                            # A deployment whose ssh-gateway secret predates
+                            # the CA key (or has no ssh-gateway at all) must
+                            # still start: the projected CA key is additive,
+                            # not required. The entrypoint already treats
+                            # its absence as "certificate auth unavailable",
+                            # not fatal.
+                            "optional": True,
                             "defaultMode": 0o600,
                         },
                     },

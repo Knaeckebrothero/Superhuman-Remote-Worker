@@ -62,6 +62,32 @@ if [ -f /tmp/ssh-pubkey/ssh-publickey ]; then
     chmod 644 /etc/ssh/authorized_keys/agent-host
 fi
 
+# Gateway user CA. Absent on deployments without the ssh-gateway, in which case
+# sshd simply has no CA to trust and certificate auth is unavailable -- the
+# agent's own key path is unaffected.
+if [ -f /tmp/ssh-pubkey/user-ca.pub ]; then
+    cp /tmp/ssh-pubkey/user-ca.pub /etc/ssh/srw_user_ca.pub
+    chmod 644 /etc/ssh/srw_user_ca.pub
+
+    # Scope certificate auth to THIS workspace. Every workspace image bakes
+    # in the same Unix user and trusts the same CA, so without this file a
+    # certificate minted for any workspace would authenticate to all of
+    # them for its whole validity window (sshd_config's
+    # AuthorizedPrincipalsFile /etc/ssh/principals/%u reads this, keyed by
+    # login user -- always "agent-host" here). SRW_WORKSPACE_OWNER_ID is the
+    # same thread id the gateway resolves for this workspace's ssh handle,
+    # and connect_upstream() mints each certificate's principal from that
+    # same value, so the two agree without either side hard-coding the
+    # other. No identity, no file: sshd then finds AuthorizedPrincipalsFile
+    # pointing at a missing file and refuses every certificate, which is
+    # the safe default for a workspace with nothing to scope to.
+    if [ -n "${SRW_WORKSPACE_OWNER_ID:-}" ]; then
+        install -d -o root -g root -m 0755 /etc/ssh/principals
+        printf '%s\n' "$SRW_WORKSPACE_OWNER_ID" > /etc/ssh/principals/agent-host
+        chmod 644 /etc/ssh/principals/agent-host
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # 2a. Install a per-workspace SSH host identity.
 #

@@ -170,9 +170,33 @@ async def test_uses_a_minted_certificate_not_a_static_key(monkeypatch):
     recorder = Recorder()
     monkeypatch.setattr(mod.asyncssh, "connect", recorder)
     context = _context()
-    await connect_upstream(context, _target())
+    target = _target()
+    await connect_upstream(context, target)
     assert recorder.kwargs["client_keys"], "a minted keypair+cert must be passed"
-    assert context.ca.mint_calls == [mod.WORKSPACE_PRINCIPAL]
+    # Ruling G3/G44: the certificate's PRINCIPAL is minted per-workspace
+    # (the resolved thread id), not the fixed WORKSPACE_PRINCIPAL constant --
+    # that constant names the shared Unix LOGIN user only (asserted below).
+    # A cert minted with the fixed constant would authenticate to every
+    # workspace for its whole validity window, which is exactly what
+    # AuthorizedPrincipalsFile plus this per-workspace principal closes.
+    assert context.ca.mint_calls == [target.thread_id]
+
+
+@pytest.mark.asyncio
+async def test_login_username_is_the_fixed_unix_account_not_the_principal(
+    monkeypatch,
+):
+    """The certificate's principal is per-workspace (previous test), but the
+    Unix account every workspace image bakes in is not -- ``ssh-keygen(1)``'s
+    principal and the SSH login username are different things, and
+    ``AuthorizedPrincipalsFile`` is what lets them diverge: OpenSSH matches
+    the certificate's principals against that file's contents rather than
+    against the login name once it is set (docker/Dockerfile.workspace)."""
+    recorder = Recorder()
+    monkeypatch.setattr(mod.asyncssh, "connect", recorder)
+    await connect_upstream(_context(), _target(thread_id="some-other-thread"))
+    assert recorder.kwargs["username"] == mod.WORKSPACE_PRINCIPAL
+    assert mod.WORKSPACE_PRINCIPAL == "agent-host"
 
 
 @pytest.mark.asyncio
@@ -235,14 +259,26 @@ async def _workspace_session(process) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _workspace(tmp_path):
+async def _workspace(tmp_path, principal="t1"):
     """A real sshd that trusts a fresh CA, exactly as a provisioned
-    workspace trusts the gateway's via ``TrustedUserCAKeys``."""
+    workspace trusts the gateway's via ``TrustedUserCAKeys`` -- AND scopes
+    accepted certificates to one principal, exactly as a provisioned
+    workspace's ``AuthorizedPrincipalsFile`` (populated at boot from
+    ``SRW_WORKSPACE_OWNER_ID``) does. asyncssh's authorized-keys
+    ``principals="..."`` option on the ``cert-authority`` line is its
+    equivalent of that file: it makes validation check the certificate's
+    principal list against this value instead of against the login
+    username -- see ``connection.py``'s ``_validate_openssh_certificate``,
+    where a ``principals`` key option sets ``cert_user = None`` rather than
+    the username. Defaults to ``"t1"``, matching ``_target()``'s default
+    ``thread_id``, so existing callers that never mint for a different
+    workspace need no change.
+    """
     ca_key = asyncssh.generate_private_key("ssh-ed25519")
     ca = SshUserCa(ca_key.export_private_key())
     host_key = asyncssh.generate_private_key("ssh-ed25519")
     authorized = asyncssh.import_authorized_keys(
-        "cert-authority " + ca.public_key_line + "\n"
+        f'cert-authority,principals="{principal}" ' + ca.public_key_line + "\n"
     )
 
     server = await asyncssh.create_server(
@@ -385,6 +421,38 @@ async def test_a_wrong_pin_is_refused_by_a_real_server(tmp_path, monkeypatch):
             await connect_upstream(_context(ca=workspace.ca), target)
 
     assert fired == [False]
+
+
+@pytest.mark.asyncio
+async def test_a_certificate_is_refused_by_a_workspace_it_was_not_minted_for(
+    tmp_path,
+):
+    """The WORKSPACE side of Ruling G3/G44's fix, against a real asyncssh
+    server rather than a recorder. ``test_uses_a_minted_certificate_not_a_
+    static_key`` proves the GATEWAY mints per-workspace (``target.thread_
+    id``, not the fixed constant); this proves the other half actually
+    matters -- that a workspace scoped via ``AuthorizedPrincipalsFile`` to
+    one principal really does reject a certificate carrying a different
+    one, via asyncssh's ``principals="..."`` authorized-keys option (its
+    analogue of that OpenSSH directive).
+
+    This test alone would still pass if the gateway regressed to minting
+    every certificate with the fixed ``WORKSPACE_PRINCIPAL`` constant --
+    ``"agent-host"`` mismatches ``"some-other-thread"`` exactly as ``"t1"``
+    does. That regression is what ``test_uses_a_minted_certificate_not_a_
+    static_key`` (the mint-argument assertion) and the successful full-stack
+    dials below (workspace scoped to ``"t1"``, matching ``_target()``'s
+    default) exist to catch instead.
+    """
+    async with _workspace(tmp_path, principal="some-other-thread") as workspace:
+        target = _target(
+            pod_ip="127.0.0.1",
+            pod_port=workspace.port,
+            host_key_fingerprint=workspace.fingerprint,
+            thread_id="t1",
+        )
+        with pytest.raises(asyncssh.PermissionDenied):
+            await connect_upstream(_context(ca=workspace.ca), target)
 
 
 @pytest.mark.asyncio

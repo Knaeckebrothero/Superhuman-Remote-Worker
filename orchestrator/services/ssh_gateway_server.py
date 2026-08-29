@@ -968,9 +968,21 @@ class GatewaySSHServer(asyncssh.SSHServer):
 EMPTY_KNOWN_HOSTS = ((), (), (), (), (), (), ())
 
 # The single Unix user every workspace image bakes in
-# (docker/Dockerfile.workspace). Also the certificate's only principal --
-# see ssh_gateway_ca's module docstring for what that does and does not
-# scope.
+# (docker/Dockerfile.workspace). This is ONLY the SSH login name.
+#
+# It is deliberately NOT the certificate's principal (Task 9 / ruling
+# G3-G44): every workspace shares this same login user and trusts the same
+# CA, so a certificate whose principal was this fixed constant would
+# authenticate to every workspace in the fleet for its whole validity
+# window. connect_upstream() below mints each certificate's principal from
+# the resolved target's thread id instead, and every workspace's
+# AuthorizedPrincipalsFile (populated at boot from SRW_WORKSPACE_OWNER_ID --
+# see docker/workspace-entrypoint.sh) checks that principal against its own
+# identity rather than against this login name, per ``AuthorizedPrincipalsFile``
+# semantics (OpenSSH matches certificate principals against that file's
+# contents, not the login name, once it is set). See ssh_gateway_ca's module
+# docstring for the fuller "what a single principal does and does not scope"
+# discussion.
 WORKSPACE_PRINCIPAL = "agent-host"
 
 # Bounds on the inner hop. Without them a pod that black-holes packets hangs
@@ -1027,7 +1039,10 @@ async def connect_upstream(context: GatewayContext, target: SshTarget):
     ``target.pod_ip`` is a misnomer carried from the orchestrator's API: it
     holds a Kubernetes Service DNS name, and must not be validated as an IP.
     """
-    key, cert = context.ca.mint(WORKSPACE_PRINCIPAL)
+    # The certificate's PRINCIPAL is this specific workspace's thread id --
+    # not WORKSPACE_PRINCIPAL, which names only the shared Unix login user
+    # passed as `username` below. See WORKSPACE_PRINCIPAL's docstring.
+    key, cert = context.ca.mint(target.thread_id)
     expected = target.host_key_fingerprint
     return await asyncssh.connect(
         target.pod_ip,
