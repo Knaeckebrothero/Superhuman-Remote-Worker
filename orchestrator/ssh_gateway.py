@@ -94,10 +94,20 @@ from services.ssh_gateway_token import verify_attach_token
 
 logger = logging.getLogger(__name__)
 
-# Application-defined close codes (4000-4999 is the private range). Distinct
-# per refusal so the client helper can tell "your token expired, fetch another"
-# from "this build is talking to the wrong host" without parsing a reason
-# string.
+# Application-defined close codes (4000-4999 is the private range), distinct
+# per refusal.
+#
+# WHAT THE CLIENT ACTUALLY SEES, measured against a real uvicorn rather than
+# assumed: nothing. All three of these fire BEFORE ``accept()``, and a close
+# before accept is an ASGI handshake denial, which uvicorn renders as a bare
+# ``HTTP 403`` -- identical for all three (verified live: no-token, bad-origin
+# and internal-key-as-token all came back 403). The codes are therefore a
+# GATEWAY-SIDE distinction, useful in logs and in the tests, not something
+# plan 3's helper can branch on. If that helper needs to tell "your token
+# expired, fetch another" from "wrong host", it needs a real denial response
+# (Starlette's ``send_denial_response``, which depends on the ASGI server
+# advertising the ``websocket.http.response`` extension) -- do not assume
+# these numbers reach it.
 WS_TOKEN_REFUSED = 4401
 WS_ORIGIN_REFUSED = 4403
 WS_RATE_REFUSED = 4429
