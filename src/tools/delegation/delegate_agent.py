@@ -175,13 +175,20 @@ def ensure_runtime(context: ToolContext) -> Any:
     if runtime is not None:
         return runtime
     from src.subagents.host import WorkerHost
+    from src.subagents.ledger import NullLedger
+    from src.subagents.persistence import DbSubagentLedger
     from src.subagents.runtime import SubagentRuntime
 
     host = getattr(context, "_parent_host", None)
     if host is None:
         host = WorkerHost.from_context(context)
         context._parent_host = host
-    runtime = SubagentRuntime.from_context(context, host)
+    # The same ledger choice agent.py makes: durable rows when the context
+    # carries the orchestrator client and the agent-side pool, else nothing.
+    ledger = DbSubagentLedger.from_context(context)
+    runtime = SubagentRuntime.from_context(
+        context, host, ledger=ledger if ledger is not None else NullLedger()
+    )
     context.subagent_runtime = runtime
     return runtime
 

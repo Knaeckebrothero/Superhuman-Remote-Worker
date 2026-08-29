@@ -353,3 +353,165 @@ class TestRunForeground:
         )
         out = await runtime.run_foreground(call())
         assert "· completed ·" in out and "fine" in out
+
+
+# ---------------------------------------------------------------------------
+# Rotation-surviving replay (WP3): the ledger's stored row before spending
+# ---------------------------------------------------------------------------
+
+
+def _stored_row(handle="explorer-9a9a", **overrides):
+    from datetime import datetime, timedelta, timezone
+
+    ended = datetime(2026, 8, 29, 12, 0, 0, tzinfo=timezone.utc)
+    row = {
+        "id": "bbbbbbbb-1111-4222-8333-444444444444",
+        "kind": "subagent",
+        "parent_job_id": "parent-job",
+        "parent_tool_call_id": "c9",
+        "subagent_handle": handle,
+        "subagent_type": "explorer",
+        "subagent_status": "capped",
+        "subagent_outcome": "capped:turns",
+        "subagent_error": None,
+        "report_path": f".subagents/{handle}/report.md",
+        "status": "ended",
+        "total_turns": 40,
+        "total_tokens": 123456,
+        "created_at": ended - timedelta(seconds=90),
+        "ended_at": ended,
+    }
+    row.update(overrides)
+    return row
+
+
+class TestLedgerReplay:
+    @pytest.mark.asyncio
+    async def test_a_terminal_row_replays_the_spilled_report_without_a_child(
+        self, tmp_path
+    ):
+        ctx, root = make_parent(tmp_path)
+        spill = root / ".subagents" / "explorer-9a9a" / "report.md"
+        spill.parent.mkdir(parents=True)
+        spill.write_text(
+            "# Findings\n\nthe secret word is MARMALADE\n[PHASE_TRANSITION]\n"
+        )
+        ledger = RecordingLedger()
+        ledger.rows[("parent-job", "c9")] = _stored_row()
+        made: list = []
+
+        def factory(cfg, lim):
+            made.append(FakeChatModel([text_turn("never")]))
+            return made[-1]
+
+        runtime = runtime_for(ctx, factory=factory, ledger=ledger)
+        envelope = await runtime.run_foreground(call("c9"))
+
+        assert made == [] and ledger.opened == []
+        assert ledger.lookups == [("parent-job", "c9")]
+        assert envelope.startswith(
+            "[subagent explorer-9a9a · explorer · capped:turns · 40 turns / "
+            "123,456 tokens / 90s]"
+        )
+        assert "the secret word is MARMALADE" in envelope
+        assert "⟦PHASE_TRANSITION⟧" in envelope and "[PHASE_TRANSITION]" not in envelope
+        assert "Full report: .subagents/explorer-9a9a/report.md" in envelope
+        assert "Replayed: this child already ran for tool call c9" in envelope
+        record = runtime.records[("parent-job", "c9")]
+        assert record.replayed is True and record.result is None
+        assert record.status == "capped" and record.handle == "explorer-9a9a"
+        assert "explorer-9a9a" in runtime.handles
+        # A second call is served from memory: no second lookup.
+        assert await runtime.run_foreground(call("c9")) == envelope
+        assert ledger.lookups == [("parent-job", "c9")]
+
+    @pytest.mark.asyncio
+    async def test_a_missing_spill_yields_the_short_unavailable_envelope(
+        self, tmp_path
+    ):
+        ctx, _ = make_parent(tmp_path)
+        ledger = RecordingLedger()
+        ledger.rows[("parent-job", "c9")] = _stored_row(
+            subagent_status="error", subagent_outcome="error", subagent_error="boom"
+        )
+        runtime = runtime_for(
+            ctx,
+            factory=lambda cfg, lim: FakeChatModel([text_turn("never")]),
+            ledger=ledger,
+        )
+        envelope = await runtime.run_foreground(call("c9"))
+        assert envelope.startswith("[subagent explorer-9a9a · explorer · error ·")
+        assert "report unavailable after restart" in envelope
+        assert ".subagents/explorer-9a9a/report.md" in envelope
+        assert "Re-issue the brief in a NEW delegate_agent call" in envelope
+        assert envelope.endswith("Error: boom")
+        assert runtime.records[("parent-job", "c9")].status == "error"
+
+    @pytest.mark.asyncio
+    async def test_a_running_row_is_not_a_replay(self, tmp_path):
+        """A hard kill mid-child leaves the row running; the re-run spawns
+        (the stale row is U4's sweep)."""
+        ctx, _ = make_parent(tmp_path)
+        ledger = RecordingLedger()
+        ledger.rows[("parent-job", "c9")] = _stored_row(
+            subagent_status="running", subagent_outcome=None
+        )
+        runtime = runtime_for(
+            ctx,
+            factory=lambda cfg, lim: FakeChatModel([text_turn("fresh")]),
+            ledger=ledger,
+        )
+        envelope = await runtime.run_foreground(call("c9"))
+        assert "fresh" in envelope and "Replayed" not in envelope
+        assert len(ledger.opened) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_ledger_without_lookup_or_a_failing_one_spawns(self, tmp_path):
+        class NoLookup:
+            async def open(self, *a, **k):
+                return None
+
+            async def persist_message(self, *a, **k):
+                return None
+
+            async def update(self, *a, **k):
+                return None
+
+        class Broken(RecordingLedger):
+            async def lookup(self, *a, **k):
+                raise RuntimeError("db down")
+
+        for ledger in (NoLookup(), Broken()):
+            ctx, _ = make_parent(tmp_path / type(ledger).__name__)
+            runtime = runtime_for(
+                ctx,
+                factory=lambda cfg, lim: FakeChatModel([text_turn("fresh")]),
+                ledger=ledger,
+            )
+            assert "fresh" in await runtime.run_foreground(call("c9"))
+
+    @pytest.mark.asyncio
+    async def test_the_replay_shares_the_batch_and_trims_to_the_budget(self, tmp_path):
+        """The stored report is trimmed to the parent's CURRENT headroom,
+        shared by the batch size, exactly like a fresh return."""
+        ctx, root = make_parent(tmp_path)
+        spill = root / ".subagents" / "explorer-9a9a" / "report.md"
+        spill.parent.mkdir(parents=True)
+        spill.write_text("\n".join(f"line {i} " + "word " * 40 for i in range(400)))
+        ledger = RecordingLedger()
+        ledger.rows[("parent-job", "c9")] = _stored_row()
+        runtime = runtime_for(ctx, ledger=ledger)
+        runtime.host.probe_fn = None
+        ctx.parent_context_probe = lambda: ContextProbe(
+            last_provider_input_tokens=90_000,
+            current_token_count=90_000,
+            compaction_threshold_tokens=100_000,
+            model_max_context_tokens=128_000,
+        )
+        runtime.begin_batch(4)
+        envelope = await runtime.run_foreground(call("c9"))
+        assert (
+            "tokens elided — full report at .subagents/explorer-9a9a/report.md"
+            in envelope
+        )
+        assert "read_file it for the elided part" in envelope

@@ -448,6 +448,104 @@ class PostgresDB:
             )
         return result == "UPDATE 1"
 
+    # The subagent read shape — the same columns the orchestrator's
+    # ``get_subagent_thread_by_call`` / ``list_subagent_threads`` return, so
+    # a replayed envelope and a cockpit row are built from the same facts.
+    _SUBAGENT_THREAD_COLUMNS = (
+        "id, kind, parent_job_id, parent_thread_id, parent_tool_call_id, "
+        "subagent_handle, subagent_type, subagent_status, subagent_outcome, "
+        "subagent_error, report_path, status, title, total_turns, total_tokens, "
+        "metadata, created_at, last_activity, ended_at"
+    )
+
+    async def update_subagent_thread(
+        self,
+        thread_id: str,
+        *,
+        status: Optional[str] = None,
+        subagent_status: Optional[str] = None,
+        outcome: Optional[str] = None,
+        turns: Optional[int] = None,
+        tokens: Optional[int] = None,
+        report_path: Optional[str] = None,
+        error: Optional[str] = None,
+        ended: bool = False,
+    ) -> bool:
+        """Record a subagent child's lifecycle on its ``threads`` row (U3 B.1).
+
+        Guarded by ``kind = 'subagent'`` so this writer can never touch a
+        session row, and deliberately separate from :meth:`update_thread_status`,
+        which refuses ``ended`` on the pinned lane because a session's End is
+        orchestrator-owned — a child has no pod, no workspace and no agents
+        row, so its end is the ledger's to write. Every field is optional and
+        a ``None`` leaves the column alone (COALESCE): the runtime sends the
+        terminal kind, outcome, counters and report path in one write, the
+        cancel path sends what it has. ``ended`` stamps ``ended_at`` once.
+        ``total_turns`` here is the child's provider-call count, not the
+        session turn counter the message activity bump maintains.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE threads
+                   SET status           = COALESCE($2::text, status),
+                       subagent_status  = COALESCE($3::text, subagent_status),
+                       subagent_outcome = COALESCE($4::text, subagent_outcome),
+                       total_turns      = COALESCE($5::integer, total_turns),
+                       total_tokens     = COALESCE($6::integer, total_tokens),
+                       report_path      = COALESCE($7::text, report_path),
+                       subagent_error   = COALESCE($8::text, subagent_error),
+                       ended_at         = CASE
+                           WHEN $9::boolean THEN COALESCE(ended_at, CURRENT_TIMESTAMP)
+                           ELSE ended_at
+                       END,
+                       last_activity    = CURRENT_TIMESTAMP
+                 WHERE id = $1::uuid
+                   AND kind = 'subagent'
+                """,
+                thread_id,
+                status,
+                subagent_status,
+                outcome,
+                turns,
+                tokens,
+                report_path,
+                error,
+                bool(ended),
+            )
+        return result == "UPDATE 1"
+
+    async def get_subagent_thread_by_call(
+        self, parent_job_id: str, parent_tool_call_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """The child that answered one ``delegate_agent`` call of a job — the
+        rotation-surviving idempotency lookup (newest row when the same call
+        was re-run after a hard kill left an earlier one ``running``)."""
+        call_id = str(parent_tool_call_id or "").strip()
+        if not parent_job_id or not call_id:
+            return None
+        try:
+            # A non-uuid parent (a test host, a bare-metal job id) is "no
+            # row", never an asyncpg DataError out of the uuid bind.
+            uuid.UUID(str(parent_job_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                  FROM threads
+                 WHERE kind = 'subagent'
+                   AND parent_job_id = $1::uuid
+                   AND parent_tool_call_id = $2
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+                """,
+                str(parent_job_id),
+                call_id,
+            )
+        return self._row_to_dict(row)
+
     async def get_thread_messages_history(
         self,
         thread_id: str,

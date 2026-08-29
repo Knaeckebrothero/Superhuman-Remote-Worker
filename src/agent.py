@@ -4327,9 +4327,12 @@ class UniversalAgent:
         provider-admission fence (a drain ends every child at its next
         provider call without spend). The ``WorkerHost`` + ``SubagentRuntime``
         pair is built only when ``delegation.enabled`` (nothing else binds
-        ``delegate_agent``). Lazy import: ``src.subagents`` pulls
-        ``persistent_graph``. Non-fatal — the tool builds its own runtime on
-        first use if this failed.
+        ``delegate_agent``). The runtime's ledger is the DB one
+        (``DbSubagentLedger``: a ``threads`` row per child + its transcript,
+        WP3) when the context carries both the orchestrator client and the
+        agent-side pool, else the null ledger. Lazy import: ``src.subagents``
+        pulls ``persistent_graph``. Non-fatal — the tool builds its own
+        runtime on first use if this failed.
         """
         from .graph import _is_drain_requested
 
@@ -4342,6 +4345,8 @@ class UniversalAgent:
             return
         try:
             from src.subagents.host import WorkerHost
+            from src.subagents.ledger import NullLedger
+            from src.subagents.persistence import DbSubagentLedger
             from src.subagents.runtime import SubagentRuntime
 
             host = WorkerHost(
@@ -4355,12 +4360,17 @@ class UniversalAgent:
                 postgres=self.postgres_conn,
             )
             context._parent_host = host
-            context.subagent_runtime = SubagentRuntime.from_context(context, host)
+            ledger = DbSubagentLedger.from_context(context)
+            context.subagent_runtime = SubagentRuntime.from_context(
+                context, host, ledger=ledger if ledger is not None else NullLedger()
+            )
             logger.info(
-                "Subagent runtime installed for job %s: roster=%s max_concurrent=%s",
+                "Subagent runtime installed for job %s: roster=%s "
+                "max_concurrent=%s ledger=%s",
                 self._current_job_id,
                 context.subagent_runtime.roster_names,
                 context.subagent_runtime.max_concurrent,
+                "db" if ledger is not None else "null",
             )
         except Exception as e:
             logger.warning(f"Subagent runtime unavailable (non-fatal): {e}")

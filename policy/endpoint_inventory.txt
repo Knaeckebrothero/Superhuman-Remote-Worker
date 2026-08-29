@@ -86,6 +86,7 @@ GET    /api/admin/users                                                         
 POST   /api/admin/users/approve                                                         admin:_require_admin
 PATCH  /api/admin/users/{user_id}                                                       admin:_require_admin
 GET    /api/agents                                                                      admin:_require_admin
+POST   /api/agents/jobs/{job_id}/subagents                                              internal:require_internal
 POST   /api/agents/register                                                             internal:require_internal
 POST   /api/agents/threads                                                              internal:require_internal
 POST   /api/agents/threads/{thread_id}/abort-vm-upgrade                                 internal:require_internal
@@ -261,6 +262,7 @@ PUT    /api/jobs/{job_id}/snapshot/pin                                          
 GET    /api/jobs/{job_id}/sources/search                                                gated:require_job_access
 GET    /api/jobs/{job_id}/sources/{source_id}/annotations                               gated:require_job_access
 GET    /api/jobs/{job_id}/sources/{source_id}/tags                                      gated:require_job_access
+GET    /api/jobs/{job_id}/subagents                                                     gated:require_job_access
 POST   /api/jobs/{job_id}/subjob-merge                                                  internal:require_internal
 GET    /api/jobs/{job_id}/subjobs                                                       gated:require_job_access
 GET    /api/jobs/{job_id}/todos                                                         gated:require_job_access

@@ -595,6 +595,11 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
             return "SELECT 1"
         if normalized.startswith("UPDATE docker_workspace_leases"):
             return "UPDATE 0"
+        if normalized.startswith("UPDATE threads"):
+            # 0206 subagent children are ended before the jobs DELETE so the
+            # cascade never trips the pinned delete authority on a live child.
+            assert "kind = 'subagent'" in normalized
+            return "UPDATE 0"
         if normalized.startswith("DELETE FROM run_queue"):
             return "DELETE 1"
         if normalized.startswith("DELETE FROM jobs"):

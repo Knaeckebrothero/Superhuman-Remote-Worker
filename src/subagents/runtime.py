@@ -15,11 +15,12 @@ What the runtime owns, and the ``delegate_agent`` tool only calls:
   (B.5);
 - ``run_foreground(call)`` — build the child (``build_child``), run the
   driver on the brief, render the envelope, record through the
-  ``SubagentLedger`` (``NullLedger`` until WP3), remember the result;
+  ``SubagentLedger`` (the DB ledger in production, WP3), remember the result;
 - idempotent re-execution keyed by ``(parent_job_id, tool_call_id)``: a
-  repeated call (LangGraph re-running the tools node after a hard kill, once
-  WP3's DB ledger makes the record survive rotation) returns the stored
-  report without re-spending.
+  repeated call returns the stored report without re-spending — from the
+  in-memory record within one process life, and across a restart from the
+  ledger (``ledger.lookup``, WP3): a terminal ``threads`` row for the key is
+  re-rendered from its stored facts and the spilled report file.
 
 Nothing here assumes a worker: the parent is a :class:`ParentHost` and the
 graph-specific stamps live in ``graph.py`` (B.13).
@@ -39,10 +40,15 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from .budgets import ChildBudgets
 from .child import SharedWriterGuard, SpawnRefused, build_child
 from .driver import SubagentDriver, SubagentResult
-from .envelope import build_envelope, report_path
+from .envelope import build_envelope, build_replay_envelope, report_path
 from .fork import seed_fork_history
 from .host import ParentHost
-from .ledger import SUBAGENT_STATUSES, NullLedger, SubagentLedger
+from .ledger import (
+    SUBAGENT_STATUSES,
+    NullLedger,
+    SubagentLedger,
+    is_terminal_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +90,9 @@ class SubagentRecord:
     status: str
     envelope: str
     result: Optional[SubagentResult] = None
+    #: True when the envelope was re-rendered from the ledger's stored row
+    #: (a child that finished before a restart) — no driver ran here.
+    replayed: bool = False
 
 
 def _handle_base(subagent_type: str) -> str:
@@ -250,6 +259,9 @@ class SubagentRuntime:
             inflight = self._inflight.get(key)
             if inflight is not None:
                 return await asyncio.shield(inflight)
+            stored = await self._ledger_lookup(key)
+            if stored is not None:
+                return self._replay_from_ledger(key, call, stored)
 
         if call.run_in_background:
             return BACKGROUND_UNAVAILABLE
@@ -482,6 +494,73 @@ class SubagentRuntime:
             return bool(exists(report_path(handle)))
         except Exception:
             return False
+
+    async def _ledger_lookup(self, key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+        """A TERMINAL ledger row for ``key`` (a child that already ran for
+        this tool call before a restart), or ``None``. Bounded and non-fatal:
+        a ledger without ``lookup``, a timeout or an error all mean "spawn"."""
+        lookup = getattr(self.ledger, "lookup", None)
+        if not callable(lookup) or not key[0]:
+            return None
+        try:
+            row = await asyncio.wait_for(lookup(key[0], key[1]), _LEDGER_TIMEOUT_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("subagent ledger lookup failed (non-fatal): %s", exc)
+            return None
+        if not isinstance(row, Mapping):
+            return None
+        if not is_terminal_status(row.get("subagent_status")):
+            return None
+        return dict(row)
+
+    def _replay_from_ledger(
+        self, key: Tuple[str, str], call: SubagentCall, row: Dict[str, Any]
+    ) -> str:
+        """Re-render the envelope of a child the ledger says already ran for
+        ``key`` — the rotation-surviving half of idempotent re-execution. The
+        return budget is the roster entry's (the row's type, else the call's),
+        shared against the parent's CURRENT headroom like a fresh return."""
+        subagent_type = str(row.get("subagent_type") or call.subagent_type or "")
+        try:
+            name, entry = self.resolve_entry(subagent_type)
+            budget = ChildBudgets.from_entry(entry, name).return_budget_tokens
+        except SpawnRefused:
+            budget = ChildBudgets.defaults_for(
+                subagent_type or None
+            ).return_budget_tokens
+        envelope = build_replay_envelope(
+            row,
+            tool_call_id=key[1],
+            workspace_manager=getattr(self.parent_context, "workspace_manager", None),
+            entry_budget=budget,
+            probe=self.host.context_probe(),
+            n_in_batch=self._batch_size,
+            model=self._parent_model(),
+        )
+        handle = str(row.get("subagent_handle") or "subagent")
+        status = str(row.get("subagent_status") or "error")
+        self._handles.add(handle)
+        self._records[key] = SubagentRecord(
+            key=key,
+            handle=handle,
+            subagent_id=str(row.get("id") or ""),
+            subagent_type=subagent_type or "unknown",
+            status=status if status in SUBAGENT_STATUSES else "error",
+            envelope=envelope,
+            result=None,
+            replayed=True,
+        )
+        logger.info(
+            "subagent %s: replaying the stored report for tool call %s from the "
+            "ledger (%s, %s turns) — no child spawned",
+            handle,
+            key[1],
+            row.get("subagent_outcome") or status,
+            row.get("total_turns") or 0,
+        )
+        return envelope
 
     async def _ledger_open(self, subagent_id: str, **fields: Any) -> None:
         opener = getattr(self.ledger, "open", None)

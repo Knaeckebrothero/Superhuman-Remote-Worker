@@ -606,9 +606,11 @@ class TestListThreads:
 
         result = await db.list_threads()
         assert len(result) == 2
-        # SQL should have no WHERE clause
+        # No caller filter — only the always-on session gate (0206: subagent
+        # child rows share the table and must never reach the sessions page).
         sql = " ".join(conn.fetch.call_args[0][0].split())
-        assert "WHERE" not in sql
+        assert "WHERE kind = 'session' ORDER BY" in sql
+        assert conn.fetch.call_args[0][1:] == ()
         assert "ORDER BY created_at DESC" in sql
         assert "LIMIT 50" in sql
 

@@ -18948,6 +18948,17 @@ CREATE TABLE public.threads (
     runtime_attach_abort_receipt jsonb,
     main_cloud_backend_instance_id uuid,
     ssh_handle text,
+    kind text DEFAULT 'session'::text NOT NULL,
+    parent_job_id uuid,
+    parent_thread_id uuid,
+    parent_tool_call_id text,
+    subagent_handle text,
+    subagent_type text,
+    subagent_status text,
+    subagent_outcome text,
+    subagent_error text,
+    report_path text,
+    CONSTRAINT threads_kind_check CHECK ((kind = ANY (ARRAY['session'::text, 'subagent'::text]))),
     CONSTRAINT threads_runtime_retirement_external_cleanup_shape CHECK (((runtime_retirement_external_cleanup IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent = true) AND (jsonb_typeof(runtime_retirement_external_cleanup) = 'object'::text)))),
     CONSTRAINT threads_runtime_retirement_local_quiescence_shape CHECK (((runtime_retirement_local_quiescence IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_local_quiescence) = 'object'::text)))),
     CONSTRAINT threads_runtime_retirement_shape CHECK ((((runtime_retirement_token IS NULL) AND (runtime_retirement_permanent IS NULL) AND (runtime_retirement_started_at IS NULL) AND (runtime_retirement_authorized_at IS NULL) AND (runtime_retirement_context IS NULL)) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent IS NOT NULL) AND (runtime_retirement_started_at IS NOT NULL) AND (jsonb_typeof(runtime_retirement_context) = 'object'::text)))),
@@ -19075,6 +19086,76 @@ COMMENT ON COLUMN public.threads.runtime_attach_token IS 'Exact physical pinned-
 --
 
 COMMENT ON COLUMN public.threads.runtime_attach_abort_receipt IS 'Last exact pre-input attach-abort rotation receipt. Internal authority only; browser thread payloads must redact it.';
+
+
+--
+-- Name: COLUMN threads.kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.kind IS 'What this row is: ''session'' (an interactive thread, the default) or ''subagent'' (a child session a worker job or a session spawned through delegate_agent; U3). Session listings filter on kind so child rows never reach the sessions page; the subagent_* / parent_* columns are NULL for sessions.';
+
+
+--
+-- Name: COLUMN threads.parent_job_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.parent_job_id IS 'kind=subagent only: the worker job that spawned this child. ON DELETE CASCADE — a job takes its children with it (delete_job ends live children first, because the pinned delete authority only lets an ended, authority-free row go).';
+
+
+--
+-- Name: COLUMN threads.parent_thread_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.parent_thread_id IS 'kind=subagent only: the session thread that spawned this child (U5 session parents). NULL for a worker-job parent. ON DELETE CASCADE.';
+
+
+--
+-- Name: COLUMN threads.parent_tool_call_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.parent_tool_call_id IS 'kind=subagent only: the parent''s delegate_agent tool call this child answered. (parent_job_id, parent_tool_call_id) is the idempotency key: a parent re-running its tools node after a hard kill replays the stored report instead of spawning again.';
+
+
+--
+-- Name: COLUMN threads.subagent_handle; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_handle IS 'kind=subagent only: the short handle the parent sees (<type>-<4 hex>, e.g. implementer-7f3a) — unique per parent, not globally; the durable identity is the thread id.';
+
+
+--
+-- Name: COLUMN threads.subagent_type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_type IS 'kind=subagent only: the roster entry name the child ran as (explorer, implementer, reviewer, ...).';
+
+
+--
+-- Name: COLUMN threads.subagent_status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_status IS 'kind=subagent only: the bare lifecycle kind, written by the agent-side ledger. Open set by design — app-validated, no CHECK, so a new kind never needs a migration. Today: running | completed | parked | interrupted | capped | error | cancelled (src/subagents/ledger.py SUBAGENT_STATUSES). Anything other than running is terminal, and a terminal write also moves status to ended and stamps ended_at.';
+
+
+--
+-- Name: COLUMN threads.subagent_outcome; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_outcome IS 'kind=subagent only: the driver''s full classification behind subagent_status (capped:turns, interrupted:drain, interrupted:stale, cancelled:parent_deleted, ...). Free text; the cockpit shows it as the outcome badge detail.';
+
+
+--
+-- Name: COLUMN threads.subagent_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_error IS 'kind=subagent only: the error text of an error / cancelled child, NULL otherwise.';
+
+
+--
+-- Name: COLUMN threads.report_path; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.report_path IS 'kind=subagent only: workspace-relative path of the child''s full spilled report in the PARENT tree (.subagents/<handle>/report.md); NULL when the spill failed. The replay path re-renders the envelope from this file.';
 
 
 --
@@ -22841,6 +22922,13 @@ CREATE INDEX idx_threads_awaiting_user_since ON public.threads USING btree (awai
 
 
 --
+-- Name: idx_threads_parent_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_threads_parent_job ON public.threads USING btree (parent_job_id) WHERE (parent_job_id IS NOT NULL);
+
+
+--
 -- Name: idx_threads_project; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -26448,6 +26536,22 @@ ALTER TABLE ONLY public.threads
 
 ALTER TABLE ONLY public.threads
     ADD CONSTRAINT threads_main_cloud_backend_instance_fk FOREIGN KEY (main_cloud_backend_instance_id, main_cloud_backend) REFERENCES public.main_cloud_backend_instances(id, backend_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: threads threads_parent_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.threads
+    ADD CONSTRAINT threads_parent_job_id_fkey FOREIGN KEY (parent_job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: threads threads_parent_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.threads
+    ADD CONSTRAINT threads_parent_thread_id_fkey FOREIGN KEY (parent_thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --

@@ -4,7 +4,9 @@ Package layout:
 
 - ``host``     — ``ParentHost`` (what a child needs from its parent, B.13),
                  ``WorkerHost`` (the worker job's implementation)
-- ``ledger``   — ``SubagentLedger`` (durable child state; null impl here, DB in WP3)
+- ``ledger``   — ``SubagentLedger`` (durable child state; the null / recording impls)
+- ``persistence`` — ``DbSubagentLedger`` (a ``threads`` row of kind='subagent'
+                 + its ``thread_messages`` transcript, WP3)
 - ``budgets``  — ``ChildBudgets`` + the staleness watcher (B.4)
 - ``child``    — build the child from a resolved roster entry (B.2, B.8, B.9)
 - ``driver``   — ``SubagentDriver`` on ``run_persistent_loop`` (B.3)
@@ -32,7 +34,14 @@ from .driver import STOP, SubagentDriver, SubagentResult
 from .envelope import build_envelope, neutralise_control_markers, return_budget
 from .fork import seed_fork_history
 from .host import ContextProbe, ParentHost, SimpleParentHost, WorkerHost
-from .ledger import SUBAGENT_STATUSES, NullLedger, RecordingLedger, SubagentLedger
+from .ledger import (
+    SUBAGENT_STATUSES,
+    NullLedger,
+    RecordingLedger,
+    SubagentLedger,
+    is_terminal_status,
+)
+from .persistence import DbSubagentLedger
 from .runtime import (
     BACKGROUND_UNAVAILABLE,
     SubagentCall,
@@ -47,6 +56,7 @@ __all__ = [
     "ChildBudgets",
     "ChildBuild",
     "ContextProbe",
+    "DbSubagentLedger",
     "NullLedger",
     "ParentHost",
     "RecordingLedger",
@@ -64,6 +74,7 @@ __all__ = [
     "build_child",
     "build_child_config",
     "build_envelope",
+    "is_terminal_status",
     "neutralise_control_markers",
     "return_budget",
     "seed_fork_history",

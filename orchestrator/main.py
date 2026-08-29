@@ -35936,6 +35936,91 @@ async def get_job_subjobs(request: Request, job_id: str) -> dict[str, Any]:
     }
 
 
+def _subagent_thread_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """One ``threads`` row of ``kind='subagent'`` as the roster publishes it.
+
+    ``status`` is the child's lifecycle kind (``subagent_status``: running,
+    completed, parked, interrupted, capped, error, cancelled) — the value a
+    reader wants first; the thread's own ``active``/``ended`` rides along as
+    ``thread_status``. The spawn facts the agent stamped at creation
+    (isolation, write policy, the brief, the parent turn) come out of
+    ``metadata.subagent``; ``metadata`` itself never leaves (it is the
+    thread's internal envelope, redacted elsewhere for a reason).
+    """
+    metadata = row.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    spawn = metadata.get("subagent")
+    if not isinstance(spawn, dict):
+        spawn = {}
+    return {
+        "thread_id": str(row["id"]),
+        "handle": row.get("subagent_handle"),
+        "subagent_type": row.get("subagent_type"),
+        "status": row.get("subagent_status"),
+        "thread_status": row.get("status"),
+        "outcome": row.get("subagent_outcome"),
+        "error": row.get("subagent_error"),
+        "turns": int(row.get("total_turns") or 0),
+        "tokens": int(row.get("total_tokens") or 0),
+        "report_path": row.get("report_path"),
+        "parent_tool_call_id": row.get("parent_tool_call_id"),
+        "parent_thread_id": (
+            str(row["parent_thread_id"]) if row.get("parent_thread_id") else None
+        ),
+        "description": spawn.get("brief_description") or "",
+        "isolation": spawn.get("isolation"),
+        "write_policy": spawn.get("write_policy"),
+        "parent_iteration": spawn.get("parent_iteration"),
+        "fork": bool(spawn.get("fork", False)),
+        "started_at": row.get("created_at"),
+        "ended_at": row.get("ended_at"),
+        "last_activity": row.get("last_activity"),
+    }
+
+
+@app.get("/api/jobs/{job_id}/subagents")
+async def get_job_subagents(request: Request, job_id: str) -> dict[str, Any]:
+    """The subagent roster of one job — every child it delegated to, and
+    where each stands (U3 B.10).
+
+    The sibling of ``GET /api/jobs/{job_id}/subjobs`` for the in-process
+    children: a ``delegate_agent`` call runs a child session inside the
+    parent's pod, and the only durable trace is its ``threads`` row of
+    ``kind='subagent'`` (0206) plus the transcript in ``thread_messages``.
+    Those rows are deliberately kept off the sessions page (``list_threads``
+    filters on kind), so this is the one place a reader sees them — with
+    ``thread_id`` linking to ``/sessions/<thread_id>``, where the ordinary
+    thread endpoints render the transcript read-only.
+
+    Like the subjob roster it takes no filter parameters: the children of a
+    job are a property of the job, not of the view someone reads it through,
+    and terminal children are the ones that explain the parent's diff.
+
+    Authorization is the parent's (``require_job_access``): a child row
+    inherits the job's owner and project at creation, so seeing the job is
+    seeing its children — the same rule that lets the job owner open the
+    child's transcript through ``require_thread_owner``.
+    """
+    await require_job_access(request, postgres_db, job_id)
+
+    try:
+        rows = await postgres_db.list_subagent_threads(job_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return {
+        "job_id": job_id,
+        "count": len(rows),
+        "subagents": [_subagent_thread_payload(row) for row in rows],
+    }
+
+
 @app.get("/api/jobs/{job_id}/audit")
 async def get_job_audit(
     request: Request,
@@ -43109,6 +43194,72 @@ async def agent_create_thread(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+class AgentSubagentThreadCreateRequest(BaseModel):
+    """Body of ``POST /api/agents/jobs/{job_id}/subagents`` — what the agent-side
+    subagent ledger knows at spawn (``SubagentLedger.open``)."""
+
+    handle: str = Field(
+        ..., min_length=1, max_length=120, description="<type>-<4 hex> handle"
+    )
+    subagent_type: str = Field(
+        ..., min_length=1, max_length=120, description="Roster entry name"
+    )
+    # The agent's in-process subagent id becomes the row id, so the audit
+    # rows, the llm_requests rows and the thread share one identity.
+    subagent_id: UUID | None = None
+    parent_tool_call_id: str | None = Field(default=None, max_length=512)
+    parent_thread_id: UUID | None = None
+    isolation: str = Field(default="shared", max_length=32)
+    write_policy: str = Field(default="none", max_length=32)
+    brief_description: str = Field(default="", max_length=2000)
+    parent_iteration: int | None = None
+    fork: bool = False
+
+
+@app.post("/api/agents/jobs/{job_id}/subagents")
+async def agent_create_subagent_thread(
+    request: Request, job_id: str, body: AgentSubagentThreadCreateRequest
+) -> dict[str, Any]:
+    """Create the ``threads`` row of a subagent child of a job (U3 B.1).
+    **Internal** — requires ``X-Internal-Key``. Ingress strips this path.
+
+    The orchestrator owns thread creation: the row is derived from the JOB
+    (``user_id`` / ``project_id`` come from ``jobs``, never from the body),
+    which is what makes the child's transcript readable by the job owner
+    through the ordinary thread endpoints and keeps it off every other
+    user's sessions page. Nothing is provisioned — no repository, no
+    workspace, no pod: a child runs inside its parent's. Compare
+    ``POST /api/agents/threads``, which provisions a session.
+
+    Idempotent per ``subagent_id``: a retried create returns the same id.
+    404 when the job does not exist (the FK would refuse the row anyway).
+    """
+    await require_internal(request)
+    try:
+        thread_id = await postgres_db.create_subagent_thread(
+            parent_job_id=job_id,
+            thread_id=str(body.subagent_id) if body.subagent_id else None,
+            handle=body.handle,
+            subagent_type=body.subagent_type,
+            parent_tool_call_id=body.parent_tool_call_id,
+            parent_thread_id=(
+                str(body.parent_thread_id) if body.parent_thread_id else None
+            ),
+            isolation=body.isolation,
+            write_policy=body.write_policy,
+            brief_description=body.brief_description,
+            parent_iteration=body.parent_iteration,
+            fork=body.fork,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if thread_id is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    return {"thread_id": thread_id, "status": "created"}
 
 
 def _slugify_mount_name(name: str) -> str:

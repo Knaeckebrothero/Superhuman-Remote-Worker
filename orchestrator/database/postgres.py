@@ -4160,6 +4160,34 @@ class PostgresDB:
                             deleting_job["completion_outcome_kind"],
                         )
                     )
+                # Subagent children (0206) cascade with the job, but the
+                # cascade DELETE fires threads_pinned_delete_authority on each
+                # child row, and that fence only lets an ENDED, authority-free
+                # pinned row go. A child still 'active' — one running right
+                # now, or one a hard kill left behind before the U4 sweep —
+                # would abort the whole delete, after the workspace teardown
+                # already ran. End them here, in the same transaction, with
+                # the cancelled outcome the runtime would have recorded.
+                await conn.execute(
+                    """
+                    UPDATE threads
+                       SET status = 'ended',
+                           ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP),
+                           last_activity = CURRENT_TIMESTAMP,
+                           subagent_status = CASE
+                               WHEN subagent_status IS DISTINCT FROM 'running'
+                               THEN subagent_status
+                               ELSE 'cancelled'
+                           END,
+                           subagent_outcome = COALESCE(
+                               subagent_outcome, 'cancelled:parent_deleted'
+                           )
+                     WHERE kind = 'subagent'
+                       AND parent_job_id = $1
+                       AND status <> 'ended'
+                    """,
+                    uuid_val,
+                )
                 if prepared_stateless:
                     queue_result = await conn.execute(
                         "DELETE FROM run_queue "
@@ -29294,8 +29322,16 @@ class PostgresDB:
         project_id: str | None = None,
         status: str | None = None,
     ) -> List[Dict[str, Any]]:
-        """List threads with optional filters."""
-        conditions = []
+        """List SESSION threads with optional filters.
+
+        Always ``kind = 'session'``: a subagent's child row (0206, U3) is a
+        thread too — same table, same transcript columns — but it is the
+        job's, not the user's session, and it would otherwise land on every
+        owner's sessions page (the single caller, ``GET
+        /api/persistent/threads``). Child rows are listed per job through
+        :meth:`list_subagent_threads` instead.
+        """
+        conditions = ["kind = 'session'"]
         params = []
         idx = 1
 
@@ -29312,7 +29348,7 @@ class PostgresDB:
             params.append(status)
             idx += 1
 
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        where = f"WHERE {' AND '.join(conditions)}"
 
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -29320,6 +29356,178 @@ class PostgresDB:
                 *params,
             )
         return [dict(row) for row in rows]
+
+    # The columns every subagent read returns — the roster endpoint and the
+    # replay lookup share one shape so a cockpit row and a re-rendered
+    # envelope are built from the same facts.
+    _SUBAGENT_THREAD_COLUMNS = (
+        "id, kind, parent_job_id, parent_thread_id, parent_tool_call_id, "
+        "subagent_handle, subagent_type, subagent_status, subagent_outcome, "
+        "subagent_error, report_path, status, title, total_turns, total_tokens, "
+        "metadata, created_at, last_activity, ended_at"
+    )
+
+    async def create_subagent_thread(
+        self,
+        *,
+        parent_job_id: str,
+        handle: str,
+        subagent_type: str,
+        thread_id: str | None = None,
+        parent_tool_call_id: str | None = None,
+        parent_thread_id: str | None = None,
+        isolation: str = "shared",
+        write_policy: str = "none",
+        brief_description: str = "",
+        parent_iteration: int | None = None,
+        fork: bool = False,
+    ) -> str | None:
+        """Create the ``threads`` row of a subagent child (U3 B.1) and return
+        its id, or ``None`` when the parent job does not exist.
+
+        The row is derived from the JOB in one statement — ``user_id`` and
+        ``project_id`` come from ``jobs`` so ``require_thread_owner`` lets the
+        job owner read the child's transcript, and ``parent_job_id`` is the
+        job's own id so the 0206 foreign key holds by construction. Never
+        the session creation path (``create_thread`` provisions a workspace,
+        a repository and a pod; a child runs inside its parent's).
+
+        Identity: ``execution_lane='pinned'`` with ``agent_id`` NULL (the
+        0185 reciprocity fence never fires — no agents row claims the child),
+        ``permission_mode='autonomous'`` (the allowlist is the policy, B.9),
+        ``config_name`` NULL (the session config resolvers fall back to
+        ``session_base``; the roster type lives in ``subagent_type``), no ssh
+        handle (nothing addresses a child over SSH). ``status='active'``
+        with ``subagent_status='running'``; the agent-side ledger moves it to
+        ``ended`` with the terminal kind.
+
+        ``thread_id`` lets the agent pick the row id (its in-process
+        ``subagent_id``, so audit / llm_requests rows and the thread share one
+        id); a repeated create for the same id is idempotent and returns it.
+        """
+        try:
+            job_uuid = UUID(str(parent_job_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        try:
+            row_uuid = UUID(str(thread_id)) if thread_id else uuid4()
+        except (ValueError, TypeError, AttributeError):
+            return None
+        parent_thread_uuid: UUID | None = None
+        if parent_thread_id:
+            try:
+                parent_thread_uuid = UUID(str(parent_thread_id))
+            except (ValueError, TypeError, AttributeError):
+                return None
+        handle = str(handle or "").strip()
+        subagent_type = str(subagent_type or "").strip()
+        if not handle or not subagent_type:
+            raise ValueError("a subagent thread needs a handle and a type")
+        description = " ".join(str(brief_description or "").split())
+        title = f"{handle}: {description}" if description else f"subagent {handle}"
+        metadata = {
+            # Authoritative empty selection, like every created thread:
+            # inheritance must never mistake a child for a pre-materialized
+            # historical row.
+            "datasource_ids": [],
+            "subagent": {
+                "type": subagent_type,
+                "handle": handle,
+                "isolation": str(isolation or "shared"),
+                "write_policy": str(write_policy or "none"),
+                "brief_description": description,
+                "parent_iteration": parent_iteration,
+                "fork": bool(fork),
+            },
+        }
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO threads (
+                    id, kind, user_id, project_id, title, status,
+                    permission_mode, narration_mode, execution_lane, metadata,
+                    parent_job_id, parent_thread_id, parent_tool_call_id,
+                    subagent_handle, subagent_type, subagent_status
+                )
+                SELECT $1, 'subagent', j.user_id, j.project_id, $3, 'active',
+                       'autonomous', 'silent', 'pinned', $4::jsonb,
+                       j.id, $5, $6, $7, $8, 'running'
+                  FROM jobs j
+                 WHERE j.id = $2
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+                """,
+                row_uuid,
+                job_uuid,
+                title[:200],
+                json.dumps(metadata),
+                parent_thread_uuid,
+                parent_tool_call_id,
+                handle,
+                subagent_type,
+            )
+            if row is not None:
+                return str(row["id"])
+            # No row back: either the job is gone, or this exact id already
+            # exists (a retried create) — only the latter is a success.
+            existing = await conn.fetchval(
+                "SELECT id FROM threads WHERE id = $1 AND kind = 'subagent'",
+                row_uuid,
+            )
+        return str(existing) if existing else None
+
+    async def list_subagent_threads(self, parent_job_id: str) -> List[Dict[str, Any]]:
+        """Every subagent child of one job, in spawn order (U3 B.10).
+
+        The subagent sibling of :meth:`get_job_subjob_roster`: a property of
+        the job, independent of any caller-side filter. Terminal children
+        included — a finished implementer is what explains the parent's
+        diff. Empty for a job without children or an unknown id.
+        """
+        try:
+            job_uuid = UUID(str(parent_job_id))
+        except (ValueError, TypeError, AttributeError):
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                  FROM threads
+                 WHERE kind = 'subagent' AND parent_job_id = $1
+                 ORDER BY created_at, id
+                """,
+                job_uuid,
+            )
+        return [dict(row) for row in rows]
+
+    async def get_subagent_thread_by_call(
+        self, parent_job_id: str, parent_tool_call_id: str
+    ) -> Dict[str, Any] | None:
+        """The child that answered one ``delegate_agent`` call of a job — the
+        rotation-surviving idempotency lookup (newest row when the same call
+        was re-run after a hard kill left an earlier one ``running``)."""
+        try:
+            job_uuid = UUID(str(parent_job_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        call_id = str(parent_tool_call_id or "").strip()
+        if not call_id:
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {self._SUBAGENT_THREAD_COLUMNS}
+                  FROM threads
+                 WHERE kind = 'subagent'
+                   AND parent_job_id = $1
+                   AND parent_tool_call_id = $2
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+                """,
+                job_uuid,
+                call_id,
+            )
+        return dict(row) if row else None
 
     async def list_threads_needing_workspace(self) -> List[Dict[str, Any]]:
         """Active sessions whose workspace_container entry exists but is not ready or

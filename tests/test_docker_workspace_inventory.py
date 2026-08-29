@@ -330,6 +330,9 @@ class _InventoryConnection:
             # a session wake, but permanent thread deletion still issues the
             # production atomic wake-retirement statement.
             return "UPDATE 0"
+        if sql.startswith("UPDATE threads") and "kind = 'subagent'" in sql:
+            # 0206: delete_job ends subagent children before the jobs DELETE.
+            return "UPDATE 0"
         if sql.startswith("UPDATE threads") and "workspace_container" in sql:
             if self.fail_owner_update_once:
                 self.fail_owner_update_once = False

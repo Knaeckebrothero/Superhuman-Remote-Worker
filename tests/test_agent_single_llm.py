@@ -370,6 +370,31 @@ class TestSubagentHostWiring:
         assert host.fork_source() == messages
         assert host.fork_source() is not messages  # a copy, never the live list
 
+    def test_the_ledger_is_the_db_one_when_the_context_carries_both_halves(self):
+        """WP3: durable child rows need the orchestrator client (row creation)
+        and the agent-side pool (transcript + lifecycle); with either missing
+        the runtime keeps the null ledger and a child leaves no trace."""
+        from src.subagents import DbSubagentLedger, NullLedger
+
+        ctx = _delegating_context()
+        _install(ctx)
+        assert isinstance(ctx.subagent_runtime.ledger, NullLedger)
+
+        client, pool = object(), object()
+        wired = _delegating_context()
+        wired.orchestrator_client = client
+        wired.postgres_db = pool
+        _install(wired)
+        ledger = wired.subagent_runtime.ledger
+        assert isinstance(ledger, DbSubagentLedger)
+        assert ledger.client is client and ledger.postgres is pool
+        assert ledger.parent_context is wired
+
+        half = _delegating_context()
+        half.orchestrator_client = client
+        _install(half)
+        assert isinstance(half.subagent_runtime.ledger, NullLedger)
+
     def test_disabled_delegation_installs_no_runtime_but_still_the_stashes(self):
         ctx = _delegating_context(delegation={"enabled": False})
         agent = _install(ctx)

@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from .host import ContextProbe
 
@@ -259,14 +259,98 @@ def build_envelope(
     return "\n".join(lines)
 
 
+REPLAY_UNAVAILABLE = (
+    "(report unavailable after restart: this child already ran for this tool "
+    "call before the agent restarted, but its full report was not found at "
+    "{path}. The header above is the stored outcome. Re-issue the brief in a "
+    "NEW delegate_agent call if you need the content.)"
+)
+
+
+def _seconds_between(start: Any, end: Any) -> float:
+    try:
+        return max(0.0, float((end - start).total_seconds()))
+    except Exception:
+        return 0.0
+
+
+def build_replay_envelope(
+    row: Mapping[str, Any],
+    *,
+    tool_call_id: str,
+    workspace_manager: Any,
+    entry_budget: int,
+    probe: Optional[ContextProbe] = None,
+    n_in_batch: int = 1,
+    model: Optional[str] = None,
+) -> str:
+    """The envelope of a child that already ran, re-rendered from its ledger
+    row (WP3): the parent re-ran its tools node after a hard kill and the
+    stored report stands in for a new child — nothing is spent.
+
+    The header comes from the row (``subagent_outcome`` over
+    ``subagent_status``, the counters, ``ended_at - created_at``); the body
+    is the spilled ``report_path`` file read back from the parent tree and
+    trimmed to the CURRENT budget (the parent's headroom now, not at the
+    original return). A missing spill yields the short
+    :data:`REPLAY_UNAVAILABLE` body instead of a silently empty report.
+    """
+    handle = str(row.get("subagent_handle") or "subagent")
+    subagent_type = str(row.get("subagent_type") or "unknown")
+    status = str(row.get("subagent_outcome") or row.get("subagent_status") or "?")
+    turns = int(row.get("total_turns") or 0)
+    tokens = int(row.get("total_tokens") or 0)
+    duration = _seconds_between(row.get("created_at"), row.get("ended_at"))
+    path = str(row.get("report_path") or report_path(handle))
+
+    text: Optional[str] = None
+    if workspace_manager is not None and row.get("report_path"):
+        try:
+            if workspace_manager.exists(path):
+                text = workspace_manager.read_file(path)
+        except Exception as e:
+            logger.warning(
+                "subagent %s: stored report %s unreadable on replay: %s",
+                handle,
+                path,
+                e,
+            )
+            text = None
+
+    lines = [render_header(handle, subagent_type, status, turns, tokens, duration)]
+    if text is not None and text.strip():
+        body = neutralise_control_markers(text)
+        budget = return_budget(entry_budget, probe, n_in_batch)
+        trimmed, elided = trim_head_tail(body, budget, handle=handle, model=model)
+        lines.append(wrap_report(handle, trimmed))
+        note = (
+            "read_file it for the elided part"
+            if elided
+            else "read_file it if you need it"
+        )
+        lines.append(f"Full report: {path} ({note}).")
+    else:
+        lines.append(wrap_report(handle, REPLAY_UNAVAILABLE.format(path=path)))
+    lines.append(
+        f"Replayed: this child already ran for tool call {tool_call_id} before "
+        "a restart; no new child was spawned and nothing was spent."
+    )
+    error = row.get("subagent_error")
+    if error:
+        lines.append(f"Error: {error}")
+    return "\n".join(lines)
+
+
 __all__ = [
     "EVIDENCE_NOTE",
     "HEADROOM_SHARE",
     "HEAD_FRACTION",
     "MIN_RETURN_TOKENS",
+    "REPLAY_UNAVAILABLE",
     "REPORT_DIR",
     "REPORT_NAME",
     "build_envelope",
+    "build_replay_envelope",
     "count_tokens",
     "neutralise_control_markers",
     "render_header",

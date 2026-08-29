@@ -676,6 +676,68 @@ class OrchestratorClient:
             logger.error(f"Failed to create thread: {e}")
             return None
 
+    async def create_subagent_thread(
+        self,
+        job_id: str,
+        *,
+        handle: str,
+        subagent_type: str,
+        subagent_id: Optional[str] = None,
+        parent_tool_call_id: Optional[str] = None,
+        parent_thread_id: Optional[str] = None,
+        isolation: str = "shared",
+        write_policy: str = "none",
+        brief_description: str = "",
+        parent_iteration: Optional[int] = None,
+        fork: bool = False,
+    ) -> Optional[str]:
+        """Create the ``threads`` row of a subagent child of ``job_id`` (U3 B.1).
+
+        ``POST /api/agents/jobs/{job_id}/subagents`` — internal (X-Internal-Key),
+        never the session creation route: the orchestrator derives the row's
+        owner and project from the job and provisions nothing. ``subagent_id``
+        becomes the row id when given, so the child's audit rows and its
+        thread share one identity. Returns the thread id, or ``None`` on any
+        failure (the ledger then keeps no durable state for that child).
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/agents/jobs/{job_id}/subagents"
+        payload: dict[str, Any] = {
+            "handle": handle,
+            "subagent_type": subagent_type,
+            "subagent_id": subagent_id,
+            "parent_tool_call_id": parent_tool_call_id,
+            "parent_thread_id": parent_thread_id,
+            "isolation": isolation,
+            "write_policy": write_policy,
+            "brief_description": brief_description,
+            "parent_iteration": parent_iteration,
+            "fork": bool(fork),
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+            if response.status_code == 200:
+                thread_id = response.json().get("thread_id")
+                logger.info(
+                    "Created subagent thread %s for job %s (%s)",
+                    thread_id,
+                    job_id,
+                    handle,
+                )
+                return str(thread_id) if thread_id else None
+            logger.error(
+                "Failed to create subagent thread for job %s: %s - %s",
+                job_id,
+                response.status_code,
+                response.text,
+            )
+            return None
+        except Exception as e:
+            logger.error(f"Failed to create subagent thread for job {job_id}: {e}")
+            return None
+
     async def save_thread_message(
         self,
         thread_id: str,

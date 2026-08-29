@@ -312,7 +312,19 @@ APP_SSH_ATTACHMENTS = (
 APP_EXPERTS_ROLE_TAGS_BACKFILL = (
     ROOT / "orchestrator/database/migrations/app/0205_experts_role_tags_backfill.sql"
 )
-APP_CURRENT_MIGRATION_HEAD = APP_EXPERTS_ROLE_TAGS_BACKFILL
+# U3 subagents (WP3): the threads kind / parent / subagent columns, their
+# partial parent-job index and the validation of the NOT VALID constraints —
+# the head after the 0205 role-tag backfill; bump when the next lands.
+APP_THREADS_SUBAGENT_KIND = (
+    ROOT / "orchestrator/database/migrations/app/0206_threads_subagent_kind.sql"
+)
+APP_THREADS_PARENT_JOB_IDX = (
+    ROOT / "orchestrator/database/migrations/app/0207_threads_parent_job_idx.notx.sql"
+)
+APP_THREADS_SUBAGENT_VALIDATE = (
+    ROOT / "orchestrator/database/migrations/app/0208_threads_subagent_validate.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = APP_THREADS_SUBAGENT_VALIDATE
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
