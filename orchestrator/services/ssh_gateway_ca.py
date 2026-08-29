@@ -57,6 +57,13 @@ from __future__ import annotations
 import time
 
 import asyncssh
+
+# Not exported from asyncssh's top level: `__all__` carries only the base
+# SSHCertificate, which does NOT define validate()/principals/options. This
+# submodule path is therefore the only way to annotate what mint() really
+# returns; tests/test_ssh_gateway_ca.py already imports CERT_TYPE_USER from
+# the same place. If a future asyncssh relocates it, this fails loudly at
+# import rather than silently.
 from asyncssh.public_key import SSHOpenSSHCertificate
 
 DEFAULT_CERT_LIFETIME_SECONDS = 300
@@ -107,12 +114,17 @@ class SshUserCa:
         """A fresh keypair and a certificate over it, valid for one attachment.
 
         ``valid_after`` is backdated by ``CERT_BACKDATE_SECONDS`` (see that
-        constant's docstring). ``lifetime_seconds`` is capped at
-        ``MAX_CERT_LIFETIME_SECONDS``: small/degenerate values already fail
-        closed (asyncssh rejects ``valid_before <= valid_after``), but
-        nothing bounds the top end, so a future caller wiring this to config
-        or an env var could otherwise mint a certificate lasting years from
-        a single typo.
+        constant's docstring). ``lifetime_seconds`` is bounded on BOTH ends,
+        explicitly, rather than leaning on asyncssh to reject the degenerate
+        cases. It does not reject all of them: for a lifetime in
+        ``(-CERT_BACKDATE_SECONDS, 0]`` the backdating still leaves
+        ``valid_before > valid_after``, so asyncssh happily mints a
+        certificate that is already past its own ``valid_before`` by the time
+        the call returns -- unusable, but only discovered downstream at
+        ``validate()``. Only a lifetime at or below
+        ``-CERT_BACKDATE_SECONDS`` trips asyncssh's own guard. The top end has
+        no guard at all, so a future caller wiring this to config or an env
+        var could otherwise mint a certificate lasting years from one typo.
 
         ``permit_pty`` and ``permit_port_forwarding`` are granted -- an
         interactive shell needs the former, ``direct-tcpip`` needs the
@@ -127,6 +139,11 @@ class SshUserCa:
         """
         if not principal:
             raise ValueError("a certificate principal is required")
+        if lifetime_seconds <= 0:
+            raise ValueError(
+                f"lifetime_seconds={lifetime_seconds} must be positive; "
+                "a non-positive lifetime mints an already-expired certificate"
+            )
         if lifetime_seconds > MAX_CERT_LIFETIME_SECONDS:
             raise ValueError(
                 f"lifetime_seconds={lifetime_seconds} exceeds "

@@ -158,3 +158,15 @@ def test_rejects_a_non_ed25519_ca(tmp_path):
     message = str(exc_info.value)
     assert "ed25519" in message.lower()
     assert "ssh-rsa" in message
+
+
+@pytest.mark.parametrize("bad", [0, -1, -60, -1000])
+def test_mint_refuses_a_non_positive_lifetime(ca_pem, bad):
+    """asyncssh only rejects part of this range on its own: with the 60s
+    backdate, a lifetime in (-CERT_BACKDATE_SECONDS, 0] still leaves
+    valid_before > valid_after, so it mints a certificate that is already past
+    its own valid_before — unusable, but not discovered until validate().
+    Bound it here instead, so the failure names the real cause."""
+    ca = SshUserCa(ca_pem)
+    with pytest.raises(ValueError, match="must be positive"):
+        ca.mint("agent-host", lifetime_seconds=bad)
