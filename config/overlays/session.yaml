@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=../schema.json
+# Session role overlay — what an interactive/persistent expert adds to
+# config/expert_base.yaml. Public name: `session_base` (`$extends: session_base`
+# and `--config session_base` both land here); `persistent_default(s)` are
+# legacy aliases of the same name.
+#
+# Sessions have no phase loop, so none of the worker's instruction_files /
+# phase_settings / delegation / autonomy / verification / scholar / curator /
+# communication keys exist here — a session expert simply never sees them.
+# This overlay carries only the session values of shared keys (workspace
+# layout, the canvas grant and the session-only application groups, memory
+# budgets and writers). Anything shared by every role goes in expert_base.yaml.
+#
+# This overlay declares no `$ignore_keys`: a worker expert re-rooted onto the
+# session role keeps every key it authored (expert wins); the session runtime
+# ignores the worker-only ones by never reading them.
+$extends: expert_base
+
+agent_id: session_base
+display_name: Framework Session Base
+
+workspace:
+  structure:
+    - documents/
+    - notes/
+    - output/
+
+tools:
+  # Descriptor-backed job groups are opt-in. Their current safe category-level
+  # defaults preserve the pre-unification Fleet Management subset; S5 policy
+  # expansion remains pending.
+  job_control: [ ]
+  job_inspection: [ ]
+  # File-backed Dynamic Canvas presentation (persistent sessions only)
+  canvas:
+    - get_canvas
+    - set_canvas
+    - clear_canvas
+  # Catalogue-authoring WRITES (expert/skill/automation bundle get+set). Declared
+  # here so `session_tool_group_enablement` sees an explicit [] rather than an
+  # absent key, which it reads as enabled. Turning it on also needs the
+  # `catalog_authoring` capability grant, so the base default and the grant agree.
+  catalog_authoring: [ ]
+  # Phase-specific tools not used in persistent mode
+  core: [ ]
+  # Not used in persistent mode
+  communication: [ ]
+
+memory:
+  budget_tokens: 10000
+  max_memories_per_injection: 150
+  # Persistent mode has its own writer set: the elapsed-gate interval
+  # extractor and the session_end/idle_archive teardown extractor (no
+  # assembler, no phases).
+  pipeline:
+    writers:
+      - persistent_interval_extractor  # In-loop observer (elapsed gate)
+      - pre_compaction_extractor       # Chunked extraction of the evicted slice before compaction
+      - teardown_extractor             # Final extraction on session end / idle archive

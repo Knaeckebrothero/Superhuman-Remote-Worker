@@ -109,7 +109,7 @@ tools:
   sql: []
   # Citations: a research agent must back every factual claim with a source.
   # the research-guide skill (tactical phase) instructs cite_web / cite_document,
-  # so the tools must exist. Mirrors worker_base.yaml's citation suite.
+  # so the tools must exist. Mirrors expert_base.yaml's citation suite.
   citation:
     - cite_document
     - cite_web

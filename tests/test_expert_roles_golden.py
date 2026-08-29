@@ -1,0 +1,483 @@
+"""Golden contract for the U1 root split (universal experts, WP2).
+
+Before WP2 every expert extended one of two self-contained bases,
+``config/worker_base.yaml`` or ``config/session_base.yaml``. WP2 split them
+into ONE shared root (``config/expert_base.yaml``) plus a role overlay each
+(``config/overlays/{worker,session,subagent}.yaml``), kept the public names as
+aliases of the overlays, and taught the loader to re-root any chain onto a
+requested role. The contract this file pins:
+
+1. **Neutrality.** For every bundled expert, in the role it was authored for,
+   the merged dict AND the effective (matrix-applied, serialized) config are
+   identical to what the pre-split base produced. The pre-split bases are
+   frozen under ``tests/fixtures/pre_split/`` (verbatim copies of commit
+   ``a8950251``) and resolved through the real loader by pointing a copy of
+   each leaf's ``$extends`` at the fixture — so the comparison exercises the
+   same code path, not a re-implementation.
+2. **Universality.** Every bundled expert resolves in every role; the
+   subagent overlay's ``$ignore_keys`` are honoured (pruned, never errors); a
+   session expert re-rooted as a worker gains the worker keys and vice versa.
+3. **Aliases.** ``worker_base`` / ``session_base`` (and the legacy
+   ``default(s)`` / ``persistent_default(s)``) stay valid names and path
+   forms, canonicalise to the PUBLIC names, and resolve to the overlay files.
+
+If neutrality fails, the split leaked a value — fix the YAML, never the
+fixture. The fixtures only change when a new pre-split baseline is
+deliberately frozen.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+from src.core.loader import (
+    EXPERT_BASE,
+    IGNORE_KEYS_DIRECTIVE,
+    ROLE_ROOTS,
+    ROOT_NAMES,
+    authored_llm_keys,
+    canonical_config_name,
+    chain_root,
+    deep_merge,
+    load_agent_config,
+    load_agent_config_from_dict,
+    load_and_merge_config,
+    load_role_base,
+    prune_ignored_keys,
+    reroot_extends,
+    resolve_config_path,
+    role_of_root,
+    serialize_resolved_config,
+)
+
+_REPO = Path(__file__).resolve().parents[1]
+_CONFIG = _REPO / "config"
+_FIXTURES = Path(__file__).parent / "fixtures" / "pre_split"
+#: role -> the frozen pre-split base for that role.
+_PRE_SPLIT = {
+    "worker": _FIXTURES / "worker_base.a8950251.yaml",
+    "session": _FIXTURES / "session_base.a8950251.yaml",
+}
+#: The keys the design note names as parent-only (§1.1) — the subagent overlay
+#: must ignore at least these; it may ignore more.
+_NOTE_IGNORED = {
+    "workspace.backend",
+    "autonomy",
+    "verification",
+    "phase_settings",
+    "delegation",
+    "communication",
+    "scholar",
+    "curator",
+}
+
+
+def _bundled_configs() -> list[tuple[str, Path, str | None]]:
+    """``(name, leaf path, deployment_dir)`` for every bundled expert and the
+    standalone ``interactive`` session profile — discovered, so a new expert is
+    covered on arrival."""
+    out = [
+        (p.parent.name, p, str(p.parent))
+        for p in sorted(_CONFIG.glob("experts/*/config.yaml"))
+        if p.parent.name != "__pycache__"
+    ]
+    out.append(("interactive", _CONFIG / "interactive.yaml", None))
+    return out
+
+
+_BUNDLED = _bundled_configs()
+_IDS = [name for name, _, _ in _BUNDLED]
+
+
+def _native_role(leaf: Path) -> str:
+    root = chain_root(str(leaf))
+    role = role_of_root(root)
+    assert role in _PRE_SPLIT, f"{leaf} is rooted on {root!r}, not a pre-split role"
+    return role
+
+
+def _dotted_present(data: dict, dotted: str) -> bool:
+    node = data
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def _effective(config_path: str, deployment_dir: str | None) -> dict:
+    """The deterministic part of the frozen blob for a config loaded from disk."""
+    cfg = load_agent_config(config_path, deployment_dir)
+    blob = serialize_resolved_config(cfg, model=cfg.llm.model)
+    return {k: blob[k] for k in ("agent", "prompts", "instructions")}
+
+
+@pytest.fixture(scope="module")
+def pre_split_leaves(tmp_path_factory) -> dict[str, tuple[Path, str | None, str]]:
+    """A copy of every bundled leaf whose ``$extends`` points at the frozen
+    pre-split base of its role: ``name -> (tmp leaf, deployment_dir, role)``."""
+    tmp = tmp_path_factory.mktemp("pre_split_leaves")
+    out = {}
+    for name, leaf, deployment_dir in _BUNDLED:
+        role = _native_role(leaf)
+        raw = yaml.safe_load(leaf.read_text(encoding="utf-8"))
+        raw["$extends"] = str(_PRE_SPLIT[role].resolve())
+        copy = tmp / f"{name}.yaml"
+        copy.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        out[name] = (copy, deployment_dir, role)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The frozen baseline itself
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
+def test_pre_split_fixture_is_the_a8950251_base(role):
+    """Guard the guard: the fixture must still be the self-contained base it
+    was frozen as (the alias machinery must not have been pointed at it)."""
+    fixture = _PRE_SPLIT[role]
+    assert fixture.is_file()
+    assert canonical_config_name(str(fixture)) == str(fixture)
+    raw = yaml.safe_load(fixture.read_text(encoding="utf-8"))
+    assert raw["agent_id"] == ROLE_ROOTS[role]
+    assert "$extends" not in raw
+
+
+# ---------------------------------------------------------------------------
+# 1. Neutrality
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
+def test_role_base_merged_dict_is_identical_to_the_pre_split_base(role):
+    pre = load_and_merge_config(str(_PRE_SPLIT[role]))
+    post = load_role_base(role)
+    assert post == pre
+    assert json.dumps(post, sort_keys=True) == json.dumps(pre, sort_keys=True)
+    # and by public name / re-rooting, the same dict again
+    root_path, _ = resolve_config_path(ROLE_ROOTS[role])
+    assert load_and_merge_config(root_path) == pre
+    assert load_and_merge_config(root_path, role=role) == pre
+
+
+@pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
+def test_role_base_effective_config_is_identical_to_the_pre_split_base(role):
+    """``agent.py --config worker_base|session_base`` boots on the same
+    effective config as before: matrix applied with the same explicit keys,
+    same prompts, same instructions."""
+    root_path, deployment_dir = resolve_config_path(ROLE_ROOTS[role])
+    assert _effective(root_path, deployment_dir) == _effective(
+        str(_PRE_SPLIT[role]), None
+    )
+
+
+@pytest.mark.parametrize("role", sorted(_PRE_SPLIT))
+def test_authored_llm_keys_of_a_root_match_the_pre_split_base(role):
+    """The settings matrix must skip exactly the llm keys the framework base
+    authored — now split over overlay + expert_base, so the union counts."""
+    root_path, _ = resolve_config_path(ROLE_ROOTS[role])
+    raw = yaml.safe_load(_PRE_SPLIT[role].read_text(encoding="utf-8"))
+    assert authored_llm_keys(root_path) == set(raw["llm"])
+    assert authored_llm_keys(str(_PRE_SPLIT[role])) == set(raw["llm"])
+
+
+@pytest.mark.parametrize("name", _IDS)
+def test_bundled_expert_merged_dict_is_identical(name, pre_split_leaves):
+    tmp_leaf, _, role = pre_split_leaves[name]
+    leaf = next(p for n, p, _ in _BUNDLED if n == name)
+    pre = load_and_merge_config(str(tmp_leaf))
+    post = load_and_merge_config(str(leaf))
+    post_role = load_and_merge_config(str(leaf), role=role)
+    assert post == pre, name
+    assert post_role == pre, name
+    assert json.dumps(post, sort_keys=True) == json.dumps(pre, sort_keys=True)
+
+
+@pytest.mark.parametrize("name", _IDS)
+def test_bundled_expert_effective_config_is_identical(name, pre_split_leaves):
+    tmp_leaf, deployment_dir, _ = pre_split_leaves[name]
+    leaf = next(p for n, p, _ in _BUNDLED if n == name)
+    assert _effective(str(leaf), deployment_dir) == _effective(
+        str(tmp_leaf), deployment_dir
+    ), name
+
+
+# ---------------------------------------------------------------------------
+# 2. Universality
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def subagent_ignored() -> list[str]:
+    raw = yaml.safe_load((_CONFIG / "overlays" / "subagent.yaml").read_text())
+    declared = raw[IGNORE_KEYS_DIRECTIVE]
+    assert _NOTE_IGNORED <= set(declared), "the note's parent-only keys are the floor"
+    return declared
+
+
+@pytest.mark.parametrize("name", _IDS)
+def test_every_bundled_expert_resolves_in_the_subagent_role(name, subagent_ignored):
+    leaf, deployment_dir = next((p, d) for n, p, d in _BUNDLED if n == name)
+    data = load_and_merge_config(str(leaf), role="subagent")
+    assert data["agent_id"] == yaml.safe_load(leaf.read_text())["agent_id"]
+    assert data[IGNORE_KEYS_DIRECTIVE] == subagent_ignored
+    for dotted in subagent_ignored:
+        assert not _dotted_present(data, dotted), f"{name}: {dotted} survived"
+    assert data["tools"] and data["llm"]["model"]
+    # The subagent overlay's own values sit under the expert
+    assert data["interactive"]["permission_mode"] in {"autonomous", "supervised"}
+    # and the whole thing parses — with the matrix applied — like any config.
+    cfg = load_agent_config(str(leaf), deployment_dir, role="subagent")
+    assert cfg.agent_id == data["agent_id"]
+    assert IGNORE_KEYS_DIRECTIVE not in cfg.extra
+    blob = serialize_resolved_config(cfg, model=cfg.llm.model)
+    assert IGNORE_KEYS_DIRECTIVE not in blob["agent"]
+
+
+def test_subagent_role_keeps_the_experts_tools_and_drops_the_parent_only_keys():
+    """``$ref: critic`` semantics: the critic's tools survive, its
+    workspace.backend / verification / autonomy do not (D4)."""
+    critic = _CONFIG / "experts" / "critic" / "config.yaml"
+    own = yaml.safe_load(critic.read_text())
+    data = load_and_merge_config(str(critic), role="subagent")
+    assert data["tools"]["shell"] == own["tools"]["shell"]
+    assert "backend" not in data["workspace"]
+    assert data["workspace"]["max_read_words"] == 25000  # per-agent cap kept
+    for key in ("verification", "autonomy", "delegation", "phase_settings"):
+        assert key not in data
+    assert data["memory"]["enabled"] is False
+    assert all(t["enabled"] is False for t in data["auxiliary"]["tasks"].values())
+
+
+def test_session_expert_as_worker_carries_the_worker_keys():
+    assistant = _CONFIG / "experts" / "assistant" / "config.yaml"
+    assert _native_role(assistant) == "session"
+    data = load_and_merge_config(str(assistant), role="worker")
+    worker = load_role_base("worker")
+    assert data["agent_id"] == "assistant"
+    assert data["phase_settings"] == worker["phase_settings"]
+    assert data["autonomy"] == worker["autonomy"]
+    assert data["tools"]["core"] == worker["tools"]["core"]
+    assert data["llm"]["max_retries"] == 0
+    assert (
+        data["memory"]["pipeline"]["writers"] == worker["memory"]["pipeline"]["writers"]
+    )
+
+
+def test_worker_expert_as_session_uses_the_session_overlay_and_drops_nothing():
+    developer = _CONFIG / "experts" / "developer" / "config.yaml"
+    assert _native_role(developer) == "worker"
+    own = yaml.safe_load(developer.read_text())
+    data = load_and_merge_config(str(developer), role="session")
+    session = load_role_base("session")
+    assert data["agent_id"] == "developer"
+    assert data["llm"]["max_retries"] == 3
+    assert data["tools"]["canvas"] == session["tools"]["canvas"]
+    assert (
+        data["memory"]["pipeline"]["writers"]
+        == session["memory"]["pipeline"]["writers"]
+    )
+    # Expert wins: everything the developer authored is still there, including
+    # keys the session runtime never reads.
+    assert data["tools"]["shell"] == own["tools"]["shell"]
+    assert data["delegation"]["enabled"] == own["delegation"]["enabled"]
+    assert IGNORE_KEYS_DIRECTIVE not in data
+
+
+@pytest.mark.parametrize("role", sorted(ROLE_ROOTS))
+def test_loading_any_root_with_a_role_yields_that_roles_base(role):
+    """The roots are one thing in different roles: naming one root with
+    another role's re-rooting gives the requested role's base."""
+    for root_name in ROOT_NAMES:
+        root_path, _ = resolve_config_path(root_name)
+        assert load_and_merge_config(root_path, role=role) == load_role_base(role)
+
+
+# ---------------------------------------------------------------------------
+# 3. Aliases and public names
+# ---------------------------------------------------------------------------
+
+
+def test_public_names_canonicalise_to_themselves_and_resolve_to_the_overlays():
+    for alias, public in (
+        ("default", "worker_base"),
+        ("defaults", "worker_base"),
+        ("worker_base", "worker_base"),
+        ("overlays/worker", "worker_base"),
+        ("persistent_default", "session_base"),
+        ("persistent_defaults", "session_base"),
+        ("session_base", "session_base"),
+        ("overlays/session", "session_base"),
+        ("subagent_base", "subagent_base"),
+        ("overlays/subagent", "subagent_base"),
+        ("expert_base", "expert_base"),
+    ):
+        assert canonical_config_name(alias) == public, alias
+    assert resolve_config_path("worker_base")[0].endswith("config/overlays/worker.yaml")
+    assert resolve_config_path("default")[0] == resolve_config_path("worker_base")[0]
+    assert resolve_config_path("session_base")[0].endswith("overlays/session.yaml")
+    assert resolve_config_path("subagent_base")[0].endswith("overlays/subagent.yaml")
+    assert resolve_config_path("expert_base")[0].endswith("config/expert_base.yaml")
+    # never a deployment dir for a root, and the directory form is never probed
+    for name in ROOT_NAMES:
+        path, deployment_dir = resolve_config_path(name)
+        assert deployment_dir is None and Path(path).is_file(), name
+
+
+def test_path_forms_of_the_old_base_files_still_load():
+    """``config/worker_base.yaml`` no longer exists on disk, but the path form
+    (create_persistent_app("config/session_base.yaml"), old CLI invocations)
+    lands on the overlay next to where the file used to be."""
+    assert (
+        canonical_config_name("config/worker_base.yaml")
+        == "config/overlays/worker.yaml"
+    )
+    assert (
+        canonical_config_name("config/persistent_defaults.yaml")
+        == "config/overlays/session.yaml"
+    )
+    assert canonical_config_name("worker_base.yaml") == "overlays/worker.yaml"
+    assert load_and_merge_config("config/worker_base.yaml") == load_role_base("worker")
+    assert load_and_merge_config("config/session_base.yaml") == load_role_base(
+        "session"
+    )
+    assert load_agent_config("config/defaults.yaml").agent_id == "worker_base"
+    # A name that merely starts with a base name is not an alias.
+    assert (
+        canonical_config_name("worker_base.a8950251.yaml")
+        == "worker_base.a8950251.yaml"
+    )
+
+
+@pytest.mark.parametrize(
+    ("public", "agent_id", "probe"),
+    [
+        ("worker_base", "worker_base", lambda c: c.phase_settings.min_todos == 2),
+        ("session_base", "session_base", lambda c: "get_canvas" in c.tools.canvas),
+    ],
+)
+def test_agent_boot_path_loads_both_public_names(public, agent_id, probe):
+    """What ``agent.py --config worker_base|session_base`` does
+    (src/api/app.py: resolve_config_path -> load_agent_config)."""
+    path, deployment_dir = resolve_config_path(public)
+    cfg = load_agent_config(path, deployment_dir)
+    assert cfg.agent_id == agent_id
+    assert probe(cfg)
+
+
+def test_chain_root_names_the_first_role_overlay_met():
+    assert (
+        chain_root(str(_CONFIG / "experts" / "assistant" / "config.yaml"))
+        == "session_base"
+    )
+    assert (
+        chain_root(str(_CONFIG / "experts" / "developer" / "config.yaml"))
+        == "worker_base"
+    )
+    assert chain_root(str(_CONFIG / "interactive.yaml")) == "session_base"
+    assert chain_root(str(_CONFIG / "overlays" / "session.yaml")) == "session_base"
+    assert chain_root(str(_CONFIG / "expert_base.yaml")) == EXPERT_BASE
+    assert chain_root(str(_PRE_SPLIT["worker"])) is None  # standalone
+    assert chain_root(str(_CONFIG / "does-not-exist.yaml")) is None
+
+
+def test_chain_root_follows_an_expert_to_expert_chain(tmp_path):
+    child = tmp_path / "child.yaml"
+    child.write_text(
+        "$extends: " + str(_CONFIG / "experts" / "assistant" / "config.yaml") + "\n"
+        "agent_id: child\ndisplay_name: Child\n"
+    )
+    assert chain_root(str(child)) == "session_base"
+    data = load_and_merge_config(str(child), role="worker")
+    assert data["agent_id"] == "child" and data["autonomy"] == "review"
+
+
+# ---------------------------------------------------------------------------
+# The mechanics: $ignore_keys pruning and re-rooting
+# ---------------------------------------------------------------------------
+
+
+def test_prune_ignored_keys_removes_nested_paths_and_keeps_the_directive():
+    data = {
+        IGNORE_KEYS_DIRECTIVE: ["workspace.backend", "autonomy", "nope.missing"],
+        "workspace": {"backend": "vm", "max_read_words": 1},
+        "autonomy": "full",
+        "tools": {"shell": []},
+    }
+    out = prune_ignored_keys(data)
+    assert out is data
+    assert data["workspace"] == {"max_read_words": 1}
+    assert "autonomy" not in data
+    assert data["tools"] == {"shell": []}
+    assert data[IGNORE_KEYS_DIRECTIVE] == [
+        "workspace.backend",
+        "autonomy",
+        "nope.missing",
+    ]
+
+
+def test_prune_ignored_keys_is_a_no_op_without_the_directive():
+    assert prune_ignored_keys({"a": 1}) == {"a": 1}
+    assert prune_ignored_keys({IGNORE_KEYS_DIRECTIVE: [], "a": 1}) == {
+        IGNORE_KEYS_DIRECTIVE: [],
+        "a": 1,
+    }
+    assert prune_ignored_keys(None) is None
+    assert prune_ignored_keys(["not", "a", "dict"]) == ["not", "a", "dict"]
+
+
+def test_prune_ignored_keys_rejects_a_malformed_directive():
+    with pytest.raises(ValueError):
+        prune_ignored_keys({IGNORE_KEYS_DIRECTIVE: "autonomy"})
+    with pytest.raises(ValueError):
+        prune_ignored_keys({IGNORE_KEYS_DIRECTIVE: [{"k": "v"}]})
+
+
+def test_ignore_keys_ride_the_merge_as_a_list_that_a_child_may_replace():
+    """deep_merge's lists-replace rule applies to the directive too: an expert
+    that declares its own list wins wholesale (and an empty list disables
+    pruning) — a later layer cannot re-add a key by merging, only by
+    redeclaring the directive."""
+    base = {IGNORE_KEYS_DIRECTIVE: ["autonomy"], "autonomy": "review"}
+    child = {"autonomy": "full"}
+    assert "autonomy" not in prune_ignored_keys(deep_merge(base, child))
+    override = {IGNORE_KEYS_DIRECTIVE: [], "autonomy": "full"}
+    assert prune_ignored_keys(deep_merge(base, override))["autonomy"] == "full"
+
+
+def test_ignore_keys_never_reach_extra_or_the_blob():
+    data = load_and_merge_config(
+        str(_CONFIG / "experts" / "critic" / "config.yaml"), role="subagent"
+    )
+    cfg = load_agent_config_from_dict(dict(data))
+    assert IGNORE_KEYS_DIRECTIVE not in cfg.extra
+    assert "verification" not in cfg.extra
+    blob = serialize_resolved_config(cfg, model=cfg.llm.model)
+    assert IGNORE_KEYS_DIRECTIVE not in blob["agent"]
+
+
+def test_reroot_extends_rules():
+    assert reroot_extends("worker_base", None) == ("worker_base", None)
+    assert reroot_extends("worker_base", "session") == ("session_base", None)
+    assert reroot_extends("persistent_defaults", "worker") == ("worker_base", None)
+    assert reroot_extends("overlays/subagent", "worker") == ("worker_base", None)
+    assert reroot_extends("expert_base", "subagent") == ("subagent_base", None)
+    # a link to another expert passes the role down
+    assert reroot_extends("critic", "subagent") == ("critic", "subagent")
+    with pytest.raises(ValueError):
+        reroot_extends("worker_base", "officer")
+
+
+def test_unknown_role_is_refused_everywhere():
+    with pytest.raises(ValueError):
+        load_role_base("officer")
+    with pytest.raises(ValueError):
+        load_and_merge_config(
+            str(_CONFIG / "experts" / "critic" / "config.yaml"), role="officer"
+        )

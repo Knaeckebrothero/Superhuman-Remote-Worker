@@ -123,7 +123,7 @@ class TodoManager:
             min_todos: Minimum todos required for tactical phases (default: 5).
                 This is the LIVE floor enforced by stage_tactical_todos;
                 production sites pass config.phase_settings.min_todos
-                (worker_base.yaml sets 2).
+                (the worker overlay, config/overlays/worker.yaml, sets 2).
             max_todos: Maximum todos allowed for tactical phases (default: 20)
             model_name: Optional model id used to resolve family-specific
                 runtime nudges (e.g. the todo-list footer rendered into

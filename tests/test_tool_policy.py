@@ -110,7 +110,15 @@ def _raw_declarations() -> list[tuple[str, str, object]]:
 
 _DECLARATIONS = _raw_declarations()
 
-_STANDALONE_CONFIGS = ["session_base", "worker_base", "interactive"]
+# The chain roots by their public names (expert_base + the three role
+# overlays) plus the one standalone session profile.
+_STANDALONE_CONFIGS = [
+    "expert_base",
+    "session_base",
+    "subagent_base",
+    "worker_base",
+    "interactive",
+]
 
 
 def _all_config_names() -> list[str]:
@@ -133,18 +141,23 @@ class TestPopulation:
     def test_the_declaration_scan_actually_found_the_configs(self):
         """A scan that silently found nothing would make every test below pass."""
         files = {rel for rel, _, _ in _DECLARATIONS}
-        assert len(files) == 12, f"expected 12 configs declaring tools:, got {files}"
-        assert "config/session_base.yaml" in files
-        assert "config/worker_base.yaml" in files
+        assert len(files) == 14, f"expected 14 configs declaring tools:, got {files}"
+        assert "config/expert_base.yaml" in files
+        assert "config/overlays/worker.yaml" in files
+        assert "config/overlays/session.yaml" in files
+        assert "config/overlays/subagent.yaml" in files
         assert any("experts/centurion" in f for f in files)
         # 148 after job_control/job_inspection became descriptor-owned groups;
         # 149 with the Centurion's explicit knowledge grant
         # (officer_knowledge_plane.md §3, K2); 141 after the eight shell-having
         # configs dropped their `git:` blocks — ToolsConfig.__post_init__
         # suppresses that group whenever shell tools are present, so declaring
-        # it there advertised tools the pod never binds.
-        assert len(_DECLARATIONS) == 141, (
-            f"expected 141 raw declarations, got {len(_DECLARATIONS)}"
+        # it there advertised tools the pod never binds; 137 after the U1 root
+        # split: the two self-contained bases (21 + 23 declarations) became
+        # expert_base (17 shared groups) + the worker / session / subagent
+        # overlays (4 + 6 + 13 role-owned groups).
+        assert len(_DECLARATIONS) == 137, (
+            f"expected 137 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):
@@ -352,10 +365,12 @@ class TestShellMustEnumerate:
         ]
 
     def test_every_shipped_shell_declaration_is_still_accepted(self):
-        """Eleven configs declare ``tools.shell``; all are bare lists or ``[]``,
-        the legacy spellings of ``only`` and ``false``. None is affected."""
+        """Ten configs declare ``tools.shell`` (the shared root plus nine
+        experts/profiles — the role overlays inherit the root's ``[]``); all
+        are bare lists or ``[]``, the legacy spellings of ``only`` and
+        ``false``. None is affected."""
         decls = [(rel, v) for rel, cat, v in _DECLARATIONS if cat == "shell"]
-        assert len(decls) == 11, decls
+        assert len(decls) == 10, decls
         for rel, value in decls:
             assert (
                 normalize_tool_policy({"tools": {"shell": value}})["tools"]["shell"]

@@ -229,3 +229,117 @@ class TestAccountDefaultsLayer:
         )
 
         assert detail["config"]["workspace"]["backend"] == "sandbox"
+
+
+# --- U1 WP2: the public base ids and the bundled listing survive the split ---
+
+
+class TestPublicBaseIdsAfterTheRootSplit:
+    """``worker_base`` / ``session_base`` are public ids the cockpit fetches
+    (``GET /api/experts/worker_base?account_defaults=true`` on the job form,
+    ``/api/experts/session_base?type=session`` on the session form). After
+    the split the files behind them are ``expert_base.yaml`` + a role overlay;
+    the detail must still be the fully merged role base, not one file."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("expert_id", "defaults_type", "role"),
+        [
+            ("worker_base", None, "worker"),
+            ("default", None, "worker"),
+            ("worker_base", "worker", "worker"),
+            ("session_base", "session", "session"),
+            ("session_base", None, "session"),  # the id itself names the role
+            ("persistent_defaults", None, "session"),
+        ],
+    )
+    async def test_base_id_detail_is_the_merged_role_base(
+        self, expert_id, defaults_type, role
+    ):
+        from src.core.loader import ROLE_ROOTS, load_role_base
+
+        detail = await _load_expert_detail(expert_id, defaults_type=defaults_type)
+
+        expected = dict(load_role_base(role))
+        expected.pop("connections", None)
+        assert detail["config"] == expected
+        assert detail["config"]["agent_id"] == ROLE_ROOTS[role]
+        # a raw read of an overlay alone would lack these
+        if role == "worker":
+            assert detail["config"]["phase_settings"]["min_todos"] == 2
+            assert detail["config"]["instruction_files"]
+        else:
+            assert "get_canvas" in detail["config"]["tools"]["canvas"]
+        assert detail["config"]["llm"]["model"]  # expert_base's block is there
+        assert detail["instructions"]  # template fallback still resolves
+
+    @pytest.mark.asyncio
+    async def test_session_base_id_with_account_defaults(self, monkeypatch):
+        monkeypatch.setattr(
+            orchestrator_main.postgres_db,
+            "get_user_settings",
+            AsyncMock(return_value={"default_model": "account-pinned-model"}),
+        )
+        monkeypatch.setattr(
+            orchestrator_main.postgres_db,
+            "resolve_default_for_capability",
+            AsyncMock(return_value=None),
+        )
+        detail = await _load_expert_detail(
+            "session_base",
+            defaults_type="session",
+            user_id="11111111-1111-4111-8111-111111111111",
+            include_account_defaults=True,
+        )
+        assert detail["config"]["agent_id"] == "session_base"
+        assert detail["config"]["llm"]["model"] == "account-pinned-model"
+        assert detail["config"]["workspace"]["backend"] == "virtual"
+        assert detail["effective_models"]["session"]["model"] == "account-pinned-model"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expert_id", ["developer", "assistant", "centurion"])
+    async def test_bundled_expert_detail_matches_the_loader_chain(self, expert_id):
+        """The served config equals the loader's merged chain for the expert's
+        own role (base + leaf), minus the keys the API never serves."""
+        from src.core.loader import load_and_merge_config, resolve_config_path
+
+        detail = await _load_expert_detail(expert_id)
+
+        path, _ = resolve_config_path(expert_id)
+        expected = load_and_merge_config(path)
+        expected.pop("connections", None)
+        assert detail["config"] == expected
+
+
+def test_scan_experts_lists_exactly_the_bundled_experts_with_unchanged_roles():
+    """The listing the cockpit filters by id: only ``config/experts/*``, with
+    the role inferred from the chain root — never the roots themselves."""
+    experts = orchestrator_main._scan_experts()
+    listed = {e.id: e.expert_type for e in experts}
+    assert listed == {
+        "assistant": "session",
+        "bughunter": "worker",
+        "centurion": "session",
+        "critic": "worker",
+        "curator": "worker",
+        "designer": "worker",
+        "designer-interactive": "session",
+        "developer": "worker",
+        "general-worker": "worker",
+        "product-qa": "worker",
+        "scholar": "worker",
+        "writer": "worker",
+    }
+    for forbidden in (
+        "expert_base",
+        "overlays",
+        "worker",
+        "session",
+        "subagent",
+        "worker_base",
+        "session_base",
+        "subagent_base",
+    ):
+        assert forbidden not in listed
+    assistant = next(e for e in experts if e.id == "assistant")
+    assert assistant.display_name and assistant.tags and assistant.description

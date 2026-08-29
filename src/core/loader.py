@@ -375,7 +375,120 @@ def get_project_root() -> Path:
     return Path(__file__).parent.parent.parent.parent
 
 
-def load_and_merge_config(config_path: str) -> Dict[str, Any]:
+# =============================================================================
+# Roles and chain roots (U1 — universal experts)
+# =============================================================================
+#
+# Every expert resolves on ONE shared root (``config/expert_base.yaml``) with a
+# role overlay in between: ``expert_base <- overlays/<role> <- expert``. The
+# public names of the overlays are the pre-split base names — ``worker_base``
+# and ``session_base`` stay valid ``$extends`` values, ``--config`` names and
+# API ids — plus ``subagent_base`` for the new role. ``resolve_config_path``
+# maps a public root name to its overlay file; ``canonical_config_name`` folds
+# the ``overlays/<role>`` spelling and the legacy aliases back onto the public
+# name, so every ``== "worker_base"`` comparison in the orchestrator keeps
+# working. See knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.
+
+#: role -> public root name (the role overlay's logical name).
+ROLE_ROOTS: Dict[str, str] = {
+    "worker": "worker_base",
+    "session": "session_base",
+    "subagent": "subagent_base",
+}
+#: The shared root every role overlay extends.
+EXPERT_BASE = "expert_base"
+#: public root name -> file under ``config/``.
+_ROOT_FILES: Dict[str, str] = {
+    "worker_base": "overlays/worker.yaml",
+    "session_base": "overlays/session.yaml",
+    "subagent_base": "overlays/subagent.yaml",
+    EXPERT_BASE: "expert_base.yaml",
+}
+#: Every name that ends a ``$extends`` chain: the three role roots + expert_base.
+ROOT_NAMES = frozenset(_ROOT_FILES)
+#: The ``$``-directive a role overlay uses to declare the dotted key paths its
+#: role ignores. Rides the merge like any key (lists replace) and is pruned by
+#: :func:`prune_ignored_keys`; never parsed into ``AgentConfig``.
+IGNORE_KEYS_DIRECTIVE = "$ignore_keys"
+
+
+def role_of_root(root_name: Optional[str]) -> Optional[str]:
+    """The role whose overlay a public root name is; ``None`` for expert_base
+    or anything that is not a role root."""
+    for role, name in ROLE_ROOTS.items():
+        if name == root_name:
+            return role
+    return None
+
+
+def _delete_dotted(data: Dict[str, Any], dotted: str) -> bool:
+    """Delete ``data['a']['b']`` for ``dotted='a.b'``; False when absent."""
+    node: Any = data
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        if not isinstance(node, dict):
+            return False
+        node = node.get(part)
+    if isinstance(node, dict) and parts[-1] in node:
+        del node[parts[-1]]
+        return True
+    return False
+
+
+def prune_ignored_keys(data: Any) -> Any:
+    """Drop every dotted path listed under ``$ignore_keys`` from ``data``.
+
+    The role overlay declares the keys that do not apply to its role (the
+    subagent overlay ignores ``workspace.backend``, ``autonomy``, ...). Those
+    keys are *ignored, not errors* (D4): any layer may still author them and
+    they are silently pruned. ``None`` in an overlay would not do — deep_merge
+    clears the key for that merge only and a later layer re-adds it — so the
+    list rides the merge and pruning runs at three points: after every merge in
+    :func:`load_and_merge_config`, after the request layers in the
+    orchestrator's ``resolve_config``, and after the roster override in the
+    roster resolver. The directive itself stays on the dict (a later pruning
+    point needs it) and is dropped only when the dict is parsed into
+    ``AgentConfig``. Mutates and returns ``data``; a non-dict passes through.
+    """
+    if not isinstance(data, dict):
+        return data
+    ignored = data.get(IGNORE_KEYS_DIRECTIVE)
+    if not ignored:
+        return data
+    if not isinstance(ignored, list) or not all(isinstance(k, str) for k in ignored):
+        raise ValueError(
+            f"{IGNORE_KEYS_DIRECTIVE} must be a list of dotted key paths, "
+            f"got {ignored!r}"
+        )
+    for dotted in ignored:
+        _delete_dotted(data, dotted)
+    return data
+
+
+def reroot_extends(parent_name: str, role: Optional[str]) -> tuple[str, Optional[str]]:
+    """Apply the role re-rooting rule to one ``$extends`` link.
+
+    Returns ``(parent_name_to_load, role_to_pass_down)``. Without a role the
+    link is followed as written. With one, a link that ends the chain (any
+    role root or ``expert_base``) is replaced by the requested role's overlay,
+    and the overlay's own fixed chain is then walked with no role — so an
+    expert authored for sessions resolves onto the worker overlay when a job
+    asks for it, and vice versa. Links to other experts pass the role down.
+    """
+    if role is None:
+        return parent_name, None
+    if role not in ROLE_ROOTS:
+        raise ValueError(
+            f"Unknown config role {role!r}; expected one of {sorted(ROLE_ROOTS)}"
+        )
+    if canonical_config_name(str(parent_name)) in ROOT_NAMES:
+        return ROLE_ROOTS[role], None
+    return parent_name, role
+
+
+def load_and_merge_config(
+    config_path: str, role: Optional[str] = None
+) -> Dict[str, Any]:
     """Load configuration with inheritance resolution.
 
     Handles $extends field to load and merge parent configs.
@@ -384,18 +497,34 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
 
     Args:
         config_path: Path to the configuration file (YAML or JSON)
+        role: ``worker`` | ``session`` | ``subagent`` to re-root the chain
+            onto that role's overlay (see :func:`reroot_extends`). ``None``
+            keeps the chain's own root — a bundled config loaded by name
+            resolves exactly as authored.
 
     Returns:
-        Merged configuration dictionary
+        Merged configuration dictionary (ignored keys already pruned)
 
     Example:
         ```python
         # config/my_agent.yaml with $extends: worker_base
         data = load_and_merge_config("config/my_agent.yaml")
         # Returns merged worker base + agent overrides
+        data = load_and_merge_config("config/my_agent.yaml", role="session")
+        # The same expert on the session overlay
         ```
     """
     config_path = canonical_config_name(config_path)
+    if role is not None:
+        if role not in ROLE_ROOTS:
+            raise ValueError(
+                f"Unknown config role {role!r}; expected one of {sorted(ROLE_ROOTS)}"
+            )
+        # A root named directly with a role: the roots are one thing in
+        # different roles, so the requested role's overlay IS the answer.
+        if _root_name_for_path(config_path) is not None:
+            root_path, _ = resolve_config_path(ROLE_ROOTS[role])
+            return load_and_merge_config(root_path)
     with open(config_path, "r", encoding="utf-8") as f:
         config_data = yaml.safe_load(f)
 
@@ -410,7 +539,9 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
 
     # Handle $extends inheritance
     if "$extends" in config_data:
-        parent_name = config_data.pop("$extends")
+        parent_name, parent_role = reroot_extends(
+            str(config_data.pop("$extends")), role
+        )
 
         # Resolve parent config path
         parent_path, _ = resolve_config_path(parent_name)
@@ -420,7 +551,7 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
             )
 
         # Recursively load parent (supports chained inheritance)
-        parent_data = load_and_merge_config(parent_path)
+        parent_data = load_and_merge_config(parent_path, role=parent_role)
 
         # Merge: parent as base, current as override
         config_data = deep_merge(parent_data, config_data)
@@ -428,7 +559,9 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
     # Remove $comment if present (documentation only)
     config_data.pop("$comment", None)
 
-    return config_data
+    # Pruning point 1 of 3: whatever the overlay below declared as ignored is
+    # dropped again after every merge, so no link of the chain can re-add it.
+    return prune_ignored_keys(config_data)
 
 
 # =============================================================================
@@ -1725,7 +1858,7 @@ class PhaseSettings:
 
     Controls the strategic/tactical phase transitions. min/max_todos are
     the LIVE bounds: agent.py passes them into TodoManager at construction,
-    where stage_tactical_todos enforces them. worker_base.yaml lowers the
+    where stage_tactical_todos enforces them. The worker overlay (worker_base) lowers the
     floor to 2.
     """
 
@@ -2096,7 +2229,7 @@ class DelegationConfig:
 class AgentConfig:
     """Complete agent configuration.
 
-    Loaded from YAML configuration (e.g., worker_base.yaml, my_agent.yaml).
+    Loaded from YAML configuration (e.g., overlays/worker.yaml, my_agent.yaml).
     """
 
     agent_id: str
@@ -2379,7 +2512,10 @@ def _parse_response_validation(data: Dict[str, Any]) -> ResponseValidationConfig
 
 
 def load_agent_config(
-    config_path: str, deployment_dir: Optional[str] = None
+    config_path: str,
+    deployment_dir: Optional[str] = None,
+    *,
+    role: Optional[str] = None,
 ) -> AgentConfig:
     """Load agent configuration from a JSON file.
 
@@ -2390,6 +2526,9 @@ def load_agent_config(
         config_path: Path to the configuration JSON file
         deployment_dir: Optional deployment directory for prompt resolution.
                        Set automatically when loading from config/{name}/.
+        role: Optional role (``worker`` / ``session`` / ``subagent``) to
+              re-root the ``$extends`` chain onto — see
+              :func:`load_and_merge_config`.
 
     Returns:
         AgentConfig dataclass with loaded configuration
@@ -2415,21 +2554,13 @@ def load_agent_config(
     if not config_path_obj.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    # Load config with inheritance resolution
-    data = load_and_merge_config(config_path)
+    # Load config with inheritance resolution (re-rooted onto `role` if given)
+    data = load_and_merge_config(config_path, role=role)
 
     # Apply settings matrix between the mode base and the expert config.
-    # Read the raw expert file to know which llm keys were explicitly set.
-    raw_expert_llm_keys = set()
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            raw_expert = yaml.safe_load(f) or {}
-        # A lifted legacy phase block is explicit for this leaf too — its
-        # params must survive the matrix like any hand-set llm key.
-        raw_expert = normalize_llm_tiers(raw_expert, source=str(config_path))
-        raw_expert_llm_keys = set((raw_expert.get("llm") or {}).keys())
-    except Exception:
-        pass
+    # The raw leaf's own llm keys are the explicit ones (a lifted legacy phase
+    # block counts; for a role root the overlay + expert_base pair counts).
+    raw_expert_llm_keys = authored_llm_keys(config_path)
     _apply_settings_matrix(data, raw_expert_llm_keys, deployment_dir)
 
     # Validate required fields
@@ -2619,6 +2750,7 @@ def load_agent_config(
     # Collect extra fields (agent-specific config)
     known_fields = {
         "$schema",
+        IGNORE_KEYS_DIRECTIVE,
         "agent_id",
         "display_name",
         "description",
@@ -2892,6 +3024,7 @@ def load_agent_config_from_dict(
     # Collect extra fields
     known_fields = {
         "$schema",
+        IGNORE_KEYS_DIRECTIVE,
         "agent_id",
         "display_name",
         "description",
@@ -2982,7 +3115,8 @@ def load_agent_config_from_dict(
 def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
     """Load an uploaded worker config file and merge with worker_base.
 
-    The uploaded config is treated as an override on top of worker_base.yaml.
+    The uploaded config is treated as an override on top of the worker role
+    base (``expert_base`` + ``overlays/worker``, public name ``worker_base``).
     Uses the same deep_merge semantics as $extends inheritance.
 
     This enables per-job config customization without modifying the mode base.
@@ -2999,7 +3133,7 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
         # llm:
         #   temperature: 0.7
         #
-        # Result is worker_base.yaml with temperature overridden to 0.7
+        # Result is the worker base (expert_base + overlays/worker) with temperature 0.7
 
         merged = load_uploaded_config(Path("/workspace/uploads/config_123/agent.yaml"))
         config = load_agent_config_from_dict(merged)
@@ -3024,8 +3158,9 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
         uploaded_data, source=f"upload:{Path(uploaded_config_path).name}"
     )
 
-    # Merge: defaults as base, uploaded as override
-    merged = deep_merge(defaults_data, uploaded_data)
+    # Merge: defaults as base, uploaded as override (then honour the base's
+    # ignored keys, should the worker overlay ever declare any)
+    merged = prune_ignored_keys(deep_merge(defaults_data, uploaded_data))
 
     # Apply settings matrix: uploaded llm keys are the explicit overrides
     uploaded_llm_keys = set((uploaded_data.get("llm") or {}).keys())
@@ -4740,6 +4875,24 @@ _CONFIG_NAME_ALIASES = {
     "defaults": "worker_base",
     "persistent_default": "session_base",
     "persistent_defaults": "session_base",
+    # The overlay files' own spelling folds back onto the public root names,
+    # so `$extends: overlays/worker` and `$extends: worker_base` are one name.
+    "overlays/worker": "worker_base",
+    "overlays/session": "session_base",
+    "overlays/subagent": "subagent_base",
+}
+
+#: Path-form aliases: ``<dir>/<stem>.yaml`` -> ``<dir>/overlays/<role>.yaml``.
+#: The pre-split base files are gone; a path that names one (or one of the
+#: legacy names) lands on the overlay next to where the file used to be.
+_CONFIG_STEM_ALIASES = {
+    "default": "overlays/worker",
+    "defaults": "overlays/worker",
+    "worker_base": "overlays/worker",
+    "persistent_default": "overlays/session",
+    "persistent_defaults": "overlays/session",
+    "session_base": "overlays/session",
+    "subagent_base": "overlays/subagent",
 }
 
 
@@ -4749,6 +4902,10 @@ def canonical_config_name(config_name: str) -> str:
     The aliases are an API compatibility boundary, not duplicate config files:
     old jobs, threads, CLI commands and expert ``$extends`` values continue to
     load while every newly persisted root uses ``worker_base``/``session_base``.
+    Names canonicalise to the PUBLIC root names (never to the overlay files —
+    ``canonical_config_name("worker_base") == "worker_base"``; the file is
+    :func:`resolve_config_path`'s business). Explicit paths canonicalise to a
+    real file: ``config/worker_base.yaml`` -> ``config/overlays/worker.yaml``.
     Explicit non-base paths are left untouched.
     """
     if not config_name:
@@ -4757,20 +4914,8 @@ def canonical_config_name(config_name: str) -> str:
     if raw in _CONFIG_NAME_ALIASES:
         return _CONFIG_NAME_ALIASES[raw]
     path = Path(raw)
-    if path.name in {
-        "default.yaml",
-        "defaults.yaml",
-        "default.yml",
-        "defaults.yml",
-    }:
-        return str(path.with_name("worker_base" + path.suffix))
-    if path.name in {
-        "persistent_default.yaml",
-        "persistent_defaults.yaml",
-        "persistent_default.yml",
-        "persistent_defaults.yml",
-    }:
-        return str(path.with_name("session_base" + path.suffix))
+    if path.suffix in (".yaml", ".yml") and path.stem in _CONFIG_STEM_ALIASES:
+        return str(path.parent / (_CONFIG_STEM_ALIASES[path.stem] + path.suffix))
     return raw
 
 
@@ -4780,8 +4925,13 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
 
     Resolution order:
     1. Absolute path or explicit extension (.yaml/.json) -> use as-is
-    2. config/{name}/config.yaml (directory with possible prompt overrides)
-    3. config/{name}.yaml (single file config)
+    2. A chain root (``worker_base`` / ``session_base`` / ``subagent_base`` /
+       ``expert_base``) -> its file (``config/overlays/<role>.yaml`` /
+       ``config/expert_base.yaml``), before any directory is probed
+    3. config/{name}/config.yaml (directory with possible prompt overrides)
+    4. config/experts/{name}/config.yaml (bundled expert)
+    5. config/subagents/{name}/config.yaml (subagent library entry)
+    6. config/{name}.yaml (single file config)
 
     Args:
         config_name: Config name (e.g., "worker_base", "my_agent")
@@ -4802,6 +4952,12 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     project_root = get_project_root()
     config_dir = project_root / "config"
 
+    # Chain roots map straight to their files: `config/worker_base/config.yaml`
+    # is never probed, and `overlays/worker` (already canonicalised to
+    # `worker_base`) never falls through to the single-file branch.
+    if config_name in _ROOT_FILES:
+        return (str(config_dir / _ROOT_FILES[config_name]), None)
+
     # Try directory config first (config/{name}/config.yaml)
     # This allows prompt overrides in the same directory
     deployment_dir = config_dir / config_name
@@ -4817,6 +4973,14 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     if experts_config.exists():
         return (str(experts_config), str(experts_dir))
 
+    # Try the subagent library (config/subagents/{name}/config.yaml) — small
+    # experts a roster references by name (universal_experts_and_subagents.md §1.1).
+    subagents_dir = config_dir / "subagents" / config_name
+    subagents_config = subagents_dir / "config.yaml"
+
+    if subagents_config.exists():
+        return (str(subagents_config), str(subagents_dir))
+
     # Fall back to single file config (config/{name}.yaml)
     single_file_config = config_dir / f"{config_name}.yaml"
 
@@ -4825,6 +4989,96 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
 
     # Return single file path even if it doesn't exist (let caller handle error)
     return (str(single_file_config), None)
+
+
+def _root_name_for_path(config_path: str) -> Optional[str]:
+    """The public root name whose file ``config_path`` is, else ``None``."""
+    try:
+        resolved = Path(config_path).resolve()
+    except OSError:
+        return None
+    for name in _ROOT_FILES:
+        root_path, _ = resolve_config_path(name)
+        if Path(root_path).resolve() == resolved:
+            return name
+    return None
+
+
+def chain_root(config_path: str) -> Optional[str]:
+    """The public root name a config's ``$extends`` chain ends on.
+
+    ``worker_base`` / ``session_base`` / ``subagent_base`` for a chain that
+    passes through a role overlay (the first one met, walking up),
+    ``expert_base`` for a chain rooted directly on the shared root, ``None``
+    for a standalone config (no ``$extends``) or a chain that cannot be
+    followed (missing or unreadable parent) — callers fall back to their own
+    default rather than fail on a listing.
+    """
+    seen: Set[str] = set()
+    current = canonical_config_name(str(config_path))
+    while True:
+        root = _root_name_for_path(current)
+        if root is not None:
+            return root
+        if current in seen or not os.path.isfile(current):
+            return None
+        seen.add(current)
+        try:
+            with open(current, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+        except Exception:
+            return None
+        parent = raw.get("$extends") if isinstance(raw, dict) else None
+        if not parent:
+            return None
+        parent_name = canonical_config_name(str(parent))
+        if parent_name in ROOT_NAMES:
+            return parent_name
+        current, _ = resolve_config_path(parent_name)
+
+
+def load_role_base(role: str) -> Dict[str, Any]:
+    """The fully merged base of one role: ``expert_base`` + its overlay.
+
+    The one way to read "what the framework grants a worker/session/subagent
+    by default" — the orchestrator's expert-detail, preference-default and
+    completion-time readers use it instead of opening a base YAML directly
+    (a raw read of an overlay would see only the role's residue).
+    """
+    if role not in ROLE_ROOTS:
+        raise ValueError(
+            f"Unknown config role {role!r}; expected one of {sorted(ROLE_ROOTS)}"
+        )
+    path, _ = resolve_config_path(ROLE_ROOTS[role])
+    return load_and_merge_config(path)
+
+
+def authored_llm_keys(config_path: str) -> Set[str]:
+    """``llm`` keys the named config authored itself — the keys the settings
+    matrix must not clobber (``_apply_settings_matrix``'s ``expert_llm_keys``).
+
+    For an expert that is the leaf's own ``llm`` block, exactly as before. For
+    a role root the named config is the overlay *and* ``expert_base`` together
+    (one framework base authored in two files), so the union of both counts:
+    a base loaded directly, or the base layer under a bundled expert in the
+    orchestrator resolver, keeps its ``temperature`` against a family default
+    exactly as the single-file base did. Legacy tier blocks are lifted first so
+    a lifted key is explicit too. Unreadable input -> empty set.
+    """
+    path = canonical_config_name(str(config_path))
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except Exception:
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    raw = normalize_llm_tiers(raw, source=str(path))
+    keys = set((raw.get("llm") or {}).keys())
+    if role_of_root(_root_name_for_path(path)) is not None and raw.get("$extends"):
+        parent_path, _ = resolve_config_path(str(raw["$extends"]))
+        keys |= authored_llm_keys(parent_path)
+    return keys
 
 
 # =============================================================================

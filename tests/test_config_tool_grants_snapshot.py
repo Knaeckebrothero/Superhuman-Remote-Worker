@@ -54,8 +54,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _REPO_ROOT / "config"
 _SNAPSHOT = Path(__file__).parent / "fixtures" / "config_tool_grants.json"
 
-# Bases plus the one standalone session profile. Experts are discovered.
-_STANDALONE_CONFIGS = ["session_base", "worker_base", "interactive"]
+# The chain roots (the shared expert_base and the three role overlays, by
+# their public names) plus the one standalone session profile. Experts are
+# discovered.
+_STANDALONE_CONFIGS = [
+    "expert_base",
+    "session_base",
+    "subagent_base",
+    "worker_base",
+    "interactive",
+]
 
 _UPDATE = os.environ.get("UPDATE_TOOL_GRANTS_SNAPSHOT") == "1"
 

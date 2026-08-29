@@ -14,7 +14,6 @@ import re
 import sys
 from pathlib import Path
 
-import yaml
 
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
@@ -37,9 +36,11 @@ class TestPhaseSettingsParsing:
         assert cfg.phase_settings.max_todos == 20
 
     def test_worker_base_sets_floor_of_two(self):
-        data = yaml.safe_load(
-            (project_root / "config" / "worker_base.yaml").read_text()
-        )
+        # The worker base is expert_base + the worker overlay; phase_settings
+        # lives in the overlay, so read the merged role base, not one file.
+        from src.core.loader import load_role_base
+
+        data = load_role_base("worker")
         assert data["phase_settings"]["min_todos"] == 2
 
 

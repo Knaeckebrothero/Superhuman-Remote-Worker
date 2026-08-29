@@ -635,11 +635,14 @@ pytest tests/ --cov=src                    # With coverage
 | **Assistant** | managed DB expert seeded from `config/experts/assistant/` | Persistent | Application default for conversational sessions |
 | **Designer-Interactive** | `config/experts/designer-interactive/` | Persistent | Collaborative design iteration in real-time sessions |
 
-All experts share the same universal agent codebase. Worker experts extend
-`config/worker_base.yaml`; session experts extend `config/session_base.yaml`.
-Those files are conservative inheritance fallbacks, while the user-facing
-defaults are database expert pointers selected by the administrator, project,
-or user. See [config/README.md](config/README.md) for details.
+All experts share the same universal agent codebase and one config root,
+`config/expert_base.yaml`, with a role overlay in between: worker experts
+extend `worker_base` (`config/overlays/worker.yaml`), session experts extend
+`session_base` (`config/overlays/session.yaml`), and any expert can be
+re-rooted onto another role at resolve time. Those files are conservative
+inheritance fallbacks, while the user-facing defaults are database expert
+pointers selected by the administrator, project, or user. See
+[config/README.md](config/README.md) for details.
 
 ### Two Operating Modes
 

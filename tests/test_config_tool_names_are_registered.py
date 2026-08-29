@@ -28,7 +28,9 @@ _WILDCARDS = {"*"}
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 
-_BASE_CONFIGS = ["session_base", "worker_base"]
+# The chain roots by their public names: the shared root and the three role
+# overlays (each checked MERGED, i.e. expert_base + overlay).
+_BASE_CONFIGS = ["expert_base", "session_base", "subagent_base", "worker_base"]
 
 
 def _expert_config_names() -> list[str]:

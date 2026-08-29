@@ -260,8 +260,10 @@ class TestCodeGrants:
         assert any(f.startswith("config/experts/") for f in sources), (
             f"expert configs missing from the scan: {sorted(sources)}"
         )
-        assert "config/session_base.yaml" in sources
-        assert "config/worker_base.yaml" in sources
+        assert "config/expert_base.yaml" in sources
+        assert "config/overlays/worker.yaml" in sources
+        assert "config/overlays/session.yaml" in sources
+        assert "config/overlays/subagent.yaml" in sources
 
 
 class TestNotClassified:

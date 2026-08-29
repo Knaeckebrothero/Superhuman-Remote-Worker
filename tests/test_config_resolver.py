@@ -338,3 +338,103 @@ def test_no_per_model_window_falls_back_to_family_default():
     assert limits["context_threshold_tokens"] == int(
         limits["model_max_context_tokens"] * 0.80
     )
+
+
+# --- U1 WP2: role re-rooting, role-wins on root names, $ignore_keys pruning ---
+
+
+def test_worker_base_only_matches_load_agent_config():
+    """Worker twin of the fidelity guard: the worker root is expert_base +
+    the worker overlay, and the resolver's explicit-llm-key handling for that
+    pair must equal the agent's from_config path."""
+    path, dep = resolve_config_path("worker_base")
+    cfg = load_agent_config(path, dep)
+    expected = serialize_resolved_config(cfg, model=cfg.llm.model)
+
+    blob = resolve_config(base_config_name="worker_base", expert_type="worker")
+
+    assert blob["agent"] == expected["agent"]
+    assert blob["prompts"] == expected["prompts"]
+    assert blob["instructions"] == expected["instructions"]
+
+
+def test_session_expert_as_worker_gets_worker_keys():
+    """A session expert (assistant extends session_base) dispatched as a
+    worker re-roots onto the worker overlay: it gains the phase loop's keys."""
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="assistant", expert_type="worker", capture=cap
+    )
+    merged = cap["merged_fragment"]
+    assert blob["agent"]["agent_id"] == "assistant"
+    assert merged["phase_settings"]["min_todos"] == 2
+    assert merged["autonomy"] == "review"
+    assert "next_phase_todos" in merged["tools"]["core"]
+    assert merged["llm"]["max_retries"] == 0
+
+
+def test_worker_expert_as_session_uses_session_overlay_and_drops_nothing():
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="developer", expert_type="session", capture=cap
+    )
+    merged = cap["merged_fragment"]
+    assert blob["agent"]["agent_id"] == "developer"
+    assert merged["llm"]["max_retries"] == 3
+    assert "get_canvas" in merged["tools"]["canvas"]
+    assert merged["memory"]["pipeline"]["writers"][0] == "persistent_interval_extractor"
+    # expert wins: the developer's own keys survive, session-relevant or not
+    assert merged["tools"]["shell"]
+    assert merged["delegation"]["enabled"] is True
+
+
+def test_role_wins_over_a_root_base_name():
+    """The roots are one thing in different roles: a job that names
+    ``session_base`` resolves the worker base, and vice versa."""
+    worker = resolve_config(base_config_name="session_base", expert_type="worker")
+    assert worker["agent"]["agent_id"] == "worker_base"
+    session = resolve_config(base_config_name="worker_base", expert_type="session")
+    assert session["agent"]["agent_id"] == "session_base"
+    # a non-role expert_type keeps the chain's own root (call-site intent only)
+    as_is = resolve_config(base_config_name="session_base", expert_type="preview")
+    assert as_is["agent"]["agent_id"] == "session_base"
+
+
+def test_ignored_keys_pruned_after_request_layers():
+    """A job override re-adding a key the subagent role ignores is pruned
+    again after the request layers (pruning point 2 of 3)."""
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="critic",
+        expert_type="subagent",
+        request_override={
+            "workspace": {"backend": "vm", "max_read_words": 123},
+            "autonomy": "full",
+            "verification": {"enabled": True},
+        },
+        capture=cap,
+    )
+    merged = cap["merged_fragment"]
+    assert "backend" not in merged["workspace"]
+    assert merged["workspace"]["max_read_words"] == 123  # not ignored: kept
+    assert "autonomy" not in merged and "verification" not in merged
+    assert merged["tools"]["shell"]  # the critic's own tools survive
+    assert "$ignore_keys" not in blob["agent"]
+    assert "verification" not in blob["agent"]
+
+
+def test_bundled_expert_base_layer_keeps_the_frameworks_explicit_llm_keys():
+    """Pre-split resolver behaviour, pinned: the framework base's own llm keys
+    (now authored across expert_base + the overlay) are explicit under a
+    bundled expert, so a family default does not clobber the base's
+    temperature at dispatch. (This differs from ``load_agent_config(expert)``,
+    where only the leaf's keys are explicit — a long-standing resolver
+    property the split must not silently change either way.)"""
+    blob = resolve_config(
+        base_config_name="developer",
+        request_override={"llm": {"model": "openai/minimax-m2.7"}},
+        expert_type="worker",
+    )
+    assert blob["agent"]["llm"]["model"] == "openai/minimax-m2.7"
+    assert blob["agent"]["llm"]["temperature"] == 0.0  # base-authored, kept
+    assert blob["agent"]["llm"]["top_p"] == 0.95  # matrix-owned, applied

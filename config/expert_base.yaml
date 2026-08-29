@@ -1,0 +1,381 @@
+# yaml-language-server: $schema=schema.json
+# Framework expert base — the ONE root every expert resolves on, in every role.
+#
+# This file carries everything the worker and session bases shared before the
+# U1 split (universal_experts_and_subagents.md §1.1). It is never the whole
+# story on its own: a role overlay (config/overlays/{worker,session,subagent}.yaml)
+# sits between this file and the expert and adds the role's own keys and the
+# role-specific values of shared keys. Resolution chain, most specific last:
+#
+#     expert_base <- overlays/<role> <- expert ($extends chain)
+#                 <- model family (matrix) <- job / thread / roster override
+#
+# `$extends: worker_base` / `$extends: session_base` in an expert name the
+# worker / session overlay (the public names are aliases of the overlay files),
+# and `load_and_merge_config(path, role=...)` re-roots ANY chain onto the
+# requested role's overlay — that is what makes an expert universal.
+#
+# Where the two old bases disagreed on a shared key, this file holds the
+# conservative value and the overlay that wants the other value restates it
+# (llm.max_retries, memory budgets, browser blocklist, assemble_memories).
+# Role-only keys (instruction_files, phase_settings, delegation, autonomy,
+# verification, scholar, curator, communication, canvas grants, ...) live in
+# the overlays, never here.
+#
+# Model-specific inference params (temperature, top_p, top_k, multimodal,
+# parallel_tool_calls) and context limits are set via
+# config/model_config_matrix.yaml — the single source of truth for
+# model-dependent settings. Do not set model_max_context_tokens here.
+
+agent_id: expert_base
+display_name: Framework Expert Base
+
+# Image quality — resolution tier of images the agent receives
+# economy | standard | high (default standard). Higher = more visual detail and
+# more image tokens; resolved to a per-model-family max edge at the image seam.
+# See knowledge-base/knowledge/issues/session_turn_hard_fails_on_transient_llm_outage.md (Track 1).
+image_quality: standard
+
+llm:
+  model: RedHatAI/gemma-4-31B-it-FP8-Dynamic
+  provider: null  # Auto-detect from model name (claude-* → anthropic, gemini-* → google)
+  temperature: 0.0
+  reasoning_level: high
+  reasoning_method: null  # Auto-detect from model name (prompt/api/none)
+  base_url: null  # Set LLM_BASE_URL env var for local vLLM endpoint
+  timeout: 600
+  # Provider-SDK retries. The worker overlay sets this to 0: the worker graph's
+  # retry_manager (limits.llm_inproc_retries) is the ONE retry authority there
+  # and SDK retries would multiply with it. Sessions and subagents keep the SDK
+  # retries — they have no graph-level retry loop.
+  max_retries: 3
+  # NOTE: do NOT declare max_output_tokens here, even as null. It is matrix-driven
+  # (per-family settings.max_output_tokens in config/model_config_matrix.yaml,
+  # clamped to the context window by _resolve_max_output_tokens). A base
+  # declaration enters explicit_llm_keys and SHADOWS the family value the same way
+  # a base model_max_context_tokens would (see
+  # knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md). A per-job/expert override
+  # still wins — it re-enters explicit_llm_keys with a real value.
+  #
+  # One model per expert: `model` runs every phase and every session turn (U1
+  # collapsed the old strategic/tactical tiers). The only remaining override is
+  #   summarization: context compaction (optional, same override path)
+  # The light-subagent reader model is `subagents.llm` (a top-level
+  # `subagents:` block), e.g. a top-tier parent spawning a mid-tier reader:
+  #   subagents:
+  #     llm:
+  #       model: claude-haiku-4-5-20251001
+  # Legacy `llm.strategic` / `llm.tactical` / `llm.subagent` keys are still
+  # accepted in any layer and mapped (with a deprecation warning) — see
+  # universal_experts_and_subagents.md §1.1.
+
+workspace:
+  # `structure` (the directories scaffolded into a fresh workspace) is
+  # role-owned: the worker and session overlays each declare their own layout
+  # and the subagent overlay ignores it (a child shares its parent's tree).
+  max_read_words: 25000
+  max_write_words: 10000
+  # Git versioning for workspace history
+  git_versioning: true
+  # Workspace backend: "sandbox" (SSH workspace container) or "vm"
+  # (KubeVirt VM with sudo gate). The agent never operates on its own
+  # filesystem — every workspace lives in an isolated SSH-accessible
+  # container or VM. The orchestrator injects the connection details at
+  # dispatch time.
+  backend: sandbox
+  # Remote backend settings (injected by orchestrator at dispatch time)
+  # remote:
+  #   host: ""                                        # VM/container hostname or IP
+  #   port: 22
+  #   username: agent-host
+  #   key_path: /run/secrets/vm-ssh-key               # K8s: Secret mount
+  #           # /run/secrets/ssh/id_ed25519            # Docker Compose: shared volume
+  #   workspace_path: /home/agent-host/workspace     # Workspace root (subdirectory of home)
+
+tools:
+  # Workspace tools - file operations (src/tools/workspace/)
+  workspace:
+    - read_file
+    - write_file
+    - edit_file
+    - use_skill
+    - list_files
+    - delete_file
+    - search_files
+    - file_exists
+    - move_file
+    - rename_file
+    - copy_file
+    - get_document_info
+    - create_directory
+    - delete_directory
+  # Research tools - web search, academic papers, browser & workflows (src/tools/research/)
+  research:
+    - web_search
+    - extract_webpage
+    - crawl_website
+    - map_website
+    - search_papers
+    - download_paper
+    - get_paper_info
+    - research_topic
+  # Direct browser control - step-by-step page interaction (src/tools/research/browser_direct.py)
+  browser_direct:
+    - browser_navigate
+    - browser_snapshot
+    - browser_click
+    - browser_type
+    - browser_select
+    - browser_scroll
+    - browser_screenshot
+    - browser_back
+    - browser_close
+  # Citation tools - citation management (src/tools/citation/)
+  citation:
+    - cite_document
+    - cite_web
+    - list_sources
+    - get_citation
+    - list_citations
+    - edit_citation
+    - annotate_source
+    - get_annotations
+    - tag_source
+    - search_library
+    - generate_bibliography
+  # Graph tools - Neo4j operations (src/tools/graph/)
+  # NOTE: Graph tools are no longer listed in defaults. They are injected
+  # automatically when a Neo4j datasource is attached to the job.
+  # See knowledge-base/knowledge/datasources.md for the datasource connector system.
+  graph: []
+  # SQL tools - PostgreSQL operations (src/tools/sql/)
+  # Injected automatically via datasource system
+  sql: []
+  # MongoDB tools - MongoDB operations (src/tools/mongodb/)
+  # Injected automatically via datasource system
+  mongodb: []
+  # Repo tools - write operations on cloned repository datasources
+  # (src/tools/repo/). Injected automatically via datasource system; distinct
+  # from `git`, which covers the agent's own workspace history.
+  repo: []
+  # Email tools - IMAP/SMTP mailbox operations (src/tools/email/)
+  # Injected automatically via datasource system
+  email: []
+  # Shell tools - shell command execution (src/tools/shell/)
+  # Privileged and orchestration-oriented capabilities are opt-in at the expert
+  # layer.  This base is a reliable fallback, not a maximal role profile.
+  shell: []
+  # Evaluation tools - verdict tools for critic agents (src/tools/evaluation/)
+  # Enable in critic config to give reviewer agents approve/return capabilities.
+  evaluation: []
+  # Knowledge tools — project knowledge base CRUD + search (src/tools/knowledge/)
+  # Available when Neo4j + pgvector are connected; silently skipped otherwise.
+  knowledge:
+    - kb_write
+    - kb_update
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+    - kb_export
+  # Delegation tools - spawn child jobs as workspace branches (src/tools/delegation/)
+  delegation: []
+  # Orchestrator tools - job delegation for persistent agents (src/tools/orchestrator/)
+  # Empty by default; persistent agents auto-load these via PersistentSession
+  orchestrator: [ ]
+  # Agent catalog tools - expert/skill management
+  # Empty by default; persistent agents auto-load these via PersistentSession
+  agent_catalog: [ ]
+  # Workflow tools - automations and project loop inspection
+  # Empty by default; session experts opt into this closed control group.
+  workflows: [ ]
+  # Git tools - workspace version control (src/tools/git/)
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  # Role-owned groups (declared by the overlays, not here): core (the worker's
+  # phase loop), communication, canvas, webdav, job_control, job_inspection,
+  # catalog_authoring.
+
+connections:
+  postgres: true
+
+limits:
+  # Model-dependent limits (context_threshold_tokens, model_max_context_tokens, etc.)
+  # are set via config/model_config_matrix.yaml — do not set them here.
+  message_count_threshold: 300
+  tool_retry_count: 3
+  response_validation:
+    enabled: true
+    max_content_length: 50000   # chars, flag if exceeded with no tool calls
+    max_tag_repetitions: 50     # same closing tag repeated this many times
+    max_token_repetitions: 20   # same word/token repeated consecutively
+    max_line_repetitions: 10    # same line repeated in output
+  # The worker's own budgets (llm_inproc_retries, max_tool_calls_per_job, the
+  # progress/act-ratio tripwires, tool_category_timeouts, ...) live in
+  # overlays/worker.yaml — they bound the phase loop, which only a worker runs.
+
+context_management:
+  keep_recent_tool_results: 150
+  keep_recent_messages: 10
+  keep_window_max_tool_result_chars: 16000
+  summarization_template: summarization_prompt.txt
+  reasoning_level: high  # Only injected when reasoning_method is "prompt" (gpt-oss)
+  max_summary_length: 20000
+
+research:
+  # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)
+  proxy:
+    enabled: false
+    type: socks5  # "http", "socks5", or "none"
+    host: null
+    port: null
+
+# Memory Light (RecallStore) — hybrid search memory for cross-context recall
+# See knowledge-base/knowledge/features/memory_light.md for architecture details.
+memory:
+  enabled: true                    # Opt-in per config
+  required: false                  # When true, a memory-dependent job pauses for bounded re-dispatch instead of running blind if memory/KB fail to init (self-improvement loop sets this)
+  budget_tokens: 4000              # Max tokens for memory injection per LLM call (P-4 A/B, strategy doc §14); the session overlay raises it
+  max_memories_per_injection: 50   # Cap on number of memories injected; the session overlay raises it
+  observer_interval: 5             # Run observer every N turns
+  assembler_interval: 7            # Run assembler every N turns (TTL curation)
+  default_ttl: 10                  # Default TTL in turns for new memories (guaranteed injection)
+  importance_threshold: 0.3        # Minimum importance to store
+  dedup_threshold: 0.85            # Cosine similarity threshold for dedup
+  retrieval_importance_floor: 0.4  # Minimum importance for retrieval (memories below this are stored but not recalled)
+  project_scoped: true             # When true, memories are shared across all jobs in the same project
+  # NOTE: the observer runs on the auxiliary LLM (see `auxiliary:` below) and
+  # the embedding model comes from the EMBEDDING_* env vars — neither is
+  # configurable here (dead keys removed, knowledge-base/knowledge/issues/memory_bugs.md B9).
+  # MemoryManager seam (memory overhaul Phase 1). manager.enabled is the
+  # cutover flag: true routes memory through the manager + the pipeline
+  # below; false keeps the legacy direct-store paths in the graph. The
+  # pipeline names resolve against MEMORY_PLUGIN_REGISTRY
+  # (src/services/memory/) — an unknown name fails loudly at setup.
+  manager:
+    enabled: true
+  pipeline:
+    retrievers:
+      - recall_two_tier              # TTL-pinned tier + hybrid search (RecallStore)
+      - kb_notes                     # Top-5 project knowledge notes
+    scorers:
+      - reranker                     # GATE B (overhaul Phase 3): cross-encoder rerank over the fused candidates
+    policies:
+      - gate                         # drop the non-qualifying tail (relative floor)
+      - bounded                      # cap the survivors at max_items
+    # `writers` is role-owned: the worker's in-loop / phase-boundary / assembler
+    # set versus the session's elapsed-gate / teardown set. Each overlay
+    # declares its own.
+  # Phase-3+4 production-candidate stack, flipped on for the dev rollout
+  # (GATE B — knowledge-base/knowledge/features/agent_memory_overhaul.md). Harness-measured:
+  # R@5 0.20->1.0 at ~111 tok/q (80x cheaper than the full dump) and
+  # knowledge-update end-task 0/4->3/4 once stale facts are retired.
+  # ROLLBACK: set scorers/policies back to [] and ingestion.enabled false —
+  # the legacy two-tier read + cosine-dedup write stay in place behind these
+  # flags, so this is a one-edit revert.
+  reranker:
+    model: qwen3-reranker-8b         # rides the embedding endpoint EMBEDDING_BASE_URL (same qwen3 router; no extra credential plumbing)
+    top_k: 512                       # cover the candidate set; any tail past this fails the gate open, bounded backstops it
+    keep_pinned_first: false         # ~95% of project corpora freeze TTL-pinned — let the reranker rank them too
+    timeout: 10                      # live-latency cap per attempt (eval used 60 for cold-batch throughput)
+    # Transient faults (timeout/connection drop/5xx) retry in-call, then
+    # degrade THAT TURN to hybrid order instead of failing the job; structural
+    # failures (4xx/shape) stay job-fatal ("configured => required").
+    # knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md
+    retries: 2                       # extra attempts after the first
+    retry_backoff: 1.0               # seconds before retry 1, doubling after
+  gate:
+    threshold: 0.01                  # relative floor = 0.01 x the assemble's top rerank score
+    mode: relative                   # absolute thresholds falsified: qwen3-reranker scale varies orders of magnitude per query
+  bounded:
+    max_items: 10                    # inject at most 10 memory items after gating
+  # Phase 4 — ingestion verdicts (ADD/UPDATE/MERGE/NOOP) + bi-temporal
+  # supersede: retire stale facts so they stop being injected. Cost guard:
+  # the verdict LLM fires only when a neighbour is >= review_floor similar.
+  ingestion:
+    enabled: true
+    verdict_top_k: 5
+    review_floor: 0.5   # measured 2026-06-17 (lifecycle probe): 0.6→0.5 halves missed-retire (catches cosine-0.547 supersede), false-retire stays 0
+  extraction:
+    write_gate: false                # completeness over precision — relevance is gated at retrieval now, not at write time
+
+# Auxiliary LLM — unified support task system for background LLM tasks.
+# Handles memory extraction, knowledge curation, and other support tasks
+# using structured output. Two modes: chain (in→out) and agent (in→tools→out).
+# See knowledge-base/knowledge/features/auxiliary.md for full design.
+auxiliary:
+  enabled: true
+  model: RedHatAI/gemma-4-31B-it-FP8-Dynamic  # Free local model for all support tasks
+  base_url: null               # null = use LLM_BASE_URL (university vLLM endpoint)
+  temperature: 0.0
+  max_iterations: 15       # Cap for agent mode loops
+  # Bounded: short aux tasks (memory extraction, knowledge curation, titles)
+  # can run on a turn's critical path, so a hung endpoint mustn't stall a turn
+  # for long. Failures fall back / skip gracefully.
+  timeout: 120             # Seconds per LLM call (quick interactive tasks)
+  # Per fold-call budget for conversation summarization (each pass is one
+  # bounded call — src/core/summarizer.py)
+  summarization_call_timeout: 240
+  tasks:
+    extract_memories:
+      enabled: true
+    curate_knowledge:
+      enabled: true
+      # The worker overlay turns on `verdict` (adjudicate each curator write
+      # against existing notes) — it fires only where the curator runs.
+    assemble_memories:
+      # Worker-only: no persistent code path calls assemble_memories
+      # (knowledge-base/knowledge/issues/memory_bugs.md B3). The worker overlay
+      # enables it; everything else keeps it off.
+      enabled: false
+    # Citation verification (citation engine Phase 2): cite_* returns 'pending'
+    # and the verifier writes the verdict back async on the citation model
+    # (CITATION_LLM_*, dispatched per job) or the auxiliary model fallback.
+    verify_citations:
+      enabled: true
+
+# Browser tool settings (workspace-side browser-exec daemon)
+# Direct browser tools (browser_navigate, browser_click, etc.) give the agent
+# step-by-step control of a Chromium on the workspace; the agent pod never
+# runs a browser. Vision mode auto-selects based on model's multimodal flag.
+browser:
+  snapshot:
+    include_screenshot: auto  # "auto" (if multimodal) | true | false
+    max_dom_chars: 40000  # Truncate DOM text beyond this
+  security:
+    allowed_domains: []  # Empty = allow all domains
+    # Conservative default; the worker overlay clears it (its browser runs in
+    # an isolated workspace where localhost is safe).
+    blocked_domains: ["localhost", "127.0.0.1", "169.254.169.254"]
+    blocked_schemes: ["file", "javascript", "data"]
+
+# Shell command execution (tmux-backed terminal multiplexer)
+# Requires tmux installed.
+shell:
+  # `mode` is intentionally NOT set here. It is model-family-derived
+  # (config/model_config_matrix.yaml `settings.shell_mode`): capable families ->
+  # "persistent" (shell_execute), everything else falls to the stateless floor at
+  # the read-sites (shell_tools.create_shell_tools / loader.get_all_tool_names,
+  # both `.get("mode", "stateless")`). An explicit `mode:` here or in an
+  # expert/session/project config overrides that family default (human wins).
+  max_tabs: 15                   # Maximum number of concurrent shell tabs
+  max_read_lines: 200          # Maximum lines shell_read can return
+  scrollback_limit: 5000       # Tmux history-limit per pane
+  default_timeout: 120         # Default timeout for sync mode (seconds)
+  blocked_commands: [reboot, shutdown, poweroff, halt, init]
+  sudo_action: freeze          # "freeze" (intercept sudo, offer VM upgrade) or "block" (hard reject)
+  sandbox: true                # Restrict working directory to workspace
+
+# Interactive persistent agent settings
+# Only used when agent is started with --mode persistent
+interactive:
+  permission_mode: supervised   # supervised | auto_accept | autonomous
+  narration_mode: auto          # silent | verbose | auto
+  idle_timeout_minutes: 30      # Auto-pause session after idle period (0 = disabled)

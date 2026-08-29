@@ -1,0 +1,141 @@
+# yaml-language-server: $schema=../schema.json
+# Subagent role overlay — the defaults a roster entry (an inline "small expert"
+# or a `$ref` to any other expert) resolves on when it runs as a child of a
+# worker or session. Public name: `subagent_base`.
+#
+# A child runs in-process in its parent's workspace (universal_experts_and_subagents.md
+# §0 D3/D7): it never provisions a workspace, never pauses for a human, never
+# spawns subjobs or children of its own. The keys below are therefore
+# parent-only and are pruned from the merged config no matter which layer
+# authored them — a `$ref: critic` keeps the critic's tools and prompts but
+# loses its workspace.backend / verification / autonomy. Ignoring, not
+# erroring, is the contract (D4): a key that does not apply to a role is
+# dropped silently.
+#
+# The list is a plain config value: `deep_merge` treats it like any other key
+# (an expert may replace it wholesale by declaring its own `$ignore_keys`), and
+# the loader prunes after every merge, the orchestrator resolver prunes again
+# after the job/thread override layers, and the roster resolver (U1 WP3) after
+# the roster override — so a later layer cannot re-introduce a pruned key.
+$extends: expert_base
+
+$ignore_keys:
+  # How the PARENT's workspace is provisioned, scaffolded and versioned. The
+  # child shares that tree (isolation: shared | worktree); read/write word caps
+  # (workspace.max_read_words / max_write_words) still apply to the child's
+  # tools and are kept.
+  - workspace.backend
+  - workspace.remote
+  - workspace.mounts
+  - workspace.structure
+  - workspace.instructions_template
+  - workspace.initial_files
+  - workspace.git_versioning
+  # Pause-for-review semantics — a child is driven by its parent's turn.
+  - autonomy
+  # Subjob spawning after/before the parent job (critic, research pass, KB
+  # curation at archive_phase) — orchestrator-side, parent-only.
+  - verification
+  - scholar
+  - curator
+  # The phase loop and its bounds — a child is a headless session, no phases.
+  - phase_settings
+  # Children get no delegation of their own (D7: depth 1).
+  - delegation
+  # Agent-to-human email — only the parent talks to people.
+  - communication
+  # Persistent-session lifecycle blocks: the always-on officer and the
+  # untethered attention watchdog / notification channels.
+  - officer
+  - headless
+  # Deliberately NOT ignored: `instruction_files` (bounded guidance can apply
+  # to a child; a trigger for a tool the child lacks simply never fires) and
+  # `interactive` (set below to what a child needs rather than dropped).
+
+agent_id: subagent_base
+display_name: Framework Subagent Base
+
+# `workspace.structure` is not declared here on purpose — it is in the ignore
+# list above (a child scaffolds nothing in its parent's tree).
+
+tools:
+  # Read-only floor. A roster entry that needs writes, a shell or a browser
+  # grants them explicitly on the entry (or via a `$ref` to a fuller expert) —
+  # the floor is what an unqualified child gets, not a maximal profile.
+  workspace:
+    - read_file
+    - use_skill
+    - list_files
+    - search_files
+    - file_exists
+    - get_document_info
+  research:
+    - web_search
+    - extract_webpage
+    - search_papers
+    - get_paper_info
+  browser_direct: []
+  citation:
+    - list_sources
+    - get_citation
+    - list_citations
+    - get_annotations
+    - search_library
+  knowledge:
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+  # Reads only; ToolsConfig suppresses this group whenever shell tools are
+  # granted (a shell can run git itself).
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  # Nothing a child may do on its own: no phase loop, no canvas, no email, no
+  # delegation, no orchestrator/catalog/workflow control.
+  core: []
+  canvas: []
+  communication: []
+  webdav: []
+  job_control: []
+  job_inspection: []
+  catalog_authoring: []
+
+limits:
+  # The child's own turn / token / staleness / return budgets
+  # (max_turns, max_tokens, return_budget_tokens, stale_idle_s, stale_in_tool_s)
+  # are documented in universal_experts_and_subagents.md §1.1 and become
+  # LimitsConfig leaves with the roster runtime (U3). LimitsConfig parses a
+  # closed set of keys today, so they are not declared here yet — an
+  # undeclared key under `limits` would be dropped silently, not carried.
+  tool_retry_count: 2
+
+memory:
+  # A child returns a bounded result to its parent; it does not write to (or
+  # read from) the shared recall store on its own.
+  enabled: false
+
+auxiliary:
+  # No background extraction/curation from a child — the parent owns those.
+  tasks:
+    extract_memories:
+      enabled: false
+    curate_knowledge:
+      enabled: false
+    assemble_memories:
+      enabled: false
+    verify_citations:
+      enabled: false
+
+interactive:
+  # A child never asks a human for permission and never narrates; it has no
+  # idle lifecycle of its own (the parent's staleness budget bounds it).
+  permission_mode: autonomous
+  narration_mode: silent
+  idle_timeout_minutes: 0

@@ -298,10 +298,21 @@ def test_todo_guide_skill_exists_and_parses():
     assert len(body) > 500
 
 
-def test_worker_base_binds_todo_guide_as_skill():
+def _bindings_source(config_path: str) -> dict:
+    """A bundled config's raw YAML, or — for the public base name
+    ``worker_base`` — the merged worker role base (``expert_base`` + the worker
+    overlay, where ``instruction_files`` lives since the U1 split)."""
     import yaml
 
-    cfg = yaml.safe_load(_P("config/worker_base.yaml").read_text())
+    from src.core.loader import load_role_base
+
+    if config_path == "worker_base":
+        return load_role_base("worker")
+    return yaml.safe_load(_P(config_path).read_text())
+
+
+def test_worker_base_binds_todo_guide_as_skill():
+    cfg = _bindings_source("worker_base")
     entries = cfg["instruction_files"]
     todo = [e for e in entries if e.get("skill") == "todo-guide"]
     assert len(todo) == 1
@@ -328,16 +339,14 @@ def test_interactive_designer_uses_an_action_gate_not_setup_injection():
 @pytest.mark.parametrize(
     "config_path",
     [
-        "config/worker_base.yaml",
+        "worker_base",
         "config/experts/scholar/config.yaml",
         "config/experts/product-qa/config.yaml",
         "config/experts/designer/config.yaml",
     ],
 )
 def test_verify_before_done_is_passive_and_freshness_scoped(config_path):
-    import yaml
-
-    cfg = yaml.safe_load(_P(config_path).read_text())
+    cfg = _bindings_source(config_path)
     entries = [
         entry
         for entry in cfg["instruction_files"]
@@ -360,7 +369,6 @@ def test_runtime_and_cockpit_schemas_accept_bounded_skill_bindings():
     import json
 
     import jsonschema
-    import yaml
 
     runtime = json.loads(_P("config/schema.json").read_text())["properties"][
         "instruction_files"
@@ -387,14 +395,14 @@ def test_runtime_and_cockpit_schemas_accept_bounded_skill_bindings():
     ]
     jsonschema.validate(bindings, runtime)
     for config_path in (
-        "config/worker_base.yaml",
+        "worker_base",
         "config/experts/assistant/config.yaml",
         "config/experts/designer/config.yaml",
         "config/experts/designer-interactive/config.yaml",
         "config/experts/product-qa/config.yaml",
         "config/experts/scholar/config.yaml",
     ):
-        config = yaml.safe_load(_P(config_path).read_text())
+        config = _bindings_source(config_path)
         jsonschema.validate(config["instruction_files"], runtime)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(

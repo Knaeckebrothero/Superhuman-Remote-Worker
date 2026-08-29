@@ -19,11 +19,17 @@ from typing import Awaitable, Callable, Optional
 import yaml
 
 from src.core.loader import (
+    ROLE_ROOTS,
+    ROOT_NAMES,
     _apply_settings_matrix,
+    authored_llm_keys,
+    canonical_config_name,
     deep_merge,
     load_agent_config_from_dict,
     load_and_merge_config,
     normalize_llm_tiers,
+    prune_ignored_keys,
+    reroot_extends,
     resolve_config_path,
     serialize_resolved_config,
 )
@@ -46,20 +52,14 @@ _OVERLAY_PROMPT_KEYS = (
 def _raw_leaf_llm_keys(config_path: str) -> set:
     """llm keys explicitly set in the base config's own leaf file.
 
-    Mirrors ``load_agent_config`` (loader.py:1831-1837): the settings matrix
-    refines only the keys it owns and must never clobber an explicitly-set llm
-    value. Without this the base-only resolve would diverge from the agent's
-    ``from_config`` fallback.
+    Mirrors ``load_agent_config``: the settings matrix refines only the keys
+    it owns and must never clobber an explicitly-set llm value. Without this
+    the base-only resolve would diverge from the agent's ``from_config``
+    fallback. ``authored_llm_keys`` is chain-aware for a role root (the
+    overlay + ``expert_base`` pair is one authored base), lifts legacy tier
+    blocks first, and returns an empty set for unreadable input.
     """
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-        # Same layer-local mapping load_and_merge_config applies to this file,
-        # so a lifted legacy block counts as explicit here too.
-        raw = normalize_llm_tiers(raw, source=str(config_path))
-        return set((raw.get("llm") or {}).keys())
-    except Exception:
-        return set()
+    return authored_llm_keys(config_path)
 
 
 def resolve_config(
@@ -92,8 +92,16 @@ def resolve_config(
 
     The returned blob carries NO credentials (``serialize_resolved_config``
     strips ``llm.api_key``); the caller injects creds into the delivery copy and
-    strips the rest before persisting. ``expert_type`` documents the call-site
-    intent (the base is actually selected by ``base_config_name``).
+    strips the rest before persisting.
+
+    ``expert_type`` is the ROLE the config is resolved for (``worker`` /
+    ``session`` / ``subagent``): the bundled base's ``$extends`` chain is
+    re-rooted onto that role's overlay (``expert_base <- overlays/<role> <-
+    expert``, universal_experts_and_subagents.md §1.1), so a session expert
+    resolves as a worker for a job and vice versa. When ``base_config_name``
+    is itself a chain root (``worker_base`` / ``session_base`` / ...) the role
+    wins over the name — the roots are one thing in different roles. Any other
+    string keeps the chain's own root (call-site intent only, as before).
 
     ``grant_strip``, when given, runs on the fully-merged ``data`` before BOTH
     ``capture`` and the returned blob are built from it — so the PDP's capture
@@ -101,19 +109,31 @@ def resolve_config(
     ``capture`` would silence the dispatch check while still delivering the
     stripped capability.
     """
+    role = expert_type if expert_type in ROLE_ROOTS else None
+    if role is not None and canonical_config_name(base_config_name) in ROOT_NAMES:
+        base_config_name = ROLE_ROOTS[role]
     base_path, deployment_dir = resolve_config_path(base_config_name)
 
     # A named bundled expert is logically an expert overlay, not the base layer.
     # Split its leaf from $extends so account fallbacks can sit above the real
     # framework base but below the bundled expert, matching DB expert precedence.
     # (Previously account defaults silently replaced bundled expert models.)
+    # A chain root is the base itself, never a leaf on top of another base.
     bundled_leaf: dict = {}
     parent_path: str | None = None
+    parent_role: str | None = None
     try:
         with open(base_path, "r", encoding="utf-8") as f:
             raw_leaf = yaml.safe_load(f) or {}
-        if isinstance(raw_leaf, dict) and raw_leaf.get("$extends"):
-            parent_path, _ = resolve_config_path(str(raw_leaf["$extends"]))
+        if (
+            isinstance(raw_leaf, dict)
+            and raw_leaf.get("$extends")
+            and canonical_config_name(base_config_name) not in ROOT_NAMES
+        ):
+            # Same re-rooting rule the loader applies to a chain link: a link
+            # to any root becomes the requested role's overlay.
+            parent_name, parent_role = reroot_extends(str(raw_leaf["$extends"]), role)
+            parent_path, _ = resolve_config_path(parent_name)
             bundled_leaf = dict(raw_leaf)
             bundled_leaf.pop("$extends", None)
             # Read straight off disk, so it bypasses load_and_merge_config's
@@ -126,10 +146,10 @@ def resolve_config(
         raw_leaf = {}
 
     if parent_path:
-        data = load_and_merge_config(parent_path)
+        data = load_and_merge_config(parent_path, role=parent_role)
         explicit_llm_keys = _raw_leaf_llm_keys(parent_path)
     else:
-        data = load_and_merge_config(base_path)
+        data = load_and_merge_config(base_path, role=role)
         explicit_llm_keys = _raw_leaf_llm_keys(base_path)
 
     # Default-model floor: replace the base placeholder model before the expert
@@ -201,6 +221,11 @@ def resolve_config(
             if layer.get("llm"):
                 explicit_llm_keys |= set(layer["llm"].keys())
             data = deep_merge(data, layer)
+
+    # Pruning point 2 of 3: the role overlay's ignored keys are dropped again
+    # after the request layers, so a job/thread override cannot re-introduce
+    # what the role does not read (e.g. `workspace.backend` for a subagent).
+    data = prune_ignored_keys(data)
 
     _apply_settings_matrix(data, explicit_llm_keys, deployment_dir)
 

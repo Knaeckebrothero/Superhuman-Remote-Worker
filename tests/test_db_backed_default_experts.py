@@ -84,12 +84,19 @@ async def test_personal_default_is_dormant_when_grant_is_revoked():
 
 
 def test_legacy_base_names_resolve_to_canonical_files():
+    """The public root names survive the U1 split: aliases canonicalise to
+    ``worker_base``/``session_base`` (never to the overlay files), and the
+    names resolve to the role overlays that replaced the old base files."""
     assert canonical_config_name("defaults") == "worker_base"
     assert canonical_config_name("persistent_defaults") == "session_base"
+    assert canonical_config_name("worker_base") == "worker_base"
+    assert canonical_config_name("overlays/session") == "session_base"
     worker, _ = resolve_config_path("defaults")
     session, _ = resolve_config_path("persistent_defaults")
-    assert Path(worker).name == "worker_base.yaml"
-    assert Path(session).name == "session_base.yaml"
+    assert Path(worker).parts[-2:] == ("overlays", "worker.yaml")
+    assert Path(session).parts[-2:] == ("overlays", "session.yaml")
+    assert resolve_config_path("worker_base")[0] == worker
+    assert resolve_config_path("session_base")[0] == session
 
 
 def test_managed_seed_bundles_are_raw_typed_overlays():

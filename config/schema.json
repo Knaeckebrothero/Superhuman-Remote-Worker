@@ -11,6 +11,19 @@
       "type": "string",
       "description": "JSON Schema reference"
     },
+    "$extends": {
+      "type": "string",
+      "description": "Parent config this file deep-merges onto (objects merge, lists replace, null clears). Chain roots: worker_base / session_base / subagent_base — the role overlays under config/overlays/ by their public names (default(s), persistent_default(s) and overlays/<role> are aliases) — and expert_base, the shared root every overlay extends. Any other value names another expert (config/experts/<name>, config/subagents/<name> or config/<name>.yaml) whose own chain is followed. When a config is resolved FOR a role (a job asks for worker, a session for session, a roster entry for subagent), the link that ends the chain is re-rooted onto that role's overlay, so every expert is usable in every role. See knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.",
+      "examples": ["worker_base", "session_base", "expert_base", "critic"]
+    },
+    "$ignore_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Dotted key paths the config's ROLE ignores — declared by a role overlay (config/overlays/subagent.yaml ignores workspace.backend, autonomy, verification, ...). Pruned from the merged config after every merge, again after the job/thread override layers, and after a roster override: a key that does not apply to a role is dropped silently, never an error. Rides the merge like any list (a child that declares its own list replaces it wholesale; an empty list disables pruning). Never parsed into the agent config.",
+      "examples": [["workspace.backend", "autonomy", "verification", "phase_settings"]]
+    },
     "agent_id": {
       "type": "string",
       "description": "Unique identifier for this agent type",

@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
-import yaml
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -2906,6 +2905,7 @@ class UniversalAgent:
         if not _config_from_db and metadata.get("config_name"):
             from .core.loader import (
                 _apply_settings_matrix,
+                authored_llm_keys,
                 load_and_merge_config,
                 load_agent_config_from_dict,
                 resolve_config_path,
@@ -2917,14 +2917,10 @@ class UniversalAgent:
                 logger.info(f"Loading expert config '{expert_name}' from {config_path}")
                 merged_config_data = load_and_merge_config(config_path)
 
-                # Apply settings_matrix (model-family defaults) — mirrors load_agent_config()
-                raw_expert_llm_keys: set[str] = set()
-                try:
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        raw_expert = yaml.safe_load(f) or {}
-                    raw_expert_llm_keys = set((raw_expert.get("llm") or {}).keys())
-                except Exception:
-                    pass
+                # Apply settings_matrix (model-family defaults) — mirrors
+                # load_agent_config(): the leaf's own llm keys are explicit (for
+                # a role root, the overlay + expert_base pair).
+                raw_expert_llm_keys: set[str] = authored_llm_keys(config_path)
                 _apply_settings_matrix(
                     merged_config_data, raw_expert_llm_keys, deployment_dir
                 )

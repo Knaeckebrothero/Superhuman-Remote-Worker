@@ -3047,10 +3047,9 @@ def _load_expert_config(config_name: str):
     right config baked in — failing loud beats silently running a session
     on the worker YAML.
     """
-    import yaml
-
     from ..core.loader import (
         _apply_settings_matrix,
+        authored_llm_keys,
         load_agent_config_from_dict,
         load_and_merge_config,
         resolve_config_path,
@@ -3058,13 +3057,9 @@ def _load_expert_config(config_name: str):
 
     config_path, deployment_dir = resolve_config_path(config_name)
     merged_config_data = load_and_merge_config(config_path)
-    raw_llm_keys: set = set()
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            raw_cfg = yaml.safe_load(f) or {}
-        raw_llm_keys = set((raw_cfg.get("llm") or {}).keys())
-    except Exception:
-        pass
+    # The leaf's own llm keys are explicit for the matrix (for a role root
+    # such as `session_base`, the overlay + expert_base pair).
+    raw_llm_keys: set = authored_llm_keys(config_path)
     _apply_settings_matrix(merged_config_data, raw_llm_keys, deployment_dir)
     return load_agent_config_from_dict(
         merged_config_data, deployment_dir=deployment_dir

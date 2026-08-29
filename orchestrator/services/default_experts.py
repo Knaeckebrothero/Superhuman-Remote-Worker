@@ -71,8 +71,11 @@ def load_seed_bundle(
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"Invalid managed expert config: {config_path}")
+    # Both sides canonical: the public root names (`worker_base`/`session_base`)
+    # are what `$extends` values and BASE_CONFIG_NAMES canonicalise to, however
+    # the seed spells its base (`defaults`, `overlays/worker`, ...).
     extends = canonical_config_name(str(raw.pop("$extends", "worker_base")))
-    expected = BASE_CONFIG_NAMES[expert_type]
+    expected = canonical_config_name(BASE_CONFIG_NAMES[expert_type])
     if extends != expected:
         raise ValueError(
             f"Managed expert {directory!r} extends {extends!r}; expected {expected!r}"

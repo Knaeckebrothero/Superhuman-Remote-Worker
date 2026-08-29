@@ -6,18 +6,18 @@ This directory contains agent configuration files and templates.
 
 ```
 config/
-├── worker_base.yaml             # Conservative inheritance base for worker experts
-├── session_base.yaml            # Conservative inheritance base for session experts
+├── expert_base.yaml             # The ONE shared root every expert resolves on (every role)
+├── overlays/                    # Role overlays — each `$extends: expert_base`
+│   ├── worker.yaml              #   public name `worker_base`  (job / phase-loop experts)
+│   ├── session.yaml             #   public name `session_base` (interactive / persistent experts)
+│   └── subagent.yaml            #   public name `subagent_base` (roster entries; declares `$ignore_keys`)
 ├── schema.json                  # JSON Schema for config validation
-├── prompt_matrix.yaml           # Base prompt matrix (model family → filename)
-├── instruction_matrix.yaml      # Base instruction matrix (model family → filename)
-├── settings_matrix.yaml         # Model-family-specific inference params & context limits
+├── model_config_matrix.yaml     # Per model family: prompt/instruction filenames, inference params, context limits
 ├── README.md                    # This file
 ├── experts/                     # Bundled roles and application-default seed bundles
 │   └── <expert>/
-│       ├── config.yaml              # Expert overlay (extends one mode base)
-│       ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
-│       └── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
+│       ├── config.yaml              # Expert overlay (`$extends: worker_base` or `session_base`)
+│       └── model_config_matrix.yaml # Expert-level matrix override (optional)
 ├── prompts/                     # Prompt templates (system prompt, phase prompts)
 │   ├── systemprompt.txt         # Main system prompt
 │   ├── persona.txt              # Agent persona/identity prompt
@@ -49,11 +49,57 @@ config/
     └── phase_retrospective_template.md  # Template for phase retrospectives
 ```
 
+## Roles, the shared root and the overlays
+
+Every expert resolves on the same chain, most specific last:
+
+```
+expert_base  <-  overlays/<role>  <-  expert ($extends chain)  <-  model family (matrix)  <-  job / thread / roster override
+```
+
+- `expert_base.yaml` carries everything every role shares (llm, tools, limits,
+  memory, auxiliary, browser, shell, ...). It is never loaded on its own by a
+  runtime.
+- `overlays/<role>.yaml` adds the role's own keys and the role's values of
+  shared keys. The worker overlay owns the phase loop (`instruction_files`,
+  `phase_settings`, `delegation`, `autonomy`, `verification`, `scholar`,
+  `curator`, `communication`, the `core` tool group); the session overlay owns
+  the canvas grant, the session-only application groups and the session memory
+  writers; the subagent overlay is a read-only tool floor with memory and
+  background tasks off.
+- The overlays' **public names** are `worker_base`, `session_base` and
+  `subagent_base`. They are what `$extends`, `--config`, `config_name` and the
+  experts API use; `default`/`defaults`, `persistent_default`/`persistent_defaults`
+  and the file spelling `overlays/<role>` are accepted aliases. A path such as
+  `config/worker_base.yaml` still loads (it lands on the overlay).
+
+**Role re-rooting.** A config is normally loaded on the root its own chain
+names. When it is resolved *for* a role — a job resolves for `worker`, a
+session for `session`, a roster entry for `subagent` — the loader
+(`load_and_merge_config(path, role=...)`) replaces the link that ends the chain
+with that role's overlay. So a session expert dispatched as a job gains the
+worker keys underneath it, and a worker expert used in a session sits on the
+session overlay; the expert's own values always win ("expert wins").
+
+**Ignored keys.** A role overlay may declare `$ignore_keys`, a list of dotted
+paths its role never reads. They are pruned from the merged config after every
+merge, again after the job/thread override layers, and after a roster
+override, so no later layer can re-introduce them. A key that does not apply
+to a role is dropped silently — never an error. Today only the subagent
+overlay declares any (`workspace.backend/remote/mounts/structure/instructions_template/initial_files/git_versioning`,
+`autonomy`, `verification`, `scholar`, `curator`, `phase_settings`,
+`delegation`, `communication`, `officer`, `headless`); the worker and session
+overlays declare none, so a re-rooted expert keeps everything it authored.
+
+Never read a base file directly — an overlay alone is only the role's residue.
+Use `load_role_base(role)` (the merged `expert_base` + overlay) from
+`src/core/loader.py`.
+
 ## Creating a Custom Agent Config
 
 ### Option 1: Single File Config
 
-Create a worker YAML file that extends the worker mode base:
+Create a worker YAML file that extends the worker role base:
 
 ```yaml
 # yaml-language-server: $schema=schema.json
@@ -77,10 +123,12 @@ Save as `config/my_agent.yaml` and run:
 python agent.py --config my_agent
 ```
 
-Persistent/session experts use `$extends: session_base` instead. The legacy
+Persistent/session experts use `$extends: session_base` instead; a shared
+"small expert" meant for rosters uses `$extends: subagent_base`. The legacy
 names `default`, `defaults`, `persistent_default`, and `persistent_defaults`
 remain accepted as compatibility aliases, but new configs should use the
-explicit mode-base names.
+explicit public root names. Whichever root an expert names, it can be used in
+every role (see "Roles, the shared root and the overlays" above).
 
 ### Option 2: Directory Config (with prompt overrides)
 
@@ -288,7 +336,8 @@ tools:
     - cite_document
 ```
 
-See `worker_base.yaml` and `session_base.yaml` for the conservative inherited
+See `expert_base.yaml` (the shared groups) and `overlays/worker.yaml` /
+`overlays/session.yaml` (the role-owned groups) for the conservative inherited
 tool surfaces. Privileged and orchestration-oriented groups such as shell,
 delegation, automations, and loops are opt-in at the expert layer.
 
@@ -424,8 +473,10 @@ memory:
 
 ## Inheritance
 
-Configs use `$extends: worker_base` or `$extends: session_base` to inherit the
-appropriate execution-mode fallback. Deep merge applies:
+Configs use `$extends: worker_base`, `$extends: session_base` or
+`$extends: subagent_base` to inherit a role base (`expert_base` + that role's
+overlay), or `$extends: <expert>` to build on another expert's chain. Deep
+merge applies at every link:
 - Objects (dicts): Recursively merged
 - Arrays (lists): Override replaces entirely
 - Scalars: Override replaces
@@ -439,6 +490,10 @@ $extends: worker_base
 tools:
   research: null  # Clears all research tools
 ```
+
+`null` clears a key for *that* merge only — a later layer (a job override)
+re-adds it. Keys a role must never see are declared with `$ignore_keys` on the
+role overlay instead (see above); they are pruned after every layer.
 
 ## Schema Validation
 

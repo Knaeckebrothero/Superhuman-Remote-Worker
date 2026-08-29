@@ -623,8 +623,12 @@ from src.shared.expert_reference import (  # noqa: E402
     resolve_expert_selection,
 )
 from src.core.loader import (  # noqa: E402
+    ROLE_ROOTS,
     canonical_config_name,
+    chain_root,
     load_and_merge_config,
+    load_role_base,
+    prune_ignored_keys,
     resolve_config_path,
 )
 from services.session_router import SessionRouterService  # noqa: E402
@@ -3913,8 +3917,17 @@ def _merged_session_tool_policy(
 
     base_fragment: dict[str, Any] = {}
     try:
+        # The same role re-rooting resolve_config just applied: a root name is
+        # answered by the role's base, a bundled expert's chain is re-rooted —
+        # otherwise provenance would blame a base layer that was never merged.
         base_path, _ = resolve_config_path(base_config_name)
-        base_fragment = load_and_merge_config(base_path) or {}
+        base_fragment = (
+            load_and_merge_config(
+                base_path,
+                role=expert_type if expert_type in ROLE_ROOTS else None,
+            )
+            or {}
+        )
     except Exception:
         logger.warning(
             "Tool-group provenance could not load base config '%s'; the base "
@@ -60397,8 +60410,26 @@ def _get_config_dir() -> Path:
     return candidates[0]
 
 
+def _role_base_or_empty(role: str) -> dict[str, Any]:
+    """The fully merged role base (``expert_base`` + the role overlay), or
+    ``{}`` with a warning when the bundled files cannot be read — the same
+    tolerance the old raw ``worker_base.yaml`` reads had. Never read a base
+    file directly: an overlay alone is only the role's residue."""
+    try:
+        return load_role_base(role)
+    except Exception as exc:
+        logger.warning("Role base %r unavailable: %s", role, exc)
+        return {}
+
+
 def _scan_experts() -> list[ExpertInfo]:
-    """Scan config/experts/ for expert configurations."""
+    """Scan config/experts/ for expert configurations.
+
+    Only ``config/experts/*/config.yaml`` is listed — the chain roots
+    (``expert_base.yaml``, ``overlays/*.yaml``) are bases, not experts, and the
+    public base ids (``worker_base`` / ``session_base``) are served by
+    ``_load_expert_detail`` by name, never listed here.
+    """
     config_dir = _get_config_dir()
     experts_dir = config_dir / "experts"
     experts: list[ExpertInfo] = []
@@ -60415,9 +60446,14 @@ def _scan_experts() -> list[ExpertInfo]:
             with open(config_path) as f:
                 data = yaml.safe_load(f) or {}
 
-            extends = canonical_config_name(str(data.get("$extends") or "worker_base"))
+            # The role is the chain's ROOT (expert -> ... -> role overlay), not
+            # only the direct $extends; a chain rooted straight on expert_base
+            # or one that cannot be followed lists as a worker, as before.
+            root = chain_root(str(config_path)) or canonical_config_name(
+                str(data.get("$extends") or "worker_base")
+            )
             expert_type: Literal["worker", "session"] = (
-                "session" if extends == "session_base" else "worker"
+                "session" if root == "session_base" else "worker"
             )
 
             description = data.get("description", "").strip()
@@ -60690,9 +60726,9 @@ async def _load_expert_detail(
         row = await postgres_db.get_expert_by_id(expert_id)
         if not row:
             return {}
-        base_name = BASE_CONFIG_NAMES[row["expert_type"]]
-        base_path = _get_config_dir() / f"{base_name}.yaml"
-        base = yaml.safe_load(base_path.read_text()) if base_path.exists() else {}
+        # The row's role base, fully merged (expert_base + overlay) — the same
+        # base `resolve_config` puts under a DB fragment at dispatch.
+        base = _role_base_or_empty(str(row["expert_type"]))
         cfg = row.get("config") or {}
         if isinstance(cfg, str):
             cfg = json.loads(cfg)
@@ -60701,8 +60737,9 @@ async def _load_expert_detail(
             if include_account_defaults
             else {}
         )
-        merged = _deep_merge(_deep_merge(base, account_layer), cfg)
-        merged.pop("connections", None)
+        merged = prune_ignored_keys(_deep_merge(_deep_merge(base, account_layer), cfg))
+        for key in ("connections", "$ignore_keys"):
+            merged.pop(key, None)
         prompts = row.get("prompts") or {}
         if isinstance(prompts, str):
             prompts = json.loads(prompts)
@@ -60762,13 +60799,12 @@ async def _load_expert_detail(
             if canonical_config_name(expert_id) == "session_base"
             else defaults_type
         )
-        base_name = "session_base" if inferred_type == "session" else "worker_base"
-        defaults_path = config_dir / f"{base_name}.yaml"
-        if defaults_path.exists():
-            with open(defaults_path) as f:
-                defaults = yaml.safe_load(f) or {}
-        else:
-            defaults = {}
+        # The public base ids resolve to the role base (expert_base + overlay);
+        # `agent_id` stays `worker_base` / `session_base` because the overlay
+        # declares it, so the served detail is unchanged by the split.
+        defaults = _role_base_or_empty(
+            "session" if inferred_type == "session" else "worker"
+        )
         # `defaults` stays the pristine framework base; the account layer is
         # merged on top only for `merged`.
         merged = _deep_merge(
@@ -60791,31 +60827,28 @@ async def _load_expert_detail(
         with open(config_path) as f:
             expert_data = yaml.safe_load(f) or {}
 
-        # Resolve $extends to load the correct base config
-        # (e.g. session_base for interactive, worker_base for worker experts)
-        extends_name = canonical_config_name(
-            str(expert_data.pop("$extends", "worker_base"))
-        )
-        base_path = config_dir / f"{extends_name}.yaml"
-        if not base_path.exists():
-            base_path = config_dir / "worker_base.yaml"
-        if base_path.exists():
-            with open(base_path) as f:
-                defaults = yaml.safe_load(f) or {}
+        # Resolve $extends to the expert's parent chain — a role overlay on
+        # expert_base for every bundled expert (another expert's chain is
+        # followed the same way). The chain ROOT names the role; an unknown
+        # parent falls back to the worker base, as before.
+        root = chain_root(str(config_path))
+        role = "session" if root == "session_base" else "worker"
+        extends_name = str(expert_data.pop("$extends", "worker_base"))
+        parent_path, _ = resolve_config_path(extends_name)
+        if Path(parent_path).is_file():
+            defaults = load_and_merge_config(parent_path)
         else:
-            defaults = {}
+            defaults = _role_base_or_empty(role)
 
         # Account layer sits above the framework base and below the bundled
         # expert leaf — the same slot `resolve_config` gives `base_defaults`.
         base_layer = _deep_merge(
             defaults,
-            await _account_defaults_layer(
-                user_id, "session" if extends_name == "session_base" else "worker"
-            )
+            await _account_defaults_layer(user_id, role)
             if include_account_defaults
             else {},
         )
-        merged = _deep_merge(base_layer, expert_data)
+        merged = prune_ignored_keys(_deep_merge(base_layer, expert_data))
         expert_config_dir = expert_dir
         # The expert's OWN llm fragment (leaf, pre-merge) — a model-agnostic
         # bundled expert has `llm: {}` here and resolves to the default floor.
@@ -60859,7 +60892,7 @@ async def _load_expert_detail(
             instructions_content = template_path.read_text(encoding="utf-8")
 
     # Remove internal/sensitive keys from merged config
-    for key in ("$extends", "connections"):
+    for key in ("$extends", "$ignore_keys", "connections"):
         merged.pop(key, None)
 
     effective = (
@@ -62362,19 +62395,14 @@ async def get_project_expert(
         tags=expert_data.get("tags", []),
     )
 
-    # Merge with defaults
+    # Merge with the worker role base (Gitea-stored experts are worker experts)
     config_dir = _get_config_dir()
-    defaults_path = config_dir / "worker_base.yaml"
-    if defaults_path.exists():
-        with open(defaults_path) as f:
-            defaults = yaml.safe_load(f) or {}
-    else:
-        defaults = {}
+    defaults = _role_base_or_empty("worker")
 
     expert_data_clean = dict(expert_data)
     expert_data_clean.pop("$extends", None)
-    merged = _deep_merge(defaults, expert_data_clean)
-    for key in ("$extends", "connections"):
+    merged = prune_ignored_keys(_deep_merge(defaults, expert_data_clean))
+    for key in ("$extends", "$ignore_keys", "connections"):
         merged.pop(key, None)
 
     # Load the raw settings_matrix for the client to resolve per-model defaults.
@@ -64322,28 +64350,16 @@ async def _resolve_preference_defaults() -> dict[str, Any]:
 
     The chat/auxiliary/session model defaults come from the DB model registry
     (``resolve_default_for_capability`` — the SAME source dispatch uses), so the
-    UI shows the model the agent will actually run, not the ``worker_base.yaml``
+    UI shows the model the agent will actually run, not the worker base's
     placeholder. Non-model fields (autonomy, reasoning, helper-model env
     fallbacks) still read framework defaults / env vars. This lets the UI show
     the actual effective value instead of "Not set" / "Server default".
     """
-    config_dir = _get_config_dir()
-
-    # Worker framework base (worker_base.yaml)
-    defaults_path = config_dir / "worker_base.yaml"
-    if defaults_path.exists():
-        with open(defaults_path) as f:
-            worker_cfg = yaml.safe_load(f) or {}
-    else:
-        worker_cfg = {}
-
-    # Persistent framework base (session_base.yaml)
-    persistent_path = config_dir / "session_base.yaml"
-    if persistent_path.exists():
-        with open(persistent_path) as f:
-            persistent_cfg = yaml.safe_load(f) or {}
-    else:
-        persistent_cfg = {}
+    # The two role bases, fully merged (expert_base + overlay): `autonomy`
+    # lives in the worker overlay and `llm.model` in expert_base, so neither
+    # file alone answers.
+    worker_cfg = _role_base_or_empty("worker")
+    persistent_cfg = _role_base_or_empty("session")
 
     llm = worker_cfg.get("llm", {})
     aux = worker_cfg.get("auxiliary", {})
@@ -64382,7 +64398,7 @@ async def _resolve_preference_defaults() -> dict[str, Any]:
         "persistent_agent": {
             # Sessions resolve their base model via the same chat-capability
             # default (base_defaults in _resolve_session_config), so surface that
-            # — not the session_base.yaml placeholder.
+            # — not the session base's placeholder.
             "model": registry_chat or p_llm.get("model"),
             "permission_mode": "supervised",
             "idle_timeout_minutes": 30,

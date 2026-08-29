@@ -41,7 +41,7 @@ def _find_repo_root() -> Path:
     """Walk up from this file to find the directory containing ``config/``."""
     anchor = Path(__file__).resolve().parent
     for _ in range(5):
-        if (anchor / "config" / "worker_base.yaml").is_file():
+        if (anchor / "config" / "expert_base.yaml").is_file():
             return anchor
         anchor = anchor.parent
     # Last resort: assume working directory (WORKDIR /app in Docker)
@@ -162,27 +162,26 @@ def _resolve_config_section_from_disk(
 
     Reads just the ``section`` key from:
 
-    1. ``config/worker_base.yaml`` (base defaults)
+    1. the worker role base (``config/expert_base.yaml`` + the worker overlay —
+       ``load_role_base("worker")``; the sections read here are worker-only,
+       so a raw read of either file alone would miss them)
     2. ``config/experts/{config_name}/config.yaml`` or
        ``config/{config_name}.yaml`` (expert override)
     3. ``config_override[section]`` (per-job override)
 
-    This avoids importing the full config loader machinery.
+    The expert leaf is still read raw — no full resolution, no matrix.
     """
     result: dict[str, Any] = {}
 
     # 1. Read defaults
-    defaults_path = _REPO_ROOT / "config" / "worker_base.yaml"
-    if defaults_path.exists():
-        try:
-            with open(defaults_path, encoding="utf-8") as f:
-                defaults = yaml.safe_load(f) or {}
-            if isinstance(defaults.get(section), dict):
-                result.update(defaults[section])
-        except Exception as e:
-            logger.warning(
-                "Failed to read worker_base.yaml for %s config: %s", section, e
-            )
+    try:
+        from src.core.loader import load_role_base
+
+        defaults = load_role_base("worker")
+        if isinstance(defaults.get(section), dict):
+            result.update(defaults[section])
+    except Exception as e:
+        logger.warning("Failed to read the worker base for %s config: %s", section, e)
 
     # 2. Read expert config (overrides defaults)
     expert_paths = [

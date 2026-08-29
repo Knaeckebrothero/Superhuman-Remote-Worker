@@ -763,15 +763,19 @@ class TestPreviewEndpoint:
         assert seen["base_config_name"] == "worker_base"
         assert seen["expert_type"] == "worker"
 
-    def test_expert_type_does_not_currently_shape_the_toolset(self):
-        """The honest scope of the ``expert_type`` parameter.
+    def test_expert_type_is_the_role_and_wins_over_a_root_base_name(self):
+        """The honest scope of the ``expert_type`` parameter, post U1 WP2.
 
-        It is threaded through because passing ``resolve_config`` the truthful
-        value is better than passing it a lie, and because it selects which
-        expert-row leaf is read. It is NOT what makes a job preview correct —
-        the base is. Pinned so nobody later "fixes" job create by threading
-        ``expert_type`` somewhere else and believing that did it, and so the day
-        this stops holding is a visible test change rather than a silent one.
+        Until the root split it was threaded through only because passing
+        ``resolve_config`` the truthful value beat passing it a lie: the BASE
+        made a job preview correct, and a tripwire pinned that ``expert_type``
+        changed nothing. That day came: ``expert_type`` is now the ROLE the
+        config resolves for. On a root name the role wins (``worker_base`` +
+        ``session`` answers as the session base — the roots are one thing in
+        different roles), and on a bundled expert the chain is re-rooted onto
+        the role's overlay. The preview endpoint threads it on every call (the
+        job form sends ``worker``), so its routing stays correct by
+        construction; ``config_name`` alone would not be.
         """
         import os
         import sys
@@ -794,11 +798,21 @@ class TestPreviewEndpoint:
             merged = (capture.get("merged_fragment") or {}).get("tools") or {}
             return {k: tuple(v) for k, v in merged.items() if v}
 
+        worker = tools_for("worker_base", "worker")
+        session = tools_for("session_base", "session")
+        assert worker != session
+        assert "core" in worker and "core" not in session
         for base in ("worker_base", "session_base"):
-            assert tools_for(base, "worker") == tools_for(base, "session"), (
-                f"expert_type now changes the toolset on {base}; the preview "
-                f"endpoint's base-only routing may no longer be sufficient"
+            assert tools_for(base, "worker") == worker, (
+                f"{base} + worker must answer as the worker base"
             )
+            assert tools_for(base, "session") == session, (
+                f"{base} + session must answer as the session base"
+            )
+        # A session-authored bundled expert previewed for a job gains the
+        # worker's phase-loop group underneath its own declarations.
+        assert "core" in tools_for("assistant", "worker")
+        assert "core" not in tools_for("assistant", "session")
 
     @pytest.mark.asyncio
     async def test_an_unresolvable_config_is_refused_not_guessed(
