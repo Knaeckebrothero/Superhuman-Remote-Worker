@@ -190,6 +190,64 @@ async def test_close_rejects_a_malformed_attachment_id():
     assert conn.acquired == 0
 
 
+# =============================================================================
+# get_ssh_attachment_thread_id -- fix round 2: lets the close endpoint
+# authorize a close against the attachment's own thread instead of trusting
+# an unauthenticated X-Internal-Key holder with an opaque UUID.
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_thread_id_returns_the_attachments_thread_id():
+    thread_id = UUID("00000000-0000-0000-0000-000000000002")
+    conn = FakeConn(fetchval=thread_id)
+    got = await _db(conn).get_ssh_attachment_thread_id(
+        "00000000-0000-0000-0000-0000000000a1"
+    )
+    assert got == str(thread_id)
+    # Bound as a UUID, not the raw string -- same contract as every other
+    # method on this table.
+    assert conn.calls[0][1][0] == UUID("00000000-0000-0000-0000-0000000000a1")
+
+
+@pytest.mark.asyncio
+async def test_get_thread_id_returns_none_for_an_unknown_attachment_id():
+    conn = FakeConn(fetchval=None)
+    got = await _db(conn).get_ssh_attachment_thread_id(
+        "00000000-0000-0000-0000-0000000000a1"
+    )
+    assert got is None
+
+
+@pytest.mark.asyncio
+async def test_get_thread_id_returns_none_when_the_thread_was_deleted():
+    """thread_id carries ON DELETE SET NULL (test_survives_session_deletion
+    above), so a real attachment row whose thread no longer exists reads
+    back NULL here. SELECT ... WHERE id = $1 cannot tell that apart from "no
+    row matched" -- fetchval returns None either way -- and that collapse is
+    intentional, not a gap: there is no thread left to authorize a close
+    against, so the close endpoint must refuse it exactly like an unknown
+    attachment id. The row's detached_at then stays NULL forever in this
+    (rare: a live channel outliving its own thread's deletion) case, a
+    data-quality nit traded for never resurrecting an access check with no
+    thread on the other end of it.
+    """
+    conn = FakeConn(fetchval=None)
+    got = await _db(conn).get_ssh_attachment_thread_id(
+        "00000000-0000-0000-0000-0000000000a1"
+    )
+    assert got is None
+
+
+@pytest.mark.asyncio
+async def test_get_thread_id_rejects_a_malformed_attachment_id():
+    conn = FakeConn()
+    with pytest.raises(ValueError):
+        await _db(conn).get_ssh_attachment_thread_id("a1")
+    assert conn.calls == []
+    assert conn.acquired == 0
+
+
 @pytest.mark.asyncio
 async def test_record_rejects_a_malformed_thread_id_before_acquiring():
     conn = FakeConn()

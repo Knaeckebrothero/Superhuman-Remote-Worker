@@ -64141,6 +64141,18 @@ async def internal_create_ssh_attachment(
 class SshAttachmentClose(BaseModel):
     """Body for closing an SSH-attachment audit row.
 
+    ``fingerprint`` (fix round 2): before this field existed, any
+    ``X-Internal-Key`` holder (every agent pod) could close ANY attachment
+    row it could name — there was no identity in this body at all, only an
+    opaque path-param UUID. Unlike ``SshAttachmentCreate`` there was no
+    identity to *forge*, so the risk isn't access escalation, but a
+    forensics table any internal-key holder can silently corrupt (mark
+    detached, stamp fabricated ``channels``) is weaker evidence, and being
+    evidence is this table's whole purpose. ``internal_close_ssh_attachment``
+    resolves this fingerprint to a user and checks that user against the
+    NAMED attachment's own thread — see that function's docstring. Capped
+    for the same reason as the other two fingerprint fields.
+
     ``channels`` is capped in both count and per-entry length: it is written
     straight into a ``text[]`` column (migration 0204) with no size limit of
     its own, so an unbounded body would let any ``X-Internal-Key`` holder
@@ -64149,6 +64161,7 @@ class SshAttachmentClose(BaseModel):
     generous headroom, not a tight fit.
     """
 
+    fingerprint: str = Field(..., min_length=1, max_length=128)
     channels: list[str] = Field(default_factory=list, max_length=8)
 
     @field_validator("channels")
@@ -64167,18 +64180,58 @@ async def internal_close_ssh_attachment(
     """Stamp detach time on an SSH-attachment row. **Internal** — requires
     ``X-Internal-Key``.
 
-    Returns the row count from ``close_ssh_attachment`` honestly: 0 for an
-    unknown or already-closed id, 1 for a normal close. The gateway treats
-    this as best-effort bookkeeping, so a 0 is not turned into an error here
-    either — the caller decides whether a double-detach or a lost row needs
-    logging.
+    Authorizes the close server-side rather than trusting the path-param
+    UUID alone: resolves ``attachment_id`` to the thread it was opened
+    against (``get_ssh_attachment_thread_id``), resolves ``body.fingerprint``
+    to a user (``resolve_user_by_ssh_fingerprint``), and requires
+    ``user_can_access_ide_entity`` to hold between them — the identical two
+    building blocks ``internal_create_ssh_attachment`` composes, reused
+    rather than re-invented. Both lookups run unconditionally regardless of
+    whether the first already failed, mirroring ``get_ssh_target``'s own
+    comment on why: skipping the fingerprint resolution whenever
+    ``attachment_id`` is already known-bad would make "was the id real" a
+    timing oracle.
+
+    Every authorization failure — unknown id, a thread whose FK already went
+    NULL (``get_ssh_attachment_thread_id``'s docstring), unresolvable
+    fingerprint, and "not your thread" — collapses into the SAME
+    ``{"closed": 0}`` the pre-existing "unknown or already-closed id" case
+    returns, deliberately: a caller must not be able to distinguish "no such
+    attachment" from "not yours" (opaque, matching create's contract), and
+    the gateway already treats ``{"closed": 0}`` as a normal best-effort
+    outcome, so this changes no caller's error handling. ``close_ssh_
+    attachment`` itself is never reached in any of these cases.
+
+    A malformed ``attachment_id`` is a distinct, earlier failure: it 400s
+    (via ``get_ssh_attachment_thread_id``'s own ``UUID()`` parse, before any
+    connection is acquired) rather than folding into the opaque envelope
+    above, because the caller already knows whether the string it sent is a
+    syntactically valid UUID — that check discloses nothing about which real
+    ids exist.
     """
     await require_internal(request)
+
     try:
-        closed = await postgres_db.close_ssh_attachment(attachment_id, body.channels)
+        thread_id = await postgres_db.get_ssh_attachment_thread_id(attachment_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"closed": closed}
+
+    user = await postgres_db.resolve_user_by_ssh_fingerprint(body.fingerprint)
+
+    if (
+        thread_id is not None
+        and user is not None
+        and await user_can_access_ide_entity(user, postgres_db, thread_id)
+    ):
+        try:
+            closed = await postgres_db.close_ssh_attachment(
+                attachment_id, body.channels
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"closed": closed}
+
+    return {"closed": 0}
 
 
 # =============================================================================

@@ -41489,6 +41489,33 @@ class PostgresDB:
             )
             return str(value)
 
+    async def get_ssh_attachment_thread_id(self, attachment_id: str) -> Optional[str]:
+        """Resolve an attachment id to the thread_id it was opened against,
+        so a close request can be authorized against that thread instead of
+        trusting anything an ``X-Internal-Key`` holder asserts about it.
+
+        Returns None for an unknown id — callers must render that
+        identically to "found but not yours" (anti-enumeration), same
+        contract ``get_thread_id_by_ssh_handle`` documents for handles.
+
+        thread_id carries ``ON DELETE SET NULL`` (migration 0204,
+        ``test_survives_session_deletion``), so a real row whose thread was
+        since deleted reads back NULL here too — indistinguishable from "no
+        row matched" at the SQL level, and that collapse is intentional:
+        there is no thread left to authorize a close against either way, so
+        the caller must refuse both the same way.
+
+        The id is parsed before a connection is acquired — same contract as
+        every other method on this table, see close_ssh_attachment.
+        """
+        attachment_uuid = UUID(attachment_id)
+        async with self.acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT thread_id FROM ssh_attachments WHERE id = $1",
+                attachment_uuid,
+            )
+            return str(value) if value else None
+
     async def close_ssh_attachment(
         self, attachment_id: str, channels: List[str]
     ) -> int:

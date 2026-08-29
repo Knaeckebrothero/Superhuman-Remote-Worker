@@ -92,6 +92,28 @@ def _resolved(monkeypatch, *, thread_id=THREAD, user=_DEFAULT_USER, access=True)
     monkeypatch.setattr(main, "user_can_access_ide_entity", _access_fn)
 
 
+def _close_resolved(monkeypatch, *, thread_id=THREAD, user=_DEFAULT_USER, access=True):
+    """Wire the three lookups internal_close_ssh_attachment performs (fix
+    round 2) -- the same shape as _resolved above, but keyed off
+    get_ssh_attachment_thread_id(attachment_id) rather than
+    get_thread_id_by_ssh_handle(handle), since close has no handle."""
+    if user is _DEFAULT_USER:
+        user = {"id": USER, "ssh_key_id": KEY_ID}
+
+    async def _thread_id_fn(attachment_id):
+        return thread_id
+
+    async def _user_fn(fp):
+        return user
+
+    async def _access_fn(u, db, entity_id):
+        return access
+
+    monkeypatch.setattr(main.postgres_db, "get_ssh_attachment_thread_id", _thread_id_fn)
+    monkeypatch.setattr(main.postgres_db, "resolve_user_by_ssh_fingerprint", _user_fn)
+    monkeypatch.setattr(main, "user_can_access_ide_entity", _access_fn)
+
+
 # =============================================================================
 # X-Internal-Key enforcement
 # =============================================================================
@@ -138,7 +160,7 @@ async def test_close_attachment_requires_internal_key(monkeypatch):
         await main.internal_close_ssh_attachment(
             request=object(),
             attachment_id=ATTACHMENT_ID,
-            body=main.SshAttachmentClose(channels=["session"]),
+            body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=["session"]),
         )
     assert excinfo.value.status_code == 401
 
@@ -475,6 +497,9 @@ def test_create_attachment_fingerprint_is_capped():
 
 @pytest.mark.asyncio
 async def test_close_attachment_happy_path(internal, monkeypatch):
+    """A caller who can prove (via fingerprint) that it has access to the
+    attachment's OWN thread may close it."""
+    _close_resolved(monkeypatch, user={"id": USER, "ssh_key_id": KEY_ID})
     captured = {}
 
     async def _close(attachment_id, channels):
@@ -487,7 +512,9 @@ async def test_close_attachment_happy_path(internal, monkeypatch):
     result = await main.internal_close_ssh_attachment(
         request=object(),
         attachment_id=ATTACHMENT_ID,
-        body=main.SshAttachmentClose(channels=["session", "sftp"]),
+        body=main.SshAttachmentClose(
+            fingerprint=FINGERPRINT, channels=["session", "sftp"]
+        ),
     )
     assert result == {"closed": 1}
     assert captured == {
@@ -500,8 +527,113 @@ async def test_close_attachment_happy_path(internal, monkeypatch):
 async def test_close_attachment_unknown_id_returns_zero_not_an_error(
     internal, monkeypatch
 ):
-    """0 rows updated (unknown id, or already closed) is a normal response,
-    not an exception — the gateway treats this as best-effort bookkeeping."""
+    """Fix round 2: an unknown attachment id has no thread_id to authorize
+    against, so close_ssh_attachment must never even be called — this is
+    now a refusal, not the "0 rows updated" case it used to be. The
+    response shape is preserved anyway ({"closed": 0}), so the gateway's
+    best-effort contract is unchanged even though the reason for the 0
+    changed."""
+    _close_resolved(monkeypatch, thread_id=None)
+
+    async def _tripwire(attachment_id, channels):
+        raise AssertionError("close_ssh_attachment must not run for an unknown id")
+
+    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _tripwire)
+
+    result = await main.internal_close_ssh_attachment(
+        request=object(),
+        attachment_id=ATTACHMENT_ID,
+        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+    )
+    assert result == {"closed": 0}
+
+
+@pytest.mark.asyncio
+async def test_close_attachment_unknown_fingerprint_returns_zero_not_an_error(
+    internal, monkeypatch
+):
+    """A caller that cannot be resolved to any user cannot be proven to have
+    access to the attachment's thread, so this refuses the same way an
+    unknown attachment id does."""
+    _close_resolved(monkeypatch, user=None)
+
+    async def _tripwire(attachment_id, channels):
+        raise AssertionError(
+            "close_ssh_attachment must not run for an unresolved caller"
+        )
+
+    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _tripwire)
+
+    result = await main.internal_close_ssh_attachment(
+        request=object(),
+        attachment_id=ATTACHMENT_ID,
+        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+    )
+    assert result == {"closed": 0}
+
+
+@pytest.mark.asyncio
+async def test_close_attachment_not_authorized_is_refused(internal, monkeypatch):
+    """The item the review actually asked for: a caller who resolves to a
+    real user, and names a real attachment, but whose user cannot access
+    THAT attachment's thread must be refused -- close_ssh_attachment must
+    not run."""
+    _close_resolved(monkeypatch, access=False)
+
+    async def _tripwire(attachment_id, channels):
+        raise AssertionError(
+            "close_ssh_attachment must not run for an unauthorized user"
+        )
+
+    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _tripwire)
+
+    result = await main.internal_close_ssh_attachment(
+        request=object(),
+        attachment_id=ATTACHMENT_ID,
+        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+    )
+    assert result == {"closed": 0}
+
+
+@pytest.mark.asyncio
+async def test_close_attachment_unknown_and_unauthorized_are_indistinguishable(
+    internal, monkeypatch
+):
+    """Second required test: a caller must not be able to tell "no such
+    attachment" apart from "real attachment, not yours" -- both must
+    produce the identical response, and neither may ever reach
+    close_ssh_attachment (the thing being protected)."""
+
+    async def _tripwire(attachment_id, channels):
+        raise AssertionError("close_ssh_attachment must not run for either case")
+
+    monkeypatch.setattr(main.postgres_db, "close_ssh_attachment", _tripwire)
+
+    _close_resolved(monkeypatch, thread_id=None)
+    unknown = await main.internal_close_ssh_attachment(
+        request=object(),
+        attachment_id=ATTACHMENT_ID,
+        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+    )
+
+    _close_resolved(monkeypatch, access=False)
+    not_yours = await main.internal_close_ssh_attachment(
+        request=object(),
+        attachment_id=ATTACHMENT_ID,
+        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
+    )
+
+    assert unknown == not_yours == {"closed": 0}
+
+
+@pytest.mark.asyncio
+async def test_close_attachment_already_closed_returns_zero_not_an_error(
+    internal, monkeypatch
+):
+    """Pre-existing contract, still true once authorized: 0 rows updated
+    (already closed) is a normal response, not an exception -- the gateway
+    treats this as best-effort bookkeeping."""
+    _close_resolved(monkeypatch)
 
     async def _close(attachment_id, channels):
         return 0
@@ -511,7 +643,7 @@ async def test_close_attachment_unknown_id_returns_zero_not_an_error(
     result = await main.internal_close_ssh_attachment(
         request=object(),
         attachment_id=ATTACHMENT_ID,
-        body=main.SshAttachmentClose(channels=[]),
+        body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
     )
     assert result == {"closed": 0}
 
@@ -519,30 +651,36 @@ async def test_close_attachment_unknown_id_returns_zero_not_an_error(
 @pytest.mark.asyncio
 async def test_close_attachment_malformed_id_maps_to_400_not_500(internal):
     """Process item 4, close-endpoint half. Deliberately does NOT
-    monkeypatch close_ssh_attachment: UUID(attachment_id) raises ValueError
-    inside the REAL method before any connection is acquired
-    (database/postgres.py), so this exercises the actual production code
-    path end to end. Deleting the endpoint's ``except ValueError`` lets a
-    bare ValueError propagate — not an HTTPException — which fails this
-    test.
+    monkeypatch anything on postgres_db: UUID(attachment_id) raises
+    ValueError inside the REAL get_ssh_attachment_thread_id, before any
+    connection is acquired (database/postgres.py) and before the
+    fingerprint/access checks ever run, so this exercises the actual
+    production code path end to end. Deleting the endpoint's ``except
+    ValueError`` lets a bare ValueError propagate — not an HTTPException —
+    which fails this test.
     """
     with pytest.raises(HTTPException) as excinfo:
         await main.internal_close_ssh_attachment(
             request=object(),
             attachment_id="not-a-uuid",
-            body=main.SshAttachmentClose(channels=[]),
+            body=main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=[]),
         )
     assert excinfo.value.status_code == 400
 
 
 def test_close_attachment_channels_count_is_capped():
     with pytest.raises(ValidationError):
-        main.SshAttachmentClose(channels=["session"] * 9)
+        main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=["session"] * 9)
 
 
 def test_close_attachment_channel_name_length_is_capped():
     with pytest.raises(ValidationError):
-        main.SshAttachmentClose(channels=["x" * 33])
+        main.SshAttachmentClose(fingerprint=FINGERPRINT, channels=["x" * 33])
+
+
+def test_close_attachment_fingerprint_is_capped():
+    with pytest.raises(ValidationError):
+        main.SshAttachmentClose(fingerprint="A" * (500 * 1024), channels=[])
 
 
 # =============================================================================
