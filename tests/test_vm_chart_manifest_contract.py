@@ -649,10 +649,11 @@ def test_named_validation_reasons(
 
 def test_capability_checks_are_opt_in() -> None:
     # Disable chart-generated random Secret values so byte comparison is stable.
-    normal = render_chart(MAIN, "secrets.create=false")
+    normal = render_chart(MAIN, "secrets.create=false", "searxng.enabled=false")
     with_versions = render_chart(
         MAIN,
         "secrets.create=false",
+        "searxng.enabled=false",
         api_versions=("kubevirt.io/v1", "cdi.kubevirt.io/v1beta1"),
     )
     assert normal == with_versions
