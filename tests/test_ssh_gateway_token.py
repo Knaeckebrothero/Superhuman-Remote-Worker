@@ -98,7 +98,9 @@ def test_an_expired_token_is_refused():
     now = time.time()
     token, _ = mint_attach_token(USER, SECRET, now=now)
     assert verify_attach_token(token, SECRET, now=now + 1) == USER
-    assert verify_attach_token(token, SECRET, now=now + ATTACH_TOKEN_TTL_SECONDS) is None
+    assert (
+        verify_attach_token(token, SECRET, now=now + ATTACH_TOKEN_TTL_SECONDS) is None
+    )
 
 
 def test_a_token_signed_with_another_secret_is_refused():
@@ -169,3 +171,94 @@ def test_two_tokens_for_the_same_user_differ():
 def test_a_non_string_token_is_refused_rather_than_crashing():
     assert verify_attach_token(None, SECRET) is None
     assert verify_attach_token(b"bytes", SECRET) is None
+
+
+# ---------------------------------------------------------------------------
+# POST /api/ssh/attach-token — where a user actually gets one
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def approved_user(monkeypatch):
+    import main
+
+    user = {"id": USER, "is_approved": True}
+
+    async def _require(request, db):
+        return user
+
+    monkeypatch.setattr(main, "require_approved_user", _require)
+    monkeypatch.setattr(main, "_session_jwt_secret", SECRET)
+    return user
+
+
+def test_the_minting_route_is_registered():
+    """Without a route, nobody can ever obtain the credential the gateway
+    demands, and the WSS transport is unreachable by design rather than by
+    accident."""
+    import main
+    from tests._route_inventory import mounted_routes
+
+    assert ("POST", "/api/ssh/attach-token") in mounted_routes(main.app)
+
+
+@pytest.mark.asyncio
+async def test_the_endpoint_mints_a_token_the_gateway_accepts(approved_user):
+    import main
+
+    result = await main.create_ssh_attach_token(request=object())
+    assert verify_attach_token(result["token"], SECRET) == USER
+    assert result["expires_at"]
+
+
+@pytest.mark.asyncio
+async def test_the_endpoint_never_hands_out_the_internal_key(
+    approved_user, monkeypatch
+):
+    """Ruling G38 in one assertion: whatever this returns, it is not the
+    platform's service-to-service credential."""
+    import main
+
+    monkeypatch.setenv("MCP_INTERNAL_KEY", "the-master-internal-key")
+    result = await main.create_ssh_attach_token(request=object())
+    assert "the-master-internal-key" not in result["token"]
+
+
+@pytest.mark.asyncio
+async def test_the_endpoint_fails_closed_without_the_secret(approved_user, monkeypatch):
+    import main
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(main, "_session_jwt_secret", "")
+    with pytest.raises(HTTPException) as excinfo:
+        await main.create_ssh_attach_token(request=object())
+    assert excinfo.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_a_project_scoped_token_cannot_mint_an_attach_token(monkeypatch):
+    """Same gate, same reason as ``create_ssh_key``: this token opens a
+    transport into every workspace its holder's keys can reach, and by the
+    time the SSH layer authorizes, the MCP token's scope is long gone."""
+    import main
+    from fastapi import HTTPException
+
+    scoped = {
+        "id": USER,
+        "is_approved": True,
+        "scopes": ["project:11111111-1111-1111-1111-111111111111"],
+    }
+
+    async def _require(request, db):
+        return scoped
+
+    async def _no_audit(**kwargs):
+        return None
+
+    monkeypatch.setattr(main, "require_approved_user", _require)
+    monkeypatch.setattr(main, "_session_jwt_secret", SECRET)
+    monkeypatch.setattr(main.postgres_db, "record_security_event", _no_audit)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await main.create_ssh_attach_token(request=object())
+    assert excinfo.value.status_code == 403

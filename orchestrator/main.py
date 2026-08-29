@@ -482,6 +482,7 @@ from services.ssh_gateway_targets import (  # noqa: E402
     resolve_workspace_state,
 )
 from services.ssh_handles import is_valid_handle  # noqa: E402
+from services.ssh_gateway_token import mint_attach_token  # noqa: E402
 from services.canvas_ssh import (  # noqa: E402
     CanvasSSHError,
     RemoteWorkspaceTarget,
@@ -63997,6 +63998,46 @@ async def delete_ssh_key(request: Request, key_id: str) -> dict[str, str]:
     if not deleted:
         raise HTTPException(status_code=404, detail="Key not found")
     return {"status": "deleted"}
+
+
+@app.post("/api/ssh/attach-token")
+async def create_ssh_attach_token(request: Request) -> dict[str, Any]:
+    """Mint the short-lived credential the SSH gateway's WSS front door wants.
+
+    This is the ONLY thing a user should ever present to
+    ``wss://.../api/ssh/attach``. It is emphatically not ``MCP_INTERNAL_KEY``:
+    that value is the platform's service-to-service credential, guarding ~50
+    ``require_internal`` endpoints, and an earlier draft of the gateway
+    compared the user's bearer token against it — which would have put the
+    master key in every SSH user's ``~/.config/srw/token`` (ruling G38; see
+    ``services/ssh_gateway_token.py`` for the full account).
+
+    Stateless and user-bound, the same shape as the SSH-key registration
+    challenge above and for the same reason: the gateway is a separate
+    Deployment from this one, and this one runs ``replicas: 2`` with no
+    session affinity, so there is nowhere to keep a nonce that both sides can
+    see. The two tokens are minted with the same secret and kept apart by a
+    version clause inside the MAC.
+
+    Scope-gated like ``create_ssh_key``: a ``project:<uuid>``-scoped MCP token
+    is refused. The token opens a transport into every workspace its holder's
+    registered keys can reach, and by the time the SSH layer authorizes (by
+    key fingerprint) the MCP token's scope no longer exists to check.
+    """
+    user = await require_approved_user(request, postgres_db)
+    await require_personal_scope(
+        request, postgres_db, user, resource_type="ssh_attach_token"
+    )
+    if not _session_jwt_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="SSH access is temporarily unavailable.",
+        )
+    token, expires_at = mint_attach_token(str(user["id"]), _session_jwt_secret)
+    return {
+        "token": token,
+        "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+    }
 
 
 def _ssh_target_response(
