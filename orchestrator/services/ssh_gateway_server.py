@@ -154,6 +154,31 @@ async def drain_background_tasks(timeout: float = DRAIN_TIMEOUT_SECONDS) -> int:
     return len(still_pending)
 
 
+# How long a closing inner hop is waited on before it is abandoned. Well
+# inside DRAIN_TIMEOUT_SECONDS so a shutdown drain is bounded by its own
+# ceiling rather than by this one, and by a Kubernetes
+# terminationGracePeriodSeconds either way.
+UPSTREAM_CLOSE_TIMEOUT_SECONDS = 3.0
+
+
+async def _await_upstream_closed(connection) -> None:
+    """Wait, briefly, for an already-close()d inner hop to finish closing.
+
+    Never raises: this runs as a background task, where an exception would
+    reach the loop's handler as an unretrieved-exception warning and tell
+    the operator nothing they can act on. A teardown that outlives its
+    budget is abandoned rather than waited on forever -- the workspace
+    sshd's own timeout is the backstop.
+    """
+    try:
+        async with asyncio.timeout(UPSTREAM_CLOSE_TIMEOUT_SECONDS):
+            await connection.wait_closed()
+    except TimeoutError:
+        logger.warning("ssh gateway: an upstream connection did not close in time")
+    except Exception:
+        logger.debug("ssh gateway: upstream close failed", exc_info=True)
+
+
 def clamp_direct_tcpip(dest_host: str) -> bool:
     """True iff a direct-tcpip destination is permitted.
 
@@ -317,7 +342,31 @@ class _GatewayProxyProcess(ProxyProcess):
             # asyncssh to start a session on a channel it has already torn
             # down; reporting anything at all is pointless.
             return
-        report(allowed)
+        try:
+            report(allowed)
+        except Exception:
+            # THIS GUARD IS WHAT MAKES DEPENDING ON A PRIVATE METHOD
+            # ACCEPTABLE. ``_report_response`` is called from a task, so an
+            # exception here would reach asyncssh's ``_reap_task`` ->
+            # ``internal_error()``, which tears down the ENTIRE inbound
+            # connection -- every other channel on it included -- rather
+            # than this one channel. The branch above handles the method
+            # being renamed away; this one handles the likelier upgrade
+            # failure, "same name, different contract".
+            #
+            # Closing the channel is the degradation, not a tidy-up:
+            # ``_cleanup`` resolves the peer's pending request waiters with
+            # ``False`` (channel.py:218-226), so the client gets the same
+            # clean "Session request failed" it would have got from an
+            # honest CHANNEL_FAILURE, and the connection survives.
+            logger.exception(
+                "ssh gateway: could not answer a deferred subsystem request; "
+                "refusing this channel"
+            )
+            try:
+                self._chan.close()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("ssh gateway: could not close a stuck channel")
 
 
 class GatewaySSHServer(asyncssh.SSHServer):
@@ -561,8 +610,15 @@ class GatewaySSHServer(asyncssh.SSHServer):
         Nothing else ever closes it: without this, every gateway connection
         leaves a live inner-hop connection holding one of the workspace
         sshd's ``MaxSessions`` slots until the gateway pod restarts.
-        Synchronous ``close()`` rather than ``wait_closed()`` because
-        ``connection_lost`` is a synchronous asyncssh callback.
+
+        ``close()`` is synchronous because ``connection_lost`` is, but it
+        only REQUESTS the close -- the disconnect and socket teardown finish
+        on the loop afterwards. The bounded ``wait_closed()`` is therefore
+        scheduled through ``_schedule``, which is what puts it in
+        ``_BACKGROUND_TASKS`` and so under ``drain_background_tasks``: a
+        rollout that stops the loop between the close request and its
+        completion would otherwise drop the inner hop mid-teardown, leaving
+        the workspace sshd to time the half-closed connection out itself.
         """
         connection, self._upstream_conn = self._upstream_conn, None
         if connection is None:
@@ -571,6 +627,8 @@ class GatewaySSHServer(asyncssh.SSHServer):
             connection.close()
         except Exception:  # pragma: no cover - defensive
             logger.exception("ssh gateway: failed to close an upstream connection")
+            return
+        self._schedule(_await_upstream_closed(connection))
 
     def _release_attachment(self) -> None:
         workspace_id, self._attached_workspace = self._attached_workspace, None
@@ -806,9 +864,15 @@ class GatewaySSHServer(asyncssh.SSHServer):
             try:
                 connection = await connect_upstream(self._context, target)
             except asyncssh.HostKeyNotVerifiable as exc:
+                # Deliberately does not assert WHICH way the pin failed:
+                # ``_PinnedClient`` refuses both a genuine mismatch and a
+                # malformed attested fingerprint, and logs its own line
+                # naming which of the two happened immediately before this
+                # one. Both are operator signals, hence ``error``.
                 logger.error(
-                    "ssh gateway: workspace %s presented an unexpected host "
-                    "key; refusing the inner hop: %r",
+                    "ssh gateway: could not verify workspace %s's host key "
+                    "against the attested fingerprint; refusing the inner "
+                    "hop: %r",
                     target.thread_id,
                     exc,
                 )
@@ -826,7 +890,13 @@ class GatewaySSHServer(asyncssh.SSHServer):
                 # ran while the dial was in flight, found ``_upstream_conn``
                 # still None, and closed nothing. This is the only place
                 # that connection can be given back.
-                connection.close()
+                #
+                # Published and immediately reclaimed, rather than closed
+                # inline, so that EVERY upstream close goes through the one
+                # method -- same bounded wait_closed, same drain coverage,
+                # nothing to keep in sync between two teardown paths.
+                self._upstream_conn = connection
+                self._close_upstream()
                 raise TargetUnavailable("unreachable")
 
             self._upstream_conn = connection
@@ -925,7 +995,25 @@ class _PinnedClient(asyncssh.SSHClient):
 
     def validate_host_public_key(self, host, addr, port, key) -> bool:
         del host, addr, port
-        return secrets.compare_digest(key.get_fingerprint("sha256"), self._expected)
+        try:
+            return secrets.compare_digest(key.get_fingerprint("sha256"), self._expected)
+        except TypeError:
+            # ``compare_digest`` raises TypeError for None, bytes, or a
+            # non-ASCII str. It already failed CLOSED before this guard --
+            # the exception escaped the callback and asyncssh refused the
+            # connection -- but it surfaced through ``_upstream``'s generic
+            # handler as "could not open the inner hop", at ``warning``, as
+            # though the workspace were unreachable. It is not: OUR OWN
+            # attested data is malformed, which is an operator problem and a
+            # different thing to go looking at. ``resolve_target``'s
+            # ``_is_valid_identifier`` check makes this unreachable today,
+            # so this is defence in depth for a future path that skips it.
+            logger.error(
+                "ssh gateway: the attested host-key fingerprint is not a "
+                "usable string (got %s); refusing the inner hop",
+                type(self._expected).__name__,
+            )
+            return False
 
 
 async def connect_upstream(context: GatewayContext, target: SshTarget):
@@ -953,6 +1041,13 @@ async def connect_upstream(context: GatewayContext, target: SshTarget):
         # against the ed25519 one. See ssh_gateway_config.SERVER_HOST_KEY_ALGS
         # for the server-side half of this distinction.
         server_host_key_algs=["ssh-ed25519"],
+        # DO NOT "tidy" this lambda into a direct reference or a partial.
+        # asyncssh calls it when the connection is built, so ``_PinnedClient``
+        # is resolved from module globals at that moment -- which is the seam
+        # ``test_known_hosts_none_is_the_negative_control`` and its siblings
+        # patch to prove the pin callback fires (or, with known_hosts=None,
+        # never fires). Binding the class here instead would leave those
+        # controls green while testing nothing.
         client_factory=lambda: _PinnedClient(expected),
         encoding=None,
         connect_timeout=UPSTREAM_CONNECT_TIMEOUT_SECONDS,

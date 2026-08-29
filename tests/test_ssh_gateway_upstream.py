@@ -324,6 +324,32 @@ def test_pinned_client_accepts_only_the_attested_fingerprint():
     )
 
 
+@pytest.mark.parametrize("malformed", [None, b"SHA256:" + b"A" * 43, "SHA256:é"])
+def test_a_malformed_pin_is_refused_and_named_as_our_own_data(malformed, caplog):
+    """``compare_digest`` raises TypeError for None, bytes, or non-ASCII.
+
+    It already failed CLOSED without the guard -- the exception escaped the
+    callback and asyncssh refused the connection -- but it surfaced through
+    ``_upstream``'s generic handler at ``warning``, as "could not open the
+    inner hop", i.e. as though the WORKSPACE were the problem. It is our own
+    attested data that is malformed, which is a different thing to go
+    looking at, so it is named and logged at ``error``.
+
+    ``resolve_target``'s ``_is_valid_identifier`` makes this unreachable
+    today; this is defence in depth for a future path that skips it.
+    """
+    key = asyncssh.generate_private_key("ssh-ed25519").convert_to_public()
+
+    with caplog.at_level(logging.ERROR, logger="services.ssh_gateway_server"):
+        allowed = mod._PinnedClient(malformed).validate_host_public_key(
+            "workspace", "127.0.0.1", 22, key
+        )
+
+    assert allowed is False
+    assert "fingerprint is not a usable string" in caplog.text
+    assert [r.levelname for r in caplog.records] == ["ERROR"]
+
+
 @pytest.mark.asyncio
 async def test_the_real_kwarg_set_connects_and_authenticates(tmp_path, monkeypatch):
     """Unmocked end to end: a bogus kwarg, a rejected certificate, or a
@@ -403,11 +429,18 @@ def _server_with_target(**context_overrides) -> GatewaySSHServer:
 
 
 class FakeUpstream:
-    def __init__(self):
+    def __init__(self, hangs_on_close=False):
         self.closed = 0
+        self.awaited = 0
+        self._hangs_on_close = hangs_on_close
 
     def close(self):
         self.closed += 1
+
+    async def wait_closed(self):
+        self.awaited += 1
+        if self._hangs_on_close:
+            await asyncio.Event().wait()
 
 
 @pytest.mark.asyncio
@@ -465,7 +498,54 @@ async def test_connection_lost_closes_the_upstream(monkeypatch):
     await server._upstream()
 
     server.connection_lost(None)
+    await mod.drain_background_tasks(timeout=5.0)
 
+    assert upstream.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_the_upstream_teardown_is_awaited_and_covered_by_the_drain(monkeypatch):
+    """``close()`` only REQUESTS the close; the disconnect and socket
+    teardown finish on the loop afterwards. Scheduling the bounded
+    ``wait_closed`` through ``_schedule`` is what puts it in
+    ``_BACKGROUND_TASKS``, so Task 8's shutdown drain covers it instead of
+    stopping the loop mid-teardown."""
+    upstream = FakeUpstream()
+
+    async def _connect(context, target):
+        return upstream
+
+    monkeypatch.setattr(mod, "connect_upstream", _connect)
+    server = _server_with_target()
+    await server._upstream()
+
+    server.connection_lost(None)
+    assert upstream.awaited == 0, "a synchronous callback cannot await"
+
+    assert await mod.drain_background_tasks(timeout=5.0) == 0
+    assert upstream.awaited == 1
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_upstream_teardown_is_abandoned_not_waited_on(monkeypatch):
+    """A shutdown that hangs on an inner hop that will not close is worse
+    than an abandoned teardown -- the workspace sshd times the half-closed
+    connection out on its own."""
+    upstream = FakeUpstream(hangs_on_close=True)
+
+    async def _connect(context, target):
+        return upstream
+
+    monkeypatch.setattr(mod, "connect_upstream", _connect)
+    monkeypatch.setattr(mod, "UPSTREAM_CLOSE_TIMEOUT_SECONDS", 0.01)
+    server = _server_with_target()
+    await server._upstream()
+
+    server.connection_lost(None)
+
+    # Settles on its own budget rather than the drain's, and never raises
+    # out of the background task.
+    assert await mod.drain_background_tasks(timeout=5.0) == 0
     assert upstream.closed == 1
 
 
@@ -494,8 +574,12 @@ async def test_a_peer_lost_during_the_dial_does_not_leak_the_upstream(monkeypatc
     release.set()
     with pytest.raises(TargetUnavailable):
         await dialing
+    await mod.drain_background_tasks(timeout=5.0)
 
+    # Closed through the same one method as every other teardown path, so it
+    # gets the same bounded wait and the same drain coverage.
     assert upstream.closed == 1
+    assert upstream.awaited == 1
 
 
 @pytest.mark.asyncio
@@ -523,15 +607,22 @@ async def test_a_context_without_a_ca_refuses_readably(monkeypatch):
 
 
 class _FakeChannel:
-    def __init__(self, subsystem="sftp"):
+    def __init__(self, subsystem="sftp", report_raises=None):
         self.reported = []
+        self.closed = 0
         self.logger = logging.getLogger("test.channel")
         self._subsystem = subsystem
+        self._report_raises = report_raises
 
     def get_subsystem(self):
         return self._subsystem
 
+    def close(self):
+        self.closed += 1
+
     def _report_response(self, result):
+        if self._report_raises is not None:
+            raise self._report_raises
         self.reported.append(result)
 
 
@@ -669,6 +760,34 @@ async def test_a_deferred_reply_is_dropped_when_the_peer_has_already_left(monkey
     await process._conn.drain()
 
     assert process._chan.reported == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_deferred_reply_refuses_only_its_own_channel(monkeypatch):
+    """``_report_response`` is asyncssh-private and called FROM A TASK, so an
+    exception out of it reaches ``_reap_task`` -> ``internal_error()``, which
+    tears down the whole inbound connection. The degradation branch above
+    covers the method being renamed away; this covers "same name, different
+    contract", which is the likelier way private API breaks on an upgrade.
+
+    Closing the channel is the degradation: asyncssh's ``_cleanup`` resolves
+    the peer's pending request waiters with ``False``, so the client gets the
+    same clean failure an honest CHANNEL_FAILURE would have produced."""
+
+    async def _connect(context, target):
+        return FakeUpstream()
+
+    monkeypatch.setattr(mod, "connect_upstream", _connect)
+    server = _server_with_target()
+    channel = _FakeChannel(report_raises=RuntimeError("asyncssh changed"))
+    process = _subsystem_process(server, channel)
+
+    process.subsystem_requested("sftp")
+    await process._conn.drain()
+
+    # Not raised out of the task, and the one channel was refused.
+    assert [task.exception() for task in process._conn.tasks] == [None]
+    assert channel.closed == 1
 
 
 @pytest.mark.asyncio
@@ -864,6 +983,40 @@ async def test_a_refused_workspace_still_explains_itself_on_a_shell(tmp_path):
     message, code = REFUSAL_MESSAGES["suspended"]
     assert result.stderr == f"srw: {message}\n".encode()
     assert result.exit_status == code
+
+
+@pytest.mark.asyncio
+async def test_a_broken_report_response_costs_one_channel_not_the_connection(
+    tmp_path, monkeypatch
+):
+    """Against REAL asyncssh, with the private method made to raise.
+
+    This is the negative control for the guard around ``report(allowed)``.
+    Unguarded, the exception reaches asyncssh's ``_reap_task`` ->
+    ``internal_error()``, which disconnects the whole inbound connection --
+    so the ``connection.run`` at the end fails too, and every other channel a
+    JetBrains client had open dies with it. Guarded, sftp fails alone and the
+    connection is still usable.
+    """
+    original = asyncssh.channel.SSHChannel._report_response
+
+    def _broken(self, result):
+        if self._request_queue and self._request_queue[0][0] == "subsystem":
+            raise RuntimeError("a future asyncssh changed this contract")
+        return original(self, result)
+
+    monkeypatch.setattr(asyncssh.channel.SSHChannel, "_report_response", _broken)
+
+    async with _workspace(tmp_path) as workspace:
+        async with _gateway(_live_context(workspace)) as port:
+            async with _client(port) as connection:
+                async with asyncio.timeout(20):
+                    with pytest.raises(asyncssh.ChannelOpenError):
+                        await connection.start_sftp_client()
+
+                    result = await connection.run("still alive")
+
+    assert result.stdout == b"workspace:still alive\n"
 
 
 @pytest.mark.asyncio
