@@ -7,6 +7,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.tools.context import ToolContext
+from src.tools.research.search import (
+    ProviderAuthError,
+    ProviderQuotaError,
+    ProviderRateLimitError,
+    ProviderRequestError,
+    ProviderUnavailableError,
+    Result,
+)
 from src.tools.research.web import (
     MAX_TOTAL_INLINE_CHARS,
     RESEARCH_TOOLS_METADATA,
@@ -279,6 +287,87 @@ class TestWebSearch:
 
         assert "usage limit exceeded" in result
         assert "No web results found" not in result
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ProviderAuthError("primary auth"),
+            ProviderQuotaError("primary quota"),
+            ProviderRateLimitError("primary rate limit"),
+            ProviderUnavailableError("primary unavailable"),
+        ],
+    )
+    def test_hard_provider_error_uses_fallback_once(self, error, caplog):
+        primary = MagicMock(provider="tavily")
+        primary.search.side_effect = error
+        fallback = MagicMock(provider="searxng")
+        fallback.search.return_value = [
+            Result(
+                title="Fallback result",
+                url="https://example.com",
+                snippet="answer",
+            )
+        ]
+
+        with caplog.at_level("WARNING"):
+            result = _direct_web_search(
+                "query",
+                5,
+                adapter=primary,
+                fallback_adapter=fallback,
+            )
+
+        fallback.search.assert_called_once()
+        assert "Provider fallback: searxng answered after tavily failed." in result
+        assert "Fallback result" in result
+        assert str(error) in caplog.text
+
+    def test_provider_request_error_does_not_use_fallback(self):
+        primary = MagicMock(provider="tavily")
+        primary.search.side_effect = ProviderRequestError("bad request")
+        fallback = MagicMock(provider="searxng")
+
+        result = _direct_web_search(
+            "query",
+            5,
+            adapter=primary,
+            fallback_adapter=fallback,
+        )
+
+        fallback.search.assert_not_called()
+        assert "bad request" in result
+
+    def test_empty_primary_result_does_not_use_fallback(self):
+        primary = MagicMock(provider="tavily")
+        primary.search.return_value = []
+        fallback = MagicMock(provider="searxng")
+
+        result = _direct_web_search(
+            "query",
+            5,
+            adapter=primary,
+            fallback_adapter=fallback,
+        )
+
+        fallback.search.assert_not_called()
+        assert result == "No web results found for: query"
+
+    def test_failing_fallback_surfaces_primary_error(self):
+        primary = MagicMock(provider="tavily")
+        primary.search.side_effect = ProviderQuotaError("primary quota")
+        fallback = MagicMock(provider="searxng")
+        fallback.search.side_effect = ProviderUnavailableError("fallback down")
+
+        result = _direct_web_search(
+            "query",
+            5,
+            adapter=primary,
+            fallback_adapter=fallback,
+        )
+
+        fallback.search.assert_called_once()
+        assert "primary quota" in result
+        assert "fallback down" not in result
 
     def test_search_depth_advanced(self, mock_tool_context, mock_langchain_tavily):
         mock_instance = MagicMock()

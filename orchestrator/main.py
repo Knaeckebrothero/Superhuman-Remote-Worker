@@ -13558,6 +13558,7 @@ async def _inject_search_credentials(
     from services.capability_credentials import resolve_capability_credentials
 
     research = config_override.setdefault("research", {})
+    resolved: dict[str, Any] = {}
     for capability in ("search", "fetch"):
         creds = await resolve_capability_credentials(
             capability=capability,
@@ -13569,7 +13570,6 @@ async def _inject_search_credentials(
         if creds is None:
             research.pop(capability, None)
             continue
-
         ops_value = creds.params.get("ops")
         ops = (
             [str(op) for op in ops_value if isinstance(op, str)]
@@ -13586,6 +13586,7 @@ async def _inject_search_credentials(
             )
             continue
 
+        resolved[capability] = creds
         research[capability] = {
             "provider": creds.provider,
             "base_url": creds.base_url,
@@ -13597,6 +13598,49 @@ async def _inject_search_credentials(
             capability,
             creds.provider,
             creds.model,
+        )
+
+    primary = resolved.get("search")
+    fallback = await resolve_capability_credentials(
+        capability="search",
+        setting_key="default_search_fallback_model",
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+        postgres_db=postgres_db,
+    )
+    fallback_ops_value = fallback.params.get("ops") if fallback is not None else None
+    fallback_ops = (
+        [str(op) for op in fallback_ops_value if isinstance(op, str)]
+        if isinstance(fallback_ops_value, list)
+        else []
+    )
+    different_row = bool(
+        primary is not None
+        and fallback is not None
+        and primary.catalog_id
+        and fallback.catalog_id
+        and primary.catalog_id != fallback.catalog_id
+    )
+    if (
+        primary is None
+        or fallback is None
+        or not different_row
+        or not fallback.provider
+        or "search" not in fallback_ops
+    ):
+        research.pop("search_fallback", None)
+    else:
+        research["search_fallback"] = {
+            "provider": fallback.provider,
+            "base_url": fallback.base_url,
+            "api_key": fallback.api_key,
+            "ops": fallback_ops,
+        }
+        logger.info(
+            "Dispatch: injected search fallback provider %s (%s)",
+            fallback.provider,
+            fallback.model,
         )
 
     if not research:
@@ -15737,6 +15781,7 @@ VALID_DEFAULT_MODEL_KINDS = {
     "tts",
     "search",
     "fetch",
+    "search_fallback",
 }
 
 # System-scoped API keys only cover shared providers. Codex auth is
@@ -15764,6 +15809,7 @@ class UserSettingsUpdate(BaseModel):
     default_tts_model: str | None = None
     default_search_model: str | None = None
     default_fetch_model: str | None = None
+    default_search_fallback_model: str | None = None
     default_tts_voice: str | None = None
     default_session_model: str | None = None
     # NOTE: per-phase model defaults (default_strategic_model /

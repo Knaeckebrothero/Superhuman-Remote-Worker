@@ -177,6 +177,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
         _creator_loop = None
 
     search_adapter = _research_adapter(context, "search")
+    search_fallback_adapter = _research_adapter(context, "search_fallback")
     fetch_adapter = _research_adapter(context, "fetch")
 
     @tool
@@ -222,6 +223,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             include_raw_content=include_raw_content,
             creator_loop=_creator_loop,
             adapter=search_adapter,
+            fallback_adapter=search_fallback_adapter,
         )
 
     @tool
@@ -361,6 +363,7 @@ def _direct_web_search(
     include_raw_content: bool = False,
     creator_loop: Optional[asyncio.AbstractEventLoop] = None,
     adapter: SearchAdapter | None = None,
+    fallback_adapter: SearchAdapter | None = None,
 ) -> str:
     """Search the web through the configured provider.
 
@@ -386,16 +389,39 @@ def _direct_web_search(
     try:
         parsed_include = _parse_comma_list(include_domains)
         parsed_exclude = _parse_comma_list(exclude_domains)
-        provider_results = adapter.search(
-            query,
-            max_results,
-            search_depth=search_depth,
-            topic=topic,
-            time_range=time_range,
-            include_domains=parsed_include,
-            exclude_domains=parsed_exclude,
-            include_raw_content=include_raw_content,
-        )
+        search_kwargs = {
+            "search_depth": search_depth,
+            "topic": topic,
+            "time_range": time_range,
+            "include_domains": parsed_include,
+            "exclude_domains": parsed_exclude,
+            "include_raw_content": include_raw_content,
+        }
+        fallback_annotation = ""
+        try:
+            provider_results = adapter.search(query, max_results, **search_kwargs)
+        except ProviderError as primary_error:
+            if not primary_error.failover_eligible or fallback_adapter is None:
+                raise
+            logger.warning(
+                "Web search falling back from %s to %s after %s: %s",
+                adapter.provider,
+                fallback_adapter.provider,
+                type(primary_error).__name__,
+                primary_error,
+            )
+            try:
+                provider_results = fallback_adapter.search(
+                    query, max_results, **search_kwargs
+                )
+            except Exception:
+                # The primary is the actionable operator signal. A failed
+                # fallback must not replace it with a secondary symptom.
+                raise primary_error
+            fallback_annotation = (
+                f"Provider fallback: {fallback_adapter.provider} answered after "
+                f"{adapter.provider} failed.\n"
+            )
         results = [
             {
                 "title": item.title,
@@ -406,7 +432,7 @@ def _direct_web_search(
             for item in provider_results
         ]
         if not results:
-            return f"No web results found for: {query}"
+            return fallback_annotation + f"No web results found for: {query}"
 
         # Register each result as a citation source if context available
         registered_sources = []
@@ -447,7 +473,7 @@ def _direct_web_search(
                             saved_paths[url] = saved_path
 
         # Format output
-        result = f"Web Search Results for: {query}\n"
+        result = fallback_annotation + f"Web Search Results for: {query}\n"
         if registered_sources:
             result += f"Results: {len(results)} ({len(registered_sources)} archived as citation sources)\n\n"
         else:

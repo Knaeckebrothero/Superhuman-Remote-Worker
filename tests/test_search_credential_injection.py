@@ -115,3 +115,77 @@ async def test_malformed_provider_params_degrade_without_credentials():
         )
 
     assert "research" not in config
+
+
+@pytest.mark.asyncio
+async def test_different_catalog_row_is_injected_as_search_fallback():
+    primary = CapabilityCredentials(
+        model="tavily",
+        base_url="https://api.tavily.com",
+        api_key="primary-key",
+        provider="tavily",
+        params={"provider": "tavily", "ops": ["search"]},
+        catalog_id="primary-row",
+    )
+    fallback = CapabilityCredentials(
+        model="searxng",
+        base_url="http://searxng.svc:8080",
+        provider="searxng",
+        params={"provider": "searxng", "ops": ["search"]},
+        catalog_id="fallback-row",
+    )
+
+    async def resolve(*, capability, setting_key=None, **kwargs):
+        del kwargs
+        if setting_key == "default_search_fallback_model":
+            return fallback
+        return primary if capability == "search" else None
+
+    config = {}
+    with patch(
+        "services.capability_credentials.resolve_capability_credentials",
+        AsyncMock(side_effect=resolve),
+    ):
+        await main._inject_search_credentials(
+            config,
+            user_settings={},
+            user_id="user-1",
+            resolved_keys={},
+        )
+
+    assert config["research"]["search_fallback"] == {
+        "provider": "searxng",
+        "base_url": "http://searxng.svc:8080",
+        "api_key": None,
+        "ops": ["search"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_same_catalog_row_is_not_injected_as_its_own_fallback():
+    same = CapabilityCredentials(
+        model="tavily",
+        base_url="https://api.tavily.com",
+        api_key="key",
+        provider="tavily",
+        params={"provider": "tavily", "ops": ["search"]},
+        catalog_id="same-row",
+    )
+
+    async def resolve(*, capability, **kwargs):
+        del kwargs
+        return same if capability == "search" else None
+
+    config = {}
+    with patch(
+        "services.capability_credentials.resolve_capability_credentials",
+        AsyncMock(side_effect=resolve),
+    ):
+        await main._inject_search_credentials(
+            config,
+            user_settings={},
+            user_id="user-1",
+            resolved_keys={},
+        )
+
+    assert "search_fallback" not in config["research"]

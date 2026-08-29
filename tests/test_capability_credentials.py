@@ -130,3 +130,40 @@ async def test_system_provider_uses_per_user_resolved_key():
     )
 
     assert result is not None and result.api_key == "user-key"
+
+
+@pytest.mark.asyncio
+async def test_fallback_slot_uses_its_own_user_then_system_chain():
+    db = _db(default="system-fallback", row=_row(model_id="user-fallback"))
+
+    result = await resolve_capability_credentials(
+        capability="search",
+        setting_key="default_search_fallback_model",
+        user_settings={"default_search_fallback_model": "user-fallback"},
+        user_id="user-1",
+        resolved_keys={},
+        postgres_db=db,
+    )
+
+    assert result is not None and result.model == "user-fallback"
+    db.resolve_default_for_capability.assert_not_awaited()
+    db.resolve_catalog_model.assert_awaited_once_with(
+        "user-fallback", capability="search"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_slot_reads_independent_system_setting():
+    db = _db(default="system-fallback", row=_row(model_id="system-fallback"))
+
+    result = await resolve_capability_credentials(
+        capability="search",
+        setting_key="default_search_fallback_model",
+        user_settings={},
+        user_id="user-1",
+        resolved_keys={},
+        postgres_db=db,
+    )
+
+    assert result is not None and result.model == "system-fallback"
+    db.resolve_default_for_capability.assert_awaited_once_with("search_fallback")
