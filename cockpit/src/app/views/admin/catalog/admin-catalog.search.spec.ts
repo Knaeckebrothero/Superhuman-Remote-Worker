@@ -76,7 +76,7 @@ describe('AdminCatalogComponent search/fetch form', () => {
     )
       .map((option) => option.value)
       .filter(Boolean);
-    expect(adapters).toEqual(['brave', 'searxng', 'tavily']);
+    expect(adapters).toEqual(['brave', 'firecrawl', 'searxng', 'tavily']);
   });
 
   it('requires adapter and matching operations, then writes params_json', () => {

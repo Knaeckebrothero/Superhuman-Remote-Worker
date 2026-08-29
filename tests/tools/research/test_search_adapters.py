@@ -7,7 +7,9 @@ import httpx
 import pytest
 
 from src.tools.research.search import (
+    ADAPTER_NAMES,
     BraveAdapter,
+    FirecrawlAdapter,
     Page,
     ProviderAuthError,
     ProviderQuotaError,
@@ -17,6 +19,7 @@ from src.tools.research.search import (
     Result,
     SearxngAdapter,
     TavilyAdapter,
+    create_search_adapter,
 )
 
 
@@ -313,3 +316,216 @@ def test_search_query_never_changes_http_request_origin(
 
     assert client.get.call_args.args[0] == expected_origin
     assert client.get.call_args.kwargs["params"]["q"] == influenced_query
+
+
+def test_firecrawl_declared_ops_return_normalized_shapes():
+    client = MagicMock()
+    client.post.side_effect = [
+        httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "web": [
+                        {
+                            "title": "Search result",
+                            "url": "https://result.example/search",
+                            "description": "Snippet",
+                            "markdown": "Search body",
+                        }
+                    ]
+                },
+            },
+        ),
+        httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "markdown": "Extracted body",
+                    "metadata": {"sourceURL": "https://result.example/extract"},
+                },
+            },
+        ),
+        httpx.Response(200, json={"success": True, "id": "crawl-job"}),
+        httpx.Response(
+            200,
+            json={
+                "success": True,
+                "links": [
+                    {"url": "https://result.example/one"},
+                    "https://result.example/two",
+                ],
+            },
+        ),
+    ]
+    client.get.return_value = httpx.Response(
+        200,
+        json={
+            "status": "completed",
+            "data": [
+                {
+                    "markdown": "Crawled body",
+                    "metadata": {"sourceURL": "https://result.example/crawl"},
+                }
+            ],
+        },
+    )
+    manager = MagicMock()
+    manager.__enter__.return_value = client
+    manager.__exit__.return_value = False
+    adapter = FirecrawlAdapter(
+        base_url="https://firecrawl.internal/v2",
+        api_key="fc-test",
+    )
+
+    with patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager):
+        assert adapter.search("query", 5, include_raw_content=True) == [
+            Result(
+                title="Search result",
+                url="https://result.example/search",
+                snippet="Snippet",
+                raw_content="Search body",
+            )
+        ]
+        assert adapter.extract(["https://result.example/extract"]) == [
+            Page(url="https://result.example/extract", content="Extracted body")
+        ]
+        assert adapter.crawl("https://result.example") == [
+            Page(url="https://result.example/crawl", content="Crawled body")
+        ]
+        assert adapter.map("https://result.example") == [
+            "https://result.example/one",
+            "https://result.example/two",
+        ]
+
+    assert adapter.ops == frozenset({"search", "extract", "crawl", "map"})
+    assert client.get.call_args.args[0] == (
+        "https://firecrawl.internal/v2/crawl/crawl-job"
+    )
+
+
+@pytest.mark.parametrize("op", ["extract", "crawl", "map"])
+def test_firecrawl_undeclared_ops_raise(op):
+    adapter = FirecrawlAdapter(
+        base_url="https://firecrawl.internal/v2",
+        ops=frozenset({"search"}),
+    )
+
+    with pytest.raises(ProviderRequestError):
+        if op == "extract":
+            adapter.extract(["https://example.com"])
+        else:
+            getattr(adapter, op)("https://example.com")
+
+
+def test_firecrawl_zero_results_is_an_answer():
+    response = httpx.Response(
+        200,
+        json={"success": True, "data": {"web": []}},
+    )
+    manager, client = _http_client(response)
+    client.post.return_value = response
+    adapter = FirecrawlAdapter(base_url="https://firecrawl.internal/v2")
+
+    with patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager):
+        assert adapter.search("nothing", 5) == []
+
+
+def test_firecrawl_classifies_rate_limit():
+    response = httpx.Response(429)
+    manager, client = _http_client(response)
+    client.post.return_value = response
+    adapter = FirecrawlAdapter(base_url="https://firecrawl.internal/v2")
+
+    with (
+        patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager),
+        pytest.raises(ProviderRateLimitError),
+    ):
+        adapter.search("query", 5)
+
+
+def test_firecrawl_cloud_requires_a_key_and_timeout_can_fail_over():
+    with pytest.raises(ProviderAuthError):
+        FirecrawlAdapter().search("query", 5)
+
+    response = httpx.Response(408)
+    manager, client = _http_client(response)
+    client.post.return_value = response
+    adapter = FirecrawlAdapter(api_key="fc-test")
+    with (
+        patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager),
+        pytest.raises(ProviderUnavailableError) as raised,
+    ):
+        adapter.search("query", 5)
+    assert raised.value.status_code == 408
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_endpoint"),
+    [
+        ("extract", "https://firecrawl.internal/v2/scrape"),
+        ("crawl", "https://firecrawl.internal/v2/crawl"),
+        ("map", "https://firecrawl.internal/v2/map"),
+    ],
+)
+def test_firecrawl_target_url_never_changes_http_request_origin(
+    method, expected_endpoint
+):
+    influenced_url = "http://169.254.169.254/latest/meta-data"
+    client = MagicMock()
+    if method == "extract":
+        client.post.return_value = httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {"markdown": "", "metadata": {"sourceURL": influenced_url}},
+            },
+        )
+    elif method == "crawl":
+        client.post.return_value = httpx.Response(
+            200, json={"success": True, "id": "job-id"}
+        )
+        client.get.return_value = httpx.Response(
+            200, json={"status": "completed", "data": []}
+        )
+    else:
+        client.post.return_value = httpx.Response(
+            200, json={"success": True, "links": []}
+        )
+    manager = MagicMock()
+    manager.__enter__.return_value = client
+    manager.__exit__.return_value = False
+    adapter = FirecrawlAdapter(base_url="https://firecrawl.internal/v2")
+
+    with patch("src.tools.research.search.firecrawl.httpx.Client", return_value=manager):
+        if method == "extract":
+            adapter.extract([influenced_url])
+        else:
+            getattr(adapter, method)(influenced_url)
+
+    assert client.post.call_args.args[0] == expected_endpoint
+    assert client.post.call_args.kwargs["json"]["url"] == influenced_url
+
+
+def test_firecrawl_is_registered_and_constructed():
+    assert "firecrawl" in ADAPTER_NAMES
+    adapter = create_search_adapter(
+        {
+            "provider": "firecrawl",
+            "base_url": "https://firecrawl.internal/v2",
+            "api_key": None,
+            "ops": ["search", "extract", "crawl", "map"],
+        }
+    )
+
+    assert isinstance(adapter, FirecrawlAdapter)
+    assert adapter.ops == frozenset({"search", "extract", "crawl", "map"})
+
+
+def test_firecrawl_accepts_api_root_with_or_without_v2():
+    root = FirecrawlAdapter(base_url="https://firecrawl.internal")
+    versioned = FirecrawlAdapter(base_url="https://firecrawl.internal/v2/")
+
+    assert root.search_endpoint == "https://firecrawl.internal/v2/search"
+    assert versioned.search_endpoint == "https://firecrawl.internal/v2/search"
